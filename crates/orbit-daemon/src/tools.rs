@@ -412,6 +412,8 @@ fn resolve_composite_dispatch(name: &str, args: &Value) -> anyhow::Result<&'stat
                 Ok("list_pending_permissions")
             }
             "respond_permission" | "respond_to_permission" => Ok("respond_to_permission"),
+            "list_projects" | "projects" => Ok("list_projects"),
+            "inspect_project_context" | "project_context" => Ok("inspect_project_context"),
             other => anyhow::bail!("unsupported `orbit_control` action `{other}`"),
         },
         "orbit_browser" => match req_action()? {
@@ -2036,6 +2038,31 @@ async fn execute_tool_inner(
             if !matches!(decision.as_str(), "allow" | "allow_always" | "deny") {
                 anyhow::bail!("decision must be `allow`, `allow_always`, or `deny`");
             }
+            // Enforce 3-Tier Guardian + Personal Router Pre-Review ceiling when called by PersonalRouter
+            if let Some(cid) = caller_agent_id
+                && rt
+                    .personal_router
+                    .is_authorized_global_router(cid, target_host.is_some())
+                    .await
+            {
+                let pending_assessment = if target_host.is_none() {
+                    rt.orchestrator
+                        .list_pending_permissions(Some(&agent_id))
+                        .await
+                        .into_iter()
+                        .find(|p| p.request_id == request_id)
+                        .and_then(|p| p.guardian_assessment)
+                } else {
+                    None
+                };
+                if let Err(reason) = rt
+                    .personal_router
+                    .validate_router_permission_decision(&decision, pending_assessment.as_ref())
+                    .await
+                {
+                    anyhow::bail!("{reason}");
+                }
+            }
             if let Some(ref remote_host_id) = target_host {
                 let req_id = Uuid::new_v4();
                 let resp = rt
@@ -2074,6 +2101,30 @@ async fn execute_tool_inner(
                 "self": rt.host_info,
                 "connected_hosts": peers,
             }))
+        }
+
+        "list_projects" => {
+            let requested_host = opt_str(args, "host_id");
+            let resolved_host = match requested_host.as_deref() {
+                Some("all") | Some("*") => Some("all".to_string()),
+                _ => target_host.clone(),
+            };
+            let projects = rt
+                .personal_router
+                .list_fleet_projects(resolved_host.as_deref())
+                .await;
+            Ok(json!({
+                "projects": projects,
+            }))
+        }
+
+        "inspect_project_context" => {
+            let cwd = str_arg(args, "cwd")?;
+            let packet = rt
+                .personal_router
+                .inspect_project_context(target_host.as_deref(), &cwd)
+                .await?;
+            Ok(serde_json::to_value(packet)?)
         }
 
         // ==================== MISSION WORKSPACE COLLABORATION ====================
@@ -4180,6 +4231,13 @@ async fn authorize_remote_agent_control(
     {
         return Ok(());
     }
+    if rt
+        .personal_router
+        .is_authorized_global_router(caller_id, true)
+        .await
+    {
+        return Ok(());
+    }
     anyhow::bail!(
         "caller agent `{caller_id}` is not authorized to control remote agent `{target_agent_id}` on host `{remote_host_id}`"
     )
@@ -4602,16 +4660,17 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
             pack: McpToolPack::Core,
             def: ToolDefinition {
                 name: "orbit_control",
-                description: "Inspect host profiles, providers, models, connected remote hosts, or list/respond to pending child permission approvals.",
+                description: "Inspect host profiles, providers, models, connected remote hosts, cross-host projects & project context (`AGENTS.md`/`README.md`/git), or list/respond to pending child permission approvals.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["list_profiles", "list_providers", "list_models", "list_hosts", "list_pending_permissions", "respond_permission"] },
+                        "action": { "type": "string", "enum": ["list_profiles", "list_providers", "list_models", "list_hosts", "list_projects", "inspect_project_context", "list_pending_permissions", "respond_permission"] },
                         "provider": { "type": "string" },
+                        "cwd": { "type": "string", "description": "Project directory path for `inspect_project_context`." },
                         "agent_id": { "type": "string" },
                         "request_id": { "type": "string" },
                         "decision": { "type": "string", "enum": ["allow", "allow_always", "deny"] },
-                        "host_id": { "type": "string" }
+                        "host_id": { "type": "string", "description": "Target host ID (or `all` for `list_projects`)." }
                     },
                     "required": ["action"]
                 }),

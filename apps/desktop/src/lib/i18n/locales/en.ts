@@ -139,6 +139,7 @@ export const en = {
   // Sidebar
   "sidebar.newConversation": "New Conversation",
   "sidebar.automations": "Automations",
+  "sidebar.personalRouter": "Personal Router",
   "sidebar.needsAttention": "Needs Attention",
   "sidebar.pinned": "Pinned",
   "sidebar.projects": "Projects",
@@ -466,6 +467,7 @@ export const en = {
   "settings.subTabImChannels": "IM Channels",
   "settings.subTabProvidersRuntime": "Providers & Runtime",
   "settings.subTabAcpRegistry": "ACP Registry",
+  "settings.subTabPersonalRouter": "Personal Router",
   "settings.subTabGuardian": "Guardian",
   "settings.subTabUsage": "Usage",
   "settings.subTabInstructions": "Instructions",

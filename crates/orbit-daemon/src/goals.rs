@@ -137,6 +137,14 @@ pub fn authorize_agent_control(
     if target.parent_agent_id.as_deref() == Some(caller_id) && target.parent_host_id.is_none() {
         return Ok(());
     }
+    if store
+        .get_agent(caller_id)
+        .ok()
+        .flatten()
+        .is_some_and(|caller| caller.archived_at.is_none() && caller.is_personal_router())
+    {
+        return Ok(());
+    }
     Err(format!(
         "caller agent `{caller_id}` is not authorized to control agent `{target_agent_id}`"
     ))

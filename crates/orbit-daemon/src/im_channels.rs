@@ -17,8 +17,9 @@ use axum::{
 };
 use chrono::Utc;
 use orbit_protocol::{
-    AgentStatus, ImChannelRecord, ImConnectionStatus, ImPlatform, ImThreadBinding, ProviderKind,
-    SessionMode, TimelinePayload, ToolCallDetail, WorktreeCreateMode, sanitize_im_allowlist,
+    AgentStatus, ImChannelRecord, ImConnectionStatus, ImPlatform, ImRoutingMode, ImThreadBinding,
+    ProviderKind, RouterImMirrorPolicy, SessionMode, TimelinePayload, ToolCallDetail,
+    WorktreeCreateMode, sanitize_im_allowlist,
 };
 use orbit_store::{OrbitStore, StoredImChannel};
 use serde_json::{Value, json};
@@ -70,6 +71,8 @@ pub struct UpsertImChannelSpec {
     pub default_provider: ProviderKind,
     pub default_mode: SessionMode,
     pub forward_approvals: bool,
+    pub routing_mode: ImRoutingMode,
+    pub router_mirror_policy: RouterImMirrorPolicy,
 }
 
 impl std::fmt::Debug for UpsertImChannelSpec {
@@ -95,6 +98,8 @@ impl std::fmt::Debug for UpsertImChannelSpec {
             .field("default_provider", &self.default_provider)
             .field("default_mode", &self.default_mode)
             .field("forward_approvals", &self.forward_approvals)
+            .field("routing_mode", &self.routing_mode)
+            .field("router_mirror_policy", &self.router_mirror_policy)
             .finish()
     }
 }
@@ -204,6 +209,7 @@ pub struct ImChannelBridge {
     callback_refs: Arc<Mutex<VecDeque<(String, CallbackApprovalRef)>>>,
     pollers: Arc<Mutex<HashMap<String, PollerHandle>>>,
     broadcast_task: Arc<Mutex<Option<AbortHandle>>>,
+    personal_router: RwLock<Option<Arc<crate::personal_router::PersonalRouterManager>>>,
     /// Test hook: skip `authorize_workspace_mutation_cwd` only in isolated unit tests.
     enforce_workspace_auth: bool,
 }
@@ -225,8 +231,16 @@ impl ImChannelBridge {
             callback_refs: Arc::new(Mutex::new(VecDeque::new())),
             pollers: Arc::new(Mutex::new(HashMap::new())),
             broadcast_task: Arc::new(Mutex::new(None)),
+            personal_router: RwLock::new(None),
             enforce_workspace_auth: true,
         })
+    }
+
+    pub async fn set_personal_router(
+        &self,
+        router: Arc<crate::personal_router::PersonalRouterManager>,
+    ) {
+        *self.personal_router.write().await = Some(router);
     }
 
     #[cfg(test)]
@@ -242,6 +256,7 @@ impl ImChannelBridge {
             callback_refs: Arc::new(Mutex::new(VecDeque::new())),
             pollers: Arc::new(Mutex::new(HashMap::new())),
             broadcast_task: Arc::new(Mutex::new(None)),
+            personal_router: RwLock::new(None),
             enforce_workspace_auth: false,
         })
     }
@@ -496,6 +511,8 @@ impl ImChannelBridge {
             default_provider: spec.default_provider,
             default_mode: spec.default_mode,
             forward_approvals: spec.forward_approvals,
+            routing_mode: spec.routing_mode,
+            router_mirror_policy: spec.router_mirror_policy,
             message_count: existing.as_ref().map(|e| e.message_count).unwrap_or(0),
             last_activity_at_ms: existing.as_ref().and_then(|e| e.last_activity_at_ms),
             created_at_ms: existing.as_ref().map(|e| e.created_at_ms).unwrap_or(now),
@@ -925,6 +942,42 @@ impl ImChannelBridge {
         if let Some(cmd) = parse_im_slash_command(text) {
             let reply = self.execute_slash_command(channel, &inbound, cmd).await;
             return Ok(Some(reply));
+        }
+
+        // PersonalRouter routing mode: route ALL authorized IM messages into the host's single
+        // canonical Personal Router ("分工师") session so Feishu/IM and Orbit Native UI share
+        // one continuous bidirectional conversation!
+        if channel.routing_mode == ImRoutingMode::PersonalRouter {
+            let router_opt = self.personal_router.read().await.clone();
+            let Some(router) = router_opt else {
+                return Ok(Some(
+                    "Personal Router is not initialized on this host.".to_string(),
+                ));
+            };
+            let router_agent = match router.ensure_router_agent().await {
+                Ok(ag) => ag,
+                Err(e) => {
+                    return Ok(Some(format!("Unable to activate Personal Router: {e}")));
+                }
+            };
+            let tagged_prompt = format!("[via {}] {text}", channel.platform.display_name());
+            if let Err(e) = self
+                .orchestrator
+                .send_prompt(&router_agent.agent_id, tagged_prompt)
+                .await
+            {
+                return Ok(Some(format!(
+                    "Failed to deliver message to Personal Router: {e}"
+                )));
+            }
+            let _ = self.store.upsert_im_binding(&ImThreadBinding {
+                channel_id: channel.channel_id.clone(),
+                external_chat_id: inbound.chat_id.clone(),
+                external_thread_id: inbound.thread_id.clone(),
+                agent_id: router_agent.agent_id,
+                updated_at_ms: now,
+            });
+            return Ok(None);
         }
 
         // Route to existing bound agent or create a fresh one in `default_workspace_cwd`
@@ -3725,6 +3778,8 @@ mod tests {
             default_provider: ProviderKind::ClaudeCode,
             default_mode: SessionMode::Default,
             forward_approvals: true,
+            routing_mode: ImRoutingMode::PerThreadAgent,
+            router_mirror_policy: RouterImMirrorPolicy::MilestonesAndApprovals,
             message_count: 0,
             last_activity_at_ms: None,
             created_at_ms: 1_760_000_000_000,
@@ -3841,6 +3896,8 @@ mod tests {
             default_provider: ProviderKind::ClaudeCode,
             default_mode: SessionMode::Default,
             forward_approvals: true,
+            routing_mode: ImRoutingMode::PerThreadAgent,
+            router_mirror_policy: RouterImMirrorPolicy::MilestonesAndApprovals,
         };
         let dbg = format!("{spec:?}");
         assert!(!dbg.contains("super_secret_bot_token"));
@@ -4101,6 +4158,8 @@ mod tests {
                 default_provider: ProviderKind::ClaudeCode,
                 default_mode: SessionMode::Default,
                 forward_approvals: true,
+                routing_mode: ImRoutingMode::PerThreadAgent,
+                router_mirror_policy: RouterImMirrorPolicy::MilestonesAndApprovals,
             })
             .await
             .expect("create channel");
@@ -4128,6 +4187,8 @@ mod tests {
                 default_provider: ProviderKind::ClaudeCode,
                 default_mode: SessionMode::Default,
                 forward_approvals: true,
+                routing_mode: ImRoutingMode::PerThreadAgent,
+                router_mirror_policy: RouterImMirrorPolicy::MilestonesAndApprovals,
             })
             .await
             .expect("update keeping secrets");
@@ -4150,6 +4211,8 @@ mod tests {
                 default_provider: ProviderKind::ClaudeCode,
                 default_mode: SessionMode::Default,
                 forward_approvals: true,
+                routing_mode: ImRoutingMode::PerThreadAgent,
+                router_mirror_policy: RouterImMirrorPolicy::MilestonesAndApprovals,
             })
             .await
             .expect("update clearing signing secret");

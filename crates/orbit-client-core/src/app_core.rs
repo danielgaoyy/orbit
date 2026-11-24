@@ -738,6 +738,10 @@ pub struct UpsertImChannelRequest {
     pub default_mode: SessionMode,
     #[serde(default = "default_keep_existing_secrets")]
     pub forward_approvals: bool,
+    #[serde(default)]
+    pub routing_mode: orbit_protocol::ImRoutingMode,
+    #[serde(default)]
+    pub router_mirror_policy: orbit_protocol::RouterImMirrorPolicy,
 }
 
 impl std::fmt::Debug for UpsertImChannelRequest {
@@ -1121,6 +1125,22 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<PushDevicesSnapshotView, String>>>,
     pending_push_tests:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<PushTestResultView, String>>>,
+    pending_router_statuses: HashMap<
+        Uuid,
+        tokio::sync::oneshot::Sender<Result<orbit_protocol::RouterStatusSnapshot, String>>,
+    >,
+    pending_router_probes: HashMap<
+        Uuid,
+        tokio::sync::oneshot::Sender<Result<orbit_protocol::RouterHostCapabilities, String>>,
+    >,
+    pending_fleet_router_hosts: HashMap<
+        Uuid,
+        tokio::sync::oneshot::Sender<Result<Vec<orbit_protocol::RouterHostCapabilities>, String>>,
+    >,
+    pending_hermes_bridge_exports: HashMap<
+        Uuid,
+        tokio::sync::oneshot::Sender<Result<orbit_protocol::HermesBridgeBundle, String>>,
+    >,
     rewound_agents: std::collections::HashSet<String>,
     caught_up_agents: std::collections::HashSet<String>,
     timeline_has_older: HashMap<String, bool>,
@@ -1277,6 +1297,10 @@ impl HostMemoryState {
             pending_im_channel_tests: HashMap::new(),
             pending_push_snapshots: HashMap::new(),
             pending_push_tests: HashMap::new(),
+            pending_router_statuses: HashMap::new(),
+            pending_router_probes: HashMap::new(),
+            pending_fleet_router_hosts: HashMap::new(),
+            pending_hermes_bridge_exports: HashMap::new(),
             rewound_agents: std::collections::HashSet::new(),
             caught_up_agents: std::collections::HashSet::new(),
             timeline_has_older: HashMap::new(),
@@ -6514,6 +6538,29 @@ impl OrbitAppCore {
                         let _ = tx.send(Ok(ImChannelTestResultView { ok, detail }));
                     }
                 }
+                WireMessage::PersonalRouterStatusSnapshot { request_id, status } => {
+                    if let Some(tx) = state.pending_router_statuses.remove(&request_id) {
+                        let _ = tx.send(Ok(status));
+                    }
+                }
+                WireMessage::RouterCapabilitiesResponse {
+                    request_id,
+                    capabilities,
+                } => {
+                    if let Some(tx) = state.pending_router_probes.remove(&request_id) {
+                        let _ = tx.send(Ok(capabilities));
+                    }
+                }
+                WireMessage::FleetRouterHostsSnapshot { request_id, hosts } => {
+                    if let Some(tx) = state.pending_fleet_router_hosts.remove(&request_id) {
+                        let _ = tx.send(Ok(hosts));
+                    }
+                }
+                WireMessage::HermesBridgeConfigResponse { request_id, bundle } => {
+                    if let Some(tx) = state.pending_hermes_bridge_exports.remove(&request_id) {
+                        let _ = tx.send(Ok(bundle));
+                    }
+                }
                 WireMessage::PushDevicesSnapshot {
                     request_id,
                     devices,
@@ -6994,6 +7041,22 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_push_tests.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_router_statuses.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_router_probes.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_fleet_router_hosts.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_hermes_bridge_exports.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -14457,6 +14520,385 @@ impl OrbitAppCore {
         .await
     }
 
+    /// Fetch the Personal Router ("分工师") status snapshot for a specific host.
+    pub async fn get_personal_router_status_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+    ) -> Result<orbit_protocol::RouterStatusSnapshot, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        }
+        .ok_or_else(|| "Host is disconnected".to_string())?;
+
+        let host_id_owned = host_id.to_string();
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id_owned) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_router_statuses.insert(req_id, ack_tx);
+                        None
+                    }
+                    _ => Some("Host disconnected".to_string()),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::GetPersonalRouterStatus { request_id: req_id })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id_owned)
+                {
+                    h.pending_router_statuses.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("send failed: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(12), ack_rx).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(_)) => Err("host disconnected while fetching router status".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id_owned)
+                    {
+                        h.pending_router_statuses.remove(&req_id);
+                    }
+                    Err("timed out waiting for personal router status".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "router status request cancelled".to_string())?
+    }
+
+    /// Configure (and optionally activate) the Personal Router ("分工师") on a specific host.
+    pub async fn configure_personal_router_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        config: orbit_protocol::PersonalRouterConfig,
+        external_webhook_secret: Option<String>,
+        activate: bool,
+    ) -> Result<orbit_protocol::RouterStatusSnapshot, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        }
+        .ok_or_else(|| "Host is disconnected".to_string())?;
+
+        let host_id_owned = host_id.to_string();
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id_owned) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_router_statuses.insert(req_id, ack_tx);
+                        None
+                    }
+                    _ => Some("Host disconnected".to_string()),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ConfigurePersonalRouter {
+                    request_id: req_id,
+                    config,
+                    external_webhook_secret,
+                    activate,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id_owned)
+                {
+                    h.pending_router_statuses.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("send failed: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(30), ack_rx).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(_)) => Err("host disconnected while configuring router".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id_owned)
+                    {
+                        h.pending_router_statuses.remove(&req_id);
+                    }
+                    Err("timed out configuring personal router".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "configure router request cancelled".to_string())?
+    }
+
+    /// Auto-discover Personal Router & Hermes readiness across ALL hosts in the client's Multi-Host
+    /// Fleet pool concurrently, ranked by `recommended_score` descending so the user can pull in
+    /// the best host (e.g., an always-on Mac mini or Devbox with Hermes + existing memory) in 1 click.
+    pub async fn discover_fleet_router_hosts(
+        self: &Arc<Self>,
+    ) -> Result<Vec<orbit_protocol::RouterHostCapabilities>, String> {
+        let host_entries: Vec<_> = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .iter()
+                .map(|(hid, h)| {
+                    let is_local = h
+                        .profile
+                        .direct_endpoints
+                        .iter()
+                        .any(|u| u.contains("127.0.0.1") || u.contains("localhost"));
+                    let display_name = h
+                        .profile
+                        .custom_name
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| h.profile.hostname.clone());
+                    (hid.clone(), display_name, is_local, h.session.clone())
+                })
+                .collect()
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let mut tasks = Vec::with_capacity(host_entries.len());
+            for (hid, name, is_local, session_opt) in host_entries {
+                let c = Arc::clone(&core);
+                tasks.push(tokio::spawn(async move {
+                    let Some(session) = session_opt else {
+                        return orbit_protocol::RouterHostCapabilities {
+                            host_id: hid,
+                            host_name: name,
+                            is_local,
+                            online: false,
+                            hermes_installed: false,
+                            hermes_version: None,
+                            hermes_has_existing_memory: false,
+                            hermes_acp_ready: false,
+                            hermes_gateway_running: false,
+                            available_providers: Vec::new(),
+                            active_router_agent_id: None,
+                            active_router_status: None,
+                            router_enabled: false,
+                            recommended_score: 0,
+                            recommendation_reason: Some("主机未连接".to_string()),
+                        };
+                    };
+                    let req_id = Uuid::new_v4();
+                    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                    let ok_reg = if let Ok(mut guard) = c.hosts.write()
+                        && let Some(h) = guard.get_mut(&hid)
+                    {
+                        h.pending_router_probes.insert(req_id, ack_tx);
+                        true
+                    } else {
+                        false
+                    };
+                    if ok_reg
+                        && session
+                            .send_wire(WireMessage::ProbeRouterCapabilities { request_id: req_id })
+                            .await
+                            .is_ok()
+                        && let Ok(Ok(Ok(mut cap))) =
+                            tokio::time::timeout(Duration::from_secs(6), ack_rx).await
+                    {
+                        cap.host_id = hid;
+                        cap.is_local = is_local;
+                        cap.online = true;
+                        if cap.host_name.trim().is_empty() {
+                            cap.host_name = name;
+                        }
+                        return cap;
+                    }
+                    if let Ok(mut guard) = c.hosts.write()
+                        && let Some(h) = guard.get_mut(&hid)
+                    {
+                        h.pending_router_probes.remove(&req_id);
+                    }
+                    orbit_protocol::RouterHostCapabilities {
+                        host_id: hid,
+                        host_name: name,
+                        is_local,
+                        online: true,
+                        hermes_installed: false,
+                        hermes_version: None,
+                        hermes_has_existing_memory: false,
+                        hermes_acp_ready: false,
+                        hermes_gateway_running: false,
+                        available_providers: Vec::new(),
+                        active_router_agent_id: None,
+                        active_router_status: None,
+                        router_enabled: false,
+                        recommended_score: 5,
+                        recommendation_reason: Some("该主机 Daemon 版本较旧或探测超时".to_string()),
+                    }
+                }));
+            }
+
+            let mut out = Vec::with_capacity(tasks.len());
+            for t in tasks {
+                if let Ok(cap) = t.await {
+                    out.push(cap);
+                }
+            }
+            out.sort_by(|a, b| {
+                b.recommended_score
+                    .cmp(&a.recommended_score)
+                    .then_with(|| b.online.cmp(&a.online))
+                    .then_with(|| a.host_name.cmp(&b.host_name))
+            });
+            let _ = res_tx.send(Ok(out));
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "fleet router discovery cancelled".to_string())?
+    }
+
+    /// Return the user's persisted global Primary Personal Router host selection (if configured).
+    pub fn get_primary_router_selection(&self) -> Option<orbit_protocol::PrimaryRouterSelection> {
+        let raw = self
+            .store
+            .get_client_kv("primary_router_selection")
+            .ok()
+            .flatten()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    /// Persist (or clear) the user's global Primary Personal Router host selection across the Fleet.
+    pub fn set_primary_router_selection(
+        &self,
+        selection: Option<orbit_protocol::PrimaryRouterSelection>,
+    ) -> Result<Option<orbit_protocol::PrimaryRouterSelection>, String> {
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0);
+        match selection {
+            Some(mut sel) => {
+                if sel.updated_at_ms == 0 {
+                    sel.updated_at_ms = now_ms as u64;
+                }
+                let json = serde_json::to_string(&sel)
+                    .map_err(|e| format!("failed to serialize primary router selection: {e}"))?;
+                self.store
+                    .set_client_kv("primary_router_selection", &json, now_ms)
+                    .map_err(|e| format!("failed to persist primary router selection: {e}"))?;
+                Ok(Some(sel))
+            }
+            None => {
+                self.store
+                    .set_client_kv("primary_router_selection", "null", now_ms)
+                    .map_err(|e| format!("failed to clear primary router selection: {e}"))?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Export ready-to-paste external Hermes Gateway MCP + SOUL/Skill configuration for a host.
+    pub async fn export_hermes_bridge_config_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+    ) -> Result<orbit_protocol::HermesBridgeBundle, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        }
+        .ok_or_else(|| "Host is disconnected".to_string())?;
+
+        let host_id_owned = host_id.to_string();
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id_owned) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_hermes_bridge_exports.insert(req_id, ack_tx);
+                        None
+                    }
+                    _ => Some("Host disconnected".to_string()),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ExportHermesBridgeConfig { request_id: req_id })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id_owned)
+                {
+                    h.pending_hermes_bridge_exports.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("send failed: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(12), ack_rx).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(_)) => Err("host disconnected".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id_owned)
+                    {
+                        h.pending_hermes_bridge_exports.remove(&req_id);
+                    }
+                    Err("timed out exporting Hermes bridge config".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "export hermes bridge cancelled".to_string())?
+    }
+
     /// Create or update an IM channel on any connected host.
     pub async fn upsert_im_channel_on_host(
         self: &Arc<Self>,
@@ -14481,6 +14923,8 @@ impl OrbitAppCore {
                 default_provider: req.default_provider,
                 default_mode: req.default_mode,
                 forward_approvals: req.forward_approvals,
+                routing_mode: req.routing_mode,
+                router_mirror_policy: req.router_mirror_policy,
             },
             "save IM channel",
             Duration::from_secs(15),
@@ -18199,6 +18643,18 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_push_tests.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_router_statuses.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_router_probes.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_fleet_router_hosts.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_hermes_bridge_exports.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (req_id, tx) in h.pending_side_questions.drain() {

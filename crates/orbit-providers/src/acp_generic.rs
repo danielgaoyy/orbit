@@ -185,9 +185,7 @@ pub async fn spawn_acp_session(cfg: SessionLaunchConfig) -> Result<ProviderSessi
 
 struct PendingAcpPerm {
     rpc_id: Value,
-    allow_option_id: String,
-    allow_always_option_id: String,
-    deny_option_id: Option<String>,
+    perm_options: crate::AcpPermissionOptions,
     is_question: bool,
     raw_questions: Vec<QuestionItem>,
 }
@@ -1458,25 +1456,7 @@ async fn run_acp_actor(
                     DriverCommand::ResolvePermission { request_id, decision } => {
                         if let Some(p) = pending_perms.remove(&request_id) {
                             pending_perm_order.retain(|id| id != &request_id);
-                            let outcome = match decision.as_str() {
-                                "allow_always" => json!({
-                                    "outcome": "selected",
-                                    "optionId": p.allow_always_option_id
-                                }),
-                                "allow" => json!({
-                                    "outcome": "selected",
-                                    "optionId": p.allow_option_id
-                                }),
-                                _ => match p.deny_option_id {
-                                    Some(ref opt_id) => json!({
-                                        "outcome": "selected",
-                                        "optionId": opt_id
-                                    }),
-                                    None => json!({
-                                        "outcome": "cancelled"
-                                    }),
-                                },
-                            };
+                            let outcome = p.perm_options.outcome_for_decision(decision.as_str());
                             let resp = json!({
                                 "jsonrpc": "2.0",
                                 "id": p.rpc_id,
@@ -1522,20 +1502,9 @@ async fn run_acp_actor(
                                 orbit_protocol::PlanApprovalAction::ApproveAndBuild
                                     if !has_edits =>
                                 {
-                                    json!({
-                                        "outcome": "selected",
-                                        "optionId": p.allow_option_id
-                                    })
+                                    p.perm_options.outcome_for_decision("allow")
                                 }
-                                _ => match p.deny_option_id {
-                                    Some(ref opt_id) => json!({
-                                        "outcome": "selected",
-                                        "optionId": opt_id
-                                    }),
-                                    None => json!({
-                                        "outcome": "cancelled"
-                                    }),
-                                },
+                                _ => p.perm_options.deny_outcome(),
                             }
                         };
 
@@ -1621,7 +1590,7 @@ async fn run_acp_actor(
                                 "result": {
                                     "outcome": {
                                         "outcome": "selected",
-                                        "optionId": p.allow_option_id,
+                                        "optionId": p.perm_options.question_option_id(),
                                         "updatedInput": { "answers": answers_map }
                                     }
                                 }
@@ -1702,13 +1671,7 @@ async fn run_acp_actor(
                                             })
                                             .await;
                                         if let Some((p, _)) = pending_switch.deferred_perm {
-                                            let reject_outcome = match p.deny_option_id {
-                                                Some(ref opt_id) => json!({
-                                                    "outcome": "selected",
-                                                    "optionId": opt_id
-                                                }),
-                                                None => json!({ "outcome": "cancelled" }),
-                                            };
+                                            let reject_outcome = p.perm_options.deny_outcome();
                                             let resp = json!({
                                                 "jsonrpc": "2.0",
                                                 "id": p.rpc_id,
@@ -2528,11 +2491,7 @@ fn map_generic_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> Too
             .map(ToOwned::to_owned)
             .or(prev_cmd)
             .unwrap_or_else(|| title.to_string());
-        let cwd = raw_in
-            .and_then(|i| i.get("cwd"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .or(prev_cwd);
+        let cwd = crate::extract_acp_shell_cwd(raw_in).or(prev_cwd);
         let exit_code = raw_out
             .and_then(|o| o.get("exitCode").or_else(|| o.get("exit_code")))
             .and_then(Value::as_i64)
@@ -2654,38 +2613,6 @@ fn map_generic_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> Too
     }
 }
 
-fn select_option_id_opt(
-    options: &[Value],
-    exact_kinds: &[&str],
-    fallback_subs: &[&str],
-) -> Option<String> {
-    for exact_kind in exact_kinds {
-        if let Some(id) = options
-            .iter()
-            .find(|o| o.get("kind").and_then(Value::as_str) == Some(*exact_kind))
-            .and_then(|o| o.get("optionId").and_then(Value::as_str))
-        {
-            return Some(id.to_string());
-        }
-    }
-    for fallback_sub in fallback_subs {
-        if let Some(id) = options
-            .iter()
-            .find(|o| {
-                o.get("kind")
-                    .or_else(|| o.get("optionId"))
-                    .or_else(|| o.get("name"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| s.to_ascii_lowercase().contains(fallback_sub))
-            })
-            .and_then(|o| o.get("optionId").and_then(Value::as_str))
-        {
-            return Some(id.to_string());
-        }
-    }
-    None
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn handle_generic_permission_request(
     val: &Value,
@@ -2703,16 +2630,7 @@ async fn handle_generic_permission_request(
     let tool_call = &params["toolCall"];
     let options = params["options"].as_array().cloned().unwrap_or_default();
 
-    let allow_opt = select_option_id_opt(&options, &["allow_once"], &["allow"])
-        .unwrap_or_else(|| "allow_once".to_string());
-    let allow_always_opt =
-        select_option_id_opt(&options, &["allow_always", "allow_once"], &["allow"])
-            .unwrap_or_else(|| "allow_always".to_string());
-    let deny_opt = select_option_id_opt(
-        &options,
-        &["reject_once", "reject_always"],
-        &["reject", "deny", "cancel"],
-    );
+    let perm_options = crate::AcpPermissionOptions::parse(&options);
 
     let kind_str = tool_call.get("kind").and_then(Value::as_str).unwrap_or("");
     let is_attachment_read = kind_str == "read"
@@ -2745,7 +2663,7 @@ async fn handle_generic_permission_request(
                     "edit" | "write" | "delete" | "move" | "read" | "search"
                 )));
 
-    if auto_approve {
+    if auto_approve && let Some(ref allow_opt) = perm_options.allow_once {
         let resp = json!({
             "jsonrpc": "2.0",
             "id": rpc_id,
@@ -2772,20 +2690,19 @@ async fn handle_generic_permission_request(
                 .unwrap_or("Approve tool execution")
                 .to_string()
         });
-    let detail = map_generic_tool_detail(tool_call, None);
-    let allowed_decisions = if plan_approval.is_some() {
-        vec!["allow".into(), "deny".into()]
+    let authoritative = crate::acp_tool_call_has_authoritative_identity(tool_call);
+    let detail = if plan_approval.is_none() && !authoritative {
+        crate::acp_title_only_detail(&title, tool_call)
     } else {
-        vec!["allow".into(), "allow_always".into(), "deny".into()]
+        map_generic_tool_detail(tool_call, None)
     };
+    let allowed_decisions = perm_options.allowed_decisions(plan_approval.is_some(), authoritative);
 
     pending_perms.insert(
         req_id.clone(),
         PendingAcpPerm {
             rpc_id,
-            allow_option_id: allow_opt,
-            allow_always_option_id: allow_always_opt,
-            deny_option_id: deny_opt,
+            perm_options,
             is_question: false,
             raw_questions: Vec::new(),
         },
@@ -3291,28 +3208,39 @@ done
             "Invalid params: unsupported mcpServers type".into()
         )));
 
-        // Reject option fallback & None -> cancelled
+        // Reject option fallback & None -> cancelled, plus strict allow_once separation
         let opts_reject_always = vec![
             json!({ "optionId": "a1", "kind": "allow_once" }),
             json!({ "optionId": "r_all", "kind": "reject_always" }),
         ];
+        let parsed = crate::AcpPermissionOptions::parse(&opts_reject_always);
+        assert_eq!(parsed.deny.as_deref(), Some("r_all"));
         assert_eq!(
-            select_option_id_opt(
-                &opts_reject_always,
-                &["reject_once", "reject_always"],
-                &["reject", "deny", "cancel"]
-            )
-            .as_deref(),
-            Some("r_all")
+            parsed.allowed_decisions(false, true),
+            vec!["allow".to_string(), "deny".to_string()]
         );
+
         let opts_only_allow = vec![json!({ "optionId": "a1", "kind": "allow_once" })];
+        let parsed_only_allow = crate::AcpPermissionOptions::parse(&opts_only_allow);
+        assert_eq!(parsed_only_allow.deny, None);
         assert_eq!(
-            select_option_id_opt(
-                &opts_only_allow,
-                &["reject_once", "reject_always"],
-                &["reject", "deny", "cancel"]
-            ),
-            None
+            parsed_only_allow.deny_outcome(),
+            json!({ "outcome": "cancelled" })
+        );
+
+        let opts_only_always = vec![
+            json!({ "optionId": "aa1", "kind": "allow_always" }),
+            json!({ "optionId": "r1", "kind": "reject_once" }),
+        ];
+        let parsed_only_always = crate::AcpPermissionOptions::parse(&opts_only_always);
+        assert_eq!(parsed_only_always.allow_once, None);
+        assert_eq!(
+            parsed_only_always.allowed_decisions(false, true),
+            vec!["allow_always".to_string(), "deny".to_string()]
+        );
+        assert_eq!(
+            parsed_only_always.outcome_for_decision("allow"),
+            json!({ "outcome": "cancelled" })
         );
     }
 

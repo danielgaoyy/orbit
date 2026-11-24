@@ -7,6 +7,7 @@ pub mod goals;
 pub mod guardian;
 pub mod im_channels;
 pub mod orchestration;
+pub mod permission_rules;
 pub mod push;
 pub mod search;
 pub mod timers;
@@ -20,6 +21,9 @@ pub use artifacts::{
 };
 pub use im_channels::StoredImChannel;
 pub use orchestration::*;
+pub use permission_rules::{
+    PathResolutionError, canonicalize_project_cwd, resolve_path_preserving_symlinks,
+};
 pub use push::{StoredPushDevice, StoredPushPreferences};
 pub use search::{
     DaemonMessageSearchHit, FtsBackfillProgress, MessageSearchHit, build_fts5_match_query,
@@ -543,6 +547,7 @@ impl OrbitStore {
         usage::migrate_usage_schema(&conn)?;
         timers::migrate_conditional_timers_schema(&conn)?;
         guardian::migrate_guardian_schema(&conn)?;
+        permission_rules::migrate_permission_rules_schema(&conn)?;
         goals::migrate_goals_schema(&conn)?;
         triggers::migrate_event_triggers_schema(&conn)?;
         workflows::migrate_workflows_schema(&conn)?;

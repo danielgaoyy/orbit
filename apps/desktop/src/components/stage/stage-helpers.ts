@@ -5,6 +5,7 @@ import type {
   ArtifactSummary,
   DiffFileView,
   DiffLineView,
+  GuardianAssessment,
   InlineSpanView,
   PromptBadge,
   RichBlockView,
@@ -1201,4 +1202,54 @@ export function findTurnIndexForSeq(
     }
   }
   return { index: best, exact: false };
+}
+
+export type SafeBatchDecisionCandidate =
+  | {
+      readonly kind: "permission";
+      readonly targetHostId?: string;
+      readonly targetAgentId?: string;
+      readonly requestId?: string;
+      readonly allowedDecisions?: readonly string[];
+      readonly guardianAssessment?: GuardianAssessment | null;
+      readonly isPlanApproval?: boolean;
+      readonly planApproval?: unknown;
+    }
+  | {
+      readonly kind: "question";
+      readonly targetHostId?: string;
+      readonly targetAgentId?: string;
+      readonly requestId?: string;
+    };
+
+/**
+ * Returns `true` strictly when a permission request explicitly permits a single-shot `"allow"`
+ * decision (`allow`, `allow_once`, or `accept`).
+ */
+export function permitsAllowDecision(allowedDecisions: readonly string[] | undefined): boolean {
+  if (!allowedDecisions || allowedDecisions.length === 0) return false;
+  return allowedDecisions.some((dec) => {
+    const norm = dec.trim().toLowerCase();
+    return norm === "allow" || norm === "allow_once" || norm === "accept";
+  });
+}
+
+/**
+ * Pure selector returning strictly non-plan, non-question, non-`High`/non-`Critical` pending
+ * permissions that explicitly permit `"allow"`. Mirrors daemon-side `ResolvePermissionsBatch`
+ * safety invariants.
+ */
+export function selectSafeBatchPermissions<T extends SafeBatchDecisionCandidate>(
+  queue: readonly T[],
+): Extract<T, { kind: "permission" }>[] {
+  const out: Extract<T, { kind: "permission" }>[] = [];
+  for (const item of queue) {
+    if (item.kind !== "permission") continue;
+    if (item.isPlanApproval || item.planApproval != null) continue;
+    const risk = item.guardianAssessment?.risk_level;
+    if (risk === "high" || risk === "critical") continue;
+    if (!permitsAllowDecision(item.allowedDecisions)) continue;
+    out.push(item as Extract<T, { kind: "permission" }>);
+  }
+  return out;
 }

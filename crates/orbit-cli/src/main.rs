@@ -2183,6 +2183,7 @@ where
         agent_id: agent_id.to_string(),
         permission_request_id: permission_request_id.to_string(),
         decision: decision.to_string(),
+        agent_originated: false,
     };
     if let Err(e) = send_wire(msg).await {
         let _ = writeln!(

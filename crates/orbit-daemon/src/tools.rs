@@ -2203,8 +2203,10 @@ async fn execute_tool_inner(
                 .or_else(|| opt_str(args, "permission_request_id"))
                 .ok_or_else(|| anyhow::anyhow!("missing required string argument `request_id`"))?;
             let decision = str_arg(args, "decision")?;
-            if !matches!(decision.as_str(), "allow" | "allow_always" | "deny") {
-                anyhow::bail!("decision must be `allow`, `allow_always`, or `deny`");
+            if !matches!(decision.as_str(), "allow" | "deny") {
+                anyhow::bail!(
+                    "agent permission resolution only permits `allow` or `deny` (persistent `allow_always` grants require explicit human approval)"
+                );
             }
             // Enforce 3-Tier Guardian + Personal Router Pre-Review ceiling when called by PersonalRouter
             if let Some(cid) = caller_agent_id
@@ -2277,6 +2279,7 @@ async fn execute_tool_inner(
                             agent_id: agent_id.clone(),
                             permission_request_id: request_id.clone(),
                             decision: decision.clone(),
+                            agent_originated: true,
                         },
                         Duration::from_secs(15),
                     )
@@ -5088,7 +5091,7 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
                         "cwd": { "type": "string", "description": "Project directory path for `inspect_project_context`." },
                         "agent_id": { "type": "string" },
                         "request_id": { "type": "string" },
-                        "decision": { "type": "string", "enum": ["allow", "allow_always", "deny"] },
+                        "decision": { "type": "string", "enum": ["allow", "deny"] },
                         "host_id": { "type": "string", "description": "Target host ID (or `all` for `list_projects`)." }
                     },
                     "required": ["action"]

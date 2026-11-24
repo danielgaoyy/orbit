@@ -1839,28 +1839,7 @@ async fn handle_codex_notification(
                         .and_then(|v| v.as_array())
                         .cloned()
                         .unwrap_or_default();
-                    let first_path = changes
-                        .first()
-                        .and_then(|c| c.get("path"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("files")
-                        .to_string();
-                    let combined_diff: String = changes
-                        .iter()
-                        .filter_map(|c| c.get("diff").and_then(|d| d.as_str()))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let detail = ToolCallDetail::FileEdit {
-                        path: first_path,
-                        unified_diff: if combined_diff.is_empty() {
-                            None
-                        } else {
-                            Some(crate::compact_unified_diff(
-                                &combined_diff,
-                                crate::MAX_UNIFIED_DIFF_BYTES,
-                            ))
-                        },
-                    };
+                    let detail = build_codex_file_change_detail(&changes);
                     tool_detail_cache.insert(item_id.clone(), detail.clone());
                     let status =
                         map_codex_item_status(item.get("status").and_then(|v| v.as_str()), is_done);
@@ -2118,7 +2097,7 @@ async fn handle_codex_server_request(
                         exit_code: None,
                         output_preview: None,
                     },
-                    allowed_decisions: vec!["allow".into(), "deny".into()],
+                    allowed_decisions: vec!["allow".into(), "allow_always".into(), "deny".into()],
                     plan_approval: None,
                 })
                 .await;
@@ -2142,19 +2121,26 @@ async fn handle_codex_server_request(
             }
             let req_id = format!("cfile_{rpc_id}");
             let item_id = params.get("itemId").and_then(|v| v.as_str()).unwrap_or("");
-            let detail = tool_detail_cache.get(item_id).cloned().unwrap_or_else(|| {
-                ToolCallDetail::FileEdit {
-                    path: "workspace files".into(),
-                    unified_diff: None,
-                }
+            let cached_detail = tool_detail_cache.get(item_id).cloned();
+            let allow_always_eligible = cached_detail
+                .as_ref()
+                .is_some_and(codex_file_change_single_concrete_path);
+            let detail = cached_detail.unwrap_or_else(|| ToolCallDetail::FileEdit {
+                path: "workspace files".into(),
+                unified_diff: None,
             });
+            let allowed_decisions = if allow_always_eligible {
+                vec!["allow".into(), "allow_always".into(), "deny".into()]
+            } else {
+                vec!["allow".into(), "deny".into()]
+            };
             pending_approvals.insert(req_id.clone(), PendingCodexApproval { rpc_id });
             let _ = evt_tx
                 .send(DriverEvent::PermissionRequest {
                     request_id: req_id.clone(),
                     title: "Approve file modifications".into(),
                     detail,
-                    allowed_decisions: vec!["allow".into(), "deny".into()],
+                    allowed_decisions,
                     plan_approval: None,
                 })
                 .await;
@@ -2297,6 +2283,107 @@ async fn handle_codex_server_request(
                 .await;
         }
     }
+}
+
+fn build_codex_file_change_detail(changes: &[Value]) -> ToolCallDetail {
+    let first_path = changes
+        .first()
+        .and_then(|c| c.get("path"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("files")
+        .to_string();
+
+    let mut sections: Vec<String> = Vec::with_capacity(changes.len());
+    for change in changes {
+        let path_opt = change
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+        let diff_str = change.get("diff").and_then(Value::as_str).unwrap_or("");
+        let has_header = diff_str.lines().any(|line| {
+            line.starts_with("--- ")
+                || line.starts_with("+++ ")
+                || line.starts_with("diff --git ")
+                || line.starts_with("*** Update File: ")
+                || line.starts_with("*** Add File: ")
+                || line.starts_with("*** Delete File: ")
+        });
+        if let Some(p) = path_opt {
+            if has_header {
+                sections.push(diff_str.to_string());
+            } else if diff_str.is_empty() {
+                sections.push(format!("--- a/{p}\n+++ b/{p}"));
+            } else {
+                sections.push(format!("--- a/{p}\n+++ b/{p}\n{diff_str}"));
+            }
+        } else if !diff_str.is_empty() {
+            sections.push(diff_str.to_string());
+        }
+    }
+
+    let combined_diff = sections.join("\n");
+    ToolCallDetail::FileEdit {
+        path: first_path,
+        unified_diff: if combined_diff.is_empty() {
+            None
+        } else {
+            Some(crate::compact_unified_diff(
+                &combined_diff,
+                crate::MAX_UNIFIED_DIFF_BYTES,
+            ))
+        },
+    }
+}
+
+fn codex_file_change_single_concrete_path(detail: &ToolCallDetail) -> bool {
+    let ToolCallDetail::FileEdit { path, unified_diff } = detail else {
+        return false;
+    };
+    let trimmed = path.trim();
+    if trimmed.is_empty()
+        || matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "files" | "workspace files" | "multiple files" | "workspace"
+        )
+    {
+        return false;
+    }
+    let Some(diff) = unified_diff.as_deref() else {
+        return true;
+    };
+    if diff.contains("[diff truncated")
+        || diff.contains("...(truncated")
+        || diff.contains("... (truncated")
+    {
+        return false;
+    }
+    let mut distinct: Vec<String> = vec![path.clone()];
+    for line in diff.lines() {
+        let candidate = if let Some(rest) = line.strip_prefix("+++ ") {
+            let p = rest.split('\t').next().unwrap_or(rest);
+            Some(p.strip_prefix("b/").unwrap_or(p))
+        } else if let Some(rest) = line.strip_prefix("--- ") {
+            let p = rest.split('\t').next().unwrap_or(rest);
+            Some(p.strip_prefix("a/").unwrap_or(p))
+        } else if let Some(rest) = line.strip_prefix("rename to ") {
+            Some(rest)
+        } else {
+            line.strip_prefix("rename from ")
+        };
+        if let Some(p) = candidate
+            && !p.is_empty()
+            && p != "/dev/null"
+            && p != "dev/null"
+            && !distinct.iter().any(|existing| existing == p)
+        {
+            distinct.push(p.to_string());
+            if distinct.len() > 1 {
+                return false;
+            }
+        }
+    }
+    distinct.len() == 1
 }
 
 fn format_codex_cmd(v: &Value) -> String {
@@ -4371,5 +4458,42 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
         let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    fn codex_file_change_detail_preserves_all_multi_file_paths_and_gates_allow_always() {
+        // Multi-file change where raw per-file diffs omit `---`/`+++` headers
+        let multi = build_codex_file_change_detail(&[
+            json!({ "path": "src/main.rs", "diff": "@@ -1 +1 @@\n-old\n+new" }),
+            json!({ "path": ".env", "diff": "@@ -1 +1 @@\n-SECRET=1\n+SECRET=2" }),
+        ]);
+        match &multi {
+            ToolCallDetail::FileEdit { path, unified_diff } => {
+                assert_eq!(path, "src/main.rs");
+                let diff = unified_diff.as_deref().expect("diff present");
+                assert!(diff.contains("+++ b/src/main.rs"), "diff:\n{diff}");
+                assert!(diff.contains("+++ b/.env"), "diff:\n{diff}");
+            }
+            other => panic!("expected FileEdit, got {other:?}"),
+        }
+        assert!(
+            !codex_file_change_single_concrete_path(&multi),
+            "multi-file change must NOT advertise allow_always"
+        );
+
+        // Single concrete file change IS eligible for allow_always
+        let single = build_codex_file_change_detail(&[
+            json!({ "path": "src/main.rs", "diff": "@@ -1 +1 @@\n-old\n+new" }),
+        ]);
+        assert!(codex_file_change_single_concrete_path(&single));
+
+        // Placeholder fallback on cache miss or empty changes is NOT eligible
+        let placeholder = ToolCallDetail::FileEdit {
+            path: "workspace files".into(),
+            unified_diff: None,
+        };
+        assert!(!codex_file_change_single_concrete_path(&placeholder));
+        let empty = build_codex_file_change_detail(&[]);
+        assert!(!codex_file_change_single_concrete_path(&empty));
     }
 }

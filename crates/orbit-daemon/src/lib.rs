@@ -31,6 +31,7 @@ pub mod manager;
 pub mod mcp;
 pub mod mcp_servers;
 pub mod messaging;
+pub mod permission_rules;
 pub mod personal_router;
 pub mod plan_approval;
 pub mod platform;
@@ -5366,14 +5367,24 @@ async fn handle_wire_rpc(
             agent_id,
             permission_request_id,
             decision,
-        } => match runtime
-            .orchestrator
-            .resolve_permission(&agent_id, permission_request_id, decision)
-            .await
-        {
-            Ok(()) => Some(WireMessage::Ack { request_id }),
-            Err(e) => Some(rpc_err(request_id, "resolve_permission_failed", e)),
-        },
+            agent_originated,
+        } => {
+            let res = if agent_originated {
+                runtime
+                    .orchestrator
+                    .resolve_permission_by_agent(&agent_id, permission_request_id, decision)
+                    .await
+            } else {
+                runtime
+                    .orchestrator
+                    .resolve_permission(&agent_id, permission_request_id, decision)
+                    .await
+            };
+            match res {
+                Ok(()) => Some(WireMessage::Ack { request_id }),
+                Err(e) => Some(rpc_err(request_id, "resolve_permission_failed", e)),
+            }
+        }
         WireMessage::ResolvePlanApproval {
             request_id,
             agent_id,
@@ -6506,6 +6517,55 @@ async fn handle_wire_rpc(
                 Err(e) => Some(rpc_err(request_id, "update_guardian_config_failed", e)),
             }
         }
+
+        // Fine-Grained Persistent Permission Rules Engine & Safe Batch Approval
+        WireMessage::ListPermissionRules {
+            request_id,
+            project_cwd,
+        } => match runtime
+            .orchestrator
+            .list_permission_rules(project_cwd.as_deref())
+        {
+            Ok(rules) => Some(WireMessage::PermissionRulesSnapshot { request_id, rules }),
+            Err(e) => Some(rpc_err(request_id, "list_permission_rules_failed", e)),
+        },
+        WireMessage::UpsertPermissionRule { request_id, rule } => {
+            match runtime.orchestrator.upsert_permission_rule(rule) {
+                Ok(saved) => Some(WireMessage::PermissionRuleUpdated {
+                    request_id,
+                    rule: saved,
+                }),
+                Err(e) => Some(rpc_err(request_id, "upsert_permission_rule_failed", e)),
+            }
+        }
+        WireMessage::DeletePermissionRule {
+            request_id,
+            rule_id,
+        } => match runtime.orchestrator.delete_permission_rule(&rule_id) {
+            Ok(deleted) => Some(WireMessage::PermissionRuleDeleted {
+                request_id,
+                rule_id,
+                deleted,
+            }),
+            Err(e) => Some(rpc_err(request_id, "delete_permission_rule_failed", e)),
+        },
+        WireMessage::ResolvePermissionsBatch {
+            request_id,
+            items,
+            decision,
+        } => match runtime
+            .orchestrator
+            .resolve_permissions_batch(items, decision)
+            .await
+        {
+            Ok(result) => Some(WireMessage::PermissionsBatchResolved {
+                request_id,
+                resolved_count: result.resolved_count,
+                skipped_count: result.skipped_count,
+                skipped_reasons: result.skipped_reasons,
+            }),
+            Err(e) => Some(rpc_err(request_id, "resolve_permissions_batch_failed", e)),
+        },
 
         // Unattended Autonomous Goal Mode & Streaming Monitor Engine
         WireMessage::StartGoalRun {

@@ -226,6 +226,28 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
           return [];
         case "resolve_plan_approval":
           return null;
+        case "list_permission_rules":
+          return [];
+        case "upsert_permission_rule":
+          return {
+            id: args.rule?.id ?? "pr_smoke_1",
+            scope_kind: args.rule?.scope_kind ?? "project",
+            project_cwd: args.rule?.project_cwd ?? "/tmp/smoke",
+            provider: args.rule?.provider ?? null,
+            tool_kind: args.rule?.tool_kind ?? "shell",
+            pattern_kind: args.rule?.pattern_kind ?? "command_prefix",
+            pattern: args.rule?.pattern ?? "cargo test",
+            decision: args.rule?.decision ?? "allow",
+            source: args.rule?.source ?? "manual",
+            note: args.rule?.note ?? null,
+            created_at: "2026-11-24T00:00:00Z",
+            last_matched_at: null,
+            match_count: 0,
+          };
+        case "delete_permission_rule":
+          return true;
+        case "resolve_permissions_batch":
+          return { resolved_count: 0, skipped_count: 0, skipped_reasons: [] };
         case "load_older_agent_timeline":
           return true;
         case "get_local_machine_info":

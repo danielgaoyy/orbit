@@ -3805,9 +3805,16 @@ impl AgentOrchestrator {
         decision: String,
         allow_human_only_resolution: bool,
     ) -> anyhow::Result<()> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum CanonicalDecision {
+            Allow,
+            AllowAlways,
+            Deny,
+        }
+
         let key = (agent_id.to_string(), request_id.clone());
-        let pending_entry = {
-            let mut guard = self.pending_permissions.write().await;
+        let peeked = {
+            let guard = self.pending_permissions.read().await;
             {
                 let eval_guard = self
                     .evaluating_permissions
@@ -3825,61 +3832,160 @@ impl AgentOrchestrator {
                     anyhow::bail!("no pending permission `{request_id}` for agent `{agent_id}`");
                 }
             }
-            if let Some(existing) = guard.get(&key) {
-                if existing.plan_approval.is_some() {
-                    if !allow_human_only_resolution {
-                        anyhow::bail!(
-                            "plan approval gate `{request_id}` requires explicit human review and cannot be resolved by an agent"
-                        );
-                    }
-                    drop(guard);
-                    let (action, target_mode) = match decision.as_str() {
-                        "allow" | "allow_always" => (
-                            orbit_protocol::PlanApprovalAction::ApproveAndBuild,
-                            Some(SessionMode::Default),
-                        ),
-                        _ => (orbit_protocol::PlanApprovalAction::Dismiss, None),
-                    };
-                    return self
-                        .resolve_plan_approval(
-                            agent_id,
-                            request_id,
-                            action,
-                            None,
-                            None,
-                            target_mode,
-                        )
-                        .await;
-                }
-                if !allow_human_only_resolution
-                    && (existing.human_only
-                        || existing
-                            .guardian_assessment
-                            .as_ref()
-                            .is_some_and(crate::guardian::assessment_requires_human_only))
-                {
-                    anyhow::bail!(
-                        "permission `{request_id}` is marked human-only and cannot be resolved by an agent"
-                    );
-                }
+            if let Some(existing) = guard.get(&key)
+                && !allow_human_only_resolution
+                && (existing.human_only
+                    || existing
+                        .guardian_assessment
+                        .as_ref()
+                        .is_some_and(crate::guardian::assessment_requires_human_only))
+            {
+                anyhow::bail!(
+                    "permission `{request_id}` is marked human-only and cannot be resolved by an agent"
+                );
             }
-            guard.remove(&key)
+            guard.get(&key).cloned()
         };
 
-        if let Some(tx) = self.live_agent_tx(agent_id).await {
-            if tx
-                .send(DriverCommand::ResolvePermission {
-                    request_id: request_id.clone(),
-                    decision: decision.clone(),
-                })
-                .await
-                .is_err()
-            {
-                if let Some(p) = pending_entry {
-                    self.pending_permissions.write().await.insert(key, p);
+        let allowed_decisions: &[String] = peeked
+            .as_ref()
+            .map(|p| p.allowed_decisions.as_slice())
+            .unwrap_or(&[]);
+
+        // Validate & canonicalize the decision ONCE before any persistence or provider dispatch.
+        let trimmed = decision.trim();
+        let canonical = match trimmed.to_ascii_lowercase().as_str() {
+            "allow" | "allow_once" | "accept" => {
+                if !allowed_decisions.is_empty()
+                    && !crate::permission_rules::permits_allow_decision(allowed_decisions)
+                {
+                    anyhow::bail!(
+                        "permission request `{request_id}` does not permit single-shot `allow`"
+                    );
                 }
-                anyhow::bail!("agent session not active");
+                CanonicalDecision::Allow
             }
+            "allow_always" => {
+                if !allowed_decisions.is_empty()
+                    && !crate::permission_rules::permits_allow_always_decision(allowed_decisions)
+                {
+                    anyhow::bail!(
+                        "permission request `{request_id}` does not permit `allow_always`"
+                    );
+                }
+                CanonicalDecision::AllowAlways
+            }
+            "deny" | "reject" | "reject_once" | "decline" => CanonicalDecision::Deny,
+            _ => anyhow::bail!(
+                "invalid permission decision `{decision}` (expected `allow`, `allow_always`, or `deny`)"
+            ),
+        };
+
+        // Security invariant: agents/routers NEVER mint persistent `allow_always` grants.
+        if !allow_human_only_resolution && canonical == CanonicalDecision::AllowAlways {
+            anyhow::bail!(
+                "persistent `allow_always` grants require explicit human approval and cannot be issued by an agent"
+            );
+        }
+
+        // Security invariant: handle human-only plan approval gates via dedicated workflow.
+        if let Some(ref existing) = peeked
+            && existing.plan_approval.is_some()
+        {
+            if !allow_human_only_resolution {
+                anyhow::bail!(
+                    "plan approval gate `{request_id}` requires explicit human review and cannot be resolved by an agent"
+                );
+            }
+            if canonical == CanonicalDecision::AllowAlways {
+                anyhow::bail!("plan approval gate `{request_id}` does not support `allow_always`");
+            }
+            let (action, target_mode) = match canonical {
+                CanonicalDecision::Allow => (
+                    orbit_protocol::PlanApprovalAction::ApproveAndBuild,
+                    Some(SessionMode::Default),
+                ),
+                CanonicalDecision::Deny => (orbit_protocol::PlanApprovalAction::Dismiss, None),
+                CanonicalDecision::AllowAlways => unreachable!(),
+            };
+            return self
+                .resolve_plan_approval(agent_id, request_id, action, None, None, target_mode)
+                .await;
+        }
+
+        // Handle `allow_always` with Orbit SQLite as the single authoritative persistence layer:
+        // derive & persist the Orbit rule FIRST, then dispatch a one-shot `allow` to the provider
+        // whenever `allow` is supported so revoking a rule or adding a `Deny` rule takes effect
+        // immediately across all providers (Claude, Codex, Antigravity, ACP).
+        let (wire_decision, timeline_decision) = if canonical == CanonicalDecision::AllowAlways {
+            let Some(ref pending) = peeked else {
+                anyhow::bail!(
+                    "no pending permission `{request_id}` for agent `{agent_id}` to save as Always-Allow"
+                );
+            };
+            let provider_supports_one_shot_allow =
+                crate::permission_rules::permits_allow_decision(&pending.allowed_decisions);
+            let Some(tx) = self.live_agent_tx(agent_id).await else {
+                anyhow::bail!("agent session not active");
+            };
+            let permit = tx
+                .reserve()
+                .await
+                .map_err(|_| anyhow::anyhow!("agent session not active"))?;
+
+            let ag = self
+                .store
+                .get_agent(agent_id)
+                .map_err(|e| anyhow::anyhow!("failed to look up agent scope: {e}"))?
+                .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"))?;
+
+            let derived_rule = crate::permission_rules::derive_rule_from_always_allow(
+                &ag.cwd,
+                ag.provider,
+                &pending.title,
+                &pending.detail,
+                false,
+            );
+
+            if provider_supports_one_shot_allow && derived_rule.is_none() {
+                anyhow::bail!(
+                    "cannot create a safe persistent Always-Allow rule for this request (compound/expanding command, multi-file/placeholder path, or display-title confirmation); choose one-time Allow instead"
+                );
+            }
+
+            // Atomically claim the exact pending entry FIRST so a concurrent caller that already
+            // denied/resolved this request never causes a stale Always-Allow rule to be persisted.
+            let claimed_pending = {
+                let mut guard = self.pending_permissions.write().await;
+                let still_matches = guard.get(&key).is_some_and(|cur| {
+                    cur.created_at == pending.created_at && cur.plan_approval.is_none()
+                });
+                if !still_matches {
+                    anyhow::bail!("permission request `{request_id}` was already resolved");
+                }
+                guard.remove(&key)
+            };
+
+            // Persist the Orbit SQLite rule BEFORE dispatching to the driver; on persistence
+            // failure restore the claimed pending entry so the human can retry cleanly.
+            if let Some(ref rule_input) = derived_rule
+                && let Err(e) = self.store.upsert_permission_rule(rule_input)
+            {
+                if let Some(restored) = claimed_pending {
+                    self.pending_permissions.write().await.insert(key, restored);
+                }
+                anyhow::bail!("failed to persist Always-Allow rule: {e}");
+            }
+
+            let dispatch_dec = if provider_supports_one_shot_allow {
+                crate::guardian::pick_auto_allow_decision(&pending.allowed_decisions)
+            } else {
+                "allow_always".to_string()
+            };
+            permit.send(DriverCommand::ResolvePermission {
+                request_id: request_id.clone(),
+                decision: dispatch_dec,
+            });
 
             if let Ok(ev) = self.store.append_timeline_event(
                 agent_id,
@@ -3887,7 +3993,7 @@ impl AgentOrchestrator {
                 None,
                 TimelinePayload::PermissionResolved {
                     request_id,
-                    decision,
+                    decision: "allow_always".into(),
                 },
             ) {
                 let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
@@ -3897,8 +4003,461 @@ impl AgentOrchestrator {
                     .store
                     .set_agent_attention(agent_id, AttentionState::None);
             }
+            return Ok(());
+        } else {
+            let wire_dec = match canonical {
+                CanonicalDecision::Allow => {
+                    if allowed_decisions.is_empty() {
+                        "allow".to_string()
+                    } else {
+                        crate::guardian::pick_auto_allow_decision(allowed_decisions)
+                    }
+                }
+                CanonicalDecision::Deny => {
+                    if allowed_decisions.is_empty() {
+                        "deny".to_string()
+                    } else {
+                        crate::guardian::pick_auto_deny_decision(allowed_decisions)
+                    }
+                }
+                CanonicalDecision::AllowAlways => unreachable!(),
+            };
+            let timeline_dec = match canonical {
+                CanonicalDecision::Allow => "allow".to_string(),
+                CanonicalDecision::Deny => "deny".to_string(),
+                CanonicalDecision::AllowAlways => unreachable!(),
+            };
+            (wire_dec, timeline_dec)
+        };
+
+        if let Some(tx) = self.live_agent_tx(agent_id).await {
+            let permit = tx
+                .reserve()
+                .await
+                .map_err(|_| anyhow::anyhow!("agent session not active"))?;
+            {
+                let mut guard = self.pending_permissions.write().await;
+                {
+                    let eval_guard = self
+                        .evaluating_permissions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if eval_guard.contains(&key) {
+                        anyhow::bail!(
+                            "permission `{request_id}` is currently being evaluated by PreToolUse / Guardian and cannot be resolved yet"
+                        );
+                    }
+                }
+                if let Some(ref expected) = peeked {
+                    match guard.get(&key) {
+                        Some(existing) if existing.plan_approval.is_some() => {
+                            anyhow::bail!(
+                                "plan approval gate `{request_id}` requires explicit human review"
+                            );
+                        }
+                        Some(existing)
+                            if !allow_human_only_resolution
+                                && (existing.human_only
+                                    || existing
+                                        .guardian_assessment
+                                        .as_ref()
+                                        .is_some_and(
+                                            crate::guardian::assessment_requires_human_only,
+                                        )) =>
+                        {
+                            anyhow::bail!(
+                                "permission `{request_id}` is marked human-only and cannot be resolved by an agent"
+                            );
+                        }
+                        Some(existing) if existing.created_at == expected.created_at => {
+                            guard.remove(&key);
+                        }
+                        _ => {
+                            anyhow::bail!("permission request `{request_id}` was already resolved");
+                        }
+                    }
+                } else {
+                    if let Some(existing) = guard.get(&key) {
+                        if existing.plan_approval.is_some() {
+                            anyhow::bail!(
+                                "plan approval gate `{request_id}` requires explicit human review"
+                            );
+                        }
+                        if !allow_human_only_resolution
+                            && (existing.human_only
+                                || existing
+                                    .guardian_assessment
+                                    .as_ref()
+                                    .is_some_and(crate::guardian::assessment_requires_human_only))
+                        {
+                            anyhow::bail!(
+                                "permission `{request_id}` is marked human-only and cannot be resolved by an agent"
+                            );
+                        }
+                    }
+                    guard.remove(&key);
+                }
+            }
+            permit.send(DriverCommand::ResolvePermission {
+                request_id: request_id.clone(),
+                decision: wire_decision,
+            });
+
+            if let Ok(ev) = self.store.append_timeline_event(
+                agent_id,
+                1,
+                None,
+                TimelinePayload::PermissionResolved {
+                    request_id,
+                    decision: timeline_decision,
+                },
+            ) {
+                let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+            }
+            if !self.has_pending_permissions(agent_id).await {
+                let _ = self
+                    .store
+                    .set_agent_attention(agent_id, AttentionState::None);
+            }
+        } else {
+            self.pending_permissions.write().await.remove(&key);
         }
         Ok(())
+    }
+
+    pub fn list_permission_rules(
+        &self,
+        project_cwd: Option<&str>,
+    ) -> anyhow::Result<Vec<orbit_protocol::PermissionRuleRecord>> {
+        self.store
+            .list_permission_rules(project_cwd)
+            .map_err(|e| anyhow::anyhow!("list permission rules failed: {e}"))
+    }
+
+    pub fn upsert_permission_rule(
+        &self,
+        input: orbit_protocol::UpsertPermissionRuleInput,
+    ) -> anyhow::Result<orbit_protocol::PermissionRuleRecord> {
+        crate::permission_rules::validate_permission_rule_input(&input)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.store
+            .upsert_permission_rule(&input)
+            .map_err(|e| anyhow::anyhow!("upsert permission rule failed: {e}"))
+    }
+
+    pub fn delete_permission_rule(&self, rule_id: &str) -> anyhow::Result<bool> {
+        self.store
+            .delete_permission_rule(rule_id)
+            .map_err(|e| anyhow::anyhow!("delete permission rule failed: {e}"))
+    }
+
+    /// Server-verified safe batch permission resolution (`ResolvePermissionsBatch`).
+    ///
+    /// Security invariants (enforced independently on the daemon regardless of client filtering):
+    /// - Strictly rejects `"allow_always"` or unknown batch decisions (only `"allow"` or `"deny"`).
+    /// - Strictly skips any item with `plan_approval.is_some()`.
+    /// - For `"allow"`: requires Guardian to be enabled on this host, requires agent scope and
+    ///   permission-rule store lookups to succeed (fail-closed), strictly skips items matching a
+    ///   `Deny` rule, strictly skips items that do not permit `"allow"` in `allowed_decisions`,
+    ///   strictly skips `High`/`Critical`/`fail_closed`/`guardian_disabled` assessments, and
+    ///   evaluates uncached items under the **current host Guardian policy** (including host
+    ///   `blocked_command_patterns`).
+    /// - Atomically reserves the session channel permit and claims the exact pending entry under
+    ///   lock before dispatching so concurrent callers can never double-dispatch or drop items.
+    pub async fn resolve_permissions_batch(
+        self: &Arc<Self>,
+        items: Vec<(String, String)>,
+        decision: String,
+    ) -> anyhow::Result<orbit_protocol::ResolvePermissionsBatchResult> {
+        let normalized_decision = decision.trim().to_ascii_lowercase();
+        let is_allow_batch = match normalized_decision.as_str() {
+            "allow" | "allow_once" | "accept" => true,
+            "deny" | "reject" | "reject_once" | "decline" => false,
+            _ => anyhow::bail!(
+                "unsupported batch permission decision `{decision}` (only `allow` or `deny` permitted)"
+            ),
+        };
+
+        let host_guardian_cfg = self.guardian.get_config().await;
+        let mut seen = std::collections::HashSet::new();
+        let mut resolved_count = 0usize;
+        let mut skipped_reasons = Vec::new();
+
+        for (agent_id, perm_id) in items {
+            let key = (agent_id.clone(), perm_id.clone());
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+
+            let (pending, initial_live_gen) = {
+                let guard = self.pending_permissions.read().await;
+                let live_guard = self.live_agents.read().await;
+                (
+                    guard.get(&key).cloned(),
+                    live_guard.get(&agent_id).map(|e| e.generation),
+                )
+            };
+            let Some(pending) = pending else {
+                skipped_reasons.push(orbit_protocol::BatchPermissionSkipReason {
+                    agent_id,
+                    permission_request_id: perm_id,
+                    reason: "not_pending".into(),
+                });
+                continue;
+            };
+
+            // Security invariant 1: plan approval gates NEVER batch-resolve.
+            if pending.plan_approval.is_some() {
+                skipped_reasons.push(orbit_protocol::BatchPermissionSkipReason {
+                    agent_id,
+                    permission_request_id: perm_id,
+                    reason: "plan_approval_requires_individual_review".into(),
+                });
+                continue;
+            }
+
+            let (resolved_wire_decision, timeline_decision) = if is_allow_batch {
+                // Security invariant 1b: human-only verdicts (PreToolUse fail-closed, LLM fail-closed)
+                // NEVER batch-approve.
+                if pending.human_only {
+                    skipped_reasons.push(orbit_protocol::BatchPermissionSkipReason {
+                        agent_id,
+                        permission_request_id: perm_id,
+                        reason: "human_only_requires_individual_review".into(),
+                    });
+                    continue;
+                }
+
+                // Security invariant 2: `allowed_decisions` must explicitly permit `"allow"`.
+                if !crate::permission_rules::permits_allow_decision(&pending.allowed_decisions) {
+                    skipped_reasons.push(orbit_protocol::BatchPermissionSkipReason {
+                        agent_id,
+                        permission_request_id: perm_id,
+                        reason: "allow_decision_not_permitted".into(),
+                    });
+                    continue;
+                }
+
+                // Security invariant 3: Guardian MUST be enabled on this host to certify safe batch.
+                if !host_guardian_cfg.enabled {
+                    skipped_reasons.push(orbit_protocol::BatchPermissionSkipReason {
+                        agent_id,
+                        permission_request_id: perm_id,
+                        reason: "guardian_disabled".into(),
+                    });
+                    continue;
+                }
+
+                // Security invariant 4: fail-closed on agent-scope or permission-rules store failure.
+                let ag = match self.store.get_agent(&agent_id) {
+                    Ok(Some(ag)) => ag,
+                    Ok(None) | Err(_) => {
+                        skipped_reasons.push(orbit_protocol::BatchPermissionSkipReason {
+                            agent_id,
+                            permission_request_id: perm_id,
+                            reason: "agent_scope_unavailable".into(),
+                        });
+                        continue;
+                    }
+                };
+
+                let rules = match self.store.list_permission_rules(Some(&ag.cwd)) {
+                    Ok(rules) => rules,
+                    Err(_) => {
+                        skipped_reasons.push(orbit_protocol::BatchPermissionSkipReason {
+                            agent_id,
+                            permission_request_id: perm_id,
+                            reason: "permission_rules_store_unavailable".into(),
+                        });
+                        continue;
+                    }
+                };
+
+                // Respect any active Deny permission rule even if added after the prompt arrived.
+                if let Some(matched) = crate::permission_rules::evaluate_permission_rules(
+                    &rules,
+                    &crate::permission_rules::PermissionRuleEvalContext {
+                        project_cwd: &ag.cwd,
+                        provider: ag.provider,
+                        title: &pending.title,
+                        detail: &pending.detail,
+                        has_plan_approval: false,
+                    },
+                ) && matches!(
+                    matched.rule.decision,
+                    orbit_protocol::PermissionRuleDecision::Deny
+                ) {
+                    skipped_reasons.push(orbit_protocol::BatchPermissionSkipReason {
+                        agent_id,
+                        permission_request_id: perm_id,
+                        reason: "denied_by_permission_rule".into(),
+                    });
+                    continue;
+                }
+
+                // Security invariant 5: validate cached assessment (rejecting disabled/fail-closed/
+                // High/Critical/AutoDeny) AND evaluate uncached or policy-constrained items against
+                // the CURRENT host Guardian policy (preserving `blocked_command_patterns`).
+                let is_unassessed_or_disabled = |a: &orbit_protocol::GuardianAssessment| -> bool {
+                    a.classifier_tier == "fail_closed"
+                        || a.signals
+                            .iter()
+                            .any(|s| s == "guardian_disabled" || s == "fail_closed")
+                };
+
+                if let Some(ref cached) = pending.guardian_assessment {
+                    if is_unassessed_or_disabled(cached) {
+                        skipped_reasons.push(orbit_protocol::BatchPermissionSkipReason {
+                            agent_id,
+                            permission_request_id: perm_id,
+                            reason: "guardian_disabled".into(),
+                        });
+                        continue;
+                    }
+                    if cached.risk_level >= orbit_protocol::GuardianRiskLevel::High
+                        || cached.decision == orbit_protocol::GuardianDecision::AutoDeny
+                    {
+                        skipped_reasons.push(orbit_protocol::BatchPermissionSkipReason {
+                            agent_id,
+                            permission_request_id: perm_id,
+                            reason: "high_or_critical_risk".into(),
+                        });
+                        continue;
+                    }
+                }
+
+                if pending.guardian_assessment.is_none()
+                    || !host_guardian_cfg.blocked_command_patterns.is_empty()
+                {
+                    let eval_req = crate::guardian::GuardianEvalRequest {
+                        agent_id: &agent_id,
+                        request_id: &perm_id,
+                        title: &pending.title,
+                        detail: &pending.detail,
+                        workspace_cwd: &ag.cwd,
+                        agent_provider: Some(ag.provider),
+                    };
+                    let assessment = self
+                        .guardian
+                        .assess_with_config(&eval_req, &host_guardian_cfg)
+                        .await;
+                    if is_unassessed_or_disabled(&assessment) {
+                        skipped_reasons.push(orbit_protocol::BatchPermissionSkipReason {
+                            agent_id,
+                            permission_request_id: perm_id,
+                            reason: "guardian_disabled".into(),
+                        });
+                        continue;
+                    }
+                    if assessment.risk_level >= orbit_protocol::GuardianRiskLevel::High
+                        || assessment.decision == orbit_protocol::GuardianDecision::AutoDeny
+                    {
+                        skipped_reasons.push(orbit_protocol::BatchPermissionSkipReason {
+                            agent_id,
+                            permission_request_id: perm_id,
+                            reason: "high_or_critical_risk".into(),
+                        });
+                        continue;
+                    }
+                }
+
+                (
+                    crate::guardian::pick_auto_allow_decision(&pending.allowed_decisions),
+                    "allow".to_string(),
+                )
+            } else {
+                (
+                    crate::guardian::pick_auto_deny_decision(&pending.allowed_decisions),
+                    "deny".to_string(),
+                )
+            };
+
+            // Security invariant 6 (Atomic claim & session-bound dispatch):
+            // Bind to the live session generation observed when reading `pending`, reserve a send
+            // permit first, then atomically verify generation + exact pending entry under lock
+            // before sending synchronously on the permit.
+            let Some((expected_gen, tx)) = ({
+                let live_guard = self.live_agents.read().await;
+                live_guard.get(&agent_id).and_then(|e| {
+                    (initial_live_gen == Some(e.generation))
+                        .then(|| (e.generation, e.cmd_tx.clone()))
+                })
+            }) else {
+                skipped_reasons.push(orbit_protocol::BatchPermissionSkipReason {
+                    agent_id,
+                    permission_request_id: perm_id,
+                    reason: "agent_session_not_active".into(),
+                });
+                continue;
+            };
+            let Ok(permit) = tx.reserve().await else {
+                skipped_reasons.push(orbit_protocol::BatchPermissionSkipReason {
+                    agent_id,
+                    permission_request_id: perm_id,
+                    reason: "agent_session_not_active".into(),
+                });
+                continue;
+            };
+
+            let claimed = {
+                let mut guard = self.pending_permissions.write().await;
+                let live_guard = self.live_agents.read().await;
+                let session_still_bound = live_guard
+                    .get(&agent_id)
+                    .is_some_and(|e| e.generation == expected_gen);
+                let matches_snapshot = session_still_bound
+                    && guard.get(&key).is_some_and(|cur| {
+                        cur.created_at == pending.created_at
+                            && cur.plan_approval.is_none()
+                            && cur.allowed_decisions == pending.allowed_decisions
+                    });
+                if matches_snapshot {
+                    guard.remove(&key).is_some()
+                } else {
+                    false
+                }
+            };
+
+            if !claimed {
+                // Drop `permit` without sending — another caller already resolved or replaced it.
+                drop(permit);
+                skipped_reasons.push(orbit_protocol::BatchPermissionSkipReason {
+                    agent_id,
+                    permission_request_id: perm_id,
+                    reason: "already_resolved".into(),
+                });
+                continue;
+            }
+
+            permit.send(DriverCommand::ResolvePermission {
+                request_id: perm_id.clone(),
+                decision: resolved_wire_decision,
+            });
+            if let Ok(ev) = self.store.append_timeline_event(
+                &agent_id,
+                1,
+                None,
+                TimelinePayload::PermissionResolved {
+                    request_id: perm_id,
+                    decision: timeline_decision,
+                },
+            ) {
+                let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+            }
+            if !self.has_pending_permissions(&agent_id).await {
+                let _ = self
+                    .store
+                    .set_agent_attention(&agent_id, AttentionState::None);
+            }
+            resolved_count += 1;
+        }
+
+        let skipped_count = skipped_reasons.len();
+        Ok(orbit_protocol::ResolvePermissionsBatchResult {
+            resolved_count,
+            skipped_count,
+            skipped_reasons,
+        })
     }
 
     pub async fn resolve_plan_approval(
@@ -6319,8 +6878,8 @@ impl AgentOrchestrator {
                 mut plan_approval,
             } => {
                 // Mark this `(agent_id, request_id)` as actively evaluating BEFORE dispatching
-                // PreToolUse or Guardian so no premature external `resolve_permission` call can
-                // race ahead of hook / Guardian evaluation and forward an `allow` to the driver.
+                // PreToolUse, permission rules, or Guardian so no premature external
+                // `resolve_permission` call can race ahead and forward an `allow` to the driver.
                 let eval_key = (agent_id.to_string(), request_id.clone());
                 {
                     self.evaluating_permissions
@@ -6333,7 +6892,18 @@ impl AgentOrchestrator {
                     key: Some(eval_key),
                 };
 
-                let agent_opt = self.store.get_agent(agent_id).ok().flatten();
+                let agent_lookup = self.store.get_agent(agent_id);
+                let agent_opt = match agent_lookup {
+                    Ok(ag) => ag,
+                    Err(err) => {
+                        tracing::warn!(
+                            agent_id = %agent_id,
+                            error = %err,
+                            "Failed to read agent scope during permission ingress; failing closed"
+                        );
+                        None
+                    }
+                };
                 let mut guardian_assessment = None;
 
                 if plan_approval.is_none() {
@@ -6355,8 +6925,8 @@ impl AgentOrchestrator {
                     );
                 }
 
-                // Synchronous PreToolUse lifecycle hook gate BEFORE Guardian auto-approval or
-                // surfacing the permission request to the operator.
+                // Synchronous PreToolUse lifecycle hook gate BEFORE permission rules, Guardian
+                // auto-approval, or surfacing the permission request to the operator.
                 // CRITICAL SAFETY INVARIANT: a PreToolUse hook returning `Allow` NEVER auto-approves
                 // a tool call, NEVER bypasses a human-only `plan_approval.is_some()` gate, and NEVER
                 // overrides an explicit user `Deny`. A `Block` decision or unsupported `updated_input`
@@ -6490,8 +7060,170 @@ impl AgentOrchestrator {
                     }
                 }
 
-                // Plan approval gates always require explicit human review and never auto-resolve via Guardian.
+                // Evaluate persisted fine-grained permission rules BEFORE Guardian / human prompting
+                // (strictly excluding PreToolUse-blocked and human-only `plan_approval.is_some()` gates).
+                // Fail-closed invariant: if the rules store cannot be read, do NOT fall through
+                // to Guardian auto-approval (a Deny rule may exist in SQLite).
+                let mut rules_store_unavailable = false;
                 if !pre_hook_blocked
+                    && plan_approval.is_none()
+                    && let Some(ref ag) = agent_opt
+                {
+                    match self.store.list_permission_rules(Some(&ag.cwd)) {
+                        Err(err) => {
+                            tracing::warn!(
+                                agent_id = %agent_id,
+                                error = %err,
+                                "Permission rules store unavailable on ingress; failing closed to human review"
+                            );
+                            rules_store_unavailable = true;
+                        }
+                        Ok(rules) => {
+                            if let Some(matched) =
+                                crate::permission_rules::evaluate_permission_rules(
+                                    &rules,
+                                    &crate::permission_rules::PermissionRuleEvalContext {
+                                        project_cwd: &ag.cwd,
+                                        provider: ag.provider,
+                                        title: &title,
+                                        detail: &detail,
+                                        has_plan_approval: false,
+                                    },
+                                )
+                            {
+                                let is_allow = matches!(
+                                    matched.rule.decision,
+                                    orbit_protocol::PermissionRuleDecision::Allow
+                                );
+                                let can_dispatch_match = !is_allow
+                                    || allowed_decisions.is_empty()
+                                    || crate::permission_rules::permits_allow_decision(
+                                        &allowed_decisions,
+                                    );
+                                let wire_decision = if is_allow {
+                                    crate::guardian::pick_auto_allow_decision(&allowed_decisions)
+                                } else {
+                                    crate::guardian::pick_auto_deny_decision(&allowed_decisions)
+                                };
+                                let resolved_key = (agent_id.to_string(), request_id.clone());
+                                if can_dispatch_match {
+                                    let mut set =
+                                        self.guardian_auto_resolved_requests.write().await;
+                                    if set.len() > 512 {
+                                        set.clear();
+                                    }
+                                    set.insert(resolved_key.clone());
+                                }
+                                if can_dispatch_match
+                                    && let Some(tx) = self.live_agent_tx(agent_id).await
+                                    && tx
+                                        .send(DriverCommand::ResolvePermission {
+                                            request_id: request_id.clone(),
+                                            decision: wire_decision,
+                                        })
+                                        .await
+                                        .is_ok()
+                                {
+                                    let matched_at = Utc::now();
+                                    let _ = self
+                                        .store
+                                        .record_permission_rule_match(&matched.rule.id, matched_at);
+                                    if !self.has_pending_permissions(agent_id).await {
+                                        let _ = self
+                                            .store
+                                            .set_agent_attention(agent_id, AttentionState::None);
+                                    }
+                                    let (tool_name, target_summary) =
+                                        crate::guardian::summarize_tool_request(&detail, &title);
+                                    let decided_at_ms =
+                                        u64::try_from(matched_at.timestamp_millis()).unwrap_or(0);
+                                    self.guardian
+                                        .record_audit_entry(orbit_protocol::GuardianAuditEntry {
+                                            id: format!(
+                                                "pr_{}",
+                                                &Uuid::new_v4().simple().to_string()[..12]
+                                            ),
+                                            agent_id: agent_id.to_string(),
+                                            request_id: request_id.clone(),
+                                            tool_name,
+                                            target_summary: target_summary.clone(),
+                                            assessment: orbit_protocol::GuardianAssessment {
+                                                risk_level: if is_allow {
+                                                    orbit_protocol::GuardianRiskLevel::Low
+                                                } else {
+                                                    orbit_protocol::GuardianRiskLevel::High
+                                                },
+                                                decision: if is_allow {
+                                                    orbit_protocol::GuardianDecision::AutoAllow
+                                                } else {
+                                                    orbit_protocol::GuardianDecision::AutoDeny
+                                                },
+                                                confidence: 1.0,
+                                                classifier_tier: "deterministic".into(),
+                                                reason: matched.reason.clone(),
+                                                signals: vec![
+                                                    "permission_rule".into(),
+                                                    matched.rule.scope_kind.as_str().into(),
+                                                    matched.rule.source.as_str().into(),
+                                                ],
+                                                latency_ms: 0,
+                                            },
+                                            decided_at_ms,
+                                        })
+                                        .await;
+                                    let notice = TimelinePayload::Notice {
+                                        level: if is_allow {
+                                            "info".into()
+                                        } else {
+                                            "warning".into()
+                                        },
+                                        message: if is_allow {
+                                            format!(
+                                                "Permission rule auto-approved (`{}`): {target_summary}",
+                                                matched.rule.pattern
+                                            )
+                                        } else {
+                                            format!(
+                                                "Permission rule denied (`{}`): {target_summary}",
+                                                matched.rule.pattern
+                                            )
+                                        },
+                                    };
+                                    if let Ok((saved_ev, mutated)) = self
+                                        .store
+                                        .append_timeline_event_deduped(agent_id, 1, None, notice)
+                                        && mutated
+                                    {
+                                        let _ = self
+                                            .broadcast_tx
+                                            .send(DaemonBroadcast::TimelineLive(saved_ev));
+                                    }
+                                    return;
+                                }
+                                self.guardian_auto_resolved_requests
+                                    .write()
+                                    .await
+                                    .remove(&resolved_key);
+                            }
+                        }
+                    }
+                }
+
+                // Plan approval gates always require explicit human review and never auto-resolve via Guardian.
+                // Fail-closed: if the permission rules store was unreadable, attach a fail-closed
+                // assessment and skip Guardian auto-approval regardless of session mode.
+                if !pre_hook_blocked && plan_approval.is_none() && rules_store_unavailable {
+                    guardian_assessment = Some(orbit_protocol::GuardianAssessment {
+                        risk_level: orbit_protocol::GuardianRiskLevel::High,
+                        decision: orbit_protocol::GuardianDecision::RequireHuman,
+                        confidence: 0.0,
+                        classifier_tier: "fail_closed".into(),
+                        reason: "Permission rules store unavailable; requires human approval"
+                            .into(),
+                        signals: vec!["permission_rules_store_error".into(), "fail_closed".into()],
+                        latency_ms: 0,
+                    });
+                } else if !pre_hook_blocked
                     && plan_approval.is_none()
                     && let Some(ref ag) = agent_opt
                     && matches!(ag.mode, SessionMode::Auto)
@@ -11556,6 +12288,1032 @@ diff --git a/config/prod.env b/config/prod.env\n\
             }
             other => panic!("expected human allow delivered to driver, got {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[tokio::test]
+    async fn permission_rules_capture_allow_always_across_providers_and_block_compound_bypass() {
+        let home_dir =
+            std::env::temp_dir().join(format!("orbit-perm-rules-orch-{}", Uuid::new_v4().simple()));
+        let ws_dir = home_dir.join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("create repo dir");
+
+        let store = Arc::new(OrbitStore::open_in_memory().expect("open db"));
+        let orch = AgentOrchestrator::new(
+            home_dir.clone(),
+            "host_pr".into(),
+            "tok".into(),
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(OrchestrationConfig::default())),
+            Arc::clone(&store),
+            WorkspaceScriptRegistry::new(),
+            Arc::new(KeepAwakeManager::new(false)),
+            Arc::new(RwLock::new(None)),
+            crate::hooks::HooksEngine::new(home_dir.clone()),
+        )
+        .await;
+
+        let now = Utc::now();
+        let ws_cwd = ws_dir.to_string_lossy().to_string();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_pr".into(),
+                title: "Rules Repo".into(),
+                cwd: ws_cwd.clone(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+
+        for (agent_id, provider) in [
+            ("ag_codex", ProviderKind::Codex),
+            ("ag_claude", ProviderKind::ClaudeCode),
+        ] {
+            store
+                .upsert_agent(
+                    &AgentSummary {
+                        agent_id: agent_id.into(),
+                        workspace_id: "ws_pr".into(),
+                        cwd: ws_cwd.clone(),
+                        title: format!("Agent {agent_id}"),
+                        provider,
+                        model: None,
+                        effort: None,
+                        fast_mode: false,
+                        mode: SessionMode::Default,
+                        status: AgentStatus::Running {
+                            turn_id: "t1".into(),
+                        },
+                        parent_agent_id: None,
+                        parent_host_id: None,
+                        latest_seq: 0,
+                        timeline_epoch: 0,
+                        created_at: now,
+                        updated_at: now,
+                        archived_at: None,
+                        background: false,
+                        auto_archive: false,
+                        profile_id: None,
+                        labels: HashMap::new(),
+                        attention: AttentionState::None,
+                        last_activity_at: Some(now),
+                        queued_prompts: Vec::new(),
+                        read_seq: 0,
+                        is_pinned: false,
+                        pinned_order: 0,
+                        handle: None,
+                        cluster_suggestion: None,
+                        task_summary: None,
+                        forked_from_agent_id: None,
+                        forked_at_seq: None,
+                        acp_agent_id: None,
+                    },
+                    None,
+                )
+                .expect("upsert agent");
+        }
+
+        let (codex_tx, mut codex_rx) = mpsc::channel(16);
+        let codex_gen = orch.bump_generation("ag_codex").await;
+        let t1 = tokio::spawn(async {});
+        orch.live_agents.write().await.insert(
+            "ag_codex".into(),
+            LiveAgentEntry {
+                generation: codex_gen,
+                cmd_tx: codex_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: t1.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+
+        let (claude_tx, mut claude_rx) = mpsc::channel(16);
+        let claude_gen = orch.bump_generation("ag_claude").await;
+        let t2 = tokio::spawn(async {});
+        orch.live_agents.write().await.insert(
+            "ag_claude".into(),
+            LiveAgentEntry {
+                generation: claude_gen,
+                cmd_tx: claude_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: t2.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+
+        // 1. Codex emits `cargo test -p orbit-store` permission prompt; human clicks `allow_always`.
+        orch.ingest_driver_event(
+            "ag_codex",
+            codex_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "cperm_1".into(),
+                title: "Run command: cargo test -p orbit-store".into(),
+                detail: ToolCallDetail::Shell {
+                    command: "cargo test -p orbit-store".into(),
+                    cwd: None,
+                    exit_code: None,
+                    output_preview: None,
+                },
+                allowed_decisions: vec!["allow".into(), "allow_always".into(), "deny".into()],
+                plan_approval: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            orch.list_pending_permissions(Some("ag_codex")).await.len(),
+            1
+        );
+
+        // Finding 13: invalid alias `"always"` MUST be rejected without consuming the pending prompt.
+        assert!(
+            orch.resolve_permission("ag_codex", "cperm_1".into(), "always".into())
+                .await
+                .is_err(),
+            "invalid alias `always` must be rejected"
+        );
+        assert_eq!(
+            orch.list_pending_permissions(Some("ag_codex")).await.len(),
+            1
+        );
+
+        // Finding 11: peer/agent callers MUST NEVER mint persistent `allow_always` grants.
+        assert!(
+            orch.resolve_permission_by_agent("ag_codex", "cperm_1".into(), "allow_always".into())
+                .await
+                .is_err(),
+            "agent-originated allow_always must be rejected"
+        );
+        assert!(
+            orch.list_permission_rules(Some(&ws_cwd))
+                .expect("list rules")
+                .is_empty(),
+            "rejected agent allow_always must not persist any rule"
+        );
+
+        orch.resolve_permission("ag_codex", "cperm_1".into(), "allow_always".into())
+            .await
+            .expect("resolve allow_always");
+        // Finding 12: Orbit is the single persistence authority — provider MUST receive one-shot
+        // `"allow"` (not `"allow_always"`) whenever `"allow"` is offered so rule revocation works!
+        match codex_rx.try_recv().expect("codex resolved") {
+            DriverCommand::ResolvePermission {
+                request_id,
+                decision,
+            } => {
+                assert_eq!(request_id, "cperm_1");
+                assert_eq!(
+                    decision, "allow",
+                    "provider must receive one-shot `allow` so Orbit SQLite remains authoritative"
+                );
+            }
+            other => panic!("unexpected cmd: {other:?}"),
+        }
+
+        // Rule MUST be persisted as Project-scoped AlwaysAllowGrant across all providers (`provider: None`).
+        let rules = orch
+            .list_permission_rules(Some(&ws_cwd))
+            .expect("list rules");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].pattern, "cargo test");
+        assert_eq!(
+            rules[0].pattern_kind,
+            orbit_protocol::PermissionRulePatternKind::CommandPrefix
+        );
+        assert_eq!(
+            rules[0].source,
+            orbit_protocol::PermissionRuleSource::AlwaysAllowGrant
+        );
+        assert_eq!(rules[0].provider, None);
+
+        // 2. Subsequent Codex AND Claude `cargo test` prompts MUST auto-approve without human prompt!
+        orch.ingest_driver_event(
+            "ag_codex",
+            codex_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "cperm_2".into(),
+                title: "Run cargo test --lib".into(),
+                detail: ToolCallDetail::Shell {
+                    command: "cargo test --lib".into(),
+                    cwd: None,
+                    exit_code: None,
+                    output_preview: None,
+                },
+                allowed_decisions: vec!["allow".into(), "allow_always".into(), "deny".into()],
+                plan_approval: None,
+            },
+        )
+        .await;
+        orch.ingest_driver_event(
+            "ag_claude",
+            claude_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "clperm_2".into(),
+                title: "Run cargo test".into(),
+                detail: ToolCallDetail::Shell {
+                    command: "cargo test --workspace".into(),
+                    cwd: None,
+                    exit_code: None,
+                    output_preview: None,
+                },
+                allowed_decisions: vec!["allow".into(), "allow_always".into(), "deny".into()],
+                plan_approval: None,
+            },
+        )
+        .await;
+
+        assert!(orch.list_pending_permissions(None).await.is_empty());
+        match codex_rx.try_recv().expect("codex auto-approved") {
+            DriverCommand::ResolvePermission {
+                request_id,
+                decision,
+            } => {
+                assert_eq!(request_id, "cperm_2");
+                assert_eq!(decision, "allow");
+            }
+            other => panic!("unexpected cmd: {other:?}"),
+        }
+        match claude_rx.try_recv().expect("claude auto-approved") {
+            DriverCommand::ResolvePermission {
+                request_id,
+                decision,
+            } => {
+                assert_eq!(request_id, "clperm_2");
+                assert_eq!(decision, "allow");
+            }
+            other => panic!("unexpected cmd: {other:?}"),
+        }
+
+        let updated_rules = orch
+            .list_permission_rules(Some(&ws_cwd))
+            .expect("list rules");
+        assert_eq!(updated_rules[0].match_count, 2);
+        assert!(updated_rules[0].last_matched_at.is_some());
+
+        // 3. Compound injection `cargo test && rm -rf /` MUST NOT match the Allow rule!
+        orch.ingest_driver_event(
+            "ag_codex",
+            codex_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "cperm_evil".into(),
+                title: "Run compound command".into(),
+                detail: ToolCallDetail::Shell {
+                    command: "cargo test && rm -rf /".into(),
+                    cwd: None,
+                    exit_code: None,
+                    output_preview: None,
+                },
+                allowed_decisions: vec!["allow".into(), "allow_always".into(), "deny".into()],
+                plan_approval: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            orch.list_pending_permissions(Some("ag_codex")).await.len(),
+            1,
+            "compound command MUST remain pending for human review"
+        );
+        assert!(codex_rx.try_recv().is_err());
+
+        // Finding 12: Attempting `allow_always` on a non-derivable compound command MUST fail
+        // explicitly and leave the pending prompt intact for one-time review.
+        assert!(
+            orch.resolve_permission("ag_codex", "cperm_evil".into(), "allow_always".into())
+                .await
+                .is_err(),
+            "non-derivable compound command must reject allow_always"
+        );
+        assert_eq!(
+            orch.list_pending_permissions(Some("ag_codex")).await.len(),
+            1
+        );
+        assert!(codex_rx.try_recv().is_err());
+
+        // Finding 12: Revoking the Orbit `cargo test` rule MUST take immediate effect (no stale
+        // provider grant), causing the next `cargo test` prompt to require human review again!
+        let allow_rule_id = updated_rules[0].id.clone();
+        assert!(
+            orch.delete_permission_rule(&allow_rule_id)
+                .expect("revoke allow rule")
+        );
+        orch.ingest_driver_event(
+            "ag_claude",
+            claude_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "clperm_after_revoke".into(),
+                title: "Run cargo test after revoke".into(),
+                detail: ToolCallDetail::Shell {
+                    command: "cargo test --lib".into(),
+                    cwd: None,
+                    exit_code: None,
+                    output_preview: None,
+                },
+                allowed_decisions: vec!["allow".into(), "allow_always".into(), "deny".into()],
+                plan_approval: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            orch.list_pending_permissions(Some("ag_claude")).await.len(),
+            1,
+            "revoked rule must immediately stop auto-allowing"
+        );
+        assert!(claude_rx.try_recv().is_err());
+
+        // 4. Adding a Host Deny rule for `rm -rf` MUST auto-deny even compound commands!
+        orch.upsert_permission_rule(orbit_protocol::UpsertPermissionRuleInput {
+            id: None,
+            scope_kind: orbit_protocol::PermissionRuleScopeKind::Host,
+            project_cwd: None,
+            provider: None,
+            tool_kind: orbit_protocol::PermissionRuleToolKind::Shell,
+            pattern_kind: orbit_protocol::PermissionRulePatternKind::CommandPrefix,
+            pattern: "rm -rf".into(),
+            decision: orbit_protocol::PermissionRuleDecision::Deny,
+            source: orbit_protocol::PermissionRuleSource::Manual,
+            note: Some("Never allow rm -rf".into()),
+        })
+        .expect("upsert deny rule");
+
+        orch.ingest_driver_event(
+            "ag_claude",
+            claude_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "clperm_deny".into(),
+                title: "Run compound rm".into(),
+                detail: ToolCallDetail::Shell {
+                    command: "cargo test && rm -rf /tmp/foo".into(),
+                    cwd: None,
+                    exit_code: None,
+                    output_preview: None,
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                plan_approval: None,
+            },
+        )
+        .await;
+        match claude_rx.try_recv().expect("claude auto-denied") {
+            DriverCommand::ResolvePermission {
+                request_id,
+                decision,
+            } => {
+                assert_eq!(request_id, "clperm_deny");
+                assert_eq!(decision, "deny");
+            }
+            other => panic!("unexpected cmd: {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_permissions_batch_enforces_server_side_safety_invariants() {
+        let home_dir =
+            std::env::temp_dir().join(format!("orbit-perm-batch-orch-{}", Uuid::new_v4().simple()));
+        let ws_dir = home_dir.join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("create repo dir");
+
+        let store = Arc::new(OrbitStore::open_in_memory().expect("open db"));
+        let orch = AgentOrchestrator::new(
+            home_dir.clone(),
+            "host_batch".into(),
+            "tok".into(),
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(OrchestrationConfig::default())),
+            Arc::clone(&store),
+            WorkspaceScriptRegistry::new(),
+            Arc::new(KeepAwakeManager::new(false)),
+            Arc::new(RwLock::new(None)),
+            crate::hooks::HooksEngine::new(home_dir.clone()),
+        )
+        .await;
+
+        let now = Utc::now();
+        let ws_cwd = ws_dir.to_string_lossy().to_string();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_b".into(),
+                title: "Batch Repo".into(),
+                cwd: ws_cwd.clone(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_b".into(),
+                    workspace_id: "ws_b".into(),
+                    cwd: ws_cwd.clone(),
+                    title: "Batch Agent".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Running {
+                        turn_id: "t1".into(),
+                    },
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::Permission,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let agent_gen = orch.bump_generation("ag_b").await;
+        let dummy = tokio::spawn(async {});
+        orch.live_agents.write().await.insert(
+            "ag_b".into(),
+            LiveAgentEntry {
+                generation: agent_gen,
+                cmd_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: dummy.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+
+        let insert_pending =
+            |req_id: &str,
+             detail: ToolCallDetail,
+             allowed: Vec<String>,
+             assessment: Option<orbit_protocol::GuardianAssessment>,
+             plan: Option<orbit_protocol::PlanApprovalPayload>| {
+                PendingPermissionSummary {
+                    agent_id: "ag_b".into(),
+                    agent_title: "Batch Agent".into(),
+                    workspace_id: "ws_b".into(),
+                    request_id: req_id.into(),
+                    title: req_id.into(),
+                    detail,
+                    allowed_decisions: allowed,
+                    guardian_assessment: assessment,
+                    plan_approval: plan,
+                    human_only: false,
+                    created_at: now,
+                }
+            };
+
+        let make_assessment =
+            |risk: orbit_protocol::GuardianRiskLevel| orbit_protocol::GuardianAssessment {
+                risk_level: risk,
+                decision: orbit_protocol::GuardianDecision::RequireHuman,
+                confidence: 0.95,
+                classifier_tier: "deterministic".into(),
+                reason: "test".into(),
+                signals: vec![],
+                latency_ms: 0,
+            };
+
+        {
+            let mut guard = orch.pending_permissions.write().await;
+            // 1. Safe Low-risk permission -> SHOULD RESOLVE
+            guard.insert(
+                ("ag_b".into(), "p_low".into()),
+                insert_pending(
+                    "p_low",
+                    ToolCallDetail::Shell {
+                        command: "cargo test".into(),
+                        cwd: None,
+                        exit_code: None,
+                        output_preview: None,
+                    },
+                    vec!["allow".into(), "allow_always".into(), "deny".into()],
+                    Some(make_assessment(orbit_protocol::GuardianRiskLevel::Low)),
+                    None,
+                ),
+            );
+            // 2. Safe Medium-risk permission -> SHOULD RESOLVE
+            guard.insert(
+                ("ag_b".into(), "p_med".into()),
+                insert_pending(
+                    "p_med",
+                    ToolCallDetail::FileEdit {
+                        path: "src/lib.rs".into(),
+                        unified_diff: None,
+                    },
+                    vec!["allow".into(), "deny".into()],
+                    Some(make_assessment(orbit_protocol::GuardianRiskLevel::Medium)),
+                    None,
+                ),
+            );
+            // 3. High-risk cached assessment -> MUST SKIP
+            guard.insert(
+                ("ag_b".into(), "p_high".into()),
+                insert_pending(
+                    "p_high",
+                    ToolCallDetail::FileEdit {
+                        path: "/etc/hosts".into(),
+                        unified_diff: None,
+                    },
+                    vec!["allow".into(), "deny".into()],
+                    Some(make_assessment(orbit_protocol::GuardianRiskLevel::High)),
+                    None,
+                ),
+            );
+            // 4. Unassessed destructive command (`rm -rf /`) -> on-demand Guardian classifies Critical -> MUST SKIP
+            guard.insert(
+                ("ag_b".into(), "p_unassessed_crit".into()),
+                insert_pending(
+                    "p_unassessed_crit",
+                    ToolCallDetail::Shell {
+                        command: "rm -rf /".into(),
+                        cwd: None,
+                        exit_code: None,
+                        output_preview: None,
+                    },
+                    vec!["allow".into(), "deny".into()],
+                    None,
+                    None,
+                ),
+            );
+            // 5. Human-only plan approval gate -> MUST SKIP
+            guard.insert(
+                ("ag_b".into(), "p_plan".into()),
+                insert_pending(
+                    "p_plan",
+                    ToolCallDetail::Generic {
+                        tool_name: "ExitPlanMode".into(),
+                        arguments_json: "{}".into(),
+                    },
+                    vec!["allow".into(), "deny".into()],
+                    Some(make_assessment(orbit_protocol::GuardianRiskLevel::Low)),
+                    Some(orbit_protocol::PlanApprovalPayload {
+                        plan_markdown: "# Plan".into(),
+                        plan_title: Some("Plan".into()),
+                        plan_file_path: None,
+                        summary: None,
+                        plan_file_backed: false,
+                        allowed_prompts: vec![],
+                        source: Some("exit_plan_mode".into()),
+                    }),
+                ),
+            );
+            // 6. Deny-only allowed_decisions -> MUST SKIP
+            guard.insert(
+                ("ag_b".into(), "p_deny_only".into()),
+                insert_pending(
+                    "p_deny_only",
+                    ToolCallDetail::FileRead {
+                        path: "README.md".into(),
+                        start_line: None,
+                        end_line: None,
+                    },
+                    vec!["deny".into()],
+                    Some(make_assessment(orbit_protocol::GuardianRiskLevel::Low)),
+                    None,
+                ),
+            );
+        }
+
+        // Batch with `allow_always` MUST be rejected!
+        assert!(
+            orch.resolve_permissions_batch(
+                vec![("ag_b".into(), "p_low".into())],
+                "allow_always".into(),
+            )
+            .await
+            .is_err()
+        );
+
+        let batch = orch
+            .resolve_permissions_batch(
+                vec![
+                    ("ag_b".into(), "p_low".into()),
+                    ("ag_b".into(), "p_med".into()),
+                    ("ag_b".into(), "p_high".into()),
+                    ("ag_b".into(), "p_unassessed_crit".into()),
+                    ("ag_b".into(), "p_plan".into()),
+                    ("ag_b".into(), "p_deny_only".into()),
+                ],
+                "allow".into(),
+            )
+            .await
+            .expect("batch resolve");
+
+        assert_eq!(batch.resolved_count, 2);
+        assert_eq!(batch.skipped_count, 4);
+
+        let reason_for = |id: &str| {
+            batch
+                .skipped_reasons
+                .iter()
+                .find(|r| r.permission_request_id == id)
+                .map(|r| r.reason.as_str())
+        };
+        assert_eq!(reason_for("p_high"), Some("high_or_critical_risk"));
+        assert_eq!(
+            reason_for("p_unassessed_crit"),
+            Some("high_or_critical_risk")
+        );
+        assert_eq!(
+            reason_for("p_plan"),
+            Some("plan_approval_requires_individual_review")
+        );
+        assert_eq!(
+            reason_for("p_deny_only"),
+            Some("allow_decision_not_permitted")
+        );
+
+        // Verify exact 2 driver commands were dispatched (`p_low`, `p_med`)
+        let mut resolved_ids = Vec::new();
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if let DriverCommand::ResolvePermission {
+                request_id,
+                decision,
+            } = cmd
+            {
+                assert_eq!(decision, "allow");
+                resolved_ids.push(request_id);
+            }
+        }
+        assert_eq!(resolved_ids, vec!["p_low", "p_med"]);
+
+        // Remaining pending items MUST be exactly the 4 skipped items
+        assert_eq!(orch.list_pending_permissions(Some("ag_b")).await.len(), 4);
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_permissions_batch_audit_hardening_guardian_policy_atomic_claim_and_fail_closed()
+     {
+        let home_dir = std::env::temp_dir().join(format!(
+            "orbit-perm-batch-audit-{}",
+            Uuid::new_v4().simple()
+        ));
+        let ws_dir = home_dir.join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("create repo dir");
+
+        let store = Arc::new(OrbitStore::open_in_memory().expect("open db"));
+        let orch = AgentOrchestrator::new(
+            home_dir.clone(),
+            "host_audit".into(),
+            "tok".into(),
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(OrchestrationConfig::default())),
+            Arc::clone(&store),
+            WorkspaceScriptRegistry::new(),
+            Arc::new(KeepAwakeManager::new(false)),
+            Arc::new(RwLock::new(None)),
+            crate::hooks::HooksEngine::new(home_dir.clone()),
+        )
+        .await;
+
+        let now = Utc::now();
+        let ws_cwd = ws_dir.to_string_lossy().to_string();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_a".into(),
+                title: "Audit Repo".into(),
+                cwd: ws_cwd.clone(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_a".into(),
+                    workspace_id: "ws_a".into(),
+                    cwd: ws_cwd.clone(),
+                    title: "Audit Agent".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Running {
+                        turn_id: "t1".into(),
+                    },
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::Permission,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let agent_gen = orch.bump_generation("ag_a").await;
+        let dummy = tokio::spawn(async {});
+        orch.live_agents.write().await.insert(
+            "ag_a".into(),
+            LiveAgentEntry {
+                generation: agent_gen,
+                cmd_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: dummy.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+
+        // Live ghost session that is NOT in SQLite (simulates missing agent scope -> Finding 9)
+        let (ghost_tx, mut ghost_rx) = mpsc::channel(16);
+        let ghost_gen = orch.bump_generation("ag_ghost").await;
+        let dummy_ghost = tokio::spawn(async {});
+        orch.live_agents.write().await.insert(
+            "ag_ghost".into(),
+            LiveAgentEntry {
+                generation: ghost_gen,
+                cmd_tx: ghost_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: dummy_ghost.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+
+        let make_pending =
+            |agent_id: &str,
+             req_id: &str,
+             cmd: &str,
+             assessment: Option<orbit_protocol::GuardianAssessment>| {
+                PendingPermissionSummary {
+                    agent_id: agent_id.into(),
+                    agent_title: agent_id.into(),
+                    workspace_id: "ws_a".into(),
+                    request_id: req_id.into(),
+                    title: format!("Run {cmd}"),
+                    detail: ToolCallDetail::Shell {
+                        command: cmd.into(),
+                        cwd: None,
+                        exit_code: None,
+                        output_preview: None,
+                    },
+                    allowed_decisions: vec!["allow".into(), "deny".into()],
+                    guardian_assessment: assessment,
+                    plan_approval: None,
+                    human_only: false,
+                    created_at: now,
+                }
+            };
+
+        let low_assessment = orbit_protocol::GuardianAssessment {
+            risk_level: orbit_protocol::GuardianRiskLevel::Low,
+            decision: orbit_protocol::GuardianDecision::RequireHuman,
+            confidence: 0.95,
+            classifier_tier: "deterministic".into(),
+            reason: "safe test".into(),
+            signals: vec![],
+            latency_ms: 0,
+        };
+        let disabled_medium_assessment = orbit_protocol::GuardianAssessment {
+            risk_level: orbit_protocol::GuardianRiskLevel::Medium,
+            decision: orbit_protocol::GuardianDecision::RequireHuman,
+            confidence: 0.0,
+            classifier_tier: "disabled".into(),
+            reason: "Guardian disabled".into(),
+            signals: vec!["guardian_disabled".into()],
+            latency_ms: 0,
+        };
+
+        // 1. Finding 8: Disabled host Guardian MUST skip ALL allow items with `guardian_disabled`.
+        let mut disabled_cfg = orch.guardian.get_config().await;
+        disabled_cfg.enabled = false;
+        orch.guardian
+            .update_config(disabled_cfg)
+            .await
+            .expect("disable guardian");
+
+        {
+            let mut guard = orch.pending_permissions.write().await;
+            guard.insert(
+                ("ag_a".into(), "p_disabled_low".into()),
+                make_pending(
+                    "ag_a",
+                    "p_disabled_low",
+                    "cargo test",
+                    Some(low_assessment.clone()),
+                ),
+            );
+            guard.insert(
+                ("ag_a".into(), "p_disabled_med".into()),
+                make_pending(
+                    "ag_a",
+                    "p_disabled_med",
+                    "echo hi",
+                    Some(disabled_medium_assessment.clone()),
+                ),
+            );
+        }
+
+        let res_disabled = orch
+            .resolve_permissions_batch(
+                vec![
+                    ("ag_a".into(), "p_disabled_low".into()),
+                    ("ag_a".into(), "p_disabled_med".into()),
+                ],
+                "allow".into(),
+            )
+            .await
+            .expect("batch when guardian disabled");
+        assert_eq!(res_disabled.resolved_count, 0);
+        assert_eq!(res_disabled.skipped_count, 2);
+        assert!(
+            res_disabled
+                .skipped_reasons
+                .iter()
+                .all(|r| r.reason == "guardian_disabled")
+        );
+        assert!(cmd_rx.try_recv().is_err());
+
+        // 2. Finding 8: Re-enable Guardian with host `blocked_command_patterns` -> MUST block
+        //    `cargo test` AND reject a cached `guardian_disabled` Medium assessment!
+        let mut policy_cfg = orch.guardian.get_config().await;
+        policy_cfg.enabled = true;
+        policy_cfg.blocked_command_patterns = vec!["cargo test".into()];
+        orch.guardian
+            .update_config(policy_cfg)
+            .await
+            .expect("update policy");
+
+        {
+            let mut guard = orch.pending_permissions.write().await;
+            guard.insert(
+                ("ag_a".into(), "p_uncached_blocked".into()),
+                make_pending("ag_a", "p_uncached_blocked", "cargo test --lib", None),
+            );
+            guard.insert(
+                ("ag_ghost".into(), "p_ghost".into()),
+                make_pending("ag_ghost", "p_ghost", "ls", Some(low_assessment.clone())),
+            );
+        }
+
+        let res_policy = orch
+            .resolve_permissions_batch(
+                vec![
+                    ("ag_a".into(), "p_disabled_low".into()),
+                    ("ag_a".into(), "p_disabled_med".into()),
+                    ("ag_a".into(), "p_uncached_blocked".into()),
+                    ("ag_ghost".into(), "p_ghost".into()),
+                ],
+                "allow".into(),
+            )
+            .await
+            .expect("batch under host policy");
+        assert_eq!(res_policy.resolved_count, 0);
+        assert_eq!(res_policy.skipped_count, 4);
+        let reason_for = |id: &str| {
+            res_policy
+                .skipped_reasons
+                .iter()
+                .find(|r| r.permission_request_id == id)
+                .map(|r| r.reason.as_str())
+        };
+        assert_eq!(reason_for("p_disabled_low"), Some("high_or_critical_risk"));
+        assert_eq!(reason_for("p_disabled_med"), Some("guardian_disabled"));
+        assert_eq!(
+            reason_for("p_uncached_blocked"),
+            Some("high_or_critical_risk")
+        );
+        // Finding 9: missing agent scope fails closed even with cached Low assessment
+        assert_eq!(reason_for("p_ghost"), Some("agent_scope_unavailable"));
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(ghost_rx.try_recv().is_err());
+
+        // 3. Finding 7: Concurrent batch calls on the SAME safe item MUST resolve at most ONCE!
+        let mut clean_cfg = orch.guardian.get_config().await;
+        clean_cfg.enabled = true;
+        clean_cfg.blocked_command_patterns.clear();
+        orch.guardian
+            .update_config(clean_cfg)
+            .await
+            .expect("clean config");
+
+        orch.pending_permissions.write().await.insert(
+            ("ag_a".into(), "p_race".into()),
+            make_pending("ag_a", "p_race", "ls -la", Some(low_assessment.clone())),
+        );
+        let (r1, r2) = tokio::join!(
+            orch.resolve_permissions_batch(vec![("ag_a".into(), "p_race".into())], "allow".into(),),
+            orch.resolve_permissions_batch(vec![("ag_a".into(), "p_race".into())], "allow".into(),),
+        );
+        let r1 = r1.expect("race 1");
+        let r2 = r2.expect("race 2");
+        assert_eq!(
+            r1.resolved_count + r2.resolved_count,
+            1,
+            "concurrent batch callers must claim and resolve item at most once"
+        );
+        assert_eq!(r1.skipped_count + r2.skipped_count, 1);
+        let mut dispatched = 0usize;
+        while cmd_rx.try_recv().is_ok() {
+            dispatched += 1;
+        }
+        assert_eq!(dispatched, 1, "driver must receive exactly one command");
+
+        // 4. Finding 9 (ingress): Unknown agent scope on DriverEvent::PermissionRequest MUST NOT
+        //    auto-allow even when Guardian auto_approve_max_risk == Low!
+        let mut auto_cfg = orch.guardian.get_config().await;
+        auto_cfg.enabled = true;
+        auto_cfg.auto_approve_max_risk = orbit_protocol::GuardianRiskLevel::Low;
+        orch.guardian
+            .update_config(auto_cfg)
+            .await
+            .expect("auto config");
+
+        orch.ingest_driver_event(
+            "ag_ghost",
+            ghost_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "p_ghost_ingress".into(),
+                title: "Read README".into(),
+                detail: ToolCallDetail::FileRead {
+                    path: "README.md".into(),
+                    start_line: None,
+                    end_line: None,
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                plan_approval: None,
+            },
+        )
+        .await;
+        assert!(
+            ghost_rx.try_recv().is_err(),
+            "missing agent scope on ingress must fail-closed and never auto-allow"
+        );
 
         let _ = std::fs::remove_dir_all(&home_dir);
     }

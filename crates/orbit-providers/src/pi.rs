@@ -1885,6 +1885,8 @@ async fn handle_pi_extension_ui_request(
                     tool_name: title,
                     arguments_json: message,
                 },
+                // Pi `confirm` extension dialogs carry only free-text display titles without an
+                // authoritative tool/command/path identity; keep them individual (never allow_always).
                 allowed_decisions: vec!["allow".into(), "deny".into()],
                 plan_approval: None,
             })

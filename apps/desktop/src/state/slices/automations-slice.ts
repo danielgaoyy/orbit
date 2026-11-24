@@ -29,6 +29,8 @@ import {
   type McpProbeResult,
   type GuardianConfigSnapshotView,
   type GuardianPolicyConfig,
+  type PermissionRuleRecord,
+  type UpsertPermissionRuleInput,
   type ImChannelTestResultView,
   type ImChannelsSnapshotView,
   type PushDevicesSnapshotView,
@@ -65,6 +67,7 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
   const lifecycleHooksSeqByKey = new Map<string, number>();
   const eventTriggersSeqByHost = new Map<string, number>();
   const guardianReqSeqByHost = new Map<string, number>();
+  const permissionRulesReqSeqByHost = new Map<string, number>();
   const imChannelsReqSeqByHost = new Map<string, number>();
   const pushReqSeqByHost = new Map<string, number>();
   const pathRulesReqSeqByScope = new Map<string, number>();
@@ -182,6 +185,166 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
         }));
         notifyToast(`Guardian update failed: ${String(err)}`);
         return null;
+      }
+    },
+
+    async loadPermissionRules(
+      hostId: string,
+      projectCwd?: string | null,
+    ): Promise<PermissionRuleRecord[] | null> {
+      if (!hostId) return null;
+      const seq = (permissionRulesReqSeqByHost.get(hostId) ?? 0) + 1;
+      permissionRulesReqSeqByHost.set(hostId, seq);
+      setState((s) => ({
+        ...s,
+        permissionRulesByHost: {
+          ...s.permissionRulesByHost,
+          [hostId]: {
+            status: "loading",
+            rules: s.permissionRulesByHost[hostId]?.rules ?? [],
+            saving: s.permissionRulesByHost[hostId]?.saving ?? false,
+            error: null,
+          },
+        },
+      }));
+      try {
+        const rules = await orbitIpc.listPermissionRules(hostId, projectCwd ?? null);
+        if (permissionRulesReqSeqByHost.get(hostId) !== seq) return null;
+        setState((s) => ({
+          ...s,
+          permissionRulesByHost: {
+            ...s.permissionRulesByHost,
+            [hostId]: {
+              status: "ready",
+              rules,
+              saving: false,
+              error: null,
+            },
+          },
+        }));
+        return rules;
+      } catch (err) {
+        if (permissionRulesReqSeqByHost.get(hostId) !== seq) return null;
+        setState((s) => ({
+          ...s,
+          permissionRulesByHost: {
+            ...s.permissionRulesByHost,
+            [hostId]: {
+              status: "error",
+              rules: s.permissionRulesByHost[hostId]?.rules ?? [],
+              saving: false,
+              error: String(err),
+            },
+          },
+        }));
+        return null;
+      }
+    },
+
+    async upsertPermissionRule(
+      hostId: string,
+      rule: UpsertPermissionRuleInput,
+    ): Promise<PermissionRuleRecord | null> {
+      if (!hostId) return null;
+      setState((s) => ({
+        ...s,
+        permissionRulesByHost: {
+          ...s.permissionRulesByHost,
+          [hostId]: {
+            status: s.permissionRulesByHost[hostId]?.status ?? "ready",
+            rules: s.permissionRulesByHost[hostId]?.rules ?? [],
+            saving: true,
+            error: null,
+          },
+        },
+      }));
+      try {
+        const saved = await orbitIpc.upsertPermissionRule(hostId, rule);
+        setState((s) => {
+          const prev = s.permissionRulesByHost[hostId]?.rules ?? [];
+          const exists = prev.some((r) => r.id === saved.id);
+          const nextRules = exists
+            ? prev.map((r) => (r.id === saved.id ? saved : r))
+            : [saved, ...prev];
+          return {
+            ...s,
+            permissionRulesByHost: {
+              ...s.permissionRulesByHost,
+              [hostId]: {
+                status: "ready",
+                rules: nextRules,
+                saving: false,
+                error: null,
+              },
+            },
+          };
+        });
+        return saved;
+      } catch (err) {
+        setState((s) => ({
+          ...s,
+          permissionRulesByHost: {
+            ...s.permissionRulesByHost,
+            [hostId]: {
+              status: s.permissionRulesByHost[hostId]?.status ?? "ready",
+              rules: s.permissionRulesByHost[hostId]?.rules ?? [],
+              saving: false,
+              error: String(err),
+            },
+          },
+        }));
+        notifyToast(String(err));
+        return null;
+      }
+    },
+
+    async deletePermissionRule(hostId: string, ruleId: string): Promise<boolean> {
+      if (!hostId || !ruleId) return false;
+      setState((s) => ({
+        ...s,
+        permissionRulesByHost: {
+          ...s.permissionRulesByHost,
+          [hostId]: {
+            status: s.permissionRulesByHost[hostId]?.status ?? "ready",
+            rules: s.permissionRulesByHost[hostId]?.rules ?? [],
+            saving: true,
+            error: null,
+          },
+        },
+      }));
+      try {
+        const deleted = await orbitIpc.deletePermissionRule(hostId, ruleId);
+        setState((s) => {
+          const prev = s.permissionRulesByHost[hostId]?.rules ?? [];
+          return {
+            ...s,
+            permissionRulesByHost: {
+              ...s.permissionRulesByHost,
+              [hostId]: {
+                status: "ready",
+                rules: prev.filter((r) => r.id !== ruleId),
+                saving: false,
+                error: null,
+              },
+            },
+          };
+        });
+        return deleted;
+      } catch (err) {
+        setState((s) => ({
+          ...s,
+          permissionRulesByHost: {
+            ...s.permissionRulesByHost,
+            [hostId]: {
+              status: s.permissionRulesByHost[hostId]?.status ?? "ready",
+              rules: s.permissionRulesByHost[hostId]?.rules ?? [],
+              saving: false,
+              error: String(err),
+            },
+          },
+        }));
+        notifyToast(String(err));
+        return false;
       }
     },
 

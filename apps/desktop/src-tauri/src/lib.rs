@@ -84,10 +84,10 @@ use orbit_protocol::{
     GitStashListResult, GitStashMutationResult, GuardianPolicyConfig, HookExecutionRecord,
     HookScope, LifecycleHookRule, LspCodeAction, LspCompletionItem, LspDiagnostic, LspHoverInfo,
     LspLocation, LspReferenceLocation, LspServerStatus, LspSymbolInfo, LspWorkspaceEdit,
-    LspWorkspaceEditResult,
-    ManagedSkillRecord, McpProbeResult, OrchestrationConfig, PromptBadge, ProviderKind,
-    ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
-    ScheduleTarget, SessionMode, SkillWriteScope, TimerCondition, UsageInsightsSnapshot,
+    LspWorkspaceEditResult, ManagedSkillRecord, McpProbeResult, OrchestrationConfig,
+    PermissionRuleRecord, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderSubagentEvent,
+    ReasoningEffort, ResolvePermissionsBatchResult, ScheduleRunRecord, ScheduleTarget, SessionMode,
+    SkillWriteScope, TimerCondition, UpsertPermissionRuleInput, UsageInsightsSnapshot,
     WorkspaceBoardSnapshot, WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode,
     WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
@@ -3191,6 +3191,55 @@ async fn update_guardian_config(
 }
 
 #[tauri::command]
+async fn list_permission_rules(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    project_cwd: Option<String>,
+) -> Result<Vec<PermissionRuleRecord>, String> {
+    state
+        .core
+        .list_permission_rules_on_host(&host_id, project_cwd)
+        .await
+}
+
+#[tauri::command]
+async fn upsert_permission_rule(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    rule: UpsertPermissionRuleInput,
+) -> Result<PermissionRuleRecord, String> {
+    state
+        .core
+        .upsert_permission_rule_on_host(&host_id, rule)
+        .await
+}
+
+#[tauri::command]
+async fn delete_permission_rule(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    rule_id: String,
+) -> Result<bool, String> {
+    state
+        .core
+        .delete_permission_rule_on_host(&host_id, rule_id)
+        .await
+}
+
+#[tauri::command]
+async fn resolve_permissions_batch(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    items: Vec<(String, String)>,
+    decision: String,
+) -> Result<ResolvePermissionsBatchResult, String> {
+    state
+        .core
+        .resolve_permissions_batch_on_host(&host_id, items, decision)
+        .await
+}
+
+#[tauri::command]
 async fn list_im_channels(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -4656,6 +4705,10 @@ pub fn run() {
             fire_conditional_timer_now,
             get_guardian_config,
             update_guardian_config,
+            list_permission_rules,
+            upsert_permission_rule,
+            delete_permission_rule,
+            resolve_permissions_batch,
             list_im_channels,
             upsert_im_channel,
             delete_im_channel,

@@ -8,6 +8,7 @@ import {
   type SettingSelectOption,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { PermissionRulesPanel } from "@/components/settings/permission-rules-panel";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { type MessageKey, useI18n } from "@/lib/i18n";
@@ -314,7 +315,10 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
             <button
               type="button"
               disabled={entry?.status === "loading" || isSaving}
-              onClick={() => void orbitActions.loadGuardianConfig(hostId)}
+              onClick={() => {
+                void orbitActions.loadGuardianConfig(hostId);
+                void orbitActions.loadPermissionRules(hostId);
+              }}
               className="border-border bg-background hover:bg-accent text-foreground inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:opacity-50"
             >
               <RefreshCw
@@ -566,6 +570,8 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
               </div>
             </SettingCard>
           </div>
+
+          <PermissionRulesPanel hostId={hostId} isOnline={isOnline} />
 
           <div className="flex flex-col gap-2">
             <SettingGroupLabel>{t("guardian.groupRecentDecisions")}</SettingGroupLabel>

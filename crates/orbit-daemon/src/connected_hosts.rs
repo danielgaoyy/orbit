@@ -622,6 +622,10 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::ConditionalTimersSnapshot { request_id, .. }
         | WireMessage::ConditionalTimerUpdated { request_id, .. }
         | WireMessage::GuardianConfigSnapshot { request_id, .. }
+        | WireMessage::PermissionRulesSnapshot { request_id, .. }
+        | WireMessage::PermissionRuleUpdated { request_id, .. }
+        | WireMessage::PermissionRuleDeleted { request_id, .. }
+        | WireMessage::PermissionsBatchResolved { request_id, .. }
         | WireMessage::GoalRunUpdated { request_id, .. }
         | WireMessage::GoalRunsSnapshot { request_id, .. }
         | WireMessage::MonitorWatchUpdated { request_id, .. }

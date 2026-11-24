@@ -197,6 +197,13 @@ impl GuardianManager {
             assessment: assessment.clone(),
             decided_at_ms,
         };
+        self.record_audit_entry(entry).await;
+        assessment
+    }
+
+    /// Record a pre-built audit entry (e.g. from deterministic persistent permission rules)
+    /// into the in-memory ring and SQLite audit log.
+    pub async fn record_audit_entry(&self, entry: GuardianAuditEntry) {
         {
             let mut ring = self.recent_audits.write().await;
             ring.push_front(entry.clone());
@@ -212,7 +219,6 @@ impl GuardianManager {
                 }
             });
         }
-        assessment
     }
 
     /// Evaluate a permission request against an explicit policy without mutating persisted config.

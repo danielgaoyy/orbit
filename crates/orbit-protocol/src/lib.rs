@@ -14,6 +14,7 @@ pub mod lsp;
 pub mod mcp_servers;
 pub mod media;
 pub mod orchestration;
+pub mod permission_rules;
 pub mod plan_approval;
 pub mod push;
 pub mod router;
@@ -37,6 +38,7 @@ pub use lsp::*;
 pub use mcp_servers::*;
 pub use media::*;
 pub use orchestration::*;
+pub use permission_rules::*;
 pub use plan_approval::*;
 pub use push::*;
 pub use router::*;
@@ -1847,6 +1849,11 @@ pub enum WireMessage {
         agent_id: String,
         permission_request_id: String,
         decision: String,
+        /// When `true`, this resolution was initiated by an agent/router MCP tool (not a human)
+        /// and MUST route through the daemon's agent-originated guard (forbidding `allow_always`
+        /// and human-only plan approval gates).
+        #[serde(default, skip_serializing_if = "wire_is_false")]
+        agent_originated: bool,
     },
     /// Resolve a pending structured plan approval gate (`ExitPlanMode`, Codex Plan Mode,
     /// Antigravity plan review, or ACP plan approval).
@@ -2987,6 +2994,47 @@ pub enum WireMessage {
         config: GuardianPolicyConfig,
         #[serde(default)]
         recent_audits: Vec<GuardianAuditEntry>,
+    },
+
+    // Fine-Grained Persistent Permission Rules Engine & Safe Batch Approval
+    ListPermissionRules {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_cwd: Option<String>,
+    },
+    PermissionRulesSnapshot {
+        request_id: Uuid,
+        #[serde(default)]
+        rules: Vec<PermissionRuleRecord>,
+    },
+    UpsertPermissionRule {
+        request_id: Uuid,
+        rule: UpsertPermissionRuleInput,
+    },
+    PermissionRuleUpdated {
+        request_id: Uuid,
+        rule: PermissionRuleRecord,
+    },
+    DeletePermissionRule {
+        request_id: Uuid,
+        rule_id: String,
+    },
+    PermissionRuleDeleted {
+        request_id: Uuid,
+        rule_id: String,
+        deleted: bool,
+    },
+    ResolvePermissionsBatch {
+        request_id: Uuid,
+        items: Vec<(String, String)>,
+        decision: String,
+    },
+    PermissionsBatchResolved {
+        request_id: Uuid,
+        resolved_count: usize,
+        skipped_count: usize,
+        #[serde(default)]
+        skipped_reasons: Vec<BatchPermissionSkipReason>,
     },
 
     // --- Unattended Autonomous Goal Mode & Streaming Monitor Engine ---
@@ -5012,6 +5060,90 @@ mod tests {
         for msg in messages {
             let encoded = msg.encode_zstd(3).expect("encode guardian wire msg");
             let decoded = WireMessage::decode_zstd(&encoded).expect("decode guardian wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn permission_rules_and_batch_wire_messages_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let now = Utc::now();
+        let rule_input = UpsertPermissionRuleInput {
+            id: None,
+            scope_kind: PermissionRuleScopeKind::Project,
+            project_cwd: Some("/workspace/orbit".into()),
+            provider: None,
+            tool_kind: PermissionRuleToolKind::Shell,
+            pattern_kind: PermissionRulePatternKind::CommandPrefix,
+            pattern: "cargo test".into(),
+            decision: PermissionRuleDecision::Allow,
+            source: PermissionRuleSource::AlwaysAllowGrant,
+            note: Some("Granted via Always allow".into()),
+        };
+        let rule_record = PermissionRuleRecord {
+            id: "pr_1".into(),
+            scope_kind: PermissionRuleScopeKind::Project,
+            project_cwd: Some("/workspace/orbit".into()),
+            provider: None,
+            tool_kind: PermissionRuleToolKind::Shell,
+            pattern_kind: PermissionRulePatternKind::CommandPrefix,
+            pattern: "cargo test".into(),
+            decision: PermissionRuleDecision::Allow,
+            source: PermissionRuleSource::AlwaysAllowGrant,
+            note: Some("Granted via Always allow".into()),
+            created_at: now,
+            last_matched_at: Some(now),
+            match_count: 3,
+        };
+        let messages = vec![
+            WireMessage::ListPermissionRules {
+                request_id: req_id,
+                project_cwd: Some("/workspace/orbit".into()),
+            },
+            WireMessage::PermissionRulesSnapshot {
+                request_id: req_id,
+                rules: vec![rule_record.clone()],
+            },
+            WireMessage::UpsertPermissionRule {
+                request_id: req_id,
+                rule: rule_input,
+            },
+            WireMessage::PermissionRuleUpdated {
+                request_id: req_id,
+                rule: rule_record,
+            },
+            WireMessage::DeletePermissionRule {
+                request_id: req_id,
+                rule_id: "pr_1".into(),
+            },
+            WireMessage::PermissionRuleDeleted {
+                request_id: req_id,
+                rule_id: "pr_1".into(),
+                deleted: true,
+            },
+            WireMessage::ResolvePermissionsBatch {
+                request_id: req_id,
+                items: vec![("ag_1".into(), "perm_1".into())],
+                decision: "allow".into(),
+            },
+            WireMessage::PermissionsBatchResolved {
+                request_id: req_id,
+                resolved_count: 1,
+                skipped_count: 1,
+                skipped_reasons: vec![BatchPermissionSkipReason {
+                    agent_id: "ag_1".into(),
+                    permission_request_id: "perm_2".into(),
+                    reason: "high_or_critical_risk".into(),
+                }],
+            },
+        ];
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode permission rule wire msg");
+            let decoded =
+                WireMessage::decode_zstd(&encoded).expect("decode permission rule wire msg");
             assert_eq!(
                 serde_json::to_value(&msg).expect("orig"),
                 serde_json::to_value(&decoded).expect("decoded")

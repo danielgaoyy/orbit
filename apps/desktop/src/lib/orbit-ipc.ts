@@ -278,6 +278,63 @@ export interface GuardianConfigSnapshotView {
   recent_audits: GuardianAuditEntry[];
 }
 
+export type PermissionRuleScopeKind = "host" | "project";
+export type PermissionRuleToolKind =
+  | "shell"
+  | "file_write"
+  | "file_read"
+  | "mcp_tool"
+  | "network"
+  | "any";
+export type PermissionRulePatternKind =
+  | "command_prefix"
+  | "exact_command"
+  | "path_glob"
+  | "tool_name";
+export type PermissionRuleDecision = "allow" | "deny";
+export type PermissionRuleSource = "manual" | "always_allow_grant";
+
+export interface PermissionRuleRecord {
+  id: string;
+  scope_kind: PermissionRuleScopeKind;
+  project_cwd?: string | null;
+  provider?: ProviderKind | null;
+  tool_kind: PermissionRuleToolKind;
+  pattern_kind: PermissionRulePatternKind;
+  pattern: string;
+  decision: PermissionRuleDecision;
+  source: PermissionRuleSource;
+  note?: string | null;
+  created_at: string;
+  last_matched_at?: string | null;
+  match_count: number;
+}
+
+export interface UpsertPermissionRuleInput {
+  id?: string | null;
+  scope_kind: PermissionRuleScopeKind;
+  project_cwd?: string | null;
+  provider?: ProviderKind | null;
+  tool_kind: PermissionRuleToolKind;
+  pattern_kind: PermissionRulePatternKind;
+  pattern: string;
+  decision: PermissionRuleDecision;
+  source?: PermissionRuleSource;
+  note?: string | null;
+}
+
+export interface BatchPermissionSkipReason {
+  agent_id: string;
+  permission_request_id: string;
+  reason: string;
+}
+
+export interface ResolvePermissionsBatchResult {
+  resolved_count: number;
+  skipped_count: number;
+  skipped_reasons: BatchPermissionSkipReason[];
+}
+
 export type ImPlatform = "lark" | "telegram" | "slack" | "discord";
 export type ImTransportMode = "long_connection" | "webhook";
 export type ImConnectionStatus =
@@ -5910,6 +5967,65 @@ export const orbitIpc = {
       return { config, recent_audits: [] };
     }
     return invoke<GuardianConfigSnapshotView>("update_guardian_config", { hostId, config });
+  },
+
+  listPermissionRules: async (
+    hostId: string,
+    projectCwd?: string | null,
+  ): Promise<PermissionRuleRecord[]> => {
+    if (!isTauriRuntime()) {
+      return [];
+    }
+    return invoke<PermissionRuleRecord[]>("list_permission_rules", {
+      hostId,
+      projectCwd: projectCwd ?? null,
+    });
+  },
+
+  upsertPermissionRule: async (
+    hostId: string,
+    rule: UpsertPermissionRuleInput,
+  ): Promise<PermissionRuleRecord> => {
+    if (!isTauriRuntime()) {
+      return {
+        id: rule.id ?? `pr_mock_${Date.now()}`,
+        scope_kind: rule.scope_kind,
+        project_cwd: rule.scope_kind === "project" ? (rule.project_cwd ?? null) : null,
+        provider: rule.provider ?? null,
+        tool_kind: rule.tool_kind,
+        pattern_kind: rule.pattern_kind,
+        pattern: rule.pattern.trim(),
+        decision: rule.decision,
+        source: rule.source ?? "manual",
+        note: rule.note ?? null,
+        created_at: new Date().toISOString(),
+        last_matched_at: null,
+        match_count: 0,
+      };
+    }
+    return invoke<PermissionRuleRecord>("upsert_permission_rule", { hostId, rule });
+  },
+
+  deletePermissionRule: async (hostId: string, ruleId: string): Promise<boolean> => {
+    if (!isTauriRuntime()) {
+      return true;
+    }
+    return invoke<boolean>("delete_permission_rule", { hostId, ruleId });
+  },
+
+  resolvePermissionsBatch: async (
+    hostId: string,
+    items: Array<[string, string]>,
+    decision = "allow",
+  ): Promise<ResolvePermissionsBatchResult> => {
+    if (!isTauriRuntime()) {
+      return { resolved_count: 0, skipped_count: items.length, skipped_reasons: [] };
+    }
+    return invoke<ResolvePermissionsBatchResult>("resolve_permissions_batch", {
+      hostId,
+      items,
+      decision,
+    });
   },
 
   listImChannels: async (hostId: string): Promise<ImChannelsSnapshotView> => {

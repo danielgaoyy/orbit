@@ -615,6 +615,7 @@ export function createDefaultInitialState(
     lifecycleHooksByScope: {},
     browserByHost: {},
     guardianByHost: {},
+    permissionRulesByHost: {},
     eventTriggersByHost: {},
     imChannelsByHost: {},
     pushByHost: {},

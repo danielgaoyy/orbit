@@ -177,6 +177,7 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   lifecycleHooksByScope: "automations",
   browserByHost: "automations",
   guardianByHost: "automations",
+  permissionRulesByHost: "automations",
   eventTriggersByHost: "automations",
   imChannelsByHost: "automations",
   pushByHost: "automations",

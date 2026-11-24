@@ -28,6 +28,7 @@ import type {
   GitReviewView,
   GuardianAuditEntry,
   GuardianPolicyConfig,
+  PermissionRuleRecord,
   HookExecutionRecord,
   HostDetailView,
   ImChannelRecord,
@@ -638,6 +639,15 @@ export interface OrbitUiState {
       status: "idle" | "loading" | "ready" | "error";
       config: GuardianPolicyConfig | null;
       recentAudits: GuardianAuditEntry[];
+      saving?: boolean;
+      error?: string | null;
+    }
+  >;
+  permissionRulesByHost: Record<
+    string,
+    {
+      status: "idle" | "loading" | "ready" | "error";
+      rules: PermissionRuleRecord[];
       saving?: boolean;
       error?: string | null;
     }

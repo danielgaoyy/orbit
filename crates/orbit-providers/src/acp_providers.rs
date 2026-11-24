@@ -447,9 +447,7 @@ impl AcpStreamSegmentState {
 
 struct PendingAcpPerm {
     rpc_id: Value,
-    allow_option_id: String,
-    allow_always_option_id: String,
-    deny_option_id: String,
+    perm_options: crate::AcpPermissionOptions,
     is_question: bool,
     raw_questions: Vec<QuestionItem>,
 }
@@ -1770,19 +1768,12 @@ async fn run_acp_actor(
                     }
                     DriverCommand::ResolvePermission { request_id, decision } => {
                         if let Some(p) = pending_perms.remove(&request_id) {
-                            let chosen_opt = match decision.as_str() {
-                                "allow_always" => &p.allow_always_option_id,
-                                "allow" => &p.allow_option_id,
-                                _ => &p.deny_option_id,
-                            };
+                            let outcome = p.perm_options.outcome_for_decision(decision.as_str());
                             let resp = json!({
                                 "jsonrpc": "2.0",
                                 "id": p.rpc_id,
                                 "result": {
-                                    "outcome": {
-                                        "outcome": "selected",
-                                        "optionId": chosen_opt
-                                    }
+                                    "outcome": outcome
                                 }
                             })
                             .to_string();
@@ -1814,18 +1805,14 @@ async fn run_acp_actor(
                             .as_deref()
                             .is_some_and(|s| !s.trim().is_empty());
                         let compute_outcome = |p: &PendingAcpPerm| -> Value {
-                            let chosen_opt = match action {
+                            match action {
                                 orbit_protocol::PlanApprovalAction::ApproveAndBuild
                                     if !has_edits =>
                                 {
-                                    &p.allow_option_id
+                                    p.perm_options.outcome_for_decision("allow")
                                 }
-                                _ => &p.deny_option_id,
-                            };
-                            json!({
-                                "outcome": "selected",
-                                "optionId": chosen_opt
-                            })
+                                _ => p.perm_options.deny_outcome(),
+                            }
                         };
 
                         if matches!(action, orbit_protocol::PlanApprovalAction::ApproveAndBuild) {
@@ -1907,7 +1894,7 @@ async fn run_acp_actor(
                                 "result": {
                                     "outcome": {
                                         "outcome": "selected",
-                                        "optionId": p.allow_option_id,
+                                        "optionId": p.perm_options.question_option_id(),
                                         "updatedInput": { "answers": answers_map }
                                     }
                                 }
@@ -1991,10 +1978,7 @@ async fn run_acp_actor(
                                                 "jsonrpc": "2.0",
                                                 "id": p.rpc_id,
                                                 "result": {
-                                                    "outcome": {
-                                                        "outcome": "selected",
-                                                        "optionId": p.deny_option_id
-                                                    }
+                                                    "outcome": p.perm_options.deny_outcome()
                                                 }
                                             })
                                             .to_string();
@@ -2724,14 +2708,10 @@ fn map_acp_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCal
                 _ => None,
             })
             .unwrap_or_else(|| title.to_string());
-        let cwd = raw_in
-            .and_then(|i| i.get("cwd").or_else(|| i.get("workdir")))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .or_else(|| match prev {
-                Some(ToolCallDetail::Shell { cwd, .. }) => cwd.clone(),
-                _ => None,
-            });
+        let cwd = crate::extract_acp_shell_cwd(raw_in).or_else(|| match prev {
+            Some(ToolCallDetail::Shell { cwd, .. }) => cwd.clone(),
+            _ => None,
+        });
         let exit_code = raw_out
             .and_then(|o| o.get("exitCode").or_else(|| o.get("exit_code")))
             .and_then(Value::as_i64)
@@ -2852,39 +2832,6 @@ fn map_acp_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCal
     }
 }
 
-fn select_acp_option_id(options: &[Value], target_kind: &str, fallback_id: &str) -> String {
-    for opt in options {
-        if opt.get("kind").and_then(Value::as_str) == Some(target_kind)
-            && let Some(id) = opt.get("optionId").and_then(Value::as_str)
-        {
-            return id.to_string();
-        }
-    }
-    if target_kind == "reject_once" {
-        for opt in options {
-            if opt.get("kind").and_then(Value::as_str) == Some("reject_always")
-                && let Some(id) = opt.get("optionId").and_then(Value::as_str)
-            {
-                return id.to_string();
-            }
-        }
-    }
-    for opt in options {
-        if let Some(id) = opt.get("optionId").and_then(Value::as_str) {
-            let lower = id.to_ascii_lowercase();
-            let matched = if target_kind.starts_with("allow") {
-                lower.contains("allow") || lower.contains("approve")
-            } else {
-                lower.contains("reject") || lower.contains("deny") || lower.contains("cancel")
-            };
-            if matched {
-                return id.to_string();
-            }
-        }
-    }
-    fallback_id.to_string()
-}
-
 fn parse_acp_question_items(q_arr: &[Value]) -> Vec<QuestionItem> {
     q_arr
         .iter()
@@ -2947,9 +2894,7 @@ async fn handle_acp_permission_request(
     let tool_call = &params["toolCall"];
     let options = params["options"].as_array().cloned().unwrap_or_default();
 
-    let allow_opt = select_acp_option_id(&options, "allow_once", "allow");
-    let allow_always_opt = select_acp_option_id(&options, "allow_always", &allow_opt);
-    let deny_opt = select_acp_option_id(&options, "reject_once", "deny");
+    let perm_options = crate::AcpPermissionOptions::parse(&options);
 
     if let Some(q_arr) = tool_call
         .pointer("/rawInput/questions")
@@ -2962,9 +2907,7 @@ async fn handle_acp_permission_request(
             req_id.clone(),
             PendingAcpPerm {
                 rpc_id,
-                allow_option_id: allow_opt,
-                allow_always_option_id: allow_always_opt,
-                deny_option_id: deny_opt,
+                perm_options,
                 is_question: true,
                 raw_questions: parsed_questions.clone(),
             },
@@ -3022,7 +2965,7 @@ async fn handle_acp_permission_request(
                     "edit" | "write" | "delete" | "move" | "read" | "search"
                 )));
 
-    if auto_approve {
+    if auto_approve && let Some(ref allow_opt) = perm_options.allow_once {
         let resp = json!({
             "jsonrpc": "2.0",
             "id": rpc_id,
@@ -3049,20 +2992,19 @@ async fn handle_acp_permission_request(
                 .unwrap_or("Approve tool execution")
                 .to_string()
         });
-    let detail = map_acp_tool_detail(tool_call, None);
-    let allowed_decisions = if plan_approval.is_some() {
-        vec!["allow".into(), "deny".into()]
+    let authoritative = crate::acp_tool_call_has_authoritative_identity(tool_call);
+    let detail = if plan_approval.is_none() && !authoritative {
+        crate::acp_title_only_detail(&title, tool_call)
     } else {
-        vec!["allow".into(), "allow_always".into(), "deny".into()]
+        map_acp_tool_detail(tool_call, None)
     };
+    let allowed_decisions = perm_options.allowed_decisions(plan_approval.is_some(), authoritative);
 
     pending_perms.insert(
         req_id.clone(),
         PendingAcpPerm {
             rpc_id,
-            allow_option_id: allow_opt,
-            allow_always_option_id: allow_always_opt,
-            deny_option_id: deny_opt,
+            perm_options,
             is_question: false,
             raw_questions: Vec::new(),
         },
@@ -3210,19 +3152,21 @@ mod tests {
             } if command == "cargo test" && preview.contains("test result: ok.")
         ));
 
-        // P1 #13: reject_always and deny/cancel fallback option selection
+        // P1 #13: reject_always and deny/cancel fallback option selection + strict allow_once boundary
         let opts = vec![
             json!({"optionId": "allow_1", "kind": "allow_once"}),
             json!({"optionId": "deny_all", "kind": "reject_always"}),
         ];
         assert_eq!(
-            select_acp_option_id(&opts, "reject_once", "deny"),
-            "deny_all"
+            crate::AcpPermissionOptions::parse(&opts).deny.as_deref(),
+            Some("deny_all")
         );
         let cancel_opts = vec![json!({"optionId": "cancel_action"})];
         assert_eq!(
-            select_acp_option_id(&cancel_opts, "reject_once", "deny"),
-            "cancel_action"
+            crate::AcpPermissionOptions::parse(&cancel_opts)
+                .deny
+                .as_deref(),
+            Some("cancel_action")
         );
     }
 

@@ -29,16 +29,17 @@ use orbit_protocol::{
     LspReferenceLocation, LspServerStatus, LspSymbolInfo, LspWorkspaceEdit, LspWorkspaceEditResult,
     ManagedSkillRecord, McpProbeResult, ModelOption, MonitorWatchRecord, OrchestrationConfig,
     OrchestrationSkillInfo, PathScopedRule, PendingPermissionSummary, PermissionCheckpointRef,
-    PlanApprovalAction, PlanApprovalPayload, PromptBadge, ProviderKind, ProviderModelCatalog,
-    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent, PushDeviceRecord,
-    PushPlatform, PushPreferences, QuestionItem, QueuedPromptView, ReasoningEffort,
-    RemoteMessageSearchHit, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec, ScheduleTarget,
-    SessionMode, SkillWriteScope,
+    PermissionRuleRecord, PlanApprovalAction, PlanApprovalPayload, PromptBadge, ProviderKind,
+    ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
+    PushDeviceRecord, PushPlatform, PushPreferences, QuestionItem, QueuedPromptView,
+    ReasoningEffort, RemoteMessageSearchHit, ResolvePermissionsBatchResult, RuleTriggerMode,
+    ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode, SkillWriteScope,
     TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelineOutlinePrompt, TimelinePayload,
-    TimerCondition, ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot, WireMessage,
-    WorkflowRunRecord, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind,
-    WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo,
-    WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    TimerCondition, ToolCallDetail, ToolCallStatus, UpsertPermissionRuleInput,
+    UsageInsightsSnapshot, WireMessage, WorkflowRunRecord, WorkspaceBoardSnapshot,
+    WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
+    WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode,
+    WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -1250,6 +1251,14 @@ struct HostMemoryState {
     background_timer_list_reqs: HashSet<Uuid>,
     pending_guardian_configs:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GuardianConfigSnapshotView, String>>>,
+    pending_permission_rule_lists:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<PermissionRuleRecord>, String>>>,
+    pending_permission_rule_updates:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<PermissionRuleRecord, String>>>,
+    pending_permission_rule_deletes:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<bool, String>>>,
+    pending_permission_batch_resolves:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ResolvePermissionsBatchResult, String>>>,
     pending_goal_updates:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GoalRunRecord, String>>>,
     pending_goal_lists:
@@ -1451,6 +1460,10 @@ impl HostMemoryState {
             pending_timer_updates: HashMap::new(),
             background_timer_list_reqs: HashSet::new(),
             pending_guardian_configs: HashMap::new(),
+            pending_permission_rule_lists: HashMap::new(),
+            pending_permission_rule_updates: HashMap::new(),
+            pending_permission_rule_deletes: HashMap::new(),
+            pending_permission_batch_resolves: HashMap::new(),
             pending_goal_updates: HashMap::new(),
             pending_goal_lists: HashMap::new(),
             pending_monitor_updates: HashMap::new(),
@@ -7385,6 +7398,39 @@ impl OrbitAppCore {
                         }));
                     }
                 }
+                WireMessage::PermissionRulesSnapshot { request_id, rules } => {
+                    if let Some(tx) = state.pending_permission_rule_lists.remove(&request_id) {
+                        let _ = tx.send(Ok(rules));
+                    }
+                }
+                WireMessage::PermissionRuleUpdated { request_id, rule } => {
+                    if let Some(tx) = state.pending_permission_rule_updates.remove(&request_id) {
+                        let _ = tx.send(Ok(rule));
+                    }
+                }
+                WireMessage::PermissionRuleDeleted {
+                    request_id,
+                    deleted,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_permission_rule_deletes.remove(&request_id) {
+                        let _ = tx.send(Ok(deleted));
+                    }
+                }
+                WireMessage::PermissionsBatchResolved {
+                    request_id,
+                    resolved_count,
+                    skipped_count,
+                    skipped_reasons,
+                } => {
+                    if let Some(tx) = state.pending_permission_batch_resolves.remove(&request_id) {
+                        let _ = tx.send(Ok(ResolvePermissionsBatchResult {
+                            resolved_count,
+                            skipped_count,
+                            skipped_reasons,
+                        }));
+                    }
+                }
                 WireMessage::ImChannelsSnapshot {
                     request_id,
                     channels,
@@ -7921,6 +7967,22 @@ impl OrbitAppCore {
                         // Ignore unsupported/transient background timer list errors on older daemons.
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_guardian_configs.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_permission_rule_lists.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_permission_rule_updates.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_permission_rule_deletes.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_permission_batch_resolves.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -12512,6 +12574,7 @@ impl OrbitAppCore {
                 agent_id: agent_id.to_string(),
                 permission_request_id: permission_request_id.to_string(),
                 decision: decision.to_string(),
+                agent_originated: false,
             },
         );
     }
@@ -16394,6 +16457,308 @@ impl OrbitAppCore {
         res_rx
             .await
             .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    /// List persistent permission rules configured on a connected host (optionally filtered to a project).
+    pub async fn list_permission_rules_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        project_cwd: Option<String>,
+    ) -> Result<Vec<PermissionRuleRecord>, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to list permission rules".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_permission_rule_lists.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before listing permission rules".into()),
+                    None => Some(format!("host `{owned_host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".into()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ListPermissionRules {
+                    request_id: req_id,
+                    project_cwd,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_permission_rule_lists.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to list permission rules: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while listing permission rules".into()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_permission_rule_lists.remove(&req_id);
+                    }
+                    Err("Timed out waiting for daemon to list permission rules".into())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "list permission rules task cancelled".to_string())?
+    }
+
+    /// Create or update a persistent permission rule on a connected host.
+    pub async fn upsert_permission_rule_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        rule: UpsertPermissionRuleInput,
+    ) -> Result<PermissionRuleRecord, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to save permission rule".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_permission_rule_updates.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before saving permission rule".into()),
+                    None => Some(format!("host `{owned_host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".into()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::UpsertPermissionRule {
+                    request_id: req_id,
+                    rule,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_permission_rule_updates.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to save permission rule: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while saving permission rule".into()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_permission_rule_updates.remove(&req_id);
+                    }
+                    Err("Timed out waiting for daemon to save permission rule".into())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "upsert permission rule task cancelled".to_string())?
+    }
+
+    /// Delete/revoke a persistent permission rule on a connected host.
+    pub async fn delete_permission_rule_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        rule_id: String,
+    ) -> Result<bool, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to revoke permission rule".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_permission_rule_deletes.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before revoking permission rule".into()),
+                    None => Some(format!("host `{owned_host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".into()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::DeletePermissionRule {
+                    request_id: req_id,
+                    rule_id,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_permission_rule_deletes.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to revoke permission rule: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while revoking permission rule".into()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_permission_rule_deletes.remove(&req_id);
+                    }
+                    Err("Timed out waiting for daemon to revoke permission rule".into())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "delete permission rule task cancelled".to_string())?
+    }
+
+    /// Server-verified safe batch permission resolution on a connected host.
+    pub async fn resolve_permissions_batch_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        items: Vec<(String, String)>,
+        decision: String,
+    ) -> Result<ResolvePermissionsBatchResult, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to resolve permissions".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_permission_batch_resolves.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before batch permission approval".into()),
+                    None => Some(format!("host `{owned_host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".into()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ResolvePermissionsBatch {
+                    request_id: req_id,
+                    items,
+                    decision,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_permission_batch_resolves.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to batch resolve permissions: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while batch resolving permissions".into()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_permission_batch_resolves.remove(&req_id);
+                    }
+                    Err("Timed out waiting for daemon to batch resolve permissions".into())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "resolve permissions batch task cancelled".to_string())?
     }
 
     /// List configured bidirectional IM channels and active thread bindings on any connected host.
@@ -21694,6 +22059,18 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     }
     h.background_timer_list_reqs.clear();
     for (_, tx) in h.pending_guardian_configs.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_permission_rule_lists.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_permission_rule_updates.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_permission_rule_deletes.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_permission_batch_resolves.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_goal_updates.drain() {

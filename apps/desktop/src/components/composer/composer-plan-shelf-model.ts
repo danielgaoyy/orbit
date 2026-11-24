@@ -14,10 +14,21 @@ export const traceStatus = {
   skipped: undefined,
 } as const;
 
-export function presentPlanStep(step: SessionPlanStepView, isForegroundRunning: boolean) {
+export function presentPlanStep(
+  step: SessionPlanStepView,
+  isForegroundRunning: boolean,
+  isFromPreviousTurn = false,
+) {
   let state: PlanRowState;
   if (step.status === "in_progress") {
-    state = isForegroundRunning ? "running" : "paused";
+    if (isForegroundRunning && !isFromPreviousTurn) {
+      state = "running";
+    } else if (isForegroundRunning && isFromPreviousTurn) {
+      // Carried-over step during an active continuation turn stays neutral (neither spinning nor "(paused)").
+      state = "pending";
+    } else {
+      state = "paused";
+    }
   } else {
     state = step.status;
   }
@@ -72,14 +83,16 @@ export function describePlan(
   const isFromPreviousTurn =
     latestTurnAnchorSeq !== null && latestSeq < latestTurnAnchorSeq;
   const effectiveRunning = isForegroundRunning && !isFromPreviousTurn;
-  const rows = steps.map((step) => presentPlanStep(step, effectiveRunning));
+  const rows = steps.map((step) => presentPlanStep(step, isForegroundRunning, isFromPreviousTurn));
   const skipped = rows.filter((row) => row.state === "skipped").length;
   const done = skipped + rows.filter((row) => row.state === "completed").length;
   const failed = rows.find((row) => row.state === "failed");
+  const inProgressCarryIdx = steps.findIndex((step) => step.status === "in_progress");
   const headline =
     rows.find((row) => row.state === "running") ??
     failed ??
     rows.find((row) => row.state === "paused") ??
+    (inProgressCarryIdx >= 0 ? rows[inProgressCarryIdx] : undefined) ??
     rows.find((row) => row.state === "pending");
   const allSettled = done === rows.length;
   return {

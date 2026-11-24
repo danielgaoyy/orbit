@@ -191,7 +191,8 @@ pub(crate) fn migrate_orchestration_schema(conn: &rusqlite::Connection) -> Resul
             subagent_id     TEXT NOT NULL,
             timestamp       TEXT NOT NULL,
             payload_json    TEXT NOT NULL,
-            dedupe_key      TEXT
+            dedupe_key      TEXT,
+            updated_seq     INTEGER
         );
 
         CREATE INDEX IF NOT EXISTS idx_psub_events
@@ -199,6 +200,7 @@ pub(crate) fn migrate_orchestration_schema(conn: &rusqlite::Connection) -> Resul
         ",
     )?;
     crate::ensure_table_column(conn, "provider_subagent_events", "dedupe_key", "TEXT")?;
+    crate::ensure_table_column(conn, "provider_subagent_events", "updated_seq", "INTEGER")?;
     crate::ensure_table_column(
         conn,
         "connected_hosts",
@@ -212,6 +214,8 @@ pub(crate) fn migrate_orchestration_schema(conn: &rusqlite::Connection) -> Resul
         CREATE UNIQUE INDEX IF NOT EXISTS idx_psub_events_dedupe_uniq
             ON provider_subagent_events(parent_agent_id, subagent_id, dedupe_key)
             WHERE dedupe_key IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_psub_events_updated
+            ON provider_subagent_events(parent_agent_id, subagent_id, updated_seq);
         ",
     )?;
     let cur_ver: i64 = conn
@@ -1369,10 +1373,12 @@ impl OrbitStore {
     }
 
     /// Idempotently append or coalesce a provider-subagent timeline event.
-    /// - Identical replays (`existing_json == payload_json`) return `(existing, false)` with zero write.
+    /// - Identical replays (`existing_json == payload_json`) or terminal-status downgrades
+    ///   (`Completed`/`Failed`/`Canceled` -> `Running`) return `(existing, false)` with zero write.
     /// - Mutated updates (`existing_json != payload_json`, e.g. growing thinking or `Running -> Completed`
-    ///   tool call) atomically `DELETE` the superseded row and `INSERT` a fresh row inside an `IMMEDIATE`
-    ///   transaction so SQLite stays O(1) per logical item while `seq` strictly advances (`seq > since_seq`).
+    ///   tool call) atomically `UPDATE` the existing row in place inside an `IMMEDIATE` transaction,
+    ///   preserving its original `seq` & chronological timeline position while advancing a monotonic
+    ///   `updated_seq` cursor so incremental catchup still observes the update.
     pub fn append_provider_subagent_event_upsert(
         &self,
         parent_agent_id: &str,
@@ -1385,6 +1391,14 @@ impl OrbitStore {
         let now_str = now.to_rfc3339();
         let payload_json = serde_json::to_string(&payload)?;
         let dedupe_key = provider_subagent_dedupe_key(&payload);
+
+        let (max_seq, max_upd): (i64, i64) = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0), COALESCE(MAX(updated_seq), 0)
+             FROM provider_subagent_events",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let next_updated_seq = max_seq.max(max_upd).saturating_add(1);
 
         if let Some(ref dkey) = dedupe_key {
             let existing: Option<(i64, String, String)> = tx
@@ -1411,10 +1425,53 @@ impl OrbitStore {
                         false,
                     ));
                 }
+                if matches!(
+                    payload,
+                    TimelinePayload::ToolCall {
+                        status: orbit_protocol::ToolCallStatus::Running,
+                        ..
+                    }
+                ) && let Ok(existing_payload) =
+                    serde_json::from_str::<TimelinePayload>(&existing_json)
+                    && matches!(
+                        existing_payload,
+                        TimelinePayload::ToolCall {
+                            status: orbit_protocol::ToolCallStatus::Completed
+                                | orbit_protocol::ToolCallStatus::Failed
+                                | orbit_protocol::ToolCallStatus::Denied,
+                            ..
+                        }
+                    )
+                {
+                    tx.commit()?;
+                    return Ok((
+                        ProviderSubagentEvent {
+                            seq: existing_seq as u64,
+                            parent_agent_id: parent_agent_id.to_string(),
+                            subagent_id: subagent_id.to_string(),
+                            timestamp: parse_ts(&existing_ts),
+                            payload: existing_payload,
+                        },
+                        false,
+                    ));
+                }
                 tx.execute(
-                    "DELETE FROM provider_subagent_events WHERE seq = ?1",
-                    params![existing_seq],
+                    "UPDATE provider_subagent_events
+                     SET payload_json = ?1, updated_seq = ?2
+                     WHERE seq = ?3",
+                    params![payload_json, next_updated_seq, existing_seq],
                 )?;
+                tx.commit()?;
+                return Ok((
+                    ProviderSubagentEvent {
+                        seq: existing_seq as u64,
+                        parent_agent_id: parent_agent_id.to_string(),
+                        subagent_id: subagent_id.to_string(),
+                        timestamp: parse_ts(&existing_ts),
+                        payload,
+                    },
+                    true,
+                ));
             } else {
                 // Self-heal legacy pre-dedupe_key rows when an identical payload is replayed on restart.
                 let legacy_match: Option<(i64, String)> = tx
@@ -1452,17 +1509,25 @@ impl OrbitStore {
         }
 
         tx.execute(
-            "INSERT INTO provider_subagent_events (parent_agent_id, subagent_id, timestamp, payload_json, dedupe_key)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO provider_subagent_events
+                (parent_agent_id, subagent_id, timestamp, payload_json, dedupe_key, updated_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 parent_agent_id,
                 subagent_id,
                 now_str,
                 payload_json,
-                dedupe_key.as_deref()
+                dedupe_key.as_deref(),
+                next_updated_seq
             ],
         )?;
         let seq = tx.last_insert_rowid() as u64;
+        if (seq as i64) > next_updated_seq {
+            tx.execute(
+                "UPDATE provider_subagent_events SET updated_seq = ?1 WHERE seq = ?2",
+                params![seq as i64, seq as i64],
+            )?;
+        }
         tx.commit()?;
         Ok((
             ProviderSubagentEvent {
@@ -1488,7 +1553,9 @@ impl OrbitStore {
         let mut stmt = conn.prepare(
             "SELECT seq, parent_agent_id, subagent_id, timestamp, payload_json
              FROM provider_subagent_events
-             WHERE parent_agent_id = ?1 AND subagent_id = ?2 AND seq > ?3
+             WHERE parent_agent_id = ?1
+               AND subagent_id = ?2
+               AND COALESCE(updated_seq, seq) > ?3
              ORDER BY seq ASC
              LIMIT ?4",
         )?;

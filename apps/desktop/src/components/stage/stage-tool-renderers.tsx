@@ -245,9 +245,9 @@ export function resolveToolStepIcon(
   }
 }
 
-const SILENT_STALL_THRESHOLD_MS = 45_000;
-const THINKING_STALL_THRESHOLD_MS = 60_000;
-const QUEUED_NO_PROGRESS_THRESHOLD_MS = 30_000;
+export const SILENT_STALL_THRESHOLD_MS = 90_000;
+export const THINKING_STALL_THRESHOLD_MS = 90_000;
+export const QUEUED_NO_PROGRESS_THRESHOLD_MS = 30_000;
 
 export function computeLiveStallState({
   nowMs,
@@ -281,11 +281,15 @@ export function computeLiveStallState({
     typeof lastVisibleProgressMs === "number" &&
     effectiveActivityMs > lastVisibleProgressMs &&
     noProgressMs >= THINKING_STALL_THRESHOLD_MS;
+  // "Interrupt & continue" only makes sense when queued follow-up messages are waiting to run.
+  // With an empty queue, long silence shows the calm elapsed / waiting hint without prompting
+  // the user to falsely interrupt an active tool-argument or deep-thinking turn.
   const showInterruptContinue =
     !isNetworkOffline &&
+    queuedNotificationCount > 0 &&
     (isSilentStall ||
       isThinkingStall ||
-      (queuedNotificationCount > 0 && noProgressMs >= QUEUED_NO_PROGRESS_THRESHOLD_MS));
+      noProgressMs >= QUEUED_NO_PROGRESS_THRESHOLD_MS);
 
   return {
     elapsedMs,

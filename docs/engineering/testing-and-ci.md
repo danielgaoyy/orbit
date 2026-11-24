@@ -38,7 +38,7 @@ In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight
 
 ## 2. `e2e_pitfall_regressions` 历史踩坑回归清单
 
-[`crates/orbit-cli/tests/e2e_pitfall_regressions.rs`](../../crates/orbit-cli/tests/e2e_pitfall_regressions.rs) 固化了过往生产故障的自动化端到端拦截（其中基于 Unix Python mock / 进程组的 5 条通过 `#[cfg(unix)]` 门控，跨平台 3 条在 Linux/macOS/Windows 均运行）：
+[`crates/orbit-cli/tests/e2e_pitfall_regressions.rs`](../../crates/orbit-cli/tests/e2e_pitfall_regressions.rs) 固化了过往生产故障的自动化端到端拦截（其中基于 Unix Python mock / 进程组的 6 条通过 `#[cfg(unix)]` 门控，跨平台 3 条在 Linux/macOS/Windows 均运行）：
 
 | 用例名 | 平台 | 覆盖的历史生产故障 |
 | --- | --- | --- |
@@ -50,6 +50,7 @@ In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight
 | `pitfall_06_late_assistant_finalization_cross_turn_dedup_over_ws` | 全平台 | WebSocket 层跨轮次迟到 assistant finalize 消息去重 |
 | `pitfall_07_archive_agent_terminates_only_target_shim_pgid_without_signaling_siblings` | Unix | 归档会话终止目标 `orbit shim` / PGID 时仅杀目标进程组，绝不因缺少 `--` 误触发 `kill(-1)` 波及同级会话或无关进程 |
 | `pitfall_08_multi_agent_non_interrupting_delivery_and_stall_recovery` | Unix | Antigravity + Codex + Claude 多代理非打断异步投递（`0 session/cancel` + `Queued -> Dispatched -> Settled` FIFO）、纯思考停滞检测（`latest_visible_progress_ms < latest_activity_ms`）+ 保队列打断继续（`interrupt_agent_and_continue`）及人类抢占重排优先顺序 |
+| `pitfall_09_antigravity_interrupt_steer_bg_isolation_subagent_order_and_stderr` | Unix | Antigravity 会话标题实时同步（`session_info_update`）、多命令 Shell 与后台任务隔离防劫持、打断/Steer 事务回滚上下文交接 + 原位 `bg_task` 收敛 + 抢占轮次用量补记（`usage_ledger`）、空队列 `InterruptAndDrainQueue` 干净回 `Idle`、原生子代理前后台实时轮询 + 中途取消 + 重启回放 `seq` 保序及致命 `stderr` 错误提示上浮 |
 
 > **编写规则**：凡修复涉及消息流转、分端状态同步、Relay 建连或并行协作的生产 Bug，必须在同一 PR 中新增最小复现回归用例。
 

@@ -1,8 +1,9 @@
-import { memo, useMemo } from "react";
+import { memo, useMemo, useRef } from "react";
 import { AlertTriangle } from "lucide-react";
 import { MarkdownBlocksView, MarkdownLinkProvider } from "@/components/markdown-blocks";
 import { AgentMessageCard } from "@/components/stage/subagents-track";
 import { ContextBanner } from "@/components/ui/context-banner";
+import { useLiveSecondClock } from "@/lib/live-clock";
 import type {
   ArtifactSummary,
   PromptBadge,
@@ -115,6 +116,83 @@ const StageAssistantMessageSegment = memo(function StageAssistantMessageSegment(
         </div>
       )}
     </div>
+  );
+});
+
+export const STREAMING_TAIL_SILENCE_THRESHOLD_MS = 10_000;
+
+export function shouldShowStreamingTailActivity(
+  nowMs: number,
+  lastActivityMs: number | null | undefined,
+  thresholdMs = STREAMING_TAIL_SILENCE_THRESHOLD_MS,
+): boolean {
+  if (typeof lastActivityMs !== "number" || !Number.isFinite(lastActivityMs) || lastActivityMs <= 0) {
+    return false;
+  }
+  return Math.max(0, nowMs - lastActivityMs) >= thresholdMs;
+}
+
+const StreamingTrailingActivity = memo(function StreamingTrailingActivity({
+  liveStartedAtMs,
+  latestActivityMs,
+  latestVisibleProgressMs,
+  queuedNotificationCount,
+  onInterruptAndContinue,
+  isNetworkOffline,
+  autoFoldCompleted,
+  cwd,
+  agentId,
+  thinkingSignature,
+  getThinkingDurationMs,
+  holdViewport,
+}: {
+  liveStartedAtMs: number | null;
+  latestActivityMs: number | null | undefined;
+  latestVisibleProgressMs: number | null | undefined;
+  queuedNotificationCount: number;
+  onInterruptAndContinue?: (() => void) | null;
+  isNetworkOffline: boolean;
+  autoFoldCompleted: boolean;
+  cwd: string;
+  agentId: string;
+  thinkingSignature: string;
+  getThinkingDurationMs: ThinkingDurationLookupFn;
+  holdViewport: ViewportAnchorHoldFn;
+}) {
+  const { t } = useI18n();
+  const fallbackStartRef = useRef<number>(Date.now());
+  const nowMs = useLiveSecondClock(true);
+  const effectiveLastActivityMs = latestActivityMs ?? liveStartedAtMs ?? fallbackStartRef.current;
+
+  if (!shouldShowStreamingTailActivity(nowMs, effectiveLastActivityMs)) {
+    return null;
+  }
+
+  return (
+    <TurnActivityDisclosure
+      items={EMPTY_TIMELINE_ITEMS}
+      isWorkActive
+      liveLabel={t("stage.working")}
+      liveDetail={null}
+      settledLabel=""
+      summaryCounts={EMPTY_WORK_COUNTS}
+      labelIncludesFailure={false}
+      defaultCollapsed={autoFoldCompleted}
+      autoOpenForError={false}
+      liveStartedAtMs={liveStartedAtMs}
+      latestActivityMs={effectiveLastActivityMs}
+      latestVisibleProgressMs={latestVisibleProgressMs ?? effectiveLastActivityMs}
+      queuedNotificationCount={queuedNotificationCount}
+      onInterruptAndContinue={onInterruptAndContinue}
+      isNetworkOffline={isNetworkOffline}
+      isBackgroundWait={false}
+      settledDurationMs={null}
+      cwd={cwd}
+      agentId={agentId}
+      thinkingSignature={thinkingSignature}
+      getThinkingDurationMs={getThinkingDurationMs}
+      holdViewport={holdViewport}
+    />
   );
 });
 
@@ -271,6 +349,14 @@ export const TurnStageSection = memo(function TurnStageSection({
       lastRawSeg.kind === "compaction" ||
       lastRawSeg.kind === "agent_message" ||
       isTrailingSettledDelegation);
+
+  const isStreamingTrailingAssistant =
+    isTurnActive &&
+    !isWaitingOnlyOnBackgroundTasks &&
+    lastRawSeg !== null &&
+    lastRawSeg.kind === "assistant_message" &&
+    lastRawSeg.item.item_type === "assistant_message" &&
+    lastRawSeg.item.streaming;
 
   const hasBody = segments.length > 0 || finishStatuses.size > 0 || needsTrailingActivity;
   const hasBodyContent = segments.length > 0 || needsTrailingActivity ||
@@ -613,6 +699,25 @@ export const TurnStageSection = memo(function TurnStageSection({
                 />
               );
             })()}
+
+            {!needsTrailingActivity && isStreamingTrailingAssistant && (
+              <StreamingTrailingActivity
+                liveStartedAtMs={liveStartedAtMs}
+                latestActivityMs={
+                  turn.latest_activity_ms ?? turn.completed_at_ms ?? liveStartedAtMs
+                }
+                latestVisibleProgressMs={turn.latest_visible_progress_ms ?? liveStartedAtMs}
+                queuedNotificationCount={queuedNotificationCount}
+                onInterruptAndContinue={onInterruptAndContinue}
+                isNetworkOffline={isNetworkOffline}
+                autoFoldCompleted={autoFoldCompleted}
+                cwd={cwd}
+                agentId={agentId}
+                thinkingSignature={_thinkingSignature}
+                getThinkingDurationMs={getThinkingDurationMs}
+                holdViewport={holdViewport}
+              />
+            )}
 
             {!isTurnActive && <TurnChangesBar diffs={turn.turn_diffs} cwd={cwd} />}
           </div>

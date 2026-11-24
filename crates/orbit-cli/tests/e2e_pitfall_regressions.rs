@@ -7,6 +7,7 @@
 //! 6. Cross-turn late assistant finalization dedup over live WebSocket & fresh catchup
 //! 7. Archiving an agent kills ONLY that agent's shim/PGID without broadcast-signaling siblings (`--` before `-<pgid>`)
 //! 8. Multi-agent non-interrupting subagent/peer delivery, thinking-stall progress telemetry, queue-preserving interrupt, and human preemption ordering
+//! 9. Antigravity interrupt/steer rollback handoff, empty-queue InterruptAndDrainQueue, multi-command shell isolation, native subagent live foreground polling + cancel + restart seq preservation, stderr notices, session_info_update title, and preempted-turn usage ledger
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -21,8 +22,9 @@ use orbit_client_core::{HostConnectionState, connect_via_relay};
 use orbit_daemon::manager::DaemonBroadcast;
 use orbit_daemon::{DaemonRuntime, spawn_embedded_daemon};
 use orbit_protocol::{
-    AgentMessageDeliveryStatus, AgentSummary, AttentionState, ProviderKind, SessionMode,
-    TimelinePayload, ToolCallDetail, ToolCallStatus, WorkspaceSetupStatus, WorkspaceSummary,
+    AgentMessageDeliveryStatus, AgentSummary, AttentionState, ProviderKind, ProviderSubagentStatus,
+    SessionMode, TimelinePayload, ToolCallDetail, ToolCallStatus, WorkspaceSetupStatus,
+    WorkspaceSummary,
 };
 use orbit_relay::{RelayConfig, run_relay};
 use uuid::Uuid;
@@ -502,7 +504,9 @@ if "--version" in sys.argv[1:]:
 STDIN_FD = sys.stdin.fileno()
 READ_BUF = bytearray()
 PENDING_LINES = collections.deque()
-SESSION_ID = "mock-agy-sess-1"
+SESSION_ID = f"mock-agy-sess-{os.getpid()}"
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agy_data")
+STEP_SEQ = 0
 CWD = os.getcwd()
 TRACE_PATH = os.path.join(CWD, ".mock_acp_trace.jsonl")
 MCP_URL = os.environ.get("ORBIT_MCP_URL")
@@ -513,6 +517,15 @@ if os.environ.get("ORBIT_MCP_TOKEN"):
 def emit(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
+
+def append_transcript(session_id, steps):
+    logs_dir = os.path.join(DATA_DIR, "brain", session_id, ".system_generated", "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    path = os.path.join(logs_dir, "transcript_full.jsonl")
+    with open(path, "a", encoding="utf-8") as fh:
+        for st in steps:
+            fh.write(json.dumps(st) + "\n")
+        fh.flush()
 
 def log_trace(entry):
     with open(TRACE_PATH, "a", encoding="utf-8") as fh:
@@ -625,6 +638,8 @@ while True:
         if params.get("cwd"):
             CWD = params["cwd"]
             TRACE_PATH = os.path.join(CWD, ".mock_acp_trace.jsonl")
+        if method == "session/load" and params.get("sessionId"):
+            SESSION_ID = params["sessionId"]
         configure_mcp(params.get("mcpServers"))
         emit({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": SESSION_ID}})
         continue
@@ -644,6 +659,192 @@ while True:
     text = strip_envelopes(raw_text)
     kv = parse_kv(text)
     log_trace({"method": "session/prompt", "text": text})
+
+    if kv.get("TITLE"):
+        emit({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": SESSION_ID,
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "title": kv["TITLE"].replace("_", " "),
+                },
+            },
+        })
+
+    if kv.get("STDERR_MSG"):
+        sys.stderr.write(kv["STDERR_MSG"].replace("_", " ") + "\n")
+        sys.stderr.flush()
+
+    if kv.get("BG_SHELL_GATE"):
+        call_suffix = kv.get("BG_TAG", "1")
+        bg_cmd = f'python3 -c "import time; time.sleep(60) # {call_suffix}"'
+        emit({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": SESSION_ID,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": f"call_done_py_{call_suffix}",
+                    "kind": "execute",
+                    "status": "completed",
+                    "rawInput": {"CommandLine": 'python3 -c "print(1)"'},
+                    "rawOutput": {"exitCode": 0, "stdout": "1\n"},
+                },
+            },
+        })
+        emit({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": SESSION_ID,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": f"call_bg_py_{call_suffix}",
+                    "kind": "execute",
+                    "status": "in_progress",
+                    "rawInput": {"CommandLine": bg_cmd},
+                },
+            },
+        })
+        s0, s1, s2 = STEP_SEQ, STEP_SEQ + 1, STEP_SEQ + 2
+        STEP_SEQ += 3
+        append_transcript(SESSION_ID, [
+            {
+                "step_index": s0,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "content": "",
+                "tool_calls": [
+                    {"id": f"tp_done_{s0}", "name": "run_command", "args": {"CommandLine": 'python3 -c "print(1)"'}},
+                    {"id": f"tp_bg_{s0}", "name": "run_command", "args": {"CommandLine": bg_cmd}},
+                ],
+            },
+            {"step_index": s1, "type": "GENERIC", "status": "DONE", "content": "1\n"},
+            {
+                "step_index": s2,
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": f"Tool is running as a background task with task id: {SESSION_ID}/task-{s2}\nTask Description: python3 -c",
+            },
+        ])
+        if kv.get("EMIT_UNCOMMITTED_PROSE") == "1":
+            emit({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": SESSION_ID,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "PARTIAL_P9_ROLLBACK"},
+                    },
+                },
+            })
+
+    if kv.get("SUBAGENT_CANCEL_ID"):
+        sub_c = kv["SUBAGENT_CANCEL_ID"]
+        emit({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": SESSION_ID,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_sub_cancel",
+                    "title": "Invoke subagent",
+                    "status": "completed",
+                    "rawInput": {"Role": "P9 Live Worker", "Prompt": "Analyze runtime"},
+                    "content": [{
+                        "type": "content",
+                        "content": {
+                            "type": "text",
+                            "text": f"Created subagent: conversationId={sub_c}",
+                        },
+                    }],
+                },
+            },
+        })
+        append_transcript(sub_c, [
+            {
+                "step_index": 0,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "thinking": "P9 live subagent inspecting",
+                "content": "",
+                "tool_calls": [{"id": "p9_sub_tool", "name": "run_command", "args": {"CommandLine": "sleep 30"}}],
+            },
+            {
+                "step_index": 1,
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": f"Tool is running as a background task with task id: {sub_c}/task-1\nTask Description: sleep 30",
+            },
+        ])
+
+    if kv.get("SUBAGENT_DONE_ID"):
+        sub_d = kv["SUBAGENT_DONE_ID"]
+        s0, s1 = STEP_SEQ, STEP_SEQ + 1
+        STEP_SEQ += 2
+        append_transcript(SESSION_ID, [
+            {
+                "step_index": s0,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "content": "",
+                "tool_calls": [{"id": f"call_sub_done_{s0}", "name": "invoke_subagent", "args": {"Role": "P9 Done Worker", "Prompt": "Summarize module"}}],
+            },
+            {
+                "step_index": s1,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": f'Created the following subagent: {{"conversationId": "{sub_d}"}}',
+            },
+        ])
+        emit({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": SESSION_ID,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": f"call_sub_done_{s0}",
+                    "title": "Invoke subagent",
+                    "status": "completed",
+                    "rawInput": {"Role": "P9 Done Worker", "Prompt": "Summarize module"},
+                    "content": [{
+                        "type": "content",
+                        "content": {
+                            "type": "text",
+                            "text": f'Created the following subagent: {{"conversationId": "{sub_d}"}}',
+                        },
+                    }],
+                },
+            },
+        })
+        append_transcript(sub_d, [
+            {
+                "step_index": 0,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "thinking": "P9 done thinking",
+                "content": "",
+                "tool_calls": [{"id": "p9_done_tool", "name": "read_file", "args": {"Path": "/repo/Cargo.toml"}}],
+            },
+            {
+                "step_index": 1,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "read Cargo.toml ok",
+            },
+            {
+                "step_index": 2,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "content": "P9 done summary",
+            },
+        ])
 
     if kv.get("SPAWN_CODEX_PROMPT"):
         mcp_call("create_agent", {
@@ -2932,4 +3133,569 @@ async fn pitfall_08_multi_agent_non_interrupting_delivery_and_stall_recovery() {
 
     drop_core(core).await;
     drop(rt);
+}
+
+// ============================================================================
+// PITFALL 9: Antigravity Interrupt/Steer, Shell Isolation, Subagent Seq & Stderr
+// ============================================================================
+#[cfg(unix)]
+fn collect_stage_items(stage: &orbit_client_core::stage::AgentStageView) -> Vec<&TimelineItemView> {
+    let mut out = Vec::new();
+    for turn in &stage.turns {
+        for item in &turn.folded_steps {
+            out.push(item);
+        }
+        for seg in &turn.live_segments {
+            match seg {
+                TurnLiveSegmentView::StepGroup { items, .. } => {
+                    for item in items {
+                        out.push(item);
+                    }
+                }
+                TurnLiveSegmentView::AssistantMessage { item, .. }
+                | TurnLiveSegmentView::AgentMessage { item, .. }
+                | TurnLiveSegmentView::Notice { item, .. } => out.push(item),
+                TurnLiveSegmentView::Compaction { .. } | TurnLiveSegmentView::Wakeup { .. } => {}
+            }
+        }
+        if let Some(ref item) = turn.terminal_reply {
+            out.push(item);
+        }
+        if let Some(ref item) = turn.agent_message {
+            out.push(item);
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pitfall_09_antigravity_interrupt_steer_bg_isolation_subagent_order_and_stderr() {
+    install_mock_script(
+        &MOCK_ANTIGRAVITY_PATH,
+        ProviderKind::Antigravity,
+        "mock_agy_reg.py",
+        MOCK_ANTIGRAVITY_SCRIPT,
+    );
+    let agy_data_dir = base_tmp_dir()
+        .join(format!("orb_reg_mocks_{}", std::process::id()))
+        .join("agy_data");
+    std::fs::create_dir_all(&agy_data_dir).expect("mkdir agy_data");
+    orbit_providers::antigravity::set_agy_data_dir_override(Some(agy_data_dir.clone()));
+
+    let home = new_temp_dir("p9_h");
+    let work = new_temp_dir("p9_w");
+    let trace_path = work.join(".mock_acp_trace.jsonl");
+
+    let (addr, rt) = spawn_embedded_daemon(home.to_path_buf(), None)
+        .await
+        .expect("spawn daemon");
+    let uri = rt
+        .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("offer")
+        .to_qr_uri()
+        .expect("uri");
+    let (core, host_id) = open_and_connect_core(home.join("c9_1.db"), uri).await;
+
+    // ------------------------------------------------------------------------
+    // Scenario 1: `session_info_update` updates title + usage ledger recorded
+    // ------------------------------------------------------------------------
+    core.create_agent(
+        &host_id,
+        &work.to_string_lossy(),
+        ProviderKind::Antigravity,
+        SessionMode::FullAccess,
+        "TITLE=Fix_auth_token_refresh ECHO=P9_BOOT",
+        None,
+    );
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            async move {
+                c.host_detail(&hid).is_some_and(|d| {
+                    d.agents.iter().any(|a| {
+                        !a.agent_id.starts_with("opt_")
+                            && a.provider == ProviderKind::Antigravity
+                            && !a.is_running
+                            && a.latest_seq > 0
+                    })
+                })
+            }
+        })
+        .await,
+        "Antigravity agent must boot and finish initial turn"
+    );
+    let agent_id = core
+        .host_detail(&host_id)
+        .expect("host detail")
+        .agents
+        .into_iter()
+        .find(|a| !a.agent_id.starts_with("opt_") && a.provider == ProviderKind::Antigravity)
+        .expect("agent card")
+        .agent_id;
+    core.open_agent_timeline(&host_id, &agent_id);
+
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = agent_id.clone();
+            async move {
+                let title_ok = c.host_detail(&hid).is_some_and(|d| {
+                    d.agents
+                        .into_iter()
+                        .find(|a| a.agent_id == aid)
+                        .is_some_and(|a| a.title == "Fix auth token refresh")
+                });
+                title_ok && stage_settled_with_text(&c, &hid, &aid, "REPLY=P9_BOOT")
+            }
+        })
+        .await,
+        "session_info_update must update title to 'Fix auth token refresh'"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let store = Arc::clone(&rt.store);
+            let aid = agent_id.clone();
+            async move {
+                store
+                    .list_usage_entries_since(0)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|u| u.agent_id == aid)
+            }
+        })
+        .await,
+        "Turn 1 fallback usage ledger entry must be recorded"
+    );
+
+    // ------------------------------------------------------------------------
+    // Scenario 2: Multi-command shell isolation + Human Steer rollback handoff
+    //             + in-place bg settlement + preempted-turn usage ledger
+    // ------------------------------------------------------------------------
+    let gate_steer = work.join("p9_gate_steer.flag");
+    let usage_before_steer = rt
+        .store
+        .list_usage_entries_since(0)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|u| u.agent_id == agent_id)
+        .count();
+    core.send_prompt(
+        &host_id,
+        &agent_id,
+        &format!(
+            "BG_SHELL_GATE=1 BG_TAG=s2 EMIT_UNCOMMITTED_PROSE=1 WAIT_FILE={} ECHO=NEVER_COMPLETE",
+            gate_steer.display()
+        ),
+    );
+    assert!(
+        wait_until(Duration::from_secs(12), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = agent_id.clone();
+            async move {
+                let st = c.agent_stage(&hid, &aid);
+                let items = collect_stage_items(&st);
+                let done_ok = items.iter().any(|it| {
+                    matches!(
+                        it,
+                        TimelineItemView::ToolCall {
+                            call_id,
+                            status: ToolCallStatus::Completed,
+                            background_task: None,
+                            ..
+                        } if call_id == "call_done_py_s2"
+                    )
+                });
+                let bg_running = items.iter().any(|it| {
+                    matches!(
+                        it,
+                        TimelineItemView::ToolCall {
+                            call_id,
+                            status: ToolCallStatus::Running,
+                            background_task: Some(_),
+                            ..
+                        } if call_id == "call_bg_py_s2"
+                    )
+                });
+                let partial_ok = st.turns.iter().any(|t| {
+                    turn_reply_texts(t)
+                        .iter()
+                        .any(|txt| txt.contains("PARTIAL_P9_ROLLBACK"))
+                });
+                done_ok && bg_running && partial_ok
+            }
+        })
+        .await,
+        "call_done_py_s2 must stay Completed without hijack while call_bg_py_s2 binds bg task and PARTIAL_P9_ROLLBACK streams"
+    );
+
+    // Human Steer interrupts Turn 2 mid-stream.
+    core.send_prompt(&host_id, &agent_id, "ECHO=AFTER_STEER_2");
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = agent_id.clone();
+            async move { stage_settled_with_text(&c, &hid, &aid, "REPLY=AFTER_STEER_2") }
+        })
+        .await,
+        "Human steer must cancel Turn 2 and complete Turn 3 REPLY=AFTER_STEER_2"
+    );
+
+    let st_after_steer = core.agent_stage(&host_id, &agent_id);
+    let turn_idx_done = st_after_steer
+        .turns
+        .iter()
+        .position(|t| turn_user_prompt_text(t).contains("BG_TAG=s2"))
+        .expect("Turn 2 present");
+    let turn_idx_steer = st_after_steer
+        .turns
+        .iter()
+        .position(|t| turn_user_prompt_text(t).contains("ECHO=AFTER_STEER_2"))
+        .expect("Turn 3 present");
+    assert!(turn_idx_done < turn_idx_steer);
+    let steer_turn_user_seq = st_after_steer.turns[turn_idx_steer].anchor_seq;
+    let items_after_steer = collect_stage_items(&st_after_steer);
+    assert!(
+        items_after_steer.iter().any(|it| {
+            matches!(
+                it,
+                TimelineItemView::ToolCall {
+                    call_id,
+                    status: ToolCallStatus::Completed,
+                    background_task: None,
+                    ..
+                } if call_id == "call_done_py_s2"
+            )
+        }),
+        "call_done_py_s2 must remain Completed (never regressed to Running or hijacked)"
+    );
+    let bg_item_seq = items_after_steer
+        .iter()
+        .find_map(|it| match it {
+            TimelineItemView::ToolCall {
+                seq,
+                call_id,
+                status: ToolCallStatus::Failed,
+                ..
+            } if call_id == "call_bg_py_s2" => Some(*seq),
+            _ => None,
+        })
+        .expect("call_bg_py_s2 must be settled Failed in place");
+    assert!(
+        bg_item_seq < steer_turn_user_seq,
+        "cancelled call_bg_py_s2 seq ({bg_item_seq}) must remain BEFORE Turn 3 UserPrompt seq ({steer_turn_user_seq})"
+    );
+
+    let trace = read_mock_acp_trace(&trace_path);
+    let steer_prompt_entry = trace
+        .iter()
+        .filter(|e| e.get("method").and_then(|v| v.as_str()) == Some("session/prompt"))
+        .find_map(|e| {
+            let t = e.get("text").and_then(|v| v.as_str())?;
+            t.contains("ECHO=AFTER_STEER_2").then_some(t.to_string())
+        })
+        .expect("steer prompt traced");
+    assert!(
+        steer_prompt_entry.contains("[Interrupted Prior Turn Context]")
+            && steer_prompt_entry.contains("PARTIAL_P9_ROLLBACK"),
+        "Steer turn must carry rollback handoff of uncommitted Turn 2 partial prose, got: {steer_prompt_entry}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let store = Arc::clone(&rt.store);
+            let aid = agent_id.clone();
+            async move {
+                store
+                    .list_usage_entries_since(0)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|u| u.agent_id == aid)
+                    .count()
+                    >= usage_before_steer + 2
+            }
+        })
+        .await,
+        "preempted Turn 2 AND Turn 3 must both record fallback usage_ledger entries"
+    );
+
+    // ------------------------------------------------------------------------
+    // Scenario 3: Empty-queue `interrupt_agent_and_continue` settles to Idle (not bgwait)
+    // ------------------------------------------------------------------------
+    let gate_empty_iq = work.join("p9_gate_empty_iq.flag");
+    core.send_prompt(
+        &host_id,
+        &agent_id,
+        &format!(
+            "BG_SHELL_GATE=1 BG_TAG=s3 WAIT_FILE={} ECHO=NEVER_COMPLETE",
+            gate_empty_iq.display()
+        ),
+    );
+    assert!(
+        wait_until(Duration::from_secs(12), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = agent_id.clone();
+            async move {
+                let st = c.agent_stage(&hid, &aid);
+                collect_stage_items(&st).iter().any(|it| {
+                    matches!(
+                        it,
+                        TimelineItemView::ToolCall {
+                            call_id,
+                            status: ToolCallStatus::Running,
+                            background_task: Some(_),
+                            ..
+                        } if call_id == "call_bg_py_s3"
+                    )
+                })
+            }
+        })
+        .await,
+        "call_bg_py_s3 must attach background task"
+    );
+    core.interrupt_agent_and_continue(&host_id, &agent_id);
+    assert!(
+        wait_until(Duration::from_secs(12), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = agent_id.clone();
+            async move {
+                let card_idle = c.host_detail(&hid).is_some_and(|d| {
+                    d.agents
+                        .into_iter()
+                        .find(|a| a.agent_id == aid)
+                        .is_some_and(|a| !a.is_running && !a.has_background_tasks)
+                });
+                let st = c.agent_stage(&hid, &aid);
+                let bg_failed = collect_stage_items(&st).iter().any(|it| {
+                    matches!(
+                        it,
+                        TimelineItemView::ToolCall {
+                            call_id,
+                            status: ToolCallStatus::Failed,
+                            ..
+                        } if call_id == "call_bg_py_s3"
+                    )
+                });
+                card_idle && bg_failed
+            }
+        })
+        .await,
+        "empty-queue InterruptAndDrainQueue must settle open bg task Failed and reach Idle without phantom bgwait"
+    );
+
+    // ------------------------------------------------------------------------
+    // Scenario 4: Subagent live foreground polling + mid-flight cancel +
+    //             completed subagent seq order preserved across daemon restart replay
+    // ------------------------------------------------------------------------
+    let sub_done_id = Uuid::new_v4().to_string();
+    core.send_prompt(
+        &host_id,
+        &agent_id,
+        &format!("SUBAGENT_DONE_ID={sub_done_id} ECHO=SUB_DONE_PARENT"),
+    );
+    core.list_provider_subagents(&host_id, &agent_id);
+    core.open_provider_subagent_timeline(&host_id, &agent_id, &sub_done_id);
+    assert!(
+        wait_until(Duration::from_secs(12), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = agent_id.clone();
+            let sid = sub_done_id.clone();
+            async move {
+                c.list_provider_subagents(&hid, &aid);
+                let evs = c.provider_subagent_timeline(&hid, &aid, &sid);
+                evs.len() == 3 && stage_settled_with_text(&c, &hid, &aid, "REPLY=SUB_DONE_PARENT")
+            }
+        })
+        .await,
+        "SUBAGENT_DONE_ID must record 3 events [thinking, tool(Completed), msg]"
+    );
+    let pre_restart_evs = core.provider_subagent_timeline(&host_id, &agent_id, &sub_done_id);
+    assert!(matches!(
+        pre_restart_evs[0].payload,
+        TimelinePayload::AssistantThinking { .. }
+    ));
+    assert!(matches!(
+        pre_restart_evs[1].payload,
+        TimelinePayload::ToolCall {
+            status: ToolCallStatus::Completed,
+            ..
+        }
+    ));
+    assert!(matches!(
+        pre_restart_evs[2].payload,
+        TimelinePayload::AssistantMessage { .. }
+    ));
+
+    // Now launch live subagent that hangs until parent is interrupted.
+    let sub_cancel_id = Uuid::new_v4().to_string();
+    let gate_sub = work.join("p9_gate_sub.flag");
+    core.send_prompt(
+        &host_id,
+        &agent_id,
+        &format!(
+            "SUBAGENT_CANCEL_ID={sub_cancel_id} WAIT_FILE={} ECHO=NEVER_SUB",
+            gate_sub.display()
+        ),
+    );
+    core.open_provider_subagent_timeline(&host_id, &agent_id, &sub_cancel_id);
+    assert!(
+        wait_until(Duration::from_secs(12), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = agent_id.clone();
+            let sid = sub_cancel_id.clone();
+            async move {
+                c.list_provider_subagents(&hid, &aid);
+                let is_running_desc = c
+                    .host_detail(&hid)
+                    .and_then(|d| d.provider_subagents.get(&aid).cloned())
+                    .is_some_and(|list| {
+                        list.iter().any(|s| {
+                            s.subagent_id == sid && s.status == ProviderSubagentStatus::Running
+                        })
+                    });
+                let evs = c.provider_subagent_timeline(&hid, &aid, &sid);
+                let has_th = evs
+                    .iter()
+                    .any(|e| matches!(e.payload, TimelinePayload::AssistantThinking { .. }));
+                let has_tool = evs.iter().any(|e| {
+                    matches!(
+                        e.payload,
+                        TimelinePayload::ToolCall {
+                            ref call_id,
+                            status: ToolCallStatus::Running,
+                            ..
+                        } if call_id == "p9_sub_tool"
+                    )
+                });
+                is_running_desc && has_th && has_tool
+            }
+        })
+        .await,
+        "native subagent Running descriptor, thinking, and tool call must stream live while parent is STILL running"
+    );
+
+    core.interrupt_agent(&host_id, &agent_id);
+    assert!(
+        wait_until(Duration::from_secs(12), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = agent_id.clone();
+            let sid = sub_cancel_id.clone();
+            async move {
+                c.list_provider_subagents(&hid, &aid);
+                let canceled_desc = c
+                    .host_detail(&hid)
+                    .and_then(|d| d.provider_subagents.get(&aid).cloned())
+                    .is_some_and(|list| {
+                        list.iter().any(|s| {
+                            s.subagent_id == sid && s.status == ProviderSubagentStatus::Canceled
+                        })
+                    });
+                let evs = c.provider_subagent_timeline(&hid, &aid, &sid);
+                let settled_tool = evs.iter().any(|e| {
+                    matches!(
+                        e.payload,
+                        TimelinePayload::ToolCall {
+                            ref call_id,
+                            status: ToolCallStatus::Failed,
+                            ..
+                        } if call_id == "p9_sub_tool"
+                    )
+                });
+                canceled_desc && settled_tool
+            }
+        })
+        .await,
+        "interrupting parent must cancel subagent and settle open subagent tool Failed"
+    );
+
+    // ------------------------------------------------------------------------
+    // Scenario 5: Stderr fatal error notice surfaces as Notice { level: "error" }
+    // ------------------------------------------------------------------------
+    core.send_prompt(
+        &host_id,
+        &agent_id,
+        "STDERR_MSG=FATAL:_No_space_left_on_device ECHO=ERR_SURFACED",
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = agent_id.clone();
+            async move {
+                let st = c.agent_stage(&hid, &aid);
+                let has_notice = collect_stage_items(&st).iter().any(|it| {
+                    matches!(
+                        it,
+                        TimelineItemView::Notice { level, message, .. }
+                            if level == "error" && message.contains("No space left on device")
+                    )
+                });
+                has_notice && stage_settled_with_text(&c, &hid, &aid, "REPLY=ERR_SURFACED")
+            }
+        })
+        .await,
+        "stderr disk-full line must surface as error Notice in timeline"
+    );
+
+    // Restart embedded daemon against same `home` (`orbit.db` + `agy_data` transcripts) and
+    // verify `sub_done_id` replay preserves `[thinking, tool(Completed), msg]` order & zero dupes!
+    drop_core(core).await;
+    drop(rt);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let (addr2, rt2) = spawn_embedded_daemon(home.to_path_buf(), None)
+        .await
+        .expect("respawn daemon");
+    let uri2 = rt2
+        .build_pairing_offer(vec![format!("ws://{addr2}/ws")], None)
+        .expect("offer 2")
+        .to_qr_uri()
+        .expect("uri 2");
+    let (core2, host_id2) = open_and_connect_core(home.join("c9_2.db"), uri2).await;
+    core2.open_agent_timeline(&host_id2, &agent_id);
+    core2.list_provider_subagents(&host_id2, &agent_id);
+    core2.open_provider_subagent_timeline(&host_id2, &agent_id, &sub_done_id);
+    assert!(
+        wait_until(Duration::from_secs(12), || {
+            let c = Arc::clone(&core2);
+            let hid = host_id2.clone();
+            let aid = agent_id.clone();
+            let sid = sub_done_id.clone();
+            async move { c.provider_subagent_timeline(&hid, &aid, &sid).len() >= 3 }
+        })
+        .await,
+        "restarted daemon + fresh client must hydrate replayed subagent timeline"
+    );
+    let post_restart_evs = core2.provider_subagent_timeline(&host_id2, &agent_id, &sub_done_id);
+    assert_eq!(
+        post_restart_evs.len(),
+        3,
+        "daemon restart replay must produce zero duplicates, got: {post_restart_evs:?}"
+    );
+    assert!(matches!(
+        post_restart_evs[0].payload,
+        TimelinePayload::AssistantThinking { .. }
+    ));
+    assert!(matches!(
+        post_restart_evs[1].payload,
+        TimelinePayload::ToolCall {
+            status: ToolCallStatus::Completed,
+            ..
+        }
+    ));
+    assert!(matches!(
+        post_restart_evs[2].payload,
+        TimelinePayload::AssistantMessage { .. }
+    ));
+
+    drop_core(core2).await;
+    drop(rt2);
 }

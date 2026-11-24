@@ -17,7 +17,8 @@
 | 路径 | 管辖范围 (Scope Globs) | 何时必须先读 (Mandatory Pre-Read Trigger) | 权威边界 (Source of Truth) | 同步更新触发器 (Keep-in-Sync) |
 | --- | --- | --- | --- | --- |
 | `AGENTS.md` | `**` | 每次进入仓库开始任何任务时必读 | 6 条核心架构与工程红线（含全局同源排查与联动预检）、PR-First 流程铁律、任务触发路由表（硬上限 ≤ 140 行 / 8 KB） | 修改核心红线、发版流程或新增专题/领域文档入口 |
-| `README.md` | `README.md` | 对外介绍能力矩阵、快速安装与源码构建命令时 | 项目对外总览、Quick Start 与各端构建命令索引 | 增减支持平台、主流 Provider 或变更仓库总览文档链接 |
+| `README.md` | `README.md` | 对外介绍能力矩阵、快速安装与源码构建命令时 | 项目对外总览（英文）、Quick Start 与各端构建命令索引 | 增减支持平台、主流 Provider 或变更仓库总览文档链接 |
+| `README.zh-CN.md` | `README.zh-CN.md` | 同步更新中文对外项目总览、Quick Start 与多机拓扑说明时 | 项目对外总览（简体中文镜像，与 `README.md` 保持能力与链接一致） | 修改 `README.md` 能力矩阵、支持平台、截图路径或构建命令 |
 | `ARCHITECTURE.md` | `crates/**`, `apps/**` | 首次理解全栈分层与 13 个 crate / 4 个 app 拓扑关系时 | 宏观系统拓扑图与四端/多 crate 职责边界总览 | 新增/移除 crate 或 app、调整系统核心协议或 UI 基础库选型 |
 | `CONTRIBUTING.md` | `**` | 提交 PR、检查环境依赖或核对开源协作规范时 | PR 规范、本地环境前置依赖与验证命令清单 | 修改构建先决条件、CI 检查门禁或 PR 提交规范 |
 | `SECURITY.md` | `crates/orbit-crypto/**`, `crates/orbit-relay/**`, `crates/orbit-daemon/**`, `deploy/install*.sh` | 修改认证、`pairing_secret`、Noise 握手、Relay 准入、自更新校验或私钥处理前 | 语音批准与端点凭据绑定、威胁模型、密码学基线、供应链校验与漏洞私密披露流程 | 变更加密序言/原语、鉴权方式、安全边界或支持版本矩阵 |

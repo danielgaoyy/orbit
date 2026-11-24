@@ -1,0 +1,1070 @@
+---
+interface Props {
+  lang: "en" | "zh-CN";
+}
+
+const { lang } = Astro.props;
+const isZh = lang === "zh-CN";
+const prefix = isZh ? "/zh-cn" : "";
+
+const copy = isZh
+  ? {
+      badge: "v0.10 · 纯 Rust 单静态二进制 · 零知识端到端加密",
+      heroLine1: "一个 Personal Agent，",
+      heroLine2: "调度你全部机器上的 AI 编码舰队。",
+      heroSub:
+        "告别在多台机器和终端标签页之间疲于切换。从飞书、Slack、Discord、桌面端、移动端或离线语音对唯一常驻的 Personal Agent 下达目标——它自动跨 Mac Studio、Linux 构建机与云端 GPU 派发 Claude Code、Codex、Antigravity 与 ACP 子代理，在独立 Git Worktree 并行推进，仅在 Tier-3 高危决策时打扰你。",
+      ctaPrimary: "五分钟快速开始",
+      ctaSecondary: "了解 Personal Agent 调度",
+      stats: [
+        { val: "1", label: "单一静态 Rust 二进制 · 零 Node/Python 依赖" },
+        { val: "5", label: "套原生界面共享同一 Rust ViewModel" },
+        { val: "34+", label: "原生引擎与 ACP 编码代理统一接入" },
+      ],
+      topoTitle: "PERSONAL AGENT · 跨主机调度拓扑",
+      tabs: [
+        {
+          id: "dispatch",
+          label: "01 跨机派单",
+          tag: "MULTI-HOST DISPATCH",
+          tone: "success",
+          summary:
+            "一个目标进入 Personal Agent，免 SSH 拉取多机项目上下文并向 Mac Studio、Linux 构建机、云端 GPU 与 Worktree 子代理并行派单，同时挂起条件唤醒定时器。",
+        },
+        {
+          id: "guardian",
+          label: "02 三级风控",
+          tag: "TIER-3 HUMAN GATE",
+          tone: "warning",
+          summary:
+            "Tier-1 只读/测试由 Guardian 自动放行；Tier-2 由 Personal Agent 结合上下文预审；Tier-3 高危操作在协议层硬禁止自动放行，推送至原生端与飞书交互卡片由人类拍板。",
+        },
+        {
+          id: "shim",
+          label: "03 热升级隔离",
+          tag: "ZERO-DOWNTIME SHIM",
+          tone: "info",
+          summary:
+            "所有有状态 Agent 与 PTY 均托管于 setsid 独立的 orbit shim 进程（Unix Socket），重启或热升级 orbit daemon 时正在执行的编码会话零中断。",
+        },
+      ],
+      svg: {
+        channelsTitle: "全渠道入口 · 零公网 Webhook",
+        channelsList: "飞书 · Slack · Discord · 桌面/移动 · 语音",
+        centerRole: "PERSONAL AGENT",
+        centerSub: "常驻总控 · 跨机上下文 · 条件唤醒",
+        e2eeLabel: "Noise_NKpsk0 端到端加密 · 盲中继零明文",
+        nodes: [
+          { title: "Mac Studio", sub: "Claude Code · 本地 1ms", badge: "审计完成" },
+          { title: "linux-build-01", sub: "Codex · 独立 Worktree", badge: "Cargo E2E" },
+          { title: "gpu-h100-cloud", sub: "Antigravity · SSH+Relay", badge: "Patrol 通过" },
+          { title: "ACP 子代理集群", sub: "34+ Registry · 动物头像", badge: "定时唤醒" },
+        ],
+        gateNote: "Tier-3 人工确认 → 飞书卡片 / 原生 DecisionDock",
+        shimNote: "orbit shim (setsid) 保活 · daemon 热升级不杀 Agent",
+      },
+      showcaseEyebrow: "ORBITAL QUIET PRECISION · 真实桌面界面",
+      showcaseH2: "一屏掌控多机舰队、子代理进度、计划与 Diff。",
+      showcaseLead:
+        "基于 OKLCH 258° 冷岩灰中性色轴打造，拒绝浮夸渐变与视觉噪声。深色「黑曜石墨」与浅色「雪花石膏纸」均由真实 Orbit Desktop 在 2× Retina 下自动渲染生成。",
+      themeDark: "黑曜石墨 Dark",
+      themeLight: "雪花石膏 Light",
+      frameMeta: "3 台在线主机 · Personal Agent 活跃 · Git Diff 实时审阅",
+      captions: [
+        {
+          num: "01",
+          title: "多机舰队侧边栏",
+          desc: "Needs Attention 与置顶线程自动收敛，一眼识别跨主机审批、Worktree 分支与待触发定时器。",
+        },
+        {
+          num: "02",
+          title: "Personal Agent 与子代理头像",
+          desc: "24 只确定性动物头像跨时间线、顶栏与侧栏稳定追踪每个并行专家代理。",
+        },
+        {
+          num: "03",
+          title: "贴合输入框的 Plan 计划架",
+          desc: "只保留唯一计划视图，新计划自动展开，与审阅队列无缝退让互不遮挡。",
+        },
+        {
+          num: "04",
+          title: "纯 Rust 语法 Diff 与 PR 审阅",
+          desc: "单 Hunk 暂存、Worktree 移交、三方冲突解决与 Orbit Patrol 两阶段审阅开箱即用。",
+        },
+      ],
+      diffEyebrow: "WHY ORBIT · 核心架构差异",
+      diffH2: "为什么选择 Orbit，而不是单机外壳或云端托管 IDE？",
+      diffLead:
+        "多数工具只解决「在一台电脑上开一个 AI 终端」。Orbit 从底层协议、进程隔离到五端视图模型，专为多机自治与私有零知识工程闭环而建。",
+      diffColDim: "工程维度",
+      diffColOther: "传统单机外壳 / SSH 终端复用",
+      diffColOrbit: "Orbit 多机控制平面",
+      diffRows: [
+        {
+          dim: "全局调度与交互入口",
+          other: "人工在多个本地终端与 SSH 会话间来回切屏、手动复制上下文与进度。",
+          orbit:
+            "唯一常驻 Personal Agent 跨主机聚合状态、并行派发并挂起条件定时器；通过零公网 Webhook 长连接直连飞书、Slack、Discord 与离线语音。",
+        },
+        {
+          dim: "跨主机网络与隐私边界",
+          other: "依赖明文云中转、手动配置 VPN/端口转发，或代码与提示词经第三方服务器。",
+          orbit:
+            "局域网/SSH/Tailscale 直连与自托管零知识 Relay 自动竞速；Noise_NKpsk0_25519_ChaChaPoly_SHA256 全程端到端加密，中继绝不接触明文。",
+        },
+        {
+          dim: "守护进程热升级与依赖",
+          other: "依赖庞大 Node.js / Python 运行时；重启服务或断网立即杀死正在干活的 Agent。",
+          orbit:
+            "单一零依赖静态 Rust 二进制；所有 Agent 与 PTY 运行在独立 setsid 的 orbit shim 中，升级 daemon 永不中断活跃会话。",
+        },
+        {
+          dim: "跨端体验与数据一致性",
+          other: "仅限桌面浏览器或各端重写一套状态机，移动端体验割裂且离线即白屏。",
+          orbit:
+            "一套纯 Rust orbit-client-core 驱动 5 端原生界面：Desktop (Tauri v2)、Web WASM PWA、iOS (+ Live Activity)、Android 与 HarmonyOS 7+。",
+        },
+        {
+          dim: "防御纵深与合规审计",
+          other: "Agent 直接裸奔在宿主 shell 中，凭证与外网出站不受控，缺乏防篡改记录。",
+          orbit:
+            "OS 内核级沙箱（macOS Seatbelt / Linux bwrap）+ 域名白名单 SSRF 防护代理 + 3 级 Guardian + Ed25519 签名防篡改审计链。",
+        },
+        {
+          dim: "记忆、扩展与代码闭环",
+          other: "记忆锁死在单一厂商，插件无隔离，缺少代码级回溯与自动化 PR 审阅。",
+          orbit:
+            "跨引擎 Markdown + FTS5 + RRF 项目记忆、wasmi 沙箱 WASM 插件、CodeMirror 6 + LSP + FIM 补全、交互式文件回溯与两阶段 Orbit Patrol。",
+        },
+      ],
+      pillarsEyebrow: "SYSTEM ARCHITECTURE · 五大能力支柱",
+      pillarsH2: "为真实生产环境打磨的全栈工程闭环。",
+      pillars: [
+        {
+          span: "span-7",
+          tag: "01 · ORCHESTRATION",
+          title: "Personal Agent 与零公网 Webhook IM 闭环",
+          body: "把任意一台常驻机器指定为全局总控。通过纯 Rust 主动出站长连接接入飞书、Slack Socket Mode 与 Discord Gateway v10，无需公网域名即可在手机 IM 派单并审批 Tier-3 风险卡片。",
+          chips: ["PersonalRouter", "Feishu WS", "Slack Socket", "Discord v10", "Conditional Timers"],
+          href: `${prefix}/guides/personal-agent/`,
+          cta: "阅读 Personal Agent 指南",
+        },
+        {
+          span: "span-5",
+          tag: "02 · FLEET MESH",
+          title: "多主机舰队、盲中继与零知识云同步",
+          body: "同时管理 Mac Studio、Linux Devbox、云端 GPU 与内网隔离节点（Peer-Bridge）。配置与主机目录经 Argon2id + AES-256-GCM 本地加密后同步至私有 GitHub Gist。",
+          chips: ["Noise_NKpsk0", "Peer-Bridge", "BYOR < 6MB", "GitHub Gist Vault"],
+          href: `${prefix}/guides/multi-host-fleet/`,
+          cta: "查看多主机组网",
+        },
+        {
+          span: "span-4",
+          tag: "03 · DEFENSE IN DEPTH",
+          title: "OS 内核沙箱、出站代理与防篡改审计链",
+          body: "默认回环监听 + 反 CSWSH；Seatbelt / bubblewrap 锁定文件系统并保护 SSH/AWS/Kube 凭证；所有安全事件写入 SHA-256 哈希链与 Ed25519 签名。",
+          chips: ["Seatbelt / bwrap", "Egress Proxy", "Ed25519 Audit"],
+          href: `${prefix}/guides/security-sandbox/`,
+          cta: "安全与沙箱架构",
+        },
+        {
+          span: "span-4",
+          tag: "04 · MEMORY & PLUGINS",
+          title: "跨引擎 Markdown 记忆与 wasmi 插件生态",
+          body: "项目记忆落盘为可版本控制的 .orbit/memory/*.md，经 FTS5 + 256 维向量 RRF 混合召回；插件运行在无原生权限的 wasmi WASM 沙箱中并支持跨端声明式 UI。",
+          chips: ["FTS5 + RRF", "orbit_memory", "wasmi SDK", "Declarative UI"],
+          href: `${prefix}/guides/memory-and-plugins/`,
+          cta: "记忆与插件开发",
+        },
+        {
+          span: "span-4",
+          tag: "05 · FIVE CLIENTS & CODE",
+          title: "五端原生客户端、离线语音与 Orbit Patrol",
+          body: "一套 Rust Core 驱动五端原生 UI；支持 Codex 风格离线 Whisper 语音、CodeMirror 6 + LSP + FIM 幽灵补全、交互式文件 Rewind 与两阶段 PR 巡检。",
+          chips: ["5 Native UIs", "Offline Voice", "FIM Ghost Text", "Orbit Patrol"],
+          href: `${prefix}/guides/code-and-review/`,
+          cta: "代码、语音与审阅",
+        },
+      ],
+      qsEyebrow: "QUICKSTART · 单二进制零依赖部署",
+      qsH2: "三条命令，启动你的第一台 Orbit 主机。",
+      qsLead:
+        "无 Node.js，无 Python，强制 SHA-256 校验。安装后自动探测本机 Claude Code、Codex、Antigravity 与 34+ ACP 代理，并生成加密配对二维码。",
+      qsCta1: "完整上手文档",
+      qsCta2: "CLI 与架构参考",
+      copyIdle: "复制命令",
+      copyDone: "已复制",
+      terminalLabel: "macOS / Linux · Single Static Binary",
+      footerLeft: "Orbit · 双协议开源（MIT / Apache-2.0）· 纯 Rust 工程控制平面",
+      footerLinks: [
+        { label: "快速开始", href: `${prefix}/getting-started/quickstart/` },
+        { label: "Personal Agent", href: `${prefix}/guides/personal-agent/` },
+        { label: "安全边界", href: `${prefix}/guides/security-sandbox/` },
+        { label: "CLI 参考", href: `${prefix}/reference/cli-and-architecture/` },
+        { label: "GitHub", href: "https://github.com/danielgaoyy/orbit" },
+      ],
+    }
+  : {
+      badge: "v0.10 · Single Static Rust Binary · Zero-Knowledge E2EE",
+      heroLine1: "One Personal Agent.",
+      heroLine2: "Every machine in your fleet.",
+      heroSub:
+        "Stop babysitting isolated terminal tabs across laptops and devboxes. Talk to ONE persistent Personal Agent from Feishu, Slack, Discord, Desktop, Mobile, or Offline Voice — it dispatches Claude Code on Mac Studio, Codex on Linux build boxes, Antigravity on Cloud GPUs, and ACP subagents in isolated Git worktrees, surfacing only high-signal human decisions.",
+      ctaPrimary: "Quickstart in 5 Minutes",
+      ctaSecondary: "Explore Personal Agent",
+      stats: [
+        { val: "1", label: "Static Rust binary · Zero Node/Python runtime" },
+        { val: "5", label: "Native UIs sharing one Rust ViewModel" },
+        { val: "34+", label: "Native & ACP coding agents orchestrated" },
+      ],
+      topoTitle: "PERSONAL AGENT · FLEET DISPATCH TOPOLOGY",
+      tabs: [
+        {
+          id: "dispatch",
+          label: "01 Dispatch",
+          tag: "MULTI-HOST DISPATCH",
+          tone: "success",
+          summary:
+            "One intent enters your Personal Agent, which inspects cross-host repo context without SSH, fans out parallel workers across Mac Studio, Linux worktrees, and Cloud GPUs, and arms conditional wakeup timers.",
+        },
+        {
+          id: "guardian",
+          label: "02 Tier-3 Gate",
+          tag: "TIER-3 HUMAN GATE",
+          tone: "warning",
+          summary:
+            "Guardian Tier-1 auto-allows safe reads & workspace tests; Tier-2 is pre-reviewed by the Personal Agent; Tier-3 High/Critical actions are protocol-hard-blocked from auto-approval and pushed to Desktop & Feishu cards.",
+        },
+        {
+          id: "shim",
+          label: "03 Hot Upgrade",
+          tag: "ZERO-DOWNTIME SHIM",
+          tone: "info",
+          summary:
+            "Every stateful agent and PTY runs inside a detached setsid orbit shim over Unix domain sockets — upgrading or restarting orbit daemon never kills running coding agents.",
+        },
+      ],
+      svg: {
+        channelsTitle: "OMNICHANNEL INPUT · ZERO PUBLIC WEBHOOKS",
+        channelsList: "Feishu · Slack · Discord · Desktop / Mobile · Voice",
+        centerRole: "PERSONAL AGENT",
+        centerSub: "Chief of Staff · Fleet Context · Wakeup Timers",
+        e2eeLabel: "Noise_NKpsk0_25519_ChaChaPoly_SHA256 · Blind Zero-Knowledge Relay",
+        nodes: [
+          { title: "Mac Studio", sub: "Claude Code · Direct 1ms", badge: "Audit OK" },
+          { title: "linux-build-01", sub: "Codex · Git Worktree", badge: "Cargo E2E" },
+          { title: "gpu-h100-cloud", sub: "Antigravity · SSH+Relay", badge: "Patrol 0" },
+          { title: "ACP Subagents", sub: "34+ Registry · Avatars", badge: "Armed Timer" },
+        ],
+        gateNote: "Tier-3 Human Decision -> Native DecisionDock & Feishu Card",
+        shimNote: "Detached orbit shim (setsid) survives daemon upgrades with zero dropped turns",
+      },
+      showcaseEyebrow: "ORBITAL QUIET PRECISION · REAL DESKTOP BUILD",
+      showcaseH2: "Your entire fleet, subagent crew, plan, and diffs in one calm frame.",
+      showcaseLead:
+        "Built on Orbit's OKLCH 258° cool-slate neutral axis with zero visual clutter. Both Obsidian Graphite (dark) and Alabaster Paper (light) below are captured directly from the live Orbit Desktop build at 2× Retina.",
+      themeDark: "Obsidian Graphite",
+      themeLight: "Alabaster Paper",
+      frameMeta: "3 Hosts Online · Personal Agent Active · Syntax-Highlighted Git Review",
+      captions: [
+        {
+          num: "01",
+          title: "Multi-Host Fleet Sidebar",
+          desc: "Needs Attention & Pinned threads surface Tier-3 approvals, worktree branches, and armed timers across every online host.",
+        },
+        {
+          num: "02",
+          title: "Personal Agent & Crew Avatars",
+          desc: "24 deterministic animal portraits keep parallel cross-host subagents visually unmistakable across timeline, topbar, and side panel.",
+        },
+        {
+          num: "03",
+          title: "Docked Plan Shelf",
+          desc: "A single quiet plan surface aligned to the 740px reading column — auto-opens on active work and yields cleanly to decisions.",
+        },
+        {
+          num: "04",
+          title: "Rust Diff, Rewind & Patrol",
+          desc: "Hunk-level staging, worktree handoff, 3-way conflict resolution, and Two-Stage Orbit Patrol PR review built right in.",
+        },
+      ],
+      diffEyebrow: "WHY ORBIT · ARCHITECTURAL DIFFERENTIATION",
+      diffH2: "Built for multi-host autonomy, not single-laptop terminal wrapping.",
+      diffLead:
+        "Most agent wrappers assume one machine, one foreground tab, and an untrusted cloud proxy. Orbit is engineered from the wire protocol up as a private, multi-host control plane.",
+      diffColDim: "Dimension",
+      diffColOther: "Single-Machine Wrappers / SSH Multiplexers",
+      diffColOrbit: "Orbit Multi-Host Control Plane",
+      diffRows: [
+        {
+          dim: "Agent Orchestration",
+          other: "Manual tab switching per machine; you act as the human glue copying context between sessions.",
+          orbit:
+            "One persistent Personal Agent aggregates cross-host fleet state, dispatches workers in parallel worktrees, arms conditional timers, and bridges Feishu, Slack, Discord & Offline Voice.",
+        },
+        {
+          dim: "Remote Access & Privacy",
+          other: "Plaintext SaaS relays, fragile port forwarding, or vendor-hosted workspaces holding your code.",
+          orbit:
+            "Happy-Eyeballs direct LAN/SSH/Tailscale routing + self-hosted <6MB Zero-Knowledge Relay with mutual Noise_NKpsk0_25519_ChaChaPoly_SHA256 E2EE — the relay never sees plaintext.",
+        },
+        {
+          dim: "Process Isolation & Runtime",
+          other: "Heavy Node.js/Python daemons; restarting or upgrading kills active agent processes and PTYs.",
+          orbit:
+            "Single static Rust binary with zero external runtimes. Stateful agents & PTYs run in setsid orbit shim processes over Unix sockets so daemon upgrades never interrupt work.",
+        },
+        {
+          dim: "Cross-Platform Parity",
+          other: "Desktop-only webviews or fragmented mobile rewrites that drift out of sync offline.",
+          orbit:
+            "One pure-Rust orbit-client-core ViewModel powers 5 native UIs: Desktop (Tauri v2), Web WASM PWA, iOS (+ Live Activity), Android, and HarmonyOS 7+.",
+        },
+        {
+          dim: "Security & Auditability",
+          other: "Unsandboxed shell execution with ambient SSH/AWS keys and no tamper-evident history.",
+          orbit:
+            "OS kernel sandboxes (macOS Seatbelt / Linux bwrap), SSRF-hardened domain Egress Proxy, 3-Tier Guardian + persistent permission rules, and Ed25519 signed audit chains.",
+        },
+        {
+          dim: "Memory, Plugins & Code Loop",
+          other: "Provider-locked memory, arbitrary native plugin risk, and external tools for review/rollback.",
+          orbit:
+            "Cross-provider .orbit/memory/*.md + FTS5 + RRF memory, sandboxed wasmi WASM plugins, CodeMirror 6 + LSP + FIM ghost text, interactive file rewind, and Two-Stage Orbit Patrol.",
+        },
+      ],
+      pillarsEyebrow: "CORE CAPABILITIES · ENGINEERING LOOP",
+      pillarsH2: "Every layer designed to survive real-world engineering.",
+      pillars: [
+        {
+          span: "span-7",
+          tag: "01 · ORCHESTRATION",
+          title: "Personal Agent & Zero-Webhook IM Control",
+          body: "Elect any always-on machine as your global Chief of Staff. Pure-Rust outbound long connections wire Feishu, Slack Socket Mode, and Discord Gateway v10 behind home or corporate NATs with zero public webhooks.",
+          chips: ["PersonalRouter", "Feishu WS", "Slack Socket", "Discord v10", "Conditional Timers"],
+          href: `${prefix}/guides/personal-agent/`,
+          cta: "Read Personal Agent Guide",
+        },
+        {
+          span: "span-5",
+          tag: "02 · FLEET MESH",
+          title: "Multi-Host Fleet, Blind Relay & Cloud Sync",
+          body: "Drive Mac Studio, Linux devboxes, Cloud GPUs, and LAN-isolated Peer-Bridge nodes from one UI. Sync your encrypted fleet directory via Argon2id + AES-256-GCM Secret GitHub Gists.",
+          chips: ["Noise_NKpsk0", "Peer-Bridge", "BYOR < 6MB", "GitHub Gist Vault"],
+          href: `${prefix}/guides/multi-host-fleet/`,
+          cta: "Explore Multi-Host Fleet",
+        },
+        {
+          span: "span-4",
+          tag: "03 · SECURITY",
+          title: "Kernel Sandbox, Egress Proxy & Audit Chain",
+          body: "Loopback-by-default daemon, Seatbelt / bubblewrap filesystem locks protecting SSH/AWS/Kube keys, DNS-pinned egress proxy, and Ed25519 signed audit logs.",
+          chips: ["Seatbelt / bwrap", "Egress Proxy", "Ed25519 Audit"],
+          href: `${prefix}/guides/security-sandbox/`,
+          cta: "Security & Sandbox",
+        },
+        {
+          span: "span-4",
+          tag: "04 · MEMORY & PLUGINS",
+          title: "Cross-Provider Memory & wasmi Plugins",
+          body: "Git-friendly .orbit/memory/*.md indexed with FTS5 + 256-dim cosine RRF across every provider, paired with capability-scoped wasmi WASM plugins & declarative cross-platform UI.",
+          chips: ["FTS5 + RRF", "orbit_memory", "wasmi SDK", "Declarative UI"],
+          href: `${prefix}/guides/memory-and-plugins/`,
+          cta: "Memory & Plugins",
+        },
+        {
+          span: "span-4",
+          tag: "05 · CLIENTS & CODE",
+          title: "Five Native UIs, Offline Voice & Patrol",
+          body: "Desktop, Web WASM PWA, iOS (+ Live Activity), Android, and HarmonyOS 7+, plus offline Whisper voice input, CodeMirror 6 + LSP + FIM ghost text, file rewind, and Orbit Patrol.",
+          chips: ["5 Native UIs", "Offline Voice", "FIM Ghost Text", "Orbit Patrol"],
+          href: `${prefix}/guides/code-and-review/`,
+          cta: "Code, Voice & Review",
+        },
+      ],
+      qsEyebrow: "QUICKSTART · ZERO RUNTIME DEPENDENCIES",
+      qsH2: "Three commands to bring your first host online.",
+      qsLead:
+        "No Node.js, no Python, mandatory SHA-256 checksum verification. Orbit probes installed Claude Code, Codex, Antigravity, and 34+ ACP CLIs automatically and prints an encrypted pairing QR code.",
+      qsCta1: "Read Full Quickstart",
+      qsCta2: "CLI & Architecture Reference",
+      copyIdle: "Copy",
+      copyDone: "Copied",
+      terminalLabel: "macOS / Linux · Single Static Binary",
+      footerLeft: "Orbit · Dual-licensed MIT / Apache-2.0 · Pure-Rust Multi-Host Control Plane",
+      footerLinks: [
+        { label: "Quickstart", href: `${prefix}/getting-started/quickstart/` },
+        { label: "Personal Agent", href: `${prefix}/guides/personal-agent/` },
+        { label: "Security", href: `${prefix}/guides/security-sandbox/` },
+        { label: "CLI & Architecture", href: `${prefix}/reference/cli-and-architecture/` },
+        { label: "GitHub", href: "https://github.com/danielgaoyy/orbit" },
+      ],
+    };
+
+const installSnippet = `curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh
+orbit doctor
+orbit daemon up
+orbit pair`;
+---
+
+<div class="orbit-landing" data-orbit-landing>
+  <!-- ===================================================================== -->
+  <!-- 1. HERO + INTERACTIVE PERSONAL AGENT FLEET DISPATCH TOPOLOGY          -->
+  <!-- ===================================================================== -->
+  <section class="orbit-hero">
+    <div class="orbit-wrap orbit-hero-inner">
+      <div class="orbit-hero-grid">
+        <div>
+          <span class="orbit-pill-badge">
+            <span class="orbit-eyebrow-dot" aria-hidden="true"></span>
+            {copy.badge}
+          </span>
+
+          <h1 class="orbit-hero-title">
+            {copy.heroLine1}
+            <br />
+            <em>{copy.heroLine2}</em>
+          </h1>
+
+          <p class="orbit-hero-sub">{copy.heroSub}</p>
+
+          <div class="orbit-cta-row">
+            <a class="orbit-btn orbit-btn-primary" href={`${prefix}/getting-started/quickstart/`}>
+              {copy.ctaPrimary}
+              <span aria-hidden="true">→</span>
+            </a>
+            <a class="orbit-btn orbit-btn-secondary" href={`${prefix}/guides/personal-agent/`}>
+              {copy.ctaSecondary}
+            </a>
+          </div>
+
+          <div class="orbit-telemetry-strip">
+            {copy.stats.map((s) => (
+              <div>
+                <div class="orbit-stat-val">{s.val}</div>
+                <div class="orbit-stat-lbl">{s.label}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <!-- Live Interactive Personal Agent Fleet Dispatch SVG Topology -->
+        <div class="orbit-topo-card" data-topo-root data-mode="dispatch">
+          <div class="orbit-topo-header">
+            <span class="orbit-topo-title">
+              <span class="orbit-eyebrow-dot" aria-hidden="true"></span>
+              {copy.topoTitle}
+            </span>
+            <div class="orbit-seg" role="group" aria-label={copy.topoTitle}>
+              {copy.tabs.map((tab, idx) => (
+                <button
+                  type="button"
+                  class="orbit-seg-btn"
+                  data-topo-tab={tab.id}
+                  data-topo-tag={tab.tag}
+                  data-topo-tone={tab.tone}
+                  data-topo-summary={tab.summary}
+                  aria-pressed={idx === 0 ? "true" : "false"}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div class="orbit-topo-stage">
+            <svg
+              class="orbit-topo-svg"
+              viewBox="0 0 640 436"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+              role="img"
+              aria-label={copy.topoTitle}
+            >
+              <!-- Subtle architectural orbital geometry -->
+              <circle cx="320" cy="196" r="158" stroke="var(--orbit-ring-stroke)" stroke-width="1" stroke-dasharray="3 5" />
+              <circle cx="320" cy="196" r="106" stroke="var(--orbit-ring-stroke)" stroke-width="1" />
+              <ellipse
+                cx="320"
+                cy="196"
+                rx="222"
+                ry="62"
+                transform="rotate(-11 320 196)"
+                stroke="var(--orbit-ring-stroke)"
+                stroke-width="1"
+              />
+
+              <!-- Top: Omnichannel Input Bar (Human Entry) -->
+              <rect
+                x="110"
+                y="14"
+                width="420"
+                height="58"
+                rx="11"
+                fill="var(--orbit-surface-recessed)"
+                stroke="var(--orbit-border-default)"
+                stroke-width="1"
+              />
+              <circle cx="132" cy="34" r="3.5" fill="var(--orbit-success)" />
+              <text
+                x="144"
+                y="38"
+                fill="var(--orbit-ink-tertiary)"
+                font-family="var(--sl-font-mono)"
+                font-size="10.2"
+                font-weight="600"
+                letter-spacing="0.06em"
+              >
+                {copy.svg.channelsTitle}
+              </text>
+              <text
+                x="132"
+                y="57"
+                fill="var(--orbit-ink-primary)"
+                font-family="var(--sl-font)"
+                font-size="12.5"
+                font-weight="500"
+              >
+                {copy.svg.channelsList}
+              </text>
+
+              <!-- Vertical Bidirectional Conduit: Human <-> Personal Agent -->
+              <line
+                x1="308"
+                y1="72"
+                x2="308"
+                y2="146"
+                stroke="var(--orbit-info)"
+                stroke-width="1.6"
+                class="orbit-flow-line"
+                data-flow="dispatch"
+              />
+              <line
+                x1="332"
+                y1="146"
+                x2="332"
+                y2="72"
+                stroke="var(--orbit-warning)"
+                stroke-width="1.6"
+                class="orbit-flow-line"
+                data-flow="guardian"
+                opacity="0.35"
+              />
+
+              <!-- Center Hub: Persistent Personal Agent -->
+              <rect
+                x="180"
+                y="146"
+                width="280"
+                height="76"
+                rx="13"
+                fill="var(--orbit-surface-base)"
+                stroke="var(--orbit-border-strong)"
+                stroke-width="1.4"
+              />
+              <circle
+                cx="206"
+                cy="184"
+                r="14"
+                fill="var(--orbit-surface-recessed)"
+                stroke="var(--orbit-ring-accent)"
+                stroke-width="1.2"
+              />
+              <circle cx="206" cy="184" r="4.5" fill="var(--orbit-ink-primary)" />
+              <circle
+                cx="206"
+                cy="184"
+                r="10"
+                stroke="var(--orbit-success)"
+                stroke-width="1.1"
+                stroke-dasharray="4 3"
+                class="orbit-pulse-ring"
+              />
+              <text
+                x="232"
+                y="174"
+                fill="var(--orbit-ink-primary)"
+                font-family="var(--sl-font-mono)"
+                font-size="12.5"
+                font-weight="700"
+                letter-spacing="0.04em"
+              >
+                {copy.svg.centerRole}
+              </text>
+              <text
+                x="232"
+                y="194"
+                fill="var(--orbit-ink-secondary)"
+                font-family="var(--sl-font)"
+                font-size="11.5"
+              >
+                {copy.svg.centerSub}
+              </text>
+              <rect
+                x="232"
+                y="202"
+                width="104"
+                height="13"
+                rx="4"
+                fill="var(--orbit-success-bg)"
+              />
+              <text
+                x="239"
+                y="211.5"
+                fill="var(--orbit-success)"
+                font-family="var(--sl-font-mono)"
+                font-size="8.8"
+                font-weight="600"
+              >
+                chief-of-staff · LIVE
+              </text>
+
+              <!-- Fan-out Dispatch Lines from Personal Agent to 4 Fleet Nodes -->
+              <path
+                d="M240 222 C240 282, 86 266, 86 306"
+                stroke="var(--orbit-success)"
+                stroke-width="1.5"
+                class="orbit-flow-line"
+                data-flow="workers"
+              />
+              <path
+                d="M292 222 C292 278, 242 272, 242 306"
+                stroke="var(--orbit-info)"
+                stroke-width="1.5"
+                class="orbit-flow-line"
+                data-flow="workers"
+              />
+              <path
+                d="M348 222 C348 278, 398 272, 398 306"
+                stroke="var(--orbit-info)"
+                stroke-width="1.5"
+                class="orbit-flow-line"
+                data-flow="workers"
+              />
+              <path
+                d="M400 222 C400 282, 554 266, 554 306"
+                stroke="var(--orbit-success)"
+                stroke-width="1.5"
+                class="orbit-flow-line"
+                data-flow="workers"
+              />
+
+              <!-- E2EE Bus Pill (rendered ABOVE flow paths so text stays 100% crisp) -->
+              <rect
+                x="116"
+                y="246"
+                width="408"
+                height="24"
+                rx="12"
+                fill="var(--orbit-surface-recessed)"
+                stroke="var(--orbit-border-default)"
+                stroke-width="1"
+              />
+              <text
+                x="320"
+                y="261.5"
+                text-anchor="middle"
+                fill="var(--orbit-ink-secondary)"
+                font-family="var(--sl-font-mono)"
+                font-size="9.6"
+              >
+                {copy.svg.e2eeLabel}
+              </text>
+
+              <!-- 4 Fleet Execution Nodes -->
+              {copy.svg.nodes.map((node, i) => {
+                const x = 14 + i * 156;
+                const dotColor = i === 1 ? "var(--orbit-warning)" : "var(--orbit-success)";
+                return (
+                  <g>
+                    <rect
+                      x={x}
+                      y="306"
+                      width="144"
+                      height="84"
+                      rx="10"
+                      fill="var(--orbit-surface-base)"
+                      stroke="var(--orbit-border-default)"
+                      stroke-width="1"
+                    />
+                    {/* Detached Shim boundary dashed footer */}
+                    <line
+                      x1={x + 10}
+                      y1="364"
+                      x2={x + 134}
+                      y2="364"
+                      stroke="var(--orbit-border-subtle)"
+                      stroke-dasharray="3 3"
+                    />
+                    <circle cx={x + 14} cy="324" r="3.2" fill={dotColor} />
+                    <text
+                      x={x + 24}
+                      y="328"
+                      fill="var(--orbit-ink-primary)"
+                      font-family="var(--sl-font-mono)"
+                      font-size="11"
+                      font-weight="600"
+                    >
+                      {node.title}
+                    </text>
+                    <text
+                      x={x + 12}
+                      y="349"
+                      fill="var(--orbit-ink-secondary)"
+                      font-family="var(--sl-font)"
+                      font-size="10.4"
+                    >
+                      {node.sub}
+                    </text>
+                    <text
+                      x={x + 12}
+                      y="379"
+                      fill="var(--orbit-ink-tertiary)"
+                      font-family="var(--sl-font-mono)"
+                      font-size="9.4"
+                    >
+                      shim · {node.badge}
+                    </text>
+                  </g>
+                );
+              })}
+
+              <!-- Dynamic Mode Callout Strip -->
+              <rect
+                x="14"
+                y="404"
+                width="612"
+                height="24"
+                rx="6"
+                fill="var(--orbit-surface-recessed)"
+              />
+              <text
+                x="320"
+                y="419.5"
+                text-anchor="middle"
+                fill="var(--orbit-ink-secondary)"
+                font-family="var(--sl-font-mono)"
+                font-size="10"
+                data-svg-banner
+                data-banner-dispatch={copy.svg.e2eeLabel}
+                data-banner-guardian={copy.svg.gateNote}
+                data-banner-shim={copy.svg.shimNote}
+              >
+                {copy.svg.e2eeLabel}
+              </text>
+            </svg>
+          </div>
+
+          <div class="orbit-topo-footer">
+            <span class="orbit-topo-tag" data-topo-active-tag data-tone="success">
+              {copy.tabs[0].tag}
+            </span>
+            <span data-topo-active-summary>{copy.tabs[0].summary}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- 2. INTERACTIVE LIGHT / DARK REAL PRODUCT SHOWCASE                     -->
+  <!-- ===================================================================== -->
+  <section class="orbit-section">
+    <div class="orbit-wrap">
+      <div class="orbit-showcase-head">
+        <div>
+          <span class="orbit-eyebrow">{copy.showcaseEyebrow}</span>
+          <h2 class="orbit-h2">{copy.showcaseH2}</h2>
+          <p class="orbit-lead">{copy.showcaseLead}</p>
+        </div>
+
+        <div class="orbit-seg" role="group" aria-label="Theme preview">
+          <button
+            type="button"
+            class="orbit-seg-btn"
+            data-preview-theme="dark"
+            aria-pressed="true"
+          >
+            {copy.themeDark}
+          </button>
+          <button
+            type="button"
+            class="orbit-seg-btn"
+            data-preview-theme="light"
+            aria-pressed="false"
+          >
+            {copy.themeLight}
+          </button>
+        </div>
+      </div>
+
+      <div class="orbit-frame-shell">
+        <div class="orbit-frame-bar">
+          <span class="orbit-frame-meta">
+            <span class="orbit-eyebrow-dot" aria-hidden="true"></span>
+            {copy.frameMeta}
+          </span>
+          <span>2880 × 1800 · 2× Retina</span>
+        </div>
+        <div class="orbit-frame-viewport">
+          <img
+            src="/images/orbit-desktop-dark.png"
+            alt="Orbit Desktop in Obsidian Graphite dark theme showing multi-host fleet sidebar, Personal Agent orchestrating 3 subagents, Plan shelf, and syntax-highlighted Git Review Diff"
+            class="orbit-frame-img"
+            data-preview-img="dark"
+            data-visible="true"
+            width="2880"
+            height="1800"
+            loading="eager"
+          />
+          <img
+            src="/images/orbit-desktop-light.png"
+            alt="Orbit Desktop in Alabaster Paper light theme showing multi-host fleet sidebar, Personal Agent orchestrating 3 subagents, Plan shelf, and syntax-highlighted Git Review Diff"
+            class="orbit-frame-img"
+            data-preview-img="light"
+            data-visible="false"
+            width="2880"
+            height="1800"
+            loading="lazy"
+          />
+        </div>
+      </div>
+
+      <div class="orbit-caption-grid">
+        {copy.captions.map((cap) => (
+          <div class="orbit-caption-item">
+            <div class="orbit-caption-num">{cap.num}</div>
+            <div class="orbit-caption-title">{cap.title}</div>
+            <div class="orbit-caption-desc">{cap.desc}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- 3. WHY ORBIT VS SINGLE-MACHINE WRAPPERS (DIFFERENTIATION MATRIX)      -->
+  <!-- ===================================================================== -->
+  <section class="orbit-section">
+    <div class="orbit-wrap">
+      <span class="orbit-eyebrow">{copy.diffEyebrow}</span>
+      <h2 class="orbit-h2">{copy.diffH2}</h2>
+      <p class="orbit-lead">{copy.diffLead}</p>
+
+      <div class="orbit-matrix-wrap">
+        <table class="orbit-matrix">
+          <thead>
+            <tr>
+              <th>{copy.diffColDim}</th>
+              <th>{copy.diffColOther}</th>
+              <th class="col-orbit">{copy.diffColOrbit}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {copy.diffRows.map((row) => (
+              <tr>
+                <td class="col-dim">{row.dim}</td>
+                <td class="col-other">{row.other}</td>
+                <td class="col-orbit">
+                  <span class="orbit-check" aria-hidden="true">✓</span>
+                  {row.orbit}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- 4. ASYMMETRIC CAPABILITY PILLARS BENTO                                -->
+  <!-- ===================================================================== -->
+  <section class="orbit-section">
+    <div class="orbit-wrap">
+      <span class="orbit-eyebrow">{copy.pillarsEyebrow}</span>
+      <h2 class="orbit-h2">{copy.pillarsH2}</h2>
+
+      <div class="orbit-bento">
+        {copy.pillars.map((p) => (
+          <article class={`orbit-bento-card ${p.span}`}>
+            <div>
+              <div class="orbit-bento-tag">{p.tag}</div>
+              <h3 class="orbit-bento-title">{p.title}</h3>
+              <p class="orbit-bento-body">{p.body}</p>
+            </div>
+            <div>
+              <div class="orbit-chip-row" style="margin-bottom: 14px;">
+                {p.chips.map((c) => (
+                  <span class="orbit-chip">{c}</span>
+                ))}
+              </div>
+              <a class="orbit-bento-link" href={p.href}>
+                {p.cta}
+                <span aria-hidden="true">→</span>
+              </a>
+            </div>
+          </article>
+        ))}
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- 5. COPYABLE QUICKSTART TERMINAL & DOCS ENTRY                          -->
+  <!-- ===================================================================== -->
+  <section class="orbit-section orbit-section-tight">
+    <div class="orbit-wrap">
+      <div class="orbit-qs-grid">
+        <div>
+          <span class="orbit-eyebrow">{copy.qsEyebrow}</span>
+          <h2 class="orbit-h2">{copy.qsH2}</h2>
+          <p class="orbit-lead">{copy.qsLead}</p>
+          <div class="orbit-cta-row">
+            <a class="orbit-btn orbit-btn-primary" href={`${prefix}/getting-started/quickstart/`}>
+              {copy.qsCta1}
+              <span aria-hidden="true">→</span>
+            </a>
+            <a class="orbit-btn orbit-btn-secondary" href={`${prefix}/reference/cli-and-architecture/`}>
+              {copy.qsCta2}
+            </a>
+          </div>
+        </div>
+
+        <div class="orbit-terminal">
+          <div class="orbit-terminal-bar">
+            <span>{copy.terminalLabel}</span>
+            <button
+              type="button"
+              class="orbit-copy-btn"
+              data-copy-btn
+              data-copy-text={installSnippet}
+              data-label-idle={copy.copyIdle}
+              data-label-done={copy.copyDone}
+            >
+              {copy.copyIdle}
+            </button>
+          </div>
+          <pre class="orbit-terminal-code"><code><span class="orbit-cmd-comment"># 1. Install single static binary (SHA-256 verified)</span>
+<span class="orbit-cmd-prompt">$ </span>curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh
+
+<span class="orbit-cmd-comment"># 2. Probe installed coding agents &amp; kernel sandbox</span>
+<span class="orbit-cmd-prompt">$ </span>orbit doctor
+
+<span class="orbit-cmd-comment"># 3. Start loopback daemon (127.0.0.1:6868) &amp; print QR pairing URI</span>
+<span class="orbit-cmd-prompt">$ </span>orbit daemon up
+<span class="orbit-cmd-prompt">$ </span>orbit pair</code></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer class="orbit-footer-band">
+    <div class="orbit-wrap orbit-footer-row">
+      <span>{copy.footerLeft}</span>
+      <nav class="orbit-footer-links" aria-label="Documentation links">
+        {copy.footerLinks.map((lnk) => (
+          <a href={lnk.href}>{lnk.label}</a>
+        ))}
+      </nav>
+    </div>
+  </footer>
+</div>
+
+<script>
+  // Minimal progressive enhancement: topology mode toggle, Light/Dark screenshot preview sync, and clipboard copy.
+  (() => {
+    const root = document.querySelector("[data-orbit-landing]");
+    if (!root) return;
+
+    // 1. Interactive Personal Agent Topology Scenario Tabs
+    const topoRoot = root.querySelector("[data-topo-root]");
+    if (topoRoot) {
+      const tabBtns = topoRoot.querySelectorAll<HTMLButtonElement>("[data-topo-tab]");
+      const activeTag = topoRoot.querySelector<HTMLElement>("[data-topo-active-tag]");
+      const activeSummary = topoRoot.querySelector<HTMLElement>("[data-topo-active-summary]");
+      const svgBanner = topoRoot.querySelector<SVGTextElement>("[data-svg-banner]");
+      const flowDispatch = topoRoot.querySelector<SVGElement>('[data-flow="dispatch"]');
+      const flowGuardian = topoRoot.querySelector<SVGElement>('[data-flow="guardian"]');
+
+      const setMode = (btn: HTMLButtonElement) => {
+        const mode = btn.dataset.topoTab || "dispatch";
+        topoRoot.setAttribute("data-mode", mode);
+        tabBtns.forEach((b) => b.setAttribute("aria-pressed", b === btn ? "true" : "false"));
+        if (activeTag) {
+          activeTag.textContent = btn.dataset.topoTag || "";
+          activeTag.setAttribute("data-tone", btn.dataset.topoTone || "success");
+        }
+        if (activeSummary) {
+          activeSummary.textContent = btn.dataset.topoSummary || "";
+        }
+        if (svgBanner) {
+          const attr =
+            mode === "guardian"
+              ? "bannerGuardian"
+              : mode === "shim"
+                ? "bannerShim"
+                : "bannerDispatch";
+          svgBanner.textContent = svgBanner.dataset[attr] || "";
+        }
+        if (flowGuardian && flowDispatch) {
+          flowGuardian.style.opacity = mode === "guardian" ? "1" : "0.35";
+          flowDispatch.style.opacity = mode === "guardian" ? "0.45" : "1";
+        }
+      };
+
+      tabBtns.forEach((btn) => btn.addEventListener("click", () => setMode(btn)));
+    }
+
+    // 2. Light / Dark Desktop Screenshot Switcher (auto-follows Starlight theme until manually toggled)
+    const previewBtns = root.querySelectorAll<HTMLButtonElement>("[data-preview-theme]");
+    const previewImgs = root.querySelectorAll<HTMLImageElement>("[data-preview-img]");
+    let userPinnedPreview = false;
+
+    const setPreview = (theme: string) => {
+      previewBtns.forEach((b) =>
+        b.setAttribute("aria-pressed", b.dataset.previewTheme === theme ? "true" : "false"),
+      );
+      previewImgs.forEach((img) =>
+        img.setAttribute("data-visible", img.dataset.previewImg === theme ? "true" : "false"),
+      );
+    };
+
+    const syncFromDocumentTheme = () => {
+      if (userPinnedPreview) return;
+      const docTheme = document.documentElement.dataset.theme === "light" ? "light" : "dark";
+      setPreview(docTheme);
+    };
+
+    syncFromDocumentTheme();
+    const observer = new MutationObserver(syncFromDocumentTheme);
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-theme"],
+    });
+
+    previewBtns.forEach((btn) =>
+      btn.addEventListener("click", () => {
+        userPinnedPreview = true;
+        setPreview(btn.dataset.previewTheme || "dark");
+      }),
+    );
+
+    // 3. Copy Quickstart Snippet
+    const copyBtn = root.querySelector<HTMLButtonElement>("[data-copy-btn]");
+    if (copyBtn) {
+      copyBtn.addEventListener("click", async () => {
+        const text = copyBtn.dataset.copyText || "";
+        try {
+          await navigator.clipboard.writeText(text);
+          copyBtn.textContent = copyBtn.dataset.labelDone || "Copied";
+          window.setTimeout(() => {
+            copyBtn.textContent = copyBtn.dataset.labelIdle || "Copy";
+          }, 1800);
+        } catch {
+          // Clipboard unavailable in restricted contexts
+        }
+      });
+    }
+  })();
+</script>

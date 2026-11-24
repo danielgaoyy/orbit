@@ -26,7 +26,21 @@ use uuid::Uuid;
 
 const PREFIX: &str = ".orbit/memory/";
 const MAX_BYTES: usize = 256 * 1024;
+const MAX_MEMORY_FILES: usize = 2048;
+const MAX_SHARD_WORKSPACES: usize = 64;
 const TOP_K: usize = 8;
+
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+const BLOCKED_METADATA_HOSTS: &[&str] = &[
+    "metadata.google.internal",
+    "metadata.goog",
+    "metadata",
+    "instance-data",
+];
 
 #[derive(Deserialize)]
 pub(crate) struct MemoryDraft {
@@ -59,12 +73,17 @@ struct Frontmatter {
 }
 
 fn valid_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 160
-        && !id.starts_with('.')
-        && id
+    if id.is_empty()
+        || id.len() > 160
+        || id.starts_with('.')
+        || !id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return false;
+    }
+    let stem = id.split('.').next().unwrap_or(id).to_ascii_lowercase();
+    !WINDOWS_RESERVED_NAMES.contains(&stem.as_str())
 }
 
 fn markdown_name(name: &str) -> bool {
@@ -101,9 +120,23 @@ fn bound_paths(paths: Vec<String>) -> Result<Vec<String>> {
 }
 
 fn validate(item: &ProjectMemoryItem) -> Result<()> {
+    let extra_bytes: usize = item
+        .tags
+        .iter()
+        .chain(item.file_paths.iter())
+        .map(String::len)
+        .sum();
     ensure!(
-        item.title.len().saturating_add(item.content.len()) <= MAX_BYTES,
+        item.title
+            .len()
+            .saturating_add(item.content.len())
+            .saturating_add(extra_bytes)
+            <= MAX_BYTES,
         "memory exceeds {MAX_BYTES} bytes"
+    );
+    ensure!(
+        item.tags.len() <= 64 && item.file_paths.len() <= 128,
+        "memory has too many tags or bound file paths"
     );
     ensure!(
         valid_id(&item.id) && !item.id.starts_with("hermes-"),
@@ -302,9 +335,8 @@ struct IndexedFile {
 }
 
 #[derive(Default)]
-struct IndexedWorkspace {
-    root: String,
-    files: HashMap<String, IndexedFile>,
+struct ShardCache {
+    workspaces: HashMap<String, HashMap<String, IndexedFile>>,
 }
 
 #[derive(Clone)]
@@ -312,8 +344,47 @@ pub(crate) struct MemoryEngine {
     store: Arc<OrbitStore>,
     pub config: MemoryEmbeddingConfig,
     legacy: Option<PathBuf>,
-    client: Option<reqwest::Client>,
-    locks: Arc<[Mutex<IndexedWorkspace>; 32]>,
+    dense_enabled: bool,
+    locks: Arc<[Mutex<ShardCache>; 32]>,
+    watcher_gates: Arc<[tokio::sync::Mutex<()>; 32]>,
+}
+
+fn validate_embedding_endpoint(raw: &str) -> Result<reqwest::Url, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("embedding endpoint URL cannot be empty or contain control/whitespace".into());
+    }
+    let mut parsed =
+        reqwest::Url::parse(trimmed).map_err(|e| format!("invalid embedding endpoint URL: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "unsupported embedding endpoint scheme `{}` (expected http or https)",
+            parsed.scheme()
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("embedding endpoint URL must not contain embedded credentials".into());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "embedding endpoint URL is missing a host".to_string())?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if BLOCKED_METADATA_HOSTS.contains(&host.as_str()) {
+        return Err(format!(
+            "refusing to connect embedding endpoint to metadata host `{host}`"
+        ));
+    }
+    let current_path = parsed.path().trim_end_matches('/');
+    if !current_path.ends_with("/embeddings") {
+        let next_path = if current_path.is_empty() {
+            "/embeddings".to_string()
+        } else {
+            format!("{current_path}/embeddings")
+        };
+        parsed.set_path(&next_path);
+    }
+    Ok(parsed)
 }
 
 impl MemoryEngine {
@@ -322,34 +393,33 @@ impl MemoryEngine {
         config: MemoryEmbeddingConfig,
         legacy: Option<PathBuf>,
     ) -> Self {
-        let client = (config.provider == MemoryEmbeddingProvider::OpenAiCompatible)
-            .then(|| {
-                reqwest::Client::builder()
-                    .timeout(Duration::from_secs(3))
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()
-                    .ok()
-            })
-            .flatten();
+        let dense_enabled = config.provider == MemoryEmbeddingProvider::OpenAiCompatible;
         Self {
             store,
             config,
             legacy,
-            client,
+            dense_enabled,
             locks: Arc::new(std::array::from_fn(|_| Mutex::default())),
+            watcher_gates: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
         }
     }
 
-    fn embedding_model(&self) -> Option<(String, &str, String)> {
-        let url = self.config.endpoint_url.as_deref()?.trim_end_matches('/');
-        let endpoint = if url.ends_with("/embeddings") {
-            url.into()
-        } else {
-            format!("{url}/embeddings")
+    fn embedding_model(&self) -> Option<(reqwest::Url, &str, String)> {
+        let raw_url = self.config.endpoint_url.as_deref()?;
+        let parsed = match validate_embedding_endpoint(raw_url) {
+            Ok(url) => url,
+            Err(reason) => {
+                tracing::warn!(%reason, "invalid memory dense embedding endpoint");
+                return None;
+            }
         };
-        let model = self.config.model.as_deref()?;
-        let index_key = format!("{model}@{:x}", Sha256::digest(endpoint.as_bytes()));
-        Some((endpoint, model, index_key))
+        let model = self.config.model.as_deref()?.trim();
+        if model.is_empty() {
+            tracing::warn!("memory dense embedding model name is empty");
+            return None;
+        }
+        let index_key = format!("{model}@{:x}", Sha256::digest(parsed.as_str().as_bytes()));
+        Some((parsed, model, index_key))
     }
 
     async fn dense(&self, text: &str) -> Option<(String, Vec<f32>)> {
@@ -361,29 +431,68 @@ impl MemoryEngine {
         struct Response {
             data: Vec<Embedding>,
         }
-        let client = self.client.as_ref()?;
+        if !self.dense_enabled {
+            return None;
+        }
         let (endpoint, model, index_key) = self.embedding_model()?;
+        let (host_norm, pinned_addrs) =
+            match crate::mcp_servers::resolve_and_validate_http_addrs(&endpoint).await {
+                Ok(v) => v,
+                Err(reason) => {
+                    tracing::warn!(%reason, "blocked memory dense embedding endpoint");
+                    return None;
+                }
+            };
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(&host_norm, &pinned_addrs)
+            .build()
+        {
+            Ok(c) => c,
+            Err(error) => {
+                tracing::warn!(%error, "failed to build pinned dense embedding client");
+                return None;
+            }
+        };
         let mut req = client
-            .post(&endpoint)
+            .post(endpoint)
             .json(&serde_json::json!({"model":model,"input":text}));
         if let Some(var) = &self.config.api_key_env {
-            req = req.bearer_auth(std::env::var(var).ok()?);
+            let Ok(secret) = std::env::var(var) else {
+                tracing::warn!(env_var = %var, "memory embedding API key env var is unset");
+                return None;
+            };
+            req = req.bearer_auth(secret);
         }
-        let mut response = req.send().await.ok()?.error_for_status().ok()?;
+        let mut response = match req.send().await.and_then(|r| r.error_for_status()) {
+            Ok(r) => r,
+            Err(error) => {
+                tracing::warn!(%error, "memory dense embedding request failed");
+                return None;
+            }
+        };
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.ok()? {
             if bytes.len() + chunk.len() > 1024 * 1024 {
+                tracing::warn!("memory dense embedding response exceeded 1 MiB limit");
                 return None;
             }
             bytes.extend_from_slice(&chunk);
         }
-        let res: Response = serde_json::from_slice(&bytes).ok()?;
+        let res: Response = match serde_json::from_slice(&bytes) {
+            Ok(r) => r,
+            Err(error) => {
+                tracing::warn!(%error, "memory dense embedding response JSON decode failed");
+                return None;
+            }
+        };
         let mut v = res.data.into_iter().next()?.embedding;
         (v.len() <= 16384 && normalize(&mut v)).then_some((index_key, v))
     }
 
     async fn embed_item(&self, item: ProjectMemoryItem) {
-        if self.client.is_some()
+        if self.dense_enabled
             && let Some((model, v)) = self.dense(&embedding_text(&item)).await
         {
             let store = self.store.clone();
@@ -400,7 +509,7 @@ impl MemoryEngine {
     fn reconcile(
         &self,
         root: &str,
-        cache: &mut IndexedWorkspace,
+        shard: &mut ShardCache,
         events: &[String],
     ) -> Result<Vec<ProjectMemoryItem>> {
         let mut dirs = Vec::new();
@@ -414,30 +523,59 @@ impl MemoryEngine {
                 Err(e) => tracing::warn!(%e,"cannot scan legacy Hermes memories"),
             }
         }
-        let cold = cache.root != root;
+        let prev_files = shard.workspaces.get(root);
+        let cold = prev_files.is_none();
         let mut next = HashMap::new();
         let mut changed = Vec::new();
         let mut ids = HashSet::new();
+        let mut scanned = 0usize;
         for (dir, prefix, legacy) in dirs {
+            let mut entries = Vec::new();
             for entry in dir.entries()? {
-                let entry = entry?;
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                };
                 let filename = entry.file_name();
                 let Some(name) = filename.to_str().filter(|n| markdown_name(n)) else {
                     continue;
                 };
-                if !entry.file_type()?.is_file() {
+                entries.push((name.to_string(), entry));
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, entry) in entries {
+                if scanned >= MAX_MEMORY_FILES {
+                    tracing::warn!(%root, limit = MAX_MEMORY_FILES, "memory directory exceeded scan limit; skipping remaining files");
+                    break;
+                }
+                let is_file = match entry.file_type() {
+                    Ok(ft) => ft.is_file(),
+                    Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                if !is_file {
                     continue;
                 }
-                let source = prefix.join(name);
+                let meta = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                let modified = match meta.modified() {
+                    Ok(m) => m.into_std(),
+                    Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                scanned += 1;
+                let source = prefix.join(&name);
                 let key = if legacy {
                     source.display().to_string()
                 } else {
                     format!("{PREFIX}{name}")
                 };
-                let meta = entry.metadata()?;
-                let modified = meta.modified()?.into_std();
-                let prev = cache.files.get(&key);
-                let id = if !cold
+                let prev = prev_files.and_then(|files| files.get(&key));
+                let mut id = if !cold
                     && let Some(previous) = prev
                     && previous.modified == modified
                     && previous.size == meta.len()
@@ -445,13 +583,23 @@ impl MemoryEngine {
                 {
                     previous.id.clone()
                 } else {
-                    let parsed = read_md(&dir, name).and_then(|text| {
-                        if legacy {
-                            legacy_item(root, &source, &text, modified)
-                        } else {
-                            parse(root, name, &text).map(Some)
+                    let parsed = match read_md(&dir, &name) {
+                        Ok(text) => {
+                            if legacy {
+                                legacy_item(root, &source, &text, modified)
+                            } else {
+                                parse(root, &name, &text).map(Some)
+                            }
                         }
-                    });
+                        Err(err)
+                            if err
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|io| io.kind() == ErrorKind::NotFound) =>
+                        {
+                            continue;
+                        }
+                        Err(err) => Err(err),
+                    };
                     match parsed {
                         Ok(Some(item)) => {
                             let id = item.id.clone();
@@ -465,8 +613,14 @@ impl MemoryEngine {
                         }
                     }
                 };
-                if let Some(id) = &id {
-                    ensure!(ids.insert(id.clone()), "duplicate Markdown memory id: {id}");
+                if let Some(candidate) = &id
+                    && !ids.insert(candidate.clone())
+                {
+                    tracing::warn!(%name, id = %candidate, "skipping duplicate Markdown memory id");
+                    changed.retain(|item| {
+                        item.id != *candidate || item.source_path.as_deref() != Some(key.as_str())
+                    });
+                    id = None;
                 }
                 next.insert(
                     key,
@@ -478,13 +632,13 @@ impl MemoryEngine {
                 );
             }
         }
-        if !cold && changed.is_empty() && cache.files == next {
+        if !cold && changed.is_empty() && prev_files.is_some_and(|files| files == &next) {
             return Ok(Vec::new());
         }
         let model = self
-            .client
-            .as_ref()
-            .and_then(|_| self.embedding_model())
+            .dense_enabled
+            .then(|| self.embedding_model())
+            .flatten()
             .map(|(_, _, key)| key);
         let mut embed = Vec::new();
         for mut item in changed {
@@ -503,7 +657,7 @@ impl MemoryEngine {
                 }
             }
             self.store.index_project_memory(&item)?;
-            if self.client.is_some() && local_name(&item).is_ok() {
+            if self.dense_enabled && local_name(&item).is_ok() {
                 embed.push(item);
             }
         }
@@ -512,10 +666,10 @@ impl MemoryEngine {
                 self.store.remove_project_memory(root, &old)?;
             }
         }
-        *cache = IndexedWorkspace {
-            root: root.into(),
-            files: next,
-        };
+        if shard.workspaces.len() >= MAX_SHARD_WORKSPACES && !shard.workspaces.contains_key(root) {
+            shard.workspaces.clear();
+        }
+        shard.workspaces.insert(root.into(), next);
         Ok(embed)
     }
 
@@ -589,7 +743,7 @@ impl MemoryEngine {
             access_count: 0,
         };
         validate(&item)?;
-        let input = self.client.as_ref().map(|_| embedding_text(&item));
+        let input = self.dense_enabled.then(|| embedding_text(&item));
         let vector = match &input {
             Some(text) => self.dense(text).await,
             None => None,
@@ -740,13 +894,22 @@ impl MemoryEngine {
     }
 
     pub async fn changed(&self, cwd: &str, paths: Vec<String>) -> Result<()> {
-        let memory_events = paths
+        let mut hasher = DefaultHasher::new();
+        cwd.hash(&mut hasher);
+        let _gate = self.watcher_gates[hasher.finish() as usize % self.watcher_gates.len()]
+            .lock()
+            .await;
+        let normalized: Vec<String> = paths
+            .into_iter()
+            .filter_map(|p| orbit_store::memory::normalize_rel_path(&p))
+            .collect();
+        let memory_events: Vec<String> = normalized
             .iter()
             .filter(|p| p.starts_with(PREFIX))
             .cloned()
             .collect();
         self.workspace_after_events(cwd, memory_events, move |e, root| {
-            let changed: Vec<_> = paths
+            let changed: Vec<_> = normalized
                 .into_iter()
                 .filter(|p| !p.starts_with(PREFIX))
                 .collect();
@@ -761,10 +924,14 @@ impl MemoryEngine {
             for mut item in confirmed {
                 item.status = MemoryStatus::NeedsRevalidation;
                 item.updated_at_ms = now;
-                write_md(root, &item, false)?;
+                if let Err(error) = write_md(root, &item, false) {
+                    tracing::warn!(id = %item.id, %error, "failed to update memory file status to needs_revalidation");
+                    continue;
+                }
+                if let Err(error) = e.store.index_project_memory(&item) {
+                    tracing::warn!(id = %item.id, %error, "failed to reindex memory after revalidation");
+                }
             }
-            e.store
-                .mark_memories_needing_revalidation_for_paths_at(root, &changed, now)?;
             Ok(())
         })
         .await
@@ -788,7 +955,7 @@ impl MemoryEngine {
             query.to_lowercase().as_str(),
             "" | "hi" | "hello" | "continue" | "help" | "你好" | "继续"
         );
-        let dense = if !general && self.client.is_some() {
+        let dense = if !general && self.dense_enabled {
             let present = self
                 .workspace(workspace_root, |e, root| {
                     Ok(!e.store.preferred_confirmed_memories(root, 1)?.is_empty())
@@ -826,41 +993,49 @@ impl MemoryEngine {
 }
 
 fn format_context(items: &[ProjectMemoryItem], tokens: u32) -> String {
-    const OPEN: &str = "<orbit_project_memory>\n";
+    const OPEN: &str = "<orbit_project_memory untrusted=\"true\">\n";
     const CLOSE: &str = "\n</orbit_project_memory>";
     let mut remaining = (tokens as usize)
         .saturating_mul(4)
         .saturating_sub(OPEN.len() + CLOSE.len());
     let mut body = String::new();
     for item in items {
-        if remaining < 4 {
+        let prefix = if body.is_empty() { "- " } else { "\n- " };
+        if remaining <= prefix.len() {
             break;
         }
-        let line = format!(
-            "{}- {} — {}",
-            if body.is_empty() { "" } else { "\n" },
-            item.title,
-            item.content
-        );
-        for ch in line.chars() {
+        let mut line_budget = remaining - prefix.len();
+        let raw_content = format!("{} — {}", item.title, item.content);
+        let mut escaped_content = String::new();
+        for ch in raw_content.chars() {
             let escaped = match ch {
                 '&' => "&amp;",
                 '<' => "&lt;",
                 '>' => "&gt;",
                 _ => "",
             };
-            let cost = escaped.len().max(1);
-            if cost > remaining {
-                remaining = 0;
+            let cost = if escaped.is_empty() {
+                ch.len_utf8()
+            } else {
+                escaped.len()
+            };
+            if cost > line_budget {
+                line_budget = 0;
                 break;
             }
             if escaped.is_empty() {
-                body.push(ch)
+                escaped_content.push(ch);
             } else {
-                body.push_str(escaped)
+                escaped_content.push_str(escaped);
             }
-            remaining -= cost;
+            line_budget -= cost;
         }
+        if escaped_content.is_empty() {
+            break;
+        }
+        body.push_str(prefix);
+        body.push_str(&escaped_content);
+        remaining = line_budget;
     }
     if body.is_empty() {
         String::new()

@@ -748,6 +748,11 @@ async fn execute_tool_inner(
         "orbit_memory" => {
             let caller = caller
                 .ok_or_else(|| anyhow::anyhow!("orbit_memory requires a workspace-bound caller"))?;
+            if caller.is_personal_router() {
+                anyhow::bail!(
+                    "orbit_memory is scoped to project workspaces and cannot be invoked from the host-level Personal Router"
+                );
+            }
             crate::memory::execute_tool(&rt.orchestrator.memory, &caller, args).await
         }
         // ==================== AGENTS ====================

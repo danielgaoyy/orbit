@@ -161,9 +161,28 @@ fn get(conn: &Connection, key: &str) -> rusqlite::Result<Option<ProjectMemoryIte
     .optional()
 }
 
+pub fn normalize_rel_path(path: &str) -> Option<String> {
+    let portable = path.trim().replace('\\', "/");
+    if portable.is_empty()
+        || portable.starts_with('/')
+        || portable.contains('\0')
+        || portable.as_bytes().get(1) == Some(&b':')
+    {
+        return None;
+    }
+    let parts: Vec<&str> = portable
+        .split('/')
+        .filter(|p| !matches!(*p, "" | "."))
+        .collect();
+    if parts.is_empty() || parts.contains(&"..") {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
 fn match_query(query: &str) -> String {
     query
-        .split_whitespace()
+        .split(|c: char| c == '\0' || c.is_whitespace() || c.is_control())
         .filter(|w| w.chars().any(char::is_alphanumeric))
         .take(32)
         .map(|w| format!("\"{}\"", w.replace('"', "\"\"")))
@@ -195,7 +214,7 @@ impl OrbitStore {
         let id = key(&item.workspace_root, &item.id);
         let hash = encode(&builtin_embedding(&embedding_text(item)));
         let mut conn = self.memory_conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let same_text = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM project_memories WHERE id=?1 AND title=?2 AND content=?3 AND tags=?4)",
             params![id, item.title, item.content, serde_json::to_string(&item.tags)?],
@@ -234,12 +253,19 @@ impl OrbitStore {
         model: &str,
         vector: &[f32],
     ) -> Result<(), StoreError> {
+        let mut normalized = vector.to_vec();
+        if normalized.is_empty()
+            || !normalized.iter().all(|v| v.is_finite())
+            || !normalize(&mut normalized)
+        {
+            return Ok(());
+        }
         // A slow endpoint must never overwrite the vector for a newer revision.
         self.memory_conn()?.execute(
             "UPDATE project_memory_vectors SET model=?2,dims=?3,vector=?4,updated_at_ms=?5
             WHERE memory_id=?1 AND EXISTS(SELECT 1 FROM project_memories WHERE id=?1 AND title=?6 AND content=?7 AND tags=?8)",
             params![
-                key(&item.workspace_root, &item.id), model, vector.len(), encode(vector), item.updated_at_ms,
+                key(&item.workspace_root, &item.id), model, normalized.len(), encode(&normalized), item.updated_at_ms,
                 item.title, item.content, serde_json::to_string(&item.tags)?,
             ],
         )?;
@@ -280,6 +306,16 @@ impl OrbitStore {
         query: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ProjectMemoryItem>, StoreError> {
+        let fts_query = match query.map(str::trim).filter(|q| !q.is_empty()) {
+            Some(q) => {
+                let matched = match_query(q);
+                if matched.is_empty() {
+                    return Ok(Vec::new());
+                }
+                matched
+            }
+            None => String::new(),
+        };
         let conn = self.memory_conn()?;
         let mut stmt = conn.prepare("SELECT document,access_count,last_accessed_ms FROM project_memories
             WHERE workspace_root=?1 AND (?2 IS NULL OR status=json_extract(?2,'$')) AND (?3 IS NULL OR category=json_extract(?3,'$'))
@@ -291,7 +327,7 @@ impl OrbitStore {
                     root,
                     status.map(|s| serde_json::to_string(&s)).transpose()?,
                     category.map(|c| serde_json::to_string(&c)).transpose()?,
-                    match_query(query.unwrap_or_default()),
+                    fts_query,
                     limit
                 ],
                 item_row,
@@ -355,7 +391,7 @@ impl OrbitStore {
         }
         let hash = builtin_embedding(query);
         let mut conn = self.memory_conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut ranks = HashMap::<String, (Option<usize>, Option<usize>)>::new();
         let candidates = limit.saturating_mul(4).clamp(64, 1024);
         let terms = match_query(query);
@@ -435,10 +471,14 @@ impl OrbitStore {
         root: &str,
         paths: &[String],
     ) -> Result<Vec<ProjectMemoryItem>, StoreError> {
+        let normalized: Vec<String> = paths.iter().filter_map(|p| normalize_rel_path(p)).collect();
+        if normalized.is_empty() {
+            return Ok(Vec::new());
+        }
         let conn = self.memory_conn()?;
         let mut stmt = conn.prepare(&format!("SELECT document,access_count,last_accessed_ms FROM project_memories WHERE {BOUND_CONFIRMED}"))?;
         Ok(stmt
-            .query_map(params![root, serde_json::to_string(paths)?], item_row)?
+            .query_map(params![root, serde_json::to_string(&normalized)?], item_row)?
             .collect::<Result<_, _>>()?)
     }
 
@@ -460,9 +500,16 @@ impl OrbitStore {
         changed_rel_paths: &[String],
         updated_at_ms: i64,
     ) -> Result<usize, StoreError> {
+        let normalized: Vec<String> = changed_rel_paths
+            .iter()
+            .filter_map(|p| normalize_rel_path(p))
+            .collect();
+        if normalized.is_empty() {
+            return Ok(0);
+        }
         Ok(self.memory_conn()?.execute(&format!("UPDATE project_memories SET document=json_set(document,'$.status','needs_revalidation','$.updated_at_ms',?3)
             WHERE {BOUND_CONFIRMED}"),
-            params![root, serde_json::to_string(changed_rel_paths)?, updated_at_ms])?)
+            params![root, serde_json::to_string(&normalized)?, updated_at_ms])?)
     }
 }
 
@@ -638,6 +685,50 @@ mod tests {
                 .recall_project_memories("/two", "socket", 5, false, None)?
                 .len(),
             1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fts5_sanitizes_nul_and_special_chars_and_normalizes_windows_revalidation_paths()
+    -> Result<(), StoreError> {
+        let store = OrbitStore::open_in_memory()?;
+        let mem = item("/win", "m1", "Socket retry", "Keep connection alive");
+        store.index_project_memory(&mem)?;
+
+        // Embedded NUL and FTS5 operators must never error.
+        let _ = store.recall_project_memories(
+            "/win",
+            "foo\0bar \"* NEAR NOT :-，。！？",
+            5,
+            false,
+            None,
+        )?;
+        let _ = store.list_project_memories(
+            "/win",
+            None,
+            None,
+            Some("foo\0bar \"* NEAR NOT :-"),
+            10,
+        )?;
+
+        // Punctuation-only list filter must return empty, not all rows.
+        assert!(
+            store
+                .list_project_memories("/win", None, None, Some("!!! ---"), 10)?
+                .is_empty()
+        );
+
+        // Windows-style relative paths normalize cleanly for revalidation.
+        assert_eq!(
+            store
+                .mark_memories_needing_revalidation_for_paths("/win", &[r".\src\auth.rs".into()])?,
+            1
+        );
+        assert!(
+            store
+                .recall_project_memories("/win", "Socket", 5, false, None)?
+                .is_empty()
         );
         Ok(())
     }

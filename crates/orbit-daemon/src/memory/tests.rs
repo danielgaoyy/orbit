@@ -261,7 +261,7 @@ async fn composite_mcp_lifecycle_and_budgeted_context() -> Result<()> {
     );
     assert!(!call(json!({"action":"confirm","id":id})).await.is_error);
     let xml = e.build_confirmed_memory_context(cwd, "quorum", 32).await?;
-    assert!(xml.starts_with("<orbit_project_memory>\n- quorum"));
+    assert!(xml.starts_with("<orbit_project_memory untrusted=\"true\">\n- quorum"));
     assert!(xml.contains("&lt;guard&gt;"));
     assert!(xml.ends_with("</orbit_project_memory>"));
     assert!(xml.chars().count() <= 128);
@@ -349,5 +349,72 @@ async fn five_wire_rpcs_share_the_markdown_index() -> Result<()> {
             _ => assert_eq!(res["item"]["id"], "rpc"),
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn embedding_endpoint_blocks_ssrf_metadata_and_preserves_azure_query() -> Result<()> {
+    for bad in [
+        "file:///etc/passwd",
+        "http://user:pass@127.0.0.1:11434/v1",
+        "http://metadata.google.internal/computeMetadata/v1",
+        "http://169.254.169.254/latest/meta-data",
+    ] {
+        let store = Arc::new(OrbitStore::open_in_memory()?);
+        let engine = MemoryEngine::new(
+            store,
+            MemoryEmbeddingConfig {
+                provider: MemoryEmbeddingProvider::OpenAiCompatible,
+                endpoint_url: Some(bad.into()),
+                model: Some("text-embedding-3-small".into()),
+                api_key_env: None,
+                auto_inject_budget_tokens: 1200,
+            },
+            None,
+        );
+        assert!(engine.dense("hello").await.is_none(), "must reject {bad}");
+    }
+    let azure = validate_embedding_endpoint(
+        "https://example.openai.azure.com/openai/deployments/emb?api-version=2024-02-01",
+    )
+    .expect("azure URL valid");
+    assert_eq!(azure.path(), "/openai/deployments/emb/embeddings");
+    assert_eq!(azure.query(), Some("api-version=2024-02-01"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn duplicate_markdown_id_and_cjk_budget_degrade_gracefully() -> Result<()> {
+    let project = TempDir::new()?;
+    let cwd = project.path().to_str().context("cwd")?;
+    let mem_dir = project.path().join(".orbit/memory");
+    std::fs::create_dir_all(&mem_dir)?;
+    let md = "---\nid: dup1\ntitle: 第一条\ncategory: architecture\nstatus: confirmed\nconfidence: 1.0\nfile_paths:\n  - src/a.rs\ntags: []\ncreated_at_ms: 1\nupdated_at_ms: 1\n---\n重要架构约定内容非常长需要严格按字节截断避免超出中文令牌预算\n";
+    std::fs::write(mem_dir.join("a.md"), md)?;
+    std::fs::write(mem_dir.join("b.md"), md)?;
+
+    let engine = MemoryEngine::new(
+        Arc::new(OrbitStore::open_in_memory()?),
+        MemoryEmbeddingConfig::default(),
+        None,
+    );
+    let listed = engine.list(cwd, None, None, None, Some(10)).await?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, "dup1");
+
+    // Windows backslash revalidation flips confirmed -> needs_revalidation cleanly.
+    engine.changed(cwd, vec![r".\src\a.rs".into()]).await?;
+    let after = engine.list(cwd, None, None, None, Some(10)).await?;
+    assert_eq!(after[0].status, MemoryStatus::NeedsRevalidation);
+
+    // UTF-8 byte budget enforcement on CJK content.
+    let ctx = format_context(&listed, 40);
+    assert!(
+        ctx.len() <= 40 * 4,
+        "ctx bytes {} exceeded budget {}",
+        ctx.len(),
+        40 * 4
+    );
+    assert!(!ctx.ends_with("- \n</orbit_project_memory>"));
     Ok(())
 }

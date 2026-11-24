@@ -9590,7 +9590,10 @@ mod streaming_buffer_tests {
             let Some(DriverCommand::SendPrompt { prompt, .. }) = cmd_rx.recv().await else {
                 anyhow::bail!("expected prompt")
             };
-            assert_eq!(prompt.contains("<orbit_project_memory>"), first);
+            assert_eq!(
+                prompt.contains("<orbit_project_memory untrusted=\"true\">"),
+                first
+            );
             assert!(prompt.contains(query));
             let timeline = rt.store.fetch_timeline_outline_prompts(agent)?;
             assert_eq!(timeline.last().map(|p| p.preview.as_str()), Some(query));

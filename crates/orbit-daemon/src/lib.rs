@@ -697,17 +697,23 @@ impl DaemonRuntime {
         let bcast_for_watch = orchestrator.broadcast_tx.clone();
         let workspace_watcher =
             crate::workspace_watcher::WorkspaceWatcherManager::new(move |batch| {
-                sym_for_watch.invalidate(&batch.canonical_root);
-                let memory = orch_for_watch.memory.clone();
-                let root = batch.canonical_root.clone();
-                let paths = batch.changed_paths.clone();
-                tokio::spawn(async move {
-                    if let Some(cwd) = root.to_str()
-                        && let Err(error) = memory.changed(cwd, paths).await
-                    {
-                        tracing::warn!(%error, "project memory watcher reconciliation failed");
-                    }
-                });
+                if batch.is_primary_root_event {
+                    sym_for_watch.invalidate(&batch.canonical_root);
+                    let memory = orch_for_watch.memory.clone();
+                    let root = batch.canonical_root.clone();
+                    let paths = if batch.revalidation_paths.is_empty() {
+                        batch.changed_paths.clone()
+                    } else {
+                        batch.revalidation_paths
+                    };
+                    tokio::spawn(async move {
+                        if let Some(cwd) = root.to_str()
+                            && let Err(error) = memory.changed(cwd, paths).await
+                        {
+                            tracing::warn!(%error, "project memory watcher reconciliation failed");
+                        }
+                    });
+                }
                 if batch.skills_or_rules_changed {
                     let orch_bg = Arc::clone(&orch_for_watch);
                     let ws_id = batch.workspace_id.clone();

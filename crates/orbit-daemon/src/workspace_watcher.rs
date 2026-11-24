@@ -35,6 +35,9 @@ pub const MAX_WATCHED_ROOTS: usize = 64;
 /// Maximum relative paths included in a single coalesced `WorkspaceFilesChanged` event.
 pub const MAX_COALESCED_PATHS_PER_EVENT: usize = 64;
 
+/// Maximum relative paths retained per debounced batch for background memory revalidation.
+pub const MAX_REVALIDATION_PATHS_PER_EVENT: usize = 4096;
+
 /// Bounded event queue between the OS watcher callback thread and the Tokio debouncer task.
 const RAW_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
@@ -63,6 +66,8 @@ pub struct WorkspaceWatchBatch {
     pub cwd: String,
     pub canonical_root: PathBuf,
     pub changed_paths: Vec<String>,
+    pub revalidation_paths: Vec<String>,
+    pub is_primary_root_event: bool,
     pub git_changed: bool,
     pub skills_or_rules_changed: bool,
 }
@@ -212,6 +217,7 @@ struct WatcherRegistryState {
 #[derive(Default)]
 struct PendingRootBatch {
     changed_paths: BTreeSet<String>,
+    revalidation_paths: BTreeSet<String>,
     git_changed: bool,
     skills_or_rules_changed: bool,
     first_event_at: Option<Instant>,
@@ -469,7 +475,7 @@ async fn run_debouncer_loop(
             let Some(ev) = raw_rx.recv().await else {
                 break;
             };
-            ingest_raw_event(&state, &mut pending, ev, &on_change);
+            ingest_raw_event(&state, &mut pending, ev);
             continue;
         };
 
@@ -487,7 +493,7 @@ async fn run_debouncer_loop(
             }
             maybe_ev = raw_rx.recv() => {
                 match maybe_ev {
-                    Some(ev) => ingest_raw_event(&state, &mut pending, ev, &on_change),
+                    Some(ev) => ingest_raw_event(&state, &mut pending, ev),
                     None => {
                         flush_pending_roots(
                             &state,
@@ -508,7 +514,6 @@ fn ingest_raw_event(
     state: &Arc<Mutex<WatcherRegistryState>>,
     pending: &mut HashMap<PathBuf, PendingRootBatch>,
     ev: Event,
-    on_change: &WatchCallback,
 ) {
     let roots: Vec<PathBuf> = {
         let Ok(guard) = state.lock() else {
@@ -531,16 +536,15 @@ fn ingest_raw_event(
                 continue;
             };
             let entry = pending.entry(root.clone()).or_default();
-            // Bound each notification while preserving paths needed for memory revalidation.
-            if entry.changed_paths.len() == MAX_COALESCED_PATHS_PER_EVENT
-                && !entry.changed_paths.contains(&classified.rel_path)
-            {
-                emit_root_batch(state, root, std::mem::take(entry), on_change);
-            }
             if entry.first_event_at.is_none() {
                 entry.first_event_at = Some(now);
             }
-            entry.changed_paths.insert(classified.rel_path);
+            if entry.changed_paths.len() < MAX_COALESCED_PATHS_PER_EVENT {
+                entry.changed_paths.insert(classified.rel_path.clone());
+            }
+            if entry.revalidation_paths.len() < MAX_REVALIDATION_PATHS_PER_EVENT {
+                entry.revalidation_paths.insert(classified.rel_path);
+            }
             if classified.is_git_state {
                 entry.git_changed = true;
             }
@@ -610,12 +614,19 @@ fn emit_root_batch(
             .unwrap_or_default()
     };
     let changed_paths: Vec<String> = batch.changed_paths.into_iter().collect();
-    for (workspace_id, cwd) in targets {
+    let revalidation_paths: Vec<String> = batch.revalidation_paths.into_iter().collect();
+    for (idx, (workspace_id, cwd)) in targets.into_iter().enumerate() {
         on_change(WorkspaceWatchBatch {
             workspace_id,
             cwd,
             canonical_root: root.to_path_buf(),
             changed_paths: changed_paths.clone(),
+            revalidation_paths: if idx == 0 {
+                revalidation_paths.clone()
+            } else {
+                Vec::new()
+            },
+            is_primary_root_event: idx == 0,
             git_changed: batch.git_changed,
             skills_or_rules_changed: batch.skills_or_rules_changed,
         });
@@ -671,7 +682,9 @@ mod tests {
         );
         event.paths.push(root.join("src/index.rs"));
         let mut pending = HashMap::new();
-        ingest_raw_event(&state, &mut pending, event, &callback);
+        ingest_raw_event(&state, &mut pending, event);
+        // Must stay debounced (not flushed synchronously before flush_pending_roots).
+        assert!(rx.try_recv().is_err());
         flush_pending_roots(
             &state,
             &mut pending,
@@ -679,13 +692,15 @@ mod tests {
             Duration::ZERO,
             &callback,
         );
-        let mut count = 0;
-        while let Ok(batch) = rx.try_recv() {
-            assert!(batch.changed_paths.len() <= MAX_COALESCED_PATHS_PER_EVENT);
-            count += batch.changed_paths.len();
-            engine.changed(&batch.cwd, batch.changed_paths).await?;
-        }
-        assert_eq!(count, MAX_COALESCED_PATHS_PER_EVENT + 1);
+        let batch = rx.try_recv()?;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(batch.changed_paths.len(), MAX_COALESCED_PATHS_PER_EVENT);
+        assert_eq!(
+            batch.revalidation_paths.len(),
+            MAX_COALESCED_PATHS_PER_EVENT + 1
+        );
+        assert!(batch.is_primary_root_event);
+        engine.changed(&batch.cwd, batch.revalidation_paths).await?;
         assert_eq!(
             store.project_memory(cwd, "watch")?.map(|i| i.status),
             Some(orbit_protocol::MemoryStatus::NeedsRevalidation)
@@ -699,7 +714,6 @@ mod tests {
             &state,
             &mut pending,
             Event::new(EventKind::Any).add_path(path),
-            &callback,
         );
         flush_pending_roots(
             &state,
@@ -709,7 +723,7 @@ mod tests {
             &callback,
         );
         let batch = rx.try_recv()?;
-        engine.changed(&batch.cwd, batch.changed_paths).await?;
+        engine.changed(&batch.cwd, batch.revalidation_paths).await?;
         assert_eq!(
             store.project_memory(cwd, "watch")?.map(|i| i.content),
             Some("Rebuild locally.".into())

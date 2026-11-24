@@ -124,8 +124,11 @@ impl PushManager {
         home: &std::path::Path,
     ) -> anyhow::Result<Arc<Self>> {
         let config = match std::fs::read(home.join("push.json")) {
-            Ok(bytes) => serde_json::from_slice::<DirectPush>(&bytes)
-                .map_err(|_| anyhow::anyhow!("invalid push.json provider configuration"))?,
+            Ok(bytes) => {
+                let bytes = zeroize::Zeroizing::new(bytes);
+                serde_json::from_slice::<DirectPush>(&bytes)
+                    .map_err(|_| anyhow::anyhow!("invalid push.json provider configuration"))?
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => DirectPush::default(),
             Err(e) => return Err(e.into()),
         };
@@ -282,9 +285,14 @@ impl PushManager {
             }
         }
 
-        validate_activity_token(platform, live_activity_token.as_deref())?;
+        let clean_activity_token = live_activity_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        validate_activity_token(platform, clean_activity_token.as_deref())?;
         let record = StoredPushDevice {
-            live_activity_token,
+            live_activity_token: clean_activity_token,
             device_id: clean_id.to_string(),
             platform,
             device_name: clean_name,
@@ -307,9 +315,17 @@ impl PushManager {
         device_id: &str,
         token: Option<&str>,
     ) -> Result<PushSnapshotData, String> {
-        validate_activity_token(PushPlatform::Apns, token)?;
+        if contains_forbidden_control_chars(device_id) {
+            return Err("device_id must not contain control characters".to_string());
+        }
+        let clean_id = device_id.trim();
+        if clean_id.is_empty() || clean_id.len() > MAX_DEVICE_ID_LEN {
+            return Err("device_id must be 1..=160 characters".to_string());
+        }
+        let clean_token = token.map(str::trim).filter(|s| !s.is_empty());
+        validate_activity_token(PushPlatform::Apns, clean_token)?;
         self.store
-            .set_live_activity_token(device_id, token)
+            .set_live_activity_token(clean_id, clean_token)
             .map_err(|e| e.to_string())?;
         self.list_snapshot()
     }
@@ -827,6 +843,24 @@ fn validate_activity_token(platform: PushPlatform, token: Option<&str>) -> Resul
     Ok(())
 }
 
+struct ZeroizingSecret(zeroize::Zeroizing<String>);
+
+impl ZeroizingSecret {
+    fn new(s: String) -> Self {
+        Self(zeroize::Zeroizing::new(s))
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ZeroizingSecret {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self::new)
+    }
+}
+
 #[derive(Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct DirectPush {
@@ -838,8 +872,14 @@ struct DirectPush {
     fcm_service_account_path: Option<String>,
     hms_service_account_path: Option<String>,
     hms_client_id: Option<String>,
-    hms_client_secret: Option<String>,
+    hms_client_secret: Option<ZeroizingSecret>,
     hms_project_id: Option<String>,
+    #[serde(skip)]
+    apns_token_lock: Mutex<()>,
+    #[serde(skip)]
+    fcm_token_lock: Mutex<()>,
+    #[serde(skip)]
+    hms_token_lock: Mutex<()>,
     #[serde(skip)]
     tokens: Mutex<HashMap<PushPlatform, ProviderToken>>,
     #[serde(skip)]
@@ -857,7 +897,10 @@ struct ProviderConnection {
 struct ProviderToken {
     bearer: zeroize::Zeroizing<String>,
     project: String,
+    iat: i64,
     refresh_at: i64,
+    issued_at: std::time::Instant,
+    max_age: Duration,
 }
 
 fn jwt_input(header: Value, claims: Value) -> String {
@@ -890,12 +933,22 @@ struct GoogleAccount {
     client_email: String,
     private_key: String,
 }
+impl Drop for GoogleAccount {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.private_key);
+    }
+}
 #[derive(serde::Deserialize)]
 struct HuaweiAccount {
     project_id: String,
     sub_account: String,
     key_id: String,
     private_key: String,
+}
+impl Drop for HuaweiAccount {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.private_key);
+    }
 }
 
 fn google_assertion(account: &GoogleAccount, now: i64) -> Result<String, PushDispatchError> {
@@ -954,31 +1007,41 @@ async fn exchange_token(
         access_token: String,
         expires_in: i64,
     }
-    let token: Response = serde_json::from_slice(&bounded_response(response).await?)
+    let body_bytes = zeroize::Zeroizing::new(bounded_response(response).await?);
+    let mut token: Response = serde_json::from_slice(&body_bytes)
         .map_err(|_| transient("invalid push OAuth response"))?;
     if token.access_token.is_empty() || token.expires_in <= 0 {
+        zeroize::Zeroize::zeroize(&mut token.access_token);
         return Err(transient("empty or expired OAuth token"));
     }
-    Ok((token.access_token, token.expires_in.saturating_sub(60)))
+    Ok((
+        std::mem::take(&mut token.access_token),
+        token.expires_in.saturating_sub(60),
+    ))
 }
 
 impl DirectPush {
-    fn with_env(self) -> Self {
+    fn with_env(mut self) -> Self {
         let var = |name| std::env::var(name).ok().filter(|s| !s.is_empty());
         Self {
-            apns_key_path: var("ORBIT_APNS_KEY_PATH").or(self.apns_key_path),
-            apns_key_id: var("ORBIT_APNS_KEY_ID").or(self.apns_key_id),
-            apns_team_id: var("ORBIT_APNS_TEAM_ID").or(self.apns_team_id),
-            apns_bundle_id: var("ORBIT_APNS_BUNDLE_ID").or(self.apns_bundle_id),
+            apns_key_path: var("ORBIT_APNS_KEY_PATH").or_else(|| self.apns_key_path.take()),
+            apns_key_id: var("ORBIT_APNS_KEY_ID").or_else(|| self.apns_key_id.take()),
+            apns_team_id: var("ORBIT_APNS_TEAM_ID").or_else(|| self.apns_team_id.take()),
+            apns_bundle_id: var("ORBIT_APNS_BUNDLE_ID").or_else(|| self.apns_bundle_id.take()),
             apns_sandbox: var("ORBIT_APNS_SANDBOX")
                 .map_or(self.apns_sandbox, |v| v == "true" || v == "1"),
             fcm_service_account_path: var("ORBIT_FCM_SERVICE_ACCOUNT_PATH")
-                .or(self.fcm_service_account_path),
+                .or_else(|| self.fcm_service_account_path.take()),
             hms_service_account_path: var("ORBIT_HMS_SERVICE_ACCOUNT_PATH")
-                .or(self.hms_service_account_path),
-            hms_client_id: var("ORBIT_HMS_CLIENT_ID").or(self.hms_client_id),
-            hms_client_secret: var("ORBIT_HMS_CLIENT_SECRET").or(self.hms_client_secret),
-            hms_project_id: var("ORBIT_HMS_PROJECT_ID").or(self.hms_project_id),
+                .or_else(|| self.hms_service_account_path.take()),
+            hms_client_id: var("ORBIT_HMS_CLIENT_ID").or_else(|| self.hms_client_id.take()),
+            hms_client_secret: var("ORBIT_HMS_CLIENT_SECRET")
+                .map(ZeroizingSecret::new)
+                .or_else(|| self.hms_client_secret.take()),
+            hms_project_id: var("ORBIT_HMS_PROJECT_ID").or_else(|| self.hms_project_id.take()),
+            apns_token_lock: Default::default(),
+            fcm_token_lock: Default::default(),
+            hms_token_lock: Default::default(),
             tokens: Default::default(),
             clients: Default::default(),
         }
@@ -986,22 +1049,48 @@ impl DirectPush {
 
     fn configured(&self, platform: PushPlatform) -> bool {
         match platform {
-            PushPlatform::Apns => self.apns_key_path.is_some(),
+            PushPlatform::Apns => {
+                self.apns_key_path.is_some()
+                    && self.apns_key_id.is_some()
+                    && self.apns_team_id.is_some()
+                    && self.apns_bundle_id.is_some()
+            }
             PushPlatform::Fcm => self.fcm_service_account_path.is_some(),
             PushPlatform::HarmonyPushKit => {
-                self.hms_service_account_path.is_some() || self.hms_client_id.is_some()
+                self.hms_service_account_path.is_some()
+                    || (self.hms_client_id.is_some()
+                        && self.hms_client_secret.is_some()
+                        && self.hms_project_id.is_some())
             }
         }
+    }
+
+    fn platform_lock(&self, platform: PushPlatform) -> &Mutex<()> {
+        match platform {
+            PushPlatform::Apns => &self.apns_token_lock,
+            PushPlatform::Fcm => &self.fcm_token_lock,
+            PushPlatform::HarmonyPushKit => &self.hms_token_lock,
+        }
+    }
+
+    async fn invalidate_token(&self, platform: PushPlatform) {
+        self.tokens.lock().await.remove(&platform);
     }
 
     async fn credentials(
         &self,
         platform: PushPlatform,
     ) -> Result<ProviderToken, PushDispatchError> {
-        let mut tokens = self.tokens.lock().await;
+        let _platform_guard = self.platform_lock(platform).lock().await;
         let now = Utc::now().timestamp();
-        if let Some(token) = tokens.get(&platform).filter(|t| now < t.refresh_at) {
-            return Ok(token.clone());
+        {
+            let tokens = self.tokens.lock().await;
+            if let Some(token) = tokens
+                .get(&platform)
+                .filter(|t| now >= t.iat && now < t.refresh_at && t.issued_at.elapsed() < t.max_age)
+            {
+                return Ok(token.clone());
+            }
         }
         let (project, bearer, lifetime) = match platform {
             PushPlatform::Apns => {
@@ -1028,16 +1117,16 @@ impl DirectPush {
                     &read_key(self.fcm_service_account_path.as_deref()).await?,
                 )
                 .map_err(|_| transient("invalid Google service account JSON"))?;
-                let assertion = google_assertion(&account, now)?;
+                let assertion = zeroize::Zeroizing::new(google_assertion(&account, now)?);
                 let (bearer, life) = exchange_token(
                     GOOGLE_TOKEN_URL,
                     &[
                         ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
-                        ("assertion", &assertion),
+                        ("assertion", assertion.as_str()),
                     ],
                 )
                 .await?;
-                (account.project_id, bearer, life)
+                (account.project_id.clone(), bearer, life)
             }
             PushPlatform::HarmonyPushKit => {
                 if let Some(path) = self.hms_service_account_path.as_deref() {
@@ -1053,7 +1142,7 @@ impl DirectPush {
                         .pss_sign::<rsa::sha2::Sha256>(input.as_bytes())
                         .map_err(|_| transient("Huawei JWT signing failed"))?;
                     (
-                        acct.project_id,
+                        acct.project_id.clone(),
                         format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig)),
                         3000,
                     )
@@ -1068,7 +1157,8 @@ impl DirectPush {
                         .ok_or_else(|| transient("missing Huawei client ID"))?;
                     let secret = self
                         .hms_client_secret
-                        .as_deref()
+                        .as_ref()
+                        .map(ZeroizingSecret::as_str)
                         .ok_or_else(|| transient("missing Huawei client secret"))?;
                     let (bearer, life) = exchange_token(
                         HUAWEI_TOKEN_URL,
@@ -1083,19 +1173,19 @@ impl DirectPush {
                 }
             }
         };
-        if project.is_empty()
-            || !project
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
-        {
+        if !is_valid_push_project_id(platform, &project) {
             return Err(transient("invalid push project or bundle ID"));
         }
+        let max_age_secs = lifetime.clamp(1, 3000) as u64;
         let token = ProviderToken {
             project,
             bearer: zeroize::Zeroizing::new(bearer),
-            refresh_at: now.saturating_add(lifetime),
+            iat: now,
+            refresh_at: now.saturating_add(max_age_secs as i64),
+            issued_at: std::time::Instant::now(),
+            max_age: Duration::from_secs(max_age_secs),
         };
-        tokens.insert(platform, token.clone());
+        self.tokens.lock().await.insert(platform, token.clone());
         Ok(token)
     }
 
@@ -1122,68 +1212,161 @@ impl DirectPush {
 
     async fn deliver(
         &self,
-        store: &OrbitStore,
+        store: &Arc<OrbitStore>,
         device: &StoredPushDevice,
         payload: &PushDispatchPayload,
     ) -> Result<(), PushDispatchError> {
-        let auth = self.credentials(device.platform).await?;
-        let project = &auth.project;
-        let endpoint = match device.platform {
-            PushPlatform::Apns => {
-                if self.apns_sandbox || device.sandbox {
-                    "https://api.sandbox.push.apple.com".into()
-                } else {
-                    "https://api.push.apple.com".into()
-                }
-            }
-            PushPlatform::Fcm => {
-                format!("https://fcm.googleapis.com/v1/projects/{project}/messages:send")
-            }
-            PushPlatform::HarmonyPushKit => {
-                format!("https://push-api.cloud.huawei.com/v3/{project}/messages:send")
-            }
-        };
-        let ProviderConnection { client, url, .. } = self.connection(&endpoint).await?;
-        if device.platform == PushPlatform::Apns {
-            let send = |kind, token: &str| {
-                apns_request(
-                    &client,
-                    url.clone(),
-                    project,
-                    kind,
-                    token,
-                    payload,
-                    Utc::now().timestamp(),
-                )
-                .bearer_auth(auth.bearer.as_str())
-            };
-            let alert = send_direct(
-                send(PushDeliveryKind::Alert, &device.device_token),
-                device.platform,
-            )
-            .await;
-            if let Some(token) = device.live_activity_token.as_deref()
-                && let Err(error) =
-                    send_direct(send(PushDeliveryKind::LiveActivity, token), device.platform).await
-            {
-                if matches!(error, PushDispatchError::InvalidToken(_)) {
-                    store
-                        .clear_stale_activity_token(&device.device_id, token)
-                        .map_err(|_| transient("could not retire stale activity token"))?;
-                }
-                warn!(device_id=%device.device_id, reason=%error.message(), "ActivityKit update failed");
-            }
-            return alert;
+        if device.platform == PushPlatform::Apns && !is_valid_apns_hex_token(&device.device_token) {
+            return Err(PushDispatchError::InvalidToken(
+                "invalid APNs hexadecimal device token".into(),
+            ));
         }
-        let mut request = client.post(url.clone()).bearer_auth(auth.bearer.as_str());
-        let body = if device.platform == PushPlatform::HarmonyPushKit {
-            request = request.header("push-type", "0");
-            harmony_payload(device, payload)
-        } else {
-            build_gateway_request_body(&url, device, payload)
-        };
-        send_direct(request.json(&body), device.platform).await
+        for attempt in 0..2 {
+            let auth = self.credentials(device.platform).await?;
+            let project = &auth.project;
+            let endpoint = match device.platform {
+                PushPlatform::Apns => {
+                    if self.apns_sandbox || device.sandbox {
+                        "https://api.sandbox.push.apple.com".into()
+                    } else {
+                        "https://api.push.apple.com".into()
+                    }
+                }
+                PushPlatform::Fcm => {
+                    format!("https://fcm.googleapis.com/v1/projects/{project}/messages:send")
+                }
+                PushPlatform::HarmonyPushKit => {
+                    format!("https://push-api.cloud.huawei.com/v3/{project}/messages:send")
+                }
+            };
+            let ProviderConnection { client, url, .. } = self.connection(&endpoint).await?;
+            if device.platform == PushPlatform::Apns {
+                let send = |kind, token: &str| {
+                    apns_request(
+                        &client,
+                        url.clone(),
+                        project,
+                        kind,
+                        token,
+                        payload,
+                        Utc::now().timestamp(),
+                    )
+                    .bearer_auth(auth.bearer.as_str())
+                };
+                let alert = match send_direct(
+                    send(PushDeliveryKind::Alert, &device.device_token),
+                    device.platform,
+                )
+                .await
+                {
+                    DirectSendOutcome::Ok => Ok(()),
+                    DirectSendOutcome::AuthRejected(msg) => {
+                        self.invalidate_token(device.platform).await;
+                        if attempt == 0 {
+                            continue;
+                        }
+                        Err(transient(&msg))
+                    }
+                    DirectSendOutcome::Error(err) => Err(err),
+                };
+                if let Some(token) = device.live_activity_token.as_deref() {
+                    if !is_valid_apns_hex_token(token) {
+                        warn!(device_id=%device.device_id, "skipping malformed ActivityKit token");
+                    } else {
+                        match send_direct(
+                            send(PushDeliveryKind::LiveActivity, token),
+                            device.platform,
+                        )
+                        .await
+                        {
+                            DirectSendOutcome::Ok => {}
+                            DirectSendOutcome::AuthRejected(msg) => {
+                                self.invalidate_token(device.platform).await;
+                                warn!(device_id=%device.device_id, reason=%msg, "ActivityKit auth rejected");
+                            }
+                            DirectSendOutcome::Error(error) => {
+                                if matches!(error, PushDispatchError::InvalidToken(_)) {
+                                    let store_bg = Arc::clone(store);
+                                    let dev_id = device.device_id.clone();
+                                    let tok = token.to_owned();
+                                    match tokio::task::spawn_blocking(move || {
+                                        store_bg.clear_stale_activity_token(&dev_id, &tok)
+                                    })
+                                    .await
+                                    {
+                                        Ok(Ok(_)) => {}
+                                        Ok(Err(db_err)) => {
+                                            warn!(device_id=%device.device_id, error=%db_err, "failed to retire stale activity token");
+                                        }
+                                        Err(join_err) => {
+                                            warn!(device_id=%device.device_id, error=%join_err, "activity token cleanup worker failed");
+                                        }
+                                    }
+                                }
+                                warn!(device_id=%device.device_id, reason=%error.message(), "ActivityKit update failed");
+                            }
+                        }
+                    }
+                }
+                return alert;
+            }
+            let mut request = client.post(url.clone()).bearer_auth(auth.bearer.as_str());
+            let body = if device.platform == PushPlatform::HarmonyPushKit {
+                request = request.header("push-type", "0");
+                harmony_payload(device, payload)
+            } else {
+                build_gateway_request_body(&url, device, payload)
+            };
+            match send_direct(request.json(&body), device.platform).await {
+                DirectSendOutcome::Ok => return Ok(()),
+                DirectSendOutcome::AuthRejected(msg) => {
+                    self.invalidate_token(device.platform).await;
+                    if attempt == 0 {
+                        continue;
+                    }
+                    return Err(transient(&msg));
+                }
+                DirectSendOutcome::Error(err) => return Err(err),
+            }
+        }
+        Err(transient("push provider rejected authentication"))
     }
+}
+
+fn is_valid_push_project_id(platform: PushPlatform, project: &str) -> bool {
+    if project.is_empty()
+        || project.len() > 256
+        || project == "."
+        || project == ".."
+        || project.contains("..")
+    {
+        return false;
+    }
+    match platform {
+        PushPlatform::Apns => {
+            !project.starts_with('.')
+                && !project.ends_with('.')
+                && project
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        }
+        PushPlatform::Fcm | PushPlatform::HarmonyPushKit => project
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
+    }
+}
+
+fn is_valid_apns_hex_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_DEVICE_TOKEN_LEN
+        && token.len().is_multiple_of(2)
+        && token.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+enum DirectSendOutcome {
+    Ok,
+    AuthRejected(String),
+    Error(PushDispatchError),
 }
 
 fn apns_request(
@@ -1215,6 +1398,7 @@ fn apns_request(
         .version(reqwest::Version::HTTP_2)
         .header("apns-push-type", push_type)
         .header("apns-topic", topic)
+        .header("apns-priority", "10")
         .json(&body)
 }
 
@@ -1225,18 +1409,42 @@ fn harmony_payload(device: &StoredPushDevice, p: &PushDispatchPayload) -> Value 
 async fn send_direct(
     request: reqwest::RequestBuilder,
     platform: PushPlatform,
-) -> Result<(), PushDispatchError> {
-    let response = request
-        .send()
-        .await
-        .map_err(|_| transient("push provider transport failed"))?;
+) -> DirectSendOutcome {
+    let response = match request.send().await {
+        Ok(r) => r,
+        Err(_) => return DirectSendOutcome::Error(transient("push provider transport failed")),
+    };
     let status = response.status();
-    let bytes = bounded_response(response).await?;
+    let bytes = match bounded_response(response).await {
+        Ok(b) => b,
+        Err(e) => return DirectSendOutcome::Error(e),
+    };
     let body = serde_json::from_slice::<Value>(&bytes).unwrap_or_default();
     if status.is_success()
         && (platform != PushPlatform::HarmonyPushKit || body["code"] == "80000000")
     {
-        return Ok(());
+        return DirectSendOutcome::Ok;
+    }
+    let auth_rejected = match platform {
+        PushPlatform::Apns => {
+            status == reqwest::StatusCode::UNAUTHORIZED
+                || (status == reqwest::StatusCode::FORBIDDEN
+                    && matches!(
+                        body["reason"].as_str(),
+                        Some("ExpiredProviderToken" | "InvalidProviderToken")
+                    ))
+        }
+        PushPlatform::Fcm => status == reqwest::StatusCode::UNAUTHORIZED,
+        PushPlatform::HarmonyPushKit => {
+            status == reqwest::StatusCode::UNAUTHORIZED
+                || matches!(body["code"].as_str(), Some("80200001" | "80200003"))
+        }
+    };
+    if auth_rejected {
+        return DirectSendOutcome::AuthRejected(format!(
+            "push provider rejected auth token (HTTP {})",
+            status.as_u16()
+        ));
     }
     let stale = status == reqwest::StatusCode::GONE
         || body["reason"] == "BadDeviceToken"
@@ -1246,11 +1454,11 @@ async fn send_direct(
             .and_then(Value::as_array)
             .is_some_and(|details| details.iter().any(|e| e["errorCode"] == "UNREGISTERED"));
     if stale {
-        Err(PushDispatchError::InvalidToken(
+        DirectSendOutcome::Error(PushDispatchError::InvalidToken(
             "push provider rejected device token".into(),
         ))
     } else {
-        Err(transient(&format!(
+        DirectSendOutcome::Error(transient(&format!(
             "push provider rejected notification (HTTP {})",
             status.as_u16()
         )))
@@ -1258,7 +1466,7 @@ async fn send_direct(
 }
 
 fn contains_forbidden_control_chars(raw: &str) -> bool {
-    raw.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+    raw.bytes().any(|b| b < 0x20 || b == 0x7f)
 }
 
 /// Scrub raw device tokens and gateway Bearer auth tokens from any outbound error or response
@@ -2533,5 +2741,60 @@ mod tests {
         mgr.shutdown_all().await;
         server_task.abort();
         let _ = std::fs::remove_dir_all(&tmp_home);
+    }
+
+    #[test]
+    fn direct_push_hardening_rejects_path_traversal_and_sets_apns_priority() {
+        assert!(!is_valid_push_project_id(PushPlatform::Fcm, "."));
+        assert!(!is_valid_push_project_id(PushPlatform::Fcm, ".."));
+        assert!(!is_valid_push_project_id(
+            PushPlatform::Fcm,
+            "proj.with.dot"
+        ));
+        assert!(is_valid_push_project_id(
+            PushPlatform::Fcm,
+            "orbit-prod-123"
+        ));
+        assert!(!is_valid_push_project_id(PushPlatform::Apns, ".."));
+        assert!(!is_valid_push_project_id(PushPlatform::Apns, ".com.orbit"));
+        assert!(is_valid_push_project_id(
+            PushPlatform::Apns,
+            "dev.orbit.ios"
+        ));
+
+        assert!(is_valid_apns_hex_token("a1b2c3d4"));
+        assert!(!is_valid_apns_hex_token(".."));
+        assert!(!is_valid_apns_hex_token("abc"));
+        assert!(contains_forbidden_control_chars("tok\x1b"));
+
+        let partial = DirectPush {
+            apns_key_path: Some("/tmp/key.p8".into()),
+            ..Default::default()
+        };
+        assert!(!partial.configured(PushPlatform::Apns));
+
+        let client = reqwest::Client::new();
+        let url = reqwest::Url::parse("https://api.push.apple.com").expect("url");
+        let payload = PushDispatchPayload {
+            event_kind: PushEventKind::PermissionRequired,
+            host_id: "h1".into(),
+            agent_id: Some("a1".into()),
+            title: "t".into(),
+            body: "b".into(),
+            deep_link: "orbit://open?host=h1".into(),
+        };
+        let req = apns_request(
+            &client,
+            url,
+            "dev.orbit.ios",
+            PushDeliveryKind::Alert,
+            "a1b2c3d4",
+            &payload,
+            100,
+        )
+        .build()
+        .expect("build apns");
+        assert_eq!(req.headers()["apns-priority"], "10");
+        assert_eq!(req.headers()["apns-push-type"], "alert");
     }
 }

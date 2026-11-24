@@ -2356,6 +2356,7 @@ dependencies = [
  "orbit-protocol",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
@@ -2369,6 +2370,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "uniffi",
+ "zeroize",
 ]
 
 [[package]]

@@ -55,6 +55,9 @@ impl SecretEnvelope {
 
     pub fn open(&self, field: &str, value: &str) -> Result<String, StoreError> {
         let Some(encoded) = value.strip_prefix(PREFIX) else {
+            if self.0.is_some() {
+                return Err(invalid());
+            }
             return Ok(value.to_owned());
         };
         let bytes = STANDARD.decode(encoded).map_err(|_| invalid())?;
@@ -72,8 +75,8 @@ impl SecretEnvelope {
             ciphertext_b64: URL_SAFE_NO_PAD.encode(&bytes[12..]),
             updated_at_ms: 0,
         };
-        String::from_utf8(decrypt_vault_bytes(&key, &envelope).map_err(|_| invalid())?)
-            .map_err(|_| invalid())
+        let plain = Zeroizing::new(decrypt_vault_bytes(&key, &envelope).map_err(|_| invalid())?);
+        String::from_utf8(plain.to_vec()).map_err(|_| invalid())
     }
 
     pub fn cloud_fields(
@@ -90,8 +93,8 @@ impl SecretEnvelope {
         Ok(serde_json::to_string(&json)?)
     }
 
-    fn migrate(&self, field: &str, raw: &str) -> Result<String, StoreError> {
-        if raw.starts_with(PREFIX) {
+    fn migrate(&self, field: &str, raw: &str, enrolling: bool) -> Result<String, StoreError> {
+        if !enrolling && raw.starts_with(PREFIX) {
             self.open(field, raw)?;
             Ok(raw.to_owned())
         } else {
@@ -135,6 +138,15 @@ impl SecretEnvelope {
             )?;
         }
         if self.0.is_some() {
+            // Preserve pre-existing `cloud_sync_dirty` state across secret re-encoding so
+            // encrypting local rows at rest never triggers a spurious cloud sync upload.
+            let prev_dirty: Option<(String, i64)> = tx
+                .query_row(
+                    "SELECT value_json, updated_at_ms FROM client_kv WHERE key='cloud_sync_dirty'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
             {
                 let query = "SELECT host_id,pairing_secret FROM client_hosts";
                 let update = "UPDATE client_hosts SET pairing_secret=?2 WHERE host_id=?1";
@@ -143,7 +155,7 @@ impl SecretEnvelope {
                     stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
                 {
                     let (id, old) = row?;
-                    let new = self.migrate(&format!("pairing_secret/{id}"), &old)?;
+                    let new = self.migrate(&format!("pairing_secret/{id}"), &old, enrolling)?;
                     if new != old {
                         tx.execute(update, params![id, new])?;
                     }
@@ -157,7 +169,8 @@ impl SecretEnvelope {
                 )
                 .optional()?;
             if let Some(raw) = raw {
-                let updated = self.cloud_fields(&raw, Self::migrate)?;
+                let updated =
+                    self.cloud_fields(&raw, |s, field, value| s.migrate(field, value, enrolling))?;
                 if updated != raw {
                     tx.execute(
                         "UPDATE client_kv SET value_json=?2 WHERE key=?1",
@@ -165,7 +178,12 @@ impl SecretEnvelope {
                     )?;
                 }
             }
-            let mut stmt = tx.prepare("SELECT id,host_id,payload_json FROM client_pending_outbox WHERE payload_json NOT LIKE 'enc:v1:%'")?;
+            let outbox_sql = if enrolling {
+                "SELECT id,host_id,payload_json FROM client_pending_outbox"
+            } else {
+                "SELECT id,host_id,payload_json FROM client_pending_outbox WHERE substr(payload_json,1,7) != 'enc:v1:'"
+            };
+            let mut stmt = tx.prepare(outbox_sql)?;
             for row in stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -178,6 +196,17 @@ impl SecretEnvelope {
                     "UPDATE client_pending_outbox SET payload_json=?2 WHERE id=?1",
                     params![id, self.seal(&format!("outbox/{host}"), &raw)?],
                 )?;
+            }
+            match prev_dirty {
+                Some((val, ts)) => {
+                    tx.execute(
+                        "INSERT INTO client_kv(key,value_json,updated_at_ms) VALUES('cloud_sync_dirty',?1,?2) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at_ms=excluded.updated_at_ms",
+                        params![val, ts],
+                    )?;
+                }
+                None => {
+                    tx.execute("DELETE FROM client_kv WHERE key='cloud_sync_dirty'", [])?;
+                }
             }
         }
         tx.commit()?;
@@ -306,6 +335,44 @@ mod tests {
         assert!(store.list_pending_outbox("b")?.is_empty());
         assert_eq!(store.prune_stale_outbox(i64::MAX)?, 0);
         drop(store);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn keyed_open_rejects_plaintext_downgrade_and_migration_does_not_mark_cloud_dirty()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let env = SecretEnvelope(Some(Zeroizing::new([9u8; 32])));
+        assert!(
+            env.open("pairing_secret/h1", "unencrypted-downgrade")
+                .is_err()
+        );
+
+        // Legacy plaintext that happens to start with `enc:v1:` enrolls cleanly without aborting.
+        let path =
+            std::env::temp_dir().join(format!("orbit-enroll-edge-{}.db", uuid::Uuid::new_v4()));
+        {
+            let legacy = OrbitStore::open(&path)?;
+            legacy.upsert_client_host(&StoredHostProfile {
+                host_id: "h-edge".into(),
+                display_name: "edge".into(),
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                pairing_secret: "enc:v1:legacy-literal".into(),
+                meta: Default::default(),
+            })?;
+            if let Some(rev) = legacy.cloud_dirty_revision()? {
+                legacy.clear_cloud_dirty_revision(rev)?;
+            }
+            assert_eq!(legacy.cloud_dirty_revision()?, None);
+        }
+        let keyed = OrbitStore::open_with_master_key(&path, Some([7u8; 32]))?;
+        // Migration ran before dirty triggers were installed, so cloud_sync_dirty stays clean.
+        assert_eq!(keyed.cloud_dirty_revision()?, None);
+        let hosts = keyed.list_client_hosts()?;
+        assert_eq!(hosts[0].pairing_secret, "enc:v1:legacy-literal");
+        drop(keyed);
         std::fs::remove_file(path)?;
         Ok(())
     }

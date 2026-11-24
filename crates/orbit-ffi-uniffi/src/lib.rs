@@ -5232,12 +5232,12 @@ impl OrbitMobileCore {
         db_path: String,
         master_key_bytes: Vec<u8>,
     ) -> Result<Arc<Self>, FfiOrbitError> {
-        let key = master_key_bytes
-            .try_into()
-            .map_err(|_| FfiOrbitError::Core {
-                detail: "expected a 32-byte master key".into(),
-            })?;
-        let inner = OrbitAppCore::open_with_master_key(db_path, Some(key)).map_err(|e| {
+        let raw = zeroize::Zeroizing::new(master_key_bytes);
+        let key: [u8; 32] = raw.as_slice().try_into().map_err(|_| FfiOrbitError::Core {
+            detail: "expected a 32-byte master key".into(),
+        })?;
+        let key = zeroize::Zeroizing::new(key);
+        let inner = OrbitAppCore::open_with_master_key(db_path, Some(*key)).map_err(|e| {
             FfiOrbitError::Core {
                 detail: e.to_string(),
             }

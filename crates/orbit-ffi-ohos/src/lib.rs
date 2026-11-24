@@ -2390,14 +2390,19 @@ impl OhosCoreFacade {
     }
     pub fn new_with_master_key(db_path: String, master_key_b64: String) -> Result<Self, String> {
         use base64::Engine as _;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(master_key_b64)
-            .map_err(|_| "invalid master key base64")?;
-        let key = bytes
+        let master_key_b64 = zeroize::Zeroizing::new(master_key_b64);
+        let bytes = zeroize::Zeroizing::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(master_key_b64.as_str())
+                .map_err(|_| "invalid master key base64")?,
+        );
+        let key: [u8; 32] = bytes
+            .as_slice()
             .try_into()
             .map_err(|_| "expected a 32-byte master key")?;
+        let key = zeroize::Zeroizing::new(key);
         Ok(Self {
-            inner: OrbitAppCore::open_with_master_key(db_path, Some(key))
+            inner: OrbitAppCore::open_with_master_key(db_path, Some(*key))
                 .map_err(|e| e.to_string())?,
         })
     }

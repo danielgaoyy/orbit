@@ -709,9 +709,9 @@ impl OrbitStore {
         workflows::migrate_workflows_schema(&conn)?;
         im_channels::migrate_im_channels_schema(&conn)?;
         push::migrate_push_schema(&conn)?;
-        install_cloud_dirty_triggers(&conn)?;
         let secrets = secrets::SecretEnvelope(key.map(zeroize::Zeroizing::new));
         secrets.initialize(&mut conn)?;
+        install_cloud_dirty_triggers(&conn)?;
         Ok(Self {
             secrets,
             conn: Mutex::new(conn),

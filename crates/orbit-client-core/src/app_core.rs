@@ -2306,7 +2306,11 @@ impl OrbitAppCore {
             });
         }
         if !core.is_ephemeral_memory {
+            let _ = core.store.prune_stale_outbox(7 * 24 * 60 * 60 * 1000);
             core.spawn_cloud_sync_etag_poller();
+            if core.store.cloud_dirty_revision().ok().flatten().is_some() {
+                core.schedule_cloud_auto_sync(false);
+            }
         }
         Ok(core)
     }
@@ -8813,6 +8817,8 @@ impl OrbitAppCore {
     }
 
     fn flush_host_outbox(&self, host_id: &str) {
+        const OUTBOX_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+        const MAX_OUTBOX_ATTEMPTS: u32 = 8;
         let Some(writer) = self.hosts.read().ok().and_then(|hosts| {
             let h = hosts.get(host_id)?;
             h.session.as_ref()?;
@@ -8835,22 +8841,94 @@ impl OrbitAppCore {
             }) else {
                 return;
             };
-            let result: Result<(), ClientCoreError> = async {
-                for row in store.list_pending_outbox(&host_id)? {
-                    let msg = serde_json::from_str(&row.payload_json).map_err(|_| {
-                        ClientCoreError::Transport("invalid stored outbox frame".into())
-                    })?;
-                    if let Err(err) = handle.send_wire_confirmed(msg).await {
-                        store.mark_outbox_attempt(row.id, "transport write failed")?;
-                        return Err(err);
-                    }
-                    store.remove_pending_outbox(row.id)?;
+            let list_store = Arc::clone(&store);
+            let list_host = host_id.clone();
+            let rows = match tokio::task::spawn_blocking(move || {
+                let _ = list_store.prune_stale_outbox(OUTBOX_MAX_AGE_MS);
+                list_store.list_pending_outbox(&list_host)
+            })
+            .await
+            {
+                Ok(Ok(rows)) => rows,
+                Ok(Err(error)) => {
+                    tracing::warn!(%host_id, %error, "outbox load deferred");
+                    return;
                 }
-                Ok(())
-            }
-            .await;
-            if let Err(error) = result {
-                tracing::warn!(%host_id,%error,"outbox delivery deferred");
+                Err(error) => {
+                    tracing::warn!(%host_id, %error, "outbox load worker failed");
+                    return;
+                }
+            };
+            for row in rows {
+                if row.attempts >= MAX_OUTBOX_ATTEMPTS {
+                    tracing::warn!(
+                        %host_id,
+                        outbox_id = row.id,
+                        attempts = row.attempts,
+                        "evicting poison-pill outbox entry after max retries"
+                    );
+                    let rm_store = Arc::clone(&store);
+                    let row_id = row.id;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        rm_store.remove_pending_outbox(row_id)
+                    })
+                    .await;
+                    continue;
+                }
+                let msg: WireMessage = match serde_json::from_str(&row.payload_json) {
+                    Ok(msg) => msg,
+                    Err(error) => {
+                        tracing::warn!(
+                            %host_id,
+                            outbox_id = row.id,
+                            %error,
+                            "evicting unparseable stored outbox frame"
+                        );
+                        let rm_store = Arc::clone(&store);
+                        let row_id = row.id;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            rm_store.remove_pending_outbox(row_id)
+                        })
+                        .await;
+                        continue;
+                    }
+                };
+                match handle.send_wire_confirmed(msg).await {
+                    Ok(()) => {
+                        let rm_store = Arc::clone(&store);
+                        let row_id = row.id;
+                        if let Ok(Err(error)) = tokio::task::spawn_blocking(move || {
+                            rm_store.remove_pending_outbox(row_id)
+                        })
+                        .await
+                        {
+                            tracing::warn!(%host_id, outbox_id = row_id, %error, "outbox remove failed");
+                        }
+                    }
+                    Err(crate::OutboxSendError::EncodeFailed) => {
+                        tracing::warn!(
+                            %host_id,
+                            outbox_id = row.id,
+                            "evicting non-encodable outbox frame"
+                        );
+                        let rm_store = Arc::clone(&store);
+                        let row_id = row.id;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            rm_store.remove_pending_outbox(row_id)
+                        })
+                        .await;
+                    }
+                    Err(crate::OutboxSendError::TransportFailed) => {
+                        let mark_store = Arc::clone(&store);
+                        let row_id = row.id;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            mark_store.mark_outbox_attempt(row_id, "transport write failed")
+                        })
+                        .await;
+                        tracing::warn!(%host_id, outbox_id = row_id, "outbox delivery deferred");
+                        break;
+                    }
+                }
             }
         });
     }
@@ -20356,9 +20434,23 @@ impl OrbitAppCore {
         .await
     }
 
-    /// Drive a mobile bridge RPC on the application's Tokio runtime from a native worker thread.
-    pub fn run_mobile_rpc<F: std::future::Future>(&self, rpc: F) -> F::Output {
-        self.runtime.block_on(rpc)
+    /// Drive a mobile bridge RPC on the application's Tokio runtime safely even if invoked
+    /// re-entrantly from a Tokio worker thread (e.g. inside `CoreEventSubscriber::on_notification`).
+    pub fn run_mobile_rpc<F>(&self, rpc: F) -> F::Output
+    where
+        F: std::future::Future + Send,
+        F::Output: Send,
+    {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| self.runtime.block_on(rpc))
+                    .join()
+                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+            })
+        } else {
+            self.runtime.block_on(rpc)
+        }
     }
 
     pub async fn get_session_usage(
@@ -21377,13 +21469,7 @@ impl OrbitAppCore {
     ) -> Result<CloudSyncResultView, CloudSyncError> {
         let _guard = self.cloud_sync_mutex.lock().await;
         self.cloud_sync_in_flight.store(true, Ordering::SeqCst);
-        let dirty_revision = self.store.cloud_dirty_revision().ok().flatten();
         let res = self.cloud_sync_unlock_inner(passphrase).await;
-        if res.is_ok()
-            && let Some(revision) = dirty_revision
-        {
-            let _ = self.store.clear_cloud_dirty_revision(revision);
-        }
         self.cloud_sync_in_flight.store(false, Ordering::SeqCst);
         if let Err(ref err) = res {
             let mut cfg = load_sync_config_from_store(&self.store);
@@ -21429,13 +21515,7 @@ impl OrbitAppCore {
     async fn cloud_sync_now_async(self: &Arc<Self>) -> Result<CloudSyncResultView, CloudSyncError> {
         let _guard = self.cloud_sync_mutex.lock().await;
         self.cloud_sync_in_flight.store(true, Ordering::SeqCst);
-        let dirty_revision = self.store.cloud_dirty_revision().ok().flatten();
         let res = self.cloud_sync_now_inner().await;
-        if res.is_ok()
-            && let Some(revision) = dirty_revision
-        {
-            let _ = self.store.clear_cloud_dirty_revision(revision);
-        }
         self.cloud_sync_in_flight.store(false, Ordering::SeqCst);
         if let Err(ref err) = res {
             let mut cfg = load_sync_config_from_store(&self.store);
@@ -21836,6 +21916,11 @@ impl OrbitAppCore {
             *fp_guard = Some(vault_fp.clone());
         }
 
+        // Snapshot dirty revision AFTER remote-apply SQLite writes and BEFORE network push so
+        // remote pulls never leave `cloud_sync_dirty` stuck true while concurrent local edits
+        // made during `push_vault_payload` advance past `synced_dirty_rev` and stay dirty.
+        let synced_dirty_rev = self.store.cloud_dirty_revision().ok().flatten();
+
         // Push encrypted vault to GitHub Secret Gist if local state contributed new changes
         if outcome.needs_push {
             let (gid, html_url) =
@@ -21887,6 +21972,9 @@ impl OrbitAppCore {
         cfg.synced_project_count = active_projects;
         cfg.last_error = None;
         save_sync_config_to_store(&self.store, cfg)?;
+        if let Some(revision) = synced_dirty_rev {
+            let _ = self.store.clear_cloud_dirty_revision(revision);
+        }
 
         if let Ok(mut guard) = self.hosts.write() {
             for (hid, h) in guard.iter_mut() {
@@ -21953,7 +22041,12 @@ impl OrbitAppCore {
                     .fetch_vault_gist_conditional(&token, &gist_id, cfg.last_etag.as_deref())
                     .await
                 {
-                    Ok(GistConditionalFetch::NotModified) => continue,
+                    Ok(GistConditionalFetch::NotModified) => {
+                        if core.store.cloud_dirty_revision().ok().flatten().is_some() {
+                            let _ = core.cloud_sync_now_async().await;
+                        }
+                        continue;
+                    }
                     Ok(GistConditionalFetch::Updated { gist, etag }) => {
                         let _guard = core.cloud_sync_mutex.lock().await;
                         core.cloud_sync_in_flight.store(true, Ordering::SeqCst);
@@ -24865,7 +24958,7 @@ mod tests {
             panic!("expected retry")
         };
         assert_eq!(request_id, id);
-        receipt.send(()).expect("acknowledge write");
+        receipt.send(Ok(())).expect("acknowledge write");
         core.runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(3), async {
                 while core
@@ -24879,6 +24972,41 @@ mod tests {
             .await
             .expect("row retired");
         });
+
+        // P0-1: Corrupt head-of-line outbox row is evicted rather than blocking subsequent frames.
+        core.store
+            .enqueue_pending_outbox("mobile-host", "{not-valid-json")
+            .expect("enqueue corrupt");
+        let valid_id = Uuid::new_v4();
+        core.store
+            .enqueue_pending_outbox(
+                "mobile-host",
+                &serde_json::to_string(&WireMessage::MarkAgentUnread {
+                    request_id: valid_id,
+                    agent_id: "a1".into(),
+                })
+                .expect("json"),
+            )
+            .expect("enqueue valid");
+        core.flush_host_outbox("mobile-host");
+        let next = core.runtime.block_on(rx.recv()).expect("valid delivered");
+        let crate::OutboundPayload::ConfirmedWire(
+            WireMessage::MarkAgentUnread {
+                request_id: got_id, ..
+            },
+            receipt2,
+        ) = next
+        else {
+            panic!("expected valid frame after corrupt row eviction");
+        };
+        assert_eq!(got_id, valid_id);
+        receipt2.send(Ok(())).expect("ack valid");
+
+        // P0-2: run_mobile_rpc safely runs even when invoked re-entrantly inside a Tokio worker.
+        let val = core
+            .runtime
+            .block_on(async { core.run_mobile_rpc(async { 42u32 }) });
+        assert_eq!(val, 42);
         drop(core);
         std::fs::remove_file(path).expect("cleanup");
     }

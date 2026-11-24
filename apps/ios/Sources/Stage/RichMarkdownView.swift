@@ -250,7 +250,7 @@ private struct MarkdownTableModel: Equatable {
 
 private enum MarkdownRenderSegment {
     case prose([FfiRichBlock])
-    case checkListItem(checked: Bool, spans: [FfiInlineSpan])
+    case checkListItem(checked: Bool, depth: UInt8, spans: [FfiInlineSpan])
     case blockQuote([FfiInlineSpan])
     case horizontalRule
     case codeBlock(language: String, rawCode: String, lines: [FfiHighlightedLine])
@@ -318,10 +318,10 @@ struct RichMarkdownView: View {
                 if proseBuffer.count >= 3 {
                     flushProseBuffer()
                 }
-            case let .listItem(_, _, checked, spans):
+            case let .listItem(_, _, checked, depth, spans):
                 if let checked = checked {
                     flushProseBuffer()
-                    out.append(.checkListItem(checked: checked, spans: spans))
+                    out.append(.checkListItem(checked: checked, depth: depth, spans: spans))
                 } else {
                     proseBuffer.append(block)
                     if proseBuffer.count >= 4 {
@@ -384,7 +384,7 @@ struct RichMarkdownView: View {
                 onOpenFileLink: onOpenFileLink
             )
 
-        case let .checkListItem(checked, spans):
+        case let .checkListItem(checked, depth, spans):
             HStack(alignment: .firstTextBaseline, spacing: OrbitSpacing.sm) {
                 Image(systemName: checked ? "checkmark.square.fill" : "square")
                     .font(OrbitTypography.iconSmall)
@@ -404,6 +404,7 @@ struct RichMarkdownView: View {
                     onOpenFileLink: onOpenFileLink
                 )
             }
+            .padding(.leading, CGFloat(min(depth, 6)) * 16)
 
         case let .blockQuote(spans):
             HStack(alignment: .top, spacing: OrbitSpacing.md) {
@@ -700,15 +701,21 @@ struct RichMarkdownView: View {
                     paragraphStyle: p
                 ))
 
-            case let .listItem(ordered, index, _, spans):
+            case let .listItem(ordered, index, _, depth, spans):
+                let nestedIndent = CGFloat(min(depth, 6)) * 16
                 let p = NSMutableParagraphStyle()
-                p.firstLineHeadIndent = 4
-                p.headIndent = 20
-                p.tabStops = [NSTextTab(textAlignment: .left, location: 20)]
+                p.firstLineHeadIndent = 4 + nestedIndent
+                p.headIndent = 20 + nestedIndent
+                p.tabStops = [NSTextTab(textAlignment: .left, location: 20 + nestedIndent)]
                 p.lineSpacing = OrbitTypography.bodyLineSpacing
                 p.paragraphSpacing = isLast ? 0 : 6
 
-                let marker = ordered ? "\(index).\t" : "•\t"
+                let bulletGlyph: String = switch depth % 3 {
+                case 1: "◦"
+                case 2: "▪"
+                default: "•"
+                }
+                let marker = ordered ? "\(index).\t" : "\(bulletGlyph)\t"
                 let markerFont = ordered
                     ? uiFont(size: 13, weight: .medium)
                     : uiFont(size: 15, weight: .semibold)

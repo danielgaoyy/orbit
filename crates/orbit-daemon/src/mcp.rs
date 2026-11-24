@@ -193,9 +193,14 @@ async fn handle_single_rpc(
                 .pointer("/params/arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let exec =
-                execute_tool_with_context(runtime, caller_agent_id, tool_name, args, hook_origin)
-                    .await;
+            let exec = Box::pin(execute_tool_with_context(
+                runtime,
+                caller_agent_id,
+                tool_name,
+                args,
+                hook_origin,
+            ))
+            .await;
             Some(json!({
                 "jsonrpc": "2.0",
                 "id": id_val,

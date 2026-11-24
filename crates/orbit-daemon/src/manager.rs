@@ -2182,22 +2182,20 @@ impl AgentOrchestrator {
         // prompt leaves zero DB rows or ghost UI state behind.
         let mut initial_prompt = spec.initial_prompt;
         if !initial_prompt.trim().is_empty() {
-            let hook_outcome = self
-                .hooks
-                .dispatch_event(
-                    orbit_protocol::HookEventKind::PrePromptSubmit,
-                    Some(Path::new(&final_cwd)),
-                    Some(provider.slug()),
-                    serde_json::json!({
-                        "event": "pre_prompt_submit",
-                        "agent_id": &agent_id,
-                        "workspace_id": &ws.workspace_id,
-                        "cwd": &final_cwd,
-                        "provider": provider.slug(),
-                        "prompt": &initial_prompt,
-                    }),
-                )
-                .await;
+            let hook_outcome = Box::pin(self.hooks.dispatch_event(
+                orbit_protocol::HookEventKind::PrePromptSubmit,
+                Some(Path::new(&final_cwd)),
+                Some(provider.slug()),
+                serde_json::json!({
+                    "event": "pre_prompt_submit",
+                    "agent_id": &agent_id,
+                    "workspace_id": &ws.workspace_id,
+                    "cwd": &final_cwd,
+                    "provider": provider.slug(),
+                    "prompt": &initial_prompt,
+                }),
+            ))
+            .await;
             if hook_outcome.decision == orbit_protocol::HookDecision::Block {
                 let hook_name = hook_outcome
                     .blocking_hook_name
@@ -4550,12 +4548,9 @@ impl AgentOrchestrator {
                         Some(existing)
                             if !allow_human_only_resolution
                                 && (existing.human_only
-                                    || existing
-                                        .guardian_assessment
-                                        .as_ref()
-                                        .is_some_and(
-                                            crate::guardian::assessment_requires_human_only,
-                                        )) =>
+                                    || existing.guardian_assessment.as_ref().is_some_and(
+                                        crate::guardian::assessment_requires_human_only,
+                                    )) =>
                         {
                             anyhow::bail!(
                                 "permission `{request_id}` is marked human-only and cannot be resolved by an agent"
@@ -6981,11 +6976,19 @@ impl AgentOrchestrator {
                                             );
                                         }
                                         if let Some(prev) = flushed {
-                                            mgr.ingest_driver_event(&ag_id, expected_gen, *prev)
-                                                .await;
-                                        }
-                                        mgr.ingest_driver_event(&ag_id, expected_gen, *current)
+                                            Box::pin(mgr.ingest_driver_event(
+                                                &ag_id,
+                                                expected_gen,
+                                                *prev,
+                                            ))
                                             .await;
+                                        }
+                                        Box::pin(mgr.ingest_driver_event(
+                                            &ag_id,
+                                            expected_gen,
+                                            *current,
+                                        ))
+                                        .await;
                                         let cur_seq = shim_seq_bg.load(Ordering::Relaxed);
                                         if cur_seq > last_persisted_shim_seq {
                                             let aid_cur = ag_id.clone();
@@ -7003,7 +7006,12 @@ impl AgentOrchestrator {
                                 if let Some(pending) = stream_buf.take()
                                     && mgr.current_generation(&ag_id).await == expected_gen
                                 {
-                                    mgr.ingest_driver_event(&ag_id, expected_gen, pending).await;
+                                    Box::pin(mgr.ingest_driver_event(
+                                        &ag_id,
+                                        expected_gen,
+                                        pending,
+                                    ))
+                                    .await;
                                 }
                                 let cur_seq = shim_seq_bg.load(Ordering::Relaxed);
                                 if cur_seq > last_persisted_shim_seq {
@@ -7022,7 +7030,8 @@ impl AgentOrchestrator {
                         if let Some(pending) = stream_buf.take()
                             && mgr.current_generation(&ag_id).await == expected_gen
                         {
-                            mgr.ingest_driver_event(&ag_id, expected_gen, pending).await;
+                            Box::pin(mgr.ingest_driver_event(&ag_id, expected_gen, pending))
+                                .await;
                             let cur_seq = shim_seq_bg.load(Ordering::Relaxed);
                             if cur_seq > last_persisted_shim_seq {
                                 let aid_cur = ag_id.clone();

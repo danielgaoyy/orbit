@@ -88,9 +88,8 @@ use orbit_protocol::{
     McpToolCallOutcome, OrchestrationConfig, PermissionRuleRecord, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ResolvePermissionsBatchResult,
     ScheduleRunRecord, ScheduleTarget, SessionMode, SkillWriteScope, TimerCondition,
-    UpsertPermissionRuleInput, UsageInsightsSnapshot,
-    WorkspaceBoardSnapshot, WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode,
-    WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    UpsertPermissionRuleInput, UsageInsightsSnapshot, WorkspaceBoardSnapshot, WorkspaceEventRecord,
+    WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 use orbit_providers::{
     ProviderReadinessInfo, SideQuestionSpec,
@@ -1458,7 +1457,13 @@ async fn call_artifact_mcp_tool(
 ) -> Result<McpToolCallOutcome, String> {
     state
         .core
-        .call_artifact_mcp_tool_async(&host_id, &artifact_id, artifact_version, &tool_name, arguments)
+        .call_artifact_mcp_tool_async(
+            &host_id,
+            &artifact_id,
+            artifact_version,
+            &tool_name,
+            arguments,
+        )
         .await
 }
 

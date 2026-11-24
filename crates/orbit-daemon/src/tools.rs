@@ -675,30 +675,36 @@ pub async fn execute_tool_with_context(
         None => args,
     };
 
-    let exec_result =
-        match execute_tool_inner(runtime, caller_agent_id, &resolved, &effective_args).await {
-            Ok(val) => ToolExecResult::ok(val),
-            Err(e) => {
-                if let Some(cas_err) = e.downcast_ref::<BoardCasConflictError>() {
-                    let structured = json!({
-                        "error": cas_err.to_string(),
-                        "conflict": true,
-                        "expected_revision": cas_err.expected,
-                        "current_revision": cas_err.current_board.revision,
-                        "current_board": cas_err.current_board,
-                    });
-                    let text =
-                        serde_json::to_string_pretty(&structured).unwrap_or_else(|_| e.to_string());
-                    ToolExecResult {
-                        is_error: true,
-                        structured,
-                        text,
-                    }
-                } else {
-                    ToolExecResult::err(e.to_string())
+    let exec_result = match Box::pin(execute_tool_inner(
+        runtime,
+        caller_agent_id,
+        &resolved,
+        &effective_args,
+    ))
+    .await
+    {
+        Ok(val) => ToolExecResult::ok(val),
+        Err(e) => {
+            if let Some(cas_err) = e.downcast_ref::<BoardCasConflictError>() {
+                let structured = json!({
+                    "error": cas_err.to_string(),
+                    "conflict": true,
+                    "expected_revision": cas_err.expected,
+                    "current_revision": cas_err.current_board.revision,
+                    "current_board": cas_err.current_board,
+                });
+                let text =
+                    serde_json::to_string_pretty(&structured).unwrap_or_else(|_| e.to_string());
+                ToolExecResult {
+                    is_error: true,
+                    structured,
+                    text,
                 }
+            } else {
+                ToolExecResult::err(e.to_string())
             }
-        };
+        }
+    };
 
     // Bounded asynchronous PostToolUse hook dispatch after MCP tool completion.
     // Suppressed when this MCP call originated from an active hook subprocess to break
@@ -886,9 +892,8 @@ async fn execute_tool_inner(
                 let cwd = opt_str(args, "cwd")
                     .or_else(|| caller.as_ref().map(|c| c.cwd.clone()))
                     .unwrap_or_else(|| "~".to_string());
-                let res = rt
-                    .orchestrator
-                    .create_and_start_agent(CreateAgentSpec {
+                let res = Box::pin(
+                    rt.orchestrator.create_and_start_agent(CreateAgentSpec {
                         cwd,
                         extra_dirs: Vec::new(),
                         title,
@@ -922,8 +927,9 @@ async fn execute_tool_inner(
                         handle: opt_str(args, "handle"),
                         auto_cluster: args.get("auto_cluster").and_then(|v| v.as_bool()),
                         acp_agent_id: opt_str(args, "acp_agent_id"),
-                    })
-                    .await;
+                    }),
+                )
+                .await;
                 match res {
                     Ok(a) => a,
                     Err(e) => {

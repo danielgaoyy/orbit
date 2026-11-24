@@ -177,8 +177,11 @@ fun MarkdownBlocks(
                     is MarkdownRenderSegment.TaskListItem -> {
                         val item = seg.block
                         val checked = item.checked == true
+                        val nestedIndentDp = (item.depth.toInt().coerceAtMost(6) * 16).dp
                         Row(
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(start = nestedIndentDp),
                             horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
                             verticalAlignment = Alignment.Top,
                         ) {
@@ -334,10 +337,17 @@ private fun buildCombinedProseAnnotatedString(
             }
 
             is FfiRichBlock.ListItem -> {
-                val prefix = if (block.ordered) "${block.index}.  " else "•  "
+                val depth = block.depth.toInt().coerceAtMost(6)
+                val bullet = when (depth % 3) {
+                    1 -> "◦"
+                    2 -> "▪"
+                    else -> "•"
+                }
+                val prefix = if (block.ordered) "${block.index}.  " else "$bullet  "
+                val baseIndentSp = (depth * 16).sp
                 val indentStyle = ParagraphStyle(
                     lineHeight = typography.body.lineHeight,
-                    textIndent = TextIndent(firstLine = 0.sp, restLine = 16.sp),
+                    textIndent = TextIndent(firstLine = baseIndentSp, restLine = (depth * 16 + 16).sp),
                 )
                 withStyle(indentStyle) {
                     withStyle(SpanStyle(color = colors.fgSecondary, fontWeight = FontWeight.Medium)) {

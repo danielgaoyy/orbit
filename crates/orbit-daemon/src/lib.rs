@@ -2339,7 +2339,7 @@ async fn run_client_session_loop(
             return;
         }
         use_zstd = true;
-        if let Some(reply) = handle_wire_rpc(
+        if let Some(reply) = Box::pin(handle_wire_rpc(
             &runtime,
             session_id,
             msg,
@@ -2349,7 +2349,7 @@ async fn run_client_session_loop(
             &mut cleanup.slot_to_terminal,
             &mut cleanup.active_side_questions,
             &out_tx,
-        )
+        ))
         .await
             && out_tx
                 .send(SessionFrame::Wire {
@@ -2468,7 +2468,7 @@ async fn run_client_session_loop(
                                 }
                             }
                             other => {
-                                if let Some(reply) = handle_wire_rpc(
+                                if let Some(reply) = Box::pin(handle_wire_rpc(
                                     &runtime,
                                     session_id,
                                     other,
@@ -2478,7 +2478,7 @@ async fn run_client_session_loop(
                                     &mut cleanup.slot_to_terminal,
                                     &mut cleanup.active_side_questions,
                                     &out_tx,
-                                )
+                                ))
                                 .await
                                     && out_tx
                                         .send(SessionFrame::Wire {

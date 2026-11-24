@@ -13,11 +13,13 @@
    - 文档索引与体积防膨胀检查（`bash scripts/check-docs-index.sh`）
    - Workspace 与 `apps/desktop/src-tauri` 格式检查（`cargo fmt --all -- --check`）
    - 严格静态检查（`cargo clippy --workspace --all-targets -- -D warnings`）
+   - WASM ViewModel 编译校验（`cargo check -p orbit-client-wasm --target wasm32-unknown-unknown`）
    - 单元测试与二进制内部测试（`cargo test --workspace --lib --bins`）
 2. **`e2e-regression-matrix`**（4 分片并发执行，共享 `Swatinem/rust-cache@v2` `shared-key: "orbit-rust-e2e"`，固定使用 `TMPDIR=/tmp ... -- --test-threads=4`）：
    - `Pitfall Regressions`：`-p orbit-cli --test e2e_pitfall_regressions`
-   - `Relay E2EE & Isolation`：`-p orbit-cli --test e2e_relay_and_pty --test e2e_multi_user_isolation`
-   - `Orchestration & Fleet Mesh`：`-p orbit-cli --test e2e_orchestration`
+   - `Relay E2EE & Isolation`：`-p orbit-cli --test e2e_relay_and_pty --test e2e_multi_user_isolation --test e2e_browser_noise`
+   - `Orchestration & Fleet Mesh`：`-p orbit-cli --test e2e_orchestration --test e2e_voice`
+     此分片同时验证插件安装/启停/调用/条件 MCP 目录以及本地离线语音控制面端到端流程。
    - `Workspace Sync & Worktree`：`-p orbit-cli --test e2e_workspace_sync_and_worktree`
 3. **跨端构建与烟测任务**：
    - `desktop-frontend-build`（`Desktop Frontend Typecheck & Build`）：Node unit tests + `npm run build` + `npm run test:smoke`
@@ -58,6 +60,8 @@ In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight
 > **编写规则**：凡修复涉及消息流转、分端状态同步、Relay 建连或并行协作的生产 Bug，必须在同一 PR 中新增最小复现回归用例。
 
 ---
+
+`cargo test -p orbit-cli --test e2e_voice` 使用临时目录和已配对的 Daemon 验证语音配置持久化、CLI WAV 转写、客户端回退与缺失授权请求的拒绝。模型完整性与兼容音频端点测试使用本地数据和回环服务。
 
 ## 3. Desktop Chrome Runtime Smoke（防前端白屏/React `#185`）
 

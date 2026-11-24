@@ -16,6 +16,7 @@ pub mod media;
 pub mod orchestration;
 pub mod permission_rules;
 pub mod plan_approval;
+pub mod plugins;
 pub mod push;
 pub mod router;
 pub mod rules;
@@ -23,6 +24,7 @@ pub mod skills;
 pub mod timers;
 pub mod triggers;
 pub mod usage;
+pub mod voice;
 pub mod workflows;
 pub use acp::*;
 pub use artifacts::*;
@@ -40,6 +42,7 @@ pub use media::*;
 pub use orchestration::*;
 pub use permission_rules::*;
 pub use plan_approval::*;
+pub use plugins::*;
 pub use push::*;
 pub use router::*;
 pub use rules::*;
@@ -47,6 +50,7 @@ pub use skills::*;
 pub use timers::*;
 pub use triggers::*;
 pub use usage::*;
+pub use voice::*;
 pub use workflows::*;
 
 use std::collections::{BTreeMap, HashMap};
@@ -1320,6 +1324,7 @@ pub enum WireMessage {
         client_id: String,
         client_name: String,
         protocol_version: u32,
+        #[serde(default = "wire_default_true")]
         supports_zstd: bool,
     },
     Welcome {
@@ -1388,6 +1393,66 @@ pub enum WireMessage {
         request_id: Uuid,
         cwd: String,
         hits: Vec<ProjectMemorySearchHit>,
+    },
+    GetVoiceConfig {
+        request_id: Uuid,
+    },
+    UpdateVoiceConfig {
+        request_id: Uuid,
+        config: VoiceConfig,
+    },
+    VoiceConfigState {
+        request_id: Uuid,
+        #[serde(flatten)]
+        state: VoiceConfigState,
+    },
+    DownloadVoiceModel {
+        request_id: Uuid,
+        model_id: String,
+    },
+    DeleteVoiceModel {
+        request_id: Uuid,
+        model_id: String,
+    },
+    TranscribeVoiceAudio {
+        request_id: Uuid,
+        pcm16_le_base64: String,
+        sample_rate_hz: u32,
+        language: Option<String>,
+        agent_id: Option<String>,
+    },
+    /// Route a transcript produced by the client STT fallback through the same host policy.
+    ParseVoiceTranscript {
+        request_id: Uuid,
+        text: String,
+        language: Option<String>,
+        agent_id: Option<String>,
+    },
+    VoiceTranscriptionResult {
+        request_id: Uuid,
+        #[serde(flatten)]
+        result: VoiceTranscriptionResult,
+    },
+    ApproveVoicePermission {
+        request_id: Uuid,
+        agent_id: String,
+        permission_request_id: String,
+        confirmed: bool,
+    },
+    VoicePermissionResult {
+        request_id: Uuid,
+        safety: VoiceApprovalSafety,
+    },
+    SynthesizeVoiceSpeech {
+        request_id: Uuid,
+        text: String,
+        language: Option<String>,
+        voice_id: Option<String>,
+    },
+    VoiceSpeechResult {
+        request_id: Uuid,
+        #[serde(flatten)]
+        result: VoiceSpeechResult,
     },
 
     // Workspaces, Directory Browser & Git / Worktrees
@@ -3038,6 +3103,63 @@ pub enum WireMessage {
         total_tokens: u32,
     },
 
+    // Host-local WASM extensions. "op" is already the wire envelope discriminator.
+    ListPlugins {
+        request_id: Uuid,
+    },
+    PluginsList {
+        request_id: Uuid,
+        plugins: Vec<InstalledPluginView>,
+    },
+    InstallPlugin {
+        request_id: Uuid,
+        source: String,
+        #[serde(default)]
+        enable: bool,
+    },
+    PluginInstalled {
+        request_id: Uuid,
+        plugin: InstalledPluginView,
+    },
+    SetPluginEnabled {
+        request_id: Uuid,
+        plugin_id: String,
+        enabled: bool,
+    },
+    UninstallPlugin {
+        request_id: Uuid,
+        plugin_id: String,
+    },
+    InvokePluginOp {
+        request_id: Uuid,
+        plugin_id: String,
+        #[serde(rename = "operation")]
+        op: String,
+        cwd: Option<String>,
+        #[serde(default)]
+        input: serde_json::Value,
+    },
+    PluginOpResult {
+        request_id: Uuid,
+        plugin_id: String,
+        #[serde(rename = "operation")]
+        op: String,
+        result: serde_json::Value,
+    },
+    RenderPluginUi {
+        request_id: Uuid,
+        plugin_id: String,
+        slot: OrbitPluginUiSlot,
+        cwd: Option<String>,
+        action_id: Option<String>,
+        payload: Option<serde_json::Value>,
+    },
+    PluginUiRendered {
+        request_id: Uuid,
+        plugin_id: String,
+        spec: OrbitPluginUiSpec,
+    },
+
     // Pure-Rust LSP Language Server Integration
     ListLspServers {
         request_id: Uuid,
@@ -3815,6 +3937,12 @@ pub enum TerminalBinaryFrame {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
+    #[error("empty encrypted wire frame")]
+    EmptyWireFrame,
+    #[error("encrypted JSON wire frame exceeds size limit")]
+    WireFrameTooLarge,
+    #[error("unsupported encrypted wire frame type {0:#04x}")]
+    UnsupportedWireFrame(u8),
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("zstd compression error: {0}")]
@@ -3832,14 +3960,51 @@ pub const MAX_WS_FRAME_BYTES: usize = 48 * 1024 * 1024;
 /// Target uncompressed JSON byte budget per paginated timeline batch (`TimelineCatchup` / `AgentRewound`).
 pub const MAX_WIRE_TIMELINE_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Discriminators in the authenticated plaintext of a Noise transport record.
+pub const E2EE_FRAME_WIRE: u8 = 0x00;
+pub const E2EE_FRAME_TERMINAL: u8 = 0x01;
+pub const E2EE_FRAME_WIRE_JSON: u8 = 0x02;
+
 impl WireMessage {
+    pub fn encode_e2ee(&self, compressed: bool) -> Result<Vec<u8>, ProtocolError> {
+        let mut frame = Vec::new();
+        if compressed {
+            #[cfg(all(feature = "zstd-compression", not(target_arch = "wasm32")))]
+            {
+                frame.push(E2EE_FRAME_WIRE);
+                frame.extend(self.encode_zstd(3)?);
+                return Ok(frame);
+            }
+            #[cfg(not(all(feature = "zstd-compression", not(target_arch = "wasm32"))))]
+            return Err(ProtocolError::UnsupportedWireFrame(E2EE_FRAME_WIRE));
+        }
+        frame.push(E2EE_FRAME_WIRE_JSON);
+        serde_json::to_writer(&mut frame, self)?;
+        Ok(frame)
+    }
+
+    pub fn decode_e2ee(frame: &[u8]) -> Result<Self, ProtocolError> {
+        let (&kind, body) = frame.split_first().ok_or(ProtocolError::EmptyWireFrame)?;
+        match kind {
+            E2EE_FRAME_WIRE_JSON if body.len() <= MAX_ZSTD_WIRE_DECODE_BYTES => {
+                Ok(serde_json::from_slice(body)?)
+            }
+            E2EE_FRAME_WIRE_JSON => Err(ProtocolError::WireFrameTooLarge),
+            #[cfg(all(feature = "zstd-compression", not(target_arch = "wasm32")))]
+            E2EE_FRAME_WIRE => Self::decode_zstd(body),
+            _ => Err(ProtocolError::UnsupportedWireFrame(kind)),
+        }
+    }
+
     /// Encode message as Zstd-compressed JSON bytes for cross-border / mobile bandwidth efficiency.
+    #[cfg(all(feature = "zstd-compression", not(target_arch = "wasm32")))]
     pub fn encode_zstd(&self, level: i32) -> Result<Vec<u8>, ProtocolError> {
         let json = serde_json::to_vec(self)?;
         Ok(zstd::encode_all(json.as_slice(), level)?)
     }
 
     /// Decode a Zstd-compressed WireMessage (with a 32 MiB anti-bomb cap).
+    #[cfg(all(feature = "zstd-compression", not(target_arch = "wasm32")))]
     pub fn decode_zstd(compressed: &[u8]) -> Result<Self, ProtocolError> {
         use std::io::Read;
         let decoder = zstd::Decoder::new(compressed)?;
@@ -3942,6 +4107,31 @@ mod tests {
         }))?;
         assert_eq!(dense.provider, MemoryEmbeddingProvider::OpenAiCompatible);
         assert_eq!(dense.auto_inject_budget_tokens, 1200);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_hello_defaults_to_zstd_and_browser_wire_has_a_distinct_tag()
+    -> Result<(), ProtocolError> {
+        let hello: WireMessage = serde_json::from_str(
+            r#"{"op":"hello","client_id":"old","client_name":"old","protocol_version":3}"#,
+        )?;
+        assert!(matches!(
+            hello,
+            WireMessage::Hello {
+                supports_zstd: true,
+                ..
+            }
+        ));
+        let bytes = WireMessage::Ping { ts_ms: 7 }.encode_e2ee(false)?;
+        assert_eq!(bytes[0], E2EE_FRAME_WIRE_JSON);
+        assert!(matches!(
+            WireMessage::decode_e2ee(&bytes)?,
+            WireMessage::Ping { ts_ms: 7 }
+        ));
+        assert!(WireMessage::decode_e2ee(&[E2EE_FRAME_TERMINAL, 0]).is_err());
+        assert!(WireMessage::decode_e2ee(&[]).is_err());
+        assert!(WireMessage::decode_e2ee(&[E2EE_FRAME_WIRE_JSON, 0xff]).is_err());
         Ok(())
     }
 

@@ -2040,3 +2040,6 @@ async fn scenario_11_personal_router_cross_host_project_context_and_dispatch() {
         "Fleet state must include remote worker on host B: {fleet_xml}"
     );
 }
+
+#[path = "plugins/lifecycle.rs"]
+mod plugin_lifecycle;

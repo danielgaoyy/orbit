@@ -194,6 +194,42 @@ pub struct GuardianAssessment {
     pub latency_ms: u64,
 }
 
+/// Returns `true` whenever a Guardian assessment MUST be resolved strictly by a human operator
+/// and NEVER delegated to Personal Router or approved by an agent:
+/// - `High` or `Critical` risk level
+/// - `fail_closed` classifier tier
+/// - Fail-closed / fallback LLM errors, hook blocks, or explicit policy-disabled signals
+pub fn assessment_requires_human_only(assessment: &GuardianAssessment) -> bool {
+    if assessment.risk_level >= GuardianRiskLevel::High {
+        return true;
+    }
+    if assessment.classifier_tier == "fail_closed" {
+        return true;
+    }
+    if assessment.classifier_tier == "heuristic_fallback"
+        && assessment.decision == GuardianDecision::RequireHuman
+        && assessment.confidence <= 0.0
+    {
+        return true;
+    }
+    assessment.signals.iter().any(|s| {
+        matches!(
+            s.as_str(),
+            "fail_closed"
+                | "pre_tool_use_hook_blocked"
+                | "read_only_disabled"
+                | "workspace_tests_disabled"
+                | "llm_timeout"
+                | "llm_malformed_json"
+                | "llm_unavailable"
+                | "llm_error"
+                | "llm_provider_unavailable"
+                | "llm_provider_unsupported"
+                | "invalid_classifier_response"
+        )
+    })
+}
+
 /// Persisted / in-memory audit record of a Guardian decision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GuardianAuditEntry {

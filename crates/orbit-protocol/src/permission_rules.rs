@@ -264,6 +264,17 @@ pub struct ResolvePermissionsBatchResult {
     pub skipped_reasons: Vec<BatchPermissionSkipReason>,
 }
 
+/// Strictly verify whether a permission request's `allowed_decisions` permits a single-shot
+/// `"allow"` decision (`allow`, `allow_once`, or `accept`).
+pub fn permits_allow_decision(allowed_decisions: &[String]) -> bool {
+    allowed_decisions.iter().any(|d| {
+        matches!(
+            d.trim().to_ascii_lowercase().as_str(),
+            "allow" | "allow_once" | "accept"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

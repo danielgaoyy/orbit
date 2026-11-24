@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use crate::app_core::AgentCardView;
+use crate::viewmodel::AgentCardView;
 
 /// Hard cap on recursive subagent traversal depth (Parent -> Child -> ... up to 8 levels).
 pub const MAX_SUBAGENT_LINEAGE_DEPTH: u32 = 8;

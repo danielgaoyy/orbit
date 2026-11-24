@@ -10,12 +10,12 @@ use orbit_protocol::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::app_core::{AgentCardView, TimelineItemView};
 use crate::render::{DiffFileView, RichBlockView, parse_markdown_blocks};
 pub use crate::subagents::{
     FleetAgentNodeRef, MAX_SUBAGENT_LINEAGE_DEPTH, SubagentLineageStepView,
     collect_ancestor_lineage, collect_descendant_subagents,
 };
+use crate::viewmodel::{AgentCardView, TimelineItemView};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnFileDiffSummaryView {
@@ -341,7 +341,7 @@ impl From<TimelineOutlinePrompt> for SessionOutlinePromptView {
 }
 
 impl SessionInsightsView {
-    pub(crate) fn merge_outline(&mut self, full: &[TimelineOutlinePrompt]) {
+    pub fn merge_outline(&mut self, full: &[TimelineOutlinePrompt]) {
         if full.is_empty() {
             return;
         }

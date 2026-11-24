@@ -1700,9 +1700,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2721,6 +2723,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mermaid-rs-renderer"
+version = "0.3.1"
+source = "git+https://github.com/1jehuang/mermaid-rs-renderer?rev=91cc92bcf54ba42088653cc42ba5627bb306d451#91cc92bcf54ba42088653cc42ba5627bb306d451"
+dependencies = [
+ "anyhow",
+ "fontdb",
+ "json5",
+ "once_cell",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "ttf-parser",
+ "web-time",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3153,7 +3172,8 @@ dependencies = [
  "chrono",
  "futures-util",
  "layout-rs",
- "mermaid-rs-renderer",
+ "mermaid-rs-renderer 0.3.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "mermaid-rs-renderer 0.3.1 (git+https://github.com/1jehuang/mermaid-rs-renderer?rev=91cc92bcf54ba42088653cc42ba5627bb306d451)",
  "orbit-crypto",
  "orbit-protocol",
  "orbit-relay-transport",
@@ -3180,7 +3200,11 @@ dependencies = [
  "aes-gcm 0.10.3",
  "argon2",
  "base64 0.22.1",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rand 0.9.5",
+ "ruzstd",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4375,6 +4399,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "ruzstd"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4859,6 +4892,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f8bec09ae8fae0f4f265a4559a9334be3929d8504e9b536df0a41302bd1733"
 dependencies = [
  "bstr",
+ "web-time",
 ]
 
 [[package]]
@@ -5918,6 +5952,12 @@ dependencies = [
  "thiserror 2.0.21",
  "utf-8",
 ]
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typeid"

@@ -13,12 +13,12 @@ use orbit_protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::HostRouteMode;
-pub use crate::app_core::{AgentCardView, AskSideQuestionRequest};
 pub use crate::diagram::{DiagramKind, DiagramTheme, RenderDiagramRequest, RenderDiagramView};
 pub use crate::export::{
     ExportAgentMeta, ExportFormat, ExportOptions, ExportedTranscript, ExtractedCodeBlock,
 };
 use crate::sidebar::{SidebarProjectSort, SidebarThreadFilter};
+pub use crate::viewmodel::{AgentCardView, AskSideQuestionRequest};
 
 pub const CLIENT_BRIDGE_PROTOCOL_VERSION: u32 = 2;
 
@@ -757,4 +757,28 @@ pub struct SelectBestOfNWinnerRequest {
     pub winner_step_id: String,
     #[serde(default)]
     pub apply_to_workspace: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditChainExportView {
+    pub jsonl: String,
+    #[serde(default)]
+    pub next_after_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertProjectMemoryRequest {
+    pub host_id: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    pub title: String,
+    pub content: String,
+    pub category: orbit_protocol::MemoryCategory,
+    #[serde(default)]
+    pub status: Option<orbit_protocol::MemoryStatus>,
+    #[serde(default)]
+    pub file_paths: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }

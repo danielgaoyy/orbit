@@ -25,7 +25,7 @@ use pulldown_cmark::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::app_core::coalesce_timeline_slice;
+use crate::viewmodel::coalesce_timeline_slice;
 
 pub const TRANSCRIPT_JSON_SCHEMA: &str = "orbit.transcript.v1";
 

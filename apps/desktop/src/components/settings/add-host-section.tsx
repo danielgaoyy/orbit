@@ -10,7 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { useImeCompositionGuard } from "@/lib/ime";
-import { type LocalMachineInfo, type SshHostItem, orbitIpc } from "@/lib/orbit-ipc";
+import { type LocalMachineInfo, type SshHostItem, isWebRuntime, orbitIpc } from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
@@ -149,7 +149,7 @@ export function AddHostSection() {
         </div>
       )}
 
-      {cloudSyncStatus?.state !== "ready" && (
+      {!isWebRuntime() && cloudSyncStatus?.state !== "ready" && (
         <div className="border-border/80 bg-background/60 flex items-center justify-between gap-3 rounded-[13px] border px-4 py-3">
           <div className="flex min-w-0 items-center gap-3">
             <div className="bg-muted flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
@@ -264,7 +264,8 @@ export function AddHostSection() {
             </div>
             <div className="flex gap-2">
               <Input
-                type="text"
+                type="password"
+                autoComplete="off"
                 value={pairingUri}
                 onChange={(e) => setPairingUri(e.target.value)}
                 {...ime.compositionProps}

@@ -1,0 +1,11 @@
+{
+  "id": "pr-dashboard",
+  "name": "GitHub PR & Issue Board",
+  "version": "1.0.0",
+  "description": "Inspect open pull requests and issues in the Orbit repository.",
+  "author": "Orbit contributors",
+  "wasm_entry": "plugin.wasm",
+  "capabilities": { "http_domains": ["api.github.com"] },
+  "mcp_ops": [{ "name": "list_open", "description": "Fetch the five most recent open PRs and issues from danielgaoyy/orbit." }],
+  "ui_slots": [{ "slot": "side_panel_tab", "title": "GitHub board" }]
+}

@@ -7,6 +7,10 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["zstd-compression"]
+zstd-compression = ["dep:zstd"]
+
 [dependencies]
 snow.workspace = true
 base64.workspace = true
@@ -18,4 +22,12 @@ aes-gcm.workspace = true
 argon2.workspace = true
 rand.workspace = true
 zeroize.workspace = true
-zstd.workspace = true
+ruzstd = "0.9"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zstd = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }

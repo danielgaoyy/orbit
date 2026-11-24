@@ -7,15 +7,19 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["native"]
+native = ["orbit-protocol/zstd-compression", "dep:orbit-crypto", "dep:orbit-store", "dep:orbit-relay-transport", "dep:tokio", "dep:tokio-tungstenite", "dep:reqwest", "dep:futures-util"]
+
 [dependencies]
 orbit-protocol.workspace = true
-orbit-crypto.workspace = true
-orbit-relay-transport.workspace = true
-orbit-store.workspace = true
-tokio.workspace = true
-tokio-tungstenite.workspace = true
-reqwest.workspace = true
-futures-util.workspace = true
+orbit-crypto = { workspace = true, optional = true }
+orbit-relay-transport = { workspace = true, optional = true }
+orbit-store = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 base64.workspace = true
@@ -26,7 +30,12 @@ thiserror.workspace = true
 tracing.workspace = true
 pulldown-cmark.workspace = true
 syntect.workspace = true
-similar.workspace = true
+similar = { workspace = true, features = ["wasm32_web_time"] }
 vt100.workspace = true
-mermaid-rs-renderer.workspace = true
 layout-rs.workspace = true
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+mermaid-rs-renderer.workspace = true
+
+# Upstream PR 155 routes layout timing through performance.now() on browsers.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-mermaid = { package = "mermaid-rs-renderer", git = "https://github.com/1jehuang/mermaid-rs-renderer", rev = "91cc92bcf54ba42088653cc42ba5627bb306d451", default-features = false }

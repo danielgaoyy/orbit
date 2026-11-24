@@ -34,7 +34,6 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 const DIRECT_BIN_ZSTD_WIRE: u8 = 0x00;
-const E2EE_FRAME_WIRE: u8 = 0x00;
 
 /// Event emitted from a remote connected daemon for cross-host observation.
 #[derive(Debug, Clone)]
@@ -589,6 +588,10 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::ConnectedHostAdded { request_id, .. }
         | WireMessage::OrchestrationConfigSnapshot { request_id, .. }
         | WireMessage::OrchestrationSkillsSnapshot { request_id, .. }
+        | WireMessage::PluginsList { request_id, .. }
+        | WireMessage::PluginInstalled { request_id, .. }
+        | WireMessage::PluginUiRendered { request_id, .. }
+        | WireMessage::PluginOpResult { request_id, .. }
         | WireMessage::ManagedSkillsSnapshot { request_id, .. }
         | WireMessage::ManagedSkillContentResponse { request_id, .. }
         | WireMessage::KeepAwakeStatusSnapshot { request_id, .. }
@@ -1020,10 +1023,7 @@ async fn connect_relay_peer(
         protocol_version: PROTOCOL_VERSION,
         supports_zstd: true,
     };
-    let z = hello.encode_zstd(3)?;
-    let mut plain = Vec::with_capacity(1 + z.len());
-    plain.push(E2EE_FRAME_WIRE);
-    plain.extend_from_slice(&z);
+    let plain = hello.encode_e2ee(true)?;
     let ct = chan.lock().await.seal_record(&plain)?;
     sink.send(TungMsg::Binary(ct.into())).await?;
 
@@ -1031,9 +1031,7 @@ async fn connect_relay_peer(
         while let Some(Ok(m)) = stream.next().await {
             if let TungMsg::Binary(ct) = m
                 && let Ok(p) = chan.lock().await.open_record(&ct)
-                && !p.is_empty()
-                && p[0] == E2EE_FRAME_WIRE
-                && let Ok(WireMessage::Welcome { host }) = WireMessage::decode_zstd(&p[1..])
+                && let Ok(WireMessage::Welcome { host }) = WireMessage::decode_e2ee(&p)
             {
                 return Some(host);
             }
@@ -1050,15 +1048,15 @@ async fn connect_relay_peer(
     tokio::spawn(async move {
         let _keep_connector = connector;
         while let Some(msg) = out_rx.recv().await {
-            if let Ok(z) = msg.encode_zstd(3) {
-                let mut plain = Vec::with_capacity(1 + z.len());
-                plain.push(E2EE_FRAME_WIRE);
-                plain.extend_from_slice(&z);
-                if let Ok(ct) = chan_w.lock().await.seal_record(&plain)
-                    && sink.send(TungMsg::Binary(ct.into())).await.is_err()
-                {
-                    break;
-                }
+            let plain = match msg.encode_e2ee(true) {
+                Ok(frame) => frame,
+                Err(_) => continue,
+            };
+            let Ok(ct) = chan_w.lock().await.seal_record(&plain) else {
+                break;
+            };
+            if sink.send(TungMsg::Binary(ct.into())).await.is_err() {
+                break;
             }
         }
     });
@@ -1068,9 +1066,7 @@ async fn connect_relay_peer(
             match m {
                 TungMsg::Binary(ct) => {
                     if let Ok(p) = chan.lock().await.open_record(&ct)
-                        && !p.is_empty()
-                        && p[0] == E2EE_FRAME_WIRE
-                        && let Ok(wire) = WireMessage::decode_zstd(&p[1..])
+                        && let Ok(wire) = WireMessage::decode_e2ee(&p)
                         && in_tx.send(wire).await.is_err()
                     {
                         break;

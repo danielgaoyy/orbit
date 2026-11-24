@@ -3,7 +3,8 @@
 //! Exposed to agents via the built-in MCP Server (`POST /mcp/agents`) and `orbit mcp` stdio bridge.
 //! Exposes a compact Core Pack (12 tools) plus startup-locked optional Capability Packs (up to 19
 //! total composite tools in `tools/list`) to minimize LLM context overhead and preserve prompt cache
-//! prefixes, while keeping 100% backward compatibility in `execute_tool` for all legacy tool names.
+//! prefixes. Enabled plugin operations add one shared catalog entry. Legacy tool names remain
+//! available through `execute_tool`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -300,8 +301,27 @@ pub fn list_tool_definitions_for_caller(
         return Vec::new();
     }
     let packs = resolve_effective_packs(runtime, caller_agent_id, policy);
+    let plugin = runtime.plugins.has_ops().then(|| PackToolDefinition {
+        pack: McpToolPack::Core,
+        def: ToolDefinition {
+            name: "orbit_plugin",
+            description: "List enabled plugin operations or call one on this host.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "call"] },
+                    "plugin": { "type": "string" },
+                    "op": { "type": "string" },
+                    "input": {}
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+        },
+    });
     pack_tool_definitions()
         .into_iter()
+        .chain(plugin)
         .filter(|entry| {
             packs.contains(&entry.pack)
                 && !policy.disabled_tools.iter().any(|d| d == entry.def.name)
@@ -754,6 +774,39 @@ async fn execute_tool_inner(
                 );
             }
             crate::memory::execute_tool(&rt.orchestrator.memory, &caller, args).await
+        }
+        "orbit_plugin" => {
+            anyhow::ensure!(
+                target_host.is_none() && rt.plugins.has_ops(),
+                "plugin tool unavailable on this host"
+            );
+            match args.get("action").and_then(Value::as_str) {
+                Some("list") => {
+                    let plugins: Vec<_> = rt
+                        .plugins
+                        .list()?
+                        .into_iter()
+                        .filter(|p| p.enabled && !p.manifest.mcp_ops.is_empty())
+                        .map(|p| json!({ "plugin": p.manifest.id, "ops": p.manifest.mcp_ops }))
+                        .collect();
+                    Ok(json!({ "plugins": plugins }))
+                }
+                Some("call") => {
+                    let id = str_arg(args, "plugin")?;
+                    let op = str_arg(args, "op")?;
+                    let root = if caller.as_ref().is_some_and(|a| a.is_personal_router()) {
+                        None
+                    } else {
+                        crate::authorize_optional_mcp_cwd(&rt.store, caller.map(|a| a.cwd))
+                            .await
+                            .map_err(anyhow::Error::msg)?
+                    };
+                    rt.plugins
+                        .invoke(&id, &op, root, args.get("input").unwrap_or(&Value::Null))
+                        .await
+                }
+                _ => anyhow::bail!("expected plugin action list or call"),
+            }
         }
         // ==================== AGENTS ====================
         "create_agent" => {

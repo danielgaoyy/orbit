@@ -33,6 +33,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "orbit-rust-unit"
@@ -42,6 +43,8 @@ jobs:
           cargo fmt --all -- --check
           cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Check WASM ViewModel crate (wasm32-unknown-unknown)
+        run: cargo check -p orbit-client-wasm --target wasm32-unknown-unknown
       - run: cargo test --workspace --lib --bins
 
   e2e-regression-matrix:
@@ -56,10 +59,10 @@ jobs:
             args: "-p orbit-cli --test e2e_pitfall_regressions"
           - suite: relay-security-isolation
             label: "Relay E2EE & Isolation"
-            args: "-p orbit-cli --test e2e_relay_and_pty --test e2e_multi_user_isolation"
+            args: "-p orbit-cli --test e2e_relay_and_pty --test e2e_multi_user_isolation --test e2e_browser_noise"
           - suite: orchestration
             label: "Orchestration & Fleet Mesh"
-            args: "-p orbit-cli --test e2e_orchestration"
+            args: "-p orbit-cli --test e2e_orchestration --test e2e_voice"
           - suite: workspace-sync-worktree
             label: "Workspace Sync & Worktree"
             args: "-p orbit-cli --test e2e_workspace_sync_and_worktree"

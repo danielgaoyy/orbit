@@ -473,16 +473,7 @@ pub fn derive_rule_from_always_allow(
     })
 }
 
-/// Strictly verify whether a permission request's `allowed_decisions` permits a single-shot
-/// `"allow"` decision (`allow`, `allow_once`, or `accept`).
-pub fn permits_allow_decision(allowed_decisions: &[String]) -> bool {
-    allowed_decisions.iter().any(|d| {
-        matches!(
-            d.trim().to_ascii_lowercase().as_str(),
-            "allow" | "allow_once" | "accept"
-        )
-    })
-}
+pub use orbit_protocol::permits_allow_decision;
 
 /// Strictly verify whether `allowed_decisions` permits `"allow_always"`.
 pub fn permits_allow_always_decision(allowed_decisions: &[String]) -> bool {

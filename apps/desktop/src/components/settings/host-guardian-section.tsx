@@ -9,6 +9,7 @@ import {
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
 import { PermissionRulesPanel } from "@/components/settings/permission-rules-panel";
+import { HostSandboxAndAuditPanel } from "@/components/settings/host-security-ops-panels";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { type MessageKey, useI18n } from "@/lib/i18n";
@@ -572,6 +573,8 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
           </div>
 
           <PermissionRulesPanel hostId={hostId} isOnline={isOnline} />
+
+          <HostSandboxAndAuditPanel hostId={hostId} isOnline={isOnline} />
 
           <div className="flex flex-col gap-2">
             <SettingGroupLabel>{t("guardian.groupRecentDecisions")}</SettingGroupLabel>

@@ -9,8 +9,8 @@ use orbit_protocol::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::app_core::{AgentCardView, ClientProjectView, cwd_paths_equivalent};
 use crate::contract::GitReposInspectionView;
+use crate::viewmodel::{AgentCardView, ClientProjectView, cwd_paths_equivalent};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

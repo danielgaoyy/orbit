@@ -1,6 +1,6 @@
 # Orbit Client Architecture & Client Bridge Protocol v2
 
-This document describes the unified cross-platform architecture of Orbit across all four clients (**Desktop React/TS**, **iOS SwiftUI**, **Android Jetpack Compose**, and **HarmonyOS ArkTS V2**), anchored on **`orbit-client-core`** + **`orbit-store`** as the single authoritative data, persistence, and domain-logic layer.
+Desktop, Web PWA, iOS, Android and HarmonyOS share the Rust presentation model in `orbit-client-core`. Native clients use SQLite and the native transport runtime. The browser uses WebAssembly, WebSocket and IndexedDB.
 
 ---
 
@@ -91,8 +91,14 @@ All Contract v2 request/response DTOs are canonically defined in `crates/orbit-c
 | Host & Agent identity flags | `HostCardView.is_local`, `AgentCardView.has_armed_timers` | Same JSON fields + `isAgentTimerWaiting` | `FfiHostCard.isLocal`, `FfiAgentCard.hasArmedTimers` | Same DTO fields via N-API |
 | Global Personal Agent routing | `discover_fleet_router_hosts`, `primary_router_selection` (APP-level) | Wired via Desktop Tauri (`App -> Personal Agent`, host-independent) | Mobile FFI exposure planned | Mobile FFI exposure planned |
 | SEP-1865 MCP Apps bridge | `read_mcp_resource_async`, `call_artifact_mcp_tool_async` | `read_mcp_resource`, `call_artifact_mcp_tool` | Mobile FFI exposure planned | Mobile FFI exposure planned |
+| M3 Security, Audit, Diagnostics & IDE Migration | `get_sandbox_config`, `update_sandbox_config`, `get_audit_chain_status`, `export_audit_chain`, `export_diagnostic_bundle`, `compact_agent_context`, `inspect_external_ide_migration`, `execute_external_ide_migration` | Wired 1:1 in Tauri IPC + `WasmWebBackend` | Mobile FFI exposure planned | Mobile FFI exposure planned |
+| M4 Project Memory | `list_project_memories`, `upsert_project_memory`, `confirm_project_memory`, `delete_project_memory`, `recall_project_memory` | Wired 1:1 in Tauri IPC + `WasmWebBackend` (`Instructions & Rules -> Memory`) | Mobile FFI exposure planned | Mobile FFI exposure planned |
+| M5 WASM Plugins | `list_plugins`, `install_plugin`, `set_plugin_enabled`, `uninstall_plugin`, `invoke_plugin_op`, `render_plugin_ui` | Wired 1:1 in Tauri IPC + `WasmWebBackend` (`Capabilities -> Plugins` + `PluginUiRenderer`) | Mobile FFI exposure planned | Mobile FFI exposure planned |
+| M6 Voice Control | `get_voice_config`, `update_voice_config`, `download_voice_model`, `delete_voice_model`, `transcribe_voice_audio`, `parse_voice_transcript`, `approve_voice_permission`, `synthesize_voice_speech` | Wired 1:1 in Tauri IPC + `WasmWebBackend` (`OmniComposer` morphing circle + `Capabilities -> Voice`) | Mobile FFI exposure planned | Mobile FFI exposure planned |
 
 ---
+
+Plugin discovery, operation results and UI trees are host-local correlated wire replies. A client renders the typed JSON tree and routes button actions back to the originating host and plugin. The ABI, limits and supported slots are specified in the [plugin SDK](architecture/plugins.md).
 
 ## 4. Thread Preferences Persistence & Legacy Migration
 
@@ -103,7 +109,7 @@ Thread metadata (`seen_seq`, `is_pinned`, `pinned_order`, `updated_at_ms`) is pe
 
 ---
 
-## 5. Four-Platform Ownership & Parity Matrix
+## 5. Native binding coverage
 
 | Feature / Domain | Rust Core (`orbit-client-core`) | Desktop (React/TS) | iOS (SwiftUI) | Android (Compose) | HarmonyOS (ArkTS V2) |
 | --- | --- | --- | --- | --- | --- |
@@ -139,3 +145,23 @@ cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- 
 # 4. iOS Swift parse verification against generated UniFFI bindings
 swiftc -parse apps/ios/Generated/orbit_ffi_uniffi.swift $(find apps/ios/Sources -name '*.swift' | sort)
 ```
+
+## Host-scoped voice control
+
+The shared Rust entry points on `OrbitAppCore` take an explicit `host_id` and correlate each reply by request UUID. Settings and model mutations (`get_voice_config`, `update_voice_config`, `download_voice_model`, `delete_voice_model`) return `VoiceConfigState`. Clients can use the verified inventory and host executable capabilities to display available backends.
+
+`transcribe_voice_audio` takes base64 mono PCM16, its sample rate, an optional locale and an optional agent ID. The result includes transcript text, input duration, backend and parsed intent. An empty transcript with `system_client_fallback` requests native/Web Speech recognition. Submit the resulting text through `parse_voice_transcript` with the same host and agent. Parsing has no agent side effects. Language selection accepts `auto`, `en`, `zh` and `ja`. Examples include “read last reply”, “切换到 Build” and “キューの状態”. Explicit approval phrases include “confirm approval of request R1”, “确认批准请求 R1” and “リクエスト R1 の承認を確認”. Request IDs retain their case.
+
+For permission approvals, display the visual permission UI on `requires_visual_confirmation`. On `requires_spoken_confirmation`, collect an explicit confirmation for the same request. Route confirmed approvals through `approve_voice_permission`; it checks the live request again before a one-time dispatch. An absent, unassessed, high-risk, human-only or plan request yields visual confirmation.
+
+`synthesize_voice_speech` returns a validated WAV, MIME type, duration and backend. Its structured error code `voice_client_tts_required` requests client synthesis. The separate `voice_tts_disabled` code respects the host's explicit preference for silence. Clients may use `auto_speak_responses` when selecting assistant replies for speech.
+
+## 7. WebAssembly and browser transport
+
+`orbit-client-wasm` links the renderer, diagram, math, stage, sidebar, catalog, composer and export modules from `orbit-client-core` with its native feature disabled. Browser Noise and cloud vault operations call `orbit-crypto`. A pure Rust zstd implementation preserves the encrypted Gist vault format. The browser keeps one session and one timeline replica per paired host.
+
+`apps/web` loads the generated bindings and installs `WasmWebBackend` before mounting the Desktop React workspace. Tauri selects `TauriIpcBackend` and retains native IPC channels and binary arguments. Browser sessions try the direct WebSocket routes and then the configured WebSocket relay. The first authenticated Hello advertises `supports_zstd: false`. Welcome must match the pairing offer's host ID and static public key. Inside Noise, wire JSON uses discriminator `0x02`, compressed wire JSON uses `0x00`, and terminal frames use `0x01`. Older Hellos default to compressed output. Relay tunnel forwarding operates on ciphertext for both encodings.
+
+Pair with the URI or QR image printed by `orbit pair`. The browser stores paired profiles and bounded host snapshots in IndexedDB under a non-extractable AES-GCM key. Reopening the shell hydrates host metadata offline and refreshes it on connection. Live timelines are scoped to host and agent. Native SSH, external editors and OS integration require the desktop application.
+
+Install the Rust `wasm32-unknown-unknown` target, then run `npm ci && npm run build` in `apps/web`. The build generates version-matched wasm-bindgen glue and a service worker precache for that release's shell and WASM. Serve `dist` from a trusted HTTPS origin or run `orbit daemon --serve-web apps/web/dist` on loopback. The foreground relay accepts the same option. Static hosting defaults to off. An HTTPS page needs browser-permitted WebSocket endpoints, normally `wss://`. The daemon admits its hosted same-origin PWA on the encrypted endpoint. The existing direct RPC origin and bearer checks still apply to native RPC endpoints.

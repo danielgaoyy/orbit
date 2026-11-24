@@ -43,3 +43,8 @@ apps/harmony/entry/build/
 apps/harmony/entry/oh_modules/
 apps/harmony/entry/libs/
 crates/orbit-ffi-ohos/dist/
+
+# Browser build products
+apps/web/dist/
+apps/web/node_modules/
+apps/web/src/generated/

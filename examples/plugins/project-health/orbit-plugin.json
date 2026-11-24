@@ -1,0 +1,11 @@
+{
+  "id": "project-health",
+  "name": "Project Health Inspector",
+  "version": "1.0.0",
+  "description": "Check workspace manifests and documentation.",
+  "author": "Orbit contributors",
+  "wasm_entry": "plugin.wasm",
+  "capabilities": { "fs_read_globs": ["Cargo.toml", "package.json", "README.md"] },
+  "mcp_ops": [{ "name": "check_health", "description": "Check which project files exist and contain data." }],
+  "ui_slots": [{ "slot": "stage_card", "title": "Project health" }]
+}

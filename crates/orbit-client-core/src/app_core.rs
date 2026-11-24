@@ -10,36 +10,41 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::VoiceRpcError;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use orbit_crypto::PairingOffer;
 use orbit_protocol::{
-    AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior,
-    AgentMessageDeliveryStatus, AgentMessageKind, AgentProfile, AgentStatus, AgentSummary,
-    ArtifactDetail, ArtifactSummary, AttentionState, BackgroundTaskInfo, BrowserPolicyConfig,
-    BrowserSessionSummary, ConditionalTimerRecord, ConditionalTimerState, ConnectedHostSummary,
-    ContextOccupancyBreakdown, DirectoryEntry, DiscoveredProject, EventTriggerDelivery,
+    AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
+    AgentStatus, AgentSummary, ArtifactDetail, ArtifactSummary, AttentionState,
+    BrowserPolicyConfig, BrowserSessionSummary, ConditionalTimerRecord, ConditionalTimerState,
+    ConnectedHostSummary, ContextOccupancyBreakdown, DiscoveredProject, EventTriggerDelivery,
     ExternalMcpServerRecord, GitCollabQueryResult, GitCommitResult, GitConflictListResult,
     GitConflictResolution, GitCreatePrResult, GitGeneratedCommitMessage, GitMutationOutcome,
     GitPrStatus, GitPushResult, GitRebaseActionResult, GitRebaseStatus, GitResolveConflictResult,
     GitStashListResult, GitStashMutationResult, GitStatusSnapshot, GoalRunRecord,
-    GuardianAssessment, GuardianAuditEntry, GuardianPolicyConfig, HookExecutionRecord, HookScope,
-    HostProjectEntry, HostSyncState, ImChannelRecord, ImPlatform, ImThreadBinding, KeepAwakeStatus,
+    GuardianAuditEntry, GuardianPolicyConfig, HookExecutionRecord, HookScope, HostProjectEntry,
+    HostSyncState, ImChannelRecord, ImPlatform, ImThreadBinding, KeepAwakeStatus,
     LifecycleHookRule, LspCodeAction, LspCompletionItem, LspDiagnostic, LspHoverInfo, LspLocation,
     LspReferenceLocation, LspServerStatus, LspSymbolInfo, LspWorkspaceEdit, LspWorkspaceEditResult,
     ManagedSkillRecord, McpProbeResult, McpResourceContent, McpToolCallOutcome, ModelOption,
     MonitorWatchRecord, OrchestrationConfig, OrchestrationSkillInfo, PathScopedRule,
-    PendingPermissionSummary, PermissionCheckpointRef, PermissionRuleRecord, PlanApprovalAction,
-    PlanApprovalPayload, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot,
-    ProviderSubagentDescriptor, ProviderSubagentEvent, PushDeviceRecord, PushPlatform,
-    PushPreferences, QuestionItem, QueuedPromptView, ReasoningEffort, RemoteMessageSearchHit,
-    ResolvePermissionsBatchResult, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec,
-    ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame, TerminalSummary,
-    TimelineEvent, TimelineOutlinePrompt, TimelinePayload, TimerCondition, ToolCallDetail,
-    ToolCallStatus, UpsertPermissionRuleInput, UsageInsightsSnapshot, WireMessage,
-    WorkflowRunRecord, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind,
-    WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo,
-    WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    PendingPermissionSummary, PermissionRuleRecord, PlanApprovalAction, PromptBadge, ProviderKind,
+    ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
+    PushDeviceRecord, PushPlatform, PushPreferences, QueuedPromptView, ReasoningEffort,
+    RemoteMessageSearchHit, ResolvePermissionsBatchResult, RuleTriggerMode, ScheduleRunRecord,
+    ScheduleSpec, ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame,
+    TerminalSummary, TimelineEvent, TimelineOutlinePrompt, TimelinePayload, TimerCondition,
+    ToolCallDetail, ToolCallStatus, UpsertPermissionRuleInput, UsageInsightsSnapshot, WireMessage,
+    WorkflowRunRecord, WorkspaceBoardSnapshot, WorkspaceEventKind, WorkspaceEventRecord,
+    WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary,
+    WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
+};
+use orbit_protocol::{
+    AuditChainVerification, InstalledPluginView, MemoryCategory, MemoryStatus, MigrationConflict,
+    OrbitPluginUiSlot, OrbitPluginUiSpec, ProjectMemoryItem, ProjectMemorySearchHit, SandboxPolicy,
+    VoiceApprovalSafety, VoiceConfig, VoiceConfigState, VoiceSpeechResult,
+    VoiceTranscriptionResult,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -64,22 +69,28 @@ fn is_legacy_ssh_relay_without_ft(url: &str) -> bool {
     trimmed.starts_with("ssh+relay://") && !trimmed.contains("?ft=") && !trimmed.contains("&ft=")
 }
 pub use crate::contract::{
-    BrowserActionResponseView, BrowserSessionsSnapshotView, CancelWorkflowRunRequest,
-    ControlGoalRunRequest, ConversationSearchHit, CreateBrowserSessionRequest,
-    CreateWorkspaceEntryRequest, DeletePathRuleRequest, DeleteWorkspaceEntryRequest,
-    EventTriggersSnapshotView, ExecuteBrowserActionRequest, ExecuteWorktreeHandoffRequest,
-    ForkAgentRequest, ForkAgentResultView, InstructionFileContentView, InstructionFileSavedView,
-    InstructionFilesSnapshotView, LifecycleHooksSnapshotView, ListInstructionFilesRequest,
-    MatchPathRulesRequest, MatchedPathRulesView, PathRulesSnapshotView,
-    PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RemotePreviewTunnelView,
-    RenameWorkspaceEntryRequest, SaveInstructionFileRequest, SearchMessagesRequest,
-    SearchMessagesResponse, SelectBestOfNWinnerRequest, StartBatchFanoutRequest,
-    StartBestOfNRequest, StartDagWorkflowRequest, StartGoalRunRequest, StartMonitorWatchRequest,
+    AuditChainExportView, BrowserActionResponseView, BrowserSessionsSnapshotView,
+    CancelWorkflowRunRequest, ControlGoalRunRequest, ConversationSearchHit,
+    CreateBrowserSessionRequest, CreateWorkspaceEntryRequest, DeletePathRuleRequest,
+    DeleteWorkspaceEntryRequest, EventTriggersSnapshotView, ExecuteBrowserActionRequest,
+    ExecuteWorktreeHandoffRequest, ForkAgentRequest, ForkAgentResultView,
+    InstructionFileContentView, InstructionFileSavedView, InstructionFilesSnapshotView,
+    LifecycleHooksSnapshotView, ListInstructionFilesRequest, MatchPathRulesRequest,
+    MatchedPathRulesView, PathRulesSnapshotView, PreviewWorktreeHandoffRequest,
+    ReadInstructionFileRequest, RemotePreviewTunnelView, RenameWorkspaceEntryRequest,
+    SaveInstructionFileRequest, SearchMessagesRequest, SearchMessagesResponse,
+    SelectBestOfNWinnerRequest, StartBatchFanoutRequest, StartBestOfNRequest,
+    StartDagWorkflowRequest, StartGoalRunRequest, StartMonitorWatchRequest,
     StopMonitorWatchRequest, UpsertArtifactRequest, UpsertEventTriggerRequest,
-    UpsertExternalMcpServerRequest, UpsertPathRuleRequest, WorkspaceEntryMutationResultView,
-    WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
+    UpsertExternalMcpServerRequest, UpsertPathRuleRequest, UpsertProjectMemoryRequest,
+    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
 };
 use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
+use crate::viewmodel::*;
+pub use crate::viewmodel::{
+    AgentCardView, AskSideQuestionRequest, ClientProjectView, DirectoryListingView,
+    FleetOverviewView, GitReviewView, HostCardView, HostDetailView, TimelineItemView,
+};
 
 use crate::desktop_ops::{
     StagedAttachmentInfo, bootstrap_ssh_host_and_pair, discover_local_daemon_pairing_uri,
@@ -90,12 +101,11 @@ use crate::desktop_ops::{
 use crate::render::{
     DiffFileView, HighlightedLineView, RichBlockView, TerminalGridEmulator, TerminalScreenView,
     detect_language_for_path, highlight_code_lines_capped, highlight_code_lines_prefix,
-    parse_markdown_blocks, parse_unified_diff, parse_unified_diff_capped,
+    parse_markdown_blocks, parse_unified_diff,
 };
 use crate::stage::{self, SessionInsightsView, StageTurnView};
 use crate::{
-    ClientCoreError, ClientInboundEvent, HostConnectionState, HostRouteMode, HostSessionHandle,
-    SavedHostProfile, connect_smart, connect_via_peer_bridge,
+    ClientCoreError, ClientInboundEvent, HostSessionHandle, connect_smart, connect_via_peer_bridge,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,137 +389,10 @@ impl Drop for TerminalBinaryReceiver {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClientProjectView {
-    pub project_id: String,
-    pub host_id: String,
-    pub name: String,
-    pub directories: Vec<String>,
-    pub updated_at_ms: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DirectoryListingView {
-    pub current_path: String,
-    pub parent_path: Option<String>,
-    pub entries: Vec<DirectoryEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StagedAttachmentView {
     pub path: String,
     pub filename: String,
     pub size_bytes: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HostCardView {
-    pub host_id: String,
-    pub display_name: String,
-    pub hostname: String,
-    pub custom_name: Option<String>,
-    pub ssh_alias: Option<String>,
-    pub route_mode: HostRouteMode,
-    pub remote_daemon_port: u16,
-    pub custom_direct_endpoint: Option<String>,
-    pub via_ssh_tunnel: bool,
-    pub last_ping_ms: Option<u32>,
-    pub daemon_version: Option<String>,
-    #[serde(default)]
-    pub daemon_protocol_version: Option<u32>,
-    #[serde(default)]
-    pub client_protocol_version: u32,
-    pub os_arch: Option<String>,
-    pub daemon_pubkey_b64: String,
-    pub direct_endpoints: Vec<String>,
-    pub relay_url: Option<String>,
-    pub connection_state: HostConnectionState,
-    pub last_error: Option<String>,
-    pub available_providers: Vec<ProviderKind>,
-    pub workspace_count: u32,
-    pub agent_count: u32,
-    pub pending_approval_count: u32,
-    #[serde(default)]
-    pub supports_server_queue: bool,
-    #[serde(default)]
-    pub is_local: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FleetOverviewView {
-    pub revision: u64,
-    pub total_pending_approvals: u32,
-    pub hosts: Vec<HostCardView>,
-    pub projects: Vec<ClientProjectView>,
-    #[serde(default)]
-    pub project_order: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentCardView {
-    pub agent_id: String,
-    pub workspace_id: String,
-    pub cwd: String,
-    pub title: String,
-    pub provider: ProviderKind,
-    pub provider_label: String,
-    pub model: Option<String>,
-    pub effort: Option<ReasoningEffort>,
-    #[serde(default)]
-    pub fast_mode: bool,
-    pub mode: SessionMode,
-    pub status: AgentStatus,
-    pub status_label: String,
-    pub is_running: bool,
-    #[serde(default)]
-    pub has_background_tasks: bool,
-    #[serde(default)]
-    pub has_armed_timers: bool,
-    #[serde(default)]
-    pub has_running_subagents: bool,
-    pub is_awaiting_permission: bool,
-    pub parent_agent_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_host_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile_id: Option<String>,
-    #[serde(default)]
-    pub background: bool,
-    #[serde(default)]
-    pub auto_archive: bool,
-    #[serde(default)]
-    pub attention: AttentionState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub archived_at_rfc3339: Option<String>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub labels: HashMap<String, String>,
-    pub latest_seq: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_at_rfc3339: Option<String>,
-    pub updated_at_rfc3339: String,
-    #[serde(default)]
-    pub is_pinned: bool,
-    #[serde(default)]
-    pub seen_seq: u64,
-    #[serde(default)]
-    pub read_seq: u64,
-    #[serde(default)]
-    pub is_unread: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub queued_prompts: Vec<QueuedPromptView>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub handle: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cluster_suggestion: Option<WorkspaceClusterSuggestion>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worktree_branch: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_summary: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub forked_from_agent_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub forked_at_seq: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub acp_agent_id: Option<String>,
 }
 
 pub struct CreateAgentRequest<'a> {
@@ -562,172 +445,6 @@ pub struct ImportManagedSkillRequest {
     pub source_markdown_or_path: String,
     #[serde(default)]
     pub slug_override: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HostDetailView {
-    pub revision: u64,
-    pub host: HostCardView,
-    pub discovered_projects: Vec<DiscoveredProject>,
-    pub directory_listing: Option<DirectoryListingView>,
-    pub models_by_provider: HashMap<ProviderKind, Vec<ModelOption>>,
-    pub workspaces: Vec<WorkspaceSummary>,
-    pub agents: Vec<AgentCardView>,
-    pub last_created_agent_id: Option<String>,
-    pub replaced_optimistic_agents: HashMap<String, String>,
-    pub quotas: Vec<ProviderQuotaSnapshot>,
-    #[serde(default)]
-    pub provider_catalogs: Vec<ProviderModelCatalog>,
-    pub terminals: Vec<TerminalSummary>,
-    pub active_terminal_id: Option<String>,
-    pub active_terminal_slot: u8,
-    #[serde(default)]
-    pub profiles: Vec<AgentProfile>,
-    #[serde(default)]
-    pub schedules: Vec<ScheduleSpec>,
-    #[serde(default)]
-    pub conditional_timers: Vec<ConditionalTimerRecord>,
-    #[serde(default)]
-    pub connected_hosts: Vec<ConnectedHostSummary>,
-    #[serde(default)]
-    pub orchestration_config: OrchestrationConfig,
-    #[serde(default)]
-    pub orchestration_skills: Vec<OrchestrationSkillInfo>,
-    #[serde(default)]
-    pub managed_skills: Vec<ManagedSkillRecord>,
-    #[serde(default)]
-    pub keep_awake_status: Option<KeepAwakeStatus>,
-    #[serde(default)]
-    pub workspace_scripts: HashMap<String, Vec<WorkspaceScriptInfo>>,
-    #[serde(default)]
-    pub pending_permissions: Vec<PendingPermissionSummary>,
-    #[serde(default)]
-    pub provider_subagents: HashMap<String, Vec<ProviderSubagentDescriptor>>,
-    #[serde(default)]
-    pub git_repos_by_cwd: HashMap<String, GitReposInspectionView>,
-    #[serde(default)]
-    pub workspace_boards: HashMap<String, WorkspaceBoardSnapshot>,
-    #[serde(default)]
-    pub workspace_events: HashMap<String, Vec<WorkspaceEventRecord>>,
-    #[serde(default)]
-    pub workspace_organize_status: HashMap<String, WorkspaceOrganizeEvent>,
-    #[serde(default)]
-    pub host_sync_state: HostSyncState,
-    #[serde(default)]
-    pub acp_agents: Vec<AcpAgentAvailability>,
-    #[serde(default)]
-    pub artifacts: Vec<ArtifactSummary>,
-    #[serde(default)]
-    pub goal_runs: Vec<GoalRunRecord>,
-    #[serde(default)]
-    pub monitor_watches: Vec<MonitorWatchRecord>,
-    #[serde(default)]
-    pub workflow_runs: Vec<WorkflowRunRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "item_type", rename_all = "snake_case")]
-pub enum TimelineItemView {
-    UserPrompt {
-        seq: u64,
-        message_id: String,
-        text: String,
-        #[serde(default)]
-        badges: Vec<PromptBadge>,
-        blocks: Vec<RichBlockView>,
-        #[serde(default)]
-        timestamp_ms: Option<i64>,
-    },
-    AssistantThinking {
-        seq: u64,
-        item_id: String,
-        text: String,
-        #[serde(default)]
-        timestamp_ms: Option<i64>,
-    },
-    AssistantMessage {
-        seq: u64,
-        item_id: String,
-        text: String,
-        streaming: bool,
-        blocks: Vec<RichBlockView>,
-        #[serde(default)]
-        timestamp_ms: Option<i64>,
-    },
-    ToolCall {
-        seq: u64,
-        call_id: String,
-        status: ToolCallStatus,
-        summary_title: String,
-        detail: ToolCallDetail,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        background_task: Option<BackgroundTaskInfo>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        step_descriptor: Option<crate::stage::ToolStepDescriptorView>,
-        diff_files: Vec<DiffFileView>,
-        #[serde(default)]
-        timestamp_ms: Option<i64>,
-    },
-    PermissionRequest {
-        seq: u64,
-        request_id: String,
-        title: String,
-        detail: ToolCallDetail,
-        allowed_decisions: Vec<String>,
-        resolved_decision: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        guardian_assessment: Option<GuardianAssessment>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        plan_approval: Option<PlanApprovalPayload>,
-        #[serde(default)]
-        timestamp_ms: Option<i64>,
-    },
-    QuestionRequest {
-        seq: u64,
-        request_id: String,
-        questions: Vec<QuestionItem>,
-        resolved_answers: Option<Vec<Vec<String>>>,
-        #[serde(default)]
-        timestamp_ms: Option<i64>,
-    },
-    Notice {
-        seq: u64,
-        level: String,
-        message: String,
-        #[serde(default)]
-        timestamp_ms: Option<i64>,
-    },
-    AgentMessage {
-        seq: u64,
-        message_id: String,
-        kind: AgentMessageKind,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        source_agent_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        source_host_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        source_title: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        event: Option<String>,
-        text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        permission_context: Option<PermissionCheckpointRef>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        delivery_status: Option<AgentMessageDeliveryStatus>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        delivery_turn_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        blocking_turn_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        queued_at_ms: Option<i64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        dispatched_at_ms: Option<i64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        settled_at_ms: Option<i64>,
-        blocks: Vec<RichBlockView>,
-        #[serde(default)]
-        timestamp_ms: Option<i64>,
-    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -911,17 +628,6 @@ pub struct RewindAgentResultView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GitReviewView {
-    pub revision: u64,
-    pub host_id: String,
-    pub cwd: String,
-    pub status: Option<GitStatusSnapshot>,
-    pub selected_path: Option<String>,
-    pub raw_diff: String,
-    pub diff_files: Vec<DiffFileView>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceFileView {
     pub host_id: String,
     pub cwd: String,
@@ -958,20 +664,6 @@ pub enum SideQuestionStreamEvent {
         full_text: String,
         error: Option<String>,
     },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AskSideQuestionRequest {
-    pub host_id: String,
-    #[serde(default)]
-    pub agent_id: Option<String>,
-    pub cwd: String,
-    pub provider: ProviderKind,
-    #[serde(default)]
-    pub model: Option<String>,
-    pub question: String,
-    #[serde(default)]
-    pub context_summary: String,
 }
 
 #[derive(Debug, Clone)]
@@ -2313,38 +2005,19 @@ impl OrbitAppCore {
         let cards = self
             .hosts
             .read()
-            .map(|guard| {
-                let mut v: Vec<HostCardView> =
-                    guard.values().map(HostMemoryState::to_card).collect();
-                v.sort_by(|a, b| a.display_name.cmp(&b.display_name));
-                v
-            })
+            .map(|g| g.values().map(HostMemoryState::to_card).collect())
             .unwrap_or_default();
-        let total_pending_approvals = cards.iter().map(|c| c.pending_approval_count).sum();
-
         let projects = self
             .projects
             .read()
-            .map(|guard| {
-                let mut v: Vec<ClientProjectView> = guard.values().cloned().collect();
-                v.sort_by_key(|a| std::cmp::Reverse(a.updated_at_ms));
-                v
-            })
+            .map(|g| g.values().cloned().collect())
             .unwrap_or_default();
-
-        let project_order = self
+        let order = self
             .project_order
             .read()
             .map(|g| g.clone())
             .unwrap_or_default();
-
-        FleetOverviewView {
-            revision: rev,
-            total_pending_approvals,
-            hosts: cards,
-            projects,
-            project_order,
-        }
+        project_fleet_overview(rev, cards, projects, order)
     }
 
     pub fn host_detail(&self, host_id: &str) -> Option<HostDetailView> {
@@ -3445,17 +3118,7 @@ impl OrbitAppCore {
             (raw_diff, status)
         };
         // Parse & syntax-highlight diff outside `self.hosts` read lock so inbound WS/PTY never stalls.
-        let diff_files = parse_unified_diff(&raw_diff);
-        let capped_raw_diff = truncate_utf8_prefix(&raw_diff, 32_768);
-        GitReviewView {
-            revision: rev,
-            host_id: host_id.to_string(),
-            cwd: cwd.to_string(),
-            status,
-            selected_path: path.map(ToOwned::to_owned),
-            raw_diff: capped_raw_diff,
-            diff_files,
-        }
+        project_git_review(rev, host_id, cwd, path, &raw_diff, status)
     }
 
     pub fn terminal_screen(&self, host_id: &str) -> Option<TerminalScreenView> {
@@ -8311,6 +7974,9 @@ impl OrbitAppCore {
                             full_text: String::new(),
                             error: Some(formatted_err),
                         });
+                    } else if code.starts_with("voice_") {
+                        // Voice RPC fallback/control errors are correlated directly by request_id;
+                        // do not overwrite host-level `last_error`.
                     } else {
                         state.last_error = Some(formatted_err.clone());
                         if let Some(req_id) = request_id {
@@ -16915,6 +16581,771 @@ impl OrbitAppCore {
             .map_err(|_| format!("{op_label} task cancelled"))?
     }
 
+    async fn voice_rpc(
+        &self,
+        host_id: &str,
+        msg: WireMessage,
+    ) -> Result<WireMessage, VoiceRpcError> {
+        let session = self
+            .require_online_session(host_id)
+            .map_err(VoiceRpcError::transport)?;
+        self.runtime
+            .spawn(async move { session.request_voice(msg).await })
+            .await
+            .map_err(|e| VoiceRpcError::transport(e.to_string()))?
+    }
+
+    async fn voice_state_rpc(
+        &self,
+        host_id: &str,
+        msg: WireMessage,
+    ) -> Result<VoiceConfigState, VoiceRpcError> {
+        match self.voice_rpc(host_id, msg).await? {
+            WireMessage::VoiceConfigState { state, .. } => Ok(state),
+            _ => Err(VoiceRpcError::unexpected()),
+        }
+    }
+
+    pub async fn get_voice_config(&self, host_id: &str) -> Result<VoiceConfigState, VoiceRpcError> {
+        self.voice_state_rpc(
+            host_id,
+            WireMessage::GetVoiceConfig {
+                request_id: Uuid::new_v4(),
+            },
+        )
+        .await
+    }
+    pub async fn update_voice_config(
+        &self,
+        host_id: &str,
+        config: VoiceConfig,
+    ) -> Result<VoiceConfigState, VoiceRpcError> {
+        self.voice_state_rpc(
+            host_id,
+            WireMessage::UpdateVoiceConfig {
+                request_id: Uuid::new_v4(),
+                config,
+            },
+        )
+        .await
+    }
+    pub async fn download_voice_model(
+        &self,
+        host_id: &str,
+        model_id: String,
+    ) -> Result<VoiceConfigState, VoiceRpcError> {
+        self.voice_state_rpc(
+            host_id,
+            WireMessage::DownloadVoiceModel {
+                request_id: Uuid::new_v4(),
+                model_id,
+            },
+        )
+        .await
+    }
+    pub async fn delete_voice_model(
+        &self,
+        host_id: &str,
+        model_id: String,
+    ) -> Result<VoiceConfigState, VoiceRpcError> {
+        self.voice_state_rpc(
+            host_id,
+            WireMessage::DeleteVoiceModel {
+                request_id: Uuid::new_v4(),
+                model_id,
+            },
+        )
+        .await
+    }
+    pub async fn transcribe_voice_audio(
+        &self,
+        host_id: &str,
+        pcm16_le_base64: String,
+        sample_rate_hz: u32,
+        language: Option<String>,
+        agent_id: Option<String>,
+    ) -> Result<VoiceTranscriptionResult, VoiceRpcError> {
+        match self
+            .voice_rpc(
+                host_id,
+                WireMessage::TranscribeVoiceAudio {
+                    request_id: Uuid::new_v4(),
+                    pcm16_le_base64,
+                    sample_rate_hz,
+                    language,
+                    agent_id,
+                },
+            )
+            .await?
+        {
+            WireMessage::VoiceTranscriptionResult { result, .. } => Ok(result),
+            _ => Err(VoiceRpcError::unexpected()),
+        }
+    }
+    /// Apply the host's intent and permission policy to client-recognized speech.
+    pub async fn parse_voice_transcript(
+        &self,
+        host_id: &str,
+        text: String,
+        language: Option<String>,
+        agent_id: Option<String>,
+    ) -> Result<VoiceTranscriptionResult, VoiceRpcError> {
+        match self
+            .voice_rpc(
+                host_id,
+                WireMessage::ParseVoiceTranscript {
+                    request_id: Uuid::new_v4(),
+                    text,
+                    language,
+                    agent_id,
+                },
+            )
+            .await?
+        {
+            WireMessage::VoiceTranscriptionResult { result, .. } => Ok(result),
+            _ => Err(VoiceRpcError::unexpected()),
+        }
+    }
+    /// Recheck and claim the exact permission before dispatching a one-time approval.
+    pub async fn approve_voice_permission(
+        &self,
+        host_id: &str,
+        agent_id: String,
+        permission_request_id: String,
+        confirmed: bool,
+    ) -> Result<VoiceApprovalSafety, VoiceRpcError> {
+        match self
+            .voice_rpc(
+                host_id,
+                WireMessage::ApproveVoicePermission {
+                    request_id: Uuid::new_v4(),
+                    agent_id,
+                    permission_request_id,
+                    confirmed,
+                },
+            )
+            .await?
+        {
+            WireMessage::VoicePermissionResult { safety, .. } => Ok(safety),
+            _ => Err(VoiceRpcError::unexpected()),
+        }
+    }
+    pub async fn synthesize_voice_speech(
+        &self,
+        host_id: &str,
+        text: String,
+        language: Option<String>,
+        voice_id: Option<String>,
+    ) -> Result<VoiceSpeechResult, VoiceRpcError> {
+        match self
+            .voice_rpc(
+                host_id,
+                WireMessage::SynthesizeVoiceSpeech {
+                    request_id: Uuid::new_v4(),
+                    text,
+                    language,
+                    voice_id,
+                },
+            )
+            .await?
+        {
+            WireMessage::VoiceSpeechResult { result, .. } => Ok(result),
+            _ => Err(VoiceRpcError::unexpected()),
+        }
+    }
+
+    async fn correlated_host_rpc<F>(
+        &self,
+        host_id: &str,
+        request_id: Uuid,
+        msg: WireMessage,
+        timeout: Duration,
+        is_reply: F,
+    ) -> Result<WireMessage, String>
+    where
+        F: FnMut(&WireMessage) -> bool + Send + 'static,
+    {
+        let session = self.require_online_session(host_id)?;
+        self.runtime
+            .spawn(async move {
+                session
+                    .request_by_id(request_id, msg, timeout, is_reply)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| format!("host RPC task failed: {e}"))?
+    }
+
+    // --- M3 Security, Audit Chain, Diagnostics, Context Compaction & IDE Migration ---
+
+    pub async fn get_sandbox_config(&self, host_id: &str) -> Result<Option<SandboxPolicy>, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::GetSandboxConfig { request_id },
+                Duration::from_secs(15),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::SandboxConfig { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::SandboxConfig { sandbox_policy, .. } => Ok(sandbox_policy),
+            _ => Err("unexpected daemon reply for get_sandbox_config".into()),
+        }
+    }
+
+    pub async fn update_sandbox_config(
+        &self,
+        host_id: &str,
+        sandbox_policy: Option<SandboxPolicy>,
+    ) -> Result<Option<SandboxPolicy>, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::UpdateSandboxConfig {
+                    request_id,
+                    sandbox_policy,
+                },
+                Duration::from_secs(15),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::SandboxConfig { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::SandboxConfig { sandbox_policy, .. } => Ok(sandbox_policy),
+            _ => Err("unexpected daemon reply for update_sandbox_config".into()),
+        }
+    }
+
+    pub async fn get_audit_chain_status(
+        &self,
+        host_id: &str,
+    ) -> Result<AuditChainVerification, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::GetAuditChainStatus { request_id },
+                Duration::from_secs(30),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::AuditChainStatus { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::AuditChainStatus { verification, .. } => Ok(verification),
+            _ => Err("unexpected daemon reply for get_audit_chain_status".into()),
+        }
+    }
+
+    pub async fn export_audit_chain(
+        &self,
+        host_id: &str,
+        after_seq: u64,
+    ) -> Result<AuditChainExportView, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::ExportAuditChain {
+                    request_id,
+                    after_seq,
+                },
+                Duration::from_secs(30),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::AuditChainExport { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::AuditChainExport {
+                jsonl,
+                next_after_seq,
+                ..
+            } => Ok(AuditChainExportView {
+                jsonl,
+                next_after_seq,
+            }),
+            _ => Err("unexpected daemon reply for export_audit_chain".into()),
+        }
+    }
+
+    pub async fn export_diagnostic_bundle(
+        &self,
+        host_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::ExportDiagnosticBundle { request_id },
+                Duration::from_secs(30),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::DiagnosticBundleReady { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::DiagnosticBundleReady { bundle, .. } => Ok(bundle),
+            _ => Err("unexpected daemon reply for export_diagnostic_bundle".into()),
+        }
+    }
+
+    pub async fn compact_agent_context(&self, host_id: &str, agent_id: &str) -> Result<(), String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::CompactAgentContext {
+                    request_id,
+                    agent_id: agent_id.to_string(),
+                },
+                Duration::from_secs(60),
+                move |m| matches!(m, WireMessage::Ack { request_id: rid } if *rid == request_id),
+            )
+            .await?
+        {
+            WireMessage::Ack { .. } => Ok(()),
+            _ => Err("unexpected daemon reply for compact_agent_context".into()),
+        }
+    }
+
+    pub async fn inspect_external_ide_migration(
+        &self,
+        host_id: &str,
+        source: Option<String>,
+        cwd: Option<String>,
+        conflict: MigrationConflict,
+    ) -> Result<serde_json::Value, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::InspectExternalIdeMigration {
+                    request_id,
+                    from: source,
+                    cwd,
+                    conflict,
+                },
+                Duration::from_secs(30),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::ExternalIdeMigrationResult { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::ExternalIdeMigrationResult { items, .. } => Ok(items),
+            _ => Err("unexpected daemon reply for inspect_external_ide_migration".into()),
+        }
+    }
+
+    pub async fn execute_external_ide_migration(
+        &self,
+        host_id: &str,
+        source: Option<String>,
+        cwd: Option<String>,
+        conflict: MigrationConflict,
+    ) -> Result<serde_json::Value, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::ExecuteExternalIdeMigration {
+                    request_id,
+                    from: source,
+                    cwd,
+                    conflict,
+                },
+                Duration::from_secs(45),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::ExternalIdeMigrationResult { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::ExternalIdeMigrationResult { items, .. } => Ok(items),
+            _ => Err("unexpected daemon reply for execute_external_ide_migration".into()),
+        }
+    }
+
+    // --- M4 Project Memory ---
+
+    pub async fn list_project_memories(
+        &self,
+        host_id: &str,
+        cwd: &str,
+        status: Option<MemoryStatus>,
+        category: Option<MemoryCategory>,
+        query: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<Vec<ProjectMemoryItem>, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::ListProjectMemories {
+                    request_id,
+                    cwd: cwd.to_string(),
+                    status,
+                    category,
+                    query,
+                    limit,
+                },
+                Duration::from_secs(20),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::ProjectMemoriesList { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::ProjectMemoriesList { items, .. } => Ok(items),
+            _ => Err("unexpected daemon reply for list_project_memories".into()),
+        }
+    }
+
+    pub async fn upsert_project_memory(
+        &self,
+        req: UpsertProjectMemoryRequest,
+    ) -> Result<ProjectMemoryItem, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                &req.host_id,
+                request_id,
+                WireMessage::UpsertProjectMemory {
+                    request_id,
+                    cwd: req.cwd,
+                    id: req.id,
+                    title: req.title,
+                    content: req.content,
+                    category: req.category,
+                    status: req.status,
+                    file_paths: req.file_paths,
+                    tags: req.tags,
+                },
+                Duration::from_secs(20),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::ProjectMemorySaved { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::ProjectMemorySaved { item, .. } => Ok(item),
+            _ => Err("unexpected daemon reply for upsert_project_memory".into()),
+        }
+    }
+
+    pub async fn confirm_project_memory(
+        &self,
+        host_id: &str,
+        cwd: &str,
+        memory_id: &str,
+    ) -> Result<ProjectMemoryItem, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::ConfirmProjectMemory {
+                    request_id,
+                    cwd: cwd.to_string(),
+                    id: memory_id.to_string(),
+                },
+                Duration::from_secs(20),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::ProjectMemorySaved { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::ProjectMemorySaved { item, .. } => Ok(item),
+            _ => Err("unexpected daemon reply for confirm_project_memory".into()),
+        }
+    }
+
+    pub async fn delete_project_memory(
+        &self,
+        host_id: &str,
+        cwd: &str,
+        memory_id: &str,
+    ) -> Result<bool, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::DeleteProjectMemory {
+                    request_id,
+                    cwd: cwd.to_string(),
+                    id: memory_id.to_string(),
+                },
+                Duration::from_secs(20),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::ProjectMemoryDeleted { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::ProjectMemoryDeleted { deleted, .. } => Ok(deleted),
+            _ => Err("unexpected daemon reply for delete_project_memory".into()),
+        }
+    }
+
+    pub async fn recall_project_memory(
+        &self,
+        host_id: &str,
+        cwd: &str,
+        query: &str,
+        limit: Option<u32>,
+        include_unconfirmed: Option<bool>,
+    ) -> Result<Vec<ProjectMemorySearchHit>, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::RecallProjectMemories {
+                    request_id,
+                    cwd: cwd.to_string(),
+                    query: query.to_string(),
+                    limit,
+                    include_unconfirmed,
+                },
+                Duration::from_secs(20),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::ProjectMemoryRecallResult { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::ProjectMemoryRecallResult { hits, .. } => Ok(hits),
+            _ => Err("unexpected daemon reply for recall_project_memory".into()),
+        }
+    }
+
+    // --- M5 WASM Plugins ---
+
+    pub async fn list_plugins(&self, host_id: &str) -> Result<Vec<InstalledPluginView>, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::ListPlugins { request_id },
+                Duration::from_secs(15),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::PluginsList { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::PluginsList { plugins, .. } => Ok(plugins),
+            _ => Err("unexpected daemon reply for list_plugins".into()),
+        }
+    }
+
+    pub async fn install_plugin(
+        &self,
+        host_id: &str,
+        source_path: &str,
+        enable: bool,
+    ) -> Result<InstalledPluginView, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::InstallPlugin {
+                    request_id,
+                    source: source_path.to_string(),
+                    enable,
+                },
+                Duration::from_secs(120),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::PluginInstalled { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::PluginInstalled { plugin, .. } => Ok(plugin),
+            _ => Err("unexpected daemon reply for install_plugin".into()),
+        }
+    }
+
+    pub async fn set_plugin_enabled(
+        &self,
+        host_id: &str,
+        plugin_id: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::SetPluginEnabled {
+                    request_id,
+                    plugin_id: plugin_id.to_string(),
+                    enabled,
+                },
+                Duration::from_secs(15),
+                move |m| matches!(m, WireMessage::Ack { request_id: rid } if *rid == request_id),
+            )
+            .await?
+        {
+            WireMessage::Ack { .. } => Ok(()),
+            _ => Err("unexpected daemon reply for set_plugin_enabled".into()),
+        }
+    }
+
+    pub async fn uninstall_plugin(&self, host_id: &str, plugin_id: &str) -> Result<(), String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::UninstallPlugin {
+                    request_id,
+                    plugin_id: plugin_id.to_string(),
+                },
+                Duration::from_secs(15),
+                move |m| matches!(m, WireMessage::Ack { request_id: rid } if *rid == request_id),
+            )
+            .await?
+        {
+            WireMessage::Ack { .. } => Ok(()),
+            _ => Err("unexpected daemon reply for uninstall_plugin".into()),
+        }
+    }
+
+    pub async fn invoke_plugin_op(
+        &self,
+        host_id: &str,
+        plugin_id: &str,
+        op: &str,
+        args_json: serde_json::Value,
+        cwd: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::InvokePluginOp {
+                    request_id,
+                    plugin_id: plugin_id.to_string(),
+                    op: op.to_string(),
+                    cwd,
+                    input: args_json,
+                },
+                Duration::from_secs(30),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::PluginOpResult { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::PluginOpResult { result, .. } => Ok(result),
+            _ => Err("unexpected daemon reply for invoke_plugin_op".into()),
+        }
+    }
+
+    pub async fn render_plugin_ui(
+        &self,
+        host_id: &str,
+        plugin_id: &str,
+        slot: OrbitPluginUiSlot,
+        cwd: Option<String>,
+        action_id: Option<String>,
+        payload: Option<serde_json::Value>,
+    ) -> Result<OrbitPluginUiSpec, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::RenderPluginUi {
+                    request_id,
+                    plugin_id: plugin_id.to_string(),
+                    slot,
+                    cwd,
+                    action_id,
+                    payload,
+                },
+                Duration::from_secs(30),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::PluginUiRendered { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::PluginUiRendered { spec, .. } => Ok(spec),
+            _ => Err("unexpected daemon reply for render_plugin_ui".into()),
+        }
+    }
+
     /// Fetch Guardian auto-approval policy and recent audit entries from any connected host.
     pub async fn get_guardian_config_on_host(
         self: &Arc<Self>,
@@ -23307,36 +23738,6 @@ fn version_supports_remote_attachments(raw: &str) -> bool {
     (maj, min, pat) >= (0, 3, 3)
 }
 
-fn normalize_cwd_trim(raw: &str) -> &str {
-    let trimmed = raw.trim();
-    if trimmed == "/" {
-        "/"
-    } else {
-        trimmed.trim_end_matches('/')
-    }
-}
-
-pub(crate) fn cwd_paths_equivalent(stored_cwd: &str, query_cwd: &str) -> bool {
-    let a = normalize_cwd_trim(stored_cwd);
-    let b = normalize_cwd_trim(query_cwd);
-    if a == b {
-        return true;
-    }
-    if let Some(rel) = b.strip_prefix("~/") {
-        let suffix = format!("/{rel}");
-        if a.ends_with(&suffix) {
-            return true;
-        }
-    }
-    if let Some(rel) = a.strip_prefix("~/") {
-        let suffix = format!("/{rel}");
-        if b.ends_with(&suffix) {
-            return true;
-        }
-    }
-    false
-}
-
 struct CoalesceSlot<T> {
     last_emit: Option<tokio::time::Instant>,
     pending: Option<T>,
@@ -23701,28 +24102,6 @@ fn unix_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn truncate_utf8_prefix(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_string()
-}
-
-fn truncate_utf8_tail(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    let mut start = text.len().saturating_sub(max_bytes);
-    while start < text.len() && !text.is_char_boundary(start) {
-        start += 1;
-    }
-    text[start..].to_string()
-}
-
 fn folder_basename(path: &str) -> String {
     let clean = path.trim_end_matches('/');
     if clean.is_empty() || clean == "~" {
@@ -23734,17 +24113,6 @@ fn folder_basename(path: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or(clean)
         .to_string()
-}
-
-fn strip_segment_scope(id: &str) -> &str {
-    id.split_once("@s").map(|(base, _)| base).unwrap_or(id)
-}
-
-fn is_legacy_shared_item_id(raw_id: &str) -> bool {
-    matches!(
-        raw_id,
-        "agy_msg_default" | "agy_thought_default" | "codex_msg" | "codex_rsn" | "item"
-    )
 }
 
 /// Records an RPC error against an agent in memory, injecting a client-local error `Notice`
@@ -23778,18 +24146,6 @@ fn record_agent_rpc_error(
     });
     state.mark_stage_dirty(agent_id, idx, false);
     state.mark_stage_meta_dirty(agent_id);
-}
-
-fn is_pending_optimistic_prompt(ev: &TimelineEvent) -> bool {
-    ev.seq == 0 && matches!(ev.payload, TimelinePayload::UserPrompt { .. })
-}
-
-pub(crate) fn coalesce_timeline_slice(events: &[TimelineEvent]) -> Vec<TimelineEvent> {
-    let mut coalesced = Vec::with_capacity(events.len());
-    for ev in events {
-        coalesce_or_push_timeline(&mut coalesced, ev.clone());
-    }
-    coalesced
 }
 
 /// Merge persisted replica events with live in-memory events without dropping unpersisted middle
@@ -23879,243 +24235,6 @@ pub(crate) fn merge_persisted_and_memory_timeline(
     positive
 }
 
-fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: TimelineEvent) -> usize {
-    let active_end = list
-        .iter()
-        .position(is_pending_optimistic_prompt)
-        .unwrap_or(list.len());
-    let precedes_incoming =
-        |ev: &TimelineEvent| -> bool { ev.seq > 0 && (incoming.seq == 0 || ev.seq < incoming.seq) };
-
-    let turn_start_idx = list[..active_end]
-        .iter()
-        .rposition(|ev| {
-            precedes_incoming(ev)
-                && matches!(
-                    ev.payload,
-                    TimelinePayload::UserPrompt { .. } | TimelinePayload::AgentMessage { .. }
-                )
-        })
-        .map(|i| i + 1)
-        .unwrap_or(0);
-
-    let seg_start_idx = list[..active_end]
-        .iter()
-        .rposition(|ev| {
-            precedes_incoming(ev)
-                && matches!(
-                    ev.payload,
-                    TimelinePayload::UserPrompt { .. }
-                        | TimelinePayload::AgentMessage { .. }
-                        | TimelinePayload::ToolCall { .. }
-                )
-        })
-        .map(|i| i + 1)
-        .unwrap_or(0);
-
-    let seg_boundary_seq = if seg_start_idx > 0 {
-        list[seg_start_idx - 1].seq
-    } else {
-        0
-    };
-
-    match &mut incoming.payload {
-        TimelinePayload::UserPrompt {
-            text: inc_text,
-            message_id: inc_mid,
-            ..
-        } => {
-            if incoming.seq > 0 {
-                // Replace optimistic `seq == 0` UserPrompt with matching message_id first, then text
-                if !inc_mid.is_empty()
-                    && let Some((idx, opt_slot)) = list.iter_mut().enumerate().find(|(_, ev)| {
-                        ev.seq == 0
-                            && matches!(
-                                &ev.payload,
-                                TimelinePayload::UserPrompt { message_id, .. } if message_id == inc_mid
-                            )
-                    })
-                {
-                    *opt_slot = incoming;
-                    return idx;
-                }
-                if let Some((idx, opt_slot)) = list.iter_mut().enumerate().find(|(_, ev)| {
-                    ev.seq == 0
-                        && matches!(
-                            &ev.payload,
-                            TimelinePayload::UserPrompt { text, .. } if text.trim() == inc_text.trim()
-                        )
-                }) {
-                    *opt_slot = incoming;
-                    return idx;
-                }
-            }
-            if !inc_mid.is_empty()
-                && let Some((idx, dup_slot)) = list.iter_mut().enumerate().find(|(_, ev)| {
-                    matches!(
-                        &ev.payload,
-                        TimelinePayload::UserPrompt { message_id, .. } if message_id == inc_mid
-                    )
-                })
-            {
-                *dup_slot = incoming;
-                return idx;
-            }
-        }
-        TimelinePayload::AssistantMessage {
-            item_id,
-            text,
-            streaming,
-        } if !item_id.is_empty() => {
-            let raw_id = strip_segment_scope(item_id).to_string();
-            if is_legacy_shared_item_id(&raw_id) {
-                let effective_id = format!("{raw_id}@s{seg_boundary_seq}");
-                *item_id = effective_id.clone();
-
-                if let Some((rel_idx, prev)) = list[seg_start_idx..active_end]
-                    .iter_mut()
-                    .enumerate()
-                    .rev()
-                    .find(|(_, prev_ev)| {
-                        matches!(
-                            &prev_ev.payload,
-                            TimelinePayload::AssistantMessage { item_id: existing_id, .. }
-                                if existing_id == &effective_id
-                        )
-                    })
-                {
-                    *prev = incoming;
-                    return seg_start_idx + rel_idx;
-                }
-            } else {
-                *item_id = raw_id.clone();
-                if let Some((idx, prev)) =
-                    list[..active_end]
-                        .iter_mut()
-                        .enumerate()
-                        .rev()
-                        .find(|(_, prev_ev)| {
-                            matches!(
-                                &prev_ev.payload,
-                                TimelinePayload::AssistantMessage { item_id: existing_id, .. }
-                                    if strip_segment_scope(existing_id) == raw_id
-                            )
-                        })
-                {
-                    if idx >= seg_start_idx {
-                        *prev = incoming;
-                    } else if let TimelinePayload::AssistantMessage {
-                        text: prev_text,
-                        streaming: prev_streaming,
-                        ..
-                    } = &mut prev.payload
-                    {
-                        // Cross-segment / cross-turn in-place update: preserve original slot
-                        // before any later UserPrompt/ToolCall and settle streaming cleanly.
-                        if incoming.seq == 0 || prev.seq == 0 || incoming.seq >= prev.seq {
-                            if !text.is_empty() || prev_text.is_empty() {
-                                *prev_text = std::mem::take(text);
-                            }
-                            *prev_streaming = if idx < turn_start_idx {
-                                false
-                            } else {
-                                *streaming
-                            };
-                        }
-                    }
-                    return idx;
-                }
-            }
-        }
-        TimelinePayload::AssistantThinking { item_id, text } if !item_id.is_empty() => {
-            let raw_id = strip_segment_scope(item_id).to_string();
-            if is_legacy_shared_item_id(&raw_id) {
-                let effective_id = format!("{raw_id}@s{seg_boundary_seq}");
-                *item_id = effective_id.clone();
-
-                if let Some((rel_idx, prev)) = list[seg_start_idx..active_end]
-                    .iter_mut()
-                    .enumerate()
-                    .rev()
-                    .find(|(_, prev_ev)| {
-                        matches!(
-                            &prev_ev.payload,
-                            TimelinePayload::AssistantThinking { item_id: existing_id, .. }
-                                if existing_id == &effective_id
-                        )
-                    })
-                {
-                    *prev = incoming;
-                    return seg_start_idx + rel_idx;
-                }
-            } else {
-                *item_id = raw_id.clone();
-                if let Some((idx, prev)) =
-                    list[..active_end]
-                        .iter_mut()
-                        .enumerate()
-                        .rev()
-                        .find(|(_, prev_ev)| {
-                            matches!(
-                                &prev_ev.payload,
-                                TimelinePayload::AssistantThinking { item_id: existing_id, .. }
-                                    if strip_segment_scope(existing_id) == raw_id
-                            )
-                        })
-                {
-                    if idx >= seg_start_idx {
-                        *prev = incoming;
-                    } else if let TimelinePayload::AssistantThinking {
-                        text: prev_text, ..
-                    } = &mut prev.payload
-                        && (incoming.seq == 0 || prev.seq == 0 || incoming.seq >= prev.seq)
-                        && (!text.is_empty() || prev_text.is_empty())
-                    {
-                        *prev_text = std::mem::take(text);
-                    }
-                    return idx;
-                }
-            }
-        }
-        TimelinePayload::ToolCall { call_id, .. } if !call_id.is_empty() => {
-            let target_call_id = call_id.clone();
-            if let Some((rel_idx, prev)) = list[turn_start_idx..active_end]
-                .iter_mut()
-                .enumerate()
-                .rev()
-                .find(|(_, prev_ev)| {
-                    matches!(
-                        &prev_ev.payload,
-                        TimelinePayload::ToolCall { call_id: existing_id, .. }
-                            if existing_id == &target_call_id
-                    )
-                })
-            {
-                *prev = incoming;
-                return turn_start_idx + rel_idx;
-            }
-        }
-        _ => {}
-    }
-
-    if incoming.seq > 0 {
-        if let Some((idx, same_seq)) = list
-            .iter_mut()
-            .enumerate()
-            .find(|(_, e)| e.seq == incoming.seq)
-        {
-            *same_seq = incoming;
-            return idx;
-        }
-        if let Some(first_opt_idx) = list.iter().position(is_pending_optimistic_prompt) {
-            list.insert(first_opt_idx, incoming);
-            return first_opt_idx;
-        }
-    }
-    list.push(incoming);
-    list.len() - 1
-}
-
 fn contains_ascii_case_insensitive_str(haystack: &str, needle: &str) -> bool {
     let nb = needle.as_bytes();
     if nb.is_empty() {
@@ -24175,439 +24294,6 @@ fn dirty_index_for_event(list: &[TimelineEvent], idx: usize, payload: &TimelineP
             })
             .map_or(idx, |found| found.min(idx)),
         _ => idx,
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct AgentMessageDeliveryFold {
-    delivery_status: Option<AgentMessageDeliveryStatus>,
-    delivery_turn_id: Option<String>,
-    blocking_turn_id: Option<String>,
-    queued_at_ms: Option<i64>,
-    dispatched_at_ms: Option<i64>,
-    settled_at_ms: Option<i64>,
-}
-
-fn delivery_status_rank(status: AgentMessageDeliveryStatus) -> u8 {
-    match status {
-        AgentMessageDeliveryStatus::Queued => 0,
-        AgentMessageDeliveryStatus::Dispatched => 1,
-        AgentMessageDeliveryStatus::Settled | AgentMessageDeliveryStatus::Dropped => 2,
-    }
-}
-
-fn collect_delivery_updates(events: &[TimelineEvent]) -> HashMap<String, AgentMessageDeliveryFold> {
-    let mut map: HashMap<String, AgentMessageDeliveryFold> = HashMap::new();
-    for ev in events {
-        match &ev.payload {
-            TimelinePayload::AgentMessage {
-                message_id,
-                delivery_status,
-                delivery_turn_id,
-                blocking_turn_id,
-                queued_at_ms,
-                dispatched_at_ms,
-                settled_at_ms,
-                ..
-            } => {
-                let entry = map.entry(message_id.clone()).or_default();
-                if let Some(st) = delivery_status
-                    && entry
-                        .delivery_status
-                        .is_none_or(|prev| delivery_status_rank(*st) > delivery_status_rank(prev))
-                {
-                    entry.delivery_status = Some(*st);
-                }
-                if entry.delivery_turn_id.is_none() && delivery_turn_id.is_some() {
-                    entry.delivery_turn_id = delivery_turn_id.clone();
-                }
-                if entry.blocking_turn_id.is_none() && blocking_turn_id.is_some() {
-                    entry.blocking_turn_id = blocking_turn_id.clone();
-                }
-                if entry.queued_at_ms.is_none() {
-                    entry.queued_at_ms = *queued_at_ms;
-                }
-                if entry.dispatched_at_ms.is_none() {
-                    entry.dispatched_at_ms = *dispatched_at_ms;
-                }
-                if entry.settled_at_ms.is_none() {
-                    entry.settled_at_ms = *settled_at_ms;
-                }
-            }
-            TimelinePayload::AgentMessageDeliveryUpdated {
-                message_id,
-                status,
-                delivery_turn_id,
-                blocking_turn_id,
-                timestamp_ms,
-            } => {
-                let entry = map.entry(message_id.clone()).or_default();
-                if entry
-                    .delivery_status
-                    .is_none_or(|prev| delivery_status_rank(*status) > delivery_status_rank(prev))
-                {
-                    entry.delivery_status = Some(*status);
-                }
-                if delivery_turn_id.is_some() {
-                    entry.delivery_turn_id = delivery_turn_id.clone();
-                }
-                if entry.blocking_turn_id.is_none() && blocking_turn_id.is_some() {
-                    entry.blocking_turn_id = blocking_turn_id.clone();
-                }
-                match status {
-                    AgentMessageDeliveryStatus::Queued => {
-                        entry.queued_at_ms.get_or_insert(*timestamp_ms);
-                    }
-                    AgentMessageDeliveryStatus::Dispatched => {
-                        entry.dispatched_at_ms.get_or_insert(*timestamp_ms);
-                    }
-                    AgentMessageDeliveryStatus::Settled | AgentMessageDeliveryStatus::Dropped => {
-                        entry.settled_at_ms.get_or_insert(*timestamp_ms);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    map
-}
-
-type ResolvedGatesMap = (HashMap<String, String>, HashMap<String, Vec<Vec<String>>>);
-
-fn collect_resolved_gates(events: &[TimelineEvent]) -> ResolvedGatesMap {
-    let mut all_resolved_perms: HashMap<String, String> = HashMap::new();
-    let mut all_resolved_questions: HashMap<String, Vec<Vec<String>>> = HashMap::new();
-    for ev in events {
-        match &ev.payload {
-            TimelinePayload::PermissionResolved {
-                request_id,
-                decision,
-            } => {
-                all_resolved_perms.insert(request_id.clone(), decision.clone());
-            }
-            TimelinePayload::QuestionResolved {
-                request_id,
-                answers,
-            } => {
-                all_resolved_questions.insert(request_id.clone(), answers.clone());
-            }
-            _ => {}
-        }
-    }
-    (all_resolved_perms, all_resolved_questions)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_timeline_event_view(
-    agent_id: &str,
-    agent_cwd: Option<&str>,
-    ev: &TimelineEvent,
-    all_resolved_perms: &HashMap<String, String>,
-    all_resolved_questions: &HashMap<String, Vec<Vec<String>>>,
-    delivery_updates: &HashMap<String, AgentMessageDeliveryFold>,
-    highlight_diff: bool,
-    markdown_cache: &mut HashMap<(String, u64, usize), Vec<RichBlockView>>,
-    streaming_markdown_cache: &mut HashMap<(String, String), (usize, Vec<RichBlockView>)>,
-) -> Option<TimelineItemView> {
-    let ts_ms = Some(ev.timestamp.timestamp_millis());
-    match &ev.payload {
-        TimelinePayload::UserPrompt {
-            message_id,
-            text,
-            badges,
-        } => {
-            let key = (agent_id.to_string(), ev.seq, text.len());
-            if markdown_cache.len() > 2048 {
-                markdown_cache.clear();
-            }
-            let blocks = markdown_cache
-                .entry(key)
-                .or_insert_with(|| parse_markdown_blocks(text, false))
-                .clone();
-            Some(TimelineItemView::UserPrompt {
-                seq: ev.seq,
-                message_id: message_id.clone(),
-                text: text.clone(),
-                badges: badges.clone(),
-                blocks,
-                timestamp_ms: ts_ms,
-            })
-        }
-        TimelinePayload::AssistantThinking { item_id, text } => {
-            Some(TimelineItemView::AssistantThinking {
-                seq: ev.seq,
-                item_id: item_id.clone(),
-                text: text.trim().to_string(),
-                timestamp_ms: ts_ms,
-            })
-        }
-        TimelinePayload::AssistantMessage {
-            item_id,
-            text,
-            streaming,
-        } => {
-            if let Some(warning_msg) = extract_legacy_provider_warning_text(text) {
-                Some(TimelineItemView::Notice {
-                    seq: ev.seq,
-                    level: "warning".into(),
-                    message: warning_msg,
-                    timestamp_ms: ts_ms,
-                })
-            } else if *streaming {
-                let slot_key = (
-                    agent_id.to_string(),
-                    if item_id.is_empty() {
-                        format!("seq:{}", ev.seq)
-                    } else {
-                        item_id.clone()
-                    },
-                );
-                let blocks = match streaming_markdown_cache.get(&slot_key) {
-                    Some((cached_len, cached_blocks)) if *cached_len == text.len() => {
-                        cached_blocks.clone()
-                    }
-                    _ => {
-                        let parsed = parse_markdown_blocks(text, true);
-                        if streaming_markdown_cache.len() > 64 {
-                            streaming_markdown_cache.clear();
-                        }
-                        streaming_markdown_cache.insert(slot_key, (text.len(), parsed.clone()));
-                        parsed
-                    }
-                };
-                Some(TimelineItemView::AssistantMessage {
-                    seq: ev.seq,
-                    item_id: item_id.clone(),
-                    text: text.clone(),
-                    streaming: true,
-                    blocks,
-                    timestamp_ms: ts_ms,
-                })
-            } else {
-                if !item_id.is_empty() {
-                    streaming_markdown_cache.remove(&(agent_id.to_string(), item_id.clone()));
-                }
-                let key = (agent_id.to_string(), ev.seq, text.len());
-                if markdown_cache.len() > 2048 {
-                    markdown_cache.clear();
-                }
-                let blocks = markdown_cache
-                    .entry(key)
-                    .or_insert_with(|| parse_markdown_blocks(text, false))
-                    .clone();
-                Some(TimelineItemView::AssistantMessage {
-                    seq: ev.seq,
-                    item_id: item_id.clone(),
-                    text: text.clone(),
-                    streaming: false,
-                    blocks,
-                    timestamp_ms: ts_ms,
-                })
-            }
-        }
-        TimelinePayload::ToolCall {
-            call_id,
-            status,
-            detail,
-            background_task,
-        } => {
-            let (summary_title, diff_files) = summarize_tool_detail(detail, highlight_diff);
-            let step_descriptor = Some(crate::stage::describe_tool_detail(
-                *status,
-                &summary_title,
-                detail,
-                &diff_files,
-                agent_cwd,
-            ));
-            Some(TimelineItemView::ToolCall {
-                seq: ev.seq,
-                call_id: call_id.clone(),
-                status: *status,
-                summary_title,
-                detail: slim_tool_detail_for_stage(detail),
-                background_task: background_task.clone(),
-                step_descriptor,
-                diff_files,
-                timestamp_ms: ts_ms,
-            })
-        }
-        TimelinePayload::PermissionRequest {
-            request_id,
-            title,
-            detail,
-            allowed_decisions,
-            guardian_assessment,
-            plan_approval,
-        } => Some(TimelineItemView::PermissionRequest {
-            seq: ev.seq,
-            request_id: request_id.clone(),
-            title: title.clone(),
-            detail: detail.clone(),
-            allowed_decisions: allowed_decisions.clone(),
-            resolved_decision: all_resolved_perms.get(request_id).cloned(),
-            guardian_assessment: guardian_assessment.clone(),
-            plan_approval: plan_approval.clone(),
-            timestamp_ms: ts_ms,
-        }),
-        TimelinePayload::QuestionRequest {
-            request_id,
-            questions,
-        } => Some(TimelineItemView::QuestionRequest {
-            seq: ev.seq,
-            request_id: request_id.clone(),
-            questions: questions.clone(),
-            resolved_answers: all_resolved_questions.get(request_id).cloned(),
-            timestamp_ms: ts_ms,
-        }),
-        TimelinePayload::Notice { level, message } => Some(TimelineItemView::Notice {
-            seq: ev.seq,
-            level: level.clone(),
-            message: message.clone(),
-            timestamp_ms: ts_ms,
-        }),
-        TimelinePayload::AgentMessage {
-            message_id,
-            kind,
-            source_agent_id,
-            source_host_id,
-            source_title,
-            event,
-            text,
-            permission_context,
-            delivery_status,
-            delivery_turn_id,
-            blocking_turn_id,
-            queued_at_ms,
-            dispatched_at_ms,
-            settled_at_ms,
-        } => {
-            let key = (agent_id.to_string(), ev.seq, text.len());
-            if markdown_cache.len() > 2048 {
-                markdown_cache.clear();
-            }
-            let blocks = markdown_cache
-                .entry(key)
-                .or_insert_with(|| parse_markdown_blocks(text, false))
-                .clone();
-            let folded = delivery_updates.get(message_id);
-            let resolved_status = match (delivery_status, folded.and_then(|f| f.delivery_status)) {
-                (Some(a), Some(b)) => {
-                    if delivery_status_rank(b) >= delivery_status_rank(*a) {
-                        Some(b)
-                    } else {
-                        Some(*a)
-                    }
-                }
-                (Some(a), None) => Some(*a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            };
-            Some(TimelineItemView::AgentMessage {
-                seq: ev.seq,
-                message_id: message_id.clone(),
-                kind: *kind,
-                source_agent_id: source_agent_id.clone(),
-                source_host_id: source_host_id.clone(),
-                source_title: source_title.clone(),
-                event: event.clone(),
-                text: text.clone(),
-                permission_context: permission_context.clone(),
-                delivery_status: resolved_status,
-                delivery_turn_id: folded
-                    .and_then(|f| f.delivery_turn_id.clone())
-                    .or_else(|| delivery_turn_id.clone()),
-                blocking_turn_id: folded
-                    .and_then(|f| f.blocking_turn_id.clone())
-                    .or_else(|| blocking_turn_id.clone()),
-                queued_at_ms: queued_at_ms.or_else(|| folded.and_then(|f| f.queued_at_ms)),
-                dispatched_at_ms: folded
-                    .and_then(|f| f.dispatched_at_ms)
-                    .or(*dispatched_at_ms),
-                settled_at_ms: folded.and_then(|f| f.settled_at_ms).or(*settled_at_ms),
-                blocks,
-                timestamp_ms: ts_ms,
-            })
-        }
-        TimelinePayload::StatusChanged {
-            status: AgentStatus::Error { message, .. },
-        } => (!message.trim().is_empty()).then(|| TimelineItemView::Notice {
-            seq: ev.seq,
-            level: "error".into(),
-            message: message.clone(),
-            timestamp_ms: ts_ms,
-        }),
-        TimelinePayload::StatusChanged {
-            status: AgentStatus::AutonomousWakeup { source, .. },
-        } => {
-            // `waiting:*` transitions represent passive background-task wait state, not a new
-            // wakeup boundary: the stage's trailing live indicator already renders
-            // `Waiting for N background tasks…` directly from `currentAgent.status_label`, so
-            // emitting a `WakeupDivider` here would duplicate the exact same text right above it.
-            if source.trim().starts_with("waiting:") {
-                None
-            } else {
-                Some(TimelineItemView::Notice {
-                    seq: ev.seq,
-                    level: "wakeup".into(),
-                    message: format_autonomous_wakeup_notice(source),
-                    timestamp_ms: ts_ms,
-                })
-            }
-        }
-        TimelinePayload::PermissionResolved { .. }
-        | TimelinePayload::QuestionResolved { .. }
-        | TimelinePayload::AgentMessageDeliveryUpdated { .. }
-        | TimelinePayload::StatusChanged { .. } => None,
-    }
-}
-
-fn extract_legacy_provider_warning_text(text: &str) -> Option<String> {
-    if !text.contains('⚠') {
-        return None;
-    }
-    let mut warnings = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let rest = trimmed.strip_prefix('⚠')?.trim();
-        let lower = rest.to_ascii_lowercase();
-        let is_runtime_warning = lower.starts_with("api error")
-            || lower.starts_with("the stream was interrupted")
-            || lower.starts_with("rate limit")
-            || lower.starts_with("request failed")
-            || lower.starts_with("connection ")
-            || lower.starts_with("network ")
-            || lower.starts_with("retrying")
-            || lower.starts_with("error:");
-        if !is_runtime_warning {
-            return None;
-        }
-        warnings.push(rest);
-    }
-    if warnings.is_empty() {
-        None
-    } else {
-        Some(warnings.join("\n"))
-    }
-}
-
-fn format_autonomous_wakeup_notice(source: &str) -> String {
-    let trimmed = source.trim();
-    if let Some(rest) = trimmed.strip_prefix("waiting:") {
-        let desc = rest.trim();
-        return if desc.is_empty() {
-            "Waiting for background task(s)".to_string()
-        } else {
-            format!("Waiting for {desc}")
-        };
-    }
-    let cleaned = trimmed.replace('_', " ");
-    if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("background task") {
-        "Resumed from background task".to_string()
-    } else {
-        format!("Resumed from {cleaned}")
     }
 }
 
@@ -24774,160 +24460,13 @@ fn agent_to_card_view_with_timers(
     has_running_subagents: bool,
     has_armed_conditional_timer: bool,
 ) -> AgentCardView {
-    let (status_label, is_running, has_background_tasks, is_awaiting_permission) = match &a.status {
-        AgentStatus::Initializing => ("Starting".to_string(), true, false, false),
-        AgentStatus::Idle => ("Idle".to_string(), false, false, false),
-        AgentStatus::Running { .. } => ("Working".to_string(), true, false, false),
-        AgentStatus::AutonomousWakeup { source, .. } => {
-            if let Some(rest) = source.trim().strip_prefix("waiting:") {
-                let desc = rest.trim();
-                let label = if desc.is_empty() {
-                    "Waiting for background tasks".to_string()
-                } else if desc.to_ascii_lowercase().starts_with("waiting") {
-                    desc.to_string()
-                } else {
-                    format!("Waiting for {desc}")
-                };
-                (label, false, true, false)
-            } else {
-                (format!("Waking ({source})"), true, false, false)
-            }
-        }
-        AgentStatus::AwaitingPermission { .. } => {
-            ("Needs approval".to_string(), false, false, true)
-        }
-        AgentStatus::Error { .. } => ("Error".to_string(), false, false, false),
-        AgentStatus::Closed => ("Closed".to_string(), false, false, false),
-    };
-    let has_armed_timers = has_background_tasks || has_armed_conditional_timer;
-    let local_seen_seq = pref.map(|p| p.seen_seq).unwrap_or(0);
-    let effective_seen_seq = a.read_seq.max(local_seen_seq);
-    let is_pinned = a.is_pinned || pref.is_some_and(|p| p.is_pinned);
-    let is_unread = !a.agent_id.starts_with("opt_")
-        && !is_running
-        && (a.attention != AttentionState::None
-            || (a.latest_seq > 0 && a.latest_seq > effective_seen_seq));
-    let worktree_branch = a.labels.get("orbit.worktree_branch").cloned();
-    let provider_label = if a.provider == ProviderKind::Acp {
-        a.acp_agent_id
-            .clone()
-            .unwrap_or_else(|| a.provider.display_name().to_string())
-    } else {
-        a.provider.display_name().to_string()
-    };
-    AgentCardView {
-        agent_id: a.agent_id.clone(),
-        workspace_id: a.workspace_id.clone(),
-        cwd: a.cwd.clone(),
-        title: a.title.clone(),
-        provider: a.provider,
-        provider_label,
-        model: a.model.clone(),
-        effort: a.effort,
-        fast_mode: a.fast_mode,
-        mode: a.mode.clone(),
-        status: a.status.clone(),
-        status_label,
-        is_running,
-        has_background_tasks,
-        has_armed_timers,
+    project_agent_card(
+        a,
+        pref.map_or(0, |p| p.seen_seq),
+        pref.is_some_and(|p| p.is_pinned),
         has_running_subagents,
-        is_awaiting_permission,
-        parent_agent_id: a.parent_agent_id.clone(),
-        parent_host_id: a.parent_host_id.clone(),
-        profile_id: a.profile_id.clone(),
-        background: a.background,
-        auto_archive: a.auto_archive,
-        attention: a.attention,
-        archived_at_rfc3339: a.archived_at.map(|ts| ts.to_rfc3339()),
-        labels: a.labels.clone(),
-        latest_seq: a.latest_seq,
-        created_at_rfc3339: Some(a.created_at.to_rfc3339()),
-        updated_at_rfc3339: a.updated_at.to_rfc3339(),
-        is_pinned,
-        seen_seq: effective_seen_seq,
-        read_seq: a.read_seq,
-        is_unread,
-        queued_prompts: a.queued_prompts.clone(),
-        handle: a.handle.clone(),
-        cluster_suggestion: a.cluster_suggestion.clone(),
-        worktree_branch,
-        task_summary: a.task_summary.clone(),
-        forked_from_agent_id: a.forked_from_agent_id.clone(),
-        forked_at_seq: a.forked_at_seq,
-        acp_agent_id: a.acp_agent_id.clone(),
-    }
-}
-
-fn summarize_tool_detail(
-    detail: &ToolCallDetail,
-    highlight_diff: bool,
-) -> (String, Vec<DiffFileView>) {
-    match detail {
-        ToolCallDetail::Shell { command, .. } => (format!("$ {command}"), Vec::new()),
-        ToolCallDetail::FileRead { path, .. } => (format!("Read {path}"), Vec::new()),
-        ToolCallDetail::FileEdit { path, unified_diff } => {
-            let diffs = unified_diff
-                .as_deref()
-                .map(|raw| parse_unified_diff_capped(raw, 80, highlight_diff))
-                .unwrap_or_default();
-            (format!("Edit {path}"), diffs)
-        }
-        ToolCallDetail::Search { query, .. } => (format!("Search \"{query}\""), Vec::new()),
-        ToolCallDetail::Subagent { role, .. } => (format!("Subagent · {role}"), Vec::new()),
-        ToolCallDetail::Generic { tool_name, .. } => (tool_name.clone(), Vec::new()),
-    }
-}
-
-fn slim_tool_detail_for_stage(detail: &ToolCallDetail) -> ToolCallDetail {
-    const MAX_STAGE_DIFF_BYTES: usize = 8192;
-    const MAX_STAGE_SHELL_PREVIEW_BYTES: usize = 8192;
-    const MAX_STAGE_GENERIC_ARGS_BYTES: usize = 4096;
-
-    match detail {
-        ToolCallDetail::FileEdit { path, unified_diff } => ToolCallDetail::FileEdit {
-            path: path.clone(),
-            unified_diff: unified_diff.as_deref().map(|raw| {
-                if raw.len() <= MAX_STAGE_DIFF_BYTES {
-                    raw.to_string()
-                } else {
-                    let prefix = truncate_utf8_prefix(raw, MAX_STAGE_DIFF_BYTES);
-                    format!("{prefix}\n... (truncated)")
-                }
-            }),
-        },
-        ToolCallDetail::Shell {
-            command,
-            cwd,
-            exit_code,
-            output_preview,
-        } => ToolCallDetail::Shell {
-            command: command.clone(),
-            cwd: cwd.clone(),
-            exit_code: *exit_code,
-            output_preview: output_preview.as_deref().map(|raw| {
-                if raw.len() <= MAX_STAGE_SHELL_PREVIEW_BYTES {
-                    raw.to_string()
-                } else {
-                    let tail = truncate_utf8_tail(raw, MAX_STAGE_SHELL_PREVIEW_BYTES);
-                    format!("... (truncated)\n{tail}")
-                }
-            }),
-        },
-        ToolCallDetail::Generic {
-            tool_name,
-            arguments_json,
-        } => ToolCallDetail::Generic {
-            tool_name: tool_name.clone(),
-            arguments_json: if arguments_json.len() <= MAX_STAGE_GENERIC_ARGS_BYTES {
-                arguments_json.clone()
-            } else {
-                let prefix = truncate_utf8_prefix(arguments_json, MAX_STAGE_GENERIC_ARGS_BYTES);
-                format!("{prefix}\n... (truncated)")
-            },
-        },
-        other => other.clone(),
-    }
+        has_armed_conditional_timer,
+    )
 }
 
 fn default_client_models_map() -> HashMap<ProviderKind, Vec<ModelOption>> {

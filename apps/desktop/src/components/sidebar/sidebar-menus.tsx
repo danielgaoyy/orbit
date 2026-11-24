@@ -247,6 +247,17 @@ export function SharedConversationMenu({
             </span>
           </DropdownMenuItem>
 
+          <DropdownMenuItem
+            onSelect={() => {
+              orbitActions.pinOverviewLane(host.host_id, agent.agent_id);
+            }}
+          >
+            <span className="flex items-center gap-2 whitespace-nowrap">
+              <Columns2 className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+              <span>{t("sidebar.watchInOverview")}</span>
+            </span>
+          </DropdownMenuItem>
+
           {isGitRepo ? (
             <DropdownMenuSub>
               <DropdownMenuSubTrigger>

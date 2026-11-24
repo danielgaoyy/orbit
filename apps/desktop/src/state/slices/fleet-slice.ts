@@ -1082,6 +1082,59 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
     },
 
 
+    openGlobalOverview(): void {
+      setState((s) => ({
+        ...s,
+        activeView: "workspace",
+        workspacePanel: "overview",
+        commandPaletteOpen: false,
+        overviewPopoverOpen: false,
+      }));
+      // Refresh pending permissions across connected hosts for fresh triage accuracy
+      const hosts = getState().fleet.hosts;
+      for (const h of hosts) {
+        if (h.connection_state === "online_direct" || h.connection_state === "online_relay") {
+          void orbitIpc.refreshPendingPermissions(h.host_id).catch(() => undefined);
+        }
+      }
+    },
+
+
+    pinOverviewLane(hostId: string, agentId: string): void {
+      if (!hostId || !agentId) return;
+      setState((s) => {
+        const exists = s.overviewPinnedLanes.some(
+          (l) => l.hostId === hostId && l.agentId === agentId,
+        );
+        const nextLanes = exists
+          ? s.overviewPinnedLanes
+          : [...s.overviewPinnedLanes, { hostId, agentId }].slice(-4);
+        return {
+          ...s,
+          activeView: "workspace",
+          workspacePanel: "overview",
+          commandPaletteOpen: false,
+          overviewPinnedLanes: nextLanes,
+        };
+      });
+    },
+
+
+    unpinOverviewLane(hostId: string, agentId: string): void {
+      setState((s) => ({
+        ...s,
+        overviewPinnedLanes: s.overviewPinnedLanes.filter(
+          (l) => !(l.hostId === hostId && l.agentId === agentId),
+        ),
+      }));
+    },
+
+
+    clearOverviewLanes(): void {
+      setState((s) => (s.overviewPinnedLanes.length === 0 ? s : { ...s, overviewPinnedLanes: [] }));
+    },
+
+
     focusComposer(opts?: ComposerFocusOptions): void {
       setTimeout(() => {
         for (const fn of composerFocusListeners) {
@@ -1445,6 +1498,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
       restoreFiles: boolean,
       fallbackPromptText?: string,
       fallbackBadges?: readonly PromptBadge[],
+      restorePaths?: string[] | null,
     ): Promise<boolean> {
       const tKey = threadScopeKey(hostId, agentId);
       // Clear queued follow-ups before calling the daemon so transitioning to Idle never auto-dispatches stale prompts
@@ -1456,7 +1510,13 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
       });
 
       try {
-        const res = await orbitIpc.rewindAgent(hostId, agentId, toBeforeSeq, restoreFiles);
+        const res = await orbitIpc.rewindAgent(
+          hostId,
+          agentId,
+          toBeforeSeq,
+          restoreFiles,
+          restorePaths ?? null,
+        );
         const rawFallback = (fallbackPromptText ?? "").trim();
         const rawServerPrompt = (res.restored_prompt ?? "").trim();
         const hasFallbackBadges = Boolean(fallbackBadges && fallbackBadges.length > 0);

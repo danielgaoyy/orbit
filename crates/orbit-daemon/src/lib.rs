@@ -5798,14 +5798,40 @@ async fn handle_wire_rpc(
                 permissions,
             })
         }
+        WireMessage::PreviewRewindAgent {
+            request_id,
+            agent_id,
+            to_seq,
+        } => match runtime
+            .orchestrator
+            .preview_rewind_agent(&agent_id, to_seq)
+            .await
+        {
+            Ok(outcome) => Some(WireMessage::RewindPreviewResult {
+                request_id,
+                agent_id: outcome.agent_id,
+                to_seq: outcome.to_seq,
+                checkpoint_kind: outcome.checkpoint_kind,
+                files: outcome.files,
+                external_conflicts: outcome.external_conflicts,
+            }),
+            Err(e) => Some(rpc_err(request_id, "preview_rewind_failed", e)),
+        },
         WireMessage::RewindAgent {
             request_id,
             agent_id,
             to_before_seq,
             restore_files,
+            restore_paths,
         } => match runtime
             .orchestrator
-            .rewind_agent(&agent_id, to_before_seq, restore_files, session_id)
+            .rewind_agent(
+                &agent_id,
+                to_before_seq,
+                restore_files,
+                restore_paths,
+                session_id,
+            )
             .await
         {
             Ok(outcome) => Some(WireMessage::AgentRewound {

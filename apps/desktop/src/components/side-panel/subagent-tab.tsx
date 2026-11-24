@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
+import { ChevronRight } from "lucide-react";
 import {
   ConversationViewport,
   useViewportAnchorHold,
@@ -23,6 +24,7 @@ import { SubagentAvatar } from "@/components/ui/subagent-avatar";
 import {
   type PendingPermissionSummary,
   type StageTurnView,
+  type SubagentLineageStepView,
   type TimelineItemView,
   isAgentForegroundRunning,
   orbitIpc,
@@ -31,6 +33,7 @@ import { computeSubagentTurnsFingerprint, MAX_CACHED_STAGE_VIEWS } from "@/lib/s
 import {
   type ResolvedSubagentItem,
   buildSubagentNameMatcher,
+  resolveAgentAncestorLineage,
 } from "@/lib/subagents";
 import { useI18n } from "@/lib/i18n";
 import type {
@@ -490,6 +493,38 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
 
   const viewportResetKey = `${tab.id}:${tab.childAgentId ?? tab.providerSubagentId ?? tab.subagentCallId ?? ""}`;
 
+  const hostDetails = useOrbitSelector((s) => s.hostDetails);
+  const fleetHosts = useOrbitSelector((s) => s.fleet.hosts);
+  const ancestorLineage = useMemo((): SubagentLineageStepView[] => {
+    if (!isManaged || !hostId || !tab.childAgentId) return [];
+    return resolveAgentAncestorLineage({
+      hostId,
+      agentId: tab.childAgentId,
+      stageAncestorLineage: childStage?.insights?.ancestor_lineage ?? null,
+      hostDetails,
+      fleetHosts,
+    });
+  }, [isManaged, hostId, tab.childAgentId, childStage?.insights?.ancestor_lineage, hostDetails, fleetHosts]);
+
+  const handleOpenLineageStep = useCallback(
+    (step: SubagentLineageStepView, index: number) => {
+      if (index === 0) {
+        orbitActions.selectAgent(step.host_id, step.agent_id);
+        return;
+      }
+      const prevStep = ancestorLineage[index - 1];
+      orbitActions.openSubagentTab({
+        callId: step.agent_id,
+        role: step.title,
+        promptPreview: "",
+        childAgentId: step.agent_id,
+        childHostId: step.host_id,
+        parentAgentId: prevStep?.agent_id,
+      });
+    },
+    [ancestorLineage],
+  );
+
   // Show an actionable fallback banner ONLY when awaiting approval without a live DecisionDock payload
   // (e.g. cold hydration or provider-only subagent whose gate lives on the parent), or to identify a cross-host subagent.
   const showApprovalFallbackBanner =
@@ -509,6 +544,35 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
 
   return (
     <div className="orbit-stage-enter bg-surface-base flex min-h-0 flex-1 flex-col overflow-hidden">
+      {ancestorLineage.length > 1 && (
+        <nav
+          aria-label={t("overview.subagentLineageAria")}
+          className="border-border-subtle bg-surface-base flex h-[30px] shrink-0 items-center gap-1 overflow-x-auto border-b px-4 text-[11px] text-ink-tertiary"
+        >
+          {ancestorLineage.map((step, idx) => {
+            const isCurrent = idx === ancestorLineage.length - 1;
+            return (
+              <span key={`${step.host_id}::${step.agent_id}`} className="inline-flex shrink-0 items-center gap-1">
+                {idx > 0 && <ChevronRight aria-hidden="true" className="size-3 text-ink-muted" />}
+                {isCurrent ? (
+                  <span className="max-w-[180px] truncate font-medium text-ink-primary">
+                    {step.title}
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => handleOpenLineageStep(step, idx)}
+                    title={step.host_name ? `${step.title} · ${step.host_name}` : step.title}
+                    className="max-w-[160px] cursor-pointer truncate rounded-[4px] px-1 py-0.5 text-ink-tertiary transition-colors hover:bg-accent/70 hover:text-ink-primary"
+                  >
+                    {step.title}
+                  </button>
+                )}
+              </span>
+            );
+          })}
+        </nav>
+      )}
       {showInlineContextBar && (
         <ContextBanner
           variant="strip"

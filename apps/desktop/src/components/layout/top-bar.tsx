@@ -19,7 +19,7 @@ import {
 } from "@/lib/orbit-ipc";
 import { useI18n } from "@/lib/i18n";
 import { isAgentInGitRepo } from "@/lib/projects";
-import { modSymbol } from "@/lib/keybindings";
+import { useActionShortcutDisplay } from "@/lib/keybindings";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
 import { SubagentCrewMiniDock } from "@/components/stage/subagent-crew-dock";
 import { StandaloneGroupButton } from "@/components/stage/workspace-peer-strip";
@@ -197,6 +197,7 @@ export const TopBar = memo(function TopBar() {
 
   const rawHeaderTitle = useOrbitSelector((s) => {
     if (s.workspacePanel === "automations") return "__AUTOMATIONS__";
+    if (s.workspacePanel === "overview") return "__OVERVIEW__";
     if (s.isDraftNewSession || !s.selectedHostId || !s.selectedAgentId) {
       return "__NEW_CONVERSATION__";
     }
@@ -213,14 +214,18 @@ export const TopBar = memo(function TopBar() {
   const headerTitle =
     rawHeaderTitle === "__AUTOMATIONS__"
       ? t("common.automations")
-      : rawHeaderTitle === "__NEW_CONVERSATION__"
-        ? t("common.newConversation")
-        : rawHeaderTitle;
+      : rawHeaderTitle === "__OVERVIEW__"
+        ? t("overview.title")
+        : rawHeaderTitle === "__NEW_CONVERSATION__"
+          ? t("common.newConversation")
+          : rawHeaderTitle;
 
-  const mod = modSymbol();
+  const overviewShortcut = useActionShortcutDisplay("toggle_overview_hud");
   const isMac = isMacDesktop();
   const showBottomBorder =
-    workspacePanel === "automations" || (!isDraft && Boolean(selectedAgentId));
+    workspacePanel === "automations" ||
+    workspacePanel === "overview" ||
+    (!isDraft && Boolean(selectedAgentId));
 
   const showTopBarCrewRelay =
     hasActiveSession &&
@@ -445,7 +450,7 @@ export const TopBar = memo(function TopBar() {
               active={overviewVisible}
               indicatorTone={indicatorDotTone}
               tooltip={overviewTooltip}
-              shortcut={`${mod}⌥O`}
+              shortcut={overviewShortcut}
               aria-label={overviewVisible ? t("topbar.hideOverview") : t("topbar.showOverview")}
               onClick={() => orbitActions.toggleOverviewPanel()}
             >

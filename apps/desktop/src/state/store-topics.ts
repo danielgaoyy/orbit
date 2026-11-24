@@ -95,6 +95,7 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   sidePanelWidth: "workspace",
   sidePanelTabs: "workspace",
   activeSidePanelTabId: "workspace",
+  sidePanelSplit: "workspace",
   fileViewCache: "workspace",
   fileEditorDrafts: "workspace",
   pendingUnsavedFileAction: "workspace",
@@ -162,6 +163,7 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   terminalCursorStyle: "preferences",
   terminalScrollback: "preferences",
   terminalThemeMode: "preferences",
+  customKeybindings: "preferences",
 
   // updater
   appVersion: "updater",
@@ -194,6 +196,7 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   // ui
   activeView: "ui",
   workspacePanel: "ui",
+  overviewPinnedLanes: "ui",
   settingsSection: "ui",
   instructionsTarget: "ui",
   commandPaletteOpen: "ui",

@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { PanelLeft, PanelRight } from "lucide-react";
 import { resyncAllAmbientAnimations } from "@/lib/animation-sync";
 import { AutomationsView } from "@/components/automations/automations-view";
+import { PersonalAgentControlView } from "@/components/overview/personal-agent-control-view";
 import { CommandPalette } from "@/components/command/command-palette";
 import {
   DetachedTerminalWindow,
@@ -33,11 +34,16 @@ import { ToastViewport } from "@/components/ui/toast-viewport";
 import { SIDEBAR_DEFAULT_WIDTH_PX } from "@/lib/workspace-layout";
 import {
   isConfirmDialogOpen,
-  modSymbol,
+  useActionShortcutDisplay,
   useGlobalErgonomicKeybindings,
 } from "@/lib/keybindings";
 import { orbitIpc, isMacDesktop } from "@/lib/orbit-ipc";
-import { type ToastAction, orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import {
+  type ToastAction,
+  type WorkspacePanelMode,
+  orbitActions,
+  useOrbitSelector,
+} from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 function prefersReducedMotion(): boolean {
@@ -125,6 +131,41 @@ function MainDesktopApp() {
     return () => {
       active = false;
       unlisten?.();
+    };
+  }, []);
+
+  // Listen to native OS notification open / resolved action events
+  useEffect(() => {
+    let active = true;
+    const unlisteners: Array<() => void> = [];
+    void Promise.all([
+      orbitIpc.onNativeNotificationOpen(({ host_id, agent_id }) => {
+        if (!host_id) return;
+        orbitActions.closeSettings();
+        orbitActions.closeOnboardingGuide(false);
+        if (agent_id) {
+          orbitActions.selectAgent(host_id, agent_id);
+        } else {
+          orbitActions.selectHost(host_id);
+        }
+      }),
+      orbitIpc.onNativeNotificationResolved(({ host_id }) => {
+        if (host_id) {
+          void orbitActions.reloadHostDetail(host_id, true);
+        }
+      }),
+    ])
+      .then((fns) => {
+        if (!active) {
+          for (const fn of fns) fn();
+        } else {
+          unlisteners.push(...fns);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+      for (const fn of unlisteners) fn();
     };
   }, []);
 
@@ -346,13 +387,15 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
   workspacePanel,
 }: {
   isSettingsOpen: boolean;
-  workspacePanel: "conversation" | "automations";
+  workspacePanel: WorkspacePanelMode;
 }) {
   const sidebarOpen = useOrbitSelector((s) => s.sidebarOpen);
   const sidePanelOpen = useOrbitSelector((s) => s.sidePanelOpen);
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const isDraftNewSession = useOrbitSelector((s) => s.isDraftNewSession);
+  const toggleSidebarShortcut = useActionShortcutDisplay("toggle_sidebar");
+  const toggleSidePanelShortcut = useActionShortcutDisplay("toggle_side_panel");
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
   const sidebarElRef = useRef<HTMLDivElement | null>(null);
 
@@ -371,7 +414,6 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
   } = useWorkspaceMotion();
 
   const isMac = isMacDesktop();
-  const mod = modSymbol();
 
   const startSidebarResize = (e: React.MouseEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
@@ -447,7 +489,7 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
             <IconButton
               size="md"
               tooltip={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
-              shortcut={`${mod}B`}
+              shortcut={toggleSidebarShortcut}
               onClick={() => orbitActions.toggleSidebar()}
               className="pointer-events-auto"
             >
@@ -468,7 +510,7 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
               size="md"
               active={sidePanelOpen}
               tooltip={sidePanelOpen ? "Hide side panel" : "Show side panel"}
-              shortcut={`${mod}\\`}
+              shortcut={toggleSidePanelShortcut}
               onClick={() => orbitActions.toggleSidePanel()}
               className="pointer-events-auto"
             >
@@ -531,6 +573,13 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
                 resetKey={`${selectedHostId ?? ""}:${workspacePanel}`}
               >
                 <AutomationsView />
+              </PanelErrorBoundary>
+            ) : workspacePanel === "overview" ? (
+              <PanelErrorBoundary
+                panelName="Global Overview"
+                resetKey={`${selectedHostId ?? ""}:${workspacePanel}`}
+              >
+                <PersonalAgentControlView />
               </PanelErrorBoundary>
             ) : (
               <PanelErrorBoundary

@@ -110,6 +110,7 @@ pub struct FleetSidebarView {
 
 pub struct SidebarHostInput<'a> {
     pub host_id: &'a str,
+    pub host_name: &'a str,
     pub workspaces: &'a [WorkspaceSummary],
     pub discovered_projects: &'a [DiscoveredProject],
     pub agents: Vec<(AgentCardView, i64)>,
@@ -336,31 +337,180 @@ fn matches_conversation_filter(
     }
 }
 
-fn matches_agent_query(agent: &AgentCardView, q_lower: &str) -> bool {
-    if q_lower.is_empty() {
+/// Parsed representation of `FleetSidebarRequest.query`, supporting free-text keywords
+/// combined with optional `@host:<substring>` and `@provider:<substring>` inline tokens.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParsedSidebarQuery {
+    pub host_filters: Vec<String>,
+    pub provider_filters: Vec<String>,
+    pub terms: Vec<String>,
+}
+
+impl ParsedSidebarQuery {
+    pub fn parse(raw: &str) -> Self {
+        let mut parsed = Self::default();
+        for tok in raw.split_whitespace() {
+            let lower = tok.to_lowercase();
+            if let Some(rest) = lower.strip_prefix("@host:") {
+                if !rest.is_empty() {
+                    parsed.host_filters.push(rest.to_string());
+                }
+            } else if let Some(rest) = lower.strip_prefix("@provider:") {
+                if !rest.is_empty() {
+                    parsed.provider_filters.push(rest.to_string());
+                }
+            } else if !lower.is_empty() {
+                parsed.terms.push(lower);
+            }
+        }
+        parsed
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.host_filters.is_empty() && self.provider_filters.is_empty() && self.terms.is_empty()
+    }
+
+    pub fn matches_host(&self, host_id: &str, host_name: &str) -> bool {
+        if self.host_filters.is_empty() {
+            return true;
+        }
+        let id_l = host_id.to_lowercase();
+        let name_l = host_name.to_lowercase();
+        self.host_filters
+            .iter()
+            .all(|f| name_l.contains(f) || id_l.contains(f))
+    }
+
+    pub fn matches_provider(&self, agent: &AgentCardView) -> bool {
+        if self.provider_filters.is_empty() {
+            return true;
+        }
+        let label_l = agent.provider_label.to_lowercase();
+        let slug_l = agent.provider.slug().to_lowercase();
+        let acp_l = agent
+            .acp_agent_id
+            .as_deref()
+            .map(str::to_lowercase)
+            .unwrap_or_default();
+        self.provider_filters.iter().all(|f| {
+            label_l.contains(f) || slug_l.contains(f) || (!acp_l.is_empty() && acp_l.contains(f))
+        })
+    }
+}
+
+fn opt_contains(opt: Option<&str>, needle: &str) -> bool {
+    opt.is_some_and(|s| s.to_lowercase().contains(needle))
+}
+
+struct SidebarAgentSearchTarget<'a> {
+    host_id: &'a str,
+    host_name: &'a str,
+    agent: &'a AgentCardView,
+    ws_meta: Option<&'a WorkspaceSummary>,
+    project_name: Option<&'a str>,
+    project_cwd: Option<&'a str>,
+    project_branch: Option<&'a str>,
+}
+
+fn matches_agent_query_full(
+    parsed: &ParsedSidebarQuery,
+    target: &SidebarAgentSearchTarget<'_>,
+) -> bool {
+    let SidebarAgentSearchTarget {
+        host_id,
+        host_name,
+        agent,
+        ws_meta,
+        project_name,
+        project_cwd,
+        project_branch,
+    } = *target;
+    if parsed.is_empty() {
         return true;
     }
+    if !parsed.matches_host(host_id, host_name) || !parsed.matches_provider(agent) {
+        return false;
+    }
+    if parsed.terms.is_empty() {
+        return true;
+    }
+
     let title = if agent.title.trim().is_empty() {
         agent.provider_label.as_str()
     } else {
         agent.title.as_str()
     };
-    title.to_lowercase().contains(q_lower)
-        || agent.cwd.to_lowercase().contains(q_lower)
-        || basename_of_project_path(&agent.cwd)
-            .to_lowercase()
-            .contains(q_lower)
-        || agent.provider_label.to_lowercase().contains(q_lower)
-        || agent
-            .handle
-            .as_deref()
-            .is_some_and(|h| h.to_lowercase().contains(q_lower))
+    let title_l = title.to_lowercase();
+    let cwd_l = agent.cwd.to_lowercase();
+    let base_l = basename_of_project_path(&agent.cwd).to_lowercase();
+    let prov_label_l = agent.provider_label.to_lowercase();
+    let prov_slug_l = agent.provider.slug().to_lowercase();
+    let host_id_l = host_id.to_lowercase();
+    let host_name_l = host_name.to_lowercase();
+    let label_wt_branch = agent
+        .labels
+        .get("orbit.worktree_branch")
+        .map(String::as_str);
+
+    parsed.terms.iter().all(|term| {
+        title_l.contains(term)
+            || cwd_l.contains(term)
+            || base_l.contains(term)
+            || prov_label_l.contains(term)
+            || prov_slug_l.contains(term)
+            || host_name_l.contains(term)
+            || host_id_l.contains(term)
+            || opt_contains(agent.acp_agent_id.as_deref(), term)
+            || opt_contains(agent.handle.as_deref(), term)
+            || opt_contains(agent.worktree_branch.as_deref(), term)
+            || opt_contains(label_wt_branch, term)
+            || opt_contains(ws_meta.map(|w| w.title.as_str()), term)
+            || opt_contains(ws_meta.and_then(|w| w.mission_goal.as_deref()), term)
+            || opt_contains(ws_meta.and_then(|w| w.git_branch.as_deref()), term)
+            || opt_contains(project_name, term)
+            || opt_contains(project_cwd, term)
+            || opt_contains(project_branch, term)
+    })
+}
+
+fn matches_project_query(
+    parsed: &ParsedSidebarQuery,
+    host_id: &str,
+    host_name: &str,
+    group: &SidebarProjectGroupView,
+    curated_ws: &[&WorkspaceSummary],
+) -> bool {
+    if parsed.is_empty() {
+        return true;
+    }
+    if !parsed.matches_host(host_id, host_name) || !parsed.provider_filters.is_empty() {
+        return false;
+    }
+    if parsed.terms.is_empty() {
+        return true;
+    }
+    let host_id_l = host_id.to_lowercase();
+    let host_name_l = host_name.to_lowercase();
+    let name_l = group.name.to_lowercase();
+    let cwd_l = group.primary_cwd.to_lowercase();
+    parsed.terms.iter().all(|term| {
+        name_l.contains(term)
+            || cwd_l.contains(term)
+            || host_name_l.contains(term)
+            || host_id_l.contains(term)
+            || opt_contains(group.git_branch.as_deref(), term)
+            || curated_ws.iter().any(|w| {
+                w.title.to_lowercase().contains(term)
+                    || opt_contains(w.mission_goal.as_deref(), term)
+                    || opt_contains(w.git_branch.as_deref(), term)
+            })
+    })
 }
 
 pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
-    let q_lower = params.query.trim().to_lowercase();
+    let parsed_query = ParsedSidebarQuery::parse(params.query);
     let mut all_groups: Vec<SidebarProjectGroupView> = Vec::new();
-    let mut fallback_discovered_groups: Vec<SidebarProjectGroupView> = Vec::new();
+    let mut fallback_discovered_groups: Vec<(String, SidebarProjectGroupView)> = Vec::new();
     let mut has_any_real_project = false;
     let mut launchpad_projects: Vec<LaunchpadProjectView> = Vec::new();
     let mut needs_attention: Vec<SidebarConversationView> = Vec::new();
@@ -368,6 +518,7 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
 
     for host in &params.hosts {
         let host_id = host.host_id;
+        let host_name = host.host_name;
         let host_pinned: Vec<&ClientProjectView> = params
             .pinned_projects
             .iter()
@@ -514,7 +665,20 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 agent: agent.clone(),
             };
 
-            if agent.is_awaiting_permission {
+            if agent.is_awaiting_permission
+                && matches_agent_query_full(
+                    &parsed_query,
+                    &SidebarAgentSearchTarget {
+                        host_id,
+                        host_name,
+                        agent: &agent,
+                        ws_meta,
+                        project_name: None,
+                        project_cwd: None,
+                        project_branch: None,
+                    },
+                )
+            {
                 needs_attention.push(conv.clone());
             }
 
@@ -527,7 +691,21 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 continue;
             }
 
-            if agent.is_pinned && matches_conversation_filter(&conv, params.filter) {
+            if agent.is_pinned
+                && matches_conversation_filter(&conv, params.filter)
+                && matches_agent_query_full(
+                    &parsed_query,
+                    &SidebarAgentSearchTarget {
+                        host_id,
+                        host_name,
+                        agent: &agent,
+                        ws_meta,
+                        project_name: None,
+                        project_cwd: None,
+                        project_branch: None,
+                    },
+                )
+            {
                 pinned_with_order.push((*pinned_order, conv.clone()));
             }
 
@@ -843,23 +1021,26 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                     dp.name.clone()
                 };
                 group_idx_by_id.insert(id.clone(), fallback_discovered_groups.len());
-                fallback_discovered_groups.push(SidebarProjectGroupView {
-                    id: id.clone(),
-                    host_id: host_id.to_string(),
-                    name,
-                    is_home_workspace: is_bare_home_dir(&clean_path),
-                    primary_cwd: clean_path.clone(),
-                    directories: vec![clean_path],
-                    git_branch: dp.git_branch.clone(),
-                    is_git_repo: dp.is_git_repo,
-                    nested_git_repos: dp.nested_git_repos.clone(),
-                    pinned_project_id: None,
-                    sort_weight_ms: dp.last_modified_unix * 1000,
-                    sort_order_key: id,
-                    conversations: Vec::new(),
-                    workspaces: Vec::new(),
-                    unclassified_conversations: Vec::new(),
-                });
+                fallback_discovered_groups.push((
+                    host_name.to_string(),
+                    SidebarProjectGroupView {
+                        id: id.clone(),
+                        host_id: host_id.to_string(),
+                        name,
+                        is_home_workspace: is_bare_home_dir(&clean_path),
+                        primary_cwd: clean_path.clone(),
+                        directories: vec![clean_path],
+                        git_branch: dp.git_branch.clone(),
+                        is_git_repo: dp.is_git_repo,
+                        nested_git_repos: dp.nested_git_repos.clone(),
+                        pinned_project_id: None,
+                        sort_weight_ms: dp.last_modified_unix * 1000,
+                        sort_order_key: id,
+                        conversations: Vec::new(),
+                        workspaces: Vec::new(),
+                        unclassified_conversations: Vec::new(),
+                    },
+                ));
                 added += 1;
             }
         }
@@ -888,39 +1069,42 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 .remove(&group_idx)
                 .unwrap_or_default();
 
-            if !q_lower.is_empty() {
-                let proj_match = group.name.to_lowercase().contains(&q_lower)
-                    || group.primary_cwd.to_lowercase().contains(&q_lower)
-                    || group
-                        .git_branch
-                        .as_deref()
-                        .is_some_and(|b| b.to_lowercase().contains(&q_lower));
-                let ws_title_match = project_curated_ws.iter().any(|w| {
-                    w.title.to_lowercase().contains(&q_lower)
-                        || w.mission_goal
-                            .as_deref()
-                            .is_some_and(|g| g.to_lowercase().contains(&q_lower))
-                });
+            if !parsed_query.is_empty() {
+                if !parsed_query.matches_host(host_id, host_name) {
+                    continue;
+                }
+                let proj_match = matches_project_query(
+                    &parsed_query,
+                    host_id,
+                    host_name,
+                    &group,
+                    &project_curated_ws,
+                );
                 let thread_matches: Vec<SidebarConversationView> = group
                     .conversations
                     .iter()
                     .filter(|c| {
-                        matches_agent_query(&c.agent, &q_lower)
-                            || ws_by_id
-                                .get(c.agent.workspace_id.as_str())
-                                .is_some_and(|w| {
-                                    w.title.to_lowercase().contains(&q_lower)
-                                        || w.mission_goal
-                                            .as_deref()
-                                            .is_some_and(|g| g.to_lowercase().contains(&q_lower))
-                                })
+                        matches_agent_query_full(
+                            &parsed_query,
+                            &SidebarAgentSearchTarget {
+                                host_id,
+                                host_name,
+                                agent: &c.agent,
+                                ws_meta: ws_by_id.get(c.agent.workspace_id.as_str()).copied(),
+                                project_name: Some(&group.name),
+                                project_cwd: Some(&group.primary_cwd),
+                                project_branch: group.git_branch.as_deref(),
+                            },
+                        )
                     })
                     .cloned()
                     .collect();
                 if !thread_matches.is_empty() {
                     group.conversations = thread_matches;
-                } else if !proj_match && !ws_title_match {
+                } else if !proj_match {
                     continue;
+                } else {
+                    group.conversations = Vec::new();
                 }
             }
 
@@ -978,16 +1162,10 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 if params.filter == SidebarThreadFilter::ActiveUnread && convs.is_empty() {
                     continue;
                 }
-                if !q_lower.is_empty() && convs.is_empty() {
-                    let ws_matches = ws_meta.is_some_and(|w| {
-                        w.title.to_lowercase().contains(&q_lower)
-                            || w.mission_goal
-                                .as_deref()
-                                .is_some_and(|g| g.to_lowercase().contains(&q_lower))
-                    });
-                    let proj_matches = group.name.to_lowercase().contains(&q_lower)
-                        || group.primary_cwd.to_lowercase().contains(&q_lower);
-                    if !ws_matches && !proj_matches {
+                if !parsed_query.is_empty() && convs.is_empty() {
+                    let single_ws = ws_meta.into_iter().collect::<Vec<_>>();
+                    if !matches_project_query(&parsed_query, host_id, host_name, &group, &single_ws)
+                    {
                         continue;
                     }
                 }
@@ -1219,17 +1397,11 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
     }
 
     if !has_any_real_project && params.filter == SidebarThreadFilter::All {
-        for group in fallback_discovered_groups {
-            if !q_lower.is_empty() {
-                let proj_match = group.name.to_lowercase().contains(&q_lower)
-                    || group.primary_cwd.to_lowercase().contains(&q_lower)
-                    || group
-                        .git_branch
-                        .as_deref()
-                        .is_some_and(|b| b.to_lowercase().contains(&q_lower));
-                if !proj_match {
-                    continue;
-                }
+        for (fb_host_name, group) in fallback_discovered_groups {
+            if !parsed_query.is_empty()
+                && !matches_project_query(&parsed_query, &group.host_id, &fb_host_name, &group, &[])
+            {
+                continue;
             }
             all_groups.push(group);
         }
@@ -1438,6 +1610,7 @@ mod tests {
             revision: 1,
             hosts: vec![SidebarHostInput {
                 host_id: "h1",
+                host_name: "MacBook Pro",
                 workspaces: &workspaces,
                 discovered_projects: &discovered,
                 agents: vec![
@@ -1495,6 +1668,7 @@ mod tests {
             revision: 2,
             hosts: vec![SidebarHostInput {
                 host_id: "h1",
+                host_name: "MacBook Pro",
                 workspaces: &workspaces,
                 discovered_projects: &discovered,
                 agents: vec![
@@ -1612,6 +1786,7 @@ mod tests {
             revision: 3,
             hosts: vec![SidebarHostInput {
                 host_id: "h1",
+                host_name: "MacBook Pro",
                 workspaces: &workspaces,
                 discovered_projects: &[],
                 agents: vec![(parent, 0), (bg, 10), (archived, 20), (sub_same_ws, 30)],
@@ -1714,6 +1889,7 @@ mod tests {
             revision: 4,
             hosts: vec![SidebarHostInput {
                 host_id: "h1",
+                host_name: "MacBook Pro",
                 workspaces: &workspaces,
                 discovered_projects: &[],
                 agents: vec![(lead, 0), (worker, 0)],
@@ -1820,6 +1996,7 @@ mod tests {
             revision: 5,
             hosts: vec![SidebarHostInput {
                 host_id: "h1",
+                host_name: "MacBook Pro",
                 workspaces: &workspaces,
                 discovered_projects: &[],
                 agents: vec![(inbox_agent, 0)],
@@ -1942,6 +2119,7 @@ mod tests {
             revision: 6,
             hosts: vec![SidebarHostInput {
                 host_id: "h1",
+                host_name: "MacBook Pro",
                 workspaces: &workspaces,
                 discovered_projects: &discovered,
                 agents: Vec::new(),
@@ -2085,6 +2263,7 @@ mod tests {
             revision: 7,
             hosts: vec![SidebarHostInput {
                 host_id: "h1",
+                host_name: "MacBook Pro",
                 workspaces: &workspaces,
                 discovered_projects: &[],
                 agents: vec![(ag_primary, 0), (ag_sec_old, 0), (ag_sec_new, 0)],
@@ -2147,6 +2326,7 @@ mod tests {
             hosts: vec![
                 SidebarHostInput {
                     host_id: "h_devbox",
+                    host_name: "Linux DevBox",
                     workspaces: &[],
                     discovered_projects: &[],
                     agents: Vec::new(),
@@ -2156,6 +2336,7 @@ mod tests {
                 },
                 SidebarHostInput {
                     host_id: "h_local",
+                    host_name: "Local Mac",
                     workspaces: &[],
                     discovered_projects: &local_discovered,
                     agents: Vec::new(),
@@ -2185,6 +2366,7 @@ mod tests {
             revision: 9,
             hosts: vec![SidebarHostInput {
                 host_id: "h_local",
+                host_name: "Local Mac",
                 workspaces: &[],
                 discovered_projects: &local_discovered,
                 agents: Vec::new(),
@@ -2202,5 +2384,157 @@ mod tests {
             active_cwd: None,
         });
         assert_eq!(onboarding.projects.len(), 2);
+    }
+
+    #[test]
+    fn sidebar_search_matches_plain_fields_and_inline_host_provider_tokens() {
+        let empty_git_repos = HashMap::new();
+        let empty_conflicts = HashSet::new();
+
+        let ws_linux = vec![WorkspaceSummary {
+            workspace_id: "ws_auth".into(),
+            title: "Auth Rewrite".into(),
+            mission_goal: Some("Harden OAuth tokens".into()),
+            cwd: "/srv/api".into(),
+            project_root: None,
+            git_branch: Some("feat/oauth-v2".into()),
+            is_worktree: false,
+            updated_at: chrono::Utc::now(),
+            source_cwd: None,
+            base_ref: None,
+            parent_workspace_id: None,
+            archived_at: None,
+            background: false,
+            setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+            board_revision: 0,
+            title_locked: false,
+            auto_clustered: false,
+            is_curated: true,
+        }];
+
+        let mut linux_codex = sample_agent(
+            "ag_linux_codex",
+            "/srv/api",
+            "2026-11-24T10:00:00Z",
+            true,
+            false,
+            true,
+            true,
+        );
+        linux_codex.workspace_id = "ws_auth".into();
+        linux_codex.title = "Fix auth middleware".into();
+        linux_codex.provider = ProviderKind::Codex;
+        linux_codex.provider_label = "Codex".into();
+        linux_codex.worktree_branch = Some("fix/auth-token".into());
+
+        let mut linux_claude = sample_agent(
+            "ag_linux_claude",
+            "/srv/api",
+            "2026-11-24T09:00:00Z",
+            false,
+            false,
+            false,
+            false,
+        );
+        linux_claude.workspace_id = "ws_auth".into();
+        linux_claude.title = "Refactor billing".into();
+        linux_claude.provider = ProviderKind::ClaudeCode;
+        linux_claude.provider_label = "Claude Code".into();
+
+        let mut mac_codex = sample_agent(
+            "ag_mac_codex",
+            "/Users/jess/ui",
+            "2026-11-24T11:00:00Z",
+            false,
+            false,
+            false,
+            true,
+        );
+        mac_codex.title = "Auth login modal".into();
+        mac_codex.provider = ProviderKind::Codex;
+        mac_codex.provider_label = "Codex".into();
+
+        let run_query = |query: &str| {
+            build_fleet_sidebar(FleetSidebarParams {
+                revision: 10,
+                hosts: vec![
+                    SidebarHostInput {
+                        host_id: "h_linux_gpu",
+                        host_name: "Linux Build Box",
+                        workspaces: &ws_linux,
+                        discovered_projects: &[],
+                        agents: vec![(linux_codex.clone(), 100), (linux_claude.clone(), 0)],
+                        active_git_branch: None,
+                        git_repos_by_cwd: &empty_git_repos,
+                        workspace_conflict_ids: &empty_conflicts,
+                    },
+                    SidebarHostInput {
+                        host_id: "h_mac_studio",
+                        host_name: "Mac Studio",
+                        workspaces: &[],
+                        discovered_projects: &[],
+                        agents: vec![(mac_codex.clone(), 0)],
+                        active_git_branch: None,
+                        git_repos_by_cwd: &empty_git_repos,
+                        workspace_conflict_ids: &empty_conflicts,
+                    },
+                ],
+                pinned_projects: &[],
+                project_order: &[],
+                sort: SidebarProjectSort::Recent,
+                filter: SidebarThreadFilter::All,
+                query,
+                active_host_id: None,
+                active_agent_id: None,
+                active_cwd: None,
+            })
+        };
+
+        // 1. Plain match on host name
+        let by_host = run_query("Studio");
+        assert_eq!(by_host.projects.len(), 1);
+        assert_eq!(by_host.projects[0].host_id, "h_mac_studio");
+
+        // 2. Plain match on git branch (worktree_branch)
+        let by_branch = run_query("auth-token");
+        assert_eq!(by_branch.projects.len(), 1);
+        assert_eq!(by_branch.projects[0].conversations.len(), 1);
+        assert_eq!(
+            by_branch.projects[0].conversations[0].agent.agent_id,
+            "ag_linux_codex"
+        );
+
+        // 3. Plain match on workspace name
+        let by_ws = run_query("Auth Rewrite");
+        assert_eq!(by_ws.projects.len(), 1);
+        assert_eq!(by_ws.projects[0].conversations.len(), 2);
+
+        // 4. Combined power-user tokens: `@host:linux @provider:codex auth`
+        let combo = run_query("@host:linux @provider:codex auth");
+        assert_eq!(combo.projects.len(), 1);
+        assert_eq!(combo.projects[0].conversations.len(), 1);
+        assert_eq!(
+            combo.projects[0].conversations[0].agent.agent_id,
+            "ag_linux_codex"
+        );
+        assert_eq!(combo.needs_attention.len(), 1);
+        assert_eq!(combo.needs_attention[0].agent.agent_id, "ag_linux_codex");
+        assert_eq!(combo.pinned_conversations.len(), 1);
+
+        // 5. Provider token excludes non-matching provider threads even inside matching host/project
+        let claude_only = run_query("@provider:claude");
+        assert_eq!(claude_only.projects.len(), 1);
+        assert_eq!(claude_only.projects[0].conversations.len(), 1);
+        assert_eq!(
+            claude_only.projects[0].conversations[0].agent.agent_id,
+            "ag_linux_claude"
+        );
+        assert!(claude_only.needs_attention.is_empty());
+
+        // 6. Non-matching host token returns empty fleet
+        let none = run_query("@host:windows");
+        assert!(none.projects.is_empty());
+        assert!(none.needs_attention.is_empty());
+        assert!(none.pinned_conversations.is_empty());
     }
 }

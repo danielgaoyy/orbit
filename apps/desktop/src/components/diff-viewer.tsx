@@ -1,9 +1,10 @@
-import { memo, useCallback, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Check,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   FileCode2,
   Loader2,
   MessageSquarePlus,
@@ -11,10 +12,13 @@ import {
   Minus,
   Plus,
   RotateCcw,
+  Search,
   Trash2,
+  UnfoldVertical,
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { IconButton } from "@/components/ui/icon-button";
 import { Textarea } from "@/components/ui/textarea";
 import { resolveTokenColor } from "@/lib/code-highlight";
 import { shouldPrefetchOnPointerDown } from "@/lib/file-prefetch";
@@ -30,11 +34,12 @@ import {
 import { extractFileHunks, type IndexedDiffHunk } from "@/lib/git-patch";
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
-import type {
-  DiffFileView,
-  DiffLineView,
-  HighlightedTokenView,
-  InlineDiffSpan,
+import {
+  orbitIpc,
+  type DiffFileView,
+  type DiffLineView,
+  type HighlightedTokenView,
+  type InlineDiffSpan,
 } from "@/lib/orbit-ipc";
 import { type DiffLayoutMode, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -114,9 +119,64 @@ type DiffVirtualRow =
       notice: string;
     }
   | {
+      kind: "context_gap";
+      key: string;
+      gapKey: string;
+      filePath: string;
+      hiddenCount: number;
+      startNew: number;
+      endNew: number;
+      startOld: number;
+    }
+  | {
       kind: "file_spacer";
       key: string;
     };
+
+interface CachedFileContext {
+  lines: string[];
+  highlighted: Map<number, HighlightedTokenView[]>;
+}
+
+interface GapExpansionState {
+  shownCount: number;
+  showAll: boolean;
+}
+
+const CONTEXT_EXPAND_CHUNK_SIZE = 20;
+
+function parseHunkHeaderStart(content: string): { oldStart: number; newStart: number } | null {
+  const m = /^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@/.exec(content.trim());
+  if (!m) return null;
+  const oldStart = Number.parseInt(m[1], 10);
+  const newStart = Number.parseInt(m[2], 10);
+  if (!Number.isFinite(oldStart) || !Number.isFinite(newStart)) return null;
+  return { oldStart, newStart };
+}
+
+function buildExpandedContextLines(
+  cached: CachedFileContext | undefined,
+  startNew: number,
+  endNew: number,
+  oldOffset: number,
+): DiffLineView[] {
+  if (!cached || endNew < startNew) return [];
+  const out: DiffLineView[] = [];
+  for (let ln = startNew; ln <= endNew; ln += 1) {
+    const raw = cached.lines[ln - 1];
+    if (raw === undefined) break;
+    const oldLn = ln + oldOffset;
+    out.push({
+      kind: "context",
+      old_line: oldLn > 0 ? oldLn : null,
+      new_line: ln,
+      content: raw,
+      tokens: cached.highlighted.get(ln) ?? [],
+      inline_changes: [],
+    });
+  }
+  return out;
+}
 
 function buildSplitRows(lines: DiffLineView[]): SplitRow[] {
   const rows: SplitRow[] = [];
@@ -386,6 +446,8 @@ function estimateRowHeight(row: DiffVirtualRow): number {
       return 124;
     case "omission":
       return 30;
+    case "context_gap":
+      return 26;
     case "file_spacer":
       return 12;
   }
@@ -393,6 +455,9 @@ function estimateRowHeight(row: DiffVirtualRow): number {
 
 export const DiffFilesViewer = memo(function DiffFilesViewer({
   files,
+  hostId = null,
+  cwd = null,
+  enableLocalFind,
   layout = "unified",
   wrapLines = false,
   virtualized = false,
@@ -419,6 +484,9 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
   onDiscardHunk,
 }: {
   files: DiffFileView[];
+  hostId?: string | null;
+  cwd?: string | null;
+  enableLocalFind?: boolean;
   layout?: DiffLayoutMode;
   wrapLines?: boolean;
   virtualized?: boolean;
@@ -448,7 +516,72 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
   const isDark = useOrbitSelector((s) => s.resolvedTheme === "dark");
   const [localCollapsed, setLocalCollapsed] = useState<Set<string>>(() => new Set());
   const [activeComment, setActiveComment] = useState<ActiveCommentTarget | null>(null);
+  const [fileContextCache, setFileContextCache] = useState<Record<string, CachedFileContext>>({});
+  const [expandedGaps, setExpandedGaps] = useState<Record<string, GapExpansionState>>({});
+  const [loadingGapKey, setLoadingGapKey] = useState<string | null>(null);
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState("");
+  const [findActiveIndex, setFindActiveIndex] = useState(0);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const findInputRef = useRef<HTMLInputElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const fileContextCacheRef = useRef(fileContextCache);
+  fileContextCacheRef.current = fileContextCache;
+  const findIme = useImeCompositionGuard();
+
+  const localFindEnabled = enableLocalFind ?? virtualized;
+  const canExpandHiddenContext = Boolean(hostId && cwd);
+
+  // Reset cached context files when host/workspace changes
+  useEffect(() => {
+    setFileContextCache({});
+    setExpandedGaps({});
+    setLoadingGapKey(null);
+  }, [hostId, cwd]);
+
+  const handleExpandContextGap = useCallback(
+    async (filePath: string, gapKey: string, mode: "chunk" | "all") => {
+      if (!hostId || !cwd) return;
+      if (!fileContextCacheRef.current[filePath]) {
+        setLoadingGapKey(gapKey);
+        try {
+          const wf = await orbitIpc.readWorkspaceFile(hostId, cwd, filePath);
+          const rawLines = wf.content.split(/\r?\n/);
+          const highlighted = new Map<number, HighlightedTokenView[]>();
+          let hlLines = wf.highlighted_lines;
+          if ((!hlLines || hlLines.length === 0) && wf.content.length > 0) {
+            try {
+              hlLines = await orbitIpc.highlightWorkspaceCode(wf.language || "text", wf.content);
+            } catch {
+              hlLines = [];
+            }
+          }
+          for (const hl of hlLines ?? []) {
+            highlighted.set(hl.line_number, hl.tokens);
+          }
+          setFileContextCache((prev) => ({
+            ...prev,
+            [filePath]: { lines: rawLines, highlighted },
+          }));
+        } catch {
+          return;
+        } finally {
+          setLoadingGapKey((cur) => (cur === gapKey ? null : cur));
+        }
+      }
+      setExpandedGaps((prev) => {
+        const cur = prev[gapKey] ?? { shownCount: 0, showAll: false };
+        return {
+          ...prev,
+          [gapKey]:
+            mode === "all"
+              ? { shownCount: cur.shownCount, showAll: true }
+              : { shownCount: cur.shownCount + CONTEXT_EXPAND_CHUNK_SIZE, showAll: cur.showAll },
+        };
+      });
+    },
+    [hostId, cwd],
+  );
 
   const effectiveCollapsed = collapsedPaths ?? localCollapsed;
 
@@ -589,6 +722,81 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
           }
         }
 
+        const canExpandFile =
+          canExpandHiddenContext && file.lines.some((l) => l.new_line != null);
+        const cachedFile = canExpandFile ? fileContextCache[file.path] : undefined;
+
+        const emitGapBeforeHunk = (
+          prevNewEnd: number,
+          hunkHeaderContent: string,
+          isSplit: boolean,
+          hunkIdxTag: string,
+        ) => {
+          if (!canExpandFile) return;
+          const bounds = parseHunkHeaderStart(hunkHeaderContent);
+          if (!bounds) return;
+          const gapStartNew = prevNewEnd + 1;
+          const gapEndNew = bounds.newStart - 1;
+          if (gapEndNew < gapStartNew) return;
+          const totalGap = gapEndNew - gapStartNew + 1;
+          const oldOffset = bounds.oldStart - bounds.newStart;
+          const gapKey = `${file.path}::${gapStartNew}-${gapEndNew}`;
+          const exp = expandedGaps[gapKey];
+          const shownCount = exp
+            ? exp.showAll
+              ? totalGap
+              : Math.min(totalGap, exp.shownCount)
+            : 0;
+
+          if (shownCount > 0 && cachedFile) {
+            const expandedLines = buildExpandedContextLines(
+              cachedFile,
+              gapStartNew,
+              gapStartNew + shownCount - 1,
+              oldOffset,
+            );
+            for (let eIdx = 0; eIdx < expandedLines.length; eIdx += 1) {
+              const ctxLine = expandedLines[eIdx];
+              if (isSplit) {
+                out.push({
+                  kind: "split_pair",
+                  key: `sg:${fileKey}:${hunkIdxTag}:${ctxLine.new_line}`,
+                  file,
+                  fileKey,
+                  left: ctxLine,
+                  right: ctxLine,
+                  rowIdx: -100000 - eIdx,
+                  isLastInFile: false,
+                });
+              } else {
+                out.push({
+                  kind: "unified_line",
+                  key: `ug:${fileKey}:${hunkIdxTag}:${ctxLine.new_line}`,
+                  file,
+                  fileKey,
+                  line: ctxLine,
+                  lineIdx: -100000 - eIdx,
+                  isLastInFile: false,
+                });
+              }
+            }
+          }
+
+          const remaining = totalGap - shownCount;
+          if (remaining > 0) {
+            out.push({
+              kind: "context_gap",
+              key: `cg:${fileKey}:${gapKey}`,
+              gapKey,
+              filePath: file.path,
+              hiddenCount: remaining,
+              startNew: gapStartNew + shownCount,
+              endNew: gapEndNew,
+              startOld: Math.max(1, gapStartNew + shownCount + oldOffset),
+            });
+          }
+        };
+
         if (layout === "unified") {
           const visibleLines: { line: DiffLineView; idx: number }[] = [];
           for (let lIdx = 0; lIdx < file.lines.length; lIdx += 1) {
@@ -596,10 +804,12 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
               visibleLines.push({ line: file.lines[lIdx], idx: lIdx });
             }
           }
+          let prevNewEnd = 0;
           for (let vIdx = 0; vIdx < visibleLines.length; vIdx += 1) {
             const { line, idx } = visibleLines[vIdx];
             const isLast = vIdx === visibleLines.length - 1 && !omissionNotice;
             if (line.kind === "hunk_header") {
+              emitGapBeforeHunk(prevNewEnd, line.content, false, String(idx));
               const hunk = hunksByLineIdx?.get(idx) ?? null;
               out.push({
                 kind: "hunk_header",
@@ -610,6 +820,9 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                 hunkKey: `${file.path}::${idx}`,
               });
             } else {
+              if (line.new_line != null && line.new_line > prevNewEnd) {
+                prevNewEnd = line.new_line;
+              }
               out.push({
                 kind: "unified_line",
                 key: `ul:${fileKey}:${idx}`,
@@ -645,10 +858,12 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
           }
         } else {
           const splitRows = buildSplitRows(file.lines);
+          let prevNewEnd = 0;
           for (let rIdx = 0; rIdx < splitRows.length; rIdx += 1) {
             const sr = splitRows[rIdx];
             const isLast = rIdx === splitRows.length - 1 && !omissionNotice;
             if (sr.kind === "header") {
+              emitGapBeforeHunk(prevNewEnd, sr.headerText ?? "", true, String(rIdx));
               const headerIdx = sr.headerLineIdx ?? -1;
               const hunk = hunksByLineIdx?.get(headerIdx) ?? null;
               out.push({
@@ -660,6 +875,9 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                 hunkKey: `${file.path}::${headerIdx}`,
               });
             } else {
+              if (sr.right?.new_line != null && sr.right.new_line > prevNewEnd) {
+                prevNewEnd = sr.right.new_line;
+              }
               out.push({
                 kind: "split_pair",
                 key: `sp:${fileKey}:${rIdx}`,
@@ -720,6 +938,9 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
     commentsByFileAndAnchor,
     activeComment,
     gitWriteMode,
+    canExpandHiddenContext,
+    fileContextCache,
+    expandedGaps,
   ]);
 
   const virtualizer = useVirtualizer({
@@ -730,9 +951,96 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
     getItemKey: (index) => flatRows[index]?.key ?? index,
   });
 
+  // Diff-local Cmd+F match calculation
+  const normalizedFindQuery = findOpen ? findQuery.trim().toLowerCase() : "";
+  const findMatches = useMemo<number[]>(() => {
+    if (!normalizedFindQuery) return [];
+    const hits: number[] = [];
+    for (let i = 0; i < flatRows.length; i += 1) {
+      const row = flatRows[i];
+      if (row.kind === "unified_line") {
+        if (row.line.content.toLowerCase().includes(normalizedFindQuery)) hits.push(i);
+      } else if (row.kind === "split_pair") {
+        const leftHit = row.left?.content.toLowerCase().includes(normalizedFindQuery) ?? false;
+        const rightHit = row.right?.content.toLowerCase().includes(normalizedFindQuery) ?? false;
+        if (leftHit || rightHit) hits.push(i);
+      } else if (row.kind === "file_header") {
+        if (row.file.path.toLowerCase().includes(normalizedFindQuery)) hits.push(i);
+      }
+    }
+    return hits;
+  }, [flatRows, normalizedFindQuery]);
+
+  const findMatchRowSet = useMemo(() => new Set(findMatches), [findMatches]);
+  const clampedFindIndex =
+    findMatches.length > 0 ? Math.min(findActiveIndex, findMatches.length - 1) : 0;
+  const activeFindRowIndex = findMatches.length > 0 ? findMatches[clampedFindIndex] : null;
+
+  useEffect(() => {
+    setFindActiveIndex(0);
+  }, [normalizedFindQuery]);
+
+  useEffect(() => {
+    if (!findOpen || activeFindRowIndex === null) return;
+    if (virtualized) {
+      virtualizer.scrollToIndex(activeFindRowIndex, { align: "center" });
+    }
+  }, [findOpen, activeFindRowIndex, virtualized, virtualizer]);
+
+  const stepDiffFind = useCallback(
+    (delta: 1 | -1) => {
+      if (findMatches.length === 0) return;
+      setFindActiveIndex((prev) => {
+        const len = findMatches.length;
+        return ((prev + delta) % len + len) % len;
+      });
+    },
+    [findMatches.length],
+  );
+
+  const openDiffFind = useCallback(() => {
+    setFindOpen(true);
+    window.requestAnimationFrame(() => {
+      const el = findInputRef.current;
+      if (!el) return;
+      el.focus({ preventScroll: true });
+      el.select();
+    });
+  }, []);
+
+  const closeDiffFind = useCallback(() => {
+    setFindOpen(false);
+    containerRef.current?.focus({ preventScroll: true });
+  }, []);
+
+  // Capture Cmd+F / Ctrl+F when focus lives inside the Diff viewer or its enclosing Review tab
+  useEffect(() => {
+    if (!localFindEnabled) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (!mod || e.shiftKey || e.altKey || e.key.toLowerCase() !== "f") return;
+      const root = containerRef.current;
+      if (!root || root.offsetParent === null) return;
+      const active = document.activeElement;
+      const reviewScope = root.closest("[data-orbit-review-tab='true']") ?? root;
+      const targetEl = e.target instanceof Element ? e.target : null;
+      const insideScope =
+        (active instanceof Node && reviewScope.contains(active)) ||
+        (targetEl !== null && reviewScope.contains(targetEl));
+      if (!insideScope) return;
+      e.preventDefault();
+      e.stopPropagation();
+      openDiffFind();
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [localFindEnabled, openDiffFind]);
+
   const codeWrapClass = wrapLines ? "whitespace-pre-wrap break-all" : "whitespace-pre";
 
-  const renderRow = (row: DiffVirtualRow): ReactNode => {
+  const renderRow = (row: DiffVirtualRow, flatIndex: number): ReactNode => {
+    const isFindMatch = findOpen && findMatchRowSet.has(flatIndex);
+    const isActiveFindMatch = findOpen && activeFindRowIndex === flatIndex;
     switch (row.kind) {
       case "file_spacer":
         return <div className="h-3" />;
@@ -744,6 +1052,9 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
             className={cn(
               "border-border-subtle group/diffhdr bg-surface-raised hover:bg-accent/70 flex h-[38px] w-full items-center justify-between gap-2 border px-3 transition-colors",
               row.collapsed ? "rounded-lg" : "rounded-t-lg",
+              isActiveFindMatch
+                ? "ring-1 ring-inset ring-amber-500/70 bg-amber-400/18 dark:bg-amber-400/16"
+                : isFindMatch && "bg-amber-400/10 dark:bg-amber-400/10",
             )}
           >
             <button
@@ -964,6 +1275,9 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                 "border-l-2 border-l-sky-500/80 bg-sky-500/[0.08] pl-[6px] dark:border-l-sky-400/80 dark:bg-sky-400/[0.09]",
               inSavedRange &&
                 "border-l-2 border-l-sky-500/45 pl-[6px] dark:border-l-sky-400/45",
+              isActiveFindMatch
+                ? "bg-amber-400/28 ring-1 ring-inset ring-amber-500/65 dark:bg-amber-400/24"
+                : isFindMatch && "bg-amber-400/14 dark:bg-amber-400/14",
             )}
           >
             {(onOpenFile || onAddComment) && line.old_line != null ? (
@@ -1127,6 +1441,9 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
             className={cn(
               "border-border-subtle divide-border-subtle selectable-text bg-surface-recessed grid w-full grid-cols-2 divide-x border-x font-mono text-[12px] leading-[20px]",
               isLastInFile && "overflow-hidden rounded-b-lg border-b",
+              isActiveFindMatch
+                ? "bg-amber-400/24 ring-1 ring-inset ring-amber-500/65 dark:bg-amber-400/20"
+                : isFindMatch && "bg-amber-400/12 dark:bg-amber-400/12",
             )}
           >
             {/* Old side */}
@@ -1407,6 +1724,45 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
             {row.notice}
           </div>
         );
+
+      case "context_gap": {
+        const isLoading = loadingGapKey === row.gapKey;
+        const canExpandChunk = row.hiddenCount > CONTEXT_EXPAND_CHUNK_SIZE;
+        return (
+          <div className="border-border-subtle bg-surface-base/90 text-ink-tertiary flex h-[26px] items-center justify-between gap-2 border-x border-y border-y-border-subtle/50 px-3 text-[11px] select-none">
+            <span className="inline-flex items-center gap-1.5 tabular-nums">
+              {isLoading ? (
+                <Loader2 className="size-3 animate-spin text-ink-muted" />
+              ) : (
+                <UnfoldVertical className="size-3 text-ink-muted" />
+              )}
+              <span>{t("review.hiddenContextLines", { count: row.hiddenCount })}</span>
+            </span>
+            <div className="flex items-center gap-1.5">
+              {canExpandChunk && (
+                <button
+                  type="button"
+                  disabled={isLoading}
+                  onClick={() => void handleExpandContextGap(row.filePath, row.gapKey, "chunk")}
+                  className="hover:bg-accent hover:text-ink-primary inline-flex h-[20px] cursor-pointer items-center rounded-[5px] px-1.5 text-[11px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-45"
+                >
+                  {t("review.expandContextLines", { count: CONTEXT_EXPAND_CHUNK_SIZE })}
+                </button>
+              )}
+              <button
+                type="button"
+                disabled={isLoading}
+                onClick={() => void handleExpandContextGap(row.filePath, row.gapKey, "all")}
+                className="hover:bg-accent hover:text-ink-primary inline-flex h-[20px] cursor-pointer items-center rounded-[5px] px-1.5 text-[11px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-45"
+              >
+                {canExpandChunk
+                  ? t("review.showAllHiddenContext")
+                  : t("review.expandContextLines", { count: row.hiddenCount })}
+              </button>
+            </div>
+          </div>
+        );
+      }
     }
   };
 
@@ -1422,47 +1778,136 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
 
   if (!virtualized) {
     return (
-      <div className="min-w-0">
-        {flatRows.map((row) => (
-          <div key={row.key}>{renderRow(row)}</div>
+      <div ref={containerRef} className="min-w-0">
+        {flatRows.map((row, idx) => (
+          <div key={row.key}>{renderRow(row, idx)}</div>
         ))}
       </div>
     );
   }
 
   const virtualItems = virtualizer.getVirtualItems();
+  const hasFindQuery = findQuery.trim().length > 0;
+  const canStepFind = findMatches.length > 0;
 
   return (
-    <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto p-3">
-      <div
-        style={{
-          height: `${virtualizer.getTotalSize()}px`,
-          width: "100%",
-          position: "relative",
-        }}
-      >
-        {virtualItems.map((vItem) => {
-          const row = flatRows[vItem.index];
-          if (!row) return null;
-          const needsDynamicMeasure =
-            wrapLines || row.kind === "comment_list" || row.kind === "comment_composer";
-          return (
-            <div
-              key={vItem.key}
-              data-index={vItem.index}
-              ref={needsDynamicMeasure ? virtualizer.measureElement : undefined}
-              style={{
-                position: "absolute",
-                top: 0,
-                left: 0,
-                width: "100%",
-                transform: `translateY(${vItem.start}px)`,
-              }}
+    <div
+      ref={containerRef}
+      tabIndex={-1}
+      data-orbit-diff-viewer="true"
+      className="relative flex min-h-0 flex-1 flex-col overflow-hidden outline-none"
+    >
+      {localFindEnabled && findOpen && (
+        <div
+          role="search"
+          aria-label={t("review.findInDiffPlaceholder")}
+          className="floating-surface orbit-find-bar-enter absolute top-2.5 right-4 z-30 flex h-[36px] w-[312px] max-w-[calc(100%-24px)] items-center gap-1.5 rounded-xl border px-2.5"
+        >
+          <Search className="text-ink-tertiary size-[14px] shrink-0" aria-hidden="true" />
+          <input
+            ref={findInputRef}
+            type="text"
+            value={findQuery}
+            onChange={(e) => setFindQuery(e.target.value)}
+            {...findIme.compositionProps}
+            onKeyDown={(e) => {
+              if (findIme.shouldIgnoreKeyDown(e)) return;
+              if (e.key === "Escape") {
+                e.preventDefault();
+                e.stopPropagation();
+                closeDiffFind();
+                return;
+              }
+              if (e.key === "Enter" || e.key === "ArrowDown") {
+                e.preventDefault();
+                stepDiffFind(e.key === "Enter" && e.shiftKey ? -1 : 1);
+                return;
+              }
+              if (e.key === "ArrowUp") {
+                e.preventDefault();
+                stepDiffFind(-1);
+              }
+            }}
+            placeholder={t("review.findInDiffPlaceholder")}
+            aria-label={t("review.findInDiffPlaceholder")}
+            spellCheck={false}
+            autoCorrect="off"
+            className="text-ink-primary placeholder:text-ink-muted min-w-0 flex-1 bg-transparent text-[13px] leading-[1.45] outline-none"
+          />
+          {hasFindQuery && (
+            <span
+              aria-live="polite"
+              className={cn(
+                "shrink-0 font-mono text-[11px] leading-[1.35] tabular-nums select-none",
+                !canStepFind ? "text-signal-danger" : "text-ink-tertiary",
+              )}
             >
-              {renderRow(row)}
-            </div>
-          );
-        })}
+              {canStepFind ? `${clampedFindIndex + 1} / ${findMatches.length}` : "0 / 0"}
+            </span>
+          )}
+          <span aria-hidden="true" className="bg-border-subtle mx-0.5 h-[14px] w-px shrink-0" />
+          <div className="flex shrink-0 items-center gap-0.5">
+            <IconButton
+              size="xs"
+              tooltip={t("stage.findPrevious")}
+              shortcut="⇧↵"
+              disabled={!canStepFind}
+              onClick={() => stepDiffFind(-1)}
+            >
+              <ChevronUp />
+            </IconButton>
+            <IconButton
+              size="xs"
+              tooltip={t("stage.findNext")}
+              shortcut="↵"
+              disabled={!canStepFind}
+              onClick={() => stepDiffFind(1)}
+            >
+              <ChevronDown />
+            </IconButton>
+            <IconButton
+              size="xs"
+              tooltip={t("common.close")}
+              shortcut="Esc"
+              onClick={closeDiffFind}
+            >
+              <X />
+            </IconButton>
+          </div>
+        </div>
+      )}
+
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto p-3">
+        <div
+          style={{
+            height: `${virtualizer.getTotalSize()}px`,
+            width: "100%",
+            position: "relative",
+          }}
+        >
+          {virtualItems.map((vItem) => {
+            const row = flatRows[vItem.index];
+            if (!row) return null;
+            const needsDynamicMeasure =
+              wrapLines || row.kind === "comment_list" || row.kind === "comment_composer";
+            return (
+              <div
+                key={vItem.key}
+                data-index={vItem.index}
+                ref={needsDynamicMeasure ? virtualizer.measureElement : undefined}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  width: "100%",
+                  transform: `translateY(${vItem.start}px)`,
+                }}
+              >
+                {renderRow(row, vItem.index)}
+              </div>
+            );
+          })}
+        </div>
       </div>
     </div>
   );

@@ -184,11 +184,41 @@ export function buildRunningParentThreadKeys(
   return keys;
 }
 
+export interface ParsedSidebarFilterQuery {
+  hostFilters: string[];
+  providerFilters: string[];
+  freeQuery: string;
+  terms: string[];
+}
+
+export function parseSidebarFilterQuery(raw: string): ParsedSidebarFilterQuery {
+  const hostFilters: string[] = [];
+  const providerFilters: string[] = [];
+  const terms: string[] = [];
+  for (const tok of raw.trim().split(/\s+/).filter(Boolean)) {
+    const low = tok.toLowerCase();
+    if (low.startsWith("@host:")) {
+      const val = low.slice("@host:".length);
+      if (val) hostFilters.push(val);
+    } else if (low.startsWith("@provider:")) {
+      const val = low.slice("@provider:".length);
+      if (val) providerFilters.push(val);
+    } else {
+      terms.push(low);
+    }
+  }
+  return { hostFilters, providerFilters, freeQuery: terms.join(" "), terms };
+}
+
 export function matchSidebarThread(params: {
   trimmedFilter: string;
   effectiveTitle: string;
   projectName: string;
   hostDisplayName: string;
+  hostId?: string | null;
+  provider?: string | null;
+  providerLabel?: string | null;
+  branch?: string | null;
   handle?: string | null;
   groupTitle?: string | null;
   singleHostMode: boolean;
@@ -198,25 +228,71 @@ export function matchSidebarThread(params: {
     effectiveTitle,
     projectName,
     hostDisplayName,
+    hostId,
+    provider,
+    providerLabel,
+    branch,
     handle,
     groupTitle,
-    singleHostMode,
   } = params;
   if (!trimmedFilter) return { matched: true };
-  const titleHit = fuzzyMatch(trimmedFilter, effectiveTitle);
+
+  const parsed = parseSidebarFilterQuery(trimmedFilter);
+  if (parsed.hostFilters.length > 0) {
+    const hName = hostDisplayName.toLowerCase();
+    const hId = (hostId ?? "").toLowerCase();
+    if (!parsed.hostFilters.every((f) => hName.includes(f) || hId.includes(f))) {
+      return { matched: false };
+    }
+  }
+  if (parsed.providerFilters.length > 0) {
+    const pSlug = (provider ?? "").toLowerCase();
+    const pLabel = (providerLabel ?? "").toLowerCase();
+    if (!parsed.providerFilters.every((f) => pSlug.includes(f) || pLabel.includes(f))) {
+      return { matched: false };
+    }
+  }
+  if (parsed.terms.length === 0) {
+    return { matched: true };
+  }
+
+  const freeQuery = parsed.freeQuery;
+  const titleHit = fuzzyMatch(freeQuery, effectiveTitle);
   if (titleHit) {
     return { matched: true, titleIndices: titleHit.indices };
   }
-  if (groupTitle && fuzzyMatch(trimmedFilter, groupTitle)) {
+  if (groupTitle && fuzzyMatch(freeQuery, groupTitle)) {
     return { matched: true, groupTitleMatched: true };
   }
-  if (fuzzyMatch(trimmedFilter, projectName)) {
+  const haystack = [
+    effectiveTitle,
+    groupTitle ?? "",
+    projectName,
+    hostDisplayName,
+    hostId ?? "",
+    provider ?? "",
+    providerLabel ?? "",
+    branch ?? "",
+    handle ?? "",
+  ]
+    .join(" ")
+    .toLowerCase();
+  if (parsed.terms.every((t) => haystack.includes(t))) {
     return { matched: true };
   }
-  if (handle && fuzzyMatch(trimmedFilter, handle)) {
+  if (fuzzyMatch(freeQuery, projectName)) {
     return { matched: true };
   }
-  if (!singleHostMode && fuzzyMatch(trimmedFilter, hostDisplayName)) {
+  if (handle && fuzzyMatch(freeQuery, handle)) {
+    return { matched: true };
+  }
+  if (fuzzyMatch(freeQuery, hostDisplayName)) {
+    return { matched: true };
+  }
+  if (providerLabel && fuzzyMatch(freeQuery, providerLabel)) {
+    return { matched: true };
+  }
+  if (branch && fuzzyMatch(freeQuery, branch)) {
     return { matched: true };
   }
   return { matched: false };
@@ -364,6 +440,10 @@ export function buildSidebarDisplayModel(input: BuildSidebarModelInput): Sidebar
       effectiveTitle,
       projectName,
       hostDisplayName: host.display_name,
+      hostId: host.host_id,
+      provider: conv.agent.provider,
+      providerLabel: conv.agent.provider_label,
+      branch: conv.agent.worktree_branch ?? matchedProj?.git_branch ?? null,
       handle: conv.agent.handle,
       groupTitle: groupTitleByThreadKey.get(tKey) ?? null,
       singleHostMode,
@@ -400,6 +480,10 @@ export function buildSidebarDisplayModel(input: BuildSidebarModelInput): Sidebar
       effectiveTitle,
       projectName,
       hostDisplayName: host.display_name,
+      hostId: host.host_id,
+      provider: conv.agent.provider,
+      providerLabel: conv.agent.provider_label,
+      branch: conv.agent.worktree_branch ?? matchedProj?.git_branch ?? null,
       handle: conv.agent.handle,
       groupTitle: groupTitleByThreadKey.get(tKey) ?? null,
       singleHostMode,
@@ -497,6 +581,10 @@ export function buildSidebarDisplayModel(input: BuildSidebarModelInput): Sidebar
             effectiveTitle,
             projectName: proj.name,
             hostDisplayName: host.display_name,
+            hostId: host.host_id,
+            provider: c.agent.provider,
+            providerLabel: c.agent.provider_label,
+            branch: c.agent.worktree_branch ?? proj.git_branch ?? null,
             handle: c.agent.handle,
             groupTitle: localGroupTitleByAgentId.get(c.agent.agent_id) ?? null,
             singleHostMode,

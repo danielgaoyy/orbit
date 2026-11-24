@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef } from "react";
+import { memo, useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import {
   Blocks,
   Columns2,
@@ -31,7 +31,7 @@ import { PanelErrorBoundary } from "@/components/ui/panel-error-boundary";
 import { SubagentAvatar } from "@/components/ui/subagent-avatar";
 import { selectSessionSubagents } from "@/state/selectors/session-selectors";
 import { type MessageKey, useI18n } from "@/lib/i18n";
-import { modSymbol } from "@/lib/keybindings";
+import { useActionShortcutDisplay } from "@/lib/keybindings";
 import {
   type SidePanelTab,
   fileCacheKey,
@@ -40,6 +40,11 @@ import {
   useOrbitSelector,
 } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
+
+interface TabDropIndicator {
+  targetTabId: string;
+  position: "before" | "after";
+}
 
 const SubagentSidePanelTabAvatar = memo(function SubagentSidePanelTabAvatar({
   tab,
@@ -135,6 +140,80 @@ function resolveSidePanelTabTitle(
   }
 }
 
+function renderTransientTabBody(
+  tab: SidePanelTab,
+  selectedHostId: string,
+  selectedWorkspaceCwd: string,
+  paneStyle: CSSProperties | undefined,
+  paneClassName: string,
+) {
+  switch (tab.kind) {
+    case "files":
+      return (
+        <div key={tab.id} style={paneStyle} className={paneClassName}>
+          <PanelErrorBoundary
+            panelName="Files"
+            resetKey={`${selectedHostId}:${selectedWorkspaceCwd ?? ""}`}
+          >
+            <FilesExplorerTab />
+          </PanelErrorBoundary>
+        </div>
+      );
+    case "file":
+      return (
+        <div
+          key={`${tab.id}:${tab.filePath ?? ""}`}
+          style={paneStyle}
+          className={paneClassName}
+        >
+          <PanelErrorBoundary
+            key={`${tab.id}:${tab.filePath ?? ""}`}
+            panelName="File Viewer"
+          >
+            <FileViewerTab tab={tab} />
+          </PanelErrorBoundary>
+        </div>
+      );
+    case "side_question":
+      return (
+        <div key={tab.id} style={paneStyle} className={paneClassName}>
+          <PanelErrorBoundary
+            panelName="Side Question"
+            resetKey={`${selectedHostId}:${tab.id}`}
+          >
+            <SideQuestionTab />
+          </PanelErrorBoundary>
+        </div>
+      );
+    case "subagent":
+      return (
+        <div key={tab.id} style={paneStyle} className={paneClassName}>
+          <PanelErrorBoundary key={tab.id} panelName="Subagent">
+            <SubagentTab tab={tab} />
+          </PanelErrorBoundary>
+        </div>
+      );
+    case "peer":
+      return (
+        <div key={tab.id} style={paneStyle} className={paneClassName}>
+          <PanelErrorBoundary key={tab.id} panelName="Peer Split">
+            <PeerSplitTab tab={tab} />
+          </PanelErrorBoundary>
+        </div>
+      );
+    case "artifacts":
+      return (
+        <div key={tab.id} style={paneStyle} className={paneClassName}>
+          <PanelErrorBoundary key={tab.id} panelName="Artifacts">
+            <ArtifactsTab tab={tab} />
+          </PanelErrorBoundary>
+        </div>
+      );
+    default:
+      return null;
+  }
+}
+
 export function WorkspaceSidePanel() {
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const hasPersistentTab = useOrbitSelector(
@@ -181,9 +260,22 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
   const selectedWorkspaceCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const tabs = useOrbitSelector((s) => s.sidePanelTabs);
   const fileEditorDrafts = useOrbitSelector((s) => s.fileEditorDrafts);
-  const panelElRef = useRef<HTMLElement | null>(null);
-  const tabStripRef = useRef<HTMLDivElement | null>(null);
+  const sidePanelSplit = useOrbitSelector((s) => s.sidePanelSplit);
   const activeTabId = useOrbitSelector((s) => s.activeSidePanelTabId);
+  const newTabShortcut = useActionShortcutDisplay("new_side_tab");
+
+  const panelElRef = useRef<HTMLElement | null>(null);
+  const bodyElRef = useRef<HTMLDivElement | null>(null);
+  const tabStripRef = useRef<HTMLDivElement | null>(null);
+  const tabElRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const suppressNextTabClickRef = useRef(false);
+  const tabDragCleanupRef = useRef<(() => void) | null>(null);
+  const splitResizeCleanupRef = useRef<(() => void) | null>(null);
+
+  const [draggingTabId, setDraggingTabId] = useState<string | null>(null);
+  const [tabDropIndicator, setTabDropIndicator] = useState<TabDropIndicator | null>(null);
+  const [isResizingSplit, setIsResizingSplit] = useState(false);
+
   const hasStreamingSideQuestion = useOrbitSelector((s) => {
     const scope = sideQuestionScopeKey(s);
     const list = s.sideQuestionsByScope[scope];
@@ -209,15 +301,16 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
   });
 
   const resizeCleanupRef = useRef<(() => void) | null>(null);
-  const mod = modSymbol();
 
   useEffect(() => {
     return () => {
       resizeCleanupRef.current?.();
+      tabDragCleanupRef.current?.();
+      splitResizeCleanupRef.current?.();
     };
   }, []);
 
-  // Keep the active side-panel tab scrolled into view when multiple tabs (e.g., subagents) overflow horizontally
+  // Keep the active side-panel tab scrolled into view when multiple tabs overflow horizontally
   useEffect(() => {
     if (!activeTabId || !tabStripRef.current) return;
     const activeEl = tabStripRef.current.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
@@ -232,12 +325,168 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
   }, [activeTabId, tabs.length]);
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
+  const secondaryTab =
+    sidePanelSplit && activeTab && sidePanelSplit.secondaryTabId !== activeTab.id
+      ? (tabs.find((t) => t.id === sidePanelSplit.secondaryTabId) ?? null)
+      : null;
+  const isSplitActive = Boolean(activeTab && secondaryTab);
+  const splitRatio = sidePanelSplit?.ratio ?? 0.5;
+
+  const primaryPaneStyle: CSSProperties | undefined = isSplitActive
+    ? { order: 1, flex: `0 0 ${splitRatio * 100}%`, minWidth: 0 }
+    : undefined;
+  const secondaryPaneStyle: CSSProperties | undefined = isSplitActive
+    ? { order: 3, flex: `1 1 ${(1 - splitRatio) * 100}%`, minWidth: 0 }
+    : undefined;
+
+  const paneSlotForTab = (tabId: string): "primary" | "secondary" | null => {
+    if (!panelVisible) return null;
+    if (activeTab?.id === tabId) return "primary";
+    if (secondaryTab?.id === tabId) return "secondary";
+    return null;
+  };
+
   const hasTerminalTabInBar = tabs.some((t) => t.kind === "terminal");
   const hasAnyPtySession = totalTerminalCount > 0;
-  const isTerminalVisible = panelVisible && activeTab?.kind === "terminal";
+  const terminalTab = tabs.find((t) => t.kind === "terminal") ?? null;
+  const terminalSlot = terminalTab ? paneSlotForTab(terminalTab.id) : null;
+  const isTerminalVisible = terminalSlot !== null;
+
   const hasReviewTab = tabs.some((t) => t.kind === "review");
-  const isReviewVisible = panelVisible && activeTab?.kind === "review";
+  const reviewTab = tabs.find((t) => t.kind === "review") ?? null;
+  const reviewSlot = reviewTab ? paneSlotForTab(reviewTab.id) : null;
+  const isReviewVisible = reviewSlot !== null;
+
   const boardTabs = tabs.filter((t) => t.kind === "board");
+
+  // Pointer-driven zero-rerender horizontal tab drag-reordering (works cleanly in macOS WKWebView)
+  const startTabDrag = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>, sourceTabId: string) => {
+      if (e.button !== 0 || tabs.length < 2) return;
+      if ((e.target as HTMLElement | null)?.closest("button")) return;
+
+      tabDragCleanupRef.current?.();
+      const startX = e.clientX;
+      let hasMoved = false;
+      let latestIndicator: TabDropIndicator | null = null;
+
+      const resolveDropTarget = (clientX: number): TabDropIndicator | null => {
+        let best: { id: string; pos: "before" | "after"; dist: number } | null = null;
+        for (const [id, el] of tabElRefs.current.entries()) {
+          if (id === sourceTabId || !el.isConnected) continue;
+          const rect = el.getBoundingClientRect();
+          const mid = rect.left + rect.width * 0.5;
+          const dist = Math.abs(clientX - mid);
+          if (best === null || dist < best.dist) {
+            best = { id, pos: clientX < mid ? "before" : "after", dist };
+          }
+        }
+        return best ? { targetTabId: best.id, position: best.pos } : null;
+      };
+
+      const onMove = (ev: PointerEvent) => {
+        if (!hasMoved) {
+          if (Math.abs(ev.clientX - startX) < 5) return;
+          hasMoved = true;
+          setDraggingTabId(sourceTabId);
+          document.body.style.cursor = "grabbing";
+        }
+        const next = resolveDropTarget(ev.clientX);
+        if (
+          next?.targetTabId !== latestIndicator?.targetTabId ||
+          next?.position !== latestIndicator?.position
+        ) {
+          latestIndicator = next;
+          setTabDropIndicator(next);
+        }
+      };
+
+      const cleanup = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("pointercancel", onCancel);
+        window.removeEventListener("blur", onCancel);
+        document.body.style.cursor = "";
+        setDraggingTabId(null);
+        setTabDropIndicator(null);
+        if (tabDragCleanupRef.current === cleanup) {
+          tabDragCleanupRef.current = null;
+        }
+      };
+
+      const onUp = () => {
+        if (hasMoved) {
+          suppressNextTabClickRef.current = true;
+          if (latestIndicator) {
+            orbitActions.reorderSidePanelTabs(
+              sourceTabId,
+              latestIndicator.targetTabId,
+              latestIndicator.position,
+            );
+          }
+          window.requestAnimationFrame(() => {
+            suppressNextTabClickRef.current = false;
+          });
+        }
+        cleanup();
+      };
+
+      const onCancel = () => {
+        cleanup();
+      };
+
+      tabDragCleanupRef.current = cleanup;
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onCancel);
+      window.addEventListener("blur", onCancel);
+    },
+    [tabs.length],
+  );
+
+  const startSplitResize = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || !bodyElRef.current) return;
+    e.preventDefault();
+    splitResizeCleanupRef.current?.();
+    const rect = bodyElRef.current.getBoundingClientRect();
+    if (rect.width <= 0) return;
+
+    setIsResizingSplit(true);
+    document.body.style.cursor = "col-resize";
+
+    let rafId: number | null = null;
+    let latestRatio = splitRatio;
+
+    const onMove = (ev: MouseEvent) => {
+      latestRatio = (ev.clientX - rect.left) / rect.width;
+      if (rafId === null) {
+        rafId = window.requestAnimationFrame(() => {
+          rafId = null;
+          orbitActions.setSidePanelSplitRatio(latestRatio);
+        });
+      }
+    };
+
+    const cleanup = () => {
+      if (rafId !== null) {
+        window.cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      setIsResizingSplit(false);
+      document.body.style.cursor = "";
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", cleanup);
+      window.removeEventListener("blur", cleanup);
+      if (splitResizeCleanupRef.current === cleanup) {
+        splitResizeCleanupRef.current = null;
+      }
+    };
+
+    splitResizeCleanupRef.current = cleanup;
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", cleanup);
+    window.addEventListener("blur", cleanup);
+  };
 
   const startResize = (e: React.MouseEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
@@ -299,6 +548,13 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
     orbitActions.equalizeSidePanel(window.innerWidth, activeLeft);
   };
 
+  const styleForSlot = (slot: "primary" | "secondary" | null): CSSProperties | undefined => {
+    if (!isSplitActive || !slot) return undefined;
+    return slot === "primary" ? primaryPaneStyle : secondaryPaneStyle;
+  };
+
+  const transientClass = "orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden";
+
   return (
     <aside
       ref={panelElRef}
@@ -307,7 +563,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
       inert={!shouldOpen}
       data-open={shouldOpen ? "true" : "false"}
       data-animating={isAnimating ? "true" : "false"}
-      data-resizing={isResizingRight ? "true" : "false"}
+      data-resizing={isResizingRight || isResizingSplit ? "true" : "false"}
       onTransitionEnd={onRightTransitionEnd}
       style={{
         width: panelWidthCss,
@@ -335,274 +591,328 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
       )}
 
       {/* Transparent Drag Shield so embedded iframes / WebGL canvases never swallow resize events */}
-      {isResizingRight && <div className="fixed inset-0 z-50 cursor-col-resize select-none" />}
+      {(isResizingRight || isResizingSplit) && (
+        <div className="fixed inset-0 z-50 cursor-col-resize select-none" />
+      )}
 
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {shouldRenderBody && (
           <>
             {/* Flush 40px Two-State Side Panel Header Bar (No-Tab vs With-Tab) */}
-      <div className="@container border-border-subtle flex h-[40px] min-w-0 shrink-0 items-center gap-1 border-b pl-2 pr-[44px]">
-        {tabs.length > 0 ? (
-          <>
-            <div
-              ref={tabStripRef}
-              role="tablist"
-              onWheel={(e) => {
-                const el = tabStripRef.current;
-                if (!el || el.scrollWidth <= el.clientWidth) return;
-                if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
-                  el.scrollLeft += e.deltaY;
-                }
-              }}
-              className="flex h-full min-w-0 items-center gap-0.5 overflow-x-auto pr-2.5 [mask-image:linear-gradient(to_right,black_calc(100%-10px),transparent)] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-            >
-              {tabs.map((tab) => {
-                const isActive = tab.id === activeTab?.id;
-                const isDirtyFile =
-                  tab.kind === "file" &&
-                  Boolean(tab.filePath) &&
-                  Boolean(
-                    fileEditorDrafts[
-                      fileCacheKey(
-                        tab.hostId ?? selectedHostId,
-                        tab.cwd ?? selectedWorkspaceCwd ?? "~",
-                        tab.filePath ?? "",
-                      )
-                    ]?.dirty,
-                  );
-                const showPulseDot =
-                  (tab.kind === "side_question" && hasStreamingSideQuestion) ||
-                  (tab.kind === "terminal" && activeTerminalCount > 0 && !isActive);
-
-                const displayTitle = resolveSidePanelTabTitle(tab, t);
-                return (
+            <div className="@container border-border-subtle flex h-[40px] min-w-0 shrink-0 items-center gap-1 border-b pr-[44px] pl-2">
+              {tabs.length > 0 ? (
+                <>
                   <div
-                    key={tab.id}
-                    role="tab"
-                    aria-selected={isActive}
-                    title={tab.filePath || tab.url || displayTitle}
-                    onClick={() => orbitActions.focusSidePanelTab(tab.id)}
-                    onMouseDown={(e) => {
-                      if (e.button === 1) {
-                        e.preventDefault();
-                        orbitActions.closeSidePanelTab(tab.id);
+                    ref={tabStripRef}
+                    role="tablist"
+                    onWheel={(e) => {
+                      const el = tabStripRef.current;
+                      if (!el || el.scrollWidth <= el.clientWidth) return;
+                      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+                        el.scrollLeft += e.deltaY;
                       }
                     }}
-                    className={cn(
-                      "group/stab relative inline-flex h-[28px] max-w-[116px] shrink-0 cursor-pointer items-center gap-1.5 rounded-[7px] px-2 text-[12px] transition-colors @[380px]:max-w-[144px] @[480px]:max-w-[168px]",
-                      isActive
-                        ? "bg-black/[0.055] text-foreground font-medium dark:bg-white/[0.08]"
-                        : "text-muted-foreground hover:bg-black/[0.04] hover:text-foreground dark:hover:bg-white/[0.05]",
-                    )}
+                    className="flex h-full min-w-0 items-center gap-0.5 overflow-x-auto pr-2.5 [mask-image:linear-gradient(to_right,black_calc(100%-10px),transparent)] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
                   >
-                    <SidePanelTabIcon tab={tab} />
-                    <span className="min-w-0 truncate">{displayTitle}</span>
-                    {isDirtyFile && (
-                      <span
-                        title={t("sidePanel.unsavedChanges")}
-                        className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500/90"
-                      />
-                    )}
-                    {tab.kind === "artifacts" && artifactCount > 0 && (
-                      <span className="text-muted-foreground/75 hidden shrink-0 text-[10.5px] tabular-nums @[380px]:inline">
-                        {artifactCount}
-                      </span>
-                    )}
-                    {showPulseDot && (
-                      <span
-                        className={cn(
-                          "h-1.5 w-1.5 shrink-0 rounded-full",
-                          tab.kind === "side_question"
-                            ? "bg-signal-info animate-pulse"
-                            : "bg-emerald-500/80",
-                        )}
-                      />
-                    )}
+                    {tabs.map((tab) => {
+                      const isPrimary = tab.id === activeTab?.id;
+                      const isSecondary = tab.id === secondaryTab?.id;
+                      const isActive = isPrimary || isSecondary;
+                      const isDirtyFile =
+                        tab.kind === "file" &&
+                        Boolean(tab.filePath) &&
+                        Boolean(
+                          fileEditorDrafts[
+                            fileCacheKey(
+                              tab.hostId ?? selectedHostId,
+                              tab.cwd ?? selectedWorkspaceCwd ?? "~",
+                              tab.filePath ?? "",
+                            )
+                          ]?.dirty,
+                        );
+                      const showPulseDot =
+                        (tab.kind === "side_question" && hasStreamingSideQuestion) ||
+                        (tab.kind === "terminal" && activeTerminalCount > 0 && !isActive);
+
+                      const displayTitle = resolveSidePanelTabTitle(tab, t);
+                      const dropSide =
+                        tabDropIndicator?.targetTabId === tab.id ? tabDropIndicator.position : null;
+
+                      return (
+                        <div
+                          key={tab.id}
+                          ref={(el) => {
+                            if (el) tabElRefs.current.set(tab.id, el);
+                            else tabElRefs.current.delete(tab.id);
+                          }}
+                          role="tab"
+                          aria-selected={isPrimary}
+                          title={tab.filePath || tab.url || displayTitle}
+                          onPointerDown={(e) => startTabDrag(e, tab.id)}
+                          onClick={(e) => {
+                            if (suppressNextTabClickRef.current) return;
+                            if (e.altKey && tabs.length >= 2) {
+                              orbitActions.setSidePanelSecondaryTab(tab.id);
+                            } else {
+                              orbitActions.focusSidePanelTab(tab.id);
+                            }
+                          }}
+                          onMouseDown={(e) => {
+                            if (e.button === 1) {
+                              e.preventDefault();
+                              orbitActions.closeSidePanelTab(tab.id);
+                            }
+                          }}
+                          className={cn(
+                            "group/stab relative inline-flex h-[28px] max-w-[116px] shrink-0 cursor-pointer items-center gap-1.5 rounded-[7px] px-2 text-[12px] transition-colors @[380px]:max-w-[144px] @[480px]:max-w-[168px]",
+                            draggingTabId === tab.id && "opacity-45",
+                            isPrimary
+                              ? "bg-black/[0.055] text-foreground font-medium dark:bg-white/[0.08]"
+                              : isSecondary
+                                ? "border-border-default bg-surface-recessed text-ink-primary border font-medium"
+                                : "text-muted-foreground hover:bg-black/[0.04] hover:text-foreground dark:hover:bg-white/[0.05]",
+                          )}
+                        >
+                          {dropSide === "before" && (
+                            <span className="bg-signal-info pointer-events-none absolute top-1 bottom-1 -left-[1px] z-20 w-[2px] rounded-full" />
+                          )}
+                          {dropSide === "after" && (
+                            <span className="bg-signal-info pointer-events-none absolute top-1 -right-[1px] bottom-1 z-20 w-[2px] rounded-full" />
+                          )}
+                          <SidePanelTabIcon tab={tab} />
+                          <span className="min-w-0 truncate">{displayTitle}</span>
+                          {isDirtyFile && (
+                            <span
+                              title={t("sidePanel.unsavedChanges")}
+                              className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500/90"
+                            />
+                          )}
+                          {tab.kind === "artifacts" && artifactCount > 0 && (
+                            <span className="text-muted-foreground/75 hidden shrink-0 text-[10.5px] tabular-nums @[380px]:inline">
+                              {artifactCount}
+                            </span>
+                          )}
+                          {showPulseDot && (
+                            <span
+                              className={cn(
+                                "h-1.5 w-1.5 shrink-0 rounded-full",
+                                tab.kind === "side_question"
+                                  ? "bg-signal-info animate-pulse"
+                                  : "bg-emerald-500/80",
+                              )}
+                            />
+                          )}
+                          <button
+                            type="button"
+                            aria-label={t("sidePanel.closeTab", { title: displayTitle })}
+                            onMouseDown={(e) => e.stopPropagation()}
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              orbitActions.closeSidePanelTab(tab.id);
+                            }}
+                            className={cn(
+                              "ml-0.5 inline-flex h-[16px] w-[16px] shrink-0 cursor-pointer items-center justify-center rounded transition-opacity hover:bg-black/[0.08] dark:hover:bg-white/[0.12]",
+                              isActive
+                                ? "opacity-65 hover:opacity-100"
+                                : "opacity-0 group-hover/stab:opacity-65 hover:!opacity-100",
+                            )}
+                          >
+                            <X className="h-[11px] w-[11px]" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <SimpleTooltip label={t("sidePanel.newTab")} shortcut={newTabShortcut}>
                     <button
                       type="button"
-                      aria-label={t("sidePanel.closeTab", { title: displayTitle })}
-                      onMouseDown={(e) => e.stopPropagation()}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        orbitActions.closeSidePanelTab(tab.id);
-                      }}
+                      aria-label={t("sidePanel.newTab")}
+                      onClick={() => orbitActions.openSidePanelNewTab()}
                       className={cn(
-                        "ml-0.5 inline-flex h-[16px] w-[16px] shrink-0 cursor-pointer items-center justify-center rounded transition-opacity hover:bg-black/[0.08] dark:hover:bg-white/[0.12]",
-                        isActive
-                          ? "opacity-65 hover:opacity-100"
-                          : "opacity-0 group-hover/stab:opacity-65 hover:!opacity-100",
+                        "inline-flex h-[26px] w-[26px] shrink-0 cursor-pointer items-center justify-center rounded-[7px] transition-colors",
+                        !activeTab
+                          ? "bg-black/[0.06] text-foreground dark:bg-white/[0.09]"
+                          : "text-muted-foreground hover:text-foreground hover:bg-black/[0.045] dark:hover:bg-white/[0.06]",
                       )}
                     >
-                      <X className="h-[11px] w-[11px]" />
+                      <Plus className="h-[15px] w-[15px] stroke-[1.8]" />
                     </button>
+                  </SimpleTooltip>
+
+                  {tabs.length >= 2 && (
+                    <SimpleTooltip
+                      label={
+                        isSplitActive ? t("sidePanel.unsplitPane") : t("sidePanel.splitPane")
+                      }
+                    >
+                      <button
+                        type="button"
+                        aria-label={
+                          isSplitActive ? t("sidePanel.unsplitPane") : t("sidePanel.splitPane")
+                        }
+                        aria-pressed={isSplitActive}
+                        onClick={() =>
+                          isSplitActive
+                            ? orbitActions.closeSidePanelSplit()
+                            : orbitActions.splitSidePanelTab()
+                        }
+                        className={cn(
+                          "inline-flex h-[26px] w-[26px] shrink-0 cursor-pointer items-center justify-center rounded-[7px] transition-colors",
+                          isSplitActive
+                            ? "bg-black/[0.065] text-foreground dark:bg-white/[0.1]"
+                            : "text-muted-foreground hover:text-foreground hover:bg-black/[0.045] dark:hover:bg-white/[0.06]",
+                        )}
+                      >
+                        <Columns2 className="h-[14px] w-[14px] stroke-[1.75]" />
+                      </button>
+                    </SimpleTooltip>
+                  )}
+
+                  <div data-tauri-drag-region className="h-full min-w-2 flex-1" />
+                </>
+              ) : (
+                <div data-tauri-drag-region className="h-full min-w-0 flex-1" />
+              )}
+              {tabs.length > 0 && <WorkspaceScriptsPopover hostId={selectedHostId} />}
+            </div>
+
+            {/* Tab Body Area (Single-pane flex-col OR Dual-split flex-row with zero teardown!) */}
+            <div
+              ref={bodyElRef}
+              className={cn(
+                "relative flex min-h-0 flex-1 overflow-hidden",
+                isSplitActive ? "flex-row" : "flex-col",
+              )}
+            >
+              {/* Persistent WebGL Terminal Pool (never unmounts on tab switch or split toggle!) */}
+              {(hasTerminalTabInBar || hasAnyPtySession) && (
+                <div
+                  style={styleForSlot(terminalSlot)}
+                  className={cn(
+                    "min-h-0 min-w-0 flex-col overflow-hidden",
+                    isTerminalVisible ? "flex flex-1" : "hidden",
+                  )}
+                >
+                  <PanelErrorBoundary panelName="Terminal" resetKey={selectedHostId}>
+                    <TerminalTab selectedHostId={selectedHostId} visible={isTerminalVisible} />
+                  </PanelErrorBoundary>
+                </div>
+              )}
+
+              {/* Persistent Browser Preview Pool */}
+              {tabs
+                .filter((t) => t.kind === "browser")
+                .map((browserTab) => {
+                  const slot = paneSlotForTab(browserTab.id);
+                  const browserVisible = slot !== null;
+                  return (
+                    <div
+                      key={browserTab.id}
+                      style={styleForSlot(slot)}
+                      className={cn(
+                        "min-h-0 min-w-0 flex-col overflow-hidden",
+                        browserVisible ? "flex flex-1" : "hidden",
+                      )}
+                    >
+                      <PanelErrorBoundary
+                        panelName="Browser"
+                        resetKey={browserTab.url ?? ""}
+                      >
+                        <BrowserTab tab={browserTab} visible={browserVisible} />
+                      </PanelErrorBoundary>
+                    </div>
+                  );
+                })}
+
+              {/* Persistent Review Pool */}
+              {hasReviewTab && (
+                <div
+                  style={styleForSlot(reviewSlot)}
+                  className={cn(
+                    "min-h-0 min-w-0 flex-col overflow-hidden",
+                    isReviewVisible ? "flex flex-1" : "hidden",
+                  )}
+                >
+                  <PanelErrorBoundary
+                    panelName="Review"
+                    resetKey={`${selectedHostId}:${selectedWorkspaceCwd ?? ""}`}
+                  >
+                    <ReviewTab
+                      key={`${selectedHostId}:${selectedWorkspaceCwd ?? ""}`}
+                      selectedHostId={selectedHostId}
+                      visible={isReviewVisible}
+                    />
+                  </PanelErrorBoundary>
+                </div>
+              )}
+
+              {/* Persistent Workspace Board Pool */}
+              {boardTabs.map((boardTab) => {
+                const slot = paneSlotForTab(boardTab.id);
+                const isBoardVisible = slot !== null;
+                return (
+                  <div
+                    key={boardTab.id}
+                    style={styleForSlot(slot)}
+                    className={cn(
+                      "min-h-0 min-w-0 flex-col overflow-hidden",
+                      isBoardVisible ? "flex flex-1" : "hidden",
+                    )}
+                  >
+                    <PanelErrorBoundary panelName="Workspace Notes">
+                      <WorkspaceBoardTab tab={boardTab} visible={isBoardVisible} />
+                    </PanelErrorBoundary>
                   </div>
                 );
               })}
-            </div>
 
-            <SimpleTooltip label={t("sidePanel.newTab")} shortcut={`${mod}T`}>
-              <button
-                type="button"
-                aria-label={t("sidePanel.newTab")}
-                onClick={() => orbitActions.openSidePanelNewTab()}
-                className={cn(
-                  "inline-flex h-[26px] w-[26px] shrink-0 cursor-pointer items-center justify-center rounded-[7px] transition-colors",
-                  !activeTab
-                    ? "bg-black/[0.06] text-foreground dark:bg-white/[0.09]"
-                    : "text-muted-foreground hover:text-foreground hover:bg-black/[0.045] dark:hover:bg-white/[0.06]",
+              {/* Resizable Dual-Split Center Divider (order: 2 between Primary=1 and Secondary=3) */}
+              {isSplitActive && (
+                <div
+                  role="separator"
+                  aria-orientation="vertical"
+                  aria-label={t("sidePanel.resizeSplitAria")}
+                  onMouseDown={startSplitResize}
+                  onDoubleClick={() => orbitActions.setSidePanelSplitRatio(0.5)}
+                  style={{ order: 2 }}
+                  className="group/split-sash border-border-subtle relative flex w-[5px] shrink-0 cursor-col-resize items-center justify-center border-x bg-transparent transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.05]"
+                >
+                  <div className="bg-border-default group-hover/split-sash:bg-border-strong h-8 w-[1.5px] rounded-full transition-colors" />
+                </div>
+              )}
+
+              {/* Transient Primary Tab Body */}
+              {activeTab &&
+                renderTransientTabBody(
+                  activeTab,
+                  selectedHostId,
+                  selectedWorkspaceCwd,
+                  primaryPaneStyle,
+                  transientClass,
                 )}
-              >
-                <Plus className="h-[15px] w-[15px] stroke-[1.8]" />
-              </button>
-            </SimpleTooltip>
 
-            <div data-tauri-drag-region className="h-full min-w-2 flex-1" />
-          </>
-        ) : (
-          <div data-tauri-drag-region className="h-full min-w-0 flex-1" />
-        )}
-        {tabs.length > 0 && <WorkspaceScriptsPopover hostId={selectedHostId} />}
-      </div>
+              {/* Transient Secondary Tab Body (when dual split active) */}
+              {secondaryTab &&
+                renderTransientTabBody(
+                  secondaryTab,
+                  selectedHostId,
+                  selectedWorkspaceCwd,
+                  secondaryPaneStyle,
+                  transientClass,
+                )}
 
-      {/* Tab Body Area */}
-      <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
-        {/* Persistent WebGL Terminal Pool (mounted whenever terminal tab or live PTY exists) */}
-        {(hasTerminalTabInBar || hasAnyPtySession) && (
-          <PanelErrorBoundary
-            panelName="Terminal"
-            resetKey={selectedHostId}
-            className={!isTerminalVisible ? "hidden" : undefined}
-          >
-            <TerminalTab selectedHostId={selectedHostId} visible={isTerminalVisible} />
-          </PanelErrorBoundary>
-        )}
-
-        {/* Persistent Browser Preview Pool (kept alive across Side Panel tab switches) */}
-        {tabs
-          .filter((t) => t.kind === "browser")
-          .map((browserTab) => {
-            const browserVisible = panelVisible && activeTab?.id === browserTab.id;
-            return (
-              <PanelErrorBoundary
-                key={browserTab.id}
-                panelName="Browser"
-                resetKey={browserTab.url ?? ""}
-                className={!browserVisible ? "hidden" : undefined}
-              >
-                <BrowserTab tab={browserTab} visible={browserVisible} />
-              </PanelErrorBoundary>
-            );
-          })}
-
-        {/* Persistent Review Pool (kept alive across tab switches within the same workspace; remounted cleanly on host/cwd change) */}
-        {hasReviewTab && (
-          <PanelErrorBoundary
-            panelName="Review"
-            resetKey={`${selectedHostId}:${selectedWorkspaceCwd ?? ""}`}
-            className={!isReviewVisible ? "hidden" : undefined}
-          >
-            <ReviewTab
-              key={`${selectedHostId}:${selectedWorkspaceCwd ?? ""}`}
-              selectedHostId={selectedHostId}
-              visible={isReviewVisible}
-            />
-          </PanelErrorBoundary>
-        )}
-
-        {/* Persistent Workspace Board Pool (kept alive across tab switches so unsaved drafts survive) */}
-        {boardTabs.map((boardTab) => {
-          const isBoardVisible = panelVisible && activeTab?.id === boardTab.id;
-          return (
-            <PanelErrorBoundary
-              key={boardTab.id}
-              panelName="Workspace Notes"
-              className={!isBoardVisible ? "hidden" : undefined}
-            >
-              <WorkspaceBoardTab tab={boardTab} visible={isBoardVisible} />
-            </PanelErrorBoundary>
-          );
-        })}
-
-        {activeTab?.kind === "files" && (
-          <div
-            key={activeTab.id}
-            className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden"
-          >
-            <PanelErrorBoundary
-              panelName="Files"
-              resetKey={`${selectedHostId}:${selectedWorkspaceCwd ?? ""}`}
-            >
-              <FilesExplorerTab />
-            </PanelErrorBoundary>
-          </div>
-        )}
-        {activeTab?.kind === "file" && (
-          <div
-            key={`${activeTab.id}:${activeTab.filePath ?? ""}`}
-            className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden"
-          >
-            <PanelErrorBoundary
-              key={`${activeTab.id}:${activeTab.filePath ?? ""}`}
-              panelName="File Viewer"
-            >
-              <FileViewerTab tab={activeTab} />
-            </PanelErrorBoundary>
-          </div>
-        )}
-        {activeTab?.kind === "side_question" && (
-          <div
-            key={activeTab.id}
-            className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden"
-          >
-            <PanelErrorBoundary
-              panelName="Side Question"
-              resetKey={`${selectedHostId}:${activeTab.id}`}
-            >
-              <SideQuestionTab />
-            </PanelErrorBoundary>
-          </div>
-        )}
-        {activeTab?.kind === "subagent" && (
-          <div
-            key={activeTab.id}
-            className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden"
-          >
-            <PanelErrorBoundary key={activeTab.id} panelName="Subagent">
-              <SubagentTab tab={activeTab} />
-            </PanelErrorBoundary>
-          </div>
-        )}
-        {activeTab?.kind === "peer" && (
-          <div
-            key={activeTab.id}
-            className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden"
-          >
-            <PanelErrorBoundary key={activeTab.id} panelName="Peer Split">
-              <PeerSplitTab tab={activeTab} />
-            </PanelErrorBoundary>
-          </div>
-        )}
-        {activeTab?.kind === "artifacts" && (
-          <div
-            key={activeTab.id}
-            className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden"
-          >
-            <PanelErrorBoundary key={activeTab.id} panelName="Artifacts">
-              <ArtifactsTab tab={activeTab} />
-            </PanelErrorBoundary>
-          </div>
-        )}
-
-        {!activeTab && (
-          <PanelErrorBoundary panelName="Side Panel" resetKey={selectedHostId}>
-            <SidePanelLaunchpad
-              selectedHostId={selectedHostId}
-              isPanelOpen={shouldOpen}
-              isPanelSettled={isSettledOpen}
-            />
-          </PanelErrorBoundary>
-        )}
-      </div>
+              {!activeTab && (
+                <PanelErrorBoundary panelName="Side Panel" resetKey={selectedHostId}>
+                  <SidePanelLaunchpad
+                    selectedHostId={selectedHostId}
+                    isPanelOpen={shouldOpen}
+                    isPanelSettled={isSettledOpen}
+                  />
+                </PanelErrorBoundary>
+              )}
+            </div>
           </>
         )}
       </div>

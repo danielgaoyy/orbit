@@ -4709,6 +4709,7 @@ impl From<FfiRewindAgentRequest> for RewindAgentRequest {
             agent_id: v.agent_id,
             to_before_seq: v.to_before_seq,
             restore_files: v.restore_files,
+            restore_paths: None,
         }
     }
 }

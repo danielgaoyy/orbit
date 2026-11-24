@@ -21,6 +21,7 @@ import {
 
 const EMPTY_FIND_HITS: readonly ConversationSearchHit[] = Object.freeze([]);
 const EMPTY_FIND_MATCHES: readonly StageFindMatch[] = Object.freeze([]);
+const EMPTY_MATCHED_TURN_KEYS: ReadonlySet<string> = new Set();
 
 export interface StageFindJumpArgs {
   index: number;
@@ -60,6 +61,7 @@ export interface StageFindController {
   activeIndex: number;
   totalMatches: number;
   activeTurnKey: string | null;
+  matchedTurnKeys: ReadonlySet<string>;
   hasUnloadedMatches: boolean;
   isActiveMatchUnloaded: boolean;
   isRemoteSearching: boolean;
@@ -406,12 +408,22 @@ export function useStageFind({
     };
   }, []);
 
+  const matchedTurnKeys = useMemo<ReadonlySet<string>>(() => {
+    if (!open || matches.length === 0) return EMPTY_MATCHED_TURN_KEYS;
+    const set = new Set<string>();
+    for (const m of matches) {
+      if (m.turnKey) set.add(m.turnKey);
+    }
+    return set.size > 0 ? set : EMPTY_MATCHED_TURN_KEYS;
+  }, [open, matches]);
+
   return {
     open,
     query,
     activeIndex,
     totalMatches: matches.length,
     activeTurnKey: open && activeMatch?.turnKey ? activeMatch.turnKey : null,
+    matchedTurnKeys,
     hasUnloadedMatches,
     isActiveMatchUnloaded: Boolean(activeMatch?.unloaded),
     isRemoteSearching: remoteLoading,

@@ -6,8 +6,8 @@ import {
 import { registerOrbitLinkOpener } from "@/lib/file-links";
 import {
   type NotificationSoundTone,
-  playSoftNotificationChime,
 } from "@/lib/notification-sound";
+import { dispatchDesktopNotificationWithNativeFallback } from "@/lib/notifications";
 import {
   type CoreNotification,
   type FleetOverviewView,
@@ -606,45 +606,27 @@ function dispatchDesktopNotification(opts: {
   tag?: string;
   tone?: NotificationSoundTone;
   forceEvenIfVisible?: boolean;
+  permissionRequestId?: string | null;
+  isPlanApproval?: boolean;
+  humanOnly?: boolean;
+  riskLevel?: string | null;
+  allowDecision?: string | null;
+  denyDecision?: string | null;
 }): boolean {
-  if (typeof window === "undefined" || !("Notification" in window)) return false;
-  if (Notification.permission !== "granted") return false;
-  if (!opts.forceEvenIfVisible) {
-    if (typeof document !== "undefined" && !document.hidden && document.hasFocus()) return false;
-    if (isInDesktopQuietHours()) return false;
-  }
-
   const snap = kernel.getState();
-  const shouldPlaySound =
-    snap.notifySoundEnabled && (opts.forceEvenIfVisible || !isInDesktopQuietHours());
-  const chimePlayed = shouldPlaySound
-    ? playSoftNotificationChime(opts.tone ?? "default")
-    : false;
-
-  try {
-    const notif = new Notification(opts.title, {
-      body: opts.body,
-      silent: chimePlayed || !snap.notifySoundEnabled,
-      tag: opts.tag,
-    });
-    notif.onclick = () => {
-      void orbitIpc.focusMainWindow().catch(() => undefined);
-      if (typeof window !== "undefined") {
-        window.focus();
-      }
+  return dispatchDesktopNotificationWithNativeFallback(opts, {
+    soundEnabled: snap.notifySoundEnabled,
+    inQuietHours: isInDesktopQuietHours(),
+    onFocusTarget: (hostId, agentId) => {
       orbitActions.closeSettings();
       orbitActions.closeOnboardingGuide(false);
-      if (opts.hostId && opts.agentId) {
-        orbitActions.selectAgent(opts.hostId, opts.agentId);
-      } else if (opts.hostId) {
-        orbitActions.selectHost(opts.hostId);
+      if (hostId && agentId) {
+        orbitActions.selectAgent(hostId, agentId);
+      } else if (hostId) {
+        orbitActions.selectHost(hostId);
       }
-      notif.close();
-    };
-    return true;
-  } catch {
-    return false;
-  }
+    },
+  });
 }
 
 function notifyToast(
@@ -739,13 +721,28 @@ function syncAttentionIndicators(
       if (ag.is_awaiting_permission) {
         if (!notifiedApprovalAgents.has(key)) {
           notifiedApprovalAgents.add(key);
+          const pendingPerm = (detail.pending_permissions ?? []).find(
+            (p) => p.agent_id === ag.agent_id,
+          );
+          const decisions = pendingPerm?.allowed_decisions ?? [];
+          const allowDecision =
+            decisions.find((d) => !/deny|reject|always/i.test(d)) ?? "allow";
+          const denyDecision = decisions.find((d) => /deny|reject/i.test(d)) ?? "deny";
           dispatchDesktopNotification({
             title: `Orbit · ${detail.host.display_name}`,
-            body: `${ag.title} requires your approval`,
+            body: pendingPerm?.title
+              ? `${ag.title}: ${pendingPerm.title}`
+              : `${ag.title} requires your approval`,
             hostId: detail.host.host_id,
             agentId: ag.agent_id,
             tag: `orbit-approval-${detail.host.host_id}-${ag.agent_id}`,
             tone: "approval",
+            permissionRequestId: pendingPerm?.request_id ?? null,
+            isPlanApproval: Boolean(pendingPerm?.plan_approval),
+            humanOnly: Boolean(pendingPerm?.human_only),
+            riskLevel: pendingPerm?.guardian_assessment?.risk_level ?? null,
+            allowDecision,
+            denyDecision,
           });
         }
       } else {

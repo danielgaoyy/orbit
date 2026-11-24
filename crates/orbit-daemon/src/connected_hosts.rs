@@ -648,7 +648,8 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::PeerBridgeOpened { request_id, .. }
         | WireMessage::PreviewTunnelOpened { request_id, .. }
         | WireMessage::McpResourceResponse { request_id, .. }
-        | WireMessage::ArtifactMcpToolResponse { request_id, .. } => Some(*request_id),
+        | WireMessage::ArtifactMcpToolResponse { request_id, .. }
+        | WireMessage::RewindPreviewResult { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }
         | WireMessage::ArtifactDeleted { request_id, .. }

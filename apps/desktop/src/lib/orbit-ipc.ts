@@ -2674,6 +2674,13 @@ export interface SessionBackgroundTaskView {
   log_path?: string | null;
 }
 
+export interface SubagentLineageStepView {
+  host_id: string;
+  host_name?: string | null;
+  agent_id: string;
+  title: string;
+}
+
 export interface SessionSubagentEntryView {
   id: string;
   role: string;
@@ -2682,6 +2689,65 @@ export interface SessionSubagentEntryView {
   child_agent_id: string | null;
   provider_subagent_id?: string | null;
   last_seq: number;
+  host_id?: string | null;
+  host_name?: string | null;
+  parent_agent_id?: string | null;
+  parent_host_id?: string | null;
+  depth?: number;
+  lineage?: SubagentLineageStepView[];
+}
+
+export type RewindCheckpointKind = "git_tree" | "recorded_diffs" | "none";
+
+export interface RewindPreviewFileView {
+  path: string;
+  action: "modify" | "delete" | "restore" | string;
+  additions: number;
+  deletions: number;
+  reverse_unified_diff: string;
+  has_external_conflict: boolean;
+  diff_file?: DiffFileView | null;
+}
+
+export interface RewindPreviewView {
+  agent_id: string;
+  to_seq: number;
+  checkpoint_kind: RewindCheckpointKind;
+  files: RewindPreviewFileView[];
+  external_conflicts: string[];
+}
+
+export interface NativeApprovalNotificationRequest {
+  host_id: string;
+  agent_id: string;
+  permission_request_id?: string | null;
+  title: string;
+  body: string;
+  is_plan_approval?: boolean;
+  human_only?: boolean;
+  risk_level?: string | null;
+  allow_decision?: string | null;
+  deny_decision?: string | null;
+}
+
+export interface NativeNotificationDispatchResult {
+  delivered: boolean;
+  interactive: boolean;
+  actions_mode: "approve_deny_open" | "open_to_review_only" | string;
+  backend: string;
+}
+
+export interface NativeNotificationOpenPayload {
+  host_id: string;
+  agent_id: string;
+  permission_request_id?: string | null;
+}
+
+export interface NativeNotificationResolvedPayload {
+  host_id: string;
+  agent_id: string;
+  permission_request_id: string;
+  decision: string;
 }
 
 export interface SessionPullRequestView {
@@ -2720,6 +2786,7 @@ export interface SessionInsightsView {
   touched_files: SessionTouchedFileView[];
   background_tasks: SessionBackgroundTaskView[];
   subagents: SessionSubagentEntryView[];
+  ancestor_lineage?: SubagentLineageStepView[];
   detected_local_urls: string[];
   pull_requests?: SessionPullRequestView[];
   detected_links?: SessionLinkView[];
@@ -4864,11 +4931,33 @@ export const orbitIpc = {
     await invoke<void>("refresh_pending_permissions", { hostId });
   },
 
+  previewRewindAgent: async (
+    hostId: string,
+    agentId: string,
+    toSeq: number,
+  ): Promise<RewindPreviewView> => {
+    if (!isTauriRuntime()) {
+      return {
+        agent_id: agentId,
+        to_seq: toSeq,
+        checkpoint_kind: "none",
+        files: [],
+        external_conflicts: [],
+      };
+    }
+    return invoke<RewindPreviewView>("preview_rewind_agent", {
+      hostId,
+      agentId,
+      toSeq,
+    });
+  },
+
   rewindAgent: async (
     hostId: string,
     agentId: string,
     toBeforeSeq: number,
     restoreFiles: boolean,
+    restorePaths?: string[] | null,
   ): Promise<RewindAgentResultView> => {
     if (!isTauriRuntime()) {
       throw new Error("Rewind is unavailable outside the desktop runtime");
@@ -4878,7 +4967,22 @@ export const orbitIpc = {
       agentId,
       toBeforeSeq,
       restoreFiles,
+      restorePaths: restorePaths ?? null,
     });
+  },
+
+  sendNativeApprovalNotification: async (
+    req: NativeApprovalNotificationRequest,
+  ): Promise<NativeNotificationDispatchResult> => {
+    if (!isTauriRuntime()) {
+      return {
+        delivered: false,
+        interactive: false,
+        actions_mode: "open_to_review_only",
+        backend: "web",
+      };
+    }
+    return invoke<NativeNotificationDispatchResult>("send_native_approval_notification", { req });
   },
   forkAgent: async (req: ForkAgentRequest): Promise<ForkAgentResultView> => {
     if (!isTauriRuntime()) {
@@ -7021,6 +7125,24 @@ export const orbitIpc = {
     if (!isTauriRuntime()) return () => {};
     return listen("orbit://tray-new-conversation", () => {
       handler();
+    });
+  },
+
+  onNativeNotificationOpen: async (
+    handler: (payload: NativeNotificationOpenPayload) => void,
+  ): Promise<() => void> => {
+    if (!isTauriRuntime()) return () => {};
+    return listen<NativeNotificationOpenPayload>("orbit://notification-open", (ev) => {
+      if (ev.payload) handler(ev.payload);
+    });
+  },
+
+  onNativeNotificationResolved: async (
+    handler: (payload: NativeNotificationResolvedPayload) => void,
+  ): Promise<() => void> => {
+    if (!isTauriRuntime()) return () => {};
+    return listen<NativeNotificationResolvedPayload>("orbit://notification-action-resolved", (ev) => {
+      if (ev.payload) handler(ev.payload);
     });
   },
 

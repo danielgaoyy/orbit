@@ -284,7 +284,29 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
 
   if (entries.length === 0) return null;
 
-  const openSubagentRecord = (subagent: ResolvedSubagentItem) => openSubagent(agentId, subagent);
+  const openSubagentRecord = (subagent: ResolvedSubagentItem) =>
+    openSubagent(subagent.parentAgentId || agentId, subagent);
+
+  // Map each direct child agent ID to its recursive descendants (depth > 1) so milestone rows
+  // surface multi-level Parent -> Child -> Grandchild lineage cleanly inline.
+  const nestedByRootChildId = useMemo(() => {
+    const map = new Map<string, SubagentMaybeWithAvatar[]>();
+    if (!sessionSubagents || sessionSubagents.length === 0) return map;
+    for (const sa of sessionSubagents) {
+      const depth = sa.depth ?? 1;
+      if (depth <= 1) continue;
+      // Find the top-level child ancestor in lineage (index 1 is depth 1 after index 0 root)
+      const rootChildId =
+        sa.lineage && sa.lineage.length >= 3
+          ? sa.lineage[1]?.agent_id
+          : sa.parentAgentId;
+      if (!rootChildId) continue;
+      const bucket = map.get(rootChildId);
+      if (bucket) bucket.push(sa);
+      else map.set(rootChildId, [sa]);
+    }
+    return map;
+  }, [sessionSubagents]);
 
   return (
     <div className="flex min-w-0 flex-col gap-0.5">
@@ -303,31 +325,91 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
           } as const;
           const isFailed = effectiveStatus === "failed";
           const isAwaiting = effectiveStatus === "awaiting_permission";
+          const nestedDescendants = subagent.childAgentId
+            ? (nestedByRootChildId.get(subagent.childAgentId) ?? [])
+            : [];
 
           return (
-            <SubagentDispatchRow
-              key={entry.key}
-              title={subagent.promptPreview || t("stage.openTargetInPanel", { target: name })}
-              onClick={() => openSubagentRecord(subagent)}
-              tone={isFailed ? "danger" : isAwaiting ? "warning" : "normal"}
-              name={name}
-              statusLabel={t(statusKey[effectiveStatus])}
-              avatar={
-                <SubagentAvatar
-                  character={character}
-                  status={effectiveStatus}
-                  size="sm"
-                  showStatusBadge={
-                    effectiveStatus === "completed" || isFailed || effectiveStatus === "canceled"
-                  }
-                />
-              }
-              trailing={
-                (effectiveStatus === "running" || isAwaiting) && entry.startedAtMs != null ? (
-                  <InlineLiveElapsed startedAtMs={entry.startedAtMs} stallLabel={null} />
-                ) : undefined
-              }
-            />
+            <div key={entry.key} className="flex min-w-0 flex-col gap-0.5">
+              <SubagentDispatchRow
+                title={subagent.promptPreview || t("stage.openTargetInPanel", { target: name })}
+                onClick={() => openSubagentRecord(subagent)}
+                tone={isFailed ? "danger" : isAwaiting ? "warning" : "normal"}
+                name={name}
+                statusLabel={t(statusKey[effectiveStatus])}
+                avatar={
+                  <SubagentAvatar
+                    character={character}
+                    status={effectiveStatus}
+                    size="sm"
+                    showStatusBadge={
+                      effectiveStatus === "completed" || isFailed || effectiveStatus === "canceled"
+                    }
+                  />
+                }
+                trailing={
+                  (effectiveStatus === "running" || isAwaiting) && entry.startedAtMs != null ? (
+                    <InlineLiveElapsed startedAtMs={entry.startedAtMs} stallLabel={null} />
+                  ) : undefined
+                }
+              />
+              {nestedDescendants.length > 0 && (
+                <div className="ml-3.5 flex min-w-0 flex-col gap-0.5 border-l border-border-subtle/80 pl-2.5">
+                  {nestedDescendants.map((desc) => {
+                    const descName = desc.title === "Subagent" ? subagentFallback : desc.title;
+                    const descStatus = desc.status;
+                    const descFailed = descStatus === "failed";
+                    const descAwaiting = descStatus === "awaiting_permission";
+                    const descChar =
+                      desc.character ??
+                      resolveSubagentCharacter(
+                        desc.childAgentId || desc.providerSubagentId || desc.callId || desc.key,
+                      );
+                    const extraIndent = Math.min(Math.max(0, (desc.depth ?? 2) - 2), 4) * 12;
+                    const descStatusKey = {
+                      running: "overview.subagentWorking",
+                      awaiting_permission: "overview.subagentApprovalRequired",
+                      failed: "overview.subagentFailed",
+                      completed: "stage.subagentDone",
+                      canceled: "overview.subagentStopped",
+                    } as const;
+                    const descTooltip = [
+                      desc.lineage && desc.lineage.length > 1
+                        ? desc.lineage.map((step) => step.title).join(" → ")
+                        : null,
+                      desc.promptPreview || t("stage.openTargetInPanel", { target: descName }),
+                    ]
+                      .filter(Boolean)
+                      .join("\n");
+                    return (
+                      <div
+                        key={desc.key}
+                        style={extraIndent > 0 ? { paddingLeft: `${extraIndent}px` } : undefined}
+                        className="min-w-0"
+                      >
+                        <SubagentDispatchRow
+                          title={descTooltip}
+                          onClick={() => openSubagentRecord(desc)}
+                          tone={descFailed ? "danger" : descAwaiting ? "warning" : "normal"}
+                          name={descName}
+                          statusLabel={t(descStatusKey[descStatus])}
+                          avatar={
+                            <SubagentAvatar
+                              character={descChar}
+                              status={descStatus}
+                              size="xs"
+                              showStatusBadge={
+                                descStatus === "completed" || descFailed || descStatus === "canceled"
+                              }
+                            />
+                          }
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
           );
         }
 

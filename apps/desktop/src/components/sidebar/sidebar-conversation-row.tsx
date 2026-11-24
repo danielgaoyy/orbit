@@ -224,10 +224,24 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
       ref={setCombinedRef}
       onPointerDown={onStartThreadDrag ? handlePointerDown : undefined}
       title={hoverTooltip}
-      onClick={() => {
+      onClick={(e) => {
         if (shouldSuppressClick?.()) return;
         if (!isRenaming) {
-          orbitActions.selectAgent(host.host_id, agent.agent_id);
+          if (e.metaKey || e.ctrlKey) {
+            const snap = orbitActions.getSnapshot();
+            if (
+              snap.workspacePanel === "conversation" &&
+              !snap.isDraftNewSession &&
+              snap.selectedHostId &&
+              snap.selectedAgentId &&
+              (snap.selectedHostId !== host.host_id || snap.selectedAgentId !== agent.agent_id)
+            ) {
+              orbitActions.pinOverviewLane(snap.selectedHostId, snap.selectedAgentId);
+            }
+            orbitActions.pinOverviewLane(host.host_id, agent.agent_id);
+          } else {
+            orbitActions.selectAgent(host.host_id, agent.agent_id);
+          }
         }
       }}
       onContextMenu={(e) => {

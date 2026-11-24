@@ -20,6 +20,7 @@ pub mod math;
 pub mod render;
 pub mod sidebar;
 pub mod stage;
+pub mod subagents;
 
 use std::collections::HashMap;
 use std::path::Path;

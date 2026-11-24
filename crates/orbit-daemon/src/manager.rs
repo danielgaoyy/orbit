@@ -35,8 +35,9 @@ use uuid::Uuid;
 
 use crate::fast_copy::{DirShareMode, link_or_clone_dir};
 use crate::git::{
-    capture_git_tree_snapshot, inspect_git_status, resolve_git_scope, restore_git_tree_snapshot,
-    reverse_apply_file_edit_diffs,
+    capture_git_tree_snapshot, inspect_git_status, preview_file_edit_diffs_restore,
+    preview_git_tree_snapshot_restore, resolve_git_scope, restore_git_tree_snapshot_filtered,
+    reverse_apply_file_edit_diffs_filtered,
 };
 use crate::keep_awake::KeepAwakeManager;
 use crate::messaging::{
@@ -69,6 +70,15 @@ pub struct RewindAgentOutcome {
     pub restored_files: u32,
     pub restored_prompt: Option<String>,
     pub notice: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RewindPreviewOutcome {
+    pub agent_id: String,
+    pub to_seq: u64,
+    pub checkpoint_kind: orbit_protocol::RewindCheckpointKind,
+    pub files: Vec<orbit_protocol::RewindPreviewFile>,
+    pub external_conflicts: Vec<String>,
 }
 
 pub struct ForkAgentSpec {
@@ -6676,6 +6686,105 @@ impl AgentOrchestrator {
         );
     }
 
+    /// Preview file-level changes and external conflicts before rewinding an agent session.
+    /// Strictly read-only: never stops the driver, mutates SQLite, or writes workspace files.
+    pub async fn preview_rewind_agent(
+        &self,
+        agent_id: &str,
+        to_seq: u64,
+    ) -> anyhow::Result<RewindPreviewOutcome> {
+        if to_seq == 0 {
+            anyhow::bail!("invalid rewind target sequence");
+        }
+        let aid_get = agent_id.to_string();
+        let existing = self
+            .try_store(move |s| -> anyhow::Result<AgentSummary> {
+                s.get_agent(&aid_get)?
+                    .ok_or_else(|| anyhow::anyhow!("agent `{aid_get}` not found"))
+            })
+            .await?;
+
+        let cwd_path = PathBuf::from(&existing.cwd);
+        let aid_cp = agent_id.to_string();
+        let (checkpoint_oid, from_events) = self
+            .try_store(move |s| -> anyhow::Result<_> {
+                let cp = s.get_turn_checkpoint(&aid_cp, to_seq)?;
+                let evs = s.fetch_timeline_from(&aid_cp, to_seq).unwrap_or_default();
+                Ok((cp, evs))
+            })
+            .await?;
+
+        let recorded_edits: Vec<(String, String)> = from_events
+            .iter()
+            .filter_map(|ev| match &ev.payload {
+                TimelinePayload::ToolCall {
+                    status: ToolCallStatus::Completed,
+                    detail:
+                        ToolCallDetail::FileEdit {
+                            path,
+                            unified_diff: Some(diff),
+                        },
+                    ..
+                } if !diff.trim().is_empty() => Some((path.clone(), diff.clone())),
+                _ => None,
+            })
+            .collect();
+
+        if let Some(tree_oid) = checkpoint_oid {
+            match preview_git_tree_snapshot_restore(&cwd_path, &tree_oid, &recorded_edits).await {
+                Ok((files, external_conflicts)) => {
+                    return Ok(RewindPreviewOutcome {
+                        agent_id: agent_id.to_string(),
+                        to_seq,
+                        checkpoint_kind: orbit_protocol::RewindCheckpointKind::GitTree,
+                        files,
+                        external_conflicts,
+                    });
+                }
+                Err(_) if !recorded_edits.is_empty() => {
+                    let (files, external_conflicts) =
+                        preview_file_edit_diffs_restore(&cwd_path, &recorded_edits).await;
+                    return Ok(RewindPreviewOutcome {
+                        agent_id: agent_id.to_string(),
+                        to_seq,
+                        checkpoint_kind: orbit_protocol::RewindCheckpointKind::RecordedDiffs,
+                        files,
+                        external_conflicts,
+                    });
+                }
+                Err(_) => {
+                    return Ok(RewindPreviewOutcome {
+                        agent_id: agent_id.to_string(),
+                        to_seq,
+                        checkpoint_kind: orbit_protocol::RewindCheckpointKind::None,
+                        files: Vec::new(),
+                        external_conflicts: Vec::new(),
+                    });
+                }
+            }
+        }
+
+        if !recorded_edits.is_empty() {
+            let (files, external_conflicts) =
+                preview_file_edit_diffs_restore(&cwd_path, &recorded_edits).await;
+            return Ok(RewindPreviewOutcome {
+                agent_id: agent_id.to_string(),
+                to_seq,
+                checkpoint_kind: orbit_protocol::RewindCheckpointKind::RecordedDiffs,
+                files,
+                external_conflicts,
+            });
+        }
+
+        Ok(RewindPreviewOutcome {
+            agent_id: agent_id.to_string(),
+            to_seq,
+            checkpoint_kind: orbit_protocol::RewindCheckpointKind::None,
+            files: Vec::new(),
+            external_conflicts: Vec::new(),
+        })
+    }
+
     /// Rewind an agent to strictly before `to_before_seq`:
     /// 1. Increments the agent's lifecycle generation, gracefully stops any live provider driver,
     ///    and awaits its shutdown/ingestion drain before touching workspace files or SQLite.
@@ -6689,6 +6798,7 @@ impl AgentOrchestrator {
         agent_id: &str,
         to_before_seq: u64,
         restore_files: bool,
+        restore_paths: Option<Vec<String>>,
         origin_session_id: Uuid,
     ) -> anyhow::Result<RewindAgentOutcome> {
         if to_before_seq == 0 {
@@ -6736,14 +6846,27 @@ impl AgentOrchestrator {
                 .collect();
 
             if let Some(tree_oid) = checkpoint_oid {
-                match restore_git_tree_snapshot(&cwd_path, &tree_oid).await {
+                match restore_git_tree_snapshot_filtered(
+                    &cwd_path,
+                    &tree_oid,
+                    restore_paths.as_deref(),
+                )
+                .await
+                {
                     Ok(count) => {
                         restored_files = count;
                     }
+                    Err(err) if err.to_string().contains("path traversal guard") => {
+                        return Err(err);
+                    }
                     Err(err) => {
                         if !fallback_edits.is_empty() {
-                            restored_files =
-                                reverse_apply_file_edit_diffs(&cwd_path, &fallback_edits).await;
+                            restored_files = reverse_apply_file_edit_diffs_filtered(
+                                &cwd_path,
+                                &fallback_edits,
+                                restore_paths.as_deref(),
+                            )
+                            .await?;
                             notice = Some(format!(
                                 "Checkpoint unavailable ({err}); reverted {restored_files} file(s) from recorded diffs."
                             ));
@@ -6757,11 +6880,19 @@ impl AgentOrchestrator {
             } else if !fallback_edits.is_empty() {
                 let expected_paths: std::collections::HashSet<&str> =
                     fallback_edits.iter().map(|(p, _)| p.as_str()).collect();
-                restored_files = reverse_apply_file_edit_diffs(&cwd_path, &fallback_edits).await;
-                if (restored_files as usize) < expected_paths.len() {
+                restored_files = reverse_apply_file_edit_diffs_filtered(
+                    &cwd_path,
+                    &fallback_edits,
+                    restore_paths.as_deref(),
+                )
+                .await?;
+                let expected_count = restore_paths
+                    .as_ref()
+                    .map(Vec::len)
+                    .unwrap_or(expected_paths.len());
+                if (restored_files as usize) < expected_count {
                     notice = Some(format!(
-                        "Reverted {restored_files} of {} edited file(s) from recorded diffs (some files changed externally).",
-                        expected_paths.len()
+                        "Reverted {restored_files} of {expected_count} edited file(s) from recorded diffs (some files changed externally)."
                     ));
                 }
             } else {

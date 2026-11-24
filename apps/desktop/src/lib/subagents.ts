@@ -5,8 +5,11 @@ import type {
   ProviderKind,
   ProviderSubagentDescriptor,
   SessionSubagentEntryView,
+  SubagentLineageStepView,
   TimelineItemView,
 } from "@/lib/orbit-ipc";
+
+export const MAX_SUBAGENT_LINEAGE_DEPTH = 8;
 
 function isAgentForegroundRunningLocal(
   agent: Pick<AgentCardView, "is_running" | "has_background_tasks" | "status_label">,
@@ -62,6 +65,14 @@ export interface ResolvedSubagentItem {
   activeStartedAtMs?: number | null;
   /** Sort tie-breaker (higher = more recent) */
   sortOrder: number;
+  /** Nesting depth relative to the inspected root session (1 = direct child, 2 = grandchild, up to 8). */
+  depth?: number;
+  /** Direct parent agent ID in multi-level subagent trees. */
+  parentAgentId?: string | null;
+  /** Direct parent host ID in cross-host multi-level subagent trees. */
+  parentHostId?: string | null;
+  /** Full breadcrumb lineage from root ancestor to this subagent. */
+  lineage?: readonly SubagentLineageStepView[];
 }
 
 const STATUS_PRIORITY: Record<ResolvedSubagentStatus, number> = {
@@ -150,11 +161,88 @@ function normalizeSubagentName(value: string): string {
   return value.trim().toLowerCase().replace(/^@/, "").replace(/[-_\s]+/g, " ").trim();
 }
 
+function buildHostNameMap(
+  fleetHosts: readonly HostCardView[],
+  hostDetails: Record<string, HostDetailView>,
+): Map<string, string> {
+  const hostNameById = new Map<string, string>();
+  for (const h of fleetHosts) {
+    hostNameById.set(h.host_id, h.display_name || h.host_id);
+  }
+  for (const [hid, detail] of Object.entries(hostDetails)) {
+    if (!hostNameById.has(hid)) {
+      hostNameById.set(hid, detail.host.display_name || hid);
+    }
+  }
+  return hostNameById;
+}
+
 /**
- * Resolves a single unified, deduplicated list of subagents for a parent conversation,
+ * Resolves the cycle-safe, depth-bounded (`<= 8`) ancestor breadcrumb chain (`Root -> ... -> Current`)
+ * for an agent. Prefers Rust ViewModel `stageAncestorLineage` when present, falling back to live
+ * `hostDetails` traversal before stage hydration completes.
+ */
+export function resolveAgentAncestorLineage(params: {
+  hostId: string | null | undefined;
+  agentId: string | null | undefined;
+  stageAncestorLineage?: readonly SubagentLineageStepView[] | null;
+  hostDetails: Record<string, HostDetailView>;
+  fleetHosts: readonly HostCardView[];
+}): SubagentLineageStepView[] {
+  const { hostId, agentId, stageAncestorLineage, hostDetails, fleetHosts } = params;
+  if (stageAncestorLineage && stageAncestorLineage.length > 0) {
+    return [...stageAncestorLineage];
+  }
+  if (!hostId || !agentId) return [];
+
+  const hostNameById = buildHostNameMap(fleetHosts, hostDetails);
+  const byComposite = new Map<string, { hostId: string; agent: AgentCardView }>();
+  const byAgentId = new Map<string, { hostId: string; agent: AgentCardView }>();
+  for (const [hid, detail] of Object.entries(hostDetails)) {
+    for (const ag of detail.agents) {
+      byComposite.set(`${hid}::${ag.agent_id}`, { hostId: hid, agent: ag });
+      if (!byAgentId.has(ag.agent_id)) {
+        byAgentId.set(ag.agent_id, { hostId: hid, agent: ag });
+      }
+    }
+  }
+
+  const chain: SubagentLineageStepView[] = [];
+  const visited = new Set<string>();
+  let curHostId = hostId;
+  let curAgentId = agentId;
+
+  for (let hop = 0; hop <= MAX_SUBAGENT_LINEAGE_DEPTH; hop += 1) {
+    const key = `${curHostId}::${curAgentId}`;
+    if (visited.has(key)) break;
+    visited.add(key);
+
+    const found = byComposite.get(key) ?? byAgentId.get(curAgentId);
+    if (!found) break;
+
+    chain.push({
+      host_id: found.hostId,
+      host_name: hostNameById.get(found.hostId) ?? found.hostId,
+      agent_id: found.agent.agent_id,
+      title: found.agent.title || found.agent.agent_id,
+    });
+
+    const nextParentId = found.agent.parent_agent_id;
+    if (!nextParentId) break;
+    const nextParentHost = found.agent.parent_host_id || found.hostId;
+    curHostId = nextParentHost;
+    curAgentId = nextParentId;
+  }
+
+  chain.reverse();
+  return chain;
+}
+
+/**
+ * Resolves a single unified, deduplicated multi-level tree of subagents for a parent conversation,
  * combining:
- * 1. Rust-projected `stage.insights.subagents` (timeline calls + local managed + provider native)
- * 2. Orbit managed child agents across ALL hosts (including cross-host delegations)
+ * 1. Rust-projected `stage.insights.subagents` (recursive cross-host descendants up to depth 8 + timeline calls)
+ * 2. Live Orbit managed descendants across ALL hosts (cycle-safe, max depth 8)
  * 3. Live provider native subagent descriptors from `hostDetails[hostId].provider_subagents`
  */
 export function resolveSessionSubagents(params: {
@@ -167,45 +255,147 @@ export function resolveSessionSubagents(params: {
   const { hostId, agentId, insightsSubagents, hostDetails, fleetHosts } = params;
   if (!hostId || !agentId) return [];
 
-  const hostNameById = new Map<string, string>();
-  for (const h of fleetHosts) {
-    hostNameById.set(h.host_id, h.display_name || h.host_id);
-  }
-  for (const [hid, detail] of Object.entries(hostDetails)) {
-    if (!hostNameById.has(hid)) {
-      hostNameById.set(hid, detail.host.display_name || hid);
-    }
-  }
+  const hostNameById = buildHostNameMap(fleetHosts, hostDetails);
 
-  // 1. Index all Orbit managed children (across all hosts) and archived agent IDs
-  const managedById = new Map<
-    string,
-    { childHostId: string; remoteHostName: string | null; agent: AgentCardView; run: ManagedRun }
-  >();
-  const archivedManagedIds = new Set<string>();
+  // Build global agent lookup and parent -> direct-children adjacency across all hosts.
+  type ManagedNode = {
+    childHostId: string;
+    remoteHostName: string | null;
+    agent: AgentCardView;
+    run: ManagedRun;
+  };
+  const allAgentsByComposite = new Map<string, ManagedNode>();
+  const allAgentsById = new Map<string, ManagedNode>();
+  const childrenByParent = new Map<string, ManagedNode[]>();
+  const rootNode = (() => {
+    const ag = hostDetails[hostId]?.agents.find((a) => a.agent_id === agentId);
+    return {
+      host_id: hostId,
+      host_name: hostNameById.get(hostId) ?? hostId,
+      agent_id: agentId,
+      title: ag?.title || agentId,
+    } satisfies SubagentLineageStepView;
+  })();
 
-  // Workspace peers have no parent pointer. Their dispatch result identifies them.
-  const dispatchedIds = new Set(insightsSubagents.map((sa) => sa.child_agent_id));
   for (const [hid, detail] of Object.entries(hostDetails)) {
     const runs = managedRuns(hid, detail.agents);
     for (const ag of detail.agents) {
-      const matchesParent =
-        ag.parent_agent_id === agentId &&
-        (!ag.parent_host_id || ag.parent_host_id === hostId);
-      if (!matchesParent && !(ag.agent_id.startsWith("ag_") && dispatchedIds.has(ag.agent_id))) continue;
-
-      const run = runs.get(ag.agent_id)!;
-      if (ag.archived_at_rfc3339 && !isSubagentActiveStatus(run.status)) {
-        archivedManagedIds.add(ag.agent_id);
-        continue;
-      }
-
-      managedById.set(ag.agent_id, {
+      const node: ManagedNode = {
         childHostId: hid,
         remoteHostName: hid !== hostId ? (hostNameById.get(hid) ?? hid) : null,
         agent: ag,
-        run,
+        run: runs.get(ag.agent_id)!,
+      };
+      allAgentsByComposite.set(`${hid}::${ag.agent_id}`, node);
+      if (!allAgentsById.has(ag.agent_id)) {
+        allAgentsById.set(ag.agent_id, node);
+      }
+      if (ag.parent_agent_id) {
+        const pHost = ag.parent_host_id || hid;
+        const pKey = `${pHost}::${ag.parent_agent_id}`;
+        const list = childrenByParent.get(pKey);
+        if (list) list.push(node);
+        else childrenByParent.set(pKey, [node]);
+      }
+    }
+  }
+
+  // 1. Collect cycle-safe recursive descendants (max depth 8) across all hosts + dispatched peers
+  const managedById = new Map<
+    string,
+    ManagedNode & {
+      depth: number;
+      parentAgentId: string;
+      parentHostId: string;
+      lineage: SubagentLineageStepView[];
+    }
+  >();
+  const archivedManagedIds = new Set<string>();
+  const visitedNodes = new Set<string>([`${hostId}::${agentId}`]);
+
+  const queue: Array<{
+    node: ManagedNode;
+    depth: number;
+    parentAgentId: string;
+    parentHostId: string;
+    lineage: SubagentLineageStepView[];
+  }> = [];
+
+  const enqueueNode = (
+    node: ManagedNode,
+    depth: number,
+    parentAgentId: string,
+    parentHostId: string,
+    parentLineage: readonly SubagentLineageStepView[],
+  ) => {
+    if (depth > MAX_SUBAGENT_LINEAGE_DEPTH) return;
+    const composite = `${node.childHostId}::${node.agent.agent_id}`;
+    if (visitedNodes.has(composite)) return;
+    visitedNodes.add(composite);
+
+    const step: SubagentLineageStepView = {
+      host_id: node.childHostId,
+      host_name: hostNameById.get(node.childHostId) ?? node.childHostId,
+      agent_id: node.agent.agent_id,
+      title: node.agent.title || node.agent.agent_id,
+    };
+    const nextLineage = [...parentLineage, step];
+
+    if (node.agent.archived_at_rfc3339 && !isSubagentActiveStatus(node.run.status)) {
+      archivedManagedIds.add(node.agent.agent_id);
+    } else {
+      managedById.set(node.agent.agent_id, {
+        ...node,
+        depth,
+        parentAgentId,
+        parentHostId,
+        lineage: nextLineage,
       });
+    }
+
+    queue.push({
+      node,
+      depth,
+      parentAgentId,
+      parentHostId,
+      lineage: nextLineage,
+    });
+  };
+
+  for (const child of childrenByParent.get(`${hostId}::${agentId}`) ?? []) {
+    enqueueNode(child, 1, agentId, hostId, [rootNode]);
+  }
+
+  // Workspace peers have no parent pointer; their Rust insight entry identifies them.
+  for (const sa of insightsSubagents) {
+    if (!sa.child_agent_id?.startsWith("ag_")) continue;
+    const node =
+      (sa.host_id ? allAgentsByComposite.get(`${sa.host_id}::${sa.child_agent_id}`) : undefined) ??
+      allAgentsById.get(sa.child_agent_id);
+    if (!node) continue;
+    const insightDepth = sa.depth && sa.depth > 0 ? Math.min(sa.depth, MAX_SUBAGENT_LINEAGE_DEPTH) : 1;
+    const pAgent = sa.parent_agent_id || node.agent.parent_agent_id || agentId;
+    const pHost = sa.parent_host_id || node.agent.parent_host_id || hostId;
+    const seedLineage =
+      sa.lineage && sa.lineage.length > 1
+        ? sa.lineage.slice(0, sa.lineage.length - 1)
+        : [rootNode];
+    enqueueNode(node, insightDepth, pAgent, pHost, seedLineage);
+  }
+
+  // BFS/recursive expansion for grandchildren up to MAX_SUBAGENT_LINEAGE_DEPTH
+  for (let head = 0; head < queue.length; head += 1) {
+    const current = queue[head];
+    if (current.depth >= MAX_SUBAGENT_LINEAGE_DEPTH) continue;
+    const nestedKey = `${current.node.childHostId}::${current.node.agent.agent_id}`;
+    for (const child of childrenByParent.get(nestedKey) ?? []) {
+      enqueueNode(
+        child,
+        current.depth + 1,
+        current.node.agent.agent_id,
+        current.node.childHostId,
+        current.lineage,
+      );
     }
   }
 
@@ -233,7 +423,8 @@ export function resolveSessionSubagents(params: {
     }
   }
   const cardsByTitle = new Map<string, string | null>();
-  for (const [id, { agent }] of managedById) {
+  for (const [id, { agent, depth }] of managedById) {
+    if (depth > 1) continue;
     const insight = managedInsights.get(id);
     if (insight && insight.id !== id) continue;
     const title = normalizeSubagentName(agent.title);
@@ -257,6 +448,11 @@ export function resolveSessionSubagents(params: {
       continue;
     }
 
+    const insightHostId = sa.host_id || hostId;
+    const insightRemoteHost =
+      insightHostId !== hostId ? (sa.host_name || hostNameById.get(insightHostId) || insightHostId) : null;
+    const insightDepth = sa.depth && sa.depth > 0 ? Math.min(sa.depth, MAX_SUBAGENT_LINEAGE_DEPTH) : 1;
+
     const providerSub = sa.provider_subagent_id
       ? providerById.get(sa.provider_subagent_id)
       : undefined;
@@ -269,13 +465,17 @@ export function resolveSessionSubagents(params: {
         promptPreview: sa.prompt_preview || providerSub.subtitle || "",
         status: mapProviderSubagentStatus(providerSub.status),
         isManaged: false,
-        childHostId: hostId,
-        remoteHostName: null,
+        childHostId: insightHostId,
+        remoteHostName: insightRemoteHost,
         childAgentId: null,
         childProvider: null,
         providerSubagentId: providerSub.subagent_id,
         createdAtMs: 0,
         sortOrder: Math.max(sa.last_seq, parseTimestampMs(providerSub.updated_at)),
+        depth: insightDepth,
+        parentAgentId: sa.parent_agent_id ?? agentId,
+        parentHostId: sa.parent_host_id ?? hostId,
+        lineage: sa.lineage && sa.lineage.length > 0 ? sa.lineage : undefined,
       });
       continue;
     }
@@ -288,19 +488,25 @@ export function resolveSessionSubagents(params: {
       status: sa.child_agent_id?.startsWith("ag_") && sa.status === "completed"
         ? "running" : mapInsightStatus(sa.status),
       isManaged: false,
-      childHostId: hostId,
-      remoteHostName: null,
+      childHostId: insightHostId,
+      remoteHostName: insightRemoteHost,
       childAgentId: null,
       childProvider: null,
       providerSubagentId: sa.provider_subagent_id ?? null,
       createdAtMs: 0,
       sortOrder: sa.last_seq,
+      depth: insightDepth,
+      parentAgentId: sa.parent_agent_id ?? agentId,
+      parentHostId: sa.parent_host_id ?? hostId,
+      lineage: sa.lineage && sa.lineage.length > 0 ? sa.lineage : undefined,
     });
   }
 
-  // 4. Emit each managed child once with its timeline call ID and prompt when available.
+  // 4. Emit each managed descendant once with its timeline call ID, prompt, and lineage.
   for (const [childId, entry] of managedById) {
     const insight = managedInsights.get(childId);
+    const effectiveLineage =
+      insight?.lineage && insight.lineage.length > 0 ? insight.lineage : entry.lineage;
     out.push({
       key: `managed:${entry.childHostId}:${childId}`,
       callId: insight?.id ?? childId,
@@ -321,6 +527,10 @@ export function resolveSessionSubagents(params: {
         entry.agent.latest_seq,
         parseTimestampMs(entry.agent.updated_at_rfc3339),
       ),
+      depth: entry.depth,
+      parentAgentId: entry.parentAgentId,
+      parentHostId: entry.parentHostId,
+      lineage: effectiveLineage,
     });
   }
 
@@ -341,17 +551,65 @@ export function resolveSessionSubagents(params: {
       providerSubagentId: ps.subagent_id,
       createdAtMs: 0,
       sortOrder: parseTimestampMs(ps.updated_at),
+      depth: 1,
+      parentAgentId: agentId,
+      parentHostId: hostId,
     });
   }
 
-  // Deterministic ordering: awaiting_permission -> running -> failed -> completed, newest first
-  out.sort((a, b) => {
+  // Deterministic ordering:
+  // - Flat 1-level lists sort purely by status priority then recency.
+  // - Multi-level trees group descendants directly beneath their parent in DFS pre-order.
+  const compareItems = (a: ResolvedSubagentItem, b: ResolvedSubagentItem) => {
     const rankDiff = STATUS_PRIORITY[a.status] - STATUS_PRIORITY[b.status];
     if (rankDiff !== 0) return rankDiff;
     return b.sortOrder - a.sortOrder;
-  });
+  };
 
-  return out;
+  const hasNested = out.some((item) => (item.depth ?? 1) > 1);
+  if (!hasNested) {
+    out.sort(compareItems);
+    return out;
+  }
+
+  const knownNodeIds = new Set(out.map((item) => item.childAgentId).filter((id): id is string => Boolean(id)));
+  const grouped = new Map<string, ResolvedSubagentItem[]>();
+  const roots: ResolvedSubagentItem[] = [];
+  for (const item of out) {
+    const pId = item.parentAgentId;
+    if ((item.depth ?? 1) > 1 && pId && knownNodeIds.has(pId)) {
+      const bucket = grouped.get(pId);
+      if (bucket) bucket.push(item);
+      else grouped.set(pId, [item]);
+    } else {
+      roots.push(item);
+    }
+  }
+  roots.sort(compareItems);
+  for (const bucket of grouped.values()) {
+    bucket.sort(compareItems);
+  }
+
+  const ordered: ResolvedSubagentItem[] = [];
+  const emitted = new Set<string>();
+  const emitSubtree = (item: ResolvedSubagentItem) => {
+    if (emitted.has(item.key)) return;
+    emitted.add(item.key);
+    ordered.push(item);
+    if (item.childAgentId) {
+      for (const child of grouped.get(item.childAgentId) ?? []) {
+        emitSubtree(child);
+      }
+    }
+  };
+  for (const root of roots) {
+    emitSubtree(root);
+  }
+  // Safety net for any item disconnected from roots
+  for (const item of out) {
+    if (!emitted.has(item.key)) ordered.push(item);
+  }
+  return ordered;
 }
 
 /**
@@ -452,7 +710,11 @@ export function areResolvedSubagentsEqual(
       x.childAgentId !== y.childAgentId ||
       x.providerSubagentId !== y.providerSubagentId ||
       x.childHostId !== y.childHostId ||
-      x.promptPreview !== y.promptPreview
+      x.promptPreview !== y.promptPreview ||
+      (x.depth ?? 1) !== (y.depth ?? 1) ||
+      (x.parentAgentId ?? null) !== (y.parentAgentId ?? null) ||
+      (x.parentHostId ?? null) !== (y.parentHostId ?? null) ||
+      (x.lineage?.length ?? 0) !== (y.lineage?.length ?? 0)
     ) {
       return false;
     }

@@ -1279,6 +1279,36 @@ pub enum MigrationConflict {
     Overwrite,
     Rename,
 }
+
+/// Strategy available on the daemon for restoring workspace files during a turn rewind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewindCheckpointKind {
+    GitTree,
+    RecordedDiffs,
+    #[default]
+    None,
+}
+
+/// Per-file preview entry computed prior to rewinding workspace files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewindPreviewFile {
+    /// Workspace-relative file path (normalized forward slashes, guaranteed traversal-free).
+    pub path: String,
+    /// Action rewinding will perform: `"modify"`, `"delete"`, `"restore"`.
+    pub action: String,
+    #[serde(default)]
+    pub additions: u32,
+    #[serde(default)]
+    pub deletions: u32,
+    /// Reverse unified diff from current disk state back to the pre-turn checkpoint.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reverse_unified_diff: String,
+    /// True when external edits were detected on disk relative to the agent's recorded changes.
+    #[serde(default)]
+    pub has_external_conflict: bool,
+}
+
 /// Client-to-Daemon and Daemon-to-Client RPC envelope over WebSocket / E2EE Relay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -2033,6 +2063,24 @@ pub enum WireMessage {
         request_id: Uuid,
         permissions: Vec<PendingPermissionSummary>,
     },
+    /// Preview the exact file-level changes and external conflicts before rewinding an agent.
+    PreviewRewindAgent {
+        request_id: Uuid,
+        agent_id: String,
+        #[serde(alias = "to_before_seq")]
+        to_seq: u64,
+    },
+    /// File-level dry-run preview returned for `PreviewRewindAgent`.
+    RewindPreviewResult {
+        request_id: Uuid,
+        agent_id: String,
+        to_seq: u64,
+        checkpoint_kind: RewindCheckpointKind,
+        #[serde(default)]
+        files: Vec<RewindPreviewFile>,
+        #[serde(default)]
+        external_conflicts: Vec<String>,
+    },
     /// Rewind an agent session to strictly before `to_before_seq` (removing that user prompt and all
     /// subsequent events), optionally restoring workspace files back to the pre-turn checkpoint.
     RewindAgent {
@@ -2041,6 +2089,9 @@ pub enum WireMessage {
         to_before_seq: u64,
         #[serde(default)]
         restore_files: bool,
+        /// Optional explicit subset of workspace-relative paths to restore when `restore_files` is true.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore_paths: Option<Vec<String>>,
     },
     /// Authoritative post-rewind timeline replacement broadcast to all subscribed clients.
     AgentRewound {
@@ -4516,6 +4567,7 @@ mod tests {
             agent_id: "ag_rewind".into(),
             to_before_seq: 42,
             restore_files: true,
+            restore_paths: Some(vec!["src/main.rs".into()]),
         };
         let encoded = req.encode_zstd(3).expect("encode rewind request");
         match WireMessage::decode_zstd(&encoded).expect("decode rewind request") {
@@ -4524,11 +4576,70 @@ mod tests {
                 agent_id,
                 to_before_seq,
                 restore_files,
+                restore_paths,
             } => {
                 assert_eq!(request_id, req_id);
                 assert_eq!(agent_id, "ag_rewind");
                 assert_eq!(to_before_seq, 42);
                 assert!(restore_files);
+                assert_eq!(restore_paths, Some(vec!["src/main.rs".into()]));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let preview_req = WireMessage::PreviewRewindAgent {
+            request_id: req_id,
+            agent_id: "ag_rewind".into(),
+            to_seq: 42,
+        };
+        let encoded_preview_req = preview_req.encode_zstd(3).expect("encode preview rewind");
+        match WireMessage::decode_zstd(&encoded_preview_req).expect("decode preview rewind") {
+            WireMessage::PreviewRewindAgent {
+                request_id,
+                agent_id,
+                to_seq,
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(agent_id, "ag_rewind");
+                assert_eq!(to_seq, 42);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let preview_res = WireMessage::RewindPreviewResult {
+            request_id: req_id,
+            agent_id: "ag_rewind".into(),
+            to_seq: 42,
+            checkpoint_kind: RewindCheckpointKind::GitTree,
+            files: vec![RewindPreviewFile {
+                path: "src/main.rs".into(),
+                action: "modify".into(),
+                additions: 2,
+                deletions: 1,
+                reverse_unified_diff:
+                    "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1,2 @@\n-new\n+old\n+extra\n"
+                        .into(),
+                has_external_conflict: false,
+            }],
+            external_conflicts: vec!["README.md".into()],
+        };
+        let encoded_preview_res = preview_res.encode_zstd(3).expect("encode preview result");
+        match WireMessage::decode_zstd(&encoded_preview_res).expect("decode preview result") {
+            WireMessage::RewindPreviewResult {
+                request_id,
+                agent_id,
+                to_seq,
+                checkpoint_kind,
+                files,
+                external_conflicts,
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(agent_id, "ag_rewind");
+                assert_eq!(to_seq, 42);
+                assert_eq!(checkpoint_kind, RewindCheckpointKind::GitTree);
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].path, "src/main.rs");
+                assert_eq!(external_conflicts, vec!["README.md"]);
             }
             other => panic!("unexpected variant: {other:?}"),
         }

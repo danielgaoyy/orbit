@@ -1,3 +1,4 @@
+mod notifications;
 mod qr;
 mod tray;
 mod updater;
@@ -54,11 +55,11 @@ use orbit_client_core::contract::{
     InstructionFilesSnapshotView, ListInstructionFilesRequest, MatchPathRulesRequest,
     MatchedPathRulesView, MentionRankRequest, ModelSelectionRequest, PathRulesSnapshotView,
     PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RenameWorkspaceEntryRequest,
-    RenderDiagramRequest, RenderDiagramView, SaveInstructionFileRequest, SearchMessagesRequest,
-    SearchMessagesResponse, SearchWorkspaceSymbolsRequest, SpawnWorkspacePeerRequest,
-    UpsertArtifactRequest, UpsertEventTriggerRequest, UpsertExternalMcpServerRequest,
-    UpsertPathRuleRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
-    WorkspaceSymbolsView, WriteWorkspaceFileRequest,
+    RenderDiagramRequest, RenderDiagramView, RewindPreviewView, SaveInstructionFileRequest,
+    SearchMessagesRequest, SearchMessagesResponse, SearchWorkspaceSymbolsRequest,
+    SpawnWorkspacePeerRequest, UpsertArtifactRequest, UpsertEventTriggerRequest,
+    UpsertExternalMcpServerRequest, UpsertPathRuleRequest, WorkspaceEntryMutationResultView,
+    WorkspaceFileWriteResultView, WorkspaceSymbolsView, WriteWorkspaceFileRequest,
 };
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, LocalMachineInfo, SshHostItem, StagedAttachmentInfo,
@@ -1887,17 +1888,49 @@ fn refresh_pending_permissions(state: State<'_, DesktopAppState>, host_id: Strin
 }
 
 #[tauri::command]
+async fn preview_rewind_agent(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    to_seq: u64,
+) -> Result<RewindPreviewView, String> {
+    state
+        .core
+        .preview_rewind_agent_on_host(&host_id, &agent_id, to_seq)
+        .await
+}
+
+#[tauri::command]
 async fn rewind_agent(
     state: State<'_, DesktopAppState>,
     host_id: String,
     agent_id: String,
     to_before_seq: u64,
     restore_files: bool,
+    restore_paths: Option<Vec<String>>,
 ) -> Result<RewindAgentResultView, String> {
     state
         .core
-        .rewind_agent_on_host(&host_id, &agent_id, to_before_seq, restore_files)
+        .rewind_agent_on_host(
+            &host_id,
+            &agent_id,
+            to_before_seq,
+            restore_files,
+            restore_paths,
+        )
         .await
+}
+
+#[tauri::command]
+async fn send_native_approval_notification(
+    app: AppHandle,
+    state: State<'_, DesktopAppState>,
+    req: notifications::NativeApprovalNotificationRequest,
+) -> Result<notifications::NativeNotificationDispatchResult, String> {
+    Ok(
+        notifications::dispatch_native_approval_notification(app, Arc::clone(&state.core), req)
+            .await,
+    )
 }
 
 #[tauri::command]
@@ -4657,7 +4690,9 @@ pub fn run() {
             get_provider_subagent_timeline,
             get_provider_subagent_turns,
             refresh_pending_permissions,
+            preview_rewind_agent,
             rewind_agent,
+            send_native_approval_notification,
             fork_agent,
             preview_worktree_handoff,
             execute_worktree_handoff,

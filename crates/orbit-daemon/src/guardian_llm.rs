@@ -106,6 +106,35 @@ where
         })
 }
 
+/// Stateless inference on untrusted source requires disabling both built-in tools and MCP.
+pub(crate) struct ToolFreeLlmBackend;
+impl ToolFreeLlmBackend {
+    pub(crate) async fn authenticated() -> Option<Self> {
+        let readiness =
+            tokio::task::spawn_blocking(orbit_providers::probe_local_provider_readiness)
+                .await
+                .ok()?;
+        let available = readiness.iter().any(|p| {
+            p.kind == ProviderKind::ClaudeCode
+                && p.auth_status == orbit_providers::ProviderAuthStatus::Authenticated
+                && !orbit_providers::is_provider_overridden(p.kind)
+        });
+        available.then_some(Self)
+    }
+}
+impl GuardianLlmBackend for ToolFreeLlmBackend {
+    fn complete<'a>(&'a self, call: LlmBackendCall) -> LlmBackendFuture<'a> {
+        let model = call.requested_model.or_else(|| {
+            default_fast_model_for_provider(ProviderKind::ClaudeCode).map(str::to_owned)
+        });
+        Box::pin(orbit_providers::run_tool_free_prompt(
+            model,
+            call.prompt,
+            call.timeout_ms,
+        ))
+    }
+}
+
 /// Production LLM backend invoking Orbit's hardened isolated `run_hardened_guardian_prompt` path.
 pub struct OrbitProviderLlmBackend {
     provider_catalogs: Option<Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>>,
@@ -494,7 +523,7 @@ pub fn parse_guardian_llm_response(
 /// Strip a single optional outer markdown code fence (```` ```json ... ``` ```` or ```` ``` ... ``` ````).
 /// Direct `serde_json::from_str` afterwards natively rejects any non-JSON prose, trailing text,
 /// or concatenated JSON objects.
-fn strip_optional_markdown_fence(raw: &str) -> &str {
+pub(crate) fn strip_optional_markdown_fence(raw: &str) -> &str {
     let s = raw.trim();
     if let Some(after_open) = s.strip_prefix("```") {
         let after_lang = after_open

@@ -457,6 +457,22 @@ export function createOrbitCodeMirrorTheme(isDark: boolean): Extension {
         borderColor: "var(--signal-info-border)",
         backgroundColor: "var(--signal-info-bg)",
       },
+      /* M8.1 Inline FIM Ghost Text (Orbital Quiet Precision) */
+      ".orbit-cm-ghost-text": {
+        color: "var(--ink-faint)",
+        opacity: isDark ? "0.78" : "0.76",
+        fontFamily: ORBIT_MONO_STACK,
+        fontSize: "13px",
+        lineHeight: "20px",
+        fontStyle: "italic",
+        whiteSpace: "pre",
+        pointerEvents: "none",
+        userSelect: "none",
+        WebkitUserSelect: "none",
+      },
+      ".orbit-cm-ghost-text-multiline": {
+        display: "inline",
+      },
     },
     { dark: isDark },
   );

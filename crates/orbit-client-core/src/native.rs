@@ -241,6 +241,25 @@ impl HostSessionHandle {
         self.request_matching(msg, timeout, matcher, true).await
     }
 
+    /// Scope errors to a request on a multiplexed host connection.
+    pub async fn request_for<F>(
+        &self,
+        msg: WireMessage,
+        timeout: Duration,
+        correlation: Option<Uuid>,
+        matcher: F,
+    ) -> Result<WireMessage, ClientCoreError>
+    where
+        F: FnMut(&WireMessage) -> bool,
+    {
+        let mut rx = self.subscribe();
+        let deadline = tokio::time::Instant::now() + timeout;
+        tokio::time::timeout_at(deadline, self.send_wire(msg))
+            .await
+            .map_err(|_| ClientCoreError::Handshake("rpc send timed out".into()))??;
+        recv_correlated_wire(&mut rx, deadline, correlation, matcher).await
+    }
+
     /// Perform a request correlated by `request_id`, matching `RpcError` only for that ID.
     pub async fn request_by_id<F>(
         &self,
@@ -324,6 +343,51 @@ impl HostSessionHandle {
                     return Err(ClientCoreError::Handshake("rpc request timed out".into()));
                 }
                 _ => continue,
+            }
+        }
+    }
+}
+
+async fn recv_correlated_wire<F>(
+    rx: &mut broadcast::Receiver<ClientInboundEvent>,
+    deadline: tokio::time::Instant,
+    correlation: Option<Uuid>,
+    mut matcher: F,
+) -> Result<WireMessage, ClientCoreError>
+where
+    F: FnMut(&WireMessage) -> bool,
+{
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ClientCoreError::Handshake("rpc request timed out".into()));
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Ok(ClientInboundEvent::Wire(w))) => {
+                if matcher(&w) {
+                    return Ok(w);
+                }
+                if let WireMessage::RpcError {
+                    code,
+                    message,
+                    request_id,
+                } = &w
+                    && (correlation.is_none() || correlation == *request_id)
+                {
+                    return Err(ClientCoreError::Handshake(format!("[{code}] {message}")));
+                }
+            }
+            Ok(Ok(ClientInboundEvent::Disconnected) | Err(broadcast::error::RecvError::Closed)) => {
+                return Err(ClientCoreError::ChannelClosed);
+            }
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                return Err(ClientCoreError::Handshake(
+                    "inbound event stream lagged".into(),
+                ));
+            }
+            Ok(Ok(_)) => continue,
+            Err(_) => {
+                return Err(ClientCoreError::Handshake("rpc request timed out".into()));
             }
         }
     }
@@ -1553,6 +1617,107 @@ mod direct_auth_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn concurrent_fim_reads_ignore_sibling_rpc_errors() {
+        let (handle, mut out) = HostSessionHandle::new_test_channel();
+        let id = Uuid::new_v4();
+        let request = handle.request_for(
+            WireMessage::GetFimConfig { request_id: id },
+            Duration::from_secs(2),
+            Some(id),
+            |msg| matches!(msg, WireMessage::FimConfigState { request_id, .. } if *request_id == id),
+        );
+        let reply = async {
+            assert!(out.recv().await.is_some());
+            handle
+                .events_tx
+                .send(ClientInboundEvent::Wire(WireMessage::RpcError {
+                    request_id: Some(Uuid::new_v4()),
+                    code: "other".into(),
+                    message: "unrelated".into(),
+                }))
+                .expect("active receiver");
+            handle
+                .events_tx
+                .send(ClientInboundEvent::Wire(WireMessage::FimConfigState {
+                    request_id: id,
+                    config: Default::default(),
+                }))
+                .expect("active receiver");
+        };
+        let (result, ()) = tokio::join!(request, reply);
+        assert!(matches!(
+            result,
+            Ok(WireMessage::FimConfigState { request_id, .. }) if request_id == id
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_for_fails_promptly_on_lagged_stream_and_closed_channel() {
+        let (handle, mut out) = HostSessionHandle::new_test_channel();
+        let id = Uuid::new_v4();
+        let start = std::time::Instant::now();
+        let request = handle.request_for(
+            WireMessage::GetFimConfig { request_id: id },
+            Duration::from_secs(30),
+            Some(id),
+            |msg| matches!(msg, WireMessage::FimConfigState { request_id, .. } if *request_id == id),
+        );
+        let flood = async {
+            assert!(out.recv().await.is_some());
+            for _ in 0..32 {
+                let _ = handle
+                    .events_tx
+                    .send(ClientInboundEvent::Wire(WireMessage::RpcError {
+                        request_id: Some(Uuid::new_v4()),
+                        code: "noise".into(),
+                        message: "unrelated".into(),
+                    }));
+            }
+        };
+        let (lagged_res, ()) = tokio::join!(request, flood);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "lagged request_for must not stall until timeout"
+        );
+        match lagged_res {
+            Err(ClientCoreError::Handshake(msg)) => {
+                assert!(msg.contains("lagged"), "unexpected error: {msg}");
+            }
+            other => panic!("expected Handshake lagged error, got {other:?}"),
+        }
+
+        let (handle2, mut out2) = HostSessionHandle::new_test_channel();
+        let id2 = Uuid::new_v4();
+        let start2 = std::time::Instant::now();
+        let req2 = handle2.request_for(
+            WireMessage::GetFimConfig { request_id: id2 },
+            Duration::from_secs(30),
+            Some(id2),
+            |_| false,
+        );
+        let disc = async {
+            assert!(out2.recv().await.is_some());
+            let _ = handle2.events_tx.send(ClientInboundEvent::Disconnected);
+        };
+        let (disc_res, ()) = tokio::join!(req2, disc);
+        assert!(start2.elapsed() < Duration::from_secs(2));
+        assert!(matches!(disc_res, Err(ClientCoreError::ChannelClosed)));
+
+        let (tx, mut rx) = broadcast::channel::<ClientInboundEvent>(4);
+        drop(tx);
+        let start3 = std::time::Instant::now();
+        let closed_res = recv_correlated_wire(
+            &mut rx,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            Some(Uuid::new_v4()),
+            |_| false,
+        )
+        .await;
+        assert!(start3.elapsed() < Duration::from_secs(2));
+        assert!(matches!(closed_res, Err(ClientCoreError::ChannelClosed)));
+    }
 
     #[tokio::test]
     async fn connect_smart_never_probes_unconfigured_speculative_loopback() {

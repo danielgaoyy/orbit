@@ -79,3 +79,5 @@ In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight
 若需增删或重命名 `rust-quality-and-unit`、`e2e-regression-matrix` 标签或 `desktop-frontend-build`，**必须在同一 PR 合入前后同步调整 GitHub Ruleset `protect-main-and-master`（ID `27444583`）的 `required_status_checks`**，否则所有 PR 将被永久挂起。
 
 The Rust quality job runs `bash scripts/check-ohos-dts-sync.sh` to verify every N-API method against the checked-in ArkTS declarations, including factories, optional arguments and promise results. After changing the Rust exports, run the script with `--write` to regenerate `index.d.ts`.
+
+[Orbit Patrol’s opt-in workflow](../../.github/workflows/orbit-pr-review.yml.example) runs on read-only pull request events. It builds the reviewer at the trusted base SHA and reads the fork head as Git objects. Download the JSON report from the run artifacts.

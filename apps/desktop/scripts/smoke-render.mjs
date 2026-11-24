@@ -352,6 +352,48 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
             review_comments: [],
             unresolved_comment_count: 0,
           };
+        case "get_fim_config":
+          return {
+            mode: "off",
+            endpoint_url: null,
+            model: null,
+            api_key_env: null,
+            max_tokens: 128,
+            timeout_ms: 1800,
+            allow_fast_cli_fallback: false,
+          };
+        case "update_fim_config":
+          return (
+            args.config ?? {
+              mode: "off",
+              endpoint_url: null,
+              model: null,
+              api_key_env: null,
+              max_tokens: 128,
+              timeout_ms: 1800,
+              allow_fast_cli_fallback: false,
+            }
+          );
+        case "predict_inline_edit":
+          return {
+            request_id: "00000000-0000-0000-0000-000000000000",
+            completion: "",
+            latency_ms: 0,
+            source: "off",
+          };
+        case "run_pr_patrol":
+          return {
+            repo_root: args.cwd ?? "/tmp/smoke",
+            base_ref: args.baseRef ?? "main",
+            head_ref: args.headRef ?? "HEAD",
+            pr_number: args.prNumber ?? null,
+            files_reviewed: 0,
+            candidates_found: 0,
+            findings: [],
+            dropped_false_positives: 0,
+            summary: "Static scan only. 0 verified findings in 0 reviewed files. 0 files skipped.",
+            duration_ms: 12,
+          };
         case "git_generate_commit_message":
           return {
             message: "chore: update workspace",

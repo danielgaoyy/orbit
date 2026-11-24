@@ -48,18 +48,19 @@ use orbit_client_core::composer::{
     SlashCommandView,
 };
 use orbit_client_core::contract::{
-    AcpRegistryRefreshView, BridgeInfoView, ConversationSearchHit, CreateWorkspaceEntryRequest,
-    DeletePathRuleRequest, DeleteWorkspaceEntryRequest, EventTriggersSnapshotView,
-    ExecuteWorktreeHandoffRequest, FleetSidebarRequest, ForkAgentRequest, ForkAgentResultView,
-    GitReposInspectionView, InstructionFileContentView, InstructionFileSavedView,
-    InstructionFilesSnapshotView, ListInstructionFilesRequest, MatchPathRulesRequest,
-    MatchedPathRulesView, MentionRankRequest, ModelSelectionRequest, PathRulesSnapshotView,
-    PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RenameWorkspaceEntryRequest,
-    RenderDiagramRequest, RenderDiagramView, RewindPreviewView, SaveInstructionFileRequest,
-    SearchMessagesRequest, SearchMessagesResponse, SearchWorkspaceSymbolsRequest,
-    SpawnWorkspacePeerRequest, UpsertArtifactRequest, UpsertEventTriggerRequest,
-    UpsertExternalMcpServerRequest, UpsertPathRuleRequest, WorkspaceEntryMutationResultView,
-    WorkspaceFileWriteResultView, WorkspaceSymbolsView, WriteWorkspaceFileRequest,
+    AcpRegistryRefreshView, AuditChainExportView, BridgeInfoView, ConversationSearchHit,
+    CreateWorkspaceEntryRequest, DeletePathRuleRequest, DeleteWorkspaceEntryRequest,
+    EventTriggersSnapshotView, ExecuteWorktreeHandoffRequest, FleetSidebarRequest,
+    ForkAgentRequest, ForkAgentResultView, GitReposInspectionView, InstructionFileContentView,
+    InstructionFileSavedView, InstructionFilesSnapshotView, ListInstructionFilesRequest,
+    MatchPathRulesRequest, MatchedPathRulesView, MentionRankRequest, ModelSelectionRequest,
+    PathRulesSnapshotView, PreviewWorktreeHandoffRequest, ReadInstructionFileRequest,
+    RenameWorkspaceEntryRequest, RenderDiagramRequest, RenderDiagramView, RewindPreviewView,
+    SaveInstructionFileRequest, SearchMessagesRequest, SearchMessagesResponse,
+    SearchWorkspaceSymbolsRequest, SpawnWorkspacePeerRequest, UpsertArtifactRequest,
+    UpsertEventTriggerRequest, UpsertExternalMcpServerRequest, UpsertPathRuleRequest,
+    UpsertProjectMemoryRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
+    WorkspaceSymbolsView, WriteWorkspaceFileRequest,
 };
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, LocalMachineInfo, SshHostItem, StagedAttachmentInfo,
@@ -78,19 +79,23 @@ use orbit_client_core::sidebar::FleetSidebarView;
 use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnView};
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
-    ArtifactDetail, ArtifactSummary, ConditionalTimerRecord, ContextOccupancyBreakdown,
-    EventTriggerDelivery, ExternalMcpServerRecord, GitCommitResult, GitConflictListResult,
-    GitConflictResolution, GitCreatePrResult, GitGeneratedCommitMessage, GitMutationOutcome,
-    GitPrStatus, GitPushResult, GitRebaseActionResult, GitRebaseStatus, GitResolveConflictResult,
-    GitStashListResult, GitStashMutationResult, GuardianPolicyConfig, HookExecutionRecord,
-    HookScope, LifecycleHookRule, LspCodeAction, LspCompletionItem, LspDiagnostic, LspHoverInfo,
-    LspLocation, LspReferenceLocation, LspServerStatus, LspSymbolInfo, LspWorkspaceEdit,
-    LspWorkspaceEditResult, ManagedSkillRecord, McpProbeResult, McpResourceContent,
-    McpToolCallOutcome, OrchestrationConfig, PermissionRuleRecord, PromptBadge, ProviderKind,
+    ArtifactDetail, ArtifactSummary, AuditChainVerification, ConditionalTimerRecord,
+    ContextOccupancyBreakdown, EventTriggerDelivery, ExternalMcpServerRecord, GitCommitResult,
+    GitConflictListResult, GitConflictResolution, GitCreatePrResult, GitGeneratedCommitMessage,
+    GitMutationOutcome, GitPrStatus, GitPushResult, GitRebaseActionResult, GitRebaseStatus,
+    GitResolveConflictResult, GitStashListResult, GitStashMutationResult, GuardianPolicyConfig,
+    HookExecutionRecord, HookScope, InstalledPluginView, LifecycleHookRule, LspCodeAction,
+    LspCompletionItem, LspDiagnostic, LspHoverInfo, LspLocation, LspReferenceLocation,
+    LspServerStatus, LspSymbolInfo, LspWorkspaceEdit, LspWorkspaceEditResult, ManagedSkillRecord,
+    McpProbeResult, McpResourceContent, McpToolCallOutcome, MemoryCategory, MemoryStatus,
+    MigrationConflict, OrbitPluginUiSlot, OrbitPluginUiSpec, OrchestrationConfig,
+    PermissionRuleRecord, ProjectMemoryItem, ProjectMemorySearchHit, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ResolvePermissionsBatchResult,
-    ScheduleRunRecord, ScheduleTarget, SessionMode, SkillWriteScope, TimerCondition,
-    UpsertPermissionRuleInput, UsageInsightsSnapshot, WorkspaceBoardSnapshot, WorkspaceEventRecord,
-    WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    SandboxPolicy, ScheduleRunRecord, ScheduleTarget, SessionMode, SkillWriteScope, TimerCondition,
+    UpsertPermissionRuleInput, UsageInsightsSnapshot, VoiceApprovalSafety, VoiceConfig,
+    VoiceConfigState, VoiceSpeechResult, VoiceTranscriptionResult, WorkspaceBoardSnapshot,
+    WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffOutcome,
+    WorktreeHandoffPreview,
 };
 use orbit_providers::{
     ProviderReadinessInfo, SideQuestionSpec,
@@ -4475,6 +4480,360 @@ fn cloud_sync_update_preferences(
         .map_err(|e| e.to_string())
 }
 
+// --- M3 Security, Audit Chain, Diagnostics, Context Compaction & IDE Migration ---
+
+#[tauri::command]
+async fn get_sandbox_config(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<Option<SandboxPolicy>, String> {
+    state.core.get_sandbox_config(&host_id).await
+}
+
+#[tauri::command]
+async fn update_sandbox_config(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    sandbox_policy: Option<SandboxPolicy>,
+) -> Result<Option<SandboxPolicy>, String> {
+    state
+        .core
+        .update_sandbox_config(&host_id, sandbox_policy)
+        .await
+}
+
+#[tauri::command]
+async fn get_audit_chain_status(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<AuditChainVerification, String> {
+    state.core.get_audit_chain_status(&host_id).await
+}
+
+#[tauri::command]
+async fn export_audit_chain(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    after_seq: Option<u64>,
+) -> Result<AuditChainExportView, String> {
+    state
+        .core
+        .export_audit_chain(&host_id, after_seq.unwrap_or(0))
+        .await
+}
+
+#[tauri::command]
+async fn export_diagnostic_bundle(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<serde_json::Value, String> {
+    state.core.export_diagnostic_bundle(&host_id).await
+}
+
+#[tauri::command]
+async fn compact_agent_context(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+) -> Result<(), String> {
+    state.core.compact_agent_context(&host_id, &agent_id).await
+}
+
+#[tauri::command]
+async fn inspect_external_ide_migration(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    source: Option<String>,
+    cwd: Option<String>,
+    conflict: Option<MigrationConflict>,
+) -> Result<serde_json::Value, String> {
+    state
+        .core
+        .inspect_external_ide_migration(&host_id, source, cwd, conflict.unwrap_or_default())
+        .await
+}
+
+#[tauri::command]
+async fn execute_external_ide_migration(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    source: Option<String>,
+    cwd: Option<String>,
+    conflict: Option<MigrationConflict>,
+) -> Result<serde_json::Value, String> {
+    state
+        .core
+        .execute_external_ide_migration(&host_id, source, cwd, conflict.unwrap_or_default())
+        .await
+}
+
+// --- M4 Project Memory ---
+
+#[tauri::command]
+async fn list_project_memories(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    status: Option<MemoryStatus>,
+    category: Option<MemoryCategory>,
+    query: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<ProjectMemoryItem>, String> {
+    state
+        .core
+        .list_project_memories(&host_id, &cwd, status, category, query, limit)
+        .await
+}
+
+#[tauri::command]
+async fn upsert_project_memory(
+    state: State<'_, DesktopAppState>,
+    req: UpsertProjectMemoryRequest,
+) -> Result<ProjectMemoryItem, String> {
+    state.core.upsert_project_memory(req).await
+}
+
+#[tauri::command]
+async fn confirm_project_memory(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    memory_id: String,
+) -> Result<ProjectMemoryItem, String> {
+    state
+        .core
+        .confirm_project_memory(&host_id, &cwd, &memory_id)
+        .await
+}
+
+#[tauri::command]
+async fn delete_project_memory(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    memory_id: String,
+) -> Result<bool, String> {
+    state
+        .core
+        .delete_project_memory(&host_id, &cwd, &memory_id)
+        .await
+}
+
+#[tauri::command]
+async fn recall_project_memory(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    query: String,
+    limit: Option<u32>,
+    include_unconfirmed: Option<bool>,
+) -> Result<Vec<ProjectMemorySearchHit>, String> {
+    state
+        .core
+        .recall_project_memory(&host_id, &cwd, &query, limit, include_unconfirmed)
+        .await
+}
+
+// --- M5 WASM Plugins ---
+
+#[tauri::command]
+async fn list_plugins(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<Vec<InstalledPluginView>, String> {
+    state.core.list_plugins(&host_id).await
+}
+
+#[tauri::command]
+async fn install_plugin(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    source_path: String,
+    enable: Option<bool>,
+) -> Result<InstalledPluginView, String> {
+    state
+        .core
+        .install_plugin(&host_id, &source_path, enable.unwrap_or(false))
+        .await
+}
+
+#[tauri::command]
+async fn set_plugin_enabled(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    plugin_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .core
+        .set_plugin_enabled(&host_id, &plugin_id, enabled)
+        .await
+}
+
+#[tauri::command]
+async fn uninstall_plugin(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    plugin_id: String,
+) -> Result<(), String> {
+    state.core.uninstall_plugin(&host_id, &plugin_id).await
+}
+
+#[tauri::command]
+async fn invoke_plugin_op(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    plugin_id: String,
+    op: String,
+    args_json: Option<serde_json::Value>,
+    cwd: Option<String>,
+) -> Result<serde_json::Value, String> {
+    state
+        .core
+        .invoke_plugin_op(
+            &host_id,
+            &plugin_id,
+            &op,
+            args_json.unwrap_or_else(|| serde_json::json!({})),
+            cwd,
+        )
+        .await
+}
+
+#[tauri::command]
+async fn render_plugin_ui(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    plugin_id: String,
+    slot: OrbitPluginUiSlot,
+    cwd: Option<String>,
+    action_id: Option<String>,
+    payload: Option<serde_json::Value>,
+) -> Result<OrbitPluginUiSpec, String> {
+    state
+        .core
+        .render_plugin_ui(&host_id, &plugin_id, slot, cwd, action_id, payload)
+        .await
+}
+
+// --- M6 Voice Control Plane ---
+
+fn format_voice_rpc_error(err: orbit_client_core::VoiceRpcError) -> String {
+    serde_json::to_string(&err).unwrap_or_else(|_| err.to_string())
+}
+
+#[tauri::command]
+async fn get_voice_config(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<VoiceConfigState, String> {
+    state
+        .core
+        .get_voice_config(&host_id)
+        .await
+        .map_err(format_voice_rpc_error)
+}
+
+#[tauri::command]
+async fn update_voice_config(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    config: VoiceConfig,
+) -> Result<VoiceConfigState, String> {
+    state
+        .core
+        .update_voice_config(&host_id, config)
+        .await
+        .map_err(format_voice_rpc_error)
+}
+
+#[tauri::command]
+async fn download_voice_model(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    model_id: String,
+) -> Result<VoiceConfigState, String> {
+    state
+        .core
+        .download_voice_model(&host_id, model_id)
+        .await
+        .map_err(format_voice_rpc_error)
+}
+
+#[tauri::command]
+async fn delete_voice_model(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    model_id: String,
+) -> Result<VoiceConfigState, String> {
+    state
+        .core
+        .delete_voice_model(&host_id, model_id)
+        .await
+        .map_err(format_voice_rpc_error)
+}
+
+#[tauri::command]
+async fn transcribe_voice_audio(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    pcm16_le_base64: String,
+    sample_rate_hz: u32,
+    language: Option<String>,
+    agent_id: Option<String>,
+) -> Result<VoiceTranscriptionResult, String> {
+    state
+        .core
+        .transcribe_voice_audio(&host_id, pcm16_le_base64, sample_rate_hz, language, agent_id)
+        .await
+        .map_err(format_voice_rpc_error)
+}
+
+#[tauri::command]
+async fn parse_voice_transcript(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    text: String,
+    language: Option<String>,
+    agent_id: Option<String>,
+) -> Result<VoiceTranscriptionResult, String> {
+    state
+        .core
+        .parse_voice_transcript(&host_id, text, language, agent_id)
+        .await
+        .map_err(format_voice_rpc_error)
+}
+
+#[tauri::command]
+async fn approve_voice_permission(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    permission_request_id: String,
+    confirmed: bool,
+) -> Result<VoiceApprovalSafety, String> {
+    state
+        .core
+        .approve_voice_permission(&host_id, agent_id, permission_request_id, confirmed)
+        .await
+        .map_err(format_voice_rpc_error)
+}
+
+#[tauri::command]
+async fn synthesize_voice_speech(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    text: String,
+    language: Option<String>,
+    voice_id: Option<String>,
+) -> Result<VoiceSpeechResult, String> {
+    state
+        .core
+        .synthesize_voice_speech(&host_id, text, language, voice_id)
+        .await
+        .map_err(format_voice_rpc_error)
+}
+
 fn init_desktop_file_logging() {
     let log_path = resolve_user_home()
         .map(|home| home.join(".orbit").join("logs").join("desktop.log"))
@@ -4852,6 +5211,33 @@ pub fn run() {
             cloud_sync_logout,
             cloud_sync_get_preferences,
             cloud_sync_update_preferences,
+            get_sandbox_config,
+            update_sandbox_config,
+            get_audit_chain_status,
+            export_audit_chain,
+            export_diagnostic_bundle,
+            compact_agent_context,
+            inspect_external_ide_migration,
+            execute_external_ide_migration,
+            list_project_memories,
+            upsert_project_memory,
+            confirm_project_memory,
+            delete_project_memory,
+            recall_project_memory,
+            list_plugins,
+            install_plugin,
+            set_plugin_enabled,
+            uninstall_plugin,
+            invoke_plugin_op,
+            render_plugin_ui,
+            get_voice_config,
+            update_voice_config,
+            download_voice_model,
+            delete_voice_model,
+            transcribe_voice_audio,
+            parse_voice_transcript,
+            approve_voice_permission,
+            synthesize_voice_speech,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Orbit Tauri desktop application");

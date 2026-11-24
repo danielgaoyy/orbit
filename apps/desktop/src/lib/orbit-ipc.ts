@@ -3514,6 +3514,273 @@ export interface OrbitTransportBackend {
   subscribe(handler: (event: CoreNotification) => void): Promise<void>;
 }
 
+// --- M3 Security, Audit Chain, Diagnostics & External IDE Migration ---
+
+export type SandboxMode = "off" | "workspace_write" | "strict_read_only";
+
+export interface SandboxPolicy {
+  mode: SandboxMode;
+  writable_roots: string[];
+  denied_read_paths: string[];
+  allow_network: boolean;
+  allowed_domains: string[];
+  denied_domains: string[];
+}
+
+export interface AuditChainVerification {
+  verified_entries: number;
+  broken_seq: number | null;
+  signed_checkpoints: number;
+}
+
+export interface AuditChainExportView {
+  jsonl: string;
+  next_after_seq: number | null;
+}
+
+export type MigrationConflict = "skip" | "overwrite" | "rename";
+export type ExternalIdeSource = "claude" | "codex" | "antigravity" | "cursor" | "vscode";
+
+export interface ExternalIdeMigrationItem {
+  source: string;
+  kind: string;
+  name: string;
+  destination: string;
+  decision: string;
+}
+
+// --- M4 Project Memory ---
+
+export type MemoryStatus = "hypothesis" | "confirmed" | "needs_revalidation";
+export type MemoryCategory =
+  | "architecture"
+  | "convention"
+  | "debugging"
+  | "workflow"
+  | "decision"
+  | "preference";
+
+export interface ProjectMemoryItem {
+  id: string;
+  workspace_root: string;
+  title: string;
+  content: string;
+  category: MemoryCategory;
+  status: MemoryStatus;
+  confidence: number;
+  file_paths: string[];
+  tags: string[];
+  source_provider: string | null;
+  source_agent_id: string | null;
+  source_path: string | null;
+  access_count: number;
+  created_at_ms: number;
+  updated_at_ms: number;
+  last_accessed_ms: number;
+}
+
+export interface ProjectMemorySearchHit {
+  item: ProjectMemoryItem;
+  score: number;
+  fts_rank: number | null;
+  vector_rank: number | null;
+}
+
+export interface UpsertProjectMemoryRequest {
+  host_id: string;
+  cwd: string;
+  id?: string | null;
+  title: string;
+  content: string;
+  category: MemoryCategory;
+  status?: MemoryStatus | null;
+  file_paths?: string[];
+  tags?: string[];
+}
+
+// --- M5 WASM Plugins ---
+
+export type OrbitPluginUiSlot = "side_panel_tab" | "stage_card" | "settings_panel";
+export type OrbitPluginDirection = "horizontal" | "vertical";
+export type OrbitPluginTone = "neutral" | "info" | "success" | "warning" | "danger";
+export type OrbitPluginButtonVariant = "secondary" | "primary";
+
+export interface OrbitPluginCapabilities {
+  fs_read_globs: string[];
+  http_domains: string[];
+  hook_events: string[];
+  max_fuel: number | null;
+  max_memory_bytes: number | null;
+}
+
+export interface OrbitPluginMcpOp {
+  name: string;
+  description: string;
+}
+
+export interface OrbitPluginUiSlotDecl {
+  slot: OrbitPluginUiSlot;
+  title: string;
+}
+
+export interface OrbitPluginManifest {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  author: string | null;
+  wasm_entry: string;
+  capabilities: OrbitPluginCapabilities;
+  mcp_ops: OrbitPluginMcpOp[];
+  ui_slots: OrbitPluginUiSlotDecl[];
+}
+
+export interface InstalledPluginView {
+  manifest: OrbitPluginManifest;
+  enabled: boolean;
+}
+
+export type OrbitPluginUiNode =
+  | {
+      type: "stack";
+      direction: OrbitPluginDirection;
+      gap?: number;
+      children: OrbitPluginUiNode[];
+    }
+  | {
+      type: "card";
+      title: string;
+      subtitle?: string | null;
+      children: OrbitPluginUiNode[];
+    }
+  | {
+      type: "key_value";
+      label: string;
+      value: string;
+      tone?: OrbitPluginTone;
+    }
+  | {
+      type: "badge";
+      text: string;
+      tone?: OrbitPluginTone;
+    }
+  | {
+      type: "table";
+      columns: string[];
+      rows: string[][];
+    }
+  | {
+      type: "markdown";
+      content: string;
+    }
+  | {
+      type: "button";
+      label: string;
+      action_id: string;
+      variant?: OrbitPluginButtonVariant;
+      payload?: unknown;
+    }
+  | {
+      type: "form_input";
+      field_id: string;
+      label: string;
+      placeholder?: string | null;
+      value?: string | null;
+    };
+
+export interface OrbitPluginUiSpec {
+  root: OrbitPluginUiNode;
+}
+
+// --- M6 Voice Control Plane ---
+
+export type VoiceSttBackend =
+  | "local_whisper"
+  | "local_sense_voice"
+  | "open_ai_compatible"
+  | "system_client_fallback";
+
+export type VoiceTtsBackend =
+  | "local_kokoro"
+  | "open_ai_compatible"
+  | "system_native"
+  | "disabled";
+
+export interface VoiceConfig {
+  enabled: boolean;
+  stt_backend: VoiceSttBackend;
+  tts_backend: VoiceTtsBackend;
+  language: string | null;
+  vad_threshold: number;
+  preroll_ms: number;
+  silence_hangover_ms: number;
+  auto_speak_responses: boolean;
+  voice_id: string | null;
+  openai_endpoint_url: string | null;
+  openai_api_key_env: string | null;
+  stt_model_id: string;
+  tts_model_id: string;
+}
+
+export type VoiceModelKind = "vad" | "stt" | "tts";
+
+export interface VoiceModelDescriptor {
+  id: string;
+  kind: VoiceModelKind;
+  name: string;
+  size_bytes: number;
+  sha256: string;
+  download_url: string;
+  installed: boolean;
+  local_path: string | null;
+}
+
+export interface VoiceHostCapabilities {
+  local_whisper: boolean;
+  local_sense_voice: boolean;
+  local_kokoro: boolean;
+  system_native_tts: boolean;
+  system_client_fallback: boolean;
+}
+
+export interface VoiceConfigState {
+  config: VoiceConfig;
+  models: VoiceModelDescriptor[];
+  capabilities: VoiceHostCapabilities;
+}
+
+export type VoiceIntent =
+  | { kind: "send_prompt"; text: string }
+  | { kind: "switch_agent"; query: string }
+  | { kind: "read_last_reply" }
+  | { kind: "queue_status" }
+  | { kind: "approve_permission"; request_id: string; confirmed: boolean }
+  | { kind: "deny_permission"; request_id: string }
+  | { kind: "cancel" };
+
+export type VoiceApprovalSafety =
+  | "allowed"
+  | "requires_spoken_confirmation"
+  | "requires_visual_confirmation";
+
+export interface VoiceTranscriptionResult {
+  text: string;
+  language: string | null;
+  duration_ms: number;
+  backend_used: VoiceSttBackend;
+  parsed_intent: VoiceIntent | null;
+  approval_safety?: VoiceApprovalSafety | null;
+}
+
+export interface VoiceSpeechResult {
+  audio_wav_base64: string;
+  mime_type: string;
+  duration_ms: number;
+  backend_used: VoiceTtsBackend;
+}
+
+export { type ParsedVoiceRpcError, parseVoiceRpcError } from "./voice-audio-pcm";
+
 class TauriIpcBackend implements OrbitTransportBackend {
   invoke<T>(command: string, args?: InvokeArgs, options?: InvokeOptions): Promise<T> {
     return tauriInvoke<T>(command, args, options);
@@ -7243,6 +7510,409 @@ export const orbitIpc = {
     return invoke<PushTestResultView>("test_push_notification", {
       hostId,
       deviceId: deviceId ?? null,
+    });
+  },
+
+  // --- M3 Security, Audit Chain, Diagnostics, Context Compaction & IDE Migration ---
+
+  getSandboxConfig: async (hostId: string): Promise<SandboxPolicy | null> => {
+    if (!transport()) return null;
+    return invoke<SandboxPolicy | null>("get_sandbox_config", { hostId });
+  },
+
+  updateSandboxConfig: async (
+    hostId: string,
+    sandboxPolicy: SandboxPolicy | null,
+  ): Promise<SandboxPolicy | null> => {
+    if (!transport()) return sandboxPolicy;
+    return invoke<SandboxPolicy | null>("update_sandbox_config", {
+      hostId,
+      sandboxPolicy,
+    });
+  },
+
+  getAuditChainStatus: async (hostId: string): Promise<AuditChainVerification> => {
+    if (!transport()) {
+      return { verified_entries: 0, broken_seq: null, signed_checkpoints: 0 };
+    }
+    return invoke<AuditChainVerification>("get_audit_chain_status", { hostId });
+  },
+
+  exportAuditChain: async (
+    hostId: string,
+    afterSeq = 0,
+  ): Promise<AuditChainExportView> => {
+    if (!transport()) {
+      return { jsonl: "", next_after_seq: null };
+    }
+    return invoke<AuditChainExportView>("export_audit_chain", {
+      hostId,
+      afterSeq,
+    });
+  },
+
+  exportDiagnosticBundle: async (
+    hostId: string,
+  ): Promise<Record<string, unknown>> => {
+    if (!transport()) return {};
+    return invoke<Record<string, unknown>>("export_diagnostic_bundle", { hostId });
+  },
+
+  compactAgentContext: async (hostId: string, agentId: string): Promise<void> => {
+    if (!transport()) return;
+    await invoke<void>("compact_agent_context", { hostId, agentId });
+  },
+
+  inspectExternalIdeMigration: async (
+    hostId: string,
+    source?: ExternalIdeSource | string | null,
+    cwd?: string | null,
+    conflict: MigrationConflict = "skip",
+  ): Promise<ExternalIdeMigrationItem[]> => {
+    if (!transport()) return [];
+    const res = await invoke<unknown>("inspect_external_ide_migration", {
+      hostId,
+      source: source ?? null,
+      cwd: cwd ?? null,
+      conflict,
+    });
+    return Array.isArray(res) ? (res as ExternalIdeMigrationItem[]) : [];
+  },
+
+  executeExternalIdeMigration: async (
+    hostId: string,
+    source?: ExternalIdeSource | string | null,
+    cwd?: string | null,
+    conflict: MigrationConflict = "skip",
+  ): Promise<ExternalIdeMigrationItem[]> => {
+    if (!transport()) return [];
+    const res = await invoke<unknown>("execute_external_ide_migration", {
+      hostId,
+      source: source ?? null,
+      cwd: cwd ?? null,
+      conflict,
+    });
+    return Array.isArray(res) ? (res as ExternalIdeMigrationItem[]) : [];
+  },
+
+  // --- M4 Project Memory ---
+
+  listProjectMemories: async (
+    hostId: string,
+    cwd: string,
+    options?: {
+      status?: MemoryStatus | null;
+      category?: MemoryCategory | null;
+      query?: string | null;
+      limit?: number | null;
+    },
+  ): Promise<ProjectMemoryItem[]> => {
+    if (!transport()) return [];
+    return invoke<ProjectMemoryItem[]>("list_project_memories", {
+      hostId,
+      cwd,
+      status: options?.status ?? null,
+      category: options?.category ?? null,
+      query: options?.query ?? null,
+      limit: options?.limit ?? null,
+    });
+  },
+
+  upsertProjectMemory: async (
+    req: UpsertProjectMemoryRequest,
+  ): Promise<ProjectMemoryItem> => {
+    if (!transport()) {
+      throw new Error("Project memory requires an active Orbit host connection");
+    }
+    return invoke<ProjectMemoryItem>("upsert_project_memory", {
+      req: {
+        ...req,
+        id: req.id ?? null,
+        status: req.status ?? null,
+        file_paths: req.file_paths ?? [],
+        tags: req.tags ?? [],
+      },
+    });
+  },
+
+  confirmProjectMemory: async (
+    hostId: string,
+    cwd: string,
+    memoryId: string,
+  ): Promise<ProjectMemoryItem> => {
+    if (!transport()) {
+      throw new Error("Project memory requires an active Orbit host connection");
+    }
+    return invoke<ProjectMemoryItem>("confirm_project_memory", {
+      hostId,
+      cwd,
+      memoryId,
+    });
+  },
+
+  deleteProjectMemory: async (
+    hostId: string,
+    cwd: string,
+    memoryId: string,
+  ): Promise<boolean> => {
+    if (!transport()) return false;
+    return invoke<boolean>("delete_project_memory", {
+      hostId,
+      cwd,
+      memoryId,
+    });
+  },
+
+  recallProjectMemory: async (
+    hostId: string,
+    cwd: string,
+    query: string,
+    options?: { limit?: number | null; includeUnconfirmed?: boolean | null },
+  ): Promise<ProjectMemorySearchHit[]> => {
+    if (!transport()) return [];
+    return invoke<ProjectMemorySearchHit[]>("recall_project_memory", {
+      hostId,
+      cwd,
+      query,
+      limit: options?.limit ?? null,
+      includeUnconfirmed: options?.includeUnconfirmed ?? null,
+    });
+  },
+
+  // --- M5 WASM Plugins ---
+
+  listPlugins: async (hostId: string): Promise<InstalledPluginView[]> => {
+    if (!transport()) return [];
+    return invoke<InstalledPluginView[]>("list_plugins", { hostId });
+  },
+
+  installPlugin: async (
+    hostId: string,
+    sourcePath: string,
+    enable = false,
+  ): Promise<InstalledPluginView> => {
+    if (!transport()) {
+      throw new Error("Plugin installation requires an active Orbit host connection");
+    }
+    return invoke<InstalledPluginView>("install_plugin", {
+      hostId,
+      sourcePath,
+      enable,
+    });
+  },
+
+  setPluginEnabled: async (
+    hostId: string,
+    pluginId: string,
+    enabled: boolean,
+  ): Promise<void> => {
+    if (!transport()) return;
+    await invoke<void>("set_plugin_enabled", { hostId, pluginId, enabled });
+  },
+
+  uninstallPlugin: async (hostId: string, pluginId: string): Promise<void> => {
+    if (!transport()) return;
+    await invoke<void>("uninstall_plugin", { hostId, pluginId });
+  },
+
+  invokePluginOp: async (
+    hostId: string,
+    pluginId: string,
+    op: string,
+    argsJson: unknown = {},
+    cwd?: string | null,
+  ): Promise<unknown> => {
+    if (!transport()) return null;
+    return invoke<unknown>("invoke_plugin_op", {
+      hostId,
+      pluginId,
+      op,
+      argsJson,
+      cwd: cwd ?? null,
+    });
+  },
+
+  renderPluginUi: async (
+    hostId: string,
+    pluginId: string,
+    slot: OrbitPluginUiSlot,
+    options?: {
+      cwd?: string | null;
+      actionId?: string | null;
+      payload?: unknown;
+    },
+  ): Promise<OrbitPluginUiSpec> => {
+    if (!transport()) {
+      return {
+        root: {
+          type: "badge",
+          text: "Offline",
+          tone: "neutral",
+        },
+      };
+    }
+    return invoke<OrbitPluginUiSpec>("render_plugin_ui", {
+      hostId,
+      pluginId,
+      slot,
+      cwd: options?.cwd ?? null,
+      actionId: options?.actionId ?? null,
+      payload: options?.payload ?? null,
+    });
+  },
+
+  // --- M6 Voice Control Plane ---
+
+  getVoiceConfig: async (hostId: string): Promise<VoiceConfigState> => {
+    if (!transport()) {
+      return {
+        config: {
+          enabled: false,
+          stt_backend: "system_client_fallback",
+          tts_backend: "system_native",
+          language: null,
+          vad_threshold: 0.012,
+          preroll_ms: 300,
+          silence_hangover_ms: 750,
+          auto_speak_responses: false,
+          voice_id: null,
+          openai_endpoint_url: null,
+          openai_api_key_env: null,
+          stt_model_id: "whisper-base-q5",
+          tts_model_id: "kokoro-82m-q8",
+        },
+        models: [],
+        capabilities: {
+          local_whisper: false,
+          local_sense_voice: false,
+          local_kokoro: false,
+          system_native_tts: false,
+          system_client_fallback: true,
+        },
+      };
+    }
+    return invoke<VoiceConfigState>("get_voice_config", { hostId });
+  },
+
+  updateVoiceConfig: async (
+    hostId: string,
+    config: VoiceConfig,
+  ): Promise<VoiceConfigState> => {
+    if (!transport()) {
+      return {
+        config,
+        models: [],
+        capabilities: {
+          local_whisper: false,
+          local_sense_voice: false,
+          local_kokoro: false,
+          system_native_tts: false,
+          system_client_fallback: true,
+        },
+      };
+    }
+    return invoke<VoiceConfigState>("update_voice_config", { hostId, config });
+  },
+
+  downloadVoiceModel: async (
+    hostId: string,
+    modelId: string,
+  ): Promise<VoiceConfigState> => {
+    if (!transport()) {
+      throw new Error("Voice model download requires an active Orbit host connection");
+    }
+    return invoke<VoiceConfigState>("download_voice_model", { hostId, modelId });
+  },
+
+  deleteVoiceModel: async (
+    hostId: string,
+    modelId: string,
+  ): Promise<VoiceConfigState> => {
+    if (!transport()) {
+      throw new Error("Voice model removal requires an active Orbit host connection");
+    }
+    return invoke<VoiceConfigState>("delete_voice_model", { hostId, modelId });
+  },
+
+  transcribeVoiceAudio: async (
+    hostId: string,
+    pcm16LeBase64: string,
+    sampleRateHz: number,
+    options?: { language?: string | null; agentId?: string | null },
+  ): Promise<VoiceTranscriptionResult> => {
+    if (!transport()) {
+      return {
+        text: "",
+        language: options?.language ?? null,
+        duration_ms: 0,
+        backend_used: "system_client_fallback",
+        parsed_intent: null,
+      };
+    }
+    return invoke<VoiceTranscriptionResult>("transcribe_voice_audio", {
+      hostId,
+      pcm16LeBase64,
+      sampleRateHz,
+      language: options?.language ?? null,
+      agentId: options?.agentId ?? null,
+    });
+  },
+
+  parseVoiceTranscript: async (
+    hostId: string,
+    text: string,
+    options?: { language?: string | null; agentId?: string | null },
+  ): Promise<VoiceTranscriptionResult> => {
+    if (!transport()) {
+      return {
+        text,
+        language: options?.language ?? null,
+        duration_ms: 0,
+        backend_used: "system_client_fallback",
+        parsed_intent: text.trim() ? { kind: "send_prompt", text: text.trim() } : null,
+      };
+    }
+    return invoke<VoiceTranscriptionResult>("parse_voice_transcript", {
+      hostId,
+      text,
+      language: options?.language ?? null,
+      agentId: options?.agentId ?? null,
+    });
+  },
+
+  approveVoicePermission: async (
+    hostId: string,
+    agentId: string,
+    permissionRequestId: string,
+    confirmed: boolean,
+  ): Promise<VoiceApprovalSafety> => {
+    if (!transport()) return "requires_visual_confirmation";
+    return invoke<VoiceApprovalSafety>("approve_voice_permission", {
+      hostId,
+      agentId,
+      permissionRequestId,
+      confirmed,
+    });
+  },
+
+  synthesizeVoiceSpeech: async (
+    hostId: string,
+    text: string,
+    options?: { language?: string | null; voiceId?: string | null },
+  ): Promise<VoiceSpeechResult> => {
+    if (!transport()) {
+      throw new Error(
+        JSON.stringify({
+          code: "voice_client_tts_required",
+          message: "Use browser speech synthesis",
+        }),
+      );
+    }
+    return invoke<VoiceSpeechResult>("synthesize_voice_speech", {
+      hostId,
+      text,
+      language: options?.language ?? null,
+      voiceId: options?.voiceId ?? null,
     });
   },
 };

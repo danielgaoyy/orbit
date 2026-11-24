@@ -41,7 +41,10 @@ use orbit_protocol::{
     WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 use orbit_protocol::{
-    VoiceApprovalSafety, VoiceConfig, VoiceConfigState, VoiceSpeechResult, VoiceTranscriptionResult,
+    AuditChainVerification, InstalledPluginView, MemoryCategory, MemoryStatus, MigrationConflict,
+    OrbitPluginUiSlot, OrbitPluginUiSpec, ProjectMemoryItem, ProjectMemorySearchHit, SandboxPolicy,
+    VoiceApprovalSafety, VoiceConfig, VoiceConfigState, VoiceSpeechResult,
+    VoiceTranscriptionResult,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -60,20 +63,21 @@ use crate::cloud_sync::{
     stored_host_from_synced, unlock_remote_vault_with_passphrase, vault_fingerprint,
 };
 pub use crate::contract::{
-    BrowserActionResponseView, BrowserSessionsSnapshotView, CancelWorkflowRunRequest,
-    ControlGoalRunRequest, ConversationSearchHit, CreateBrowserSessionRequest,
-    CreateWorkspaceEntryRequest, DeletePathRuleRequest, DeleteWorkspaceEntryRequest,
-    EventTriggersSnapshotView, ExecuteBrowserActionRequest, ExecuteWorktreeHandoffRequest,
-    ForkAgentRequest, ForkAgentResultView, InstructionFileContentView, InstructionFileSavedView,
-    InstructionFilesSnapshotView, LifecycleHooksSnapshotView, ListInstructionFilesRequest,
-    MatchPathRulesRequest, MatchedPathRulesView, PathRulesSnapshotView,
-    PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RemotePreviewTunnelView,
-    RenameWorkspaceEntryRequest, SaveInstructionFileRequest, SearchMessagesRequest,
-    SearchMessagesResponse, SelectBestOfNWinnerRequest, StartBatchFanoutRequest,
-    StartBestOfNRequest, StartDagWorkflowRequest, StartGoalRunRequest, StartMonitorWatchRequest,
+    AuditChainExportView, BrowserActionResponseView, BrowserSessionsSnapshotView,
+    CancelWorkflowRunRequest, ControlGoalRunRequest, ConversationSearchHit,
+    CreateBrowserSessionRequest, CreateWorkspaceEntryRequest, DeletePathRuleRequest,
+    DeleteWorkspaceEntryRequest, EventTriggersSnapshotView, ExecuteBrowserActionRequest,
+    ExecuteWorktreeHandoffRequest, ForkAgentRequest, ForkAgentResultView,
+    InstructionFileContentView, InstructionFileSavedView, InstructionFilesSnapshotView,
+    LifecycleHooksSnapshotView, ListInstructionFilesRequest, MatchPathRulesRequest,
+    MatchedPathRulesView, PathRulesSnapshotView, PreviewWorktreeHandoffRequest,
+    ReadInstructionFileRequest, RemotePreviewTunnelView, RenameWorkspaceEntryRequest,
+    SaveInstructionFileRequest, SearchMessagesRequest, SearchMessagesResponse,
+    SelectBestOfNWinnerRequest, StartBatchFanoutRequest, StartBestOfNRequest,
+    StartDagWorkflowRequest, StartGoalRunRequest, StartMonitorWatchRequest,
     StopMonitorWatchRequest, UpsertArtifactRequest, UpsertEventTriggerRequest,
-    UpsertExternalMcpServerRequest, UpsertPathRuleRequest, WorkspaceEntryMutationResultView,
-    WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
+    UpsertExternalMcpServerRequest, UpsertPathRuleRequest, UpsertProjectMemoryRequest,
+    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
 };
 use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 use crate::viewmodel::*;
@@ -16615,6 +16619,598 @@ impl OrbitAppCore {
         {
             WireMessage::VoiceSpeechResult { result, .. } => Ok(result),
             _ => Err(VoiceRpcError::unexpected()),
+        }
+    }
+
+    async fn correlated_host_rpc<F>(
+        &self,
+        host_id: &str,
+        request_id: Uuid,
+        msg: WireMessage,
+        timeout: Duration,
+        is_reply: F,
+    ) -> Result<WireMessage, String>
+    where
+        F: FnMut(&WireMessage) -> bool + Send + 'static,
+    {
+        let session = self.require_online_session(host_id)?;
+        self.runtime
+            .spawn(async move {
+                session
+                    .request_by_id(request_id, msg, timeout, is_reply)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| format!("host RPC task failed: {e}"))?
+    }
+
+    // --- M3 Security, Audit Chain, Diagnostics, Context Compaction & IDE Migration ---
+
+    pub async fn get_sandbox_config(&self, host_id: &str) -> Result<Option<SandboxPolicy>, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::GetSandboxConfig { request_id },
+                Duration::from_secs(15),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::SandboxConfig { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::SandboxConfig { sandbox_policy, .. } => Ok(sandbox_policy),
+            _ => Err("unexpected daemon reply for get_sandbox_config".into()),
+        }
+    }
+
+    pub async fn update_sandbox_config(
+        &self,
+        host_id: &str,
+        sandbox_policy: Option<SandboxPolicy>,
+    ) -> Result<Option<SandboxPolicy>, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::UpdateSandboxConfig {
+                    request_id,
+                    sandbox_policy,
+                },
+                Duration::from_secs(15),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::SandboxConfig { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::SandboxConfig { sandbox_policy, .. } => Ok(sandbox_policy),
+            _ => Err("unexpected daemon reply for update_sandbox_config".into()),
+        }
+    }
+
+    pub async fn get_audit_chain_status(
+        &self,
+        host_id: &str,
+    ) -> Result<AuditChainVerification, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::GetAuditChainStatus { request_id },
+                Duration::from_secs(30),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::AuditChainStatus { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::AuditChainStatus { verification, .. } => Ok(verification),
+            _ => Err("unexpected daemon reply for get_audit_chain_status".into()),
+        }
+    }
+
+    pub async fn export_audit_chain(
+        &self,
+        host_id: &str,
+        after_seq: u64,
+    ) -> Result<AuditChainExportView, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::ExportAuditChain {
+                    request_id,
+                    after_seq,
+                },
+                Duration::from_secs(30),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::AuditChainExport { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::AuditChainExport {
+                jsonl,
+                next_after_seq,
+                ..
+            } => Ok(AuditChainExportView {
+                jsonl,
+                next_after_seq,
+            }),
+            _ => Err("unexpected daemon reply for export_audit_chain".into()),
+        }
+    }
+
+    pub async fn export_diagnostic_bundle(
+        &self,
+        host_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::ExportDiagnosticBundle { request_id },
+                Duration::from_secs(30),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::DiagnosticBundleReady { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::DiagnosticBundleReady { bundle, .. } => Ok(bundle),
+            _ => Err("unexpected daemon reply for export_diagnostic_bundle".into()),
+        }
+    }
+
+    pub async fn compact_agent_context(&self, host_id: &str, agent_id: &str) -> Result<(), String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::CompactAgentContext {
+                    request_id,
+                    agent_id: agent_id.to_string(),
+                },
+                Duration::from_secs(60),
+                move |m| matches!(m, WireMessage::Ack { request_id: rid } if *rid == request_id),
+            )
+            .await?
+        {
+            WireMessage::Ack { .. } => Ok(()),
+            _ => Err("unexpected daemon reply for compact_agent_context".into()),
+        }
+    }
+
+    pub async fn inspect_external_ide_migration(
+        &self,
+        host_id: &str,
+        source: Option<String>,
+        cwd: Option<String>,
+        conflict: MigrationConflict,
+    ) -> Result<serde_json::Value, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::InspectExternalIdeMigration {
+                    request_id,
+                    from: source,
+                    cwd,
+                    conflict,
+                },
+                Duration::from_secs(30),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::ExternalIdeMigrationResult { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::ExternalIdeMigrationResult { items, .. } => Ok(items),
+            _ => Err("unexpected daemon reply for inspect_external_ide_migration".into()),
+        }
+    }
+
+    pub async fn execute_external_ide_migration(
+        &self,
+        host_id: &str,
+        source: Option<String>,
+        cwd: Option<String>,
+        conflict: MigrationConflict,
+    ) -> Result<serde_json::Value, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::ExecuteExternalIdeMigration {
+                    request_id,
+                    from: source,
+                    cwd,
+                    conflict,
+                },
+                Duration::from_secs(45),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::ExternalIdeMigrationResult { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::ExternalIdeMigrationResult { items, .. } => Ok(items),
+            _ => Err("unexpected daemon reply for execute_external_ide_migration".into()),
+        }
+    }
+
+    // --- M4 Project Memory ---
+
+    pub async fn list_project_memories(
+        &self,
+        host_id: &str,
+        cwd: &str,
+        status: Option<MemoryStatus>,
+        category: Option<MemoryCategory>,
+        query: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<Vec<ProjectMemoryItem>, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::ListProjectMemories {
+                    request_id,
+                    cwd: cwd.to_string(),
+                    status,
+                    category,
+                    query,
+                    limit,
+                },
+                Duration::from_secs(20),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::ProjectMemoriesList { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::ProjectMemoriesList { items, .. } => Ok(items),
+            _ => Err("unexpected daemon reply for list_project_memories".into()),
+        }
+    }
+
+    pub async fn upsert_project_memory(
+        &self,
+        req: UpsertProjectMemoryRequest,
+    ) -> Result<ProjectMemoryItem, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                &req.host_id,
+                request_id,
+                WireMessage::UpsertProjectMemory {
+                    request_id,
+                    cwd: req.cwd,
+                    id: req.id,
+                    title: req.title,
+                    content: req.content,
+                    category: req.category,
+                    status: req.status,
+                    file_paths: req.file_paths,
+                    tags: req.tags,
+                },
+                Duration::from_secs(20),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::ProjectMemorySaved { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::ProjectMemorySaved { item, .. } => Ok(item),
+            _ => Err("unexpected daemon reply for upsert_project_memory".into()),
+        }
+    }
+
+    pub async fn confirm_project_memory(
+        &self,
+        host_id: &str,
+        cwd: &str,
+        memory_id: &str,
+    ) -> Result<ProjectMemoryItem, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::ConfirmProjectMemory {
+                    request_id,
+                    cwd: cwd.to_string(),
+                    id: memory_id.to_string(),
+                },
+                Duration::from_secs(20),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::ProjectMemorySaved { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::ProjectMemorySaved { item, .. } => Ok(item),
+            _ => Err("unexpected daemon reply for confirm_project_memory".into()),
+        }
+    }
+
+    pub async fn delete_project_memory(
+        &self,
+        host_id: &str,
+        cwd: &str,
+        memory_id: &str,
+    ) -> Result<bool, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::DeleteProjectMemory {
+                    request_id,
+                    cwd: cwd.to_string(),
+                    id: memory_id.to_string(),
+                },
+                Duration::from_secs(20),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::ProjectMemoryDeleted { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::ProjectMemoryDeleted { deleted, .. } => Ok(deleted),
+            _ => Err("unexpected daemon reply for delete_project_memory".into()),
+        }
+    }
+
+    pub async fn recall_project_memory(
+        &self,
+        host_id: &str,
+        cwd: &str,
+        query: &str,
+        limit: Option<u32>,
+        include_unconfirmed: Option<bool>,
+    ) -> Result<Vec<ProjectMemorySearchHit>, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::RecallProjectMemories {
+                    request_id,
+                    cwd: cwd.to_string(),
+                    query: query.to_string(),
+                    limit,
+                    include_unconfirmed,
+                },
+                Duration::from_secs(20),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::ProjectMemoryRecallResult { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::ProjectMemoryRecallResult { hits, .. } => Ok(hits),
+            _ => Err("unexpected daemon reply for recall_project_memory".into()),
+        }
+    }
+
+    // --- M5 WASM Plugins ---
+
+    pub async fn list_plugins(&self, host_id: &str) -> Result<Vec<InstalledPluginView>, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::ListPlugins { request_id },
+                Duration::from_secs(15),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::PluginsList { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::PluginsList { plugins, .. } => Ok(plugins),
+            _ => Err("unexpected daemon reply for list_plugins".into()),
+        }
+    }
+
+    pub async fn install_plugin(
+        &self,
+        host_id: &str,
+        source_path: &str,
+        enable: bool,
+    ) -> Result<InstalledPluginView, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::InstallPlugin {
+                    request_id,
+                    source: source_path.to_string(),
+                    enable,
+                },
+                Duration::from_secs(120),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::PluginInstalled { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::PluginInstalled { plugin, .. } => Ok(plugin),
+            _ => Err("unexpected daemon reply for install_plugin".into()),
+        }
+    }
+
+    pub async fn set_plugin_enabled(
+        &self,
+        host_id: &str,
+        plugin_id: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::SetPluginEnabled {
+                    request_id,
+                    plugin_id: plugin_id.to_string(),
+                    enabled,
+                },
+                Duration::from_secs(15),
+                move |m| matches!(m, WireMessage::Ack { request_id: rid } if *rid == request_id),
+            )
+            .await?
+        {
+            WireMessage::Ack { .. } => Ok(()),
+            _ => Err("unexpected daemon reply for set_plugin_enabled".into()),
+        }
+    }
+
+    pub async fn uninstall_plugin(&self, host_id: &str, plugin_id: &str) -> Result<(), String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::UninstallPlugin {
+                    request_id,
+                    plugin_id: plugin_id.to_string(),
+                },
+                Duration::from_secs(15),
+                move |m| matches!(m, WireMessage::Ack { request_id: rid } if *rid == request_id),
+            )
+            .await?
+        {
+            WireMessage::Ack { .. } => Ok(()),
+            _ => Err("unexpected daemon reply for uninstall_plugin".into()),
+        }
+    }
+
+    pub async fn invoke_plugin_op(
+        &self,
+        host_id: &str,
+        plugin_id: &str,
+        op: &str,
+        args_json: serde_json::Value,
+        cwd: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::InvokePluginOp {
+                    request_id,
+                    plugin_id: plugin_id.to_string(),
+                    op: op.to_string(),
+                    cwd,
+                    input: args_json,
+                },
+                Duration::from_secs(30),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::PluginOpResult { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::PluginOpResult { result, .. } => Ok(result),
+            _ => Err("unexpected daemon reply for invoke_plugin_op".into()),
+        }
+    }
+
+    pub async fn render_plugin_ui(
+        &self,
+        host_id: &str,
+        plugin_id: &str,
+        slot: OrbitPluginUiSlot,
+        cwd: Option<String>,
+        action_id: Option<String>,
+        payload: Option<serde_json::Value>,
+    ) -> Result<OrbitPluginUiSpec, String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::RenderPluginUi {
+                    request_id,
+                    plugin_id: plugin_id.to_string(),
+                    slot,
+                    cwd,
+                    action_id,
+                    payload,
+                },
+                Duration::from_secs(30),
+                move |m| {
+                    matches!(
+                        m,
+                        WireMessage::PluginUiRendered { request_id: rid, .. } if *rid == request_id
+                    )
+                },
+            )
+            .await?
+        {
+            WireMessage::PluginUiRendered { spec, .. } => Ok(spec),
+            _ => Err("unexpected daemon reply for render_plugin_ui".into()),
         }
     }
 

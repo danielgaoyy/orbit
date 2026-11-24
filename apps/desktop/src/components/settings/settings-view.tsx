@@ -36,10 +36,13 @@ import { HostHooksSection } from "@/components/settings/host-hooks-section";
 import { HostImChannelsSection } from "@/components/settings/host-im-channels-section";
 import { HostLspSection } from "@/components/settings/host-lsp-section";
 import { HostMcpSection } from "@/components/settings/host-mcp-section";
+import { HostMemorySection } from "@/components/settings/host-memory-section";
 import { HostPersonalRouterSection } from "@/components/settings/host-personal-router-section";
+import { HostPluginsSection } from "@/components/settings/host-plugins-section";
 import { HostRulesSection } from "@/components/settings/host-rules-section";
 import { HostSkillsSection } from "@/components/settings/host-skills-section";
 import { HostUsageSection } from "@/components/settings/host-usage-section";
+import { HostVoiceSection } from "@/components/settings/host-voice-section";
 import { InstructionsSection } from "@/components/settings/instructions-section";
 import { NotificationsSection } from "@/components/settings/notifications-section";
 import {
@@ -771,8 +774,26 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                       hostId={resolvedHost.hostId}
                     />
                   )}
+                  {resolvedHost?.tab === "memory" && (
+                    <HostMemorySection
+                      key={resolvedHost.hostId}
+                      hostId={resolvedHost.hostId}
+                    />
+                  )}
                   {resolvedHost?.tab === "skills" && (
                     <HostSkillsSection
+                      key={resolvedHost.hostId}
+                      hostId={resolvedHost.hostId}
+                    />
+                  )}
+                  {resolvedHost?.tab === "plugins" && (
+                    <HostPluginsSection
+                      key={resolvedHost.hostId}
+                      hostId={resolvedHost.hostId}
+                    />
+                  )}
+                  {resolvedHost?.tab === "voice" && (
+                    <HostVoiceSection
                       key={resolvedHost.hostId}
                       hostId={resolvedHost.hostId}
                     />

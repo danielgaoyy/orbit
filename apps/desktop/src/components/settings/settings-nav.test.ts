@@ -19,8 +19,8 @@ function makeTranslator(dict: MessageDictionary): (key: MessageKey) => string {
   return (key) => dict[key];
 }
 
-describe("Settings IA (3 Domain Groups · 9 Core Sections · 20 Leaf Views)", () => {
-  it("organizes all 20 settings views cleanly across APP, HOST, and WORKSPACE groups", () => {
+describe("Settings IA (3 Domain Groups · 9 Core Sections · 23 Leaf Views)", () => {
+  it("organizes all 23 settings views cleanly across APP, HOST, and WORKSPACE groups", () => {
     assert.deepEqual(
       SETTINGS_NAV_GROUPS.map((g) => g.id),
       ["app", "host", "workspace"],
@@ -45,7 +45,7 @@ describe("Settings IA (3 Domain Groups · 9 Core Sections · 20 Leaf Views)", ()
       (sum, section) => sum + Math.max(1, section.subTabs.length),
       0,
     );
-    assert.equal(totalLeafViews, 20);
+    assert.equal(totalLeafViews, 23);
 
     assert.deepEqual(
       getVisibleSubTabsForSection("general", true).map((t) => t.id),
@@ -68,11 +68,11 @@ describe("Settings IA (3 Domain Groups · 9 Core Sections · 20 Leaf Views)", ()
     assert.deepEqual(getVisibleSubTabsForSection("usage", true), []);
     assert.deepEqual(
       getVisibleSubTabsForSection("instructions_rules", true).map((t) => t.id),
-      ["instructions", "rules"],
+      ["instructions", "rules", "memory"],
     );
     assert.deepEqual(
       getVisibleSubTabsForSection("capabilities", true).map((t) => t.id),
-      ["skills", "mcp", "hooks", "lsp"],
+      ["skills", "plugins", "voice", "mcp", "hooks", "lsp"],
     );
 
     // Without a host, host-only sub-tabs gracefully filter out while non-host views stay accessible
@@ -118,8 +118,11 @@ describe("Settings IA (3 Domain Groups · 9 Core Sections · 20 Leaf Views)", ()
       { target: "instructions_rules", expectedSection: "instructions", expectedCore: "instructions_rules", expectedSubTab: "instructions" },
       { target: "instructions", expectedSection: "instructions", expectedCore: "instructions_rules", expectedSubTab: "instructions" },
       { target: "rules", expectedSection: `host:${hostId}:rules`, expectedCore: "instructions_rules", expectedSubTab: "rules" },
+      { target: "memory", expectedSection: `host:${hostId}:memory`, expectedCore: "instructions_rules", expectedSubTab: "memory" },
       { target: "capabilities", expectedSection: `host:${hostId}:skills`, expectedCore: "capabilities", expectedSubTab: "skills" },
       { target: "skills", expectedSection: `host:${hostId}:skills`, expectedCore: "capabilities", expectedSubTab: "skills" },
+      { target: "plugins", expectedSection: `host:${hostId}:plugins`, expectedCore: "capabilities", expectedSubTab: "plugins" },
+      { target: "voice", expectedSection: `host:${hostId}:voice`, expectedCore: "capabilities", expectedSubTab: "voice" },
       { target: "mcp", expectedSection: `host:${hostId}:mcp`, expectedCore: "capabilities", expectedSubTab: "mcp" },
       { target: "hooks", expectedSection: `host:${hostId}:hooks`, expectedCore: "capabilities", expectedSubTab: "hooks" },
       { target: "lsp", expectedSection: `host:${hostId}:lsp`, expectedCore: "capabilities", expectedSubTab: "lsp" },

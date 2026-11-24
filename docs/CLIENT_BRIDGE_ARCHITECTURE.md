@@ -91,6 +91,10 @@ All Contract v2 request/response DTOs are canonically defined in `crates/orbit-c
 | Host & Agent identity flags | `HostCardView.is_local`, `AgentCardView.has_armed_timers` | Same JSON fields + `isAgentTimerWaiting` | `FfiHostCard.isLocal`, `FfiAgentCard.hasArmedTimers` | Same DTO fields via N-API |
 | Global Personal Agent routing | `discover_fleet_router_hosts`, `primary_router_selection` (APP-level) | Wired via Desktop Tauri (`App -> Personal Agent`, host-independent) | Mobile FFI exposure planned | Mobile FFI exposure planned |
 | SEP-1865 MCP Apps bridge | `read_mcp_resource_async`, `call_artifact_mcp_tool_async` | `read_mcp_resource`, `call_artifact_mcp_tool` | Mobile FFI exposure planned | Mobile FFI exposure planned |
+| M3 Security, Audit, Diagnostics & IDE Migration | `get_sandbox_config`, `update_sandbox_config`, `get_audit_chain_status`, `export_audit_chain`, `export_diagnostic_bundle`, `compact_agent_context`, `inspect_external_ide_migration`, `execute_external_ide_migration` | Wired 1:1 in Tauri IPC + `WasmWebBackend` | Mobile FFI exposure planned | Mobile FFI exposure planned |
+| M4 Project Memory | `list_project_memories`, `upsert_project_memory`, `confirm_project_memory`, `delete_project_memory`, `recall_project_memory` | Wired 1:1 in Tauri IPC + `WasmWebBackend` (`Instructions & Rules -> Memory`) | Mobile FFI exposure planned | Mobile FFI exposure planned |
+| M5 WASM Plugins | `list_plugins`, `install_plugin`, `set_plugin_enabled`, `uninstall_plugin`, `invoke_plugin_op`, `render_plugin_ui` | Wired 1:1 in Tauri IPC + `WasmWebBackend` (`Capabilities -> Plugins` + `PluginUiRenderer`) | Mobile FFI exposure planned | Mobile FFI exposure planned |
+| M6 Voice Control | `get_voice_config`, `update_voice_config`, `download_voice_model`, `delete_voice_model`, `transcribe_voice_audio`, `parse_voice_transcript`, `approve_voice_permission`, `synthesize_voice_speech` | Wired 1:1 in Tauri IPC + `WasmWebBackend` (`OmniComposer` morphing circle + `Capabilities -> Voice`) | Mobile FFI exposure planned | Mobile FFI exposure planned |
 
 ---
 

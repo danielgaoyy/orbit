@@ -6,9 +6,12 @@ export type HostSettingsTab =
   | "guardian"
   | "im_channels"
   | "skills"
+  | "plugins"
+  | "voice"
   | "acp"
   | "mcp"
   | "rules"
+  | "memory"
   | "hooks"
   | "lsp"
   | "usage"
@@ -62,7 +65,10 @@ export type SettingsSubTabId =
   | "usage"
   | "instructions"
   | "rules"
+  | "memory"
   | "skills"
+  | "plugins"
+  | "voice"
   | "mcp"
   | "hooks"
   | "lsp"
@@ -74,6 +80,9 @@ export type SettingsLegacyAlias =
   | "hosts"
   | "providers"
   | "skills"
+  | "plugins"
+  | "voice"
+  | "memory"
   | "models_agents"
   | "context"
   | "sync_data"
@@ -135,9 +144,12 @@ const VALID_HOST_TABS = new Set<string>([
   "guardian",
   "im_channels",
   "skills",
+  "plugins",
+  "voice",
   "acp",
   "mcp",
   "rules",
+  "memory",
   "hooks",
   "lsp",
   "usage",
@@ -608,8 +620,13 @@ export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
           "risk",
           "policy",
           "security",
+          "sandbox",
+          "audit",
+          "audit chain",
           "blocked",
           "trusted",
+          "沙箱",
+          "审计",
           "自动审批",
           "风险",
           "安全",
@@ -710,6 +727,22 @@ export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
           "ルール",
         ],
       },
+      {
+        id: "memory",
+        labelKey: "settings.subTabMemory",
+        requiresHost: true,
+        keywords: [
+          "memory",
+          "project memory",
+          "recall",
+          "knowledge",
+          "revalidation",
+          "记忆",
+          "项目记忆",
+          "メモリ",
+          "プロジェクトメモリ",
+        ],
+      },
     ],
   },
   {
@@ -723,6 +756,12 @@ export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
       "skills",
       "skill.md",
       "plugins",
+      "wasm",
+      "voice",
+      "speech",
+      "whisper",
+      "tts",
+      "stt",
       "mcp",
       "servers",
       "hooks",
@@ -732,10 +771,14 @@ export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
       "扩展",
       "能力",
       "技能",
+      "插件",
+      "语音",
       "钩子",
       "语言服务器",
       "拡張",
       "スキル",
+      "プラグイン",
+      "音声",
       "フック",
       "言語サーバー",
     ],
@@ -748,9 +791,42 @@ export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
           "skills",
           "skill.md",
           "capabilities",
-          "plugins",
           "技能",
           "スキル",
+        ],
+      },
+      {
+        id: "plugins",
+        labelKey: "settings.subTabPlugins",
+        requiresHost: true,
+        keywords: [
+          "plugins",
+          "wasm",
+          "extensions",
+          "sandbox",
+          "插件",
+          "扩展",
+          "プラグイン",
+        ],
+      },
+      {
+        id: "voice",
+        labelKey: "settings.subTabVoice",
+        requiresHost: true,
+        keywords: [
+          "voice",
+          "speech",
+          "dictation",
+          "whisper",
+          "kokoro",
+          "tts",
+          "stt",
+          "microphone",
+          "语音",
+          "听写",
+          "朗读",
+          "音声",
+          "マイク",
         ],
       },
       {
@@ -865,8 +941,14 @@ export function resolveSettingsSectionTarget(
       return defaultHostId ? `host:${defaultHostId}:skills` : "instructions";
     case "rules":
       return defaultHostId ? `host:${defaultHostId}:rules` : "instructions";
+    case "memory":
+      return defaultHostId ? `host:${defaultHostId}:memory` : "instructions";
     case "skills":
       return defaultHostId ? `host:${defaultHostId}:skills` : "instructions";
+    case "plugins":
+      return defaultHostId ? `host:${defaultHostId}:plugins` : "instructions";
+    case "voice":
+      return defaultHostId ? `host:${defaultHostId}:voice` : "instructions";
     case "mcp":
       return defaultHostId ? `host:${defaultHostId}:mcp` : "instructions";
     case "hooks":
@@ -926,13 +1008,16 @@ export function resolveActiveSettingsLocation(
           section,
         };
       case "rules":
+      case "memory":
         return {
           coreSection: "instructions_rules",
-          subTab: "rules",
+          subTab: parsedHost.tab,
           hostId: parsedHost.hostId,
           section,
         };
       case "skills":
+      case "plugins":
+      case "voice":
       case "mcp":
       case "hooks":
       case "lsp":
@@ -1023,7 +1108,10 @@ export function buildSettingsSectionForTarget(
       case "usage":
         return hostId ? `host:${hostId}:${subTab}` : "add_host";
       case "rules":
+      case "memory":
       case "skills":
+      case "plugins":
+      case "voice":
       case "mcp":
       case "hooks":
       case "lsp":

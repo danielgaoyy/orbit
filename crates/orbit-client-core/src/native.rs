@@ -197,6 +197,42 @@ impl HostSessionHandle {
         self.request_matching(msg, timeout, matcher, true).await
     }
 
+    /// Perform a request correlated by `request_id`, matching `RpcError` only for that ID.
+    pub async fn request_by_id<F>(
+        &self,
+        request_id: Uuid,
+        msg: WireMessage,
+        timeout: Duration,
+        mut is_reply: F,
+    ) -> Result<WireMessage, ClientCoreError>
+    where
+        F: FnMut(&WireMessage) -> bool,
+    {
+        let reply = self
+            .request_matching(
+                msg,
+                timeout,
+                |wire| {
+                    is_reply(wire)
+                        || matches!(
+                            wire,
+                            WireMessage::RpcError {
+                                request_id: Some(rid),
+                                ..
+                            } if *rid == request_id
+                        )
+                },
+                false,
+            )
+            .await?;
+        match reply {
+            WireMessage::RpcError { code, message, .. } => {
+                Err(ClientCoreError::Transport(format!("[{code}] {message}")))
+            }
+            other => Ok(other),
+        }
+    }
+
     async fn request_matching<F>(
         &self,
         msg: WireMessage,

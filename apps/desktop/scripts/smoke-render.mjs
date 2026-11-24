@@ -446,6 +446,92 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
           };
         case "close_remote_preview_tunnel":
           return true;
+        case "get_sandbox_config":
+        case "update_sandbox_config":
+          return args.sandboxPolicy ?? {
+            mode: "workspace_write",
+            writable_roots: [],
+            denied_read_paths: ["~/.ssh", "~/.aws"],
+            allow_network: false,
+            allowed_domains: [],
+            denied_domains: [],
+          };
+        case "get_audit_chain_status":
+          return {
+            verified_entries: 42,
+            broken_seq: null,
+            signed_checkpoints: 4,
+          };
+        case "export_audit_chain":
+          return { jsonl: "", next_after_seq: null };
+        case "export_diagnostic_bundle":
+          return { ok: true, host_id: args.hostId ?? "host_smoke_1", redacted: true };
+        case "compact_agent_context":
+          return null;
+        case "inspect_external_ide_migration":
+        case "execute_external_ide_migration":
+          return [];
+        case "list_project_memories":
+        case "recall_project_memory":
+          return [];
+        case "delete_project_memory":
+          return true;
+        case "list_plugins":
+          return [];
+        case "set_plugin_enabled":
+        case "uninstall_plugin":
+          return null;
+        case "invoke_plugin_op":
+          return { ok: true };
+        case "render_plugin_ui":
+          return { root: { type: "badge", text: "OK", tone: "success" } };
+        case "get_voice_config":
+        case "update_voice_config":
+        case "download_voice_model":
+        case "delete_voice_model":
+          return {
+            config: args.config ?? {
+              enabled: false,
+              stt_backend: "local_whisper",
+              tts_backend: "system_native",
+              language: null,
+              vad_threshold: 0.012,
+              preroll_ms: 300,
+              silence_hangover_ms: 750,
+              auto_speak_responses: false,
+              voice_id: null,
+              openai_endpoint_url: null,
+              openai_api_key_env: null,
+              stt_model_id: "whisper-base-q5",
+              tts_model_id: "kokoro-82m-q8",
+            },
+            models: [],
+            capabilities: {
+              local_whisper: false,
+              local_sense_voice: false,
+              local_kokoro: false,
+              system_native_tts: true,
+              system_client_fallback: true,
+            },
+          };
+        case "transcribe_voice_audio":
+        case "parse_voice_transcript":
+          return {
+            text: typeof args.text === "string" ? args.text : "",
+            language: args.language ?? null,
+            duration_ms: 0,
+            backend_used: "system_client_fallback",
+            parsed_intent: null,
+          };
+        case "approve_voice_permission":
+          return "requires_visual_confirmation";
+        case "synthesize_voice_speech":
+          return {
+            audio_wav_base64: "",
+            mime_type: "audio/wav",
+            duration_ms: 0,
+            backend_used: "system_native",
+          };
         default:
           return null;
       }

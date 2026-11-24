@@ -758,3 +758,27 @@ pub struct SelectBestOfNWinnerRequest {
     #[serde(default)]
     pub apply_to_workspace: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditChainExportView {
+    pub jsonl: String,
+    #[serde(default)]
+    pub next_after_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertProjectMemoryRequest {
+    pub host_id: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    pub title: String,
+    pub content: String,
+    pub category: orbit_protocol::MemoryCategory,
+    #[serde(default)]
+    pub status: Option<orbit_protocol::MemoryStatus>,
+    #[serde(default)]
+    pub file_paths: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}

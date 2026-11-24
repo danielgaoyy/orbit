@@ -11,6 +11,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { PairingQrDialog } from "@/components/modals/pairing-qr-dialog";
+import { HostDiagnosticsAndMigrationPanel } from "@/components/settings/host-security-ops-panels";
 import {
   HostStatusIndicator,
   SettingCard,
@@ -512,6 +513,14 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
           )}
         </CollapsibleContent>
       </Collapsible>
+
+      <HostDiagnosticsAndMigrationPanel
+        hostId={host.host_id}
+        isOnline={
+          host.connection_state === "online_direct" ||
+          host.connection_state === "online_relay"
+        }
+      />
 
       {/* Danger Zone: Remove host */}
       <SettingCard>

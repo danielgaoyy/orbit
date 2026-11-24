@@ -10,9 +10,11 @@ import {
 import {
   ArrowUp,
   AtSign,
+  Mic,
   Paperclip,
   Plus,
   SquareSlash,
+  X,
 } from "lucide-react";
 import {
   collapseStrippedToken,
@@ -65,11 +67,18 @@ import {
   type ProviderModelCatalog,
   type SessionMode,
   type SlashCommandView,
+  type VoiceTranscriptionResult,
   isAgentForegroundRunning,
   isMacDesktop,
   isTauriRuntime,
   orbitIpc,
+  parseVoiceRpcError,
 } from "@/lib/orbit-ipc";
+import {
+  VoiceRecorderSession,
+  captureBrowserSpeechFallback,
+  speakVoiceText,
+} from "@/lib/voice-recorder";
 import {
   buildFolderTreeSummary,
   findInlineMentionSpans,
@@ -169,6 +178,44 @@ function isStandaloneHtmlImageCopy(html: string): boolean {
     .replace(/<\/?(?:html|head|body|meta)\b[^>]*>/gi, "")
     .trim();
   return /^<img\b[^>]*\/?>$/i.test(stripped);
+}
+
+function formatVoiceDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const mins = Math.floor(totalSeconds / 60);
+  const secs = totalSeconds % 60;
+  return `${mins}:${secs.toString().padStart(2, "0")}`;
+}
+
+function focusVisualPermissionCard(requestId?: string | null): void {
+  if (typeof document === "undefined") return;
+  const selector = requestId
+    ? `[data-permission-request-id="${CSS.escape(requestId)}"], .approval-dock-surface`
+    : ".approval-dock-surface";
+  const el = document.querySelector<HTMLElement>(selector);
+  if (!el) return;
+  el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  if (typeof el.focus === "function") {
+    el.focus({ preventScroll: true });
+  }
+  el.animate?.(
+    [
+      { boxShadow: "0 0 0 0 rgba(245, 183, 73, 0)" },
+      { boxShadow: "0 0 0 3px rgba(245, 183, 73, 0.55)" },
+      { boxShadow: "0 0 0 0 rgba(245, 183, 73, 0)" },
+    ],
+    { duration: 900, iterations: 1 },
+  );
+}
+
+function resolveVoiceModeAlias(query: string): SessionMode | null {
+  const q = query.trim().toLowerCase();
+  if (q === "plan" || q === "planning" || q === "计划" || q === "プラン") return "plan";
+  if (q === "build" || q === "auto" || q === "agent" || q === "构建" || q === "ビルド") return "auto";
+  if (q === "default" || q === "ask" || q === "默认" || q === "询问") return "default";
+  if (q === "accept edits" || q === "accept_edits" || q === "edits") return "accept_edits";
+  if (q === "full access" || q === "full_access" || q === "全权限") return "full_access";
+  return null;
 }
 
 export interface OmniComposerProps {
@@ -1451,6 +1498,350 @@ export const OmniComposer = memo(function OmniComposer({
   }, []);
   const handleSelectModeSilent = useCallback((mode: SessionMode) => handleSelectMode(mode, false), [handleSelectMode]);
   const handleSubmitClick = useCallback(() => triggerSubmit(false), [triggerSubmit]);
+
+  // --- M6 Codex-style Voice Control (zero extra toolbar chrome) ---
+  const voiceRecorderRef = useRef<VoiceRecorderSession | null>(null);
+  const voiceElapsedTimerRef = useRef<number | null>(null);
+  const voiceStartMsRef = useRef<number>(0);
+  const [voiceRecording, setVoiceRecording] = useState(false);
+  const [voiceTranscribing, setVoiceTranscribing] = useState(false);
+  const [voiceElapsedMs, setVoiceElapsedMs] = useState(0);
+  const [voiceLevel, setVoiceLevel] = useState(0);
+  const [voiceInterimText, setVoiceInterimText] = useState("");
+
+  const stopVoiceTimer = useCallback(() => {
+    if (voiceElapsedTimerRef.current !== null) {
+      window.clearInterval(voiceElapsedTimerRef.current);
+      voiceElapsedTimerRef.current = null;
+    }
+  }, []);
+
+  const handleCancelVoice = useCallback(() => {
+    stopVoiceTimer();
+    voiceRecorderRef.current?.cancel();
+    voiceRecorderRef.current = null;
+    setVoiceRecording(false);
+    setVoiceElapsedMs(0);
+    setVoiceLevel(0);
+    setVoiceInterimText("");
+  }, [stopVoiceTimer]);
+
+  // Cleanly release mic stream on unmount or host switch
+  useEffect(() => {
+    return () => {
+      stopVoiceTimer();
+      voiceRecorderRef.current?.cancel();
+      voiceRecorderRef.current = null;
+    };
+  }, [selectedHostId, stopVoiceTimer]);
+
+  // Escape cancels an active recording without disturbing surrounding panels
+  useEffect(() => {
+    if (!voiceRecording) return;
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        handleCancelVoice();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [voiceRecording, handleCancelVoice]);
+
+  const executeVoiceResult = useCallback(
+    async (
+      hostId: string,
+      agentId: string | null,
+      result: VoiceTranscriptionResult,
+      voiceLang: string | null,
+    ) => {
+      const intent = result.parsed_intent;
+      if (!intent) {
+        if (result.text.trim()) {
+          const cur = draftTextRef.current;
+          const next = cur.trim() ? `${cur.trimEnd()} ${result.text.trim()}` : result.text.trim();
+          orbitActions.setComposerDraft(next);
+          requestAnimationFrame(() => textareaRef.current?.focus());
+        } else {
+          orbitActions.showToast(t("composer.voiceNoSpeechDetected"));
+        }
+        return;
+      }
+
+      switch (intent.kind) {
+        case "send_prompt": {
+          const spoken = intent.text.trim();
+          if (!spoken) {
+            orbitActions.showToast(t("composer.voiceNoSpeechDetected"));
+            return;
+          }
+          const cur = draftTextRef.current;
+          const explicitSend =
+            !cur.trim() && spoken.toLowerCase() !== result.text.trim().toLowerCase();
+          const next = cur.trim() ? `${cur.trimEnd()} ${spoken}` : spoken;
+          orbitActions.setComposerDraft(next);
+          if (explicitSend) {
+            void orbitActions.submitComposer().catch((err) => {
+              orbitActions.showToast(err instanceof Error ? err.message : String(err));
+            });
+          } else {
+            requestAnimationFrame(() => {
+              textareaRef.current?.focus();
+              textareaRef.current?.setSelectionRange(next.length, next.length);
+            });
+          }
+          return;
+        }
+        case "switch_agent": {
+          const modeAlias = resolveVoiceModeAlias(intent.query);
+          if (modeAlias) {
+            handleSelectModeSilent(modeAlias);
+            orbitActions.showToast(
+              t("composer.voiceSwitchedMode", { mode: modeLabel(modeAlias) }),
+            );
+            return;
+          }
+          const snap = orbitActions.getSnapshot();
+          const agents = snap.hostDetails[hostId]?.agents ?? [];
+          const q = intent.query.trim().toLowerCase();
+          const matched = agents.find(
+            (a) =>
+              a.title.toLowerCase().includes(q) ||
+              a.provider_label.toLowerCase().includes(q) ||
+              a.agent_id.toLowerCase() === q,
+          );
+          if (matched) {
+            orbitActions.selectAgent(hostId, matched.agent_id);
+            orbitActions.showToast(
+              t("composer.voiceSwitchedAgent", { title: matched.title || matched.provider_label }),
+            );
+          } else {
+            orbitActions.showToast(t("composer.voiceAgentNotFound", { query: intent.query }));
+          }
+          return;
+        }
+        case "read_last_reply": {
+          if (!agentId) {
+            orbitActions.showToast(t("composer.voiceNoReplyToRead"));
+            return;
+          }
+          const snap = orbitActions.getSnapshot();
+          const stage = snap.stages[`${hostId}::${agentId}`];
+          const turns = stage?.turns ?? [];
+          let lastText = "";
+          for (let i = turns.length - 1; i >= 0; i -= 1) {
+            const termItem = turns[i]?.terminal_reply;
+            const lastItem = turns[i]?.last_assistant_reply;
+            const candidate =
+              (termItem?.item_type === "assistant_message" ? termItem.text : "") ||
+              (lastItem?.item_type === "assistant_message" ? lastItem.text : "");
+            if (candidate.trim()) {
+              lastText = candidate.trim();
+              break;
+            }
+          }
+          if (!lastText) {
+            orbitActions.showToast(t("composer.voiceNoReplyToRead"));
+            return;
+          }
+          try {
+            const spoken = await speakVoiceText(hostId, lastText, { language: voiceLang });
+            if (spoken.reason === "disabled") {
+              orbitActions.showToast(t("composer.voiceTtsDisabledToast"));
+            } else if (!spoken.spoken) {
+              orbitActions.showToast(t("composer.voiceTtsUnavailable"));
+            }
+          } catch (err) {
+            orbitActions.showToast(parseVoiceRpcError(err).message);
+          }
+          return;
+        }
+        case "queue_status": {
+          const snap = orbitActions.getSnapshot();
+          const scope = composerScopeKey(snap);
+          const count = snap.queuedPrompts[scope]?.length ?? 0;
+          orbitActions.showToast(
+            count === 0
+              ? t("composer.voiceQueueEmpty")
+              : t("composer.voiceQueueCount", { count }),
+          );
+          return;
+        }
+        case "approve_permission": {
+          const safety = result.approval_safety ?? "requires_visual_confirmation";
+          if (safety === "requires_visual_confirmation") {
+            focusVisualPermissionCard(intent.request_id);
+            orbitActions.showToast(
+              t("composer.voiceVisualConfirmRequired", { id: intent.request_id }),
+            );
+            return;
+          }
+          if (safety === "requires_spoken_confirmation" || !intent.confirmed) {
+            focusVisualPermissionCard(intent.request_id);
+            orbitActions.showToast(
+              t("composer.voiceSpokenConfirmRequired", { id: intent.request_id }),
+            );
+            return;
+          }
+          if (!agentId) {
+            focusVisualPermissionCard(intent.request_id);
+            orbitActions.showToast(
+              t("composer.voiceVisualConfirmRequired", { id: intent.request_id }),
+            );
+            return;
+          }
+          try {
+            const finalSafety = await orbitIpc.approveVoicePermission(
+              hostId,
+              agentId,
+              intent.request_id,
+              true,
+            );
+            if (finalSafety === "allowed") {
+              orbitActions.showToast(t("composer.voicePermissionApproved", { id: intent.request_id }));
+            } else {
+              focusVisualPermissionCard(intent.request_id);
+              orbitActions.showToast(
+                t("composer.voiceVisualConfirmRequired", { id: intent.request_id }),
+              );
+            }
+          } catch (err) {
+            orbitActions.showToast(parseVoiceRpcError(err).message);
+          }
+          return;
+        }
+        case "deny_permission": {
+          if (!agentId) {
+            focusVisualPermissionCard(intent.request_id);
+            return;
+          }
+          try {
+            await orbitIpc.resolvePermission(hostId, agentId, intent.request_id, "deny");
+            orbitActions.showToast(t("composer.voicePermissionDenied", { id: intent.request_id }));
+          } catch (err) {
+            orbitActions.showToast(err instanceof Error ? err.message : String(err));
+          }
+          return;
+        }
+        case "cancel": {
+          if (agentId && isTurnBusy) {
+            void orbitIpc.interruptAgent(hostId, agentId);
+            orbitActions.showToast(t("composer.voiceTurnStopped"));
+          } else {
+            orbitActions.showToast(t("composer.voiceCanceled"));
+          }
+          return;
+        }
+      }
+    },
+    [handleSelectModeSilent, isTurnBusy, t],
+  );
+
+  const handleStartVoice = useCallback(async () => {
+    if (!selectedHostId || voiceRecording || voiceTranscribing) return;
+    let voiceLang: string | null = null;
+    try {
+      const voiceState = await orbitIpc.getVoiceConfig(selectedHostId);
+      voiceLang = voiceState.config.language;
+      if (!voiceState.config.enabled) {
+        orbitActions.showToast(t("composer.voiceDisabledOnHost"), {
+          label: t("composer.voiceOpenSettings"),
+          onClick: () => orbitActions.openSettings(`host:${selectedHostId}:voice`),
+        });
+        return;
+      }
+    } catch {
+      // Proceed to mic capture and let transcribe report host errors cleanly
+    }
+
+    const session = new VoiceRecorderSession();
+    try {
+      await session.start({
+        language: voiceLang,
+        onLevel: (lvl) => setVoiceLevel(lvl),
+        onInterimTranscript: (txt) => setVoiceInterimText(txt),
+      });
+      voiceRecorderRef.current = session;
+      voiceStartMsRef.current = Date.now();
+      setVoiceElapsedMs(0);
+      setVoiceLevel(0);
+      setVoiceInterimText("");
+      setVoiceRecording(true);
+      stopVoiceTimer();
+      voiceElapsedTimerRef.current = window.setInterval(() => {
+        setVoiceElapsedMs(Date.now() - voiceStartMsRef.current);
+      }, 200);
+    } catch (err) {
+      session.cancel();
+      const domErr = err as { name?: string; message?: string };
+      if (domErr?.name === "NotAllowedError" || domErr?.name === "PermissionDeniedError") {
+        orbitActions.showToast(t("composer.voiceMicDenied"));
+      } else {
+        orbitActions.showToast(domErr?.message || t("composer.voiceUnavailable"));
+      }
+    }
+  }, [selectedHostId, stopVoiceTimer, t, voiceRecording, voiceTranscribing]);
+
+  const handleStopVoice = useCallback(async () => {
+    const session = voiceRecorderRef.current;
+    voiceRecorderRef.current = null;
+    stopVoiceTimer();
+    setVoiceRecording(false);
+    setVoiceLevel(0);
+    setVoiceInterimText("");
+    if (!session || !selectedHostId) return;
+
+    setVoiceTranscribing(true);
+    try {
+      const payload = await session.stop();
+      let voiceLang: string | null = null;
+      try {
+        const cfgState = await orbitIpc.getVoiceConfig(selectedHostId);
+        voiceLang = cfgState.config.language;
+      } catch {
+        // Optional language hint
+      }
+      let result = await orbitIpc.transcribeVoiceAudio(
+        selectedHostId,
+        payload.pcm16LeBase64,
+        payload.sampleRateHz,
+        {
+          language: voiceLang,
+          agentId: selectedAgentId,
+        },
+      );
+      if (result.backend_used === "system_client_fallback" && !result.text.trim()) {
+        const fallbackText =
+          payload.browserTranscript || (await captureBrowserSpeechFallback(voiceLang));
+        if (fallbackText.trim()) {
+          result = await orbitIpc.parseVoiceTranscript(selectedHostId, fallbackText, {
+            language: voiceLang,
+            agentId: selectedAgentId,
+          });
+        } else {
+          orbitActions.showToast(t("composer.voiceClientFallbackUnavailable"), {
+            label: t("composer.voiceOpenSettings"),
+            onClick: () => orbitActions.openSettings(`host:${selectedHostId}:voice`),
+          });
+          return;
+        }
+      }
+      await executeVoiceResult(selectedHostId, selectedAgentId, result, voiceLang);
+    } catch (err) {
+      const parsed = parseVoiceRpcError(err);
+      if (parsed.message.toLowerCase().includes("disabled")) {
+        orbitActions.showToast(t("composer.voiceDisabledOnHost"), {
+          label: t("composer.voiceOpenSettings"),
+          onClick: () => orbitActions.openSettings(`host:${selectedHostId}:voice`),
+        });
+      } else {
+        orbitActions.showToast(parsed.message || t("composer.voiceUnavailable"));
+      }
+    } finally {
+      setVoiceTranscribing(false);
+      setVoiceElapsedMs(0);
+    }
+  }, [executeVoiceResult, selectedAgentId, selectedHostId, stopVoiceTimer, t]);
   const handleRemoveInlineMention = useCallback((token: string) => {
     orbitActions.removeInlineMention(token);
     requestAnimationFrame(() => {
@@ -1727,10 +2118,56 @@ export const OmniComposer = memo(function OmniComposer({
               />
             </div>
 
+            {/* Minimal Inline Voice Recording Strip — rendered ONLY while actively recording */}
+            {voiceRecording && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="border-border-subtle/75 flex items-center justify-between gap-3 border-t px-3.5 py-2"
+              >
+                <div className="flex min-w-0 flex-1 items-center gap-2.5">
+                  <span className="bg-signal-danger size-2 shrink-0 animate-pulse rounded-full motion-reduce:animate-none" />
+                  <span
+                    aria-hidden="true"
+                    className="flex h-[14px] shrink-0 items-center gap-[2.5px]"
+                  >
+                    {[0.45, 0.78, 1.0, 0.72, 0.42].map((weight, idx) => {
+                      const scale = Math.max(0.22, Math.min(1, 0.22 + voiceLevel * weight * 0.95));
+                      return (
+                        <span
+                          key={idx}
+                          style={{ transform: `scaleY(${scale.toFixed(2)})` }}
+                          className="bg-ink-secondary/80 h-[12px] w-[2px] origin-center rounded-full transition-transform duration-100 ease-out"
+                        />
+                      );
+                    })}
+                  </span>
+                  <span className="text-ink-secondary shrink-0 font-mono text-[12px] tabular-nums">
+                    {formatVoiceDuration(voiceElapsedMs)}
+                  </span>
+                  <span className="text-ink-muted min-w-0 truncate text-[12px]">
+                    {voiceInterimText || t("composer.voiceListening")}
+                  </span>
+                </div>
+                <SimpleTooltip label={t("composer.voiceCancel")} shortcut="Esc" side="top">
+                  <button
+                    type="button"
+                    aria-label={t("composer.voiceCancel")}
+                    onClick={handleCancelVoice}
+                    className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors"
+                  >
+                    <X className="size-[13px] stroke-[2]" />
+                  </button>
+                </SimpleTooltip>
+              </div>
+            )}
+
             <ComposerBottomBar
               hasPayload={hasPayload}
               submitBusy={submitBusy}
               showStopButton={showStopButton}
+              voiceRecording={voiceRecording}
+              voiceTranscribing={voiceTranscribing}
               submitTooltipLabel={submitTooltipLabel}
               submitShortcut={submitShortcut}
               activeMode={activeMode}
@@ -1743,6 +2180,8 @@ export const OmniComposer = memo(function OmniComposer({
               onSlash={triggerSlashActionsFromButton}
               onSelectMode={handleSelectModeSilent}
               onSubmit={handleSubmitClick}
+              onStartVoice={handleStartVoice}
+              onStopVoice={handleStopVoice}
             />
           </div>
         </div>
@@ -1755,6 +2194,8 @@ interface ComposerBottomBarProps {
   hasPayload: boolean;
   submitBusy: boolean;
   showStopButton: boolean;
+  voiceRecording: boolean;
+  voiceTranscribing: boolean;
   submitTooltipLabel: string;
   submitShortcut?: string;
   activeMode: SessionMode;
@@ -1767,22 +2208,44 @@ interface ComposerBottomBarProps {
   onSlash: () => void;
   onSelectMode: (mode: SessionMode) => void;
   onSubmit: () => void;
+  onStartVoice: () => void;
+  onStopVoice: () => void;
 }
 
 const ComposerBottomBar = memo(function ComposerBottomBar({
-  hasPayload, submitBusy, showStopButton, submitTooltipLabel, submitShortcut,
+  hasPayload, submitBusy, showStopButton, voiceRecording, voiceTranscribing,
+  submitTooltipLabel, submitShortcut,
   activeMode, effectiveProvider, isCompactBar, selectedHostId, selectedAgentId,
-  onAttach, onMention, onSlash, onSelectMode, onSubmit,
+  onAttach, onMention, onSlash, onSelectMode, onSubmit, onStartVoice, onStopVoice,
 }: ComposerBottomBarProps) {
   const { t } = useI18n();
-  const actionMode: "stop" | "submitting" | "send" = showStopButton
-    ? "stop"
-    : submitBusy
-      ? "submitting"
-      : "send";
-  const actionLabel = showStopButton ? t("composer.stopGeneration") : submitTooltipLabel;
-  const actionShortcut = showStopButton ? "Esc Esc" : submitShortcut;
-  const actionDisabled = !showStopButton && (!hasPayload || submitBusy);
+  const actionMode: "stop" | "voice_recording" | "submitting" | "send" | "voice_idle" =
+    voiceRecording
+      ? "voice_recording"
+      : showStopButton
+        ? "stop"
+        : submitBusy || voiceTranscribing
+          ? "submitting"
+          : hasPayload
+            ? "send"
+            : "voice_idle";
+  const actionLabel =
+    actionMode === "voice_recording"
+      ? t("composer.voiceStopAndTranscribe")
+      : actionMode === "stop"
+        ? t("composer.stopGeneration")
+        : actionMode === "voice_idle"
+          ? t("composer.voiceStartDictation")
+          : voiceTranscribing
+            ? t("composer.voiceTranscribing")
+            : submitTooltipLabel;
+  const actionShortcut =
+    actionMode === "stop"
+      ? "Esc Esc"
+      : actionMode === "send"
+        ? submitShortcut
+        : undefined;
+  const actionDisabled = actionMode === "submitting";
 
   return (
     <div className="flex items-center justify-between gap-2 px-2.5 pt-2 pb-2">
@@ -1851,29 +2314,51 @@ const ComposerBottomBar = memo(function ComposerBottomBar({
           <button
             type="button"
             disabled={actionDisabled}
-            aria-busy={!showStopButton && submitBusy}
+            aria-busy={actionMode === "submitting"}
+            aria-pressed={actionMode === "voice_recording" ? true : undefined}
             aria-label={actionLabel}
             onClick={() => {
-              if (showStopButton) {
+              if (actionMode === "voice_recording") {
+                onStopVoice();
+                return;
+              }
+              if (actionMode === "stop") {
                 if (selectedAgentId) {
                   void orbitIpc.interruptAgent(selectedHostId, selectedAgentId);
                 }
                 return;
               }
-              onSubmit();
+              if (actionMode === "voice_idle") {
+                onStartVoice();
+                return;
+              }
+              if (actionMode === "send") {
+                onSubmit();
+              }
             }}
             className={cn(
-              "orbit-press inline-flex size-8.5 shrink-0 cursor-pointer items-center justify-center rounded-full",
-              showStopButton
+              "orbit-press inline-flex size-8.5 shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors duration-150 ease-[var(--ease-out-expo)]",
+              actionMode === "stop"
                 ? "bg-surface-recessed hover:bg-accent"
-                : hasPayload && !submitBusy
+                : actionMode === "voice_recording"
                   ? "bg-action-primary-bg text-action-primary-fg hover:bg-action-primary-hover"
-                  : submitBusy
-                    ? "bg-action-primary-bg text-action-primary-fg opacity-80"
-                    : "text-ink-muted bg-surface-recessed pointer-events-none opacity-65",
+                  : actionMode === "send"
+                    ? "bg-action-primary-bg text-action-primary-fg hover:bg-action-primary-hover"
+                    : actionMode === "submitting"
+                      ? "bg-action-primary-bg text-action-primary-fg pointer-events-none opacity-80"
+                      : "text-ink-secondary bg-surface-recessed hover:bg-accent hover:text-ink-primary",
             )}
           >
             <span className="relative flex size-4 items-center justify-center">
+              <Mic
+                aria-hidden="true"
+                className={cn(
+                  "absolute size-[15.5px] stroke-[1.9] transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)]",
+                  actionMode === "voice_idle"
+                    ? "scale-100 opacity-100"
+                    : "pointer-events-none scale-75 opacity-0",
+                )}
+              />
               <ArrowUp
                 aria-hidden="true"
                 className={cn(
@@ -1888,6 +2373,15 @@ const ComposerBottomBar = memo(function ComposerBottomBar({
                 className={cn(
                   "bg-signal-danger absolute size-[11px] rounded-[2.5px] transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)]",
                   actionMode === "stop"
+                    ? "scale-100 opacity-100"
+                    : "pointer-events-none scale-75 opacity-0",
+                )}
+              />
+              <span
+                aria-hidden="true"
+                className={cn(
+                  "bg-action-primary-fg absolute size-[10px] rounded-[2.5px] transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)]",
+                  actionMode === "voice_recording"
                     ? "scale-100 opacity-100"
                     : "pointer-events-none scale-75 opacity-0",
                 )}

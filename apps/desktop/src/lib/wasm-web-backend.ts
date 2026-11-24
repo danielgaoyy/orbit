@@ -350,9 +350,19 @@ export class WasmWebBackend implements OrbitTransportBackend {
           if (req && msg.request_id) {
             h.pending.delete(msg.request_id);
             clearTimeout(req.timer);
-            if (msg.op === "rpc_error")
-              req.reject(new Error(String(msg.message)));
-            else req.resolve(msg);
+            if (msg.op === "rpc_error") {
+              const code = typeof msg.code === "string" ? msg.code : "";
+              const message = String(msg.message ?? "Host RPC error");
+              const err = new Error(
+                code.startsWith("voice_")
+                  ? JSON.stringify({ code, message })
+                  : code
+                    ? `[${code}] ${message}`
+                    : message,
+              ) as Error & { code?: string };
+              if (code) err.code = code;
+              req.reject(err);
+            } else req.resolve(msg);
           }
         } catch (err) {
           fail(new Error(String(err)));
@@ -372,14 +382,19 @@ export class WasmWebBackend implements OrbitTransportBackend {
       throw err;
     }
   }
-  private async rpc(h: Host, op: string, args: Args = {}): Promise<Wire> {
+  private async rpc(
+    h: Host,
+    op: string,
+    args: Args = {},
+    timeoutMs = 30000,
+  ): Promise<Wire> {
     await this.connect(h);
     const request_id = crypto.randomUUID();
     return new Promise((resolve, reject) => {
       const timer = window.setTimeout(() => {
         h.pending.delete(request_id);
         reject(new Error("Host request timed out"));
-      }, 30000);
+      }, timeoutMs);
       h.pending.set(request_id, { resolve, reject, timer });
       try {
         this.send(h, { ...args, op, request_id });
@@ -435,10 +450,10 @@ export class WasmWebBackend implements OrbitTransportBackend {
 
   private async dispatch(cmd: string, a: Args): Promise<unknown> {
     const hosts = [...this.hosts.values()];
-    const id = String(a.hostId ?? "");
+    const req = a.req as Args | undefined;
+    const id = String(a.hostId ?? req?.host_id ?? "");
     const agent = String(a.agentId ?? "");
     const target = this.hosts.get(id);
-    const req = a.req as Args | undefined;
     switch (cmd) {
       case "get_bridge_info":
         return this.wasm.bridge_info();
@@ -634,6 +649,260 @@ export class WasmWebBackend implements OrbitTransportBackend {
         if (cmd === "create_agent") return reply.agent?.agent_id;
         if (cmd === "enqueue_prompt") return fields.queue_id;
         return;
+      }
+      // --- M3 Security, Audit Chain, Diagnostics, Context Compaction & IDE Migration ---
+      case "get_sandbox_config": {
+        const reply = await this.rpc(h, "get_sandbox_config");
+        return reply.sandbox_policy ?? null;
+      }
+      case "update_sandbox_config": {
+        const reply = await this.rpc(h, "update_sandbox_config", {
+          sandbox_policy: a.sandboxPolicy ?? null,
+        });
+        return reply.sandbox_policy ?? null;
+      }
+      case "get_audit_chain_status": {
+        const reply = await this.rpc(h, "get_audit_chain_status");
+        return reply.verification;
+      }
+      case "export_audit_chain": {
+        const reply = await this.rpc(h, "export_audit_chain", {
+          after_seq: Number(a.afterSeq ?? 0),
+        });
+        return {
+          jsonl: String(reply.jsonl ?? ""),
+          next_after_seq: reply.next_after_seq ?? null,
+        };
+      }
+      case "export_diagnostic_bundle": {
+        const reply = await this.rpc(h, "export_diagnostic_bundle");
+        return reply.bundle ?? {};
+      }
+      case "compact_agent_context": {
+        await this.rpc(h, "compact_agent_context", { agent_id: agent }, 60000);
+        return;
+      }
+      case "inspect_external_ide_migration": {
+        const reply = await this.rpc(h, "inspect_external_ide_migration", {
+          from: a.source ?? null,
+          cwd: a.cwd ?? null,
+          conflict: a.conflict ?? "skip",
+        });
+        return reply.items ?? [];
+      }
+      case "execute_external_ide_migration": {
+        const reply = await this.rpc(
+          h,
+          "execute_external_ide_migration",
+          {
+            from: a.source ?? null,
+            cwd: a.cwd ?? null,
+            conflict: a.conflict ?? "skip",
+          },
+          45000,
+        );
+        return reply.items ?? [];
+      }
+      // --- M4 Project Memory ---
+      case "list_project_memories": {
+        const reply = await this.rpc(h, "list_project_memories", {
+          cwd: String(a.cwd ?? ""),
+          status: a.status ?? null,
+          category: a.category ?? null,
+          query: a.query ?? null,
+          limit: a.limit ?? null,
+        });
+        return reply.items ?? [];
+      }
+      case "upsert_project_memory": {
+        const r = (a.req ?? {}) as Args;
+        const reply = await this.rpc(h, "upsert_project_memory", {
+          cwd: String(r.cwd ?? ""),
+          id: r.id ?? null,
+          title: String(r.title ?? ""),
+          content: String(r.content ?? ""),
+          category: r.category,
+          status: r.status ?? null,
+          file_paths: r.file_paths ?? [],
+          tags: r.tags ?? [],
+        });
+        return reply.item;
+      }
+      case "confirm_project_memory": {
+        const reply = await this.rpc(h, "confirm_project_memory", {
+          cwd: String(a.cwd ?? ""),
+          id: String(a.memoryId ?? ""),
+        });
+        return reply.item;
+      }
+      case "delete_project_memory": {
+        const reply = await this.rpc(h, "delete_project_memory", {
+          cwd: String(a.cwd ?? ""),
+          id: String(a.memoryId ?? ""),
+        });
+        return Boolean(reply.deleted);
+      }
+      case "recall_project_memory": {
+        const reply = await this.rpc(h, "recall_project_memories", {
+          cwd: String(a.cwd ?? ""),
+          query: String(a.query ?? ""),
+          limit: a.limit ?? null,
+          include_unconfirmed: a.includeUnconfirmed ?? null,
+        });
+        return reply.hits ?? [];
+      }
+      // --- M5 WASM Plugins ---
+      case "list_plugins": {
+        const reply = await this.rpc(h, "list_plugins");
+        return reply.plugins ?? [];
+      }
+      case "install_plugin": {
+        const reply = await this.rpc(
+          h,
+          "install_plugin",
+          {
+            source: String(a.sourcePath ?? ""),
+            enable: Boolean(a.enable),
+          },
+          120000,
+        );
+        return reply.plugin;
+      }
+      case "set_plugin_enabled": {
+        await this.rpc(h, "set_plugin_enabled", {
+          plugin_id: String(a.pluginId ?? ""),
+          enabled: Boolean(a.enabled),
+        });
+        return;
+      }
+      case "uninstall_plugin": {
+        await this.rpc(h, "uninstall_plugin", {
+          plugin_id: String(a.pluginId ?? ""),
+        });
+        return;
+      }
+      case "invoke_plugin_op": {
+        const reply = await this.rpc(h, "invoke_plugin_op", {
+          plugin_id: String(a.pluginId ?? ""),
+          operation: String(a.op ?? ""),
+          cwd: a.cwd ?? null,
+          input: a.argsJson ?? {},
+        });
+        return reply.result;
+      }
+      case "render_plugin_ui": {
+        const reply = await this.rpc(h, "render_plugin_ui", {
+          plugin_id: String(a.pluginId ?? ""),
+          slot: a.slot,
+          cwd: a.cwd ?? null,
+          action_id: a.actionId ?? null,
+          payload: a.payload ?? null,
+        });
+        return reply.spec;
+      }
+      // --- M6 Voice Control Plane ---
+      case "get_voice_config": {
+        const reply = await this.rpc(h, "get_voice_config");
+        return {
+          config: reply.config,
+          models: reply.models,
+          capabilities: reply.capabilities,
+        };
+      }
+      case "update_voice_config": {
+        const reply = await this.rpc(h, "update_voice_config", {
+          config: a.config,
+        });
+        return {
+          config: reply.config,
+          models: reply.models,
+          capabilities: reply.capabilities,
+        };
+      }
+      case "download_voice_model": {
+        const reply = await this.rpc(
+          h,
+          "download_voice_model",
+          { model_id: String(a.modelId ?? "") },
+          660000,
+        );
+        return {
+          config: reply.config,
+          models: reply.models,
+          capabilities: reply.capabilities,
+        };
+      }
+      case "delete_voice_model": {
+        const reply = await this.rpc(h, "delete_voice_model", {
+          model_id: String(a.modelId ?? ""),
+        });
+        return {
+          config: reply.config,
+          models: reply.models,
+          capabilities: reply.capabilities,
+        };
+      }
+      case "transcribe_voice_audio": {
+        const reply = await this.rpc(
+          h,
+          "transcribe_voice_audio",
+          {
+            pcm16_le_base64: String(a.pcm16LeBase64 ?? ""),
+            sample_rate_hz: Number(a.sampleRateHz ?? 16000),
+            language: a.language ?? null,
+            agent_id: a.agentId ?? null,
+          },
+          270000,
+        );
+        return {
+          text: String(reply.text ?? ""),
+          language: reply.language ?? null,
+          duration_ms: Number(reply.duration_ms ?? 0),
+          backend_used: reply.backend_used,
+          parsed_intent: reply.parsed_intent ?? null,
+          approval_safety: reply.approval_safety ?? null,
+        };
+      }
+      case "parse_voice_transcript": {
+        const reply = await this.rpc(h, "parse_voice_transcript", {
+          text: String(a.text ?? ""),
+          language: a.language ?? null,
+          agent_id: a.agentId ?? null,
+        });
+        return {
+          text: String(reply.text ?? ""),
+          language: reply.language ?? null,
+          duration_ms: Number(reply.duration_ms ?? 0),
+          backend_used: reply.backend_used,
+          parsed_intent: reply.parsed_intent ?? null,
+          approval_safety: reply.approval_safety ?? null,
+        };
+      }
+      case "approve_voice_permission": {
+        const reply = await this.rpc(h, "approve_voice_permission", {
+          agent_id: agent,
+          permission_request_id: String(a.permissionRequestId ?? ""),
+          confirmed: Boolean(a.confirmed),
+        });
+        return reply.safety;
+      }
+      case "synthesize_voice_speech": {
+        const reply = await this.rpc(
+          h,
+          "synthesize_voice_speech",
+          {
+            text: String(a.text ?? ""),
+            language: a.language ?? null,
+            voice_id: a.voiceId ?? null,
+          },
+          270000,
+        );
+        return {
+          audio_wav_base64: String(reply.audio_wav_base64 ?? ""),
+          mime_type: String(reply.mime_type ?? "audio/wav"),
+          duration_ms: Number(reply.duration_ms ?? 0),
+          backend_used: reply.backend_used,
+        };
       }
     }
     throw new Error("This action is unavailable in Orbit Web (" + cmd + ")");

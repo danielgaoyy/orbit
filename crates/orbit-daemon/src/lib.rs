@@ -52,6 +52,7 @@ pub mod timers;
 pub mod tools;
 pub mod triggers;
 pub mod usage;
+pub mod voice;
 pub mod workflows;
 pub mod workspace_board;
 pub mod workspace_cluster;
@@ -511,6 +512,7 @@ pub struct DaemonRuntime {
     pub im_channels: Arc<ImChannelBridge>,
     pub personal_router: Arc<crate::personal_router::PersonalRouterManager>,
     pub push: Arc<PushManager>,
+    voice: voice::VoiceService,
     provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
     pub mcp_probe_cache: Arc<RwLock<HashMap<String, orbit_protocol::McpProbeResult>>>,
     pub mcp_config_lock: Arc<AsyncMutex<()>>,
@@ -898,6 +900,7 @@ impl DaemonRuntime {
             im_channels,
             personal_router,
             push,
+            voice: voice::VoiceService::new(home_dir),
             provider_catalogs,
             mcp_probe_cache: Arc::new(RwLock::new(HashMap::new())),
             mcp_config_lock: Arc::new(AsyncMutex::new(())),
@@ -7001,6 +7004,30 @@ async fn handle_wire_rpc(
                     Ok(timer) => WireMessage::ConditionalTimerUpdated { request_id, timer },
                     Err(e) => rpc_err(request_id, "fire_conditional_timer_failed", e),
                 };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::GetVoiceConfig { request_id }
+        | WireMessage::UpdateVoiceConfig { request_id, .. }
+        | WireMessage::DownloadVoiceModel { request_id, .. }
+        | WireMessage::DeleteVoiceModel { request_id, .. }
+        | WireMessage::TranscribeVoiceAudio { request_id, .. }
+        | WireMessage::ParseVoiceTranscript { request_id, .. }
+        | WireMessage::ApproveVoicePermission { request_id, .. }
+        | WireMessage::SynthesizeVoiceSpeech { request_id, .. } => {
+            let Ok(permit) = runtime.voice.slots.clone().try_acquire_owned() else {
+                return Some(rpc_err(request_id, "voice_busy", "voice workers are busy"));
+            };
+            let runtime = Arc::clone(runtime);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let _permit = permit;
+                let reply = voice::handle(&runtime, request_id, req)
+                    .await
+                    .unwrap_or_else(|err| rpc_err(request_id, "voice_request_failed", err));
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });
             None

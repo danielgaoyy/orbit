@@ -213,6 +213,28 @@ pub struct HostSessionHandle {
     _ssh_tunnel: Option<Arc<SshTunnelGuard>>,
 }
 
+/// Structured daemon/transport error exposed to voice clients.
+#[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
+#[error("[{code}] {message}")]
+pub struct VoiceRpcError {
+    pub code: String,
+    pub message: String,
+}
+impl VoiceRpcError {
+    fn transport(message: String) -> Self {
+        Self {
+            code: "voice_transport_error".into(),
+            message,
+        }
+    }
+    fn unexpected() -> Self {
+        Self {
+            code: "voice_protocol_error".into(),
+            message: "unexpected voice RPC".into(),
+        }
+    }
+}
+
 impl HostSessionHandle {
     #[cfg(test)]
     pub(crate) fn new_test_channel() -> (Self, mpsc::Receiver<OutboundPayload>) {
@@ -247,12 +269,63 @@ impl HostSessionHandle {
             .map_err(|_| ClientCoreError::ChannelClosed)
     }
 
+    /// Send one host-local voice request and preserve machine-readable fallback errors.
+    pub async fn request_voice(&self, msg: WireMessage) -> Result<WireMessage, VoiceRpcError> {
+        let (id, seconds) = match &msg {
+            WireMessage::DownloadVoiceModel { request_id, .. } => (*request_id, 660),
+            WireMessage::TranscribeVoiceAudio { request_id, .. }
+            | WireMessage::SynthesizeVoiceSpeech { request_id, .. } => (*request_id, 270),
+            WireMessage::GetVoiceConfig { request_id }
+            | WireMessage::UpdateVoiceConfig { request_id, .. }
+            | WireMessage::DeleteVoiceModel { request_id, .. }
+            | WireMessage::ApproveVoicePermission { request_id, .. }
+            | WireMessage::ParseVoiceTranscript { request_id, .. } => (*request_id, 30),
+            _ => return Err(VoiceRpcError::unexpected()),
+        };
+        let reply = self
+            .request_matching(
+                msg,
+                Duration::from_secs(seconds),
+                |reply| match reply {
+                    WireMessage::VoiceConfigState { request_id, .. }
+                    | WireMessage::VoiceTranscriptionResult { request_id, .. }
+                    | WireMessage::VoiceSpeechResult { request_id, .. }
+                    | WireMessage::VoicePermissionResult { request_id, .. }
+                    | WireMessage::RpcError {
+                        request_id: Some(request_id),
+                        ..
+                    } => *request_id == id,
+                    _ => false,
+                },
+                false,
+            )
+            .await
+            .map_err(|e| VoiceRpcError::transport(e.to_string()))?;
+        match reply {
+            WireMessage::RpcError { code, message, .. } => Err(VoiceRpcError { code, message }),
+            other => Ok(other),
+        }
+    }
+
     /// Perform a correlated request/response RPC call with timeout.
     pub async fn request<F>(
         &self,
         msg: WireMessage,
         timeout: Duration,
+        matcher: F,
+    ) -> Result<WireMessage, ClientCoreError>
+    where
+        F: FnMut(&WireMessage) -> bool,
+    {
+        self.request_matching(msg, timeout, matcher, true).await
+    }
+
+    async fn request_matching<F>(
+        &self,
+        msg: WireMessage,
+        timeout: Duration,
         mut matcher: F,
+        fail_on_unmatched_error: bool,
     ) -> Result<WireMessage, ClientCoreError>
     where
         F: FnMut(&WireMessage) -> bool,
@@ -271,12 +344,24 @@ impl HostSessionHandle {
                     if matcher(&w) {
                         return Ok(w);
                     }
-                    if let WireMessage::RpcError { code, message, .. } = &w {
+                    if fail_on_unmatched_error
+                        && let WireMessage::RpcError {
+                            request_id: None,
+                            code,
+                            message,
+                        } = &w
+                    {
                         return Err(ClientCoreError::Handshake(format!("[{code}] {message}")));
                     }
                 }
-                Ok(Ok(ClientInboundEvent::Disconnected)) => {
+                Ok(Ok(ClientInboundEvent::Disconnected))
+                | Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                     return Err(ClientCoreError::ChannelClosed);
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                    return Err(ClientCoreError::Handshake(
+                        "inbound event stream lagged".into(),
+                    ));
                 }
                 Err(_) => {
                     return Err(ClientCoreError::Handshake("rpc request timed out".into()));
@@ -1549,5 +1634,52 @@ mod direct_auth_tests {
             "Auto mode must preserve auth error rather than returning Unreachable, got {err:?}"
         );
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod voice_rpc_tests {
+    use super::*;
+    #[tokio::test]
+    async fn concurrent_voice_calls_only_consume_their_own_reply_or_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use orbit_protocol::VoiceApprovalSafety;
+        let (session, mut requests) = HostSessionHandle::new_test_channel();
+        let id = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let req = |request_id| WireMessage::ApproveVoicePermission {
+            request_id,
+            agent_id: "agent".into(),
+            permission_request_id: "req".into(),
+            confirmed: true,
+        };
+        let replies = async {
+            for _ in 0..2 {
+                assert!(requests.recv().await.is_some())
+            }
+            session
+                .events_tx
+                .send(ClientInboundEvent::Wire(WireMessage::RpcError {
+                    request_id: Some(other),
+                    code: "other_error".into(),
+                    message: String::new(),
+                }))?;
+            session.events_tx.send(ClientInboundEvent::Wire(
+                WireMessage::VoicePermissionResult {
+                    request_id: id,
+                    safety: VoiceApprovalSafety::RequiresVisualConfirmation,
+                },
+            ))?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        };
+        let (a, b, sent) = tokio::join!(
+            session.request_voice(req(id)),
+            session.request_voice(req(other)),
+            replies
+        );
+        sent?;
+        assert!(matches!(a?,WireMessage::VoicePermissionResult{request_id,..} if request_id==id));
+        assert_eq!(b.expect_err("correlated daemon error").code, "other_error");
+        Ok(())
     }
 }

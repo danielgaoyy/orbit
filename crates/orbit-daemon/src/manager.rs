@@ -4712,6 +4712,32 @@ impl AgentOrchestrator {
         items: Vec<(String, String)>,
         decision: String,
     ) -> anyhow::Result<orbit_protocol::ResolvePermissionsBatchResult> {
+        self.resolve_checked_permissions(items, decision, None)
+            .await
+    }
+
+    /// Apply the same Guardian/rule checks as single-shot batch approval, with the voice
+    /// eligibility check repeated while atomically claiming the live pending request.
+    pub(crate) async fn approve_voice_permission(
+        self: &Arc<Self>,
+        pending: PendingPermissionSummary,
+    ) -> anyhow::Result<bool> {
+        let result = self
+            .resolve_checked_permissions(
+                vec![(pending.agent_id, pending.request_id)],
+                "allow".into(),
+                Some(pending.created_at),
+            )
+            .await?;
+        Ok(result.resolved_count == 1)
+    }
+
+    async fn resolve_checked_permissions(
+        self: &Arc<Self>,
+        items: Vec<(String, String)>,
+        decision: String,
+        voice_request_created_at: Option<chrono::DateTime<Utc>>,
+    ) -> anyhow::Result<orbit_protocol::ResolvePermissionsBatchResult> {
         let normalized_decision = decision.trim().to_ascii_lowercase();
         let is_allow_batch = match normalized_decision.as_str() {
             "allow" | "allow_once" | "accept" => true,
@@ -4894,6 +4920,7 @@ impl AgentOrchestrator {
                     }
                     if assessment.risk_level >= orbit_protocol::GuardianRiskLevel::High
                         || assessment.decision == orbit_protocol::GuardianDecision::AutoDeny
+                        || orbit_protocol::assessment_requires_human_only(&assessment)
                     {
                         skipped_reasons.push(orbit_protocol::BatchPermissionSkipReason {
                             agent_id,
@@ -4953,6 +4980,18 @@ impl AgentOrchestrator {
                         cur.created_at == pending.created_at
                             && cur.plan_approval.is_none()
                             && cur.allowed_decisions == pending.allowed_decisions
+                            && voice_request_created_at.is_none_or(|created_at| {
+                                cur.created_at == created_at
+                                    && orbit_protocol::evaluate_voice_approval_safety(
+                                        Some(cur),
+                                        true,
+                                    ) == orbit_protocol::VoiceApprovalSafety::Allowed
+                                    && !self
+                                        .evaluating_permissions
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .contains(&key)
+                            })
                     });
                 if matches_snapshot {
                     guard.remove(&key).is_some()

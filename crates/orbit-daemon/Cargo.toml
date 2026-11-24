@@ -37,7 +37,8 @@ ed25519-dalek.workspace = true
 rand.workspace = true
 zeroize.workspace = true
 vt100.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["multipart"] }
+pulldown-cmark.workspace = true
 notify.workspace = true
 cap-std = "4.0"
 cap-fs-ext = "4.0"

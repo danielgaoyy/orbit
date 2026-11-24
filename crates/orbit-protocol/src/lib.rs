@@ -24,6 +24,7 @@ pub mod skills;
 pub mod timers;
 pub mod triggers;
 pub mod usage;
+pub mod voice;
 pub mod workflows;
 pub use acp::*;
 pub use artifacts::*;
@@ -49,6 +50,7 @@ pub use skills::*;
 pub use timers::*;
 pub use triggers::*;
 pub use usage::*;
+pub use voice::*;
 pub use workflows::*;
 
 use std::collections::{BTreeMap, HashMap};
@@ -1388,6 +1390,66 @@ pub enum WireMessage {
         request_id: Uuid,
         cwd: String,
         hits: Vec<ProjectMemorySearchHit>,
+    },
+    GetVoiceConfig {
+        request_id: Uuid,
+    },
+    UpdateVoiceConfig {
+        request_id: Uuid,
+        config: VoiceConfig,
+    },
+    VoiceConfigState {
+        request_id: Uuid,
+        #[serde(flatten)]
+        state: VoiceConfigState,
+    },
+    DownloadVoiceModel {
+        request_id: Uuid,
+        model_id: String,
+    },
+    DeleteVoiceModel {
+        request_id: Uuid,
+        model_id: String,
+    },
+    TranscribeVoiceAudio {
+        request_id: Uuid,
+        pcm16_le_base64: String,
+        sample_rate_hz: u32,
+        language: Option<String>,
+        agent_id: Option<String>,
+    },
+    /// Route a transcript produced by the client STT fallback through the same host policy.
+    ParseVoiceTranscript {
+        request_id: Uuid,
+        text: String,
+        language: Option<String>,
+        agent_id: Option<String>,
+    },
+    VoiceTranscriptionResult {
+        request_id: Uuid,
+        #[serde(flatten)]
+        result: VoiceTranscriptionResult,
+    },
+    ApproveVoicePermission {
+        request_id: Uuid,
+        agent_id: String,
+        permission_request_id: String,
+        confirmed: bool,
+    },
+    VoicePermissionResult {
+        request_id: Uuid,
+        safety: VoiceApprovalSafety,
+    },
+    SynthesizeVoiceSpeech {
+        request_id: Uuid,
+        text: String,
+        language: Option<String>,
+        voice_id: Option<String>,
+    },
+    VoiceSpeechResult {
+        request_id: Uuid,
+        #[serde(flatten)]
+        result: VoiceSpeechResult,
     },
 
     // Workspaces, Directory Browser & Git / Worktrees

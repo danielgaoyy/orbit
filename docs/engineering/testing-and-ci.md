@@ -60,6 +60,8 @@ In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight
 
 ---
 
+`cargo test -p orbit-cli --test e2e_voice` 使用临时目录和已配对的 Daemon 验证语音配置持久化、CLI WAV 转写、客户端回退与缺失授权请求的拒绝。模型完整性与兼容音频端点测试使用本地数据和回环服务。
+
 ## 3. Desktop Chrome Runtime Smoke（防前端白屏/React `#185`）
 
 [`apps/desktop/scripts/smoke-render.mjs`](../../apps/desktop/scripts/smoke-render.mjs) 启动真实静态资源服务器与无头 Chrome CDP，校验 0 console/pageerror 与非空 UI 渲染，当前固定验证 3 个场景：

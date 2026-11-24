@@ -5,6 +5,7 @@ mod orchestration_cli;
 mod plugin_cli;
 mod service;
 mod ssh_config;
+mod voice_cli;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
@@ -232,6 +233,11 @@ enum Commands {
         port: u16,
         #[arg(last = true, required = true)]
         command: Vec<std::ffi::OsString>,
+    },
+    /// Inspect host voice settings, manage offline models and transcribe a WAV file.
+    Voice {
+        #[command(subcommand)]
+        action: voice_cli::VoiceAction,
     },
     /// Inspect current host environment, identity keypair, Relay attachment, and installed AI CLIs.
     Doctor {
@@ -805,6 +811,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+        Commands::Voice { action } => {
+            let session = connect_cli_server(&home_dir, &server, via_relay).await?;
+            voice_cli::run(&session, action, json_mode).await?;
         }
         Commands::Doctor { bundle } => {
             set_snapshot_orbit_home(&home_dir);

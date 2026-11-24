@@ -96,3 +96,28 @@ Built-in token estimates use standard API rates. Local model overrides take prec
 ## WASM 插件运行时
 
 WASM 插件由 Daemon 在独立的限额阻塞任务中执行。插件 RPC、宿主能力、执行预算与按需 MCP 工具发现见 [Plugin SDK](plugins.md)。
+
+## Host-local voice RPCs
+
+Each paired host owns its voice settings in `$ORBIT_HOME/voice.json`. Voice is disabled by default. Enable it with `UpdateVoiceConfig` or set `"enabled": true` in the host file. `GetVoiceConfig`, updates, downloads and deletions return the current settings, model inventory and available host executables. These operations use the existing authenticated direct and relay transports. The CLI uses the same RPCs.
+
+```sh
+orbit voice status
+orbit voice models
+orbit voice download whisper-base-q5
+orbit voice transcribe recording.wav
+```
+
+Capture RPCs accept base64 little-endian mono PCM16. The CLI also reads mono/stereo PCM16 WAV. Inputs are limited to 10 MiB, 120 seconds and 8–96 kHz. The daemon resamples to 16 kHz and evaluates 20 ms frames using RMS, adaptive noise floor, zero crossings and high-frequency energy. A ring retains the 300 ms immediately preceding onset. The default silence hangover is 750 ms. The optional Silero v5 ONNX file is available in the catalog for external inference runtimes. The built-in detector runs without weights.
+
+| Local backend | Download ID | Optional executable |
+| --- | --- | --- |
+| Whisper.cpp | `whisper-base-q5` | `whisper-cli` or `whisper.cpp` |
+| SenseVoice | `sensevoice-small-int8` | `sherpa-onnx-offline` |
+| Kokoro | `kokoro-82m-q8` | `kokoro-tts` with ONNX support |
+
+Set the backend and the corresponding model ID together. Each catalog entry pins the primary weight and every required sidecar. Downloads stage the bytes in private temporary files, check length and SHA-256, and publish by rename under `$ORBIT_HOME/models/voice/<id>/`. Inventory and local inference recheck the installed files.
+
+Local recognition falls back to a configured OpenAI-compatible audio endpoint and finally to client STT. Selecting `open_ai_compatible` starts at the endpoint. Selecting `system_client_fallback` hands capture directly back to the client. Local synthesis tries the configured endpoint and then the host's WAV writer. Native output uses macOS `say`, Windows PowerShell SAPI or Linux `espeak-ng` / `espeak`. The result contains WAV bytes for playback on the requesting device. A host with only a playback-only synthesizer delegates playback to the client. Speech text is reduced to at most 2,000 characters after Markdown cleanup.
+
+The endpoint accepts a base such as `http://127.0.0.1:8000/v1`. Orbit posts multipart WAV to `audio/transcriptions` and requests WAV from `audio/speech`. With a local model ID the remote defaults are `whisper-1` and `tts-1`. With the OpenAI-compatible backend the model ID may name a model served by the endpoint. Credential binding is documented in [SECURITY.md](../../SECURITY.md).

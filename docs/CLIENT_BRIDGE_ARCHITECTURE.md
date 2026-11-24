@@ -141,3 +141,13 @@ cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- 
 # 4. iOS Swift parse verification against generated UniFFI bindings
 swiftc -parse apps/ios/Generated/orbit_ffi_uniffi.swift $(find apps/ios/Sources -name '*.swift' | sort)
 ```
+
+## Host-scoped voice control
+
+The shared Rust entry points on `OrbitAppCore` take an explicit `host_id` and correlate each reply by request UUID. Settings and model mutations (`get_voice_config`, `update_voice_config`, `download_voice_model`, `delete_voice_model`) return `VoiceConfigState`. Clients can use the verified inventory and host executable capabilities to display available backends.
+
+`transcribe_voice_audio` takes base64 mono PCM16, its sample rate, an optional locale and an optional agent ID. The result includes transcript text, input duration, backend and parsed intent. An empty transcript with `system_client_fallback` requests native/Web Speech recognition. Submit the resulting text through `parse_voice_transcript` with the same host and agent. Parsing has no agent side effects. Language selection accepts `auto`, `en`, `zh` and `ja`. Examples include “read last reply”, “切换到 Build” and “キューの状態”. Explicit approval phrases include “confirm approval of request R1”, “确认批准请求 R1” and “リクエスト R1 の承認を確認”. Request IDs retain their case.
+
+For permission approvals, display the visual permission UI on `requires_visual_confirmation`. On `requires_spoken_confirmation`, collect an explicit confirmation for the same request. Route confirmed approvals through `approve_voice_permission`; it checks the live request again before a one-time dispatch. An absent, unassessed, high-risk, human-only or plan request yields visual confirmation.
+
+`synthesize_voice_speech` returns a validated WAV, MIME type, duration and backend. Its structured error code `voice_client_tts_required` requests client synthesis. The separate `voice_tts_disabled` code respects the host's explicit preference for silence. Clients may use `auto_speak_responses` when selecting assistant replies for speech.

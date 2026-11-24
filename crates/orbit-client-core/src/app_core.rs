@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::VoiceRpcError;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use orbit_crypto::PairingOffer;
@@ -40,6 +41,9 @@ use orbit_protocol::{
     WorkflowRunRecord, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind,
     WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo,
     WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
+};
+use orbit_protocol::{
+    VoiceApprovalSafety, VoiceConfig, VoiceConfigState, VoiceSpeechResult, VoiceTranscriptionResult,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -8220,6 +8224,9 @@ impl OrbitAppCore {
                             full_text: String::new(),
                             error: Some(formatted_err),
                         });
+                    } else if code.starts_with("voice_") {
+                        // Voice RPC fallback/control errors are correlated directly by request_id;
+                        // do not overwrite host-level `last_error`.
                     } else {
                         state.last_error = Some(formatted_err.clone());
                         if let Some(req_id) = request_id {
@@ -16781,6 +16788,179 @@ impl OrbitAppCore {
         res_rx
             .await
             .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    async fn voice_rpc(
+        &self,
+        host_id: &str,
+        msg: WireMessage,
+    ) -> Result<WireMessage, VoiceRpcError> {
+        let session = self
+            .require_online_session(host_id)
+            .map_err(VoiceRpcError::transport)?;
+        self.runtime
+            .spawn(async move { session.request_voice(msg).await })
+            .await
+            .map_err(|e| VoiceRpcError::transport(e.to_string()))?
+    }
+
+    async fn voice_state_rpc(
+        &self,
+        host_id: &str,
+        msg: WireMessage,
+    ) -> Result<VoiceConfigState, VoiceRpcError> {
+        match self.voice_rpc(host_id, msg).await? {
+            WireMessage::VoiceConfigState { state, .. } => Ok(state),
+            _ => Err(VoiceRpcError::unexpected()),
+        }
+    }
+
+    pub async fn get_voice_config(&self, host_id: &str) -> Result<VoiceConfigState, VoiceRpcError> {
+        self.voice_state_rpc(
+            host_id,
+            WireMessage::GetVoiceConfig {
+                request_id: Uuid::new_v4(),
+            },
+        )
+        .await
+    }
+    pub async fn update_voice_config(
+        &self,
+        host_id: &str,
+        config: VoiceConfig,
+    ) -> Result<VoiceConfigState, VoiceRpcError> {
+        self.voice_state_rpc(
+            host_id,
+            WireMessage::UpdateVoiceConfig {
+                request_id: Uuid::new_v4(),
+                config,
+            },
+        )
+        .await
+    }
+    pub async fn download_voice_model(
+        &self,
+        host_id: &str,
+        model_id: String,
+    ) -> Result<VoiceConfigState, VoiceRpcError> {
+        self.voice_state_rpc(
+            host_id,
+            WireMessage::DownloadVoiceModel {
+                request_id: Uuid::new_v4(),
+                model_id,
+            },
+        )
+        .await
+    }
+    pub async fn delete_voice_model(
+        &self,
+        host_id: &str,
+        model_id: String,
+    ) -> Result<VoiceConfigState, VoiceRpcError> {
+        self.voice_state_rpc(
+            host_id,
+            WireMessage::DeleteVoiceModel {
+                request_id: Uuid::new_v4(),
+                model_id,
+            },
+        )
+        .await
+    }
+    pub async fn transcribe_voice_audio(
+        &self,
+        host_id: &str,
+        pcm16_le_base64: String,
+        sample_rate_hz: u32,
+        language: Option<String>,
+        agent_id: Option<String>,
+    ) -> Result<VoiceTranscriptionResult, VoiceRpcError> {
+        match self
+            .voice_rpc(
+                host_id,
+                WireMessage::TranscribeVoiceAudio {
+                    request_id: Uuid::new_v4(),
+                    pcm16_le_base64,
+                    sample_rate_hz,
+                    language,
+                    agent_id,
+                },
+            )
+            .await?
+        {
+            WireMessage::VoiceTranscriptionResult { result, .. } => Ok(result),
+            _ => Err(VoiceRpcError::unexpected()),
+        }
+    }
+    /// Apply the host's intent and permission policy to client-recognized speech.
+    pub async fn parse_voice_transcript(
+        &self,
+        host_id: &str,
+        text: String,
+        language: Option<String>,
+        agent_id: Option<String>,
+    ) -> Result<VoiceTranscriptionResult, VoiceRpcError> {
+        match self
+            .voice_rpc(
+                host_id,
+                WireMessage::ParseVoiceTranscript {
+                    request_id: Uuid::new_v4(),
+                    text,
+                    language,
+                    agent_id,
+                },
+            )
+            .await?
+        {
+            WireMessage::VoiceTranscriptionResult { result, .. } => Ok(result),
+            _ => Err(VoiceRpcError::unexpected()),
+        }
+    }
+    /// Recheck and claim the exact permission before dispatching a one-time approval.
+    pub async fn approve_voice_permission(
+        &self,
+        host_id: &str,
+        agent_id: String,
+        permission_request_id: String,
+        confirmed: bool,
+    ) -> Result<VoiceApprovalSafety, VoiceRpcError> {
+        match self
+            .voice_rpc(
+                host_id,
+                WireMessage::ApproveVoicePermission {
+                    request_id: Uuid::new_v4(),
+                    agent_id,
+                    permission_request_id,
+                    confirmed,
+                },
+            )
+            .await?
+        {
+            WireMessage::VoicePermissionResult { safety, .. } => Ok(safety),
+            _ => Err(VoiceRpcError::unexpected()),
+        }
+    }
+    pub async fn synthesize_voice_speech(
+        &self,
+        host_id: &str,
+        text: String,
+        language: Option<String>,
+        voice_id: Option<String>,
+    ) -> Result<VoiceSpeechResult, VoiceRpcError> {
+        match self
+            .voice_rpc(
+                host_id,
+                WireMessage::SynthesizeVoiceSpeech {
+                    request_id: Uuid::new_v4(),
+                    text,
+                    language,
+                    voice_id,
+                },
+            )
+            .await?
+        {
+            WireMessage::VoiceSpeechResult { result, .. } => Ok(result),
+            _ => Err(VoiceRpcError::unexpected()),
+        }
     }
 
     /// Fetch Guardian auto-approval policy and recent audit entries from any connected host.

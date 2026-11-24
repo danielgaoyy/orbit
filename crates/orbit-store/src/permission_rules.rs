@@ -96,7 +96,7 @@ pub fn resolve_path_preserving_symlinks(path: &Path) -> Result<PathBuf, PathReso
         }
         if seg == ".." {
             if !acc.as_os_str().is_empty()
-                && let Ok(canon) = std::fs::canonicalize(&acc)
+                && let Ok(canon) = canonicalize_clean(&acc)
             {
                 acc = canon;
             }
@@ -151,7 +151,7 @@ pub fn resolve_path_preserving_symlinks(path: &Path) -> Result<PathBuf, PathReso
                         pending.push_front(s);
                     }
                 }
-            } else if let Ok(canon) = std::fs::canonicalize(&acc) {
+            } else if let Ok(canon) = canonicalize_clean(&acc) {
                 acc = canon;
             }
         }
@@ -165,8 +165,30 @@ pub fn resolve_path_preserving_symlinks(path: &Path) -> Result<PathBuf, PathReso
     Ok(acc)
 }
 
+fn canonicalize_clean(path: &Path) -> std::io::Result<PathBuf> {
+    let canon = std::fs::canonicalize(path)?;
+    Ok(strip_windows_verbatim_prefix(&canon))
+}
+
+fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(unc) = raw
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| raw.strip_prefix("//?/UNC/"))
+    {
+        return PathBuf::from(format!(r"\\{unc}"));
+    }
+    if let Some(rest) = raw
+        .strip_prefix(r"\\?\")
+        .or_else(|| raw.strip_prefix("//?/"))
+    {
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
+}
+
 fn canonicalize_deepest_existing_ancestor(path: &Path) -> PathBuf {
-    if let Ok(canon) = std::fs::canonicalize(path) {
+    if let Ok(canon) = canonicalize_clean(path) {
         return canon;
     }
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
@@ -179,7 +201,7 @@ fn canonicalize_deepest_existing_ancestor(path: &Path) -> PathBuf {
         if cur.as_os_str().is_empty() {
             break;
         }
-        if let Ok(canon) = std::fs::canonicalize(&cur) {
+        if let Ok(canon) = canonicalize_clean(&cur) {
             let mut rebuilt = canon;
             for seg in tail.into_iter().rev() {
                 rebuilt.push(seg);
@@ -605,7 +627,10 @@ mod tests {
                 note: Some("From Codex".into()),
             })
             .expect("upsert project rule");
-        assert_eq!(created.project_cwd.as_deref(), Some("/workspace/repo"));
+        let expected_repo = canonicalize_project_cwd("/workspace/repo");
+        assert!(!expected_repo.starts_with("//?/"));
+        assert!(expected_repo.ends_with("/workspace/repo"));
+        assert_eq!(created.project_cwd.as_deref(), Some(expected_repo.as_str()));
         assert_eq!(created.match_count, 0);
         assert!(created.last_matched_at.is_none());
 

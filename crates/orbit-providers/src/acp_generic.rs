@@ -192,6 +192,12 @@ struct PendingAcpPerm {
     raw_questions: Vec<QuestionItem>,
 }
 
+struct PendingAcpPlanModeSwitch {
+    target_mode: SessionMode,
+    previous_mode: SessionMode,
+    deferred_perm: Option<(PendingAcpPerm, Value)>,
+}
+
 #[derive(Default)]
 struct AcpStreamSegmentState {
     turn_tag: String,
@@ -948,6 +954,7 @@ async fn run_acp_actor(
     let mut tool_cache: HashMap<String, ToolCallDetail> = HashMap::new();
     let mut pending_perms: HashMap<String, PendingAcpPerm> = HashMap::new();
     let mut pending_perm_order: VecDeque<String> = VecDeque::new();
+    let mut pending_plan_mode_switches: HashMap<String, PendingAcpPlanModeSwitch> = HashMap::new();
     let mut pending_prompts: VecDeque<QueuedDriverPrompt> = VecDeque::new();
     let mut pending_interrupt_replacement: Option<QueuedDriverPrompt> = None;
     let mut active_turn_message_ids: Vec<String> = Vec::new();
@@ -1492,6 +1499,109 @@ async fn run_acp_actor(
                             .await;
                         }
                     }
+                    DriverCommand::ResolvePlanApproval {
+                        request_id,
+                        action,
+                        edited_plan_markdown,
+                        feedback: _,
+                        target_mode,
+                    } => {
+                        let perm = pending_perms.remove(&request_id);
+                        if perm.is_some() {
+                            pending_perm_order.retain(|id| id != &request_id);
+                        }
+                        // ACP permission responses do not carry native inline edited plan bodies.
+                        // When the user edited the plan on `ApproveAndBuild`, cancel/decline the
+                        // stale unedited plan gate so the daemon starts one clean build turn with
+                        // the approved edited plan text after mode switch completes.
+                        let has_edits = edited_plan_markdown
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty());
+                        let compute_outcome = |p: &PendingAcpPerm| -> Value {
+                            match action {
+                                orbit_protocol::PlanApprovalAction::ApproveAndBuild
+                                    if !has_edits =>
+                                {
+                                    json!({
+                                        "outcome": "selected",
+                                        "optionId": p.allow_option_id
+                                    })
+                                }
+                                _ => match p.deny_option_id {
+                                    Some(ref opt_id) => json!({
+                                        "outcome": "selected",
+                                        "optionId": opt_id
+                                    }),
+                                    None => json!({
+                                        "outcome": "cancelled"
+                                    }),
+                                },
+                            }
+                        };
+
+                        if matches!(action, orbit_protocol::PlanApprovalAction::ApproveAndBuild) {
+                            if let Some(wire_mode) =
+                                resolve_wire_mode_id(&target_mode, &available_modes)
+                            {
+                                let id = next_rpc_id;
+                                next_rpc_id += 1;
+                                let rpc_key = RpcId::Num(id).as_key();
+                                let req = json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "method": "session/set_mode",
+                                    "params": {
+                                        "sessionId": session_id,
+                                        "modeId": wire_mode
+                                    }
+                                })
+                                .to_string();
+                                if shim.write_stdin_line(req).await.is_err() {
+                                    finalize_stream_segments(&mut seg_state, &evt_tx).await;
+                                    let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
+                                    break;
+                                }
+                                let deferred_perm = perm.map(|p| {
+                                    let outcome = compute_outcome(&p);
+                                    (p, outcome)
+                                });
+                                pending_plan_mode_switches.insert(
+                                    rpc_key,
+                                    PendingAcpPlanModeSwitch {
+                                        target_mode,
+                                        previous_mode: mode.clone(),
+                                        deferred_perm,
+                                    },
+                                );
+                                continue;
+                            }
+                            mode = target_mode;
+                        }
+
+                        if let Some(p) = perm {
+                            let outcome = compute_outcome(&p);
+                            let resp = json!({
+                                "jsonrpc": "2.0",
+                                "id": p.rpc_id,
+                                "result": {
+                                    "outcome": outcome
+                                }
+                            })
+                            .to_string();
+                            if shim.write_stdin_line(resp).await.is_err() {
+                                finalize_stream_segments(&mut seg_state, &evt_tx).await;
+                                let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
+                                break;
+                            }
+                            emit_post_permission_status(
+                                &pending_perms,
+                                &mut pending_perm_order,
+                                &active_turn_id,
+                                &evt_tx,
+                            )
+                            .await;
+                        }
+                    }
                     DriverCommand::AnswerQuestion { request_id, answers } => {
                         if let Some(p) = pending_perms.remove(&request_id)
                             && p.is_question
@@ -1573,6 +1683,82 @@ async fn run_acp_actor(
                         if has_id && method.is_none() {
                             if let Ok(rid) = serde_json::from_value::<RpcId>(val["id"].clone()) {
                                 let key = rid.as_key();
+                                if let Some(pending_switch) = pending_plan_mode_switches.remove(&key)
+                                {
+                                    if let Some(err_obj) =
+                                        val.get("error").filter(|v| !v.is_null())
+                                    {
+                                        let err_msg = err_obj
+                                            .get("message")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("session/set_mode failed");
+                                        mode = pending_switch.previous_mode;
+                                        let _ = evt_tx
+                                            .send(DriverEvent::Notice {
+                                                level: "error".into(),
+                                                message: format!(
+                                                    "Failed to switch session mode before approving plan: {err_msg}"
+                                                ),
+                                            })
+                                            .await;
+                                        if let Some((p, _)) = pending_switch.deferred_perm {
+                                            let reject_outcome = match p.deny_option_id {
+                                                Some(ref opt_id) => json!({
+                                                    "outcome": "selected",
+                                                    "optionId": opt_id
+                                                }),
+                                                None => json!({ "outcome": "cancelled" }),
+                                            };
+                                            let resp = json!({
+                                                "jsonrpc": "2.0",
+                                                "id": p.rpc_id,
+                                                "result": { "outcome": reject_outcome }
+                                            })
+                                            .to_string();
+                                            if shim.write_stdin_line(resp).await.is_err() {
+                                                finalize_stream_segments(&mut seg_state, &evt_tx)
+                                                    .await;
+                                                let _ = evt_tx
+                                                    .send(DriverEvent::Exited { code: None })
+                                                    .await;
+                                                break;
+                                            }
+                                            emit_post_permission_status(
+                                                &pending_perms,
+                                                &mut pending_perm_order,
+                                                &active_turn_id,
+                                                &evt_tx,
+                                            )
+                                            .await;
+                                        }
+                                    } else {
+                                        mode = pending_switch.target_mode;
+                                        if let Some((p, outcome)) = pending_switch.deferred_perm {
+                                            let resp = json!({
+                                                "jsonrpc": "2.0",
+                                                "id": p.rpc_id,
+                                                "result": { "outcome": outcome }
+                                            })
+                                            .to_string();
+                                            if shim.write_stdin_line(resp).await.is_err() {
+                                                finalize_stream_segments(&mut seg_state, &evt_tx)
+                                                    .await;
+                                                let _ = evt_tx
+                                                    .send(DriverEvent::Exited { code: None })
+                                                    .await;
+                                                break;
+                                            }
+                                            emit_post_permission_status(
+                                                &pending_perms,
+                                                &mut pending_perm_order,
+                                                &active_turn_id,
+                                                &evt_tx,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    continue;
+                                }
                                 if non_prompt_rpcs.remove(&key) {
                                     continue;
                                 }
@@ -1589,6 +1775,7 @@ async fn run_acp_actor(
                                     active_prompt_rpc_key = None;
                                     pending_perms.clear();
                                     pending_perm_order.clear();
+                                    pending_plan_mode_switches.clear();
                                     finalize_stream_segments(&mut seg_state, &evt_tx).await;
                                     let finished_turn_id = active_turn_id.take();
 
@@ -1778,6 +1965,7 @@ async fn run_acp_actor(
                             handle_generic_permission_request(
                                 &val,
                                 &mode,
+                                &cfg.cwd,
                                 cfg.attachments_dir.as_deref(),
                                 &active_turn_id,
                                 &shim,
@@ -2502,6 +2690,7 @@ fn select_option_id_opt(
 async fn handle_generic_permission_request(
     val: &Value,
     mode: &SessionMode,
+    workspace_cwd: &Path,
     attachments_dir: Option<&Path>,
     active_turn_id: &Option<String>,
     shim: &orbit_shim::ShimClient,
@@ -2540,13 +2729,21 @@ async fn handle_generic_permission_request(
                 .is_some_and(|p| is_path_within_dir(Path::new(p), dir))
         });
 
-    let auto_approve = is_attachment_read
-        || matches!(mode, SessionMode::FullAccess)
-        || (matches!(mode, SessionMode::AcceptEdits)
-            && matches!(
-                kind_str,
-                "edit" | "write" | "delete" | "move" | "read" | "search"
-            ));
+    let plan_approval = crate::plan_approval::extract_plan_approval_from_acp_tool_call(
+        tool_call,
+        mode,
+        workspace_cwd,
+        "acp_plan",
+    );
+
+    let auto_approve = plan_approval.is_none()
+        && (is_attachment_read
+            || matches!(mode, SessionMode::FullAccess)
+            || (matches!(mode, SessionMode::AcceptEdits)
+                && matches!(
+                    kind_str,
+                    "edit" | "write" | "delete" | "move" | "read" | "search"
+                )));
 
     if auto_approve {
         let resp = json!({
@@ -2565,12 +2762,22 @@ async fn handle_generic_permission_request(
     }
 
     let req_id = format!("perm_{}", uuid::Uuid::new_v4().simple());
-    let title = tool_call
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or("Approve tool execution")
-        .to_string();
+    let title = plan_approval
+        .as_ref()
+        .and_then(|p| p.plan_title.clone())
+        .unwrap_or_else(|| {
+            tool_call
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("Approve tool execution")
+                .to_string()
+        });
     let detail = map_generic_tool_detail(tool_call, None);
+    let allowed_decisions = if plan_approval.is_some() {
+        vec!["allow".into(), "deny".into()]
+    } else {
+        vec!["allow".into(), "allow_always".into(), "deny".into()]
+    };
 
     pending_perms.insert(
         req_id.clone(),
@@ -2590,7 +2797,8 @@ async fn handle_generic_permission_request(
             request_id: req_id.clone(),
             title,
             detail,
-            allowed_decisions: vec!["allow".into(), "allow_always".into(), "deny".into()],
+            allowed_decisions,
+            plan_approval,
         })
         .await;
     if pending_perm_order.len() == 1 {

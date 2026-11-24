@@ -2078,6 +2078,36 @@ async fn execute_tool_inner(
                 }
             }
             if let Some(ref remote_host_id) = target_host {
+                // Agents/Routers must NEVER resolve human-only plan approval gates on remote hosts.
+                let list_req_id = Uuid::new_v4();
+                let list_resp = rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        list_req_id,
+                        WireMessage::ListPendingPermissions {
+                            request_id: list_req_id,
+                            agent_id: Some(agent_id.clone()),
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await?;
+                match list_resp {
+                    WireMessage::PendingPermissionsSnapshot { permissions, .. } => {
+                        if permissions
+                            .iter()
+                            .any(|p| p.request_id == request_id && p.plan_approval.is_some())
+                        {
+                            anyhow::bail!(
+                                "plan approval gate `{request_id}` requires explicit human review and cannot be resolved by an agent"
+                            );
+                        }
+                    }
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("{message}");
+                    }
+                    _ => {}
+                }
                 let req_id = Uuid::new_v4();
                 let resp = rt
                     .connected_hosts
@@ -2098,7 +2128,7 @@ async fn execute_tool_inner(
                 }
             } else {
                 rt.orchestrator
-                    .resolve_permission(&agent_id, request_id.clone(), decision.clone())
+                    .resolve_permission_by_agent(&agent_id, request_id.clone(), decision.clone())
                     .await?;
             }
             Ok(json!({

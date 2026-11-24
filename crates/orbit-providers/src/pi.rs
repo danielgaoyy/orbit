@@ -1237,6 +1237,34 @@ async fn run_pi_actor(
                             .await;
                         }
                     }
+                    DriverCommand::ResolvePlanApproval {
+                        request_id,
+                        action,
+                        ..
+                    } => {
+                        if let Some(req) = pending_ext_reqs.remove(&request_id) {
+                            let confirmed = matches!(
+                                action,
+                                orbit_protocol::PlanApprovalAction::ApproveAndBuild
+                            );
+                            let resp = json!({
+                                "type": "extension_ui_response",
+                                "id": req.rpc_id,
+                                "confirmed": confirmed,
+                            })
+                            .to_string();
+                            if shim.write_stdin_line(resp).await.is_err() {
+                                finalize_and_emit_unexpected_exit(&mut seg_state, &evt_tx).await;
+                                break;
+                            }
+                            emit_status_after_ext_resolve(
+                                &active_turn_id,
+                                &pending_ext_reqs,
+                                &evt_tx,
+                            )
+                            .await;
+                        }
+                    }
                     DriverCommand::AnswerQuestion { request_id, answers } => {
                         if let Some(req) = pending_ext_reqs.remove(&request_id) {
                             let first = answers
@@ -1858,6 +1886,7 @@ async fn handle_pi_extension_ui_request(
                     arguments_json: message,
                 },
                 allowed_decisions: vec!["allow".into(), "deny".into()],
+                plan_approval: None,
             })
             .await;
         let _ = evt_tx

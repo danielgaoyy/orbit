@@ -2281,6 +2281,7 @@ where
                                 detail,
                                 allowed_decisions,
                                 guardian_assessment,
+                                ..
                             } => {
                                 let summary = format_permission_summary(&title, &detail);
                                 let choices = AllowedPermissionChoices::from_wire(&allowed_decisions);
@@ -2837,6 +2838,7 @@ mod tests {
                     signals: Vec::new(),
                     latency_ms: 4,
                 }),
+                plan_approval: None,
             },
         ))
         .expect("send perm_allow");
@@ -2848,6 +2850,7 @@ mod tests {
                 detail: sample_shell_detail(),
                 allowed_decisions: vec!["deny".into()],
                 guardian_assessment: None,
+                plan_approval: None,
             },
         ))
         .expect("send perm_deny_only");
@@ -2937,6 +2940,7 @@ mod tests {
                 detail: sample_shell_detail(),
                 allowed_decisions: vec!["allow".into(), "deny".into()],
                 guardian_assessment: None,
+                plan_approval: None,
             },
         ))
         .expect("send perm");
@@ -3026,6 +3030,7 @@ mod tests {
                     detail: sample_shell_detail(),
                     allowed_decisions: vec!["allow".into(), "allow_always".into(), "deny".into()],
                     guardian_assessment: None,
+                    plan_approval: None,
                 },
             ));
             let _ = tx.send(timeline_event(
@@ -3036,6 +3041,7 @@ mod tests {
                     detail: sample_shell_detail(),
                     allowed_decisions: vec!["allow".into(), "deny".into()],
                     guardian_assessment: None,
+                    plan_approval: None,
                 },
             ));
             assert_eq!(ask_rx.recv().await.as_deref(), Some("perm_ext"));
@@ -3163,6 +3169,7 @@ mod tests {
                 detail: sample_shell_detail(),
                 allowed_decisions: vec!["allow".into(), "deny".into()],
                 guardian_assessment: None,
+                plan_approval: None,
             },
         ));
         let mut failing_send = |_msg: WireMessage| async { Err(anyhow::anyhow!("ws broken")) };

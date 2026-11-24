@@ -100,6 +100,7 @@ import {
   PromptImageLightbox,
   RewindTurnDialog,
 } from "./stage-prompt-controls";
+import { PlanReviewCard } from "./plan-review-card";
 import { TurnStageSection } from "./stage-turn-card";
 
 export { PromptImageLightbox, TurnStageSection };
@@ -1106,6 +1107,7 @@ export function StreamStage() {
     [selectedHostId, selectedAgentId],
   );
   const { subagents: sessionSubagents, decisions: unifiedDecisions } = useOrbitSelector(selectSession);
+  const pendingPlanApproval = unifiedDecisions.pendingPlanApproval;
   const pendingPermissions = unifiedDecisions.parentPermissions;
   const pendingQuestions = unifiedDecisions.parentQuestions;
   const subagentPermissions = unifiedDecisions.subagentPermissions;
@@ -1113,6 +1115,7 @@ export function StreamStage() {
   // A child approval yields the shelf while the parent can still be working.
   const isPlanForegroundRunning =
     isAgentRunning && !currentAgent?.is_awaiting_permission &&
+    pendingPlanApproval === null &&
     pendingPermissions.length === 0 && pendingQuestions.length === 0;
   const sessionTurnDiffs = stageView?.session_turn_diffs ?? EMPTY_DIFF_FILES;
   const stageInsights = stageView?.insights ?? EMPTY_INSIGHTS;
@@ -2362,6 +2365,14 @@ export function StreamStage() {
           }}
         >
           <div style={stagePushStyle}>
+            {pendingPlanApproval && (
+              <PlanReviewCard
+                hostId={selectedHostId}
+                agentId={selectedAgentId}
+                cwd={effectiveCwd}
+                plan={pendingPlanApproval}
+              />
+            )}
             <DecisionDock
               hostId={selectedHostId}
               agentId={selectedAgentId}

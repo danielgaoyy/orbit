@@ -193,6 +193,7 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
             turns: [],
             pending_permissions: [],
             pending_questions: [],
+            pending_plan_approval: null,
             session_turn_diffs: [],
             insights: emptyInsights,
             latest_seq: 0,
@@ -212,6 +213,7 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
             oldest_loaded_seq: 0,
             pending_permissions: [],
             pending_questions: [],
+            pending_plan_approval: null,
             session_turn_diffs: [],
             insights: emptyInsights,
             latest_seq: 0,
@@ -221,6 +223,8 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
           };
         case "get_agent_stage_turns_slice":
           return [];
+        case "resolve_plan_approval":
+          return null;
         case "load_older_agent_timeline":
           return true;
         case "get_local_machine_info":
@@ -523,6 +527,7 @@ const MOCK_TAURI_PAGINATED_INIT_SCRIPT = (() => {
         oldest_loaded_seq: 350,
         pending_permissions: [],
         pending_questions: [],
+        pending_plan_approval: null,
         session_turn_diffs: [],
         insights: {
           touched_files: [],

@@ -29,10 +29,11 @@ use orbit_protocol::{
     LspReferenceLocation, LspServerStatus, LspSymbolInfo, LspWorkspaceEdit, LspWorkspaceEditResult,
     ManagedSkillRecord, McpProbeResult, ModelOption, MonitorWatchRecord, OrchestrationConfig,
     OrchestrationSkillInfo, PathScopedRule, PendingPermissionSummary, PermissionCheckpointRef,
-    PromptBadge, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot,
-    ProviderSubagentDescriptor, ProviderSubagentEvent, PushDeviceRecord, PushPlatform,
-    PushPreferences, QuestionItem, QueuedPromptView, ReasoningEffort, RemoteMessageSearchHit,
-    RuleTriggerMode, ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode, SkillWriteScope,
+    PlanApprovalAction, PlanApprovalPayload, PromptBadge, ProviderKind, ProviderModelCatalog,
+    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent, PushDeviceRecord,
+    PushPlatform, PushPreferences, QuestionItem, QueuedPromptView, ReasoningEffort,
+    RemoteMessageSearchHit, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec, ScheduleTarget,
+    SessionMode, SkillWriteScope,
     TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelineOutlinePrompt, TimelinePayload,
     TimerCondition, ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot, WireMessage,
     WorkflowRunRecord, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind,
@@ -669,6 +670,8 @@ pub enum TimelineItemView {
         resolved_decision: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         guardian_assessment: Option<GuardianAssessment>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_approval: Option<PlanApprovalPayload>,
         #[serde(default)]
         timestamp_ms: Option<i64>,
     },
@@ -1002,6 +1005,7 @@ struct CachedAgentStage {
     turn_item_starts: Vec<usize>,
     pending_permissions: Vec<TimelineItemView>,
     pending_questions: Vec<TimelineItemView>,
+    pending_plan_approval: Option<crate::stage::PendingPlanApprovalView>,
     session_turn_diffs: Vec<DiffFileView>,
     insights: SessionInsightsView,
     stage_revision: u64,
@@ -1180,6 +1184,7 @@ struct HostMemoryState {
     pending_handoff_executes:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<WorktreeHandoffOutcome, String>>>,
     pending_daemon_upgrades: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<(), String>>>,
+    pending_plan_approval_acks: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<(), String>>>,
     pending_upgrade_terminals: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<String, String>>>,
     pending_git_repo_inspections:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GitReposInspectionView, String>>>,
@@ -1407,6 +1412,7 @@ impl HostMemoryState {
             pending_handoff_previews: HashMap::new(),
             pending_handoff_executes: HashMap::new(),
             pending_daemon_upgrades: HashMap::new(),
+            pending_plan_approval_acks: HashMap::new(),
             pending_upgrade_terminals: HashMap::new(),
             pending_git_repo_inspections: HashMap::new(),
             pending_git_mutations: HashMap::new(),
@@ -2538,14 +2544,19 @@ impl OrbitAppCore {
                     .get(agent_id)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
-                let (pending_permissions, pending_questions, session_turn_diffs, mut insights) =
-                    stage::collect_stage_auxiliary_state(
-                        &items,
-                        cwd,
-                        current_agent_card.as_ref(),
-                        &host_agent_cards,
-                        provider_subagents,
-                    );
+                let (
+                    pending_permissions,
+                    pending_questions,
+                    pending_plan_approval,
+                    session_turn_diffs,
+                    mut insights,
+                ) = stage::collect_stage_auxiliary_state(
+                    &items,
+                    cwd,
+                    current_agent_card.as_ref(),
+                    &host_agent_cards,
+                    provider_subagents,
+                );
 
                 insights.merge_outline(full_outline);
                 host_state.stage_cache.insert(
@@ -2558,6 +2569,7 @@ impl OrbitAppCore {
                         turn_item_starts: sliced.turn_item_starts,
                         pending_permissions,
                         pending_questions,
+                        pending_plan_approval,
                         session_turn_diffs,
                         insights,
                         stage_revision: next_rev,
@@ -2632,17 +2644,23 @@ impl OrbitAppCore {
                         .get(agent_id)
                         .map(Vec::as_slice)
                         .unwrap_or(&[]);
-                    let (pending_permissions, pending_questions, session_turn_diffs, mut insights) =
-                        stage::collect_stage_auxiliary_state(
-                            &cached.items,
-                            cwd,
-                            current_agent_card.as_ref(),
-                            &host_agent_cards,
-                            provider_subagents,
-                        );
+                    let (
+                        pending_permissions,
+                        pending_questions,
+                        pending_plan_approval,
+                        session_turn_diffs,
+                        mut insights,
+                    ) = stage::collect_stage_auxiliary_state(
+                        &cached.items,
+                        cwd,
+                        current_agent_card.as_ref(),
+                        &host_agent_cards,
+                        provider_subagents,
+                    );
                     insights.merge_outline(full_outline);
                     cached.pending_permissions = pending_permissions;
                     cached.pending_questions = pending_questions;
+                    cached.pending_plan_approval = pending_plan_approval;
                     cached.session_turn_diffs = session_turn_diffs;
                     cached.insights = insights;
                     cached.aux_revision = cached.aux_revision.saturating_add(1);
@@ -2695,6 +2713,7 @@ impl OrbitAppCore {
                 turns: c.turns.clone(),
                 pending_permissions: c.pending_permissions.clone(),
                 pending_questions: c.pending_questions.clone(),
+                pending_plan_approval: c.pending_plan_approval.clone(),
                 session_turn_diffs: c.session_turn_diffs.clone(),
                 insights: c.insights.clone(),
                 latest_seq: c.latest_seq,
@@ -2706,6 +2725,7 @@ impl OrbitAppCore {
                 turns: Vec::new(),
                 pending_permissions: Vec::new(),
                 pending_questions: Vec::new(),
+                pending_plan_approval: None,
                 session_turn_diffs: Vec::new(),
                 insights: crate::stage::SessionInsightsView::default(),
                 latest_seq: agent.map(|a| a.latest_seq).unwrap_or(0),
@@ -2758,6 +2778,7 @@ impl OrbitAppCore {
                     total_turn_count: 0,
                     pending_permissions: Vec::new(),
                     pending_questions: Vec::new(),
+                    pending_plan_approval: None,
                     session_turn_diffs: Vec::new(),
                     insights: crate::stage::SessionInsightsView::default(),
                     latest_seq: agent.map(|a| a.latest_seq).unwrap_or(0),
@@ -2791,6 +2812,11 @@ impl OrbitAppCore {
                         Vec::new()
                     } else {
                         c.pending_questions.clone()
+                    },
+                    pending_plan_approval: if aux_unchanged {
+                        None
+                    } else {
+                        c.pending_plan_approval.clone()
                     },
                     session_turn_diffs: if aux_unchanged {
                         Vec::new()
@@ -2856,6 +2882,11 @@ impl OrbitAppCore {
                 } else {
                     c.pending_questions.clone()
                 },
+                pending_plan_approval: if aux_unchanged {
+                    None
+                } else {
+                    c.pending_plan_approval.clone()
+                },
                 session_turn_diffs: if aux_unchanged {
                     Vec::new()
                 } else {
@@ -2913,6 +2944,7 @@ impl OrbitAppCore {
                         total_turn_count: 0,
                         pending_permissions: Vec::new(),
                         pending_questions: Vec::new(),
+                        pending_plan_approval: None,
                         session_turn_diffs: Vec::new(),
                         insights: crate::stage::SessionInsightsView::default(),
                         latest_seq: agent.map(|a| a.latest_seq).unwrap_or(0),
@@ -2955,6 +2987,11 @@ impl OrbitAppCore {
                             Vec::new()
                         } else {
                             c.pending_questions.clone()
+                        },
+                        pending_plan_approval: if aux_unchanged {
+                            None
+                        } else {
+                            c.pending_plan_approval.clone()
                         },
                         session_turn_diffs: if aux_unchanged {
                             Vec::new()
@@ -3038,6 +3075,11 @@ impl OrbitAppCore {
                         Vec::new()
                     } else {
                         c.pending_questions.clone()
+                    },
+                    pending_plan_approval: if aux_unchanged {
+                        None
+                    } else {
+                        c.pending_plan_approval.clone()
                     },
                     session_turn_diffs: if aux_unchanged {
                         Vec::new()
@@ -7644,6 +7686,9 @@ impl OrbitAppCore {
                     if let Some(tx) = state.pending_daemon_upgrades.remove(&request_id) {
                         let _ = tx.send(Ok(()));
                     }
+                    if let Some(tx) = state.pending_plan_approval_acks.remove(&request_id) {
+                        let _ = tx.send(Ok(()));
+                    }
                 }
                 WireMessage::AttachmentStaged {
                     request_id,
@@ -7727,6 +7772,10 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_daemon_upgrades.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_plan_approval_acks.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -12465,6 +12514,103 @@ impl OrbitAppCore {
                 decision: decision.to_string(),
             },
         );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_plan_approval_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        permission_request_id: &str,
+        action: PlanApprovalAction,
+        edited_plan_markdown: Option<String>,
+        feedback: Option<String>,
+        target_mode: Option<SessionMode>,
+    ) -> Result<(), String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to resolve plan approval".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.to_string();
+        let owned_agent_id = agent_id.to_string();
+        let owned_perm_id = permission_request_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_plan_approval_acks.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before resolving plan approval".to_string()),
+                    None => Some(format!("host `{owned_host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            core.record_agent_request(&owned_host_id, req_id, &owned_agent_id);
+            if let Err(e) = session
+                .send_wire(WireMessage::ResolvePlanApproval {
+                    request_id: req_id,
+                    agent_id: owned_agent_id,
+                    permission_request_id: owned_perm_id,
+                    action,
+                    edited_plan_markdown,
+                    feedback,
+                    target_mode,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_plan_approval_acks.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send plan approval response: {e}")));
+                return;
+            }
+
+            let outcome = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while resolving plan approval".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_plan_approval_acks.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon to resolve plan approval (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "Plan approval task canceled".to_string())?
     }
 
     pub fn answer_question(
@@ -21624,6 +21770,9 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     // Dropping pending daemon-upgrade ack senders lets `upgrade_host_daemon_over_wire` observe
     // `RecvError` immediately when the remote daemon disconnects to hot-restart.
     h.pending_daemon_upgrades.clear();
+    for (_, tx) in h.pending_plan_approval_acks.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
     for (_, tx) in h.pending_upgrade_terminals.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
@@ -23107,6 +23256,7 @@ fn render_timeline_event_view(
             detail,
             allowed_decisions,
             guardian_assessment,
+            plan_approval,
         } => Some(TimelineItemView::PermissionRequest {
             seq: ev.seq,
             request_id: request_id.clone(),
@@ -23115,6 +23265,7 @@ fn render_timeline_event_view(
             allowed_decisions: allowed_decisions.clone(),
             resolved_decision: all_resolved_perms.get(request_id).cloned(),
             guardian_assessment: guardian_assessment.clone(),
+            plan_approval: plan_approval.clone(),
             timestamp_ms: ts_ms,
         }),
         TimelinePayload::QuestionRequest {
@@ -25148,6 +25299,7 @@ mod tests {
                             },
                             allowed_decisions: vec!["allow_once".into()],
                             guardian_assessment: None,
+                            plan_approval: None,
                         },
                     },
                     TimelineEvent {

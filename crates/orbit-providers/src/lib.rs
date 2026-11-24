@@ -12,6 +12,7 @@ pub mod codex;
 pub mod driver;
 mod managed_dispatch;
 pub mod pi;
+pub mod plan_approval;
 pub mod readiness;
 pub mod shell_snapshot;
 pub mod side_question;

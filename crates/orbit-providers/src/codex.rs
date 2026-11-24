@@ -91,6 +91,7 @@ fn build_codex_turn_start_params(
     cfg: &SessionLaunchConfig,
     thread_id: &str,
     mode: &SessionMode,
+    explicit_default_collaboration_mode: bool,
     resolved_model: &Option<String>,
     current_effort: Option<ReasoningEffort>,
     fast_mode: bool,
@@ -133,17 +134,24 @@ fn build_codex_turn_start_params(
         params["serviceTier"] = Value::Null;
     }
     // Codex app-server schema requires `CollaborationMode.settings.model` to be a non-empty string.
-    // When no model is resolved yet, omit `collaborationMode` and rely on read-only `sandboxPolicy`.
-    if matches!(mode, SessionMode::Plan)
-        && let Some(m) = clean_model
+    // In Plan mode, emit `collaborationMode: "plan"`. When exiting Plan mode into Default/build,
+    // explicitly emit `collaborationMode: "default"` so Codex does not inherit Plan mode from the
+    // previous turn on the thread.
+    if let Some(m) = clean_model
+        && (matches!(mode, SessionMode::Plan) || explicit_default_collaboration_mode)
     {
         let mut settings = serde_json::Map::new();
         settings.insert("model".to_string(), Value::String(m.to_string()));
         if let Some(s) = eff_str {
             settings.insert("reasoning_effort".to_string(), Value::String(s.to_string()));
         }
+        let collab_mode = if matches!(mode, SessionMode::Plan) {
+            "plan"
+        } else {
+            "default"
+        };
         params["collaborationMode"] = json!({
-            "mode": "plan",
+            "mode": collab_mode,
             "settings": Value::Object(settings)
         });
     }
@@ -518,6 +526,9 @@ async fn run_codex_actor(
     let mut msg_accum: HashMap<String, String> = HashMap::new();
     let mut thought_accum: HashMap<String, String> = HashMap::new();
     let mut tool_detail_cache: HashMap<String, ToolCallDetail> = HashMap::new();
+    let mut pending_proposed_plan: Option<String> = None;
+    let mut pending_synthetic_plan_gate: Option<String> = None;
+    let mut had_plan_collaboration_mode = matches!(mode, SessionMode::Plan);
     let mut pending_approvals: HashMap<String, PendingCodexApproval> = HashMap::new();
     let mut pending_questions: HashMap<String, PendingCodexQuestion> = HashMap::new();
     let mut queued_prompts: VecDeque<QueuedDriverPrompt> = VecDeque::new();
@@ -692,6 +703,23 @@ async fn run_codex_actor(
                                 }
                             }
                             continue;
+                        } else if pending_synthetic_plan_gate.is_some() {
+                            // Hold queued prompts while a synthetic turn-end plan gate is awaiting
+                            // explicit user review so queued work never executes before plan approval.
+                            emit_prompt_delivery(
+                                &evt_tx,
+                                &turn_id,
+                                &message_ids,
+                                AgentMessageDeliveryStatus::Queued,
+                                None,
+                            )
+                            .await;
+                            queued_prompts.push_back(QueuedDriverPrompt {
+                                turn_id,
+                                prompt,
+                                message_ids,
+                            });
+                            continue;
                         }
 
                         pending_interrupt_on_turn_started = false;
@@ -700,6 +728,7 @@ async fn run_codex_actor(
                             &cfg,
                             &thread_id,
                             &mode,
+                            &mut had_plan_collaboration_mode,
                             &resolved_model,
                             current_effort,
                             current_fast_mode,
@@ -783,9 +812,10 @@ async fn run_codex_actor(
                             let _ = shim.write_stdin_line(req.to_string()).await;
                         } else if client_turn_id.is_some() {
                             pending_interrupt_on_turn_started = true;
-                        } else if let Some(next_q) = pending_interrupt_replacement
-                            .take()
-                            .or_else(|| queued_prompts.pop_front())
+                        } else if pending_synthetic_plan_gate.is_none()
+                            && let Some(next_q) = pending_interrupt_replacement
+                                .take()
+                                .or_else(|| queued_prompts.pop_front())
                         {
                             pending_interrupt_on_turn_started = false;
                             active_turn_message_ids = next_q.message_ids;
@@ -793,6 +823,7 @@ async fn run_codex_actor(
                                 &cfg,
                                 &thread_id,
                                 &mode,
+                                &mut had_plan_collaboration_mode,
                                 &resolved_model,
                                 current_effort,
                                 current_fast_mode,
@@ -838,6 +869,10 @@ async fn run_codex_actor(
                         }
                     }
                     DriverCommand::SetMode { mode: new_mode } => {
+                        if matches!(mode, SessionMode::Plan) || matches!(new_mode, SessionMode::Plan)
+                        {
+                            had_plan_collaboration_mode = true;
+                        }
                         mode = new_mode;
                     }
                     DriverCommand::SetConfig {
@@ -872,6 +907,122 @@ async fn run_codex_actor(
                                     .send(DriverEvent::StatusChanged(AgentStatus::Running {
                                         turn_id: tid.clone(),
                                     }))
+                                    .await;
+                            }
+                        } else if pending_synthetic_plan_gate.as_deref() == Some(request_id.as_str()) {
+                            pending_synthetic_plan_gate = None;
+                            let _ = evt_tx
+                                .send(DriverEvent::StatusChanged(AgentStatus::Idle))
+                                .await;
+                        }
+                    }
+                    DriverCommand::ResolvePlanApproval {
+                        request_id,
+                        action,
+                        edited_plan_markdown,
+                        target_mode,
+                        ..
+                    } => {
+                        let rpc_app = pending_approvals.remove(&request_id);
+                        let cleared_synthetic =
+                            pending_synthetic_plan_gate.as_deref() == Some(request_id.as_str());
+                        if cleared_synthetic {
+                            pending_synthetic_plan_gate = None;
+                        }
+                        if rpc_app.is_none() && !cleared_synthetic {
+                            continue;
+                        }
+                        if matches!(action, orbit_protocol::PlanApprovalAction::ApproveAndBuild) {
+                            if matches!(mode, SessionMode::Plan) {
+                                had_plan_collaboration_mode = true;
+                            }
+                            mode = target_mode;
+                        }
+                        if let Some(app) = rpc_app {
+                            // Codex RPC plan approval (`accept`/`decline`) carries no inline edited
+                            // plan field; when the user edited the plan, decline the stale gate so
+                            // the daemon launches one clean build turn with the approved edits.
+                            let has_edits = edited_plan_markdown
+                                .as_deref()
+                                .is_some_and(|s| !s.trim().is_empty());
+                            let wire_dec = match action {
+                                orbit_protocol::PlanApprovalAction::ApproveAndBuild
+                                    if !has_edits =>
+                                {
+                                    "accept"
+                                }
+                                _ => "decline",
+                            };
+                            let resp = json!({
+                                "id": app.rpc_id,
+                                "result": { "decision": wire_dec }
+                            });
+                            let _ = shim.write_stdin_line(resp.to_string()).await;
+                            if let Some(ref tid) = client_turn_id {
+                                let _ = evt_tx
+                                    .send(DriverEvent::StatusChanged(AgentStatus::Running {
+                                        turn_id: tid.clone(),
+                                    }))
+                                    .await;
+                            }
+                        } else if matches!(action, orbit_protocol::PlanApprovalAction::Dismiss) {
+                            // Synthetic turn-end gate dismissed: resume any queued prompts held
+                            // behind the gate, or return to Idle if none remain.
+                            if let Some(next_q) = pending_interrupt_replacement
+                                .take()
+                                .or_else(|| queued_prompts.pop_front())
+                            {
+                                active_turn_message_ids = next_q.message_ids;
+                                if dispatch_codex_turn(
+                                    &cfg,
+                                    &thread_id,
+                                    &mode,
+                                    &mut had_plan_collaboration_mode,
+                                    &resolved_model,
+                                    current_effort,
+                                    current_fast_mode,
+                                    service_tier_explicitly_controlled,
+                                    &next_q.turn_id,
+                                    &next_q.prompt,
+                                    &mut next_id,
+                                    &mut pending_turn_start_rpc_id,
+                                    &mut client_turn_id,
+                                    &mut msg_accum,
+                                    &mut thought_accum,
+                                    &shim,
+                                    &evt_tx,
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    let dropped = std::mem::take(&mut active_turn_message_ids);
+                                    emit_prompt_delivery(
+                                        &evt_tx,
+                                        &next_q.turn_id,
+                                        &dropped,
+                                        AgentMessageDeliveryStatus::Dropped,
+                                        None,
+                                    )
+                                    .await;
+                                    emit_dropped_queued_prompts(
+                                        &evt_tx,
+                                        pending_interrupt_replacement.take(),
+                                        &mut queued_prompts,
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                emit_prompt_delivery(
+                                    &evt_tx,
+                                    &next_q.turn_id,
+                                    &active_turn_message_ids,
+                                    AgentMessageDeliveryStatus::Dispatched,
+                                    None,
+                                )
+                                .await;
+                            } else {
+                                let _ = evt_tx
+                                    .send(DriverEvent::StatusChanged(AgentStatus::Idle))
                                     .await;
                             }
                         }
@@ -970,11 +1121,14 @@ async fn run_codex_actor(
                                 &cfg.agent_id,
                                 m,
                                 &val["params"],
+                                &mode,
                                 &mut native_turn_id,
                                 &mut client_turn_id,
                                 &mut msg_accum,
                                 &mut thought_accum,
                                 &mut tool_detail_cache,
+                                &mut pending_proposed_plan,
+                                &mut pending_synthetic_plan_gate,
                                 &mut usage_tracker,
                                 &evt_tx,
                             )
@@ -1000,15 +1154,17 @@ async fn run_codex_actor(
                                 pending_interrupt_on_turn_started = false;
                                 pending_turn_start_rpc_id = None;
                                 active_turn_message_ids.clear();
-                                if let Some(next_q) = pending_interrupt_replacement
-                                    .take()
-                                    .or_else(|| queued_prompts.pop_front())
+                                if pending_synthetic_plan_gate.is_none()
+                                    && let Some(next_q) = pending_interrupt_replacement
+                                        .take()
+                                        .or_else(|| queued_prompts.pop_front())
                                 {
                                     active_turn_message_ids = next_q.message_ids;
                                     if dispatch_codex_turn(
                                         &cfg,
                                         &thread_id,
                                         &mode,
+                                        &mut had_plan_collaboration_mode,
                                         &resolved_model,
                                         current_effort,
                                         current_fast_mode,
@@ -1083,15 +1239,17 @@ async fn run_codex_actor(
                                         )
                                         .await;
                                     }
-                                    if let Some(next_q) = pending_interrupt_replacement
-                                        .take()
-                                        .or_else(|| queued_prompts.pop_front())
+                                    if pending_synthetic_plan_gate.is_none()
+                                        && let Some(next_q) = pending_interrupt_replacement
+                                            .take()
+                                            .or_else(|| queued_prompts.pop_front())
                                     {
                                         active_turn_message_ids = next_q.message_ids;
                                         if dispatch_codex_turn(
                                             &cfg,
                                             &thread_id,
                                             &mode,
+                                            &mut had_plan_collaboration_mode,
                                             &resolved_model,
                                             current_effort,
                                             current_fast_mode,
@@ -1284,6 +1442,7 @@ async fn dispatch_codex_turn(
     cfg: &SessionLaunchConfig,
     thread_id: &str,
     mode: &SessionMode,
+    had_plan_collaboration_mode: &mut bool,
     resolved_model: &Option<String>,
     current_effort: Option<ReasoningEffort>,
     fast_mode: bool,
@@ -1309,6 +1468,12 @@ async fn dispatch_codex_turn(
         }))
         .await;
 
+    let explicit_default_collab =
+        *had_plan_collaboration_mode && !matches!(mode, SessionMode::Plan);
+    if matches!(mode, SessionMode::Plan) {
+        *had_plan_collaboration_mode = true;
+    }
+
     let req_id = *next_id;
     *next_id += 1;
     *pending_turn_start_rpc_id = Some(req_id);
@@ -1316,12 +1481,16 @@ async fn dispatch_codex_turn(
         cfg,
         thread_id,
         mode,
+        explicit_default_collab,
         resolved_model,
         current_effort,
         fast_mode,
         service_tier_explicitly_controlled,
         Value::Array(input_items),
     );
+    if explicit_default_collab && params.get("collaborationMode").is_some() {
+        *had_plan_collaboration_mode = false;
+    }
 
     let req = json!({
         "id": req_id,
@@ -1509,16 +1678,20 @@ async fn handle_codex_notification(
     parent_agent_id: &str,
     method: &str,
     params: &Value,
+    mode: &SessionMode,
     native_turn_id: &mut Option<String>,
     client_turn_id: &mut Option<String>,
     msg_accum: &mut HashMap<String, String>,
     thought_accum: &mut HashMap<String, String>,
     tool_detail_cache: &mut HashMap<String, ToolCallDetail>,
+    pending_proposed_plan: &mut Option<String>,
+    pending_synthetic_plan_gate: &mut Option<String>,
     usage_tracker: &mut CodexTurnUsageTracker,
     evt_tx: &mpsc::Sender<DriverEvent>,
 ) -> bool {
     match method {
         "turn/started" => {
+            *pending_proposed_plan = None;
             if let Some(tid) = params.pointer("/turn/id").and_then(|v| v.as_str()) {
                 *native_turn_id = Some(tid.to_string());
                 if client_turn_id.is_none() {
@@ -1600,6 +1773,12 @@ async fn handle_codex_notification(
                             .or_else(|| msg_accum.remove(&item_id))
                             .unwrap_or_default();
                         if !final_text.is_empty() {
+                            if matches!(mode, SessionMode::Plan)
+                                && let Some(proposed) =
+                                    orbit_protocol::extract_codex_proposed_plan(&final_text)
+                            {
+                                *pending_proposed_plan = Some(proposed);
+                            }
                             let _ = evt_tx
                                 .send(DriverEvent::AssistantText {
                                     item_id,
@@ -1608,6 +1787,20 @@ async fn handle_codex_notification(
                                 })
                                 .await;
                         }
+                    }
+                }
+                "plan" | "Plan" | "proposedPlan" | "ProposedPlan" => {
+                    if is_done
+                        && matches!(mode, SessionMode::Plan)
+                        && let Some(plan_text) = item
+                            .get("text")
+                            .or_else(|| item.get("plan"))
+                            .or_else(|| item.get("markdown"))
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                    {
+                        *pending_proposed_plan = Some(plan_text.to_string());
                     }
                 }
                 "commandExecution" | "CommandExecution" => {
@@ -1808,8 +2001,13 @@ async fn handle_codex_notification(
             usage_tracker.on_token_usage_updated(params);
         }
         "turn/completed" => {
+            let completed_turn_id = client_turn_id
+                .clone()
+                .or_else(|| native_turn_id.clone())
+                .unwrap_or_default();
             *native_turn_id = None;
             *client_turn_id = None;
+            let proposed_plan = pending_proposed_plan.take();
             if let Some(usage_evt) = usage_tracker.finalize_turn(params) {
                 let _ = evt_tx.send(usage_evt).await;
             }
@@ -1828,6 +2026,45 @@ async fn handle_codex_notification(
                         message: err_msg,
                         recoverable: true,
                     }))
+                    .await;
+            } else if status_str == "completed"
+                && matches!(mode, SessionMode::Plan)
+                && let Some(plan_markdown) = proposed_plan
+            {
+                let req_id = format!("cplan_{}", uuid::Uuid::new_v4().simple());
+                *pending_synthetic_plan_gate = Some(req_id.clone());
+                let plan_title = orbit_protocol::extract_plan_title(&plan_markdown);
+                let title = plan_title
+                    .clone()
+                    .unwrap_or_else(|| "Review implementation plan".to_string());
+                let payload = orbit_protocol::PlanApprovalPayload {
+                    plan_markdown: plan_markdown.clone(),
+                    plan_title,
+                    plan_file_path: None,
+                    summary: None,
+                    plan_file_backed: false,
+                    allowed_prompts: Vec::new(),
+                    source: Some("codex_plan".to_string()),
+                };
+                let _ = evt_tx
+                    .send(DriverEvent::PermissionRequest {
+                        request_id: req_id.clone(),
+                        title,
+                        detail: ToolCallDetail::Generic {
+                            tool_name: "ExitPlanMode".into(),
+                            arguments_json: json!({ "plan": plan_markdown }).to_string(),
+                        },
+                        allowed_decisions: vec!["allow".into(), "deny".into()],
+                        plan_approval: Some(payload),
+                    })
+                    .await;
+                let _ = evt_tx
+                    .send(DriverEvent::StatusChanged(
+                        AgentStatus::AwaitingPermission {
+                            turn_id: completed_turn_id,
+                            request_id: req_id,
+                        },
+                    ))
                     .await;
             } else {
                 let _ = evt_tx
@@ -1882,6 +2119,7 @@ async fn handle_codex_server_request(
                         output_preview: None,
                     },
                     allowed_decisions: vec!["allow".into(), "deny".into()],
+                    plan_approval: None,
                 })
                 .await;
             let _ = evt_tx
@@ -1917,6 +2155,58 @@ async fn handle_codex_server_request(
                     title: "Approve file modifications".into(),
                     detail,
                     allowed_decisions: vec!["allow".into(), "deny".into()],
+                    plan_approval: None,
+                })
+                .await;
+            let _ = evt_tx
+                .send(DriverEvent::StatusChanged(
+                    AgentStatus::AwaitingPermission {
+                        turn_id: client_turn_id.clone().unwrap_or_default(),
+                        request_id: req_id,
+                    },
+                ))
+                .await;
+        }
+        "item/plan/requestApproval" | "plan/requestApproval" => {
+            let req_id = format!("cplan_rpc_{rpc_id}");
+            let plan_markdown = params
+                .get("plan")
+                .or_else(|| params.get("text"))
+                .or_else(|| params.get("markdown"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            let plan_title = params
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .or_else(|| orbit_protocol::extract_plan_title(&plan_markdown));
+            let title = plan_title
+                .clone()
+                .unwrap_or_else(|| "Review implementation plan".to_string());
+            let payload = orbit_protocol::PlanApprovalPayload {
+                plan_markdown: plan_markdown.clone(),
+                plan_title,
+                plan_file_path: orbit_protocol::extract_plan_file_path(params),
+                summary: None,
+                plan_file_backed: false,
+                allowed_prompts: Vec::new(),
+                source: Some("codex_plan_rpc".to_string()),
+            };
+            pending_approvals.insert(req_id.clone(), PendingCodexApproval { rpc_id });
+            let _ = evt_tx
+                .send(DriverEvent::PermissionRequest {
+                    request_id: req_id.clone(),
+                    title,
+                    detail: ToolCallDetail::Generic {
+                        tool_name: "ExitPlanMode".into(),
+                        arguments_json: params.to_string(),
+                    },
+                    allowed_decisions: vec!["allow".into(), "deny".into()],
+                    plan_approval: Some(payload),
                 })
                 .await;
             let _ = evt_tx
@@ -2861,6 +3151,7 @@ mod tests {
             &cfg,
             "thr_1",
             &SessionMode::AcceptEdits,
+            false,
             &Some("gpt-5.4".into()),
             Some(ReasoningEffort::High),
             false,
@@ -2873,6 +3164,7 @@ mod tests {
             &cfg,
             "thr_1",
             &SessionMode::AcceptEdits,
+            false,
             &Some("gpt-5.4".into()),
             Some(ReasoningEffort::High),
             true,
@@ -2885,6 +3177,7 @@ mod tests {
             &cfg,
             "thr_1",
             &SessionMode::AcceptEdits,
+            false,
             &Some("gpt-5.4".into()),
             Some(ReasoningEffort::High),
             false,
@@ -3403,6 +3696,7 @@ mod tests {
             &cfg,
             "thr_1",
             &SessionMode::Plan,
+            false,
             &Some("gpt-5.4".to_string()),
             Some(ReasoningEffort::High),
             false,
@@ -3420,11 +3714,39 @@ mod tests {
         );
         assert_eq!(with_model["sandboxPolicy"]["type"], json!("readOnly"));
 
+        // Exiting Plan mode -> Default MUST explicitly emit `collaborationMode: "default"` so
+        // Codex app-server does not keep the thread stuck in Plan collaboration mode.
+        let exiting_plan = build_codex_turn_start_params(
+            &cfg,
+            "thr_1",
+            &SessionMode::Default,
+            true,
+            &Some("gpt-5.4".to_string()),
+            Some(ReasoningEffort::High),
+            false,
+            false,
+            json!([]),
+        );
+        assert_eq!(exiting_plan["collaborationMode"]["mode"], json!("default"));
+        assert_eq!(
+            exiting_plan["collaborationMode"]["settings"]["model"],
+            json!("gpt-5.4")
+        );
+        assert_eq!(
+            exiting_plan["collaborationMode"]["settings"]["reasoning_effort"],
+            json!("high")
+        );
+        assert_eq!(
+            exiting_plan["sandboxPolicy"]["type"],
+            json!("workspaceWrite")
+        );
+
         // With model but no effort: omits `reasoning_effort`, keeps `model`
         let with_model_no_effort = build_codex_turn_start_params(
             &cfg,
             "thr_1",
             &SessionMode::Plan,
+            false,
             &Some("gpt-5.4".to_string()),
             None,
             false,
@@ -3447,6 +3769,7 @@ mod tests {
                 &cfg,
                 "thr_1",
                 &SessionMode::Plan,
+                false,
                 &empty_model,
                 Some(ReasoningEffort::Medium),
                 false,

@@ -307,7 +307,7 @@ export function createStageSessionSelector(hostId: string | null, agentId: strin
     // Archive filters only affect the visible roster. Stage and decisions both use the full roster.
     const nextInputs = [
       state.hostDetails, state.fleet.hosts, stage?.insights?.subagents,
-      stage?.pending_permissions, stage?.pending_questions,
+      stage?.pending_permissions, stage?.pending_questions, stage?.pending_plan_approval,
     ];
     if (snapshot && sameItems(inputs, nextInputs)) return snapshot;
 
@@ -318,6 +318,7 @@ export function createStageSessionSelector(hostId: string | null, agentId: strin
     if (snapshot && subagents === snapshot.subagents) {
       const prev = snapshot.decisions;
       if (
+        prev.pendingPlanApproval === decisions.pendingPlanApproval &&
         sameItems(prev.parentPermissions, decisions.parentPermissions) &&
         sameItems(prev.parentQuestions, decisions.parentQuestions) &&
         prev.subagentPermissions.length === decisions.subagentPermissions.length &&

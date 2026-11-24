@@ -167,6 +167,7 @@ type QueuedDecision =
       allowedDecisions: string[];
       guardianAssessment?: GuardianAssessment | null;
       subagent?: SessionSubagentWithAvatar;
+      isPlanApproval?: boolean;
     }
   | {
       kind: "question";
@@ -560,6 +561,7 @@ function PermissionApprovalCard({
   allowedDecisions,
   guardianAssessment,
   subagent,
+  isPlanApproval = false,
   queueIndex,
   queueTotal,
   onStepPrev,
@@ -577,6 +579,7 @@ function PermissionApprovalCard({
   allowedDecisions: string[];
   guardianAssessment?: GuardianAssessment | null;
   subagent?: SessionSubagentWithAvatar;
+  isPlanApproval?: boolean;
   queueIndex: number;
   queueTotal: number;
   onStepPrev: () => void;
@@ -620,14 +623,29 @@ function PermissionApprovalCard({
       submittingRef.current = dec;
       setSubmittingDecision(dec);
       try {
-        await orbitIpc.resolvePermission(hostId, agentId, requestId, dec);
+        if (isPlanApproval) {
+          const isDeny = isDenyDecision(dec);
+          await orbitIpc.resolvePlanApproval(
+            hostId,
+            agentId,
+            requestId,
+            isDeny ? "dismiss" : "approve_and_build",
+            {
+              editedPlanMarkdown: null,
+              feedback: null,
+              targetMode: isDeny ? null : "default",
+            },
+          );
+        } else {
+          await orbitIpc.resolvePermission(hostId, agentId, requestId, dec);
+        }
       } catch (err) {
         submittingRef.current = null;
         setSubmittingDecision(null);
         orbitActions.showToast(t("approval.permissionFailed", { error: String(err) }));
       }
     },
-    [hostId, agentId, requestId, t],
+    [hostId, agentId, requestId, isPlanApproval, t],
   );
 
   // Register exact target (parent OR child subagent) and live resolve handler for `⌘Y / ⌘⇧Y / ⌘⌫`
@@ -1460,6 +1478,7 @@ export const DecisionDock = memo(
       const merged: QueuedDecision[] = [];
 
       for (const item of permissions) {
+        if (item.plan_approval != null) continue;
         const key = `permission:${hostId}:${agentId}:${item.request_id}`;
         if (!seen.has(key)) {
           seen.add(key);
@@ -1511,6 +1530,7 @@ export const DecisionDock = memo(
             allowedDecisions: subPerm.permission.allowed_decisions,
             guardianAssessment: subPerm.permission.guardian_assessment,
             subagent: subPerm.subagent,
+            isPlanApproval: subPerm.permission.plan_approval != null,
           });
         }
       }
@@ -1652,6 +1672,7 @@ export const DecisionDock = memo(
               allowedDecisions={activeEntry.allowedDecisions}
               guardianAssessment={activeEntry.guardianAssessment}
               subagent={activeEntry.subagent}
+              isPlanApproval={activeEntry.isPlanApproval}
               queueIndex={activeIndex}
               queueTotal={queue.length}
               onStepPrev={() => handleStep(-1)}
@@ -1706,6 +1727,7 @@ export const DecisionDock = memo(
         sp.key === nsp.key &&
         sp.subagent.title === nsp.subagent.title &&
         sp.subagent.character === nsp.subagent.character &&
+        (sp.permission.plan_approval != null) === (nsp.permission.plan_approval != null) &&
         sameGuardian(sp.permission.guardian_assessment, nsp.permission.guardian_assessment)
       );
     }),

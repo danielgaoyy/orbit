@@ -11,7 +11,7 @@ use orbit_protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::app_core::{AgentCardView, TimelineItemView};
-use crate::render::DiffFileView;
+use crate::render::{DiffFileView, RichBlockView, parse_markdown_blocks};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnFileDiffSummaryView {
@@ -335,6 +335,28 @@ impl SessionInsightsView {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingPlanApprovalView {
+    pub seq: u64,
+    pub request_id: String,
+    pub title: String,
+    pub plan_markdown: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_prompts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<RichBlockView>,
+    #[serde(default)]
+    pub timestamp_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentStageView {
     pub revision: u64,
@@ -343,6 +365,8 @@ pub struct AgentStageView {
     pub turns: Vec<StageTurnView>,
     pub pending_permissions: Vec<TimelineItemView>,
     pub pending_questions: Vec<TimelineItemView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_plan_approval: Option<PendingPlanApprovalView>,
     pub session_turn_diffs: Vec<DiffFileView>,
     #[serde(default)]
     pub insights: SessionInsightsView,
@@ -361,6 +385,8 @@ pub struct AgentStageDeltaView {
     pub total_turn_count: u32,
     pub pending_permissions: Vec<TimelineItemView>,
     pub pending_questions: Vec<TimelineItemView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_plan_approval: Option<PendingPlanApprovalView>,
     pub session_turn_diffs: Vec<DiffFileView>,
     #[serde(default)]
     pub insights: SessionInsightsView,
@@ -925,7 +951,9 @@ pub fn describe_tool_detail(
             let parsed = parse_generic_tool_name(tool_name);
             let raw_title = summary_title.trim();
             let is_plan = PlanTool::named(tool_name).is_some();
+            let is_plan_approval = orbit_protocol::is_plan_approval_tool_name(tool_name);
             let target = if !is_plan
+                && !is_plan_approval
                 && !raw_title.is_empty()
                 && !raw_title.eq_ignore_ascii_case(tool_name.trim())
                 && !raw_title.eq_ignore_ascii_case(&parsed.display_label)
@@ -936,6 +964,13 @@ pub fn describe_tool_detail(
             };
             let verb = if is_plan {
                 plan_action_label(status).to_owned()
+            } else if is_plan_approval {
+                match status {
+                    ToolCallStatus::Running => "Requested plan approval".to_string(),
+                    ToolCallStatus::Completed => "Approved plan".to_string(),
+                    ToolCallStatus::Denied => "Plan changes requested".to_string(),
+                    ToolCallStatus::Failed => "Plan approval failed".to_string(),
+                }
             } else if is_denied {
                 format!("Declined {}", parsed.display_label)
             } else if is_failed {
@@ -1584,7 +1619,8 @@ pub fn process_timeline_turns_slice(
     }
 }
 
-/// Collects unresolved HITL gates, deduplicated session-wide tool diffs, and derived session insights in a single pass.
+/// Collects unresolved HITL gates, structured pending plan approval, deduplicated session-wide
+/// tool diffs, and derived session insights in a single pass.
 pub fn collect_stage_auxiliary_state(
     items: &[TimelineItemView],
     cwd: Option<&str>,
@@ -1594,6 +1630,7 @@ pub fn collect_stage_auxiliary_state(
 ) -> (
     Vec<TimelineItemView>,
     Vec<TimelineItemView>,
+    Option<PendingPlanApprovalView>,
     Vec<DiffFileView>,
     SessionInsightsView,
 ) {
@@ -1601,6 +1638,7 @@ pub fn collect_stage_auxiliary_state(
 
     let mut pending_permissions: Vec<TimelineItemView> = Vec::new();
     let mut pending_questions: Vec<TimelineItemView> = Vec::new();
+    let mut pending_plan_approval: Option<PendingPlanApprovalView> = None;
     let mut diff_index_by_path: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     let mut session_turn_diffs: Vec<DiffFileView> = Vec::new();
@@ -1618,8 +1656,30 @@ pub fn collect_stage_auxiliary_state(
                 }
             }
             TimelineItemView::PermissionRequest {
-                resolved_decision, ..
+                seq,
+                request_id,
+                title,
+                resolved_decision,
+                plan_approval,
+                timestamp_ms,
+                ..
             } if resolved_decision.is_none() => {
+                if let Some(plan) = plan_approval {
+                    let blocks = parse_markdown_blocks(&plan.plan_markdown, false);
+                    pending_plan_approval = Some(PendingPlanApprovalView {
+                        seq: *seq,
+                        request_id: request_id.clone(),
+                        title: title.clone(),
+                        plan_markdown: plan.plan_markdown.clone(),
+                        plan_title: plan.plan_title.clone(),
+                        plan_file_path: plan.plan_file_path.clone(),
+                        summary: plan.summary.clone(),
+                        allowed_prompts: plan.allowed_prompts.clone(),
+                        source: plan.source.clone(),
+                        blocks,
+                        timestamp_ms: *timestamp_ms,
+                    });
+                }
                 pending_permissions.push(raw_item.clone());
             }
             TimelineItemView::QuestionRequest {
@@ -1636,6 +1696,7 @@ pub fn collect_stage_auxiliary_state(
     (
         pending_permissions,
         pending_questions,
+        pending_plan_approval,
         session_turn_diffs,
         insights,
     )
@@ -1676,7 +1737,7 @@ pub fn process_timeline_for_stage(
     Vec<DiffFileView>,
 ) {
     let sliced = process_timeline_turns_slice(items, 0, 0, cwd);
-    let (pending_permissions, pending_questions, session_turn_diffs, _) =
+    let (pending_permissions, pending_questions, _, session_turn_diffs, _) =
         collect_stage_auxiliary_state(items, cwd, None, &[], &[]);
     (
         sliced.turns,
@@ -5182,6 +5243,7 @@ mod tests {
                 allowed_decisions: vec!["allow".into(), "deny".into()],
                 resolved_decision: None,
                 guardian_assessment: None,
+                plan_approval: None,
                 timestamp_ms: Some(23_000),
             },
             TimelineItemView::QuestionRequest {
@@ -6582,5 +6644,83 @@ Log: file:///tmp/spoofed.log\n";
             process_timeline_for_stage(&[opener, thinking, tool], Some("/repo"));
         assert_eq!(progressed_turns[0].latest_activity_ms, Some(70_000));
         assert_eq!(progressed_turns[0].latest_visible_progress_ms, Some(70_000));
+    }
+
+    #[test]
+    fn collects_pending_plan_approval_strictly_from_typed_payload() {
+        let typed_exit = TimelineItemView::PermissionRequest {
+            seq: 10,
+            request_id: "clp_plan_typed".into(),
+            title: "Migration Plan".into(),
+            detail: ToolCallDetail::Generic {
+                tool_name: "ExitPlanMode".into(),
+                arguments_json: r##"{"plan":"# Migration Plan\n\n1. Schema\n2. Rollout"}"##.into(),
+            },
+            allowed_decisions: vec!["allow".into(), "deny".into()],
+            resolved_decision: None,
+            guardian_assessment: None,
+            plan_approval: Some(orbit_protocol::PlanApprovalPayload {
+                plan_markdown: "# Migration Plan\n\n1. Schema\n2. Rollout".into(),
+                plan_title: Some("Migration Plan".into()),
+                plan_file_path: Some("/repo/implementation_plan.md".into()),
+                summary: Some("Review schema changes".into()),
+                plan_file_backed: true,
+                allowed_prompts: vec!["Bash: cargo test".into()],
+                source: Some("exit_plan_mode".into()),
+            }),
+            timestamp_ms: Some(12_000),
+        };
+        let (perms, _, pending_plan, _, _) = collect_stage_auxiliary_state(
+            std::slice::from_ref(&typed_exit),
+            Some("/repo"),
+            None,
+            &[],
+            &[],
+        );
+        assert_eq!(perms.len(), 1);
+        let plan = pending_plan.expect("expected pending plan approval from typed payload");
+        assert_eq!(plan.request_id, "clp_plan_typed");
+        assert_eq!(plan.plan_title.as_deref(), Some("Migration Plan"));
+        assert_eq!(plan.summary.as_deref(), Some("Review schema changes"));
+        assert!(!plan.blocks.is_empty());
+
+        // Untyped raw permission without `plan_approval` must NOT be synthesized heuristically
+        let untyped = TimelineItemView::PermissionRequest {
+            seq: 11,
+            request_id: "clp_untyped".into(),
+            title: "Claude wants to use ExitPlanMode".into(),
+            detail: ToolCallDetail::Generic {
+                tool_name: "ExitPlanMode".into(),
+                arguments_json: r##"{"plan":"# Raw"}"##.into(),
+            },
+            allowed_decisions: vec!["allow".into(), "deny".into()],
+            resolved_decision: None,
+            guardian_assessment: None,
+            plan_approval: None,
+            timestamp_ms: Some(12_500),
+        };
+        let (_, _, untyped_plan, _, _) =
+            collect_stage_auxiliary_state(&[untyped], Some("/repo"), None, &[], &[]);
+        assert!(untyped_plan.is_none());
+
+        // Once resolved, pending_plan_approval clears cleanly
+        let resolved_exit = TimelineItemView::PermissionRequest {
+            seq: 10,
+            request_id: "clp_plan_typed".into(),
+            title: "Migration Plan".into(),
+            detail: ToolCallDetail::Generic {
+                tool_name: "ExitPlanMode".into(),
+                arguments_json: "{}".into(),
+            },
+            allowed_decisions: vec!["allow".into(), "deny".into()],
+            resolved_decision: Some("approve_and_build".into()),
+            guardian_assessment: None,
+            plan_approval: None,
+            timestamp_ms: Some(12_000),
+        };
+        let (perms_after, _, pending_plan_after, _, _) =
+            collect_stage_auxiliary_state(&[resolved_exit], Some("/repo"), None, &[], &[]);
+        assert!(perms_after.is_empty());
+        assert!(pending_plan_after.is_none());
     }
 }

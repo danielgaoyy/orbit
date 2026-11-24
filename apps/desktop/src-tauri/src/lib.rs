@@ -1903,6 +1903,32 @@ fn resolve_permission(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn resolve_plan_approval(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    permission_request_id: String,
+    action: orbit_protocol::PlanApprovalAction,
+    edited_plan_markdown: Option<String>,
+    feedback: Option<String>,
+    target_mode: Option<SessionMode>,
+) -> Result<(), String> {
+    state
+        .core
+        .resolve_plan_approval_on_host(
+            &host_id,
+            &agent_id,
+            &permission_request_id,
+            action,
+            edited_plan_markdown,
+            feedback,
+            target_mode,
+        )
+        .await
+}
+
+#[tauri::command]
 fn answer_question(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -4550,6 +4576,7 @@ pub fn run() {
             preview_worktree_handoff,
             execute_worktree_handoff,
             resolve_permission,
+            resolve_plan_approval,
             answer_question,
             fetch_git_status,
             fetch_git_diff,

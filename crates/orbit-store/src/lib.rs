@@ -5437,6 +5437,7 @@ mod tests {
                     },
                     allowed_decisions: vec!["allow".into(), "deny".into()],
                     guardian_assessment: None,
+                    plan_approval: None,
                 },
             )
             .expect("perm req");

@@ -4800,6 +4800,7 @@ mod tests {
                 },
                 allowed_decisions: vec!["allow".into(), "deny".into()],
                 guardian_assessment: None,
+                plan_approval: None,
                 created_at: Utc::now(),
             })
             .await;
@@ -4859,6 +4860,7 @@ mod tests {
                     },
                     allowed_decisions: vec!["allow".into(), "deny".into()],
                     guardian_assessment: None,
+                    plan_approval: None,
                     created_at: Utc::now(),
                 })
                 .await;
@@ -5071,6 +5073,7 @@ mod tests {
                 },
                 allowed_decisions: vec!["allow".into(), "deny".into()],
                 guardian_assessment: None,
+                plan_approval: None,
                 created_at: Utc::now(),
             })
             .await;
@@ -5125,6 +5128,7 @@ mod tests {
                 },
                 allowed_decisions: vec!["allow".into(), "deny".into()],
                 guardian_assessment: None,
+                plan_approval: None,
                 created_at: Utc::now(),
             })
             .await;
@@ -5281,6 +5285,7 @@ mod tests {
                 },
                 allowed_decisions: vec!["allow".into(), "deny".into()],
                 guardian_assessment: None,
+                plan_approval: None,
                 created_at: Utc::now(),
             })
             .await;
@@ -5560,6 +5565,7 @@ mod tests {
                 },
                 allowed_decisions: vec!["allow".into(), "deny".into()],
                 guardian_assessment: None,
+                plan_approval: None,
                 created_at: Utc::now(),
             })
             .await;

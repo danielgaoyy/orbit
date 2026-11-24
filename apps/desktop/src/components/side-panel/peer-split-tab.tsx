@@ -12,6 +12,7 @@ import {
 } from "@/components/conversation/conversation-viewport";
 import { mergeAgentPendingPermissions } from "@/components/side-panel/subagent-tab";
 import { DecisionDock } from "@/components/stage/stage-approval-dock";
+import { PlanReviewCard } from "@/components/stage/plan-review-card";
 import {
   PromptImageLightbox,
   type PromptImagePreviewTarget,
@@ -86,6 +87,7 @@ export const PeerSplitTab = memo(function PeerSplitTab({ tab }: { tab: SidePanel
   );
   const { subagents: peerSessionSubagents, decisions: peerDecisions } =
     useOrbitSelector(selectPeerSession);
+  const pendingPlanApproval = peerDecisions.pendingPlanApproval;
   const pendingPermissions = useMemo(
     () =>
       mergeAgentPendingPermissions(
@@ -93,17 +95,20 @@ export const PeerSplitTab = memo(function PeerSplitTab({ tab }: { tab: SidePanel
         peerDecisions.parentPermissions,
         stage?.pending_permissions,
         hostDetail?.pending_permissions,
+        pendingPlanApproval?.request_id ?? null,
       ),
     [
       peerAgentId,
       peerDecisions.parentPermissions,
       stage?.pending_permissions,
       hostDetail?.pending_permissions,
+      pendingPlanApproval?.request_id,
     ],
   );
   const pendingQuestions = peerDecisions.parentQuestions;
   const subagentPermissions = peerDecisions.subagentPermissions;
   const hasPendingDecisions =
+    pendingPlanApproval !== null ||
     pendingPermissions.length > 0 ||
     pendingQuestions.length > 0 ||
     subagentPermissions.length > 0;
@@ -310,6 +315,15 @@ export const PeerSplitTab = memo(function PeerSplitTab({ tab }: { tab: SidePanel
       {/* Actionable Pending Approval / Clarification Dock */}
       {hasPendingDecisions && hostId && peerAgentId && (
         <div className="bg-surface-base relative z-20 shrink-0 pt-2">
+          {pendingPlanApproval && (
+            <PlanReviewCard
+              hostId={hostId}
+              agentId={peerAgentId}
+              cwd={cwd}
+              plan={pendingPlanApproval}
+              compact
+            />
+          )}
           <DecisionDock
             hostId={hostId}
             agentId={peerAgentId}

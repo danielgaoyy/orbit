@@ -14,6 +14,7 @@ pub mod lsp;
 pub mod mcp_servers;
 pub mod media;
 pub mod orchestration;
+pub mod plan_approval;
 pub mod push;
 pub mod router;
 pub mod rules;
@@ -36,6 +37,7 @@ pub use lsp::*;
 pub use mcp_servers::*;
 pub use media::*;
 pub use orchestration::*;
+pub use plan_approval::*;
 pub use push::*;
 pub use router::*;
 pub use rules::*;
@@ -1025,6 +1027,8 @@ pub enum TimelinePayload {
         allowed_decisions: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         guardian_assessment: Option<GuardianAssessment>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_approval: Option<PlanApprovalPayload>,
     },
     PermissionResolved {
         request_id: String,
@@ -1843,6 +1847,20 @@ pub enum WireMessage {
         agent_id: String,
         permission_request_id: String,
         decision: String,
+    },
+    /// Resolve a pending structured plan approval gate (`ExitPlanMode`, Codex Plan Mode,
+    /// Antigravity plan review, or ACP plan approval).
+    ResolvePlanApproval {
+        request_id: Uuid,
+        agent_id: String,
+        permission_request_id: String,
+        action: PlanApprovalAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edited_plan_markdown: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feedback: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_mode: Option<SessionMode>,
     },
     AnswerQuestion {
         request_id: Uuid,

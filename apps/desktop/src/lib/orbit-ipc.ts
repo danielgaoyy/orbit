@@ -915,6 +915,32 @@ export interface PermissionCheckpointRef {
   allowed_decisions: string[];
 }
 
+export interface PlanApprovalPayload {
+  plan_markdown: string;
+  plan_title?: string | null;
+  plan_file_path?: string | null;
+  summary?: string | null;
+  plan_file_backed?: boolean;
+  allowed_prompts?: string[];
+  source?: string | null;
+}
+
+export type PlanApprovalAction = "approve_and_build" | "request_changes" | "dismiss";
+
+export interface PendingPlanApprovalView {
+  seq: number;
+  request_id: string;
+  title: string;
+  plan_markdown: string;
+  plan_title?: string | null;
+  plan_file_path?: string | null;
+  summary?: string | null;
+  allowed_prompts?: string[];
+  source?: string | null;
+  blocks: RichBlockView[];
+  timestamp_ms?: number | null;
+}
+
 export interface PendingPermissionSummary {
   agent_id: string;
   agent_title: string;
@@ -923,6 +949,7 @@ export interface PendingPermissionSummary {
   detail: ToolCallDetail;
   allowed_decisions: string[];
   guardian_assessment?: GuardianAssessment | null;
+  plan_approval?: PlanApprovalPayload | null;
   created_at: string;
 }
 
@@ -1893,6 +1920,7 @@ export type TimelineItemView =
       allowed_decisions: string[];
       resolved_decision: string | null;
       guardian_assessment?: GuardianAssessment | null;
+      plan_approval?: PlanApprovalPayload | null;
       timestamp_ms?: number | null;
     }
   | {
@@ -2621,6 +2649,7 @@ export interface AgentStageView {
   oldest_loaded_seq?: number;
   pending_permissions: TimelineItemView[];
   pending_questions: TimelineItemView[];
+  pending_plan_approval?: PendingPlanApprovalView | null;
   session_turn_diffs: DiffFileView[];
   insights: SessionInsightsView;
   latest_seq: number;
@@ -2640,6 +2669,7 @@ export interface AgentStageDeltaView {
   oldest_loaded_seq?: number;
   pending_permissions: TimelineItemView[];
   pending_questions: TimelineItemView[];
+  pending_plan_approval?: PendingPlanApprovalView | null;
   session_turn_diffs: DiffFileView[];
   insights: SessionInsightsView;
   latest_seq: number;
@@ -4721,6 +4751,29 @@ export const orbitIpc = {
       agentId,
       permissionRequestId,
       decision,
+    });
+  },
+
+  resolvePlanApproval: async (
+    hostId: string,
+    agentId: string,
+    permissionRequestId: string,
+    action: PlanApprovalAction,
+    options?: {
+      editedPlanMarkdown?: string | null;
+      feedback?: string | null;
+      targetMode?: SessionMode | null;
+    },
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("resolve_plan_approval", {
+      hostId,
+      agentId,
+      permissionRequestId,
+      action,
+      editedPlanMarkdown: options?.editedPlanMarkdown ?? null,
+      feedback: options?.feedback ?? null,
+      targetMode: options?.targetMode ?? null,
     });
   },
 

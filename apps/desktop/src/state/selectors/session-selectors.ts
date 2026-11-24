@@ -7,6 +7,7 @@ import type {
   GoalRunRecord,
   HostDetailView,
   PendingPermissionSummary,
+  PendingPlanApprovalView,
   SessionBackgroundTaskView,
   SessionLinkView,
   SessionPullRequestView,
@@ -147,6 +148,7 @@ export interface UnifiedPendingSubagentPermission {
 }
 
 export interface UnifiedPendingDecisions {
+  readonly pendingPlanApproval: PendingPlanApprovalView | null;
   readonly parentPermissions: readonly PendingPermissionTimelineItem[];
   readonly parentQuestions: readonly PendingQuestionTimelineItem[];
   readonly subagentPermissions: readonly UnifiedPendingSubagentPermission[];
@@ -154,6 +156,7 @@ export interface UnifiedPendingDecisions {
 }
 
 const EMPTY_DECISIONS: UnifiedPendingDecisions = Object.freeze({
+  pendingPlanApproval: null,
   parentPermissions: Object.freeze([]),
   parentQuestions: Object.freeze([]),
   subagentPermissions: Object.freeze([]),
@@ -172,9 +175,17 @@ export function selectPendingDecisions(
   if (!hostId || !agentId) return EMPTY_DECISIONS;
 
   const stage = state.stages[`${hostId}::${agentId}`];
+  const pendingPlanApproval = stage?.pending_plan_approval ?? null;
+  const planApprovalRequestId = pendingPlanApproval?.request_id ?? null;
+
+  // Deduplicate: when a dedicated PlanReviewCard gate is active, DecisionDock must NOT
+  // show a duplicate generic permission row for the same ExitPlanMode / plan approval request.
   const parentPermissions = (stage?.pending_permissions ?? []).filter(
     (item): item is PendingPermissionTimelineItem =>
-      item.item_type === "permission_request" && item.resolved_decision === null,
+      item.item_type === "permission_request" &&
+      item.resolved_decision === null &&
+      item.plan_approval == null &&
+      (planApprovalRequestId === null || item.request_id !== planApprovalRequestId),
   );
   const parentQuestions = (stage?.pending_questions ?? []).filter(
     (item): item is PendingQuestionTimelineItem =>
@@ -206,11 +217,15 @@ export function selectPendingDecisions(
   }
 
   const totalCount =
-    parentPermissions.length + parentQuestions.length + subagentPermissions.length;
+    (pendingPlanApproval ? 1 : 0) +
+    parentPermissions.length +
+    parentQuestions.length +
+    subagentPermissions.length;
 
   if (totalCount === 0) return EMPTY_DECISIONS;
 
   return {
+    pendingPlanApproval,
     parentPermissions,
     parentQuestions,
     subagentPermissions,

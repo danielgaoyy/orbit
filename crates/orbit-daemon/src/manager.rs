@@ -3737,22 +3737,74 @@ impl AgentOrchestrator {
     }
 
     pub async fn resolve_permission(
-        &self,
+        self: &Arc<Self>,
         agent_id: &str,
         request_id: String,
         decision: String,
     ) -> anyhow::Result<()> {
-        self.pending_permissions
-            .write()
+        self.resolve_permission_inner(agent_id, request_id, decision, true)
             .await
-            .remove(&(agent_id.to_string(), request_id.clone()));
+    }
+
+    /// Agent/Router-originated permission resolution path: strictly rejects human-only
+    /// plan approval gates (`plan_approval.is_some()`).
+    pub async fn resolve_permission_by_agent(
+        self: &Arc<Self>,
+        agent_id: &str,
+        request_id: String,
+        decision: String,
+    ) -> anyhow::Result<()> {
+        self.resolve_permission_inner(agent_id, request_id, decision, false)
+            .await
+    }
+
+    async fn resolve_permission_inner(
+        self: &Arc<Self>,
+        agent_id: &str,
+        request_id: String,
+        decision: String,
+        allow_plan_approval_delegation: bool,
+    ) -> anyhow::Result<()> {
+        let key = (agent_id.to_string(), request_id.clone());
+        let pending_entry = {
+            let mut guard = self.pending_permissions.write().await;
+            if let Some(existing) = guard.get(&key)
+                && existing.plan_approval.is_some()
+            {
+                if !allow_plan_approval_delegation {
+                    anyhow::bail!(
+                        "plan approval gate `{request_id}` requires explicit human review and cannot be resolved by an agent"
+                    );
+                }
+                drop(guard);
+                let (action, target_mode) = match decision.as_str() {
+                    "allow" | "allow_always" => (
+                        orbit_protocol::PlanApprovalAction::ApproveAndBuild,
+                        Some(SessionMode::Default),
+                    ),
+                    _ => (orbit_protocol::PlanApprovalAction::Dismiss, None),
+                };
+                return self
+                    .resolve_plan_approval(agent_id, request_id, action, None, None, target_mode)
+                    .await;
+            }
+            guard.remove(&key)
+        };
+
         if let Some(tx) = self.live_agent_tx(agent_id).await {
-            tx.send(DriverCommand::ResolvePermission {
-                request_id: request_id.clone(),
-                decision: decision.clone(),
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("agent session not active"))?;
+            if tx
+                .send(DriverCommand::ResolvePermission {
+                    request_id: request_id.clone(),
+                    decision: decision.clone(),
+                })
+                .await
+                .is_err()
+            {
+                if let Some(p) = pending_entry {
+                    self.pending_permissions.write().await.insert(key, p);
+                }
+                anyhow::bail!("agent session not active");
+            }
 
             if let Ok(ev) = self.store.append_timeline_event(
                 agent_id,
@@ -3771,6 +3823,186 @@ impl AgentOrchestrator {
                     .set_agent_attention(agent_id, AttentionState::None);
             }
         }
+        Ok(())
+    }
+
+    pub async fn resolve_plan_approval(
+        self: &Arc<Self>,
+        agent_id: &str,
+        request_id: String,
+        action: orbit_protocol::PlanApprovalAction,
+        edited_plan_markdown: Option<String>,
+        feedback: Option<String>,
+        target_mode: Option<SessionMode>,
+    ) -> anyhow::Result<()> {
+        let key = (agent_id.to_string(), request_id.clone());
+        // Atomically verify & single-claim the pending plan approval gate so concurrent or stale
+        // calls cannot execute a build/mode transition twice and non-plan permissions are untouched.
+        let pending = {
+            let mut guard = self.pending_permissions.write().await;
+            match guard.get(&key) {
+                None => {
+                    anyhow::bail!("no pending plan approval `{request_id}` for agent `{agent_id}`");
+                }
+                Some(p) if p.plan_approval.is_none() => {
+                    anyhow::bail!(
+                        "pending permission `{request_id}` for agent `{agent_id}` is not a plan approval gate"
+                    );
+                }
+                Some(_) => match guard.remove(&key) {
+                    Some(claimed) => claimed,
+                    None => {
+                        anyhow::bail!(
+                            "no pending plan approval `{request_id}` for agent `{agent_id}`"
+                        );
+                    }
+                },
+            }
+        };
+
+        let Some(plan) = pending.plan_approval.clone() else {
+            self.pending_permissions.write().await.insert(key, pending);
+            anyhow::bail!(
+                "pending permission `{request_id}` for agent `{agent_id}` is not a plan approval gate"
+            );
+        };
+
+        let agent = match self.store.get_agent(agent_id) {
+            Ok(Some(ag)) => ag,
+            Ok(None) => {
+                self.pending_permissions.write().await.insert(key, pending);
+                anyhow::bail!("agent `{agent_id}` not found");
+            }
+            Err(e) => {
+                self.pending_permissions.write().await.insert(key, pending);
+                return Err(e.into());
+            }
+        };
+
+        let effective_target_mode = target_mode.unwrap_or(SessionMode::Default);
+        let effective_edited = edited_plan_markdown
+            .filter(|edited| orbit_protocol::is_plan_edited(&plan.plan_markdown, Some(edited)));
+
+        // Reserve a delivery permit on the live driver channel BEFORE mutating disk or mode so
+        // driver send failure never leaves mode mutated or silently consumes the pending gate.
+        let live_tx = self.live_agent_tx(agent_id).await;
+        let driver_is_live = live_tx.is_some();
+        let driver_permit = if let Some(ref tx) = live_tx {
+            match tx.reserve().await {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    self.pending_permissions.write().await.insert(key, pending);
+                    anyhow::bail!("agent session not active");
+                }
+            }
+        } else {
+            None
+        };
+
+        if matches!(action, orbit_protocol::PlanApprovalAction::ApproveAndBuild) {
+            // Sole plan-file write owner: ONLY persist back to disk when `plan_file_backed`
+            // verified that `plan_file_path` is the exact file loaded into the card, and surface
+            // any persistence failure cleanly before mutating mode or releasing the gate.
+            if let Some(ref edited) = effective_edited
+                && plan.plan_file_backed
+                && let Some(ref fp) = plan.plan_file_path
+            {
+                match orbit_providers::plan_approval::write_edited_plan_file_safe(
+                    fp,
+                    Path::new(&agent.cwd),
+                    edited,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        drop(driver_permit);
+                        self.pending_permissions.write().await.insert(key, pending);
+                        anyhow::bail!(
+                            "cannot save edited plan: `{fp}` is outside verified plan roots"
+                        );
+                    }
+                    Err(err_msg) => {
+                        drop(driver_permit);
+                        self.pending_permissions.write().await.insert(key, pending);
+                        anyhow::bail!("{err_msg}");
+                    }
+                }
+            }
+
+            if let Err(e) = self
+                .store
+                .update_agent_mode(agent_id, &effective_target_mode)
+            {
+                drop(driver_permit);
+                self.pending_permissions.write().await.insert(key, pending);
+                return Err(e.into());
+            }
+        }
+
+        // Infallible commit to live driver (permit already reserved).
+        if let Some(permit) = driver_permit {
+            permit.send(DriverCommand::ResolvePlanApproval {
+                request_id: request_id.clone(),
+                action,
+                edited_plan_markdown: effective_edited.clone(),
+                feedback: feedback.clone(),
+                target_mode: effective_target_mode.clone(),
+            });
+        }
+
+        if matches!(action, orbit_protocol::PlanApprovalAction::ApproveAndBuild)
+            && let Ok(Some(updated)) = self.store.get_agent(agent_id)
+        {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::AgentUpdated(updated));
+        }
+
+        if let Ok(ev) = self.store.append_timeline_event(
+            agent_id,
+            1,
+            None,
+            TimelinePayload::PermissionResolved {
+                request_id: request_id.clone(),
+                decision: action.as_decision_str().to_string(),
+            },
+        ) {
+            let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+        }
+
+        if !self.has_pending_permissions(agent_id).await {
+            let _ = self
+                .store
+                .set_agent_attention(agent_id, AttentionState::None);
+            if !driver_is_live {
+                let _ = self.store.update_agent_status(agent_id, &AgentStatus::Idle);
+            }
+            if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::AgentUpdated(updated));
+            }
+        }
+
+        if let Some(followup) = crate::plan_approval::decide_plan_followup(
+            agent.provider,
+            Some(&pending),
+            &request_id,
+            action,
+            effective_edited.as_deref(),
+            feedback.as_deref(),
+            driver_is_live,
+        ) {
+            self.send_prompt_with_options(
+                agent_id,
+                followup.wire_prompt,
+                Some(followup.display_prompt),
+                Vec::new(),
+                followup.behavior,
+                None,
+            )
+            .await?;
+        }
+
         Ok(())
     }
 
@@ -5855,11 +6087,33 @@ impl AgentOrchestrator {
                 title,
                 detail,
                 allowed_decisions,
+                mut plan_approval,
             } => {
                 let agent_opt = self.store.get_agent(agent_id).ok().flatten();
                 let mut guardian_assessment = None;
 
-                if let Some(ref ag) = agent_opt
+                if plan_approval.is_none() {
+                    let in_plan_mode = agent_opt
+                        .as_ref()
+                        .is_some_and(|ag| matches!(ag.mode, SessionMode::Plan));
+                    plan_approval = orbit_protocol::extract_plan_approval_from_detail(
+                        &detail,
+                        Some(&title),
+                        in_plan_mode,
+                    );
+                }
+                if let (Some(plan), Some(ag)) = (plan_approval.as_mut(), agent_opt.as_ref()) {
+                    crate::plan_approval::enrich_plan_approval_from_store(
+                        &self.store,
+                        agent_id,
+                        Path::new(&ag.cwd),
+                        plan,
+                    );
+                }
+
+                // Plan approval gates always require explicit human review and never auto-resolve via Guardian.
+                if plan_approval.is_none()
+                    && let Some(ref ag) = agent_opt
                     && matches!(ag.mode, SessionMode::Auto)
                 {
                     let eval_req = crate::guardian::GuardianEvalRequest {
@@ -6027,6 +6281,7 @@ impl AgentOrchestrator {
                             detail: detail.clone(),
                             allowed_decisions: allowed_decisions.clone(),
                             guardian_assessment: guardian_assessment.clone(),
+                            plan_approval: plan_approval.clone(),
                             created_at: Utc::now(),
                         },
                     );
@@ -6113,6 +6368,7 @@ impl AgentOrchestrator {
                     detail,
                     allowed_decisions,
                     guardian_assessment,
+                    plan_approval,
                 }
             }
             DriverEvent::QuestionRequest {
@@ -8481,6 +8737,7 @@ mod fast_mode_orchestrator_tests {
                     output_preview: None,
                 },
                 allowed_decisions: vec!["allow".into(), "deny".into()],
+                plan_approval: None,
             },
         )
         .await;
@@ -8530,6 +8787,7 @@ mod fast_mode_orchestrator_tests {
                     output_preview: None,
                 },
                 allowed_decisions: vec!["allow".into(), "deny".into()],
+                plan_approval: None,
             },
         )
         .await;
@@ -9171,6 +9429,7 @@ mod fast_mode_orchestrator_tests {
                     },
                     allowed_decisions: vec!["allow".into(), "deny".into()],
                     guardian_assessment: None,
+                    plan_approval: None,
                     created_at: now,
                 },
             );
@@ -9198,6 +9457,404 @@ mod fast_mode_orchestrator_tests {
                 "blocked hook must NOT dispatch any driver command"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[tokio::test]
+    async fn plan_approval_approve_switches_mode_forwards_edits_and_request_changes_stays_in_plan_mode()
+     {
+        let home_dir =
+            std::env::temp_dir().join(format!("orbit_plan_approval_test_{}", uuid::Uuid::new_v4()));
+        let ws_dir = home_dir.join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("mkdir ws");
+        let plan_file = ws_dir.join("implementation_plan.md");
+        std::fs::write(&plan_file, "# Original Plan\n\n- Step 1\n").expect("write plan");
+
+        let store = Arc::new(OrbitStore::open_in_memory().expect("open db"));
+        let orch = AgentOrchestrator::new(
+            home_dir.clone(),
+            "host_plan".into(),
+            "tok".into(),
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(OrchestrationConfig::default())),
+            Arc::clone(&store),
+            WorkspaceScriptRegistry::new(),
+            Arc::new(KeepAwakeManager::new(false)),
+            Arc::new(RwLock::new(None)),
+            crate::hooks::HooksEngine::new(home_dir.clone()),
+        )
+        .await;
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_plan".into(),
+                title: "Plan Repo".into(),
+                cwd: ws_dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_plan".into(),
+                    workspace_id: "ws_plan".into(),
+                    cwd: ws_dir.to_string_lossy().to_string(),
+                    title: "Plan Agent".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: Some("claude-sonnet-4-5".into()),
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::Plan,
+                    status: AgentStatus::Running {
+                        turn_id: "t1".into(),
+                    },
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let agent_gen = orch.bump_generation("ag_plan").await;
+        let dummy_task = tokio::spawn(async {});
+        orch.live_agents.write().await.insert(
+            "ag_plan".into(),
+            LiveAgentEntry {
+                generation: agent_gen,
+                cmd_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: dummy_task.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+
+        // 1. Ingest ExitPlanMode gate backed by plan_file_path (enriches markdown from disk)
+        orch.ingest_driver_event(
+            "ag_plan",
+            agent_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "clp_plan_1".into(),
+                title: "Review implementation plan".into(),
+                detail: ToolCallDetail::Generic {
+                    tool_name: "ExitPlanMode".into(),
+                    arguments_json: serde_json::json!({
+                        "planFilePath": plan_file.to_string_lossy().to_string()
+                    })
+                    .to_string(),
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                plan_approval: None,
+            },
+        )
+        .await;
+
+        let pending = orch.list_pending_permissions(Some("ag_plan")).await;
+        assert_eq!(pending.len(), 1);
+        let plan_payload = pending[0]
+            .plan_approval
+            .as_ref()
+            .expect("structured plan approval extracted");
+        assert_eq!(plan_payload.plan_title.as_deref(), Some("Original Plan"));
+        assert!(plan_payload.plan_markdown.contains("- Step 1"));
+
+        // 2. RequestChanges keeps SessionMode::Plan and sends feedback to driver
+        orch.resolve_plan_approval(
+            "ag_plan",
+            "clp_plan_1".into(),
+            orbit_protocol::PlanApprovalAction::RequestChanges,
+            None,
+            Some("Add unit tests step".into()),
+            None,
+        )
+        .await
+        .expect("request changes");
+        let ag_after_revise = store.get_agent("ag_plan").expect("get").expect("exists");
+        assert_eq!(ag_after_revise.mode, SessionMode::Plan);
+        match cmd_rx.try_recv().expect("driver cmd") {
+            DriverCommand::ResolvePlanApproval {
+                request_id,
+                action,
+                feedback,
+                ..
+            } => {
+                assert_eq!(request_id, "clp_plan_1");
+                assert_eq!(action, orbit_protocol::PlanApprovalAction::RequestChanges);
+                assert_eq!(feedback.as_deref(), Some("Add unit tests step"));
+            }
+            other => panic!("unexpected cmd: {other:?}"),
+        }
+
+        // 3. Second ExitPlanMode gate -> ApproveAndBuild with edited Markdown switches to Default & updates plan file
+        orch.ingest_driver_event(
+            "ag_plan",
+            agent_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "clp_plan_2".into(),
+                title: "Review implementation plan".into(),
+                detail: ToolCallDetail::Generic {
+                    tool_name: "ExitPlanMode".into(),
+                    arguments_json: serde_json::json!({
+                        "plan": "# Original Plan\n\n- Step 1",
+                        "planFilePath": plan_file.to_string_lossy().to_string()
+                    })
+                    .to_string(),
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                plan_approval: None,
+            },
+        )
+        .await;
+
+        let edited_md = "# Edited Plan\n\n- Step 1\n- Step 2 (tests)\n".to_string();
+        orch.resolve_plan_approval(
+            "ag_plan",
+            "clp_plan_2".into(),
+            orbit_protocol::PlanApprovalAction::ApproveAndBuild,
+            Some(edited_md.clone()),
+            None,
+            None,
+        )
+        .await
+        .expect("approve and build");
+
+        let ag_after_approve = store.get_agent("ag_plan").expect("get").expect("exists");
+        assert_eq!(ag_after_approve.mode, SessionMode::Default);
+        assert_eq!(
+            std::fs::read_to_string(&plan_file).expect("read edited plan"),
+            edited_md
+        );
+        match cmd_rx.try_recv().expect("driver approve cmd") {
+            DriverCommand::ResolvePlanApproval {
+                request_id,
+                action,
+                edited_plan_markdown,
+                target_mode,
+                ..
+            } => {
+                assert_eq!(request_id, "clp_plan_2");
+                assert_eq!(action, orbit_protocol::PlanApprovalAction::ApproveAndBuild);
+                assert_eq!(edited_plan_markdown.as_deref(), Some(edited_md.as_str()));
+                assert_eq!(target_mode, SessionMode::Default);
+            }
+            other => panic!("unexpected cmd: {other:?}"),
+        }
+
+        // 4. Stale/duplicate resolve_plan_approval MUST be rejected cleanly with zero double execution
+        assert!(
+            orch.resolve_plan_approval(
+                "ag_plan",
+                "clp_plan_2".into(),
+                orbit_protocol::PlanApprovalAction::ApproveAndBuild,
+                None,
+                None,
+                None,
+            )
+            .await
+            .is_err(),
+            "stale/duplicate plan approval must be rejected"
+        );
+        assert!(cmd_rx.try_recv().is_err());
+
+        // 5. Ordinary non-plan permission MUST NOT be accepted by resolve_plan_approval and MUST stay intact
+        orch.ingest_driver_event(
+            "ag_plan",
+            agent_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "clp_shell_1".into(),
+                title: "Run cargo test".into(),
+                detail: ToolCallDetail::Shell {
+                    command: "cargo test".into(),
+                    cwd: Some(ws_dir.to_string_lossy().to_string()),
+                    exit_code: None,
+                    output_preview: None,
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                plan_approval: None,
+            },
+        )
+        .await;
+        assert!(
+            orch.resolve_plan_approval(
+                "ag_plan",
+                "clp_shell_1".into(),
+                orbit_protocol::PlanApprovalAction::ApproveAndBuild,
+                None,
+                None,
+                None,
+            )
+            .await
+            .is_err(),
+            "ordinary non-plan permission must be rejected by resolve_plan_approval"
+        );
+        assert_eq!(
+            orch.list_pending_permissions(Some("ag_plan")).await.len(),
+            1,
+            "failed resolve_plan_approval must leave ordinary permission intact"
+        );
+        orch.resolve_permission("ag_plan", "clp_shell_1".into(), "allow".into())
+            .await
+            .expect("resolve ordinary perm");
+        let _ = cmd_rx.try_recv().expect("ordinary perm cmd");
+
+        // 6. Plan approval in SessionMode::Auto must bypass Guardian auto-approve,
+        //    reject agent-originated resolutions, and delegate human `resolve_permission("allow")`
+        //    into ApproveAndBuild + mode switch cleanly.
+        store
+            .update_agent_mode("ag_plan", &SessionMode::Auto)
+            .expect("switch to auto");
+        orch.ingest_driver_event(
+            "ag_plan",
+            agent_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "clp_plan_auto".into(),
+                title: "Review plan".into(),
+                detail: ToolCallDetail::Generic {
+                    tool_name: "ExitPlanMode".into(),
+                    arguments_json: serde_json::json!({ "plan": "# Auto Guard Plan\n- Step A" })
+                        .to_string(),
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                plan_approval: None,
+            },
+        )
+        .await;
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "Guardian must never auto-approve ExitPlanMode plan review gates"
+        );
+        let pending_auto = orch.list_pending_permissions(Some("ag_plan")).await;
+        assert_eq!(pending_auto.len(), 1);
+        assert_eq!(pending_auto[0].request_id, "clp_plan_auto");
+
+        // Agent/Router resolution on human-only plan gate MUST be rejected without consuming gate
+        assert!(
+            orch.resolve_permission_by_agent("ag_plan", "clp_plan_auto".into(), "allow".into())
+                .await
+                .is_err(),
+            "agent-originated resolution must be rejected for plan approval gates"
+        );
+        assert_eq!(
+            orch.list_pending_permissions(Some("ag_plan")).await.len(),
+            1,
+            "rejected agent resolution must leave pending plan gate intact"
+        );
+
+        // Authenticated human generic resolve_permission("allow") delegates into ApproveAndBuild
+        store
+            .update_agent_mode("ag_plan", &SessionMode::Plan)
+            .expect("switch back to plan");
+        orch.resolve_permission("ag_plan", "clp_plan_auto".into(), "allow".into())
+            .await
+            .expect("human resolve_permission delegates cleanly");
+        assert_eq!(
+            store
+                .get_agent("ag_plan")
+                .expect("get")
+                .expect("exists")
+                .mode,
+            SessionMode::Default
+        );
+        match cmd_rx.try_recv().expect("delegated plan approve cmd") {
+            DriverCommand::ResolvePlanApproval {
+                request_id,
+                action,
+                target_mode,
+                ..
+            } => {
+                assert_eq!(request_id, "clp_plan_auto");
+                assert_eq!(action, orbit_protocol::PlanApprovalAction::ApproveAndBuild);
+                assert_eq!(target_mode, SessionMode::Default);
+            }
+            other => panic!(
+                "expected ResolvePlanApproval from delegated resolve_permission, got {other:?}"
+            ),
+        }
+
+        // 7. If driver channel is closed, resolve_plan_approval MUST fail without mutating mode or consuming gate
+        store
+            .update_agent_mode("ag_plan", &SessionMode::Plan)
+            .expect("set plan mode");
+        orch.ingest_driver_event(
+            "ag_plan",
+            agent_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "clp_plan_dead".into(),
+                title: "Review plan".into(),
+                detail: ToolCallDetail::Generic {
+                    tool_name: "ExitPlanMode".into(),
+                    arguments_json: serde_json::json!({ "plan": "# Rollback Plan\n- Step 1" })
+                        .to_string(),
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                plan_approval: None,
+            },
+        )
+        .await;
+        drop(cmd_rx);
+        assert!(
+            orch.resolve_plan_approval(
+                "ag_plan",
+                "clp_plan_dead".into(),
+                orbit_protocol::PlanApprovalAction::ApproveAndBuild,
+                None,
+                None,
+                None,
+            )
+            .await
+            .is_err(),
+            "dead driver channel must fail cleanly"
+        );
+        assert_eq!(
+            store
+                .get_agent("ag_plan")
+                .expect("get")
+                .expect("exists")
+                .mode,
+            SessionMode::Plan,
+            "mode must NOT mutate when driver delivery fails"
+        );
+        assert_eq!(
+            orch.list_pending_permissions(Some("ag_plan")).await.len(),
+            1,
+            "pending plan gate must NOT be consumed when driver delivery fails"
+        );
 
         let _ = std::fs::remove_dir_all(&home_dir);
     }

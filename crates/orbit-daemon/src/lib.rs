@@ -31,6 +31,7 @@ pub mod mcp;
 pub mod mcp_servers;
 pub mod messaging;
 pub mod personal_router;
+pub mod plan_approval;
 pub mod platform;
 pub mod push;
 pub mod rules;
@@ -5375,6 +5376,29 @@ async fn handle_wire_rpc(
         {
             Ok(()) => Some(WireMessage::Ack { request_id }),
             Err(e) => Some(rpc_err(request_id, "resolve_permission_failed", e)),
+        },
+        WireMessage::ResolvePlanApproval {
+            request_id,
+            agent_id,
+            permission_request_id,
+            action,
+            edited_plan_markdown,
+            feedback,
+            target_mode,
+        } => match runtime
+            .orchestrator
+            .resolve_plan_approval(
+                &agent_id,
+                permission_request_id,
+                action,
+                edited_plan_markdown,
+                feedback,
+                target_mode,
+            )
+            .await
+        {
+            Ok(()) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "resolve_plan_approval_failed", e)),
         },
         WireMessage::AnswerQuestion {
             request_id,

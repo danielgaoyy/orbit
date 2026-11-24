@@ -408,6 +408,9 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
                 pending_questions: reusePrevAux
                   ? prev.pending_questions
                   : delta.pending_questions,
+                pending_plan_approval: reusePrevAux
+                  ? (prev.pending_plan_approval ?? null)
+                  : (delta.pending_plan_approval ?? null),
                 session_turn_diffs: reusePrevAux
                   ? prev.session_turn_diffs
                   : delta.session_turn_diffs,

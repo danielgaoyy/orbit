@@ -5459,6 +5459,46 @@ impl AgentOrchestrator {
                 }
                 return;
             }
+            DriverEvent::SessionTitleUpdated { title } => {
+                let clean_title: String = title
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(120)
+                    .collect();
+                if clean_title.is_empty() {
+                    return;
+                }
+                if let Ok(Some(ag)) = self.store.get_agent(agent_id)
+                    && ag.labels.get("orbit.title_locked").map(String::as_str) != Some("1")
+                    && ag.title != clean_title
+                {
+                    let mut labels_patch = HashMap::new();
+                    labels_patch.insert("orbit.auto_named".to_string(), "1".to_string());
+                    if self
+                        .store
+                        .update_agent_fields(
+                            agent_id,
+                            Some(&clean_title),
+                            None,
+                            None,
+                            None,
+                            Some(&labels_patch),
+                            None,
+                            None,
+                            None,
+                        )
+                        .is_ok()
+                        && let Ok(Some(updated_ag)) = self.store.get_agent(agent_id)
+                    {
+                        let _ = self
+                            .broadcast_tx
+                            .send(DaemonBroadcast::AgentUpdated(updated_ag));
+                    }
+                }
+                return;
+            }
             DriverEvent::ProviderSubagentUpsert(desc) => {
                 let parent_id = desc.parent_agent_id.clone();
                 let is_settled = desc.status != orbit_protocol::ProviderSubagentStatus::Running;
@@ -5642,6 +5682,7 @@ impl AgentOrchestrator {
         let mut should_drain_queued_prompt = false;
         let mut should_mark_finished = false;
         let mut completed_running_turn = false;
+        let mut preempted_running_turn = false;
         let payload = match evt {
             DriverEvent::StatusChanged(status) => {
                 self.keep_awake.notify_agent_status(agent_id, &status);
@@ -5682,6 +5723,9 @@ impl AgentOrchestrator {
                         let suppressed = self.suppress_auto_drain.write().await.remove(agent_id);
                         if (was_foreground_busy || was_awaiting_permission) && !suppressed {
                             should_drain_queued_prompt = true;
+                        }
+                        if was_running_turn {
+                            completed_running_turn = true;
                         }
                         if was_foreground_busy {
                             let _ = self.store.touch_agent_activity(agent_id, Utc::now());
@@ -5732,9 +5776,17 @@ impl AgentOrchestrator {
                                 .set_agent_attention(agent_id, AttentionState::Permission);
                         }
                     }
-                    AgentStatus::Running { .. } => {
+                    AgentStatus::Running { turn_id } => {
                         self.suppress_auto_drain.write().await.remove(agent_id);
-                        self.turn_usage_recorded.write().await.remove(agent_id);
+                        let was_preempted = matches!(
+                            &prev,
+                            Some(p) if matches!(&p.status, AgentStatus::Running { turn_id: old_tid } if old_tid != turn_id)
+                        );
+                        if was_preempted {
+                            preempted_running_turn = true;
+                        } else {
+                            self.turn_usage_recorded.write().await.remove(agent_id);
+                        }
                         let _ = self.store.touch_agent_activity(agent_id, Utc::now());
                     }
                     _ => {}
@@ -6132,6 +6184,12 @@ impl AgentOrchestrator {
                         exit_code = ?code,
                         "Agent driver process exited"
                     );
+                } else {
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        exit_code = ?code,
+                        "Agent driver process exited cleanly"
+                    );
                 }
                 self.clear_pending_requests(agent_id).await;
                 self.turn_usage_recorded.write().await.remove(agent_id);
@@ -6167,6 +6225,7 @@ impl AgentOrchestrator {
                 }
             }
             DriverEvent::SessionInitialized { .. }
+            | DriverEvent::SessionTitleUpdated { .. }
             | DriverEvent::ProviderSubagentUpsert(_)
             | DriverEvent::ProviderSubagentTimeline { .. }
             | DriverEvent::ReconcileBackgroundTasks(_)
@@ -6229,7 +6288,7 @@ impl AgentOrchestrator {
             let ag_needs_auto_naming = completed_running_turn
                 && !ag_is_subagent
                 && !crate::workspace_organizer::is_auto_named(&ag.labels);
-            if completed_running_turn {
+            if completed_running_turn || preempted_running_turn {
                 let already_recorded = self.turn_usage_recorded.write().await.remove(agent_id);
                 if !already_recorded {
                     let store_bg = Arc::clone(&self.store);
@@ -6244,8 +6303,32 @@ impl AgentOrchestrator {
                         .to_string();
                     tokio::task::spawn_blocking(move || {
                         if let Ok(events) = store_bg.fetch_recent_timeline(&aid_bg, 400) {
+                            let slice = if preempted_running_turn {
+                                if let Some(last_prompt_idx) = events.iter().rposition(|ev| {
+                                    matches!(ev.payload, TimelinePayload::UserPrompt { .. })
+                                }) {
+                                    let has_turn_output_after =
+                                        events[last_prompt_idx + 1..].iter().any(|ev| {
+                                            matches!(
+                                                ev.payload,
+                                                TimelinePayload::AssistantMessage { .. }
+                                                    | TimelinePayload::AssistantThinking { .. }
+                                                    | TimelinePayload::ToolCall { .. }
+                                            )
+                                        });
+                                    if !has_turn_output_after && last_prompt_idx > 0 {
+                                        &events[..last_prompt_idx]
+                                    } else {
+                                        &events[..]
+                                    }
+                                } else {
+                                    &events[..]
+                                }
+                            } else {
+                                &events[..]
+                            };
                             let (input_tokens, output_tokens) =
-                                crate::usage::estimate_fallback_turn_tokens(&events);
+                                crate::usage::estimate_fallback_turn_tokens(slice);
                             if input_tokens > 0 || output_tokens > 0 {
                                 let (estimated_cost_usd, cache_savings_usd) =
                                     crate::usage::estimate_turn_cost_usd(

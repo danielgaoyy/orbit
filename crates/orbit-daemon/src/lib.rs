@@ -19,6 +19,7 @@ pub mod git_collab;
 pub mod git_write;
 pub mod goals;
 pub mod guardian;
+pub mod guardian_llm;
 pub mod hooks;
 pub mod idle_cleanup;
 pub mod im_channels;
@@ -4491,16 +4492,12 @@ async fn handle_wire_rpc(
                                     "path": &hook_path,
                                     "source": "workspace_editor",
                                 });
-                                tokio::spawn(async move {
-                                    let _ = hooks
-                                        .dispatch_event(
-                                            orbit_protocol::HookEventKind::PostFileEdit,
-                                            Some(&hook_cwd),
-                                            Some(&hook_path),
-                                            hook_payload,
-                                        )
-                                        .await;
-                                });
+                                let _ = hooks.dispatch_event_async_with_targets(
+                                    orbit_protocol::HookEventKind::PostFileEdit,
+                                    Some(hook_cwd),
+                                    vec![hook_path],
+                                    hook_payload,
+                                );
                             }
                             WireMessage::WorkspaceFileWritten {
                                 request_id,

@@ -10,6 +10,40 @@ use std::path::Path;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+fn sanitize_header_value(raw: Option<String>, max_len: usize) -> Option<String> {
+    let val = raw?.trim().to_string();
+    if val.is_empty()
+        || val.len() > max_len
+        || !val.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+    {
+        return None;
+    }
+    Some(val)
+}
+
+fn build_hook_origin_headers(
+    hook_exec_env: Option<String>,
+    hook_rule_env: Option<String>,
+    hook_token_env: Option<String>,
+) -> Vec<(&'static str, String)> {
+    let mut headers = Vec::new();
+    let is_hook = sanitize_header_value(hook_exec_env, 16).is_some();
+    let token = sanitize_header_value(hook_token_env, 128);
+    if is_hook || token.is_some() {
+        headers.push((
+            orbit_daemon::hooks::HOOK_ORIGIN_HTTP_HEADER,
+            "1".to_string(),
+        ));
+        if let Some(rule_id) = sanitize_header_value(hook_rule_env, 128) {
+            headers.push((orbit_daemon::hooks::HOOK_ORIGIN_RULE_HTTP_HEADER, rule_id));
+        }
+        if let Some(tok) = token {
+            headers.push((orbit_daemon::hooks::HOOK_ORIGIN_TOKEN_HTTP_HEADER, tok));
+        }
+    }
+    headers
+}
+
 pub async fn run_mcp_stdio_bridge(
     home_dir: &Path,
     caller_agent_id: Option<String>,
@@ -54,6 +88,12 @@ pub async fn run_mcp_stdio_bridge(
                 home_dir.join("mcp-token").display()
             )
         })?;
+
+    let hook_origin_headers = build_hook_origin_headers(
+        std::env::var(orbit_daemon::hooks::HOOK_RECURSION_ENV_KEY).ok(),
+        std::env::var(orbit_daemon::hooks::HOOK_ORIGIN_RULE_ENV_KEY).ok(),
+        std::env::var(orbit_daemon::hooks::HOOK_ORIGIN_TOKEN_ENV_KEY).ok(),
+    );
 
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -115,14 +155,15 @@ pub async fn run_mcp_stdio_bridge(
         };
 
         let req_id = req_val.get("id").cloned();
-        let http_res = client
+        let mut req_builder = client
             .post(&endpoint)
             .bearer_auth(&token)
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .json(&req_val)
-            .send()
-            .await;
+            .header("Accept", "application/json");
+        for (h_name, h_val) in &hook_origin_headers {
+            req_builder = req_builder.header(*h_name, h_val.as_str());
+        }
+        let http_res = req_builder.json(&req_val).send().await;
 
         match http_res {
             Ok(resp) => {
@@ -177,4 +218,49 @@ pub async fn run_mcp_stdio_bridge(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_hook_origin_headers_propagates_provenance_only_from_hook_env() {
+        assert!(build_hook_origin_headers(None, None, None).is_empty());
+        assert!(build_hook_origin_headers(Some("  ".into()), None, None).is_empty());
+
+        let hdrs = build_hook_origin_headers(
+            Some("1".into()),
+            Some("hk_post_all".into()),
+            Some("tok_abc123456789012345678901234567890".into()),
+        );
+        assert_eq!(hdrs.len(), 3);
+        assert_eq!(
+            hdrs[0],
+            (orbit_daemon::hooks::HOOK_ORIGIN_HTTP_HEADER, "1".into())
+        );
+        assert_eq!(
+            hdrs[1],
+            (
+                orbit_daemon::hooks::HOOK_ORIGIN_RULE_HTTP_HEADER,
+                "hk_post_all".into()
+            )
+        );
+        assert_eq!(
+            hdrs[2],
+            (
+                orbit_daemon::hooks::HOOK_ORIGIN_TOKEN_HTTP_HEADER,
+                "tok_abc123456789012345678901234567890".into()
+            )
+        );
+
+        // Control characters in header values are stripped/rejected.
+        let bad = build_hook_origin_headers(
+            Some("1".into()),
+            Some("hk_bad\r\ninjected".into()),
+            Some("tok\nbad".into()),
+        );
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0].0, orbit_daemon::hooks::HOOK_ORIGIN_HTTP_HEADER);
+    }
 }

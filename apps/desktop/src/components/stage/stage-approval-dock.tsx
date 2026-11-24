@@ -693,11 +693,18 @@ function PermissionApprovalCard({
     [title, detail, target],
   );
   const guardianTierLabel =
-    guardianAssessment?.classifier_tier === "ai_rubric"
-      ? t("approval.guardianAiClassifier")
-      : guardianAssessment?.classifier_tier === "deterministic"
-        ? t("approval.guardianRulePolicy")
-        : null;
+    guardianAssessment?.classifier_tier === "llm_tier2"
+      ? t("approval.guardianLlmTier2")
+      : guardianAssessment?.classifier_tier === "heuristic_fallback" ||
+          guardianAssessment?.classifier_tier === "ai_rubric"
+        ? t("approval.guardianHeuristicFallback")
+        : guardianAssessment?.classifier_tier === "deterministic_tier1" ||
+            guardianAssessment?.classifier_tier === "deterministic" ||
+            guardianAssessment?.classifier_tier === "tier1"
+          ? t("approval.guardianRulePolicy")
+          : guardianAssessment?.classifier_tier === "fail_closed"
+            ? t("approval.guardianFailClosedTier")
+            : null;
   const guardianSignals = useMemo(
     () => (guardianAssessment?.signals ?? []).filter(Boolean).slice(0, 3),
     [guardianAssessment?.signals],

@@ -213,6 +213,30 @@ pub struct CreateAgentSpec {
     pub acp_agent_id: Option<String>,
 }
 
+/// RAII guard tracking an in-flight `DriverEvent::PermissionRequest` while `PreToolUse` hooks
+/// and/or Guardian classification are evaluating. Guarantees cleanup on every early return or drop.
+struct EvaluatingPermissionGuard {
+    set: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
+    key: Option<(String, String)>,
+}
+
+impl EvaluatingPermissionGuard {
+    fn disarm(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.set
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&key);
+        }
+    }
+}
+
+impl Drop for EvaluatingPermissionGuard {
+    fn drop(&mut self) {
+        self.disarm();
+    }
+}
+
 pub struct AgentOrchestrator {
     home_dir: PathBuf,
     orbit_exe: PathBuf,
@@ -236,9 +260,15 @@ pub struct AgentOrchestrator {
     live_terminals: RwLock<HashMap<String, Arc<LiveTerminal>>>,
     /// Pending permissions keyed by `(agent_id, request_id)`
     pending_permissions: RwLock<HashMap<(String, String), PendingPermissionSummary>>,
+    /// In-flight `(agent_id, request_id)` permissions currently evaluating `PreToolUse` hooks or
+    /// Guardian classification. Any external `resolve_permission` call is rejected until settled.
+    evaluating_permissions: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
     /// Recently Guardian-auto-resolved `(agent_id, request_id)` pairs so trailing
     /// `StatusChanged::AwaitingPermission` events do not flash stale `AttentionState::Permission`.
     guardian_auto_resolved_requests: RwLock<std::collections::HashSet<(String, String)>>,
+    /// Recently dispatched `PostToolUse` `(agent_id, call_id)` pairs so repeated terminal
+    /// tool-call snapshots do not double-fire hooks.
+    post_tool_hook_dispatched: RwLock<std::collections::HashSet<(String, String)>>,
     /// Incremental `<orbit-workspace>` roster tracking state per `agent_id`.
     roster_states: RwLock<HashMap<String, WorkspaceRosterState>>,
     /// Per-agent injected `<WORKSPACE_RULES>` hashes `(agent_id -> (rule_id -> content_hash))`.
@@ -309,8 +339,13 @@ impl AgentOrchestrator {
         let orbit_exe = resolve_orbit_exe();
         let (broadcast_tx, _) = broadcast::channel(2048);
         let worktree_pool = WorktreePool::with_default_config(home_dir.clone());
-        let guardian =
-            crate::guardian::GuardianManager::new(home_dir.clone(), Some(Arc::clone(&store)));
+        let guardian = crate::guardian::GuardianManager::with_tier2(
+            home_dir.clone(),
+            Some(Arc::clone(&store)),
+            Arc::new(crate::guardian_llm::LlmGuardianClassifier::new(Some(
+                Arc::clone(&provider_catalogs),
+            ))),
+        );
         Arc::new(Self {
             home_dir,
             orbit_exe,
@@ -331,7 +366,11 @@ impl AgentOrchestrator {
             pending_questions: RwLock::new(HashMap::new()),
             live_terminals: RwLock::new(HashMap::new()),
             pending_permissions: RwLock::new(HashMap::new()),
+            evaluating_permissions: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             guardian_auto_resolved_requests: RwLock::new(std::collections::HashSet::new()),
+            post_tool_hook_dispatched: RwLock::new(std::collections::HashSet::new()),
             roster_states: RwLock::new(HashMap::new()),
             injected_rule_hashes: RwLock::new(HashMap::new()),
             repo_handoff_locks: RwLock::new(HashMap::new()),
@@ -3747,7 +3786,8 @@ impl AgentOrchestrator {
     }
 
     /// Agent/Router-originated permission resolution path: strictly rejects human-only
-    /// plan approval gates (`plan_approval.is_some()`).
+    /// plan approval gates (`plan_approval.is_some()`) and fail-closed/human-only permissions
+    /// (`human_only == true`).
     pub async fn resolve_permission_by_agent(
         self: &Arc<Self>,
         agent_id: &str,
@@ -3763,30 +3803,65 @@ impl AgentOrchestrator {
         agent_id: &str,
         request_id: String,
         decision: String,
-        allow_plan_approval_delegation: bool,
+        allow_human_only_resolution: bool,
     ) -> anyhow::Result<()> {
         let key = (agent_id.to_string(), request_id.clone());
         let pending_entry = {
             let mut guard = self.pending_permissions.write().await;
-            if let Some(existing) = guard.get(&key)
-                && existing.plan_approval.is_some()
             {
-                if !allow_plan_approval_delegation {
+                let eval_guard = self
+                    .evaluating_permissions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if eval_guard.contains(&key) {
                     anyhow::bail!(
-                        "plan approval gate `{request_id}` requires explicit human review and cannot be resolved by an agent"
+                        "permission `{request_id}` is currently being evaluated by PreToolUse / Guardian and cannot be resolved yet"
                     );
                 }
-                drop(guard);
-                let (action, target_mode) = match decision.as_str() {
-                    "allow" | "allow_always" => (
-                        orbit_protocol::PlanApprovalAction::ApproveAndBuild,
-                        Some(SessionMode::Default),
-                    ),
-                    _ => (orbit_protocol::PlanApprovalAction::Dismiss, None),
-                };
-                return self
-                    .resolve_plan_approval(agent_id, request_id, action, None, None, target_mode)
-                    .await;
+                if !guard.contains_key(&key)
+                    && (!allow_human_only_resolution
+                        || eval_guard.iter().any(|(aid, _)| aid == agent_id))
+                {
+                    anyhow::bail!("no pending permission `{request_id}` for agent `{agent_id}`");
+                }
+            }
+            if let Some(existing) = guard.get(&key) {
+                if existing.plan_approval.is_some() {
+                    if !allow_human_only_resolution {
+                        anyhow::bail!(
+                            "plan approval gate `{request_id}` requires explicit human review and cannot be resolved by an agent"
+                        );
+                    }
+                    drop(guard);
+                    let (action, target_mode) = match decision.as_str() {
+                        "allow" | "allow_always" => (
+                            orbit_protocol::PlanApprovalAction::ApproveAndBuild,
+                            Some(SessionMode::Default),
+                        ),
+                        _ => (orbit_protocol::PlanApprovalAction::Dismiss, None),
+                    };
+                    return self
+                        .resolve_plan_approval(
+                            agent_id,
+                            request_id,
+                            action,
+                            None,
+                            None,
+                            target_mode,
+                        )
+                        .await;
+                }
+                if !allow_human_only_resolution
+                    && (existing.human_only
+                        || existing
+                            .guardian_assessment
+                            .as_ref()
+                            .is_some_and(crate::guardian::assessment_requires_human_only))
+                {
+                    anyhow::bail!(
+                        "permission `{request_id}` is marked human-only and cannot be resolved by an agent"
+                    );
+                }
             }
             guard.remove(&key)
         };
@@ -3840,6 +3915,16 @@ impl AgentOrchestrator {
         // calls cannot execute a build/mode transition twice and non-plan permissions are untouched.
         let pending = {
             let mut guard = self.pending_permissions.write().await;
+            if self
+                .evaluating_permissions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&key)
+            {
+                anyhow::bail!(
+                    "permission `{request_id}` is currently being evaluated by PreToolUse / Guardian and cannot be resolved yet"
+                );
+            }
             match guard.get(&key) {
                 None => {
                     anyhow::bail!("no pending plan approval `{request_id}` for agent `{agent_id}`");
@@ -5950,10 +6035,37 @@ impl AgentOrchestrator {
                             "Agent transitioned to Error state"
                         );
                         let _ = self.store.touch_agent_activity(agent_id, Utc::now());
-                        if prev.as_ref().is_some_and(|a| !a.background) {
-                            let _ = self
-                                .store
-                                .set_agent_attention(agent_id, AttentionState::Error);
+                        if let Some(ref ag) = prev {
+                            if !ag.background {
+                                let _ = self
+                                    .store
+                                    .set_agent_attention(agent_id, AttentionState::Error);
+                            }
+                            let same_error = matches!(
+                                &ag.status,
+                                AgentStatus::Error { message: prev_msg, .. } if prev_msg == message
+                            );
+                            if !same_error {
+                                let prov_slug = ag.provider.slug().to_string();
+                                let clean_msg = crate::hooks::truncate_hook_preview(message, 500);
+                                let notif_payload = serde_json::json!({
+                                    "event": "notification",
+                                    "kind": "agent_error",
+                                    "agent_id": agent_id,
+                                    "agent_title": &ag.title,
+                                    "workspace_id": &ag.workspace_id,
+                                    "cwd": &ag.cwd,
+                                    "provider": &prov_slug,
+                                    "recoverable": recoverable,
+                                    "message": clean_msg,
+                                });
+                                let _ = self.hooks.dispatch_event_async_with_targets(
+                                    orbit_protocol::HookEventKind::Notification,
+                                    Some(PathBuf::from(&ag.cwd)),
+                                    vec!["agent_error".to_string(), "error".to_string(), prov_slug],
+                                    notif_payload,
+                                );
+                            }
                         }
                         should_check_auto_archive = true;
                     }
@@ -5969,10 +6081,50 @@ impl AgentOrchestrator {
                         {
                             return;
                         }
-                        if prev.as_ref().is_some_and(|a| !a.background) {
-                            let _ = self
-                                .store
-                                .set_agent_attention(agent_id, AttentionState::Permission);
+                        if let Some(ref ag) = prev {
+                            if !ag.background {
+                                let _ = self
+                                    .store
+                                    .set_agent_attention(agent_id, AttentionState::Permission);
+                            }
+                            let same_request = matches!(
+                                &ag.status,
+                                AgentStatus::AwaitingPermission { request_id: prev_req, .. }
+                                    if prev_req == request_id
+                            );
+                            if !same_request {
+                                let perm_title = self
+                                    .pending_permissions
+                                    .read()
+                                    .await
+                                    .get(&key)
+                                    .map(|p| p.title.clone());
+                                let notif_message = match perm_title {
+                                    Some(ref t) if !t.trim().is_empty() => format!(
+                                        "Awaiting permission: {}",
+                                        crate::hooks::truncate_hook_preview(t, 300)
+                                    ),
+                                    _ => format!("Awaiting permission ({request_id})"),
+                                };
+                                let prov_slug = ag.provider.slug().to_string();
+                                let notif_payload = serde_json::json!({
+                                    "event": "notification",
+                                    "kind": "awaiting_permission",
+                                    "agent_id": agent_id,
+                                    "agent_title": &ag.title,
+                                    "workspace_id": &ag.workspace_id,
+                                    "cwd": &ag.cwd,
+                                    "provider": &prov_slug,
+                                    "request_id": request_id,
+                                    "message": notif_message,
+                                });
+                                let _ = self.hooks.dispatch_event_async_with_targets(
+                                    orbit_protocol::HookEventKind::Notification,
+                                    Some(PathBuf::from(&ag.cwd)),
+                                    vec!["awaiting_permission".to_string(), prov_slug],
+                                    notif_payload,
+                                );
+                            }
                         }
                     }
                     AgentStatus::Running { .. } => {
@@ -6012,14 +6164,94 @@ impl AgentOrchestrator {
                 detail,
                 background_task,
             } => {
+                if matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed) {
+                    let post_key = (agent_id.to_string(), call_id.clone());
+                    let already_seen = self
+                        .post_tool_hook_dispatched
+                        .read()
+                        .await
+                        .contains(&post_key);
+                    if !already_seen && let Ok(Some(ag)) = self.store.get_agent(agent_id) {
+                        let (primary_tool, hook_targets) =
+                            crate::hooks::tool_detail_hook_targets(&detail, "");
+                        let (exit_code, output_preview, modified_files) = match &detail {
+                            ToolCallDetail::Shell {
+                                exit_code,
+                                output_preview,
+                                ..
+                            } => (
+                                *exit_code,
+                                output_preview
+                                    .as_deref()
+                                    .map(|s| crate::hooks::truncate_hook_preview(s, 2048)),
+                                Vec::new(),
+                            ),
+                            ToolCallDetail::FileEdit { path, unified_diff } => (
+                                None,
+                                unified_diff
+                                    .as_deref()
+                                    .map(|s| crate::hooks::truncate_hook_preview(s, 2048)),
+                                crate::hooks::extract_paths_from_unified_diff(
+                                    path,
+                                    unified_diff.as_deref(),
+                                ),
+                            ),
+                            ToolCallDetail::Generic { arguments_json, .. } => (
+                                None,
+                                Some(crate::hooks::truncate_hook_preview(arguments_json, 2048)),
+                                Vec::new(),
+                            ),
+                            _ => (None, None, Vec::new()),
+                        };
+                        let status_str = match status {
+                            ToolCallStatus::Completed => "completed",
+                            ToolCallStatus::Failed => "failed",
+                            ToolCallStatus::Denied => "denied",
+                            ToolCallStatus::Running => "running",
+                        };
+                        let post_payload = serde_json::json!({
+                            "event": "post_tool_use",
+                            "agent_id": agent_id,
+                            "workspace_id": &ag.workspace_id,
+                            "cwd": &ag.cwd,
+                            "provider": ag.provider.slug(),
+                            "call_id": &call_id,
+                            "tool_name": &primary_tool,
+                            "status": status_str,
+                            "exit_code": exit_code,
+                            "output_preview": output_preview,
+                            "modified_files": modified_files,
+                        });
+                        // Atomically dedup + enqueue into the bounded mpsc dispatch queue so
+                        // a call ID is never falsely marked dispatched if enqueue fails.
+                        let mut seen = self.post_tool_hook_dispatched.write().await;
+                        if seen.len() >= 2048 {
+                            seen.clear();
+                        }
+                        if !seen.contains(&post_key)
+                            && self.hooks.dispatch_event_async_with_targets(
+                                orbit_protocol::HookEventKind::PostToolUse,
+                                Some(PathBuf::from(&ag.cwd)),
+                                hook_targets,
+                                post_payload,
+                            )
+                        {
+                            seen.insert(post_key);
+                        }
+                    }
+                }
                 if status == ToolCallStatus::Completed {
                     match &detail {
-                        ToolCallDetail::FileEdit { path, .. } => {
-                            self.record_file_edit_and_check_conflict(agent_id, path)
-                                .await;
+                        ToolCallDetail::FileEdit { path, unified_diff } => {
+                            let edited_paths = crate::hooks::extract_paths_from_unified_diff(
+                                path,
+                                unified_diff.as_deref(),
+                            );
+                            for edited_path in &edited_paths {
+                                self.record_file_edit_and_check_conflict(agent_id, edited_path)
+                                    .await;
+                            }
                             if let Ok(Some(ag)) = self.store.get_agent(agent_id) {
-                                let hooks = Arc::clone(&self.hooks);
-                                let cwd_hook = PathBuf::from(&ag.cwd);
                                 let target_path = path.clone();
                                 let payload = serde_json::json!({
                                     "event": "post_file_edit",
@@ -6027,18 +6259,15 @@ impl AgentOrchestrator {
                                     "workspace_id": &ag.workspace_id,
                                     "cwd": &ag.cwd,
                                     "path": &target_path,
+                                    "paths": &edited_paths,
                                     "source": "agent_tool",
                                 });
-                                tokio::spawn(async move {
-                                    let _ = hooks
-                                        .dispatch_event(
-                                            orbit_protocol::HookEventKind::PostFileEdit,
-                                            Some(&cwd_hook),
-                                            Some(&target_path),
-                                            payload,
-                                        )
-                                        .await;
-                                });
+                                let _ = self.hooks.dispatch_event_async_with_targets(
+                                    orbit_protocol::HookEventKind::PostFileEdit,
+                                    Some(PathBuf::from(&ag.cwd)),
+                                    edited_paths,
+                                    payload,
+                                );
                             }
                         }
                         ToolCallDetail::Generic {
@@ -6089,6 +6318,21 @@ impl AgentOrchestrator {
                 allowed_decisions,
                 mut plan_approval,
             } => {
+                // Mark this `(agent_id, request_id)` as actively evaluating BEFORE dispatching
+                // PreToolUse or Guardian so no premature external `resolve_permission` call can
+                // race ahead of hook / Guardian evaluation and forward an `allow` to the driver.
+                let eval_key = (agent_id.to_string(), request_id.clone());
+                {
+                    self.evaluating_permissions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(eval_key.clone());
+                }
+                let mut eval_guard = EvaluatingPermissionGuard {
+                    set: Arc::clone(&self.evaluating_permissions),
+                    key: Some(eval_key),
+                };
+
                 let agent_opt = self.store.get_agent(agent_id).ok().flatten();
                 let mut guardian_assessment = None;
 
@@ -6111,8 +6355,144 @@ impl AgentOrchestrator {
                     );
                 }
 
+                // Synchronous PreToolUse lifecycle hook gate BEFORE Guardian auto-approval or
+                // surfacing the permission request to the operator.
+                // CRITICAL SAFETY INVARIANT: a PreToolUse hook returning `Allow` NEVER auto-approves
+                // a tool call, NEVER bypasses a human-only `plan_approval.is_some()` gate, and NEVER
+                // overrides an explicit user `Deny`. A `Block` decision or unsupported `updated_input`
+                // fails closed immediately.
+                let mut pre_hook_blocked = false;
+                {
+                    let (primary_tool, hook_targets) =
+                        crate::hooks::tool_detail_hook_targets(&detail, &title);
+                    let (_, target_summary) =
+                        crate::guardian::summarize_tool_request(&detail, &title);
+                    let hook_cwd = agent_opt.as_ref().map(|ag| PathBuf::from(&ag.cwd));
+                    let pre_payload = serde_json::json!({
+                        "event": "pre_tool_use",
+                        "agent_id": agent_id,
+                        "workspace_id": agent_opt.as_ref().map(|ag| ag.workspace_id.as_str()),
+                        "cwd": agent_opt.as_ref().map(|ag| ag.cwd.as_str()),
+                        "provider": agent_opt.as_ref().map(|ag| ag.provider.slug()),
+                        "request_id": &request_id,
+                        "title": &title,
+                        "tool_name": &primary_tool,
+                        "tool_detail": &detail,
+                        "tool_input": crate::hooks::tool_detail_input_value(&detail),
+                        "target_summary": &target_summary,
+                        "is_plan_approval": plan_approval.is_some(),
+                    });
+                    let pre_outcome = self
+                        .hooks
+                        .dispatch_event_with_targets(
+                            orbit_protocol::HookEventKind::PreToolUse,
+                            hook_cwd.as_deref(),
+                            &hook_targets,
+                            pre_payload,
+                        )
+                        .await;
+                    if self.current_generation(agent_id).await != expected_gen {
+                        return;
+                    }
+                    let unsupported_input_rewrite = pre_outcome.decision
+                        != orbit_protocol::HookDecision::Block
+                        && pre_outcome.updated_input.is_some();
+                    if pre_outcome.decision == orbit_protocol::HookDecision::Block
+                        || unsupported_input_rewrite
+                    {
+                        pre_hook_blocked = true;
+                        let hook_name = pre_outcome
+                            .blocking_hook_name
+                            .as_deref()
+                            .or_else(|| pre_outcome.records.last().map(|r| r.hook_name.as_str()))
+                            .unwrap_or("lifecycle hook");
+                        let reason = if unsupported_input_rewrite {
+                            "PreToolUse updated_input is not supported for this provider tool (fail-closed)"
+                        } else {
+                            pre_outcome
+                                .reason
+                                .as_deref()
+                                .unwrap_or("blocked by PreToolUse hook")
+                        };
+                        let deny_decision =
+                            crate::guardian::pick_auto_deny_decision(&allowed_decisions);
+                        let resolved_key = (agent_id.to_string(), request_id.clone());
+                        {
+                            let mut set = self.guardian_auto_resolved_requests.write().await;
+                            if set.len() > 512 {
+                                set.clear();
+                            }
+                            set.insert(resolved_key.clone());
+                        }
+                        if let Some(tx) = self.live_agent_tx(agent_id).await
+                            && tx
+                                .send(DriverCommand::ResolvePermission {
+                                    request_id: request_id.clone(),
+                                    decision: deny_decision,
+                                })
+                                .await
+                                .is_ok()
+                        {
+                            if !self.has_pending_permissions(agent_id).await {
+                                let _ = self
+                                    .store
+                                    .set_agent_attention(agent_id, AttentionState::None);
+                            }
+                            let notice = TimelinePayload::Notice {
+                                level: "warning".into(),
+                                message: format!(
+                                    "PreToolUse hook `{hook_name}` blocked `{primary_tool}` ({target_summary}): {reason}"
+                                ),
+                            };
+                            if let Ok((saved_ev, mutated)) = self
+                                .store
+                                .append_timeline_event_deduped(agent_id, 1, None, notice)
+                                && mutated
+                            {
+                                let _ = self
+                                    .broadcast_tx
+                                    .send(DaemonBroadcast::TimelineLive(saved_ev));
+                            }
+                            return;
+                        }
+                        self.guardian_auto_resolved_requests
+                            .write()
+                            .await
+                            .remove(&resolved_key);
+                        // Fail-closed: live driver deny dispatch unavailable -> never auto-allow;
+                        // surface warning & attach fail-closed assessment.
+                        let notice = TimelinePayload::Notice {
+                            level: "warning".into(),
+                            message: format!(
+                                "PreToolUse hook `{hook_name}` blocked `{primary_tool}` ({target_summary}): {reason} (deny dispatch unavailable)"
+                            ),
+                        };
+                        if let Ok((saved_ev, mutated)) = self
+                            .store
+                            .append_timeline_event_deduped(agent_id, 1, None, notice)
+                            && mutated
+                        {
+                            let _ = self
+                                .broadcast_tx
+                                .send(DaemonBroadcast::TimelineLive(saved_ev));
+                        }
+                        guardian_assessment = Some(orbit_protocol::GuardianAssessment {
+                            risk_level: orbit_protocol::GuardianRiskLevel::High,
+                            decision: orbit_protocol::GuardianDecision::RequireHuman,
+                            confidence: 1.0,
+                            classifier_tier: "fail_closed".into(),
+                            reason: format!(
+                                "PreToolUse hook `{hook_name}` blocked `{primary_tool}`: {reason}"
+                            ),
+                            signals: vec!["pre_tool_use_hook_blocked".into(), "fail_closed".into()],
+                            latency_ms: 0,
+                        });
+                    }
+                }
+
                 // Plan approval gates always require explicit human review and never auto-resolve via Guardian.
-                if plan_approval.is_none()
+                if !pre_hook_blocked
+                    && plan_approval.is_none()
                     && let Some(ref ag) = agent_opt
                     && matches!(ag.mode, SessionMode::Auto)
                 {
@@ -6122,6 +6502,7 @@ impl AgentOrchestrator {
                         title: &title,
                         detail: &detail,
                         workspace_cwd: &ag.cwd,
+                        agent_provider: Some(ag.provider),
                     };
                     let assessment = self.guardian.assess_and_record(&eval_req).await;
                     // Re-verify generation and current mode after async classification (TOCTOU guard).
@@ -6269,6 +6650,12 @@ impl AgentOrchestrator {
                     }
                 }
 
+                let human_only = plan_approval.is_some()
+                    || pre_hook_blocked
+                    || guardian_assessment
+                        .as_ref()
+                        .is_some_and(crate::guardian::assessment_requires_human_only);
+
                 if let Some(ref ag) = agent_opt {
                     self.pending_permissions.write().await.insert(
                         (agent_id.to_string(), request_id.clone()),
@@ -6282,12 +6669,17 @@ impl AgentOrchestrator {
                             allowed_decisions: allowed_decisions.clone(),
                             guardian_assessment: guardian_assessment.clone(),
                             plan_approval: plan_approval.clone(),
+                            human_only,
                             created_at: Utc::now(),
                         },
                     );
+                    // Transition atomically: remove from `evaluating_permissions` STRICTLY AFTER
+                    // inserting the settled entry into `pending_permissions`.
+                    eval_guard.disarm();
 
-                    // Notify active Personal Router for Tier-2 Medium pre-review (Tier-3 High/Critical
-                    // stays strictly human-only!) and mirror event to optional external Hermes webhook.
+                    // Notify active Personal Router for Tier-2 Medium pre-review (Tier-3 High/Critical,
+                    // plan approvals, and fail-closed/human-only verdicts stay strictly human-only!)
+                    // and mirror event to optional external Hermes webhook.
                     if !ag.is_personal_router()
                         && let Some(router) = self.personal_router().await
                     {
@@ -6304,18 +6696,22 @@ impl AgentOrchestrator {
                                 "request_id": request_id,
                                 "title": title,
                                 "risk_level": risk_level.as_str(),
+                                "human_only": human_only,
                             }),
                         );
                         let cfg = router.config().await;
-                        if matches!(
-                            cfg.pre_review_mode,
-                            orbit_protocol::RouterPreReviewMode::MediumRiskOnly
-                                | orbit_protocol::RouterPreReviewMode::AssistOnly
-                        ) && matches!(
-                            risk_level,
-                            orbit_protocol::GuardianRiskLevel::Low
-                                | orbit_protocol::GuardianRiskLevel::Medium
-                        ) && let Some(router_id) = router.active_router_agent_id().await
+                        if !human_only
+                            && matches!(
+                                cfg.pre_review_mode,
+                                orbit_protocol::RouterPreReviewMode::MediumRiskOnly
+                                    | orbit_protocol::RouterPreReviewMode::AssistOnly
+                            )
+                            && matches!(
+                                risk_level,
+                                orbit_protocol::GuardianRiskLevel::Low
+                                    | orbit_protocol::GuardianRiskLevel::Medium
+                            )
+                            && let Some(router_id) = router.active_router_agent_id().await
                             && router_id != agent_id
                             && let Some(delivery) = self.message_delivery().await
                         {
@@ -6401,12 +6797,14 @@ impl AgentOrchestrator {
                     );
                 }
                 self.clear_pending_requests(agent_id).await;
+                self.post_tool_hook_dispatched
+                    .write()
+                    .await
+                    .retain(|(aid, _)| aid != agent_id);
                 self.turn_usage_recorded.write().await.remove(agent_id);
                 self.keep_awake
                     .notify_agent_status(agent_id, &AgentStatus::Closed);
                 if let Ok(Some(ag)) = self.store.get_agent(agent_id) {
-                    let hooks = Arc::clone(&self.hooks);
-                    let cwd_hook = PathBuf::from(&ag.cwd);
                     let prov_slug = ag.provider.slug().to_string();
                     let payload = serde_json::json!({
                         "event": "session_end",
@@ -6417,16 +6815,12 @@ impl AgentOrchestrator {
                         "reason": "exited",
                         "exit_code": code,
                     });
-                    tokio::spawn(async move {
-                        let _ = hooks
-                            .dispatch_event(
-                                orbit_protocol::HookEventKind::SessionEnd,
-                                Some(&cwd_hook),
-                                Some(&prov_slug),
-                                payload,
-                            )
-                            .await;
-                    });
+                    let _ = self.hooks.dispatch_event_async_with_targets(
+                        orbit_protocol::HookEventKind::SessionEnd,
+                        Some(PathBuf::from(&ag.cwd)),
+                        vec![prov_slug],
+                        payload,
+                    );
                 }
                 should_check_auto_archive = true;
                 TimelinePayload::StatusChanged {
@@ -6542,8 +6936,6 @@ impl AgentOrchestrator {
                         }
                     });
                 }
-                let hooks = Arc::clone(&self.hooks);
-                let cwd_hook = PathBuf::from(&ag.cwd);
                 let prov_slug = ag.provider.slug().to_string();
                 let payload = serde_json::json!({
                     "event": "turn_stop",
@@ -6553,16 +6945,69 @@ impl AgentOrchestrator {
                     "provider": &prov_slug,
                     "title": &ag.title,
                 });
-                tokio::spawn(async move {
-                    let _ = hooks
-                        .dispatch_event(
-                            orbit_protocol::HookEventKind::TurnStop,
-                            Some(&cwd_hook),
-                            Some(&prov_slug),
-                            payload,
-                        )
-                        .await;
-                });
+                let _ = self.hooks.dispatch_event_async_with_targets(
+                    orbit_protocol::HookEventKind::TurnStop,
+                    Some(PathBuf::from(&ag.cwd)),
+                    vec![prov_slug.clone()],
+                    payload,
+                );
+
+                // Dispatch `Notification` hook on foreground turn completion with a brief summary.
+                if !ag.background && drained_prompt.is_none() {
+                    let store_bg = Arc::clone(&self.store);
+                    let aid_bg = agent_id.to_string();
+                    let aid_payload = agent_id.to_string();
+                    let ws_bg = ag.workspace_id.clone();
+                    let cwd_str = ag.cwd.clone();
+                    let cwd_hook = PathBuf::from(&ag.cwd);
+                    let title_bg = ag.title.clone();
+                    let task_summary_fallback = ag.task_summary.clone();
+                    let prov_bg = prov_slug;
+                    let _ = self.hooks.spawn_bounded_async(
+                        orbit_protocol::HookEventKind::Notification,
+                        move |hooks| async move {
+                            let summary = tokio::task::spawn_blocking(move || {
+                                if let Ok(events) = store_bg.fetch_recent_timeline(&aid_bg, 20) {
+                                    for ev in events.iter().rev() {
+                                        if let TimelinePayload::AssistantMessage { text, .. } =
+                                            &ev.payload
+                                            && !text.trim().is_empty()
+                                        {
+                                            return crate::hooks::truncate_hook_preview(text, 300);
+                                        }
+                                    }
+                                }
+                                task_summary_fallback
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(|s| crate::hooks::truncate_hook_preview(s, 300))
+                                    .unwrap_or_else(|| "Turn completed".to_string())
+                            })
+                            .await
+                            .unwrap_or_else(|_| "Turn completed".to_string());
+
+                            let notif_payload = serde_json::json!({
+                                "event": "notification",
+                                "kind": "turn_completed",
+                                "agent_id": &aid_payload,
+                                "agent_title": &title_bg,
+                                "workspace_id": &ws_bg,
+                                "cwd": &cwd_str,
+                                "provider": &prov_bg,
+                                "message": summary,
+                            });
+                            let _ = hooks
+                                .dispatch_event_with_targets(
+                                    orbit_protocol::HookEventKind::Notification,
+                                    Some(&cwd_hook),
+                                    &["turn_completed".to_string(), prov_bg],
+                                    notif_payload,
+                                )
+                                .await;
+                        },
+                    );
+                }
             }
             let _ = self.broadcast_tx.send(DaemonBroadcast::AgentUpdated(ag));
 
@@ -9430,6 +9875,7 @@ mod fast_mode_orchestrator_tests {
                     allowed_decisions: vec!["allow".into(), "deny".into()],
                     guardian_assessment: None,
                     plan_approval: None,
+                    human_only: false,
                     created_at: now,
                 },
             );
@@ -9855,6 +10301,1261 @@ mod fast_mode_orchestrator_tests {
             1,
             "pending plan gate must NOT be consumed when driver delivery fails"
         );
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn production_pre_tool_use_post_tool_use_and_notification_hooks_end_to_end() {
+        let home_dir =
+            std::env::temp_dir().join(format!("orbit-hooks-b303-test-{}", Uuid::new_v4().simple()));
+        let ws_dir = home_dir.join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("mkdir ws");
+        let post_log = home_dir.join("post_tool_use.jsonl");
+        let notif_log = home_dir.join("notifications.jsonl");
+
+        let store = Arc::new(OrbitStore::open_in_memory().expect("open store"));
+        let hooks = crate::hooks::HooksEngine::new(home_dir.clone());
+        let orch = AgentOrchestrator::new(
+            home_dir.clone(),
+            "host_hooks_b303".into(),
+            "tok".into(),
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(OrchestrationConfig::default())),
+            Arc::clone(&store),
+            WorkspaceScriptRegistry::new(),
+            Arc::new(KeepAwakeManager::new(false)),
+            Arc::new(RwLock::new(None)),
+            Arc::clone(&hooks),
+        )
+        .await;
+
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_h1".into(),
+                title: "Hooks Repo".into(),
+                cwd: ws_dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_h1".into(),
+                    workspace_id: "ws_h1".into(),
+                    cwd: ws_dir.to_string_lossy().to_string(),
+                    title: "Hooks Worker".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::Auto,
+                    status: AgentStatus::Running {
+                        turn_id: "t1".into(),
+                    },
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: Some("worker".into()),
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let agent_gen = orch.bump_generation("ag_h1").await;
+        let dummy_task = tokio::spawn(async {});
+        orch.live_agents.write().await.insert(
+            "ag_h1".into(),
+            LiveAgentEntry {
+                generation: agent_gen,
+                cmd_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: dummy_task.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+
+        // 1. PreToolUse blocking hook denies a low-risk `cargo test` fail-closed even in Auto mode!
+        hooks
+            .upsert_hook(
+                None,
+                orbit_protocol::LifecycleHookRule {
+                    id: "hk_pre_block".into(),
+                    name: "Deny Shell Policy".into(),
+                    scope: orbit_protocol::HookScope::UserGlobal,
+                    event: orbit_protocol::HookEventKind::PreToolUse,
+                    matcher: Some("Bash:cargo".into()),
+                    action: orbit_protocol::HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec![
+                            "-c".into(),
+                            r#"printf '{"decision":"block","reason":"cargo blocked during freeze"}'"#
+                                .into(),
+                        ],
+                        env: std::collections::BTreeMap::new(),
+                    },
+                    timeout_ms: 5_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert PreToolUse block hook");
+
+        orch.ingest_driver_event(
+            "ag_h1",
+            agent_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "perm_blocked_by_hook".into(),
+                title: "Run cargo test".into(),
+                detail: ToolCallDetail::Shell {
+                    command: "cargo test".into(),
+                    cwd: None,
+                    exit_code: None,
+                    output_preview: None,
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                plan_approval: None,
+            },
+        )
+        .await;
+
+        match cmd_rx.try_recv().expect("PreToolUse block must send deny") {
+            DriverCommand::ResolvePermission {
+                request_id,
+                decision,
+            } => {
+                assert_eq!(request_id, "perm_blocked_by_hook");
+                assert_eq!(decision, "deny");
+            }
+            other => panic!("expected ResolvePermission deny, got {other:?}"),
+        }
+        assert!(
+            orch.list_pending_permissions(Some("ag_h1"))
+                .await
+                .is_empty(),
+            "blocked tool must not remain pending"
+        );
+        let timeline = store
+            .fetch_recent_timeline("ag_h1", 20)
+            .expect("fetch timeline");
+        assert!(
+            timeline.iter().any(|ev| matches!(
+                &ev.payload,
+                TimelinePayload::Notice { message, .. }
+                    if message.contains("Deny Shell Policy")
+                        && message.contains("cargo blocked during freeze")
+            )),
+            "PreToolUse block reason must be surfaced in timeline"
+        );
+
+        // 2. CRITICAL SAFETY INVARIANT: PreToolUse returning `allow` MUST NEVER bypass
+        //    `plan_approval.is_some()` AND MUST NEVER override an explicit user `Deny`!
+        hooks
+            .upsert_hook(
+                None,
+                orbit_protocol::LifecycleHookRule {
+                    id: "hk_pre_allow".into(),
+                    name: "Always Allow Hook".into(),
+                    scope: orbit_protocol::HookScope::UserGlobal,
+                    event: orbit_protocol::HookEventKind::PreToolUse,
+                    matcher: Some("ExitPlanMode|file_edit".into()),
+                    action: orbit_protocol::HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec![
+                            "-c".into(),
+                            r#"printf '{"decision":"allow","reason":"hook says allow"}'"#.into(),
+                        ],
+                        env: std::collections::BTreeMap::new(),
+                    },
+                    timeout_ms: 5_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert PreToolUse allow hook");
+
+        orch.ingest_driver_event(
+            "ag_h1",
+            agent_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "perm_plan_gate".into(),
+                title: "Review plan".into(),
+                detail: ToolCallDetail::Generic {
+                    tool_name: "ExitPlanMode".into(),
+                    arguments_json: serde_json::json!({"plan": "# Plan\n- Step 1"}).to_string(),
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                plan_approval: None,
+            },
+        )
+        .await;
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "PreToolUse allow MUST NEVER auto-approve a plan_approval gate"
+        );
+        let pending_plan = orch.list_pending_permissions(Some("ag_h1")).await;
+        assert_eq!(pending_plan.len(), 1);
+        assert_eq!(pending_plan[0].request_id, "perm_plan_gate");
+        assert!(pending_plan[0].plan_approval.is_some());
+
+        // In Default mode, PreToolUse allow still surfaces to the human and respects user Deny.
+        store
+            .update_agent_mode("ag_h1", &SessionMode::Default)
+            .expect("set default mode");
+        orch.ingest_driver_event(
+            "ag_h1",
+            agent_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "perm_user_deny".into(),
+                title: "Edit file".into(),
+                detail: ToolCallDetail::FileEdit {
+                    path: format!("{}/src/lib.rs", ws_dir.display()),
+                    unified_diff: Some("+hi\n".into()),
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                plan_approval: None,
+            },
+        )
+        .await;
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "PreToolUse allow must not auto-resolve in Default mode"
+        );
+        orch.resolve_permission("ag_h1", "perm_user_deny".into(), "deny".into())
+            .await
+            .expect("explicit user deny");
+        match cmd_rx.try_recv().expect("user deny forwarded") {
+            DriverCommand::ResolvePermission {
+                request_id,
+                decision,
+            } => {
+                assert_eq!(request_id, "perm_user_deny");
+                assert_eq!(decision, "deny");
+            }
+            other => panic!("expected explicit user deny, got {other:?}"),
+        }
+
+        // 3. PostToolUse fires asynchronously on terminal Completed/Failed ToolCall (deduped by call_id)
+        hooks
+            .upsert_hook(
+                None,
+                orbit_protocol::LifecycleHookRule {
+                    id: "hk_post_tool".into(),
+                    name: "Capture PostToolUse".into(),
+                    scope: orbit_protocol::HookScope::UserGlobal,
+                    event: orbit_protocol::HookEventKind::PostToolUse,
+                    matcher: None,
+                    action: orbit_protocol::HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec![
+                            "-c".into(),
+                            format!(
+                                "cat >> '{}'; printf '\\n' >> '{}'",
+                                post_log.display(),
+                                post_log.display()
+                            ),
+                        ],
+                        env: std::collections::BTreeMap::new(),
+                    },
+                    timeout_ms: 5_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert PostToolUse hook");
+
+        // Running status must NOT trigger PostToolUse
+        orch.ingest_driver_event(
+            "ag_h1",
+            agent_gen,
+            DriverEvent::ToolCall {
+                call_id: "call_sh_1".into(),
+                status: ToolCallStatus::Running,
+                detail: ToolCallDetail::Shell {
+                    command: "cargo test".into(),
+                    cwd: None,
+                    exit_code: None,
+                    output_preview: None,
+                },
+                background_task: None,
+            },
+        )
+        .await;
+        // Completed status fires PostToolUse with exit_code & output_preview
+        orch.ingest_driver_event(
+            "ag_h1",
+            agent_gen,
+            DriverEvent::ToolCall {
+                call_id: "call_sh_1".into(),
+                status: ToolCallStatus::Completed,
+                detail: ToolCallDetail::Shell {
+                    command: "cargo test".into(),
+                    cwd: None,
+                    exit_code: Some(0),
+                    output_preview: Some("12 tests passed".into()),
+                },
+                background_task: None,
+            },
+        )
+        .await;
+        // Duplicate terminal event for same call_id must NOT double-fire
+        orch.ingest_driver_event(
+            "ag_h1",
+            agent_gen,
+            DriverEvent::ToolCall {
+                call_id: "call_sh_1".into(),
+                status: ToolCallStatus::Completed,
+                detail: ToolCallDetail::Shell {
+                    command: "cargo test".into(),
+                    cwd: None,
+                    exit_code: Some(0),
+                    output_preview: Some("12 tests passed".into()),
+                },
+                background_task: None,
+            },
+        )
+        .await;
+        // Failed FileEdit fires PostToolUse with status=failed & modified_files
+        orch.ingest_driver_event(
+            "ag_h1",
+            agent_gen,
+            DriverEvent::ToolCall {
+                call_id: "call_edit_2".into(),
+                status: ToolCallStatus::Failed,
+                detail: ToolCallDetail::FileEdit {
+                    path: "src/main.rs".into(),
+                    unified_diff: Some("+broken\n".into()),
+                },
+                background_task: None,
+            },
+        )
+        .await;
+
+        hooks.wait_async_idle().await;
+        let post_raw = std::fs::read_to_string(&post_log).expect("read post_tool_use log");
+        let post_events: Vec<serde_json::Value> = post_raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("valid json line"))
+            .collect();
+        assert_eq!(
+            post_events.len(),
+            2,
+            "expected 2 deduped PostToolUse payloads"
+        );
+        assert!(post_events.iter().any(|ev| {
+            ev["event"] == "post_tool_use"
+                && ev["tool_name"] == "shell"
+                && ev["status"] == "completed"
+                && ev["exit_code"] == 0
+                && ev["output_preview"] == "12 tests passed"
+        }));
+        assert!(post_events.iter().any(|ev| {
+            ev["event"] == "post_tool_use"
+                && ev["tool_name"] == "file_edit"
+                && ev["status"] == "failed"
+                && ev["modified_files"] == serde_json::json!(["src/main.rs"])
+        }));
+
+        // 4. Notification hook fires on AwaitingPermission, Error, and foreground TurnCompleted!
+        hooks
+            .upsert_hook(
+                None,
+                orbit_protocol::LifecycleHookRule {
+                    id: "hk_notif".into(),
+                    name: "Capture Notifications".into(),
+                    scope: orbit_protocol::HookScope::UserGlobal,
+                    event: orbit_protocol::HookEventKind::Notification,
+                    matcher: None,
+                    action: orbit_protocol::HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec![
+                            "-c".into(),
+                            format!(
+                                "cat >> '{}'; printf '\\n' >> '{}'",
+                                notif_log.display(),
+                                notif_log.display()
+                            ),
+                        ],
+                        env: std::collections::BTreeMap::new(),
+                    },
+                    timeout_ms: 5_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert Notification hook");
+
+        // (a) Entering AwaitingPermission
+        orch.ingest_driver_event(
+            "ag_h1",
+            agent_gen,
+            DriverEvent::StatusChanged(AgentStatus::AwaitingPermission {
+                turn_id: "t1".into(),
+                request_id: "perm_plan_gate".into(),
+            }),
+        )
+        .await;
+        // (b) Entering Error
+        orch.ingest_driver_event(
+            "ag_h1",
+            agent_gen,
+            DriverEvent::StatusChanged(AgentStatus::Error {
+                message: "upstream rate limit exceeded".into(),
+                recoverable: true,
+            }),
+        )
+        .await;
+        // (c) Running -> AssistantText -> Idle (foreground TurnCompleted with summary)
+        orch.ingest_driver_event(
+            "ag_h1",
+            agent_gen,
+            DriverEvent::StatusChanged(AgentStatus::Running {
+                turn_id: "t2".into(),
+            }),
+        )
+        .await;
+        orch.ingest_driver_event(
+            "ag_h1",
+            agent_gen,
+            DriverEvent::AssistantText {
+                item_id: "msg_done".into(),
+                text: "Refactored hooks and verified tests.".into(),
+                streaming: false,
+            },
+        )
+        .await;
+        orch.ingest_driver_event(
+            "ag_h1",
+            agent_gen,
+            DriverEvent::StatusChanged(AgentStatus::Idle),
+        )
+        .await;
+
+        hooks.wait_async_idle().await;
+        let notif_raw = std::fs::read_to_string(&notif_log).expect("read notifications log");
+        let notif_events: Vec<serde_json::Value> = notif_raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("valid notif json"))
+            .collect();
+        assert!(
+            notif_events.iter().any(|ev| {
+                ev["event"] == "notification"
+                    && ev["kind"] == "awaiting_permission"
+                    && ev["agent_id"] == "ag_h1"
+                    && ev["agent_title"] == "Hooks Worker"
+            }),
+            "missing awaiting_permission notification in {notif_events:?}"
+        );
+        assert!(
+            notif_events.iter().any(|ev| {
+                ev["event"] == "notification"
+                    && ev["kind"] == "agent_error"
+                    && ev["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains("upstream rate limit"))
+            }),
+            "missing agent_error notification in {notif_events:?}"
+        );
+        assert!(
+            notif_events.iter().any(|ev| {
+                ev["event"] == "notification"
+                    && ev["kind"] == "turn_completed"
+                    && ev["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains("Refactored hooks"))
+            }),
+            "missing turn_completed notification in {notif_events:?}"
+        );
+
+        // Verify HookExecutionRecord audit history contains PreToolUse, PostToolUse, and Notification.
+        let snap = hooks.list_snapshot(None).await.expect("list hook snapshot");
+        assert!(
+            snap.recent_executions
+                .iter()
+                .any(|r| r.event == orbit_protocol::HookEventKind::PreToolUse
+                    && r.decision == orbit_protocol::HookDecision::Block)
+        );
+        assert!(
+            snap.recent_executions
+                .iter()
+                .any(|r| r.event == orbit_protocol::HookEventKind::PostToolUse)
+        );
+        assert!(
+            snap.recent_executions
+                .iter()
+                .any(|r| r.event == orbit_protocol::HookEventKind::Notification)
+        );
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn evaluating_permission_blocks_premature_resolve_and_provider_updated_input_fails_closed()
+     {
+        let home_dir =
+            std::env::temp_dir().join(format!("orbit-eval-race-b303-{}", Uuid::new_v4().simple()));
+        let ws_dir = home_dir.join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("mkdir ws");
+        let ready_file = home_dir.join("hook_started.flag");
+
+        let store = Arc::new(OrbitStore::open_in_memory().expect("open store"));
+        let hooks = crate::hooks::HooksEngine::new(home_dir.clone());
+        let orch = AgentOrchestrator::new(
+            home_dir.clone(),
+            "host_eval_race".into(),
+            "tok".into(),
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(OrchestrationConfig::default())),
+            Arc::clone(&store),
+            WorkspaceScriptRegistry::new(),
+            Arc::new(KeepAwakeManager::new(false)),
+            Arc::new(RwLock::new(None)),
+            Arc::clone(&hooks),
+        )
+        .await;
+
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_race".into(),
+                title: "Race WS".into(),
+                cwd: ws_dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_race".into(),
+                    workspace_id: "ws_race".into(),
+                    cwd: ws_dir.to_string_lossy().to_string(),
+                    title: "Race Worker".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::Auto,
+                    status: AgentStatus::Running {
+                        turn_id: "t1".into(),
+                    },
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: Some("race".into()),
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let agent_gen = orch.bump_generation("ag_race").await;
+        let dummy_task = tokio::spawn(async {});
+        orch.live_agents.write().await.insert(
+            "ag_race".into(),
+            LiveAgentEntry {
+                generation: agent_gen,
+                cmd_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: dummy_task.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+
+        // 1. Slow blocking PreToolUse hook signals `ready_file`, sleeps 350ms, then blocks (exit 2).
+        hooks
+            .upsert_hook(
+                None,
+                orbit_protocol::LifecycleHookRule {
+                    id: "hk_slow_block".into(),
+                    name: "Slow Block".into(),
+                    scope: orbit_protocol::HookScope::UserGlobal,
+                    event: orbit_protocol::HookEventKind::PreToolUse,
+                    matcher: Some("Bash:echo*".into()),
+                    action: orbit_protocol::HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec![
+                            "-c".into(),
+                            format!(
+                                "touch '{}'; sleep 0.35; echo 'blocked after delay' >&2; exit 2",
+                                ready_file.display()
+                            ),
+                        ],
+                        env: std::collections::BTreeMap::new(),
+                    },
+                    timeout_ms: 5_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert slow block hook");
+
+        let orch_bg = Arc::clone(&orch);
+        let ingest_task = tokio::spawn(async move {
+            orch_bg
+                .ingest_driver_event(
+                    "ag_race",
+                    agent_gen,
+                    DriverEvent::PermissionRequest {
+                        request_id: "perm_race_1".into(),
+                        title: "Run echo".into(),
+                        detail: ToolCallDetail::Shell {
+                            command: "echo hi".into(),
+                            cwd: None,
+                            exit_code: None,
+                            output_preview: None,
+                        },
+                        allowed_decisions: vec!["allow".into(), "deny".into()],
+                        plan_approval: None,
+                    },
+                )
+                .await;
+        });
+
+        // Wait until the PreToolUse hook is actively running in-flight.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !ready_file.exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+        assert!(ready_file.exists(), "PreToolUse hook should have started");
+
+        // Premature external resolves (both human & agent, AND unknown request_id) MUST be rejected!
+        let err_human = orch
+            .resolve_permission("ag_race", "perm_race_1".into(), "allow".into())
+            .await
+            .expect_err("premature human resolve while evaluating must be rejected");
+        assert!(err_human.to_string().contains("currently being evaluated"));
+
+        let err_agent = orch
+            .resolve_permission_by_agent("ag_race", "perm_race_1".into(), "allow".into())
+            .await
+            .expect_err("premature agent resolve while evaluating must be rejected");
+        assert!(err_agent.to_string().contains("currently being evaluated"));
+
+        let err_unknown = orch
+            .resolve_permission("ag_race", "perm_unknown_99".into(), "allow".into())
+            .await
+            .expect_err("unknown request_id while evaluating must not forward to driver");
+        assert!(err_unknown.to_string().contains("no pending permission"));
+
+        // Confirm zero commands reached the driver prematurely.
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "driver must NOT receive any premature allow command during PreToolUse evaluation"
+        );
+
+        ingest_task.await.expect("ingest task completes");
+        match cmd_rx.try_recv() {
+            Ok(DriverCommand::ResolvePermission {
+                request_id,
+                decision,
+            }) => {
+                assert_eq!(request_id, "perm_race_1");
+                assert_eq!(decision, "deny");
+            }
+            other => panic!("expected PreToolUse deny after hook completed, got {other:?}"),
+        }
+
+        // 2. Provider PermissionRequest receiving `updated_input` from PreToolUse MUST fail closed!
+        hooks
+            .delete_hook(None, "hk_slow_block", orbit_protocol::HookScope::UserGlobal)
+            .await
+            .expect("delete slow block");
+        hooks
+            .upsert_hook(
+                None,
+                orbit_protocol::LifecycleHookRule {
+                    id: "hk_provider_rewrite".into(),
+                    name: "Provider Rewrite".into(),
+                    scope: orbit_protocol::HookScope::UserGlobal,
+                    event: orbit_protocol::HookEventKind::PreToolUse,
+                    matcher: Some("Bash:ls*".into()),
+                    action: orbit_protocol::HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec![
+                            "-c".into(),
+                            r#"printf '{"decision":"modify","updated_input":{"command":"ls -la"}}'"#
+                                .into(),
+                        ],
+                        env: std::collections::BTreeMap::new(),
+                    },
+                    timeout_ms: 5_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert provider rewrite hook");
+
+        orch.ingest_driver_event(
+            "ag_race",
+            agent_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "perm_rewrite_1".into(),
+                title: "Run ls".into(),
+                detail: ToolCallDetail::Shell {
+                    command: "ls".into(),
+                    cwd: None,
+                    exit_code: None,
+                    output_preview: None,
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                plan_approval: None,
+            },
+        )
+        .await;
+
+        match cmd_rx.try_recv() {
+            Ok(DriverCommand::ResolvePermission {
+                request_id,
+                decision,
+            }) => {
+                assert_eq!(request_id, "perm_rewrite_1");
+                assert_eq!(
+                    decision, "deny",
+                    "unsupported provider updated_input must fail closed with deny"
+                );
+            }
+            other => panic!("expected fail-closed deny for provider updated_input, got {other:?}"),
+        }
+        let timeline = store
+            .fetch_recent_timeline("ag_race", 10)
+            .expect("fetch timeline");
+        assert!(
+            timeline.iter().any(|ev| {
+                matches!(
+                    &ev.payload,
+                    TimelinePayload::Notice { message, .. }
+                        if message.contains("updated_input is not supported")
+                )
+            }),
+            "expected explicit Notice about unsupported updated_input in timeline"
+        );
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn multi_file_diff_triggers_pre_tool_block_and_post_tool_modified_files() {
+        let home_dir =
+            std::env::temp_dir().join(format!("orbit-multidiff-b303-{}", Uuid::new_v4().simple()));
+        let ws_dir = home_dir.join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("mkdir ws");
+        let post_log = home_dir.join("post_multidiff.jsonl");
+
+        let store = Arc::new(OrbitStore::open_in_memory().expect("open store"));
+        let hooks = crate::hooks::HooksEngine::new(home_dir.clone());
+        let orch = AgentOrchestrator::new(
+            home_dir.clone(),
+            "host_multidiff".into(),
+            "tok".into(),
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(OrchestrationConfig::default())),
+            Arc::clone(&store),
+            WorkspaceScriptRegistry::new(),
+            Arc::new(KeepAwakeManager::new(false)),
+            Arc::new(RwLock::new(None)),
+            Arc::clone(&hooks),
+        )
+        .await;
+
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_md".into(),
+                title: "MultiDiff WS".into(),
+                cwd: ws_dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_md".into(),
+                    workspace_id: "ws_md".into(),
+                    cwd: ws_dir.to_string_lossy().to_string(),
+                    title: "MultiDiff Worker".into(),
+                    provider: ProviderKind::Codex,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::Auto,
+                    status: AgentStatus::Running {
+                        turn_id: "t1".into(),
+                    },
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: Some("md".into()),
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let agent_gen = orch.bump_generation("ag_md").await;
+        let dummy_task = tokio::spawn(async {});
+        orch.live_agents.write().await.insert(
+            "ag_md".into(),
+            LiveAgentEntry {
+                generation: agent_gen,
+                cmd_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: dummy_task.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+
+        hooks
+            .upsert_hook(
+                None,
+                orbit_protocol::LifecycleHookRule {
+                    id: "hk_block_env".into(),
+                    name: "Block Env Diff".into(),
+                    scope: orbit_protocol::HookScope::UserGlobal,
+                    event: orbit_protocol::HookEventKind::PreToolUse,
+                    matcher: Some("*.env".into()),
+                    action: orbit_protocol::HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec!["-c".into(), "echo 'env file forbidden' >&2; exit 2".into()],
+                        env: std::collections::BTreeMap::new(),
+                    },
+                    timeout_ms: 5_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert env block hook");
+        hooks
+            .upsert_hook(
+                None,
+                orbit_protocol::LifecycleHookRule {
+                    id: "hk_post_md".into(),
+                    name: "Capture MultiDiff Post".into(),
+                    scope: orbit_protocol::HookScope::UserGlobal,
+                    event: orbit_protocol::HookEventKind::PostToolUse,
+                    matcher: Some("file_edit".into()),
+                    action: orbit_protocol::HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec![
+                            "-c".into(),
+                            format!(
+                                "cat >> '{}'; printf '\\n' >> '{}'",
+                                post_log.display(),
+                                post_log.display()
+                            ),
+                        ],
+                        env: std::collections::BTreeMap::new(),
+                    },
+                    timeout_ms: 5_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert post md hook");
+
+        let multi_diff = "\
+diff --git a/src/lib.rs b/src/lib.rs\n\
+--- a/src/lib.rs\n\
++++ b/src/lib.rs\n\
+@@ -1 +1 @@\n\
++pub fn ok() {}\n\
+diff --git a/config/prod.env b/config/prod.env\n\
+--- a/config/prod.env\n\
++++ b/config/prod.env\n\
+@@ -1 +1 @@\n\
++API_KEY=secret\n";
+
+        // PreToolUse matcher `*.env` must match the SECOND file inside unified_diff and deny!
+        orch.ingest_driver_event(
+            "ag_md",
+            agent_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "perm_md_1".into(),
+                title: "Apply patch".into(),
+                detail: ToolCallDetail::FileEdit {
+                    path: "src/lib.rs".into(),
+                    unified_diff: Some(multi_diff.into()),
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                plan_approval: None,
+            },
+        )
+        .await;
+        match cmd_rx.try_recv() {
+            Ok(DriverCommand::ResolvePermission {
+                request_id,
+                decision,
+            }) => {
+                assert_eq!(request_id, "perm_md_1");
+                assert_eq!(decision, "deny");
+            }
+            other => panic!("expected multi-file diff *.env block, got {other:?}"),
+        }
+
+        // PostToolUse must report BOTH modified files in `modified_files`.
+        orch.ingest_driver_event(
+            "ag_md",
+            agent_gen,
+            DriverEvent::ToolCall {
+                call_id: "tc_md_1".into(),
+                status: ToolCallStatus::Completed,
+                detail: ToolCallDetail::FileEdit {
+                    path: "src/lib.rs".into(),
+                    unified_diff: Some(multi_diff.into()),
+                },
+                background_task: None,
+            },
+        )
+        .await;
+        hooks.wait_async_idle().await;
+        let raw = std::fs::read_to_string(&post_log).expect("read post_multidiff");
+        let parsed: serde_json::Value = serde_json::from_str(raw.trim()).expect("valid post json");
+        let files: Vec<String> = parsed["modified_files"]
+            .as_array()
+            .expect("modified_files array")
+            .iter()
+            .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+            .collect();
+        assert_eq!(
+            files,
+            vec!["src/lib.rs".to_string(), "config/prod.env".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[tokio::test]
+    async fn fail_closed_guardian_verdict_marks_human_only_and_rejects_router_and_agent_allow() {
+        let home_dir =
+            std::env::temp_dir().join(format!("orbit-human-only-b303-{}", Uuid::new_v4().simple()));
+        let ws_dir = home_dir.join("repo");
+        std::fs::create_dir_all(ws_dir.join("src")).expect("mkdir src");
+        std::fs::write(ws_dir.join("src/lib.rs"), "pub fn ok() {}\n").expect("write lib.rs");
+
+        let store = Arc::new(OrbitStore::open_in_memory().expect("open store"));
+        let hooks = crate::hooks::HooksEngine::new(home_dir.clone());
+        let listen_port = Arc::new(RwLock::new(0u16));
+        let orch = AgentOrchestrator::new(
+            home_dir.clone(),
+            "host_human_only".into(),
+            "tok".into(),
+            Arc::clone(&listen_port),
+            Arc::new(RwLock::new(OrchestrationConfig::default())),
+            Arc::clone(&store),
+            WorkspaceScriptRegistry::new(),
+            Arc::new(KeepAwakeManager::new(false)),
+            Arc::new(RwLock::new(None)),
+            Arc::clone(&hooks),
+        )
+        .await;
+
+        // Configure Guardian with explicit unsupported LLM provider (`Antigravity`) so Tier-2
+        // deterministically fails closed (`Medium + RequireHuman + heuristic_fallback + fail_closed`).
+        orch.guardian
+            .update_config(orbit_protocol::GuardianPolicyConfig {
+                enabled: true,
+                auto_approve_max_risk: orbit_protocol::GuardianRiskLevel::Medium,
+                use_ai_classifier_for_medium: true,
+                llm_tier2_enabled: true,
+                llm_provider: Some(ProviderKind::Antigravity),
+                ..orbit_protocol::GuardianPolicyConfig::default()
+            })
+            .await
+            .expect("update guardian config");
+
+        let host_info = orbit_protocol::HostInfo {
+            host_id: "host_human_only".into(),
+            hostname: "Local".into(),
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            public_key_b64: String::new(),
+            protocol_version: orbit_protocol::PROTOCOL_VERSION,
+            daemon_version: "0.10.3".into(),
+            available_providers: Vec::new(),
+            relay_url: None,
+        };
+        let connected = crate::connected_hosts::ConnectedHostsManager::new(
+            host_info.host_id.clone(),
+            Arc::clone(&store),
+        );
+        let router = crate::personal_router::PersonalRouterManager::new(
+            home_dir.clone(),
+            host_info,
+            Arc::clone(&listen_port),
+            "tok".into(),
+            Arc::clone(&store),
+            Arc::clone(&orch),
+            connected,
+        );
+        orch.set_personal_router(Arc::clone(&router)).await;
+
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_ho".into(),
+                title: "HO WS".into(),
+                cwd: ws_dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_ho".into(),
+                    workspace_id: "ws_ho".into(),
+                    cwd: ws_dir.to_string_lossy().to_string(),
+                    title: "HO Worker".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::Auto,
+                    status: AgentStatus::Running {
+                        turn_id: "t1".into(),
+                    },
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: Some("ho".into()),
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let agent_gen = orch.bump_generation("ag_ho").await;
+        let dummy_task = tokio::spawn(async {});
+        orch.live_agents.write().await.insert(
+            "ag_ho".into(),
+            LiveAgentEntry {
+                generation: agent_gen,
+                cmd_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: dummy_task.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+
+        orch.ingest_driver_event(
+            "ag_ho",
+            agent_gen,
+            DriverEvent::PermissionRequest {
+                request_id: "perm_ho_1".into(),
+                title: "Edit src/lib.rs".into(),
+                detail: ToolCallDetail::FileEdit {
+                    path: ws_dir.join("src/lib.rs").to_string_lossy().to_string(),
+                    unified_diff: Some("+pub fn added() {}\n".into()),
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                plan_approval: None,
+            },
+        )
+        .await;
+
+        let pending = orch
+            .get_pending_permission("ag_ho", "perm_ho_1")
+            .await
+            .expect("fail-closed LLM verdict must remain pending for human");
+        assert!(
+            pending.human_only,
+            "fail-closed LLM fallback verdict MUST be marked human_only"
+        );
+        let assess = pending
+            .guardian_assessment
+            .as_ref()
+            .expect("guardian_assessment attached");
+        assert_eq!(assess.risk_level, orbit_protocol::GuardianRiskLevel::Medium);
+        assert_eq!(
+            assess.decision,
+            orbit_protocol::GuardianDecision::RequireHuman
+        );
+        assert_eq!(assess.classifier_tier, "heuristic_fallback");
+        assert!(assess.signals.iter().any(|s| s == "fail_closed"));
+
+        // Personal Router policy check MUST reject `allow` even though risk_level is Medium!
+        assert!(
+            router
+                .validate_router_permission_decision("allow", Some(assess))
+                .await
+                .is_err(),
+            "Personal Router must reject fail-closed Medium assessment"
+        );
+
+        // Agent-originated resolution MUST reject `human_only` permissions!
+        let err_agent = orch
+            .resolve_permission_by_agent("ag_ho", "perm_ho_1".into(), "allow".into())
+            .await
+            .expect_err("agent resolution must be rejected for human_only permission");
+        assert!(err_agent.to_string().contains("human-only"));
+
+        // Explicit human resolution MUST still succeed cleanly!
+        orch.resolve_permission("ag_ho", "perm_ho_1".into(), "allow".into())
+            .await
+            .expect("human resolve_permission must succeed");
+        match cmd_rx.try_recv() {
+            Ok(DriverCommand::ResolvePermission {
+                request_id,
+                decision,
+            }) => {
+                assert_eq!(request_id, "perm_ho_1");
+                assert_eq!(decision, "allow");
+            }
+            other => panic!("expected human allow delivered to driver, got {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&home_dir);
     }

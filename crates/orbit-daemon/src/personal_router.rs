@@ -195,6 +195,15 @@ impl PersonalRouterManager {
             return Ok(());
         }
 
+        if let Some(a) = assessment
+            && crate::guardian::assessment_requires_human_only(a)
+        {
+            return Err(
+                "Fail-closed or human-only Guardian assessment cannot be auto-approved by Personal Router; human confirmation via interactive approval card is required."
+                    .to_string(),
+            );
+        }
+
         match assessment.map(|a| a.risk_level) {
             Some(GuardianRiskLevel::Low | GuardianRiskLevel::Medium) => Ok(()),
             Some(GuardianRiskLevel::High | GuardianRiskLevel::Critical) => Err(

@@ -43,6 +43,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/overlays";
+import { type MessageKey, useI18n } from "@/lib/i18n";
 import type {
   HookAction,
   HookDecision,
@@ -61,65 +62,84 @@ const MAX_TIMEOUT_MS = 30_000;
 
 const HOOK_EVENTS: {
   id: HookEventKind;
-  label: string;
-  hint: string;
+  labelKey: MessageKey;
+  hintKey: MessageKey;
+  matcherPlaceholder: string;
   samplePayload: Record<string, unknown>;
 }[] = [
   {
     id: "session_start",
-    label: "Session Start",
-    hint: "When an agent session initializes",
+    labelKey: "hooks.eventSessionStart",
+    hintKey: "hooks.eventSessionStartHint",
+    matcherPlaceholder: "claude_code|codex",
     samplePayload: { provider: "codex", target: "codex" },
   },
   {
     id: "pre_prompt_submit",
-    label: "Pre-Prompt Submit",
-    hint: "Before dispatching a prompt (can block or modify)",
+    labelKey: "hooks.eventPrePromptSubmit",
+    hintKey: "hooks.eventPrePromptSubmitHint",
+    matcherPlaceholder: "claude_code|codex",
     samplePayload: { provider: "codex", target: "codex", prompt: "Dry-run test prompt" },
   },
   {
     id: "pre_tool_use",
-    label: "Pre-Tool Use",
-    hint: "Before an agent invokes a tool",
-    samplePayload: { tool: "Bash", target: "Bash" },
+    labelKey: "hooks.eventPreToolUse",
+    hintKey: "hooks.eventPreToolUseHint",
+    matcherPlaceholder: "Bash|shell|file_edit|create_agent",
+    samplePayload: {
+      tool_name: "shell",
+      target: "Bash",
+      tool_input: { command: "cargo test" },
+    },
   },
   {
     id: "post_tool_use",
-    label: "Post-Tool Use",
-    hint: "After a tool execution completes",
-    samplePayload: { tool: "Bash", target: "Bash" },
+    labelKey: "hooks.eventPostToolUse",
+    hintKey: "hooks.eventPostToolUseHint",
+    matcherPlaceholder: "Bash|shell|file_edit|create_agent",
+    samplePayload: {
+      tool_name: "shell",
+      target: "Bash",
+      status: "completed",
+      exit_code: 0,
+      output_preview: "ok",
+      modified_files: [],
+    },
   },
   {
     id: "post_file_edit",
-    label: "Post-File Edit",
-    hint: "After a workspace file is saved or edited",
+    labelKey: "hooks.eventPostFileEdit",
+    hintKey: "hooks.eventPostFileEditHint",
+    matcherPlaceholder: "*.rs|*.ts",
     samplePayload: { path: "src/lib.rs", target: "src/lib.rs" },
   },
   {
     id: "notification",
-    label: "Notification",
-    hint: "On agent runtime notices and warnings",
-    samplePayload: { level: "warning", target: "warning" },
+    labelKey: "hooks.eventNotification",
+    hintKey: "hooks.eventNotificationHint",
+    matcherPlaceholder: "awaiting_permission|agent_error|turn_completed",
+    samplePayload: {
+      kind: "awaiting_permission",
+      target: "awaiting_permission",
+      agent_title: "Dry-run session",
+      message: "Awaiting tool approval",
+    },
   },
   {
     id: "turn_stop",
-    label: "Turn Stop",
-    hint: "When an agent turn settles to idle",
+    labelKey: "hooks.eventTurnStop",
+    hintKey: "hooks.eventTurnStopHint",
+    matcherPlaceholder: "claude_code|codex",
     samplePayload: { provider: "claude_code", target: "claude_code" },
   },
   {
     id: "session_end",
-    label: "Session End",
-    hint: "When a session exits or is archived",
+    labelKey: "hooks.eventSessionEnd",
+    hintKey: "hooks.eventSessionEndHint",
+    matcherPlaceholder: "claude_code|codex",
     samplePayload: { provider: "claude_code", target: "claude_code", reason: "archived" },
   },
 ];
-
-const EVENT_OPTIONS: SettingSelectOption<HookEventKind>[] = HOOK_EVENTS.map((ev) => ({
-  value: ev.id,
-  label: ev.label,
-  description: ev.hint,
-}));
 
 function eventMeta(kind: HookEventKind) {
   return HOOK_EVENTS.find((e) => e.id === kind) ?? HOOK_EVENTS[0];
@@ -222,10 +242,20 @@ function HookEditorModal({
   onSave: (rule: LifecycleHookRule) => Promise<void>;
   onDelete: (rule: LifecycleHookRule) => Promise<void>;
 }) {
+  const { t } = useI18n();
   const [scope, setScope] = useState<HookScope>(
     () => editing?.scope ?? (hasProjectCwd ? "project_orbit" : "user_global"),
   );
-  const [event, setEvent] = useState<HookEventKind>(() => editing?.event ?? "pre_prompt_submit");
+  const [event, setEvent] = useState<HookEventKind>(() => editing?.event ?? "pre_tool_use");
+  const eventOptions: SettingSelectOption<HookEventKind>[] = useMemo(
+    () =>
+      HOOK_EVENTS.map((ev) => ({
+        value: ev.id,
+        label: t(ev.labelKey),
+        description: t(ev.hintKey),
+      })),
+    [t],
+  );
   const [name, setName] = useState(() => editing?.name ?? "");
   const [description, setDescription] = useState(() => editing?.description ?? "");
   const [matcher, setMatcher] = useState(() => editing?.matcher ?? "");
@@ -393,8 +423,10 @@ function HookEditorModal({
         className="flex max-h-[88vh] max-w-[540px] flex-col gap-0 p-0"
       >
         <DialogHeader className="px-5 pt-5 pr-12 pb-4">
-          <DialogTitle>{editing ? `Edit ${editing.name}` : "Add Lifecycle Hook"}</DialogTitle>
-          <DialogDescription>{eventMeta(event).hint}</DialogDescription>
+          <DialogTitle>
+            {editing ? t("hooks.editHookTitle", { name: editing.name }) : t("hooks.addHookTitle")}
+          </DialogTitle>
+          <DialogDescription>{t(eventMeta(event).hintKey)}</DialogDescription>
         </DialogHeader>
 
         <form
@@ -430,7 +462,7 @@ function HookEditorModal({
               <FieldLabel>Event</FieldLabel>
               <SettingSelect
                 value={event}
-                options={EVENT_OPTIONS}
+                options={eventOptions}
                 disabled={busy}
                 onChange={setEvent}
                 triggerClassName="h-[32px] w-full"
@@ -464,7 +496,7 @@ function HookEditorModal({
                 value={matcher}
                 disabled={busy}
                 onChange={(e) => setMatcher(e.target.value)}
-                placeholder="*.rs|*.ts or codex"
+                placeholder={eventMeta(event).matcherPlaceholder}
                 className="font-mono text-[12px]"
               />
             </Field>
@@ -556,8 +588,7 @@ function HookEditorModal({
                   </Field>
                 </div>
                 <FieldDescription className="text-[11px]">
-                  Event JSON is piped to stdin. Exit <code className="font-mono">0</code> allows (or
-                  returns JSON decision), exit <code className="font-mono">2</code> blocks.
+                  {t("hooks.commandStdinHint")}
                   {editing && hasMaskedValues(envText)
                     ? " Leave masked •••• values unchanged to preserve stored secrets."
                     : ""}
@@ -675,6 +706,7 @@ function HookEditorModal({
 }
 
 export function HostHooksSection({ hostId }: { hostId: string }) {
+  const { t } = useI18n();
   const hostCard = useOrbitSelector(
     (s) => s.fleet.hosts.find((h) => h.host_id === hostId) ?? null,
   );
@@ -820,8 +852,8 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
   return (
     <div className="space-y-5">
       <SettingSectionHeader
-        title="Lifecycle Hooks"
-        description="Deterministic commands and webhooks triggered on session, prompt, edit, and turn events."
+        title={t("hooks.title")}
+        description={t("hooks.description")}
         action={
           isOnline ? (
             <div className="flex items-center gap-1.5">
@@ -829,7 +861,7 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
                 type="button"
                 disabled={isLoading}
                 onClick={refresh}
-                aria-label="Refresh hooks"
+                aria-label={t("hooks.refreshAria")}
                 className="border-border bg-background hover:bg-accent text-foreground inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-lg border transition-colors disabled:opacity-50"
               >
                 <RefreshCw className={cn("h-[12.5px] w-[12.5px]", isLoading && "animate-spin")} />
@@ -843,7 +875,7 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
                 className="bg-foreground text-background hover:opacity-90 inline-flex h-[28px] cursor-pointer items-center gap-1 rounded-lg px-2.5 text-[12px] font-medium transition-opacity"
               >
                 <Plus className="h-[13px] w-[13px]" />
-                Add Hook
+                {t("hooks.addHook")}
               </button>
             </div>
           ) : undefined
@@ -853,7 +885,7 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
       {!isOnline ? (
         <SettingCard>
           <div className="text-muted-foreground px-4 py-6 text-center text-[13px]">
-            Connect to this host to manage lifecycle hooks.
+            {t("hooks.offline")}
           </div>
         </SettingCard>
       ) : (
@@ -970,15 +1002,13 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
             <SettingCard>
               <div className="text-muted-foreground flex items-center justify-center gap-2 px-4 py-8 text-[12.5px]">
                 <Loader2 className="h-[14px] w-[14px] animate-spin" />
-                <span>Loading hooks…</span>
+                <span>{t("hooks.loading")}</span>
               </div>
             </SettingCard>
           ) : groupedByEvent.length === 0 ? (
             <SettingCard>
               <div className="flex flex-col items-center gap-2 px-4 py-8 text-center">
-                <p className="text-muted-foreground text-[12.5px]">
-                  No lifecycle hooks configured yet.
-                </p>
+                <p className="text-muted-foreground text-[12.5px]">{t("hooks.empty")}</p>
                 <button
                   type="button"
                   onClick={() => {
@@ -988,7 +1018,7 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
                   className="border-border bg-background hover:bg-accent text-foreground inline-flex h-[28px] cursor-pointer items-center gap-1 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
                 >
                   <Plus className="h-[12.5px] w-[12.5px]" />
-                  Add Hook
+                  {t("hooks.addHook")}
                 </button>
               </div>
             </SettingCard>
@@ -997,7 +1027,7 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
               {groupedByEvent.map(({ event, rules }) => (
                 <div key={event.id} className="space-y-1.5">
                   <SettingGroupLabel>
-                    {event.label}{" "}
+                    {t(event.labelKey)}{" "}
                     <span className="font-normal opacity-70">· {rules.length}</span>
                   </SettingGroupLabel>
                   <SettingCard>
@@ -1135,7 +1165,7 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
                               {run.hook_name}
                             </span>
                             <span className="text-muted-foreground shrink-0 text-[11px]">
-                              {eventMeta(run.event).label}
+                              {t(eventMeta(run.event).labelKey)}
                             </span>
                             {run.matched_target && (
                               <span className="text-muted-foreground/80 truncate font-mono text-[10.5px]">

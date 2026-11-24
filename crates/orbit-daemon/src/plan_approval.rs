@@ -218,6 +218,7 @@ mod tests {
                 allowed_prompts: Vec::new(),
                 source: Some(source.into()),
             }),
+            human_only: true,
             created_at: Utc::now(),
         }
     }

@@ -27,7 +27,8 @@ use crate::DaemonRuntime;
 use crate::browser::CreateBrowserSessionSpec;
 use crate::goals::{GoalCriterionPatch, StartGoalSpec, StartMonitorSpec, authorize_agent_control};
 use crate::manager::{
-    CreateAgentSpec, CreateWorkspaceSpec, ExecuteWorktreeHandoffSpec, ForkAgentSpec,
+    CreateAgentSpec, CreateWorkspaceSpec, DaemonBroadcast, ExecuteWorktreeHandoffSpec,
+    ForkAgentSpec,
 };
 use crate::messaging::{AgentPromptSource, QueuedAgentMessage};
 use crate::workflows::{
@@ -519,6 +520,26 @@ pub async fn execute_tool(
     name: &str,
     args: Value,
 ) -> ToolExecResult {
+    execute_tool_with_context(
+        runtime,
+        caller_agent_id,
+        name,
+        args,
+        &crate::hooks::HookOriginContext::default(),
+    )
+    .await
+}
+
+/// Execute any Orbit orchestration tool with verified hook-origin provenance so callbacks from a
+/// running hook suppress recursive `PostToolUse` loops and self-rule re-entry without bypassing
+/// unrelated `PreToolUse` security rules.
+pub async fn execute_tool_with_context(
+    runtime: &Arc<DaemonRuntime>,
+    caller_agent_id: Option<&str>,
+    name: &str,
+    args: Value,
+    hook_origin: &crate::hooks::HookOriginContext,
+) -> ToolExecResult {
     let policy = resolve_caller_policy(runtime, caller_agent_id);
     if !policy.enabled || policy.disabled_tools.iter().any(|d| d == name) {
         return ToolExecResult::err(format!(
@@ -550,28 +571,161 @@ pub async fn execute_tool(
         ));
     }
 
-    match execute_tool_inner(runtime, caller_agent_id, &resolved, &args).await {
-        Ok(val) => ToolExecResult::ok(val),
-        Err(e) => {
-            if let Some(cas_err) = e.downcast_ref::<BoardCasConflictError>() {
-                let structured = json!({
-                    "error": cas_err.to_string(),
-                    "conflict": true,
-                    "expected_revision": cas_err.expected,
-                    "current_revision": cas_err.current_board.revision,
-                    "current_board": cas_err.current_board,
-                });
-                let text =
-                    serde_json::to_string_pretty(&structured).unwrap_or_else(|_| e.to_string());
-                return ToolExecResult {
-                    is_error: true,
-                    structured,
-                    text,
-                };
-            }
-            ToolExecResult::err(e.to_string())
-        }
+    // Security invariant: derive hook `cwd` strictly from the authorized caller agent's cwd
+    // (NEVER from untrusted raw MCP `arguments.cwd`). When no authorized caller exists, `hook_cwd`
+    // stays `None` so project-scoped hooks are never loaded from an untrusted path and global
+    // hooks execute inside `$ORBIT_HOME`.
+    let caller = caller_agent_id.and_then(|id| runtime.store.get_agent(id).ok().flatten());
+    let hook_cwd = caller.as_ref().map(|c| PathBuf::from(&c.cwd));
+    let provider_slug = caller.as_ref().map(|c| c.provider.slug().to_string());
+    let mut hook_targets = vec![resolved.clone()];
+    if name != resolved {
+        hook_targets.push(name.to_string());
     }
+
+    // Synchronous PreToolUse lifecycle hook gate before executing any Orbit MCP tool.
+    // When invoked from inside an active hook subprocess, skip only the originating rule ID so
+    // unrelated PreToolUse security hooks still enforce policy while preventing self-recursion.
+    let skip_rule_id = if hook_origin.from_hook {
+        hook_origin.origin_rule_id.as_deref()
+    } else {
+        None
+    };
+    let pre_payload = json!({
+        "event": "pre_tool_use",
+        "agent_id": caller_agent_id,
+        "workspace_id": caller.as_ref().map(|c| c.workspace_id.as_str()),
+        "cwd": hook_cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
+        "tool_name": &resolved,
+        "raw_tool_name": name,
+        "tool_input": &args,
+        "tool_detail": {
+            "kind": "mcp",
+            "tool_name": &resolved,
+            "arguments": &args,
+        },
+        "provider": provider_slug.as_deref(),
+    });
+    let pre_outcome = runtime
+        .hooks
+        .dispatch_event_with_options(
+            orbit_protocol::HookEventKind::PreToolUse,
+            hook_cwd.as_deref(),
+            &hook_targets,
+            pre_payload,
+            skip_rule_id,
+        )
+        .await;
+    if pre_outcome.decision == orbit_protocol::HookDecision::Block {
+        let hook_name = pre_outcome
+            .blocking_hook_name
+            .as_deref()
+            .unwrap_or("lifecycle hook");
+        let reason = pre_outcome
+            .reason
+            .as_deref()
+            .unwrap_or("blocked by PreToolUse hook");
+        if let Some(cid) = caller_agent_id {
+            let notice = TimelinePayload::Notice {
+                level: "warning".into(),
+                message: format!("PreToolUse hook `{hook_name}` blocked `{resolved}`: {reason}"),
+            };
+            if let Ok((saved_ev, mutated)) = runtime
+                .store
+                .append_timeline_event_deduped(cid, 1, None, notice)
+                && mutated
+            {
+                let _ = runtime
+                    .orchestrator
+                    .broadcast_tx
+                    .send(DaemonBroadcast::TimelineLive(saved_ev));
+            }
+        }
+        return ToolExecResult::err(format!(
+            "Tool `{resolved}` blocked by PreToolUse hook `{hook_name}`: {reason}"
+        ));
+    }
+
+    // Strict `updated_input` enforcement: must be a JSON object (preserving tool-name immutability).
+    // If a PreToolUse hook supplies a malformed / non-object `updated_input`, fail closed instead
+    // of silently running the unrewritten arguments.
+    let effective_args = match pre_outcome.updated_input {
+        Some(updated) if updated.is_object() => updated,
+        Some(_) => {
+            let reason =
+                "PreToolUse hook returned malformed non-object `updated_input` (fail-closed)";
+            if let Some(cid) = caller_agent_id {
+                let notice = TimelinePayload::Notice {
+                    level: "warning".into(),
+                    message: format!("Blocked `{resolved}`: {reason}"),
+                };
+                if let Ok((saved_ev, mutated)) = runtime
+                    .store
+                    .append_timeline_event_deduped(cid, 1, None, notice)
+                    && mutated
+                {
+                    let _ = runtime
+                        .orchestrator
+                        .broadcast_tx
+                        .send(DaemonBroadcast::TimelineLive(saved_ev));
+                }
+            }
+            return ToolExecResult::err(format!("Tool `{resolved}` blocked: {reason}"));
+        }
+        None => args,
+    };
+
+    let exec_result =
+        match execute_tool_inner(runtime, caller_agent_id, &resolved, &effective_args).await {
+            Ok(val) => ToolExecResult::ok(val),
+            Err(e) => {
+                if let Some(cas_err) = e.downcast_ref::<BoardCasConflictError>() {
+                    let structured = json!({
+                        "error": cas_err.to_string(),
+                        "conflict": true,
+                        "expected_revision": cas_err.expected,
+                        "current_revision": cas_err.current_board.revision,
+                        "current_board": cas_err.current_board,
+                    });
+                    let text =
+                        serde_json::to_string_pretty(&structured).unwrap_or_else(|_| e.to_string());
+                    ToolExecResult {
+                        is_error: true,
+                        structured,
+                        text,
+                    }
+                } else {
+                    ToolExecResult::err(e.to_string())
+                }
+            }
+        };
+
+    // Bounded asynchronous PostToolUse hook dispatch after MCP tool completion.
+    // Suppressed when this MCP call originated from an active hook subprocess to break
+    // cross-MCP `PostToolUse -> orbit mcp -> PostToolUse` infinite loops.
+    if !hook_origin.from_hook {
+        let post_payload = json!({
+            "event": "post_tool_use",
+            "agent_id": caller_agent_id,
+            "workspace_id": caller.as_ref().map(|c| c.workspace_id.as_str()),
+            "cwd": hook_cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
+            "provider": provider_slug.as_deref(),
+            "tool_name": &resolved,
+            "raw_tool_name": name,
+            "status": if exec_result.is_error { "failed" } else { "completed" },
+            "exit_code": if exec_result.is_error { Some(1) } else { Some(0) },
+            "output_preview": crate::hooks::truncate_hook_preview(&exec_result.text, 2048),
+            "modified_files": Vec::<String>::new(),
+        });
+        let _ = runtime.hooks.dispatch_event_async_with_targets(
+            orbit_protocol::HookEventKind::PostToolUse,
+            hook_cwd,
+            hook_targets,
+            post_payload,
+        );
+    }
+
+    exec_result
 }
 
 async fn execute_tool_inner(
@@ -2094,12 +2248,16 @@ async fn execute_tool_inner(
                     .await?;
                 match list_resp {
                     WireMessage::PendingPermissionsSnapshot { permissions, .. } => {
-                        if permissions
-                            .iter()
-                            .any(|p| p.request_id == request_id && p.plan_approval.is_some())
-                        {
+                        if permissions.iter().any(|p| {
+                            p.request_id == request_id
+                                && (p.plan_approval.is_some()
+                                    || p.human_only
+                                    || p.guardian_assessment.as_ref().is_some_and(
+                                        crate::guardian::assessment_requires_human_only,
+                                    ))
+                        }) {
                             anyhow::bail!(
-                                "plan approval gate `{request_id}` requires explicit human review and cannot be resolved by an agent"
+                                "permission `{request_id}` requires explicit human review and cannot be resolved by an agent"
                             );
                         }
                     }
@@ -5576,5 +5734,549 @@ mod tests {
             parse_turn_behavior(Some("interrupt")),
             ActiveTurnBehavior::Interrupt
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_execute_tool_enforces_pre_tool_use_block_updated_input_and_fires_post_tool_use() {
+        let tmp_home = std::env::temp_dir().join(format!(
+            "orbit-tools-hooks-b303-{}",
+            Uuid::new_v4().simple()
+        ));
+        let ws_dir = tmp_home.join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("mkdir repo");
+        let post_log = tmp_home.join("mcp_post.jsonl");
+
+        let rt = DaemonRuntime::bootstrap(&tmp_home)
+            .await
+            .expect("bootstrap runtime");
+
+        let now = Utc::now();
+        rt.store
+            .upsert_workspace(&orbit_protocol::WorkspaceSummary {
+                workspace_id: "ws_mcp_hk".into(),
+                title: "MCP Hook WS".into(),
+                cwd: ws_dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: true,
+            })
+            .expect("upsert ws");
+        rt.store
+            .upsert_agent(
+                &orbit_protocol::AgentSummary {
+                    agent_id: "ag_mcp_hk".into(),
+                    workspace_id: "ws_mcp_hk".into(),
+                    cwd: ws_dir.to_string_lossy().to_string(),
+                    title: "MCP Caller".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::Default,
+                    status: orbit_protocol::AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: orbit_protocol::AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: Some("caller".into()),
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        // 1. PreToolUse block hook on `workspace_board_update` rejects execution fail-closed.
+        rt.hooks
+            .upsert_hook(
+                None,
+                orbit_protocol::LifecycleHookRule {
+                    id: "hk_mcp_block".into(),
+                    name: "Freeze Board".into(),
+                    scope: orbit_protocol::HookScope::UserGlobal,
+                    event: orbit_protocol::HookEventKind::PreToolUse,
+                    matcher: Some("workspace_board_update".into()),
+                    action: orbit_protocol::HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec!["-c".into(), "echo 'board frozen' >&2; exit 2".into()],
+                        env: std::collections::BTreeMap::new(),
+                    },
+                    timeout_ms: 5_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert block hook");
+
+        // 2. PostToolUse capture hook on `list_workspaces`.
+        rt.hooks
+            .upsert_hook(
+                None,
+                orbit_protocol::LifecycleHookRule {
+                    id: "hk_mcp_post".into(),
+                    name: "Log MCP Post".into(),
+                    scope: orbit_protocol::HookScope::UserGlobal,
+                    event: orbit_protocol::HookEventKind::PostToolUse,
+                    matcher: Some("list_workspaces".into()),
+                    action: orbit_protocol::HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec![
+                            "-c".into(),
+                            format!(
+                                "cat >> '{}'; printf '\\n' >> '{}'",
+                                post_log.display(),
+                                post_log.display()
+                            ),
+                        ],
+                        env: std::collections::BTreeMap::new(),
+                    },
+                    timeout_ms: 5_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert post hook");
+
+        let blocked = execute_tool(
+            &rt,
+            Some("ag_mcp_hk"),
+            "workspace_board",
+            json!({ "action": "update", "content": "should not persist" }),
+        )
+        .await;
+        assert!(blocked.is_error);
+        assert!(blocked.text.contains("Freeze Board"));
+        assert!(blocked.text.contains("board frozen"));
+
+        // Verify blocked MCP tool surfaced timeline notice and did NOT mutate the board.
+        let read_after_block =
+            execute_tool(&rt, Some("ag_mcp_hk"), "workspace_board_read", json!({})).await;
+        assert!(!read_after_block.is_error);
+        assert!(
+            !read_after_block.structured["board"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("should not persist")
+        );
+
+        // Execute an allowed MCP tool and verify PostToolUse fires asynchronously.
+        let allowed = execute_tool(
+            &rt,
+            Some("ag_mcp_hk"),
+            "orbit_workspace",
+            json!({ "action": "list" }),
+        )
+        .await;
+        assert!(!allowed.is_error);
+        rt.hooks.wait_async_idle().await;
+
+        let post_raw = std::fs::read_to_string(&post_log).expect("read mcp post log");
+        let post_val: Value = serde_json::from_str(post_raw.trim()).expect("parse mcp post json");
+        assert_eq!(post_val["event"], "post_tool_use");
+        assert_eq!(post_val["tool_name"], "list_workspaces");
+        assert_eq!(post_val["status"], "completed");
+        assert_eq!(post_val["exit_code"], 0);
+
+        rt.browser.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(&tmp_home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_updated_input_fails_closed_on_malformed_type_and_ignores_untrusted_args_cwd() {
+        let tmp_home = std::env::temp_dir().join(format!(
+            "orbit-tools-audit-b303-{}",
+            Uuid::new_v4().simple()
+        ));
+        let auth_ws = tmp_home.join("auth_repo");
+        let untrusted_ws = tmp_home.join("untrusted_attacker_dir");
+        std::fs::create_dir_all(&auth_ws).expect("mkdir auth_ws");
+        std::fs::create_dir_all(&untrusted_ws).expect("mkdir untrusted_ws");
+        let payload_capture = tmp_home.join("pre_payload.jsonl");
+
+        let rt = DaemonRuntime::bootstrap(&tmp_home)
+            .await
+            .expect("bootstrap runtime");
+        let now = Utc::now();
+        rt.store
+            .upsert_workspace(&orbit_protocol::WorkspaceSummary {
+                workspace_id: "ws_auth_1".into(),
+                title: "Auth WS".into(),
+                cwd: auth_ws.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: true,
+            })
+            .expect("upsert ws");
+        rt.store
+            .upsert_agent(
+                &orbit_protocol::AgentSummary {
+                    agent_id: "ag_auth_1".into(),
+                    workspace_id: "ws_auth_1".into(),
+                    cwd: auth_ws.to_string_lossy().to_string(),
+                    title: "Auth Caller".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::Default,
+                    status: orbit_protocol::AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: orbit_protocol::AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: Some("auth".into()),
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        // 1. Capture PreToolUse payload cwd and verify untrusted `arguments.cwd` is NEVER used.
+        rt.hooks
+            .upsert_hook(
+                None,
+                orbit_protocol::LifecycleHookRule {
+                    id: "hk_capture_cwd".into(),
+                    name: "Capture CWD".into(),
+                    scope: orbit_protocol::HookScope::UserGlobal,
+                    event: orbit_protocol::HookEventKind::PreToolUse,
+                    matcher: Some("list_workspaces".into()),
+                    action: orbit_protocol::HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec![
+                            "-c".into(),
+                            format!(
+                                "cat >> '{}'; printf '\\n' >> '{}'",
+                                payload_capture.display(),
+                                payload_capture.display()
+                            ),
+                        ],
+                        env: std::collections::BTreeMap::new(),
+                    },
+                    timeout_ms: 5_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert capture hook");
+
+        // Anonymous caller passing untrusted `arguments.cwd` -> hook payload `cwd` MUST be null.
+        let anon = execute_tool(
+            &rt,
+            None,
+            "list_workspaces",
+            json!({ "cwd": untrusted_ws.to_string_lossy().to_string() }),
+        )
+        .await;
+        assert!(!anon.is_error);
+
+        // Authorized caller passing untrusted `arguments.cwd` -> hook payload `cwd` MUST be auth_ws.
+        let authed = execute_tool(
+            &rt,
+            Some("ag_auth_1"),
+            "list_workspaces",
+            json!({ "cwd": untrusted_ws.to_string_lossy().to_string() }),
+        )
+        .await;
+        assert!(!authed.is_error);
+
+        let lines: Vec<Value> = std::fs::read_to_string(&payload_capture)
+            .expect("read capture")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("valid json"))
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0]["cwd"].is_null(),
+            "anonymous MCP call must NOT derive hook cwd from untrusted arguments.cwd: {:?}",
+            lines[0]
+        );
+        assert_eq!(
+            lines[1]["cwd"].as_str(),
+            Some(auth_ws.to_string_lossy().as_ref()),
+            "authorized MCP call must use caller agent's cwd, never untrusted arguments.cwd"
+        );
+
+        // 2. Malformed non-object `updated_input` (string and explicit null) MUST fail closed!
+        for (rule_id, tool_matcher, bad_json) in [
+            (
+                "hk_bad_str_input",
+                "workspace_board_update",
+                r#"{"decision":"modify","updated_input":"not-an-object"}"#,
+            ),
+            (
+                "hk_bad_null_input",
+                "workspace_board_read",
+                r#"{"decision":"modify","updated_input":null}"#,
+            ),
+        ] {
+            rt.hooks
+                .upsert_hook(
+                    None,
+                    orbit_protocol::LifecycleHookRule {
+                        id: rule_id.into(),
+                        name: "Bad Rewrite".into(),
+                        scope: orbit_protocol::HookScope::UserGlobal,
+                        event: orbit_protocol::HookEventKind::PreToolUse,
+                        matcher: Some(tool_matcher.into()),
+                        action: orbit_protocol::HookAction::Command {
+                            command: "/bin/sh".into(),
+                            args: vec!["-c".into(), format!("printf '{bad_json}'")],
+                            env: std::collections::BTreeMap::new(),
+                        },
+                        timeout_ms: 5_000,
+                        enabled: true,
+                        trusted: true,
+                        description: None,
+                    },
+                )
+                .await
+                .expect("upsert bad rewrite hook");
+        }
+
+        let res_str = execute_tool(
+            &rt,
+            Some("ag_auth_1"),
+            "workspace_board_update",
+            json!({ "content": "must not write" }),
+        )
+        .await;
+        assert!(res_str.is_error, "string updated_input must fail closed");
+        assert!(res_str.text.contains("updated_input"));
+
+        let res_null =
+            execute_tool(&rt, Some("ag_auth_1"), "workspace_board_read", json!({})).await;
+        assert!(
+            res_null.is_error,
+            "explicit null updated_input must fail closed"
+        );
+        assert!(res_null.text.contains("updated_input"));
+
+        rt.browser.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(&tmp_home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_cross_boundary_hook_provenance_prevents_loops_and_forged_headers() {
+        let tmp_home =
+            std::env::temp_dir().join(format!("orbit-tools-prov-b303-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&tmp_home).expect("mkdir home");
+        let post_log = tmp_home.join("prov_post.log");
+
+        let rt = DaemonRuntime::bootstrap(&tmp_home)
+            .await
+            .expect("bootstrap runtime");
+
+        // 1. Header verification: only live daemon-issued invocation token is accepted; forged headers fail.
+        let mut forged_headers = axum::http::HeaderMap::new();
+        forged_headers.insert(
+            crate::hooks::HOOK_ORIGIN_HTTP_HEADER,
+            axum::http::HeaderValue::from_static("1"),
+        );
+        forged_headers.insert(
+            crate::hooks::HOOK_ORIGIN_RULE_HTTP_HEADER,
+            axum::http::HeaderValue::from_static("hk_other_pre"),
+        );
+        forged_headers.insert(
+            crate::hooks::HOOK_ORIGIN_TOKEN_HTTP_HEADER,
+            axum::http::HeaderValue::from_static("forged_token_0000000000000000000000000000"),
+        );
+        let forged_ctx = crate::mcp::extract_verified_hook_origin(&rt, &forged_headers);
+        assert!(
+            !forged_ctx.from_hook && forged_ctx.origin_rule_id.is_none(),
+            "forged hook provenance headers MUST be ignored"
+        );
+
+        let (live_tok, guard) = rt.hooks.register_active_invocation("hk_self_pre");
+        let mut valid_headers = axum::http::HeaderMap::new();
+        valid_headers.insert(
+            crate::hooks::HOOK_ORIGIN_TOKEN_HTTP_HEADER,
+            axum::http::HeaderValue::from_str(&live_tok).expect("hdr"),
+        );
+        let verified_ctx = crate::mcp::extract_verified_hook_origin(&rt, &valid_headers);
+        assert!(verified_ctx.from_hook);
+        assert_eq!(verified_ctx.origin_rule_id.as_deref(), Some("hk_self_pre"));
+
+        drop(guard);
+        let expired_ctx = crate::mcp::extract_verified_hook_origin(&rt, &valid_headers);
+        assert!(
+            !expired_ctx.from_hook,
+            "expired invocation token must no longer verify after hook exits"
+        );
+
+        // 2. Hook provenance suppresses PostToolUse AND self-rule re-entry while STILL enforcing
+        //    unrelated PreToolUse security rules!
+        rt.hooks
+            .upsert_hook(
+                None,
+                orbit_protocol::LifecycleHookRule {
+                    id: "hk_self_pre".into(),
+                    name: "Self Pre".into(),
+                    scope: orbit_protocol::HookScope::UserGlobal,
+                    event: orbit_protocol::HookEventKind::PreToolUse,
+                    matcher: Some("list_workspaces".into()),
+                    action: orbit_protocol::HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec!["-c".into(), "echo 'blocked by self' >&2; exit 2".into()],
+                        env: std::collections::BTreeMap::new(),
+                    },
+                    timeout_ms: 5_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert self pre");
+        rt.hooks
+            .upsert_hook(
+                None,
+                orbit_protocol::LifecycleHookRule {
+                    id: "hk_other_pre".into(),
+                    name: "Other Security Pre".into(),
+                    scope: orbit_protocol::HookScope::UserGlobal,
+                    event: orbit_protocol::HookEventKind::PreToolUse,
+                    matcher: Some("list_workspaces".into()),
+                    action: orbit_protocol::HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec!["-c".into(), "echo 'blocked by other' >&2; exit 2".into()],
+                        env: std::collections::BTreeMap::new(),
+                    },
+                    timeout_ms: 5_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert other pre");
+        rt.hooks
+            .upsert_hook(
+                None,
+                orbit_protocol::LifecycleHookRule {
+                    id: "hk_post_wild".into(),
+                    name: "Wildcard Post".into(),
+                    scope: orbit_protocol::HookScope::UserGlobal,
+                    event: orbit_protocol::HookEventKind::PostToolUse,
+                    matcher: Some("*".into()),
+                    action: orbit_protocol::HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec![
+                            "-c".into(),
+                            format!("echo post >> '{}'", post_log.display()),
+                        ],
+                        env: std::collections::BTreeMap::new(),
+                    },
+                    timeout_ms: 5_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert post wild");
+
+        // Hook provenance for `hk_self_pre` MUST STILL be blocked by unrelated `hk_other_pre`!
+        let still_blocked =
+            execute_tool_with_context(&rt, None, "list_workspaces", json!({}), &verified_ctx).await;
+        assert!(still_blocked.is_error);
+        assert!(still_blocked.text.contains("Other Security Pre"));
+
+        // Remove `hk_other_pre`: now `hk_self_pre` is skipped (no self-loop), tool succeeds,
+        // and PostToolUse is suppressed so wildcard PostToolUse cannot loop infinitely.
+        rt.hooks
+            .delete_hook(None, "hk_other_pre", orbit_protocol::HookScope::UserGlobal)
+            .await
+            .expect("delete other pre");
+        let from_hook_ok =
+            execute_tool_with_context(&rt, None, "list_workspaces", json!({}), &verified_ctx).await;
+        assert!(!from_hook_ok.is_error);
+        rt.hooks.wait_async_idle().await;
+        assert!(
+            !post_log.exists(),
+            "PostToolUse must be suppressed for MCP calls originating from a hook"
+        );
+
+        // Normal non-hook call DOES fire PostToolUse once `hk_self_pre` is removed.
+        rt.hooks
+            .delete_hook(None, "hk_self_pre", orbit_protocol::HookScope::UserGlobal)
+            .await
+            .expect("delete self pre");
+        let normal_ok = execute_tool(&rt, None, "list_workspaces", json!({})).await;
+        assert!(!normal_ok.is_error);
+        rt.hooks.wait_async_idle().await;
+        let post_contents =
+            std::fs::read_to_string(&post_log).expect("normal call fires PostToolUse");
+        assert_eq!(post_contents.lines().count(), 1);
+
+        rt.browser.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(&tmp_home);
     }
 }

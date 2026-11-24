@@ -377,7 +377,11 @@ pub use shell_snapshot::{
     resolve_login_shell_env_cached, set_snapshot_orbit_home, shell_snapshot_stats,
     warm_login_shell_env_in_background,
 };
-pub use side_question::{SideQuestionSpec, run_ephemeral_text_prompt, run_side_question};
+pub use side_question::{
+    HardenedGuardianCommandSpec, SideQuestionSpec, build_hardened_guardian_command_spec,
+    is_hardened_guardian_provider, run_ephemeral_text_prompt, run_hardened_guardian_prompt,
+    run_side_question,
+};
 
 static PROVIDER_EXECUTABLE_OVERRIDES: OnceLock<RwLock<HashMap<ProviderKind, PathBuf>>> =
     OnceLock::new();

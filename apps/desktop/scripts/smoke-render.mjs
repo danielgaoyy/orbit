@@ -331,6 +331,34 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
             occupancy_pct: 0,
             segments: [],
           };
+        case "get_guardian_config":
+        case "update_guardian_config":
+          return {
+            config: args.config ?? {
+              enabled: true,
+              auto_approve_max_risk: "low",
+              use_ai_classifier_for_medium: true,
+              classifier_timeout_ms: 4000,
+              allow_read_only_tools: true,
+              allow_workspace_tests: true,
+              blocked_command_patterns: [],
+              trusted_command_prefixes: [],
+              llm_tier2_enabled: true,
+              llm_provider: null,
+              llm_model: null,
+              llm_timeout_ms: 8000,
+            },
+            recent_audits: [],
+          };
+        case "list_lifecycle_hooks":
+        case "upsert_lifecycle_hook":
+        case "delete_lifecycle_hook":
+        case "set_project_hooks_trust":
+          return {
+            hooks: [],
+            recent_executions: [],
+            project_hooks_trusted: false,
+          };
         case "list_im_channels":
         case "upsert_im_channel":
         case "delete_im_channel":

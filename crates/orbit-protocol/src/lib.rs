@@ -4975,6 +4975,10 @@ mod tests {
             allow_workspace_tests: true,
             blocked_command_patterns: vec!["rm -rf".into()],
             trusted_command_prefixes: vec!["just test".into()],
+            llm_tier2_enabled: true,
+            llm_provider: Some(ProviderKind::ClaudeCode),
+            llm_model: Some("claude-haiku-4-5".into()),
+            llm_timeout_ms: 8_000,
         };
         let audit = GuardianAuditEntry {
             id: "ga_1".into(),

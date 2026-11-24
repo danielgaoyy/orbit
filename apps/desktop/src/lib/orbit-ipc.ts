@@ -241,13 +241,23 @@ export interface GuardianPolicyConfig {
   allow_workspace_tests: boolean;
   blocked_command_patterns: string[];
   trusted_command_prefixes: string[];
+  llm_tier2_enabled?: boolean;
+  llm_provider?: ProviderKind | null;
+  llm_model?: string | null;
+  llm_timeout_ms?: number;
 }
 
 export interface GuardianAssessment {
   risk_level: GuardianRiskLevel;
   decision: GuardianDecision;
   confidence: number;
-  classifier_tier: "deterministic" | "ai_rubric" | "fail_closed" | string;
+  classifier_tier:
+    | "deterministic_tier1"
+    | "deterministic"
+    | "llm_tier2"
+    | "heuristic_fallback"
+    | "fail_closed"
+    | string;
   reason: string;
   signals: string[];
   latency_ms: number;
@@ -950,6 +960,7 @@ export interface PendingPermissionSummary {
   allowed_decisions: string[];
   guardian_assessment?: GuardianAssessment | null;
   plan_approval?: PlanApprovalPayload | null;
+  human_only?: boolean;
   created_at: string;
 }
 

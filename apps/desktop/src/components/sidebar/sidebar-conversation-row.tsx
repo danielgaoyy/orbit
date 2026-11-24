@@ -313,10 +313,10 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
         <div className="grid shrink-0 items-center justify-items-end">
           <div
             className={cn(
-              "col-start-1 row-start-1 flex items-center gap-1.5 transition-opacity duration-100 motion-reduce:transition-none",
+              "col-start-1 row-start-1 flex items-center gap-1.5",
               menuOpen
-                ? "pointer-events-none opacity-0"
-                : "group-hover/item:pointer-events-none group-hover/item:opacity-0 group-focus-within/item:pointer-events-none group-focus-within/item:opacity-0",
+                ? "pointer-events-none invisible"
+                : "group-hover/item:pointer-events-none group-hover/item:invisible group-focus-within/item:pointer-events-none group-focus-within/item:invisible",
             )}
           >
             {contextLabel && (
@@ -347,9 +347,9 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
           <div
             data-thread-action="true"
             className={cn(
-              "col-start-1 row-start-1 flex items-center gap-0.5 transition-opacity duration-100 motion-reduce:transition-none",
+              "col-start-1 row-start-1 flex items-center gap-0.5",
               !menuOpen &&
-                "pointer-events-none opacity-0 group-hover/item:pointer-events-auto group-hover/item:opacity-100 group-focus-within/item:pointer-events-auto group-focus-within/item:opacity-100",
+                "pointer-events-none invisible group-hover/item:pointer-events-auto group-hover/item:visible group-focus-within/item:pointer-events-auto group-focus-within/item:visible",
             )}
             onClick={(e) => e.stopPropagation()}
           >

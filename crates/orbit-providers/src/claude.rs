@@ -427,6 +427,8 @@ async fn spawn_claude_shim_and_init(
         .map(|p| vec![p.to_path_buf()])
         .unwrap_or_default();
     let spec = ShimSpawnSpec {
+        sandbox: cfg.sandbox.clone(),
+        egress_proxy_url: None,
         shim_id: format!("claude_{}", cfg.agent_id),
         mode: ShimMode::Stdio,
         program: cfg.executable.to_string_lossy().to_string(),
@@ -3084,6 +3086,8 @@ mod tests {
 
     fn test_claude_cfg(fork_sid: Option<&str>, native_fork_only: bool) -> SessionLaunchConfig {
         SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_claude_fork_test".into(),
             provider: ProviderKind::ClaudeCode,
             executable: PathBuf::from("/bin/true"),
@@ -3120,6 +3124,8 @@ mod tests {
 
     fn sample_cfg(fast_mode: bool) -> SessionLaunchConfig {
         SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_claude_test".into(),
             provider: ProviderKind::ClaudeCode,
             executable: PathBuf::from("/usr/bin/claude"),
@@ -3909,6 +3915,8 @@ mod tests {
 
         // Run a real in-process `orbit_shim::run_shim` hosting `/bin/cat` with `cleanup_paths`.
         let shim_spec = ShimSpawnSpec {
+            sandbox: None,
+            egress_proxy_url: None,
             shim_id: "claude_ag-exit-1".into(),
             mode: ShimMode::Stdio,
             program: "/bin/cat".into(),

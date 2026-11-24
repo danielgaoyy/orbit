@@ -1139,6 +1139,178 @@ pub struct RemoteMessageSearchHit {
     pub cwd: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryStatus {
+    Hypothesis,
+    Confirmed,
+    NeedsRevalidation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryCategory {
+    Architecture,
+    Convention,
+    Debugging,
+    Workflow,
+    Decision,
+    Preference,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectMemoryItem {
+    pub id: String,
+    pub workspace_root: String,
+    pub title: String,
+    pub content: String,
+    pub category: MemoryCategory,
+    pub status: MemoryStatus,
+    pub confidence: f32,
+    #[serde(default)]
+    pub file_paths: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub source_provider: Option<String>,
+    pub source_agent_id: Option<String>,
+    pub source_path: Option<String>,
+    pub access_count: u64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub last_accessed_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectMemorySearchHit {
+    pub item: ProjectMemoryItem,
+    pub score: f64,
+    pub fts_rank: Option<usize>,
+    pub vector_rank: Option<usize>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryEmbeddingProvider {
+    #[default]
+    BuiltinHash,
+    OpenAiCompatible,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryEmbeddingConfig {
+    pub provider: MemoryEmbeddingProvider,
+    pub endpoint_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key_env: Option<String>,
+    pub auto_inject_budget_tokens: u32,
+}
+
+impl Default for MemoryEmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            provider: MemoryEmbeddingProvider::BuiltinHash,
+            endpoint_url: None,
+            model: None,
+            api_key_env: None,
+            auto_inject_budget_tokens: 1200,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxMode {
+    Off,
+    #[default]
+    WorkspaceWrite,
+    StrictReadOnly,
+}
+
+pub const SANDBOX_CREDENTIAL_PATHS: &[&str] = &[
+    "~/.ssh",
+    "~/.aws",
+    "~/.gnupg",
+    "~/.kube",
+    "~/.orbit/pairing-secret",
+    "~/.orbit/daemon.json",
+    "~/.orbit/config.json",
+    "~/.orbit/host-keypair.json",
+];
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SandboxPolicy {
+    pub mode: SandboxMode,
+    pub writable_roots: Vec<String>,
+    /// Additional exclusions. Platform wrappers always add the host credential paths.
+    pub denied_read_paths: Vec<String>,
+    pub allow_network: bool,
+    pub allowed_domains: Vec<String>,
+    pub denied_domains: Vec<String>,
+}
+
+impl Default for SandboxPolicy {
+    fn default() -> Self {
+        Self {
+            mode: SandboxMode::WorkspaceWrite,
+            writable_roots: Vec::new(),
+            denied_read_paths: SANDBOX_CREDENTIAL_PATHS
+                .iter()
+                .map(|p| (*p).into())
+                .collect(),
+            allow_network: false,
+            allowed_domains: Vec::new(),
+            denied_domains: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditChainVerification {
+    pub verified_entries: u64,
+    pub broken_seq: Option<u64>,
+    pub signed_checkpoints: u64,
+}
+
+#[derive(Debug, Clone, Default, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationConflict {
+    #[default]
+    Skip,
+    Overwrite,
+    Rename,
+}
+
+/// Strategy available on the daemon for restoring workspace files during a turn rewind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewindCheckpointKind {
+    GitTree,
+    RecordedDiffs,
+    #[default]
+    None,
+}
+
+/// Per-file preview entry computed prior to rewinding workspace files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewindPreviewFile {
+    /// Workspace-relative file path (normalized forward slashes, guaranteed traversal-free).
+    pub path: String,
+    /// Action rewinding will perform: `"modify"`, `"delete"`, `"restore"`.
+    pub action: String,
+    #[serde(default)]
+    pub additions: u32,
+    #[serde(default)]
+    pub deletions: u32,
+    /// Reverse unified diff from current disk state back to the pre-turn checkpoint.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reverse_unified_diff: String,
+    /// True when external edits were detected on disk relative to the agent's recorded changes.
+    #[serde(default)]
+    pub has_external_conflict: bool,
+}
+
 /// Client-to-Daemon and Daemon-to-Client RPC envelope over WebSocket / E2EE Relay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -1158,6 +1330,64 @@ pub enum WireMessage {
     },
     Pong {
         ts_ms: u64,
+    },
+
+    ListProjectMemories {
+        request_id: Uuid,
+        cwd: String,
+        status: Option<MemoryStatus>,
+        category: Option<MemoryCategory>,
+        query: Option<String>,
+        limit: Option<u32>,
+    },
+    ProjectMemoriesList {
+        request_id: Uuid,
+        cwd: String,
+        items: Vec<ProjectMemoryItem>,
+    },
+    UpsertProjectMemory {
+        request_id: Uuid,
+        cwd: String,
+        id: Option<String>,
+        title: String,
+        content: String,
+        category: MemoryCategory,
+        status: Option<MemoryStatus>,
+        #[serde(default)]
+        file_paths: Vec<String>,
+        #[serde(default)]
+        tags: Vec<String>,
+    },
+    ProjectMemorySaved {
+        request_id: Uuid,
+        item: ProjectMemoryItem,
+    },
+    ConfirmProjectMemory {
+        request_id: Uuid,
+        cwd: String,
+        id: String,
+    },
+    DeleteProjectMemory {
+        request_id: Uuid,
+        cwd: String,
+        id: String,
+    },
+    ProjectMemoryDeleted {
+        request_id: Uuid,
+        id: String,
+        deleted: bool,
+    },
+    RecallProjectMemories {
+        request_id: Uuid,
+        cwd: String,
+        query: String,
+        limit: Option<u32>,
+        include_unconfirmed: Option<bool>,
+    },
+    ProjectMemoryRecallResult {
+        request_id: Uuid,
+        cwd: String,
+        hits: Vec<ProjectMemorySearchHit>,
     },
 
     // Workspaces, Directory Browser & Git / Worktrees
@@ -1835,6 +2065,24 @@ pub enum WireMessage {
         request_id: Uuid,
         permissions: Vec<PendingPermissionSummary>,
     },
+    /// Preview the exact file-level changes and external conflicts before rewinding an agent.
+    PreviewRewindAgent {
+        request_id: Uuid,
+        agent_id: String,
+        #[serde(alias = "to_before_seq")]
+        to_seq: u64,
+    },
+    /// File-level dry-run preview returned for `PreviewRewindAgent`.
+    RewindPreviewResult {
+        request_id: Uuid,
+        agent_id: String,
+        to_seq: u64,
+        checkpoint_kind: RewindCheckpointKind,
+        #[serde(default)]
+        files: Vec<RewindPreviewFile>,
+        #[serde(default)]
+        external_conflicts: Vec<String>,
+    },
     /// Rewind an agent session to strictly before `to_before_seq` (removing that user prompt and all
     /// subsequent events), optionally restoring workspace files back to the pre-turn checkpoint.
     RewindAgent {
@@ -1843,6 +2091,9 @@ pub enum WireMessage {
         to_before_seq: u64,
         #[serde(default)]
         restore_files: bool,
+        /// Optional explicit subset of workspace-relative paths to restore when `restore_files` is true.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore_paths: Option<Vec<String>>,
     },
     /// Authoritative post-rewind timeline replacement broadcast to all subscribed clients.
     AgentRewound {
@@ -2925,6 +3176,63 @@ pub enum WireMessage {
         server_id: String,
     },
 
+    GetSandboxConfig {
+        request_id: Uuid,
+    },
+    UpdateSandboxConfig {
+        request_id: Uuid,
+        sandbox_policy: Option<SandboxPolicy>,
+    },
+    SandboxConfig {
+        request_id: Uuid,
+        sandbox_policy: Option<SandboxPolicy>,
+    },
+    GetAuditChainStatus {
+        request_id: Uuid,
+    },
+    AuditChainStatus {
+        request_id: Uuid,
+        verification: AuditChainVerification,
+    },
+    ExportAuditChain {
+        request_id: Uuid,
+        #[serde(default)]
+        after_seq: u64,
+    },
+    AuditChainExport {
+        request_id: Uuid,
+        jsonl: String,
+        next_after_seq: Option<u64>,
+    },
+    ExportDiagnosticBundle {
+        request_id: Uuid,
+    },
+    DiagnosticBundleReady {
+        request_id: Uuid,
+        bundle: serde_json::Value,
+    },
+    CompactAgentContext {
+        request_id: Uuid,
+        agent_id: String,
+    },
+    InspectExternalIdeMigration {
+        request_id: Uuid,
+        from: Option<String>,
+        cwd: Option<String>,
+        #[serde(default)]
+        conflict: MigrationConflict,
+    },
+    ExecuteExternalIdeMigration {
+        request_id: Uuid,
+        from: Option<String>,
+        cwd: Option<String>,
+        #[serde(default)]
+        conflict: MigrationConflict,
+    },
+    ExternalIdeMigrationResult {
+        request_id: Uuid,
+        items: serde_json::Value,
+    },
     // Usage Insights, Cost Ledger & Context Occupancy Telemetry
     GetUsageInsights {
         request_id: Uuid,
@@ -3624,6 +3932,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn project_memory_config_defaults_allow_offline_and_open_ai_compatible()
+    -> Result<(), serde_json::Error> {
+        let offline: MemoryEmbeddingConfig = serde_json::from_str("{}")?;
+        assert_eq!(offline.provider, MemoryEmbeddingProvider::BuiltinHash);
+        assert_eq!(offline.auto_inject_budget_tokens, 1200);
+        let dense: MemoryEmbeddingConfig = serde_json::from_value(serde_json::json!({
+            "provider":"open_ai_compatible","endpoint_url":"http://localhost:11434/v1/embeddings","model":"local"
+        }))?;
+        assert_eq!(dense.provider, MemoryEmbeddingProvider::OpenAiCompatible);
+        assert_eq!(dense.auto_inject_budget_tokens, 1200);
+        Ok(())
+    }
+
+    #[test]
     fn timeline_catchup_accepts_legacy_and_omits_empty_outlines() {
         let legacy = serde_json::json!({
             "op": "timeline_catchup", "request_id": Uuid::nil(),
@@ -4247,6 +4569,7 @@ mod tests {
             agent_id: "ag_rewind".into(),
             to_before_seq: 42,
             restore_files: true,
+            restore_paths: Some(vec!["src/main.rs".into()]),
         };
         let encoded = req.encode_zstd(3).expect("encode rewind request");
         match WireMessage::decode_zstd(&encoded).expect("decode rewind request") {
@@ -4255,11 +4578,70 @@ mod tests {
                 agent_id,
                 to_before_seq,
                 restore_files,
+                restore_paths,
             } => {
                 assert_eq!(request_id, req_id);
                 assert_eq!(agent_id, "ag_rewind");
                 assert_eq!(to_before_seq, 42);
                 assert!(restore_files);
+                assert_eq!(restore_paths, Some(vec!["src/main.rs".into()]));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let preview_req = WireMessage::PreviewRewindAgent {
+            request_id: req_id,
+            agent_id: "ag_rewind".into(),
+            to_seq: 42,
+        };
+        let encoded_preview_req = preview_req.encode_zstd(3).expect("encode preview rewind");
+        match WireMessage::decode_zstd(&encoded_preview_req).expect("decode preview rewind") {
+            WireMessage::PreviewRewindAgent {
+                request_id,
+                agent_id,
+                to_seq,
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(agent_id, "ag_rewind");
+                assert_eq!(to_seq, 42);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let preview_res = WireMessage::RewindPreviewResult {
+            request_id: req_id,
+            agent_id: "ag_rewind".into(),
+            to_seq: 42,
+            checkpoint_kind: RewindCheckpointKind::GitTree,
+            files: vec![RewindPreviewFile {
+                path: "src/main.rs".into(),
+                action: "modify".into(),
+                additions: 2,
+                deletions: 1,
+                reverse_unified_diff:
+                    "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1,2 @@\n-new\n+old\n+extra\n"
+                        .into(),
+                has_external_conflict: false,
+            }],
+            external_conflicts: vec!["README.md".into()],
+        };
+        let encoded_preview_res = preview_res.encode_zstd(3).expect("encode preview result");
+        match WireMessage::decode_zstd(&encoded_preview_res).expect("decode preview result") {
+            WireMessage::RewindPreviewResult {
+                request_id,
+                agent_id,
+                to_seq,
+                checkpoint_kind,
+                files,
+                external_conflicts,
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(agent_id, "ag_rewind");
+                assert_eq!(to_seq, 42);
+                assert_eq!(checkpoint_kind, RewindCheckpointKind::GitTree);
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].path, "src/main.rs");
+                assert_eq!(external_conflicts, vec!["README.md"]);
             }
             other => panic!("unexpected variant: {other:?}"),
         }

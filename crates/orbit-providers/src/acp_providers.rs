@@ -301,6 +301,8 @@ fn build_acp_spawn_spec(
     crate::shell_snapshot::merge_cached_shell_env_into_map(&mut env);
 
     ShimSpawnSpec {
+        sandbox: cfg.sandbox.clone(),
+        egress_proxy_url: None,
         shim_id: format!("{}_{}", cfg.provider.slug(), cfg.agent_id),
         mode: ShimMode::Stdio,
         program: cfg.executable.to_string_lossy().to_string(),
@@ -1324,6 +1326,8 @@ async fn run_acp_actor(
     let mut cancel_deadline: Option<tokio::time::Instant> = None;
     let (mut acp_cb_host, mut acp_cb_reply_rx) =
         crate::acp_callbacks::AcpCallbackHost::new(std::path::PathBuf::from(&cfg.cwd));
+    acp_cb_host.policy = cfg.sandbox.clone();
+    acp_cb_host.proxy = cfg.egress_proxy_url.clone();
 
     loop {
         tokio::select! {
@@ -3237,6 +3241,8 @@ mod tests {
         seq_tracker: Arc<AtomicU64>,
     ) -> SessionLaunchConfig {
         SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: agent_id.to_string(),
             provider,
             executable: script.to_path_buf(),

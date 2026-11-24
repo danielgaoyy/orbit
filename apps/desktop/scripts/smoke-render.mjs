@@ -97,6 +97,7 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
     touched_files: [],
     background_tasks: [],
     subagents: [],
+    ancestor_lineage: [],
     detected_local_urls: [],
   };
 
@@ -164,6 +165,21 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
           return { applied: false, modified_files: [], total_edits: 0 };
         case "get_cloud_sync_status":
           return null;
+        case "preview_rewind_agent":
+          return {
+            agent_id: typeof args?.agentId === "string" ? args.agentId : "ag_smoke_1",
+            to_seq: typeof args?.toSeq === "number" ? args.toSeq : 0,
+            checkpoint_kind: "none",
+            files: [],
+            external_conflicts: [],
+          };
+        case "send_native_approval_notification":
+          return {
+            delivered: true,
+            interactive: false,
+            actions_mode: "open_to_review_only",
+            backend: "smoke_mock",
+          };
         case "get_fleet_overview":
           return {
             revision: 1,
@@ -599,6 +615,7 @@ const MOCK_TAURI_PAGINATED_INIT_SCRIPT = (() => {
           touched_files: [],
           background_tasks: [],
           subagents: [],
+          ancestor_lineage: [],
           detected_local_urls: [],
         },
         latest_seq: 358,

@@ -8,6 +8,7 @@ import {
   ChevronsUpDown,
   CircleDot,
   Clock,
+  LayoutGrid,
   List,
   ListFilter,
   Plus,
@@ -16,7 +17,7 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
-import { modSymbol } from "@/lib/keybindings";
+import { useActionShortcutDisplay } from "@/lib/keybindings";
 import {
   type AgentCardView,
   type HostCardView,
@@ -104,9 +105,12 @@ export const FleetSidebar = memo(function FleetSidebar() {
   const { t } = useI18n();
   const ime = useImeCompositionGuard();
   const isMac = isMacDesktop();
-  const mod = modSymbol();
+  const newConvShortcut = useActionShortcutDisplay("new_conversation");
+  const filterSidebarShortcut = useActionShortcutDisplay("sidebar_filter");
+  const globalOverviewShortcut = useActionShortcutDisplay("open_global_overview");
   const singleHostMode = fleet.hosts.length <= 1;
   const isAutomationsActive = workspacePanel === "automations";
+  const isOverviewActive = workspacePanel === "overview";
   const hasFilterActive = sidebarThreadFilter === "active_unread";
 
   const [expandedMoreProjects, setExpandedMoreProjects] = useState<Record<string, boolean>>({});
@@ -138,6 +142,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
   const showFilterBar = filterOpen || isFilteringThreads;
 
   // Respond to global `⌘F` / `Ctrl+F` (`orbitActions.focusSidebarFilter()`)
+  const settingsShortcut = useActionShortcutDisplay("open_settings");
   const lastFilterNonceRef = useRef(sidebarFilterFocusNonce);
   useEffect(() => {
     if (sidebarFilterFocusNonce === lastFilterNonceRef.current) return;
@@ -499,7 +504,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
           size="md"
           active={showFilterBar}
           tooltip={t("sidebar.filterThreadsAria")}
-          shortcut={`${mod}⇧F`}
+          shortcut={filterSidebarShortcut}
           indicatorTone={isFilteringThreads ? "info" : "none"}
           onMouseDown={(e) => {
             if (showFilterBar && !isFilteringThreads) {
@@ -549,7 +554,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                 <span className="truncate">{t("sidebar.newConversation")}</span>
               </span>
               <ShortcutKbd
-                keys={`${mod}N`}
+                keys={newConvShortcut}
                 size="xs"
                 variant="subtle"
                 className="shrink-0 opacity-0 transition-opacity group-hover/new:opacity-100"
@@ -612,39 +617,60 @@ export const FleetSidebar = memo(function FleetSidebar() {
             selectedAgentId === activeRouter.agent.agent_id;
 
           return (
-            <button
-              type="button"
-              onClick={() => {
-                if (activeRouter) {
-                  orbitActions.selectAgent(activeRouter.hostId, activeRouter.agent.agent_id);
-                } else {
-                  orbitActions.openSettings("personal_router");
-                }
-              }}
-              className={cn(
-                "flex h-[30px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 text-left text-[13px] transition-colors",
-                isRouterActive
-                  ? "bg-accent text-ink-primary font-medium"
-                  : "text-ink-secondary hover:bg-accent/55 hover:text-ink-primary",
-              )}
-            >
-              <span className="flex min-w-0 flex-1 items-center gap-2.5">
-                <span className="inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
-                  <Sparkles
-                    className={cn(
-                      "size-[14.5px] stroke-[1.75]",
-                      isRouterActive ? "text-ink-primary" : "text-ink-muted",
-                    )}
-                  />
+            <div className="group/pa flex items-center gap-0.5">
+              <button
+                type="button"
+                onClick={() => {
+                  if (activeRouter) {
+                    orbitActions.selectAgent(activeRouter.hostId, activeRouter.agent.agent_id);
+                  } else {
+                    orbitActions.openGlobalOverview();
+                  }
+                }}
+                className={cn(
+                  "flex h-[30px] min-w-0 flex-1 cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 text-left text-[13px] transition-colors",
+                  isRouterActive
+                    ? "bg-accent text-ink-primary font-medium"
+                    : "text-ink-secondary hover:bg-accent/55 hover:text-ink-primary",
+                )}
+              >
+                <span className="flex min-w-0 flex-1 items-center gap-2.5">
+                  <span className="inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
+                    <Sparkles
+                      className={cn(
+                        "size-[14.5px] stroke-[1.75]",
+                        isRouterActive ? "text-ink-primary" : "text-ink-muted",
+                      )}
+                    />
+                  </span>
+                  <span className="truncate">{t("sidebar.personalRouter")}</span>
                 </span>
-                <span className="truncate">{t("sidebar.personalRouter")}</span>
-              </span>
-              {activeRouter && (
-                <span className="text-ink-faint max-w-20 shrink-0 truncate text-[11px]">
-                  {activeRouter.hostName}
-                </span>
-              )}
-            </button>
+                {activeRouter && (
+                  <span className="text-ink-faint max-w-20 shrink-0 truncate text-[11px]">
+                    {activeRouter.hostName}
+                  </span>
+                )}
+              </button>
+              <SimpleTooltip
+                label={t("overview.globalOverviewTooltip")}
+                shortcut={globalOverviewShortcut}
+              >
+                <button
+                  type="button"
+                  aria-label={t("overview.title")}
+                  aria-pressed={isOverviewActive}
+                  onClick={() => orbitActions.openGlobalOverview()}
+                  className={cn(
+                    "inline-flex size-[28px] shrink-0 cursor-pointer items-center justify-center rounded-[8px] transition-colors",
+                    isOverviewActive
+                      ? "bg-accent text-ink-primary"
+                      : "text-ink-muted hover:bg-accent/55 hover:text-ink-primary",
+                  )}
+                >
+                  <LayoutGrid className="size-[13.5px] stroke-[1.75]" />
+                </button>
+              </SimpleTooltip>
+            </div>
           );
         })()}
       </div>
@@ -721,14 +747,19 @@ export const FleetSidebar = memo(function FleetSidebar() {
           {/* 3A. Conditional `Needs Attention` Section — Full `SidebarConversationRow`, 0px When Clear */}
           {filteredAttentionItems.length > 0 && (
             <div className="orbit-stage-enter space-y-0.5">
-              <div className="flex h-[22px] items-center justify-between px-2">
+              <button
+                type="button"
+                onClick={() => orbitActions.openGlobalOverview()}
+                title={t("overview.openFromAttentionHint")}
+                className="hover:bg-accent/55 flex h-[22px] w-full cursor-pointer items-center justify-between rounded-[6px] px-2 text-left transition-colors"
+              >
                 <span className="text-signal-warning text-[11px] font-medium tracking-[0.03em] uppercase">
                   {t("sidebar.needsAttention")}
                 </span>
                 <span className="text-signal-warning/80 text-[11px] font-medium tabular-nums">
                   {filteredAttentionItems.length}
                 </span>
-              </div>
+              </button>
 
               {filteredAttentionItems.map(
                 ({ key, navId, host, conv, projectName, effectiveTitle, titleIndices }) => {
@@ -1206,7 +1237,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
             </span>
           ) : (
             <ShortcutKbd
-              keys={`${mod},`}
+              keys={settingsShortcut}
               size="xs"
               variant="subtle"
               className="shrink-0 opacity-0 transition-opacity group-hover/settings:opacity-100"

@@ -205,6 +205,7 @@ struct ParsedHookDecision {
 
 /// Pure-Rust deterministic lifecycle hooks engine owned by `DaemonRuntime`.
 pub struct HooksEngine {
+    pub(crate) audit_store: std::sync::OnceLock<Arc<orbit_store::OrbitStore>>,
     home_dir: PathBuf,
     config_lock: AsyncMutex<()>,
     executions: RwLock<VecDeque<HookExecutionRecord>>,
@@ -222,6 +223,7 @@ impl HooksEngine {
         let (async_tx, async_rx) = mpsc::channel(ASYNC_HOOK_QUEUE_CAPACITY);
         Arc::new(Self {
             home_dir,
+            audit_store: Default::default(),
             config_lock: AsyncMutex::new(()),
             executions: RwLock::new(VecDeque::with_capacity(MAX_HOOK_EXECUTIONS)),
             exec_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_HOOK_EXECUTIONS)),
@@ -771,6 +773,19 @@ impl HooksEngine {
     }
 
     async fn push_execution(&self, record: HookExecutionRecord) {
+        if record.decision == HookDecision::Block
+            && let Some(store) = self.audit_store.get().cloned()
+        {
+            let event = serde_json::to_value(record.event).unwrap_or_default();
+            if !matches!(
+                tokio::task::spawn_blocking(move || store
+                    .append_audit_event("hook", "execute", "daemon", None, "block", &event))
+                .await,
+                Ok(Ok(_))
+            ) {
+                tracing::error!("Failed to record blocked hook");
+            }
+        }
         let mut guard = self.executions.write().await;
         if guard.len() >= MAX_HOOK_EXECUTIONS {
             guard.pop_back();
@@ -1064,7 +1079,7 @@ impl Drop for TempFileGuard {
 fn write_json_atomic<T: Serialize>(
     path: &Path,
     value: &T,
-    private_mode: bool,
+    #[cfg_attr(not(unix), allow(unused_variables))] private_mode: bool,
 ) -> Result<String, String> {
     let parent = path
         .parent()
@@ -1968,9 +1983,17 @@ async fn execute_command_hook(
         );
     };
 
-    let mut cmd = Command::new(&resolved);
-    cmd.args(args)
-        .stdin(Stdio::piped())
+    let mut original = Command::new(&resolved);
+    original.args(args);
+    let boundary = match crate::sandbox::Boundary::load(home_dir, None).await {
+        Ok(b) => b,
+        Err(e) => return on_error(e.to_string(), String::new(), None),
+    };
+    let (mut cmd, plan) = match boundary.command_optional_cwd(original, cwd, home_dir) {
+        Ok(c) => c,
+        Err(e) => return on_error(e, String::new(), None),
+    };
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -2009,6 +2032,9 @@ async fn execute_command_hook(
 
     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
 
+    if let Some(plan) = plan.as_ref() {
+        plan.apply_env(&mut cmd);
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {

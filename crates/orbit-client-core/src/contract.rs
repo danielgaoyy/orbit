@@ -42,7 +42,7 @@ pub struct FleetSidebarRequest {
     pub sort: SidebarProjectSort,
     #[serde(default)]
     pub filter: SidebarThreadFilter,
-    #[serde(default)]
+    #[serde(default, alias = "search_query")]
     pub query: String,
     #[serde(default)]
     pub active_host_id: Option<String>,
@@ -132,12 +132,43 @@ fn default_reconnect_true() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewRewindAgentRequest {
+    pub host_id: String,
+    pub agent_id: String,
+    pub to_seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RewindPreviewFileView {
+    pub path: String,
+    pub action: String,
+    pub additions: u32,
+    pub deletions: u32,
+    pub reverse_unified_diff: String,
+    pub has_external_conflict: bool,
+    /// Pre-parsed and syntax-highlighted reverse diff ready for thin UI `<DiffFilesViewer />`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_file: Option<crate::render::DiffFileView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RewindPreviewView {
+    pub agent_id: String,
+    pub to_seq: u64,
+    pub checkpoint_kind: orbit_protocol::RewindCheckpointKind,
+    pub files: Vec<RewindPreviewFileView>,
+    pub external_conflicts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RewindAgentRequest {
     pub host_id: String,
     pub agent_id: String,
     pub to_before_seq: u64,
     #[serde(default)]
     pub restore_files: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

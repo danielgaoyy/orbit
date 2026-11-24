@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use orbit_protocol::{GitFileEntry, GitStatusSnapshot};
+use orbit_protocol::{GitFileEntry, GitStatusSnapshot, RewindPreviewFile};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use uuid::Uuid;
@@ -1176,15 +1176,522 @@ pub async fn capture_git_tree_snapshot(cwd: &Path) -> Option<String> {
     }
 }
 
-/// Restore only the files within `cwd` that changed since `target_tree_oid`, leaving untouched
-/// files, monorepo sibling subdirectories, and the user's real `.git/index` intact.
-pub async fn restore_git_tree_snapshot(cwd: &Path, target_tree_oid: &str) -> anyhow::Result<u32> {
+const MAX_REWIND_PREVIEW_DIFF_BYTES_PER_FILE: usize = 64 * 1024;
+
+fn normalize_safe_relative_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().replace('\\', "/");
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return None;
+    }
+    let stripped = trimmed.trim_start_matches("./");
+    if stripped.is_empty() || !is_safe_relative_repo_path(stripped) {
+        return None;
+    }
+    let first = stripped.split('/').next().unwrap_or("");
+    if first == ".git" {
+        return None;
+    }
+    // Reject embedded `..` segments or leading/trailing double slashes cleanly
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in stripped.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            return None;
+        }
+        parts.push(seg);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+fn validate_restore_path_filter(
+    restore_paths: Option<&[String]>,
+    subdir_scope: Option<&str>,
+) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
+    let Some(paths) = restore_paths else {
+        return Ok(None);
+    };
+    let mut allowed = std::collections::HashSet::with_capacity(paths.len());
+    for raw in paths {
+        let Some(norm) = normalize_safe_relative_path(raw) else {
+            anyhow::bail!("invalid restore path rejected by path traversal guard: {raw}");
+        };
+        if let Some(sub) = subdir_scope {
+            let sub_clean = sub.trim_matches('/');
+            let prefixed = if norm == sub_clean || norm.starts_with(&format!("{sub_clean}/")) {
+                norm
+            } else {
+                format!("{sub_clean}/{norm}")
+            };
+            allowed.insert(prefixed);
+        } else {
+            allowed.insert(norm);
+        }
+    }
+    Ok(Some(allowed))
+}
+
+fn repo_rel_to_workspace_rel(rel_path: &str, subdir_scope: Option<&str>) -> String {
+    if let Some(sub) = subdir_scope {
+        let prefix = format!("{}/", sub.trim_matches('/'));
+        if let Some(rest) = rel_path.strip_prefix(&prefix) {
+            return rest.to_string();
+        }
+    }
+    rel_path.to_string()
+}
+
+fn count_diff_add_del(diff: &str) -> (u32, u32) {
+    let mut additions = 0u32;
+    let mut deletions = 0u32;
+    for line in diff.lines() {
+        if line.starts_with("+++ ") || line.starts_with("--- ") {
+            continue;
+        }
+        if line.starts_with('+') {
+            additions = additions.saturating_add(1);
+        } else if line.starts_with('-') {
+            deletions = deletions.saturating_add(1);
+        }
+    }
+    (additions, deletions)
+}
+
+fn split_git_diff_by_file(raw_diff: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let mut cur_path: Option<String> = None;
+    let mut cur_buf = String::new();
+
+    let flush = |path_opt: &mut Option<String>,
+                 buf: &mut String,
+                 out: &mut std::collections::HashMap<String, String>| {
+        if let Some(path) = path_opt.take()
+            && !buf.is_empty()
+        {
+            let truncated = if buf.len() > MAX_REWIND_PREVIEW_DIFF_BYTES_PER_FILE {
+                let mut end = MAX_REWIND_PREVIEW_DIFF_BYTES_PER_FILE;
+                while end > 0 && !buf.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let mut s = buf[..end].to_string();
+                s.push_str("\n... (diff preview truncated)\n");
+                s
+            } else {
+                std::mem::take(buf)
+            };
+            out.insert(path, truncated);
+        }
+        buf.clear();
+    };
+
+    for line in raw_diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            flush(&mut cur_path, &mut cur_buf, &mut map);
+            // Parse `a/<path> b/<path>` (also handles quoted git paths cleanly)
+            let parsed = rest
+                .split(" b/")
+                .nth(1)
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .or_else(|| {
+                    rest.split_whitespace()
+                        .next()
+                        .and_then(|s| s.trim_matches('"').strip_prefix("a/"))
+                        .map(ToOwned::to_owned)
+                });
+            cur_path = parsed;
+        }
+        if cur_path.is_some() {
+            if !cur_buf.is_empty() {
+                cur_buf.push('\n');
+            }
+            cur_buf.push_str(line);
+        }
+    }
+    flush(&mut cur_path, &mut cur_buf, &mut map);
+    map
+}
+
+fn invert_unified_diff(diff: &str) -> String {
+    let mut out = Vec::new();
+    let mut old_hdr: Option<String> = None;
+    for raw_line in diff.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.starts_with("--- ") {
+            old_hdr = Some(line.to_string());
+            continue;
+        }
+        if line.starts_with("+++ ") {
+            let new_as_old = line.replacen("+++ ", "--- ", 1);
+            out.push(new_as_old);
+            if let Some(oh) = old_hdr.take() {
+                out.push(oh.replacen("--- ", "+++ ", 1));
+            }
+            continue;
+        }
+        if let Some(oh) = old_hdr.take() {
+            out.push(oh);
+        }
+        if line.starts_with("@@ ") {
+            // Swap `-a,b +c,d` -> `-c,d +a,b`
+            let parts: Vec<&str> = line.splitn(4, ' ').collect();
+            if parts.len() >= 3
+                && let (Some(minus_part), Some(plus_part)) =
+                    (parts[1].strip_prefix('-'), parts[2].strip_prefix('+'))
+            {
+                let tail = parts.get(3).copied().unwrap_or("@@");
+                out.push(format!("@@ -{plus_part} +{minus_part} {tail}"));
+            } else {
+                out.push(line.to_string());
+            }
+        } else if let Some(rest) = line.strip_prefix('+') {
+            out.push(format!("-{rest}"));
+        } else if let Some(rest) = line.strip_prefix('-') {
+            out.push(format!("+{rest}"));
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    if let Some(oh) = old_hdr.take() {
+        out.push(oh);
+    }
+    out.join("\n")
+}
+
+/// Preview the exact file-level restore actions, reverse unified diffs, and external conflict
+/// warnings for rewinding a Git tree checkpoint without modifying the working tree.
+pub async fn preview_git_tree_snapshot_restore(
+    cwd: &Path,
+    target_tree_oid: &str,
+    recorded_edits: &[(String, String)],
+) -> anyhow::Result<(Vec<RewindPreviewFile>, Vec<String>)> {
     if !is_valid_git_oid(target_tree_oid) {
         anyhow::bail!("invalid checkpoint tree id");
     }
     let (repo_root, subdir_scope) = resolve_git_scope(cwd)
         .await
         .ok_or_else(|| anyhow::anyhow!("workspace is not a git repository"))?;
+
+    let type_out = Command::new("git")
+        .args(["cat-file", "-t", target_tree_oid])
+        .current_dir(&repo_root)
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    if !type_out.status.success() || String::from_utf8_lossy(&type_out.stdout).trim() != "tree" {
+        anyhow::bail!("checkpoint snapshot is no longer available in git object store");
+    }
+
+    let Some(cur_tree_oid) = capture_git_tree_snapshot(cwd).await else {
+        anyhow::bail!("failed to inspect current workspace state before rewind preview");
+    };
+    if cur_tree_oid == target_tree_oid {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let mut status_cmd = Command::new("git");
+    status_cmd.args([
+        "diff",
+        "--name-status",
+        "-z",
+        "--no-renames",
+        target_tree_oid,
+        &cur_tree_oid,
+    ]);
+    if let Some(ref rel) = subdir_scope {
+        status_cmd.arg("--").arg(rel);
+    }
+    let status_out = status_cmd
+        .current_dir(&repo_root)
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    if !status_out.status.success() {
+        let stderr = String::from_utf8_lossy(&status_out.stderr);
+        anyhow::bail!("git diff checkpoint failed: {}", stderr.trim());
+    }
+
+    // Reverse direction (`cur -> target`) shows the exact changes rewinding will apply.
+    let mut diff_cmd = Command::new("git");
+    diff_cmd.args([
+        "diff",
+        "-U3",
+        "--no-renames",
+        "--no-color",
+        &cur_tree_oid,
+        target_tree_oid,
+    ]);
+    if let Some(ref rel) = subdir_scope {
+        diff_cmd.arg("--").arg(rel);
+    }
+    let diff_out = diff_cmd
+        .current_dir(&repo_root)
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    let diffs_by_repo_rel = if diff_out.status.success() {
+        split_git_diff_by_file(&String::from_utf8_lossy(&diff_out.stdout))
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // Map agent-recorded edits to repo-relative paths for external conflict detection.
+    let canon_cwd = crate::platform::canonicalize_clean_async(cwd)
+        .await
+        .unwrap_or_else(|_| cwd.to_path_buf());
+    let mut recorded_by_repo_rel: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (raw_path, diff) in recorded_edits {
+        let p = Path::new(raw_path.trim());
+        let resolved_repo_rel = if p.is_absolute() {
+            p.strip_prefix(&repo_root)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .or_else(|| {
+                    p.strip_prefix(&canon_cwd).ok().map(|r| {
+                        let rel = r.to_string_lossy().replace('\\', "/");
+                        match &subdir_scope {
+                            Some(sub) => format!("{}/{}", sub.trim_matches('/'), rel),
+                            None => rel,
+                        }
+                    })
+                })
+        } else {
+            normalize_safe_relative_path(raw_path).map(|norm| match &subdir_scope {
+                Some(sub) => {
+                    let sub_clean = sub.trim_matches('/');
+                    if norm == sub_clean || norm.starts_with(&format!("{sub_clean}/")) {
+                        norm
+                    } else {
+                        format!("{sub_clean}/{norm}")
+                    }
+                }
+                None => norm,
+            })
+        };
+        if let Some(repo_rel) = resolved_repo_rel {
+            recorded_by_repo_rel
+                .entry(repo_rel)
+                .or_default()
+                .push(diff.clone());
+        }
+    }
+
+    let mut preview_files = Vec::new();
+    let mut external_conflicts = Vec::new();
+
+    let mut fields = status_out
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|slice| !slice.is_empty());
+    while let (Some(status_bytes), Some(path_bytes)) = (fields.next(), fields.next()) {
+        let status = String::from_utf8_lossy(status_bytes);
+        let repo_rel = String::from_utf8_lossy(path_bytes).into_owned();
+        if !is_safe_relative_repo_path(&repo_rel) {
+            continue;
+        }
+        let ws_rel = repo_rel_to_workspace_rel(&repo_rel, subdir_scope.as_deref());
+        let action = if status.starts_with('A') {
+            "delete".to_string()
+        } else if status.starts_with('D') {
+            "restore".to_string()
+        } else {
+            "modify".to_string()
+        };
+
+        let reverse_unified_diff = diffs_by_repo_rel
+            .get(&repo_rel)
+            .cloned()
+            .unwrap_or_default();
+        let (additions, deletions) = count_diff_add_del(&reverse_unified_diff);
+
+        let mut has_external_conflict = false;
+        if !recorded_by_repo_rel.is_empty() {
+            if let Some(agent_diffs) = recorded_by_repo_rel.get(&repo_rel) {
+                // Verify recorded edits still match disk (unless created/deleted as a whole file).
+                if action == "modify"
+                    && !agent_diffs
+                        .iter()
+                        .any(|d| diff_header_indicates_new_file(d))
+                {
+                    let abs = repo_root.join(&repo_rel);
+                    if let Ok(mut content) = tokio::fs::read_to_string(&abs).await {
+                        for d in agent_diffs.iter().rev() {
+                            if let Some(reverted) = reverse_apply_unified_diff_to_text(&content, d)
+                            {
+                                content = reverted;
+                            } else {
+                                has_external_conflict = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Changed on disk since pre-turn checkpoint, but not in agent's recorded FileEdits.
+                has_external_conflict = true;
+            }
+        }
+
+        if has_external_conflict {
+            external_conflicts.push(ws_rel.clone());
+        }
+
+        preview_files.push(RewindPreviewFile {
+            path: ws_rel,
+            action,
+            additions,
+            deletions,
+            reverse_unified_diff,
+            has_external_conflict,
+        });
+    }
+
+    preview_files.sort_by(|a, b| a.path.cmp(&b.path));
+    external_conflicts.sort();
+    external_conflicts.dedup();
+    Ok((preview_files, external_conflicts))
+}
+
+/// Preview recorded-diff fallback restoration without touching disk.
+pub async fn preview_file_edit_diffs_restore(
+    cwd: &Path,
+    edits: &[(String, String)],
+) -> (Vec<RewindPreviewFile>, Vec<String>) {
+    let Ok(canonical_cwd) = crate::platform::canonicalize_clean_async(cwd).await else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut grouped: Vec<(String, PathBuf, Vec<String>)> = Vec::new();
+    let mut idx_by_rel: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for (raw_path, diff) in edits {
+        let p = Path::new(raw_path.trim());
+        if p.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            let Some(norm) = normalize_safe_relative_path(raw_path) else {
+                continue;
+            };
+            canonical_cwd.join(norm)
+        };
+        let Ok(sym_meta) = tokio::fs::symlink_metadata(&candidate).await else {
+            continue;
+        };
+        if sym_meta.file_type().is_symlink() || !sym_meta.is_file() {
+            continue;
+        }
+        let Ok(canonical_target) = crate::platform::canonicalize_clean_async(&candidate).await
+        else {
+            continue;
+        };
+        let Ok(rel) = canonical_target.strip_prefix(&canonical_cwd) else {
+            continue;
+        };
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if !is_safe_relative_repo_path(&rel_str) {
+            continue;
+        }
+        if let Some(&idx) = idx_by_rel.get(&rel_str) {
+            grouped[idx].2.push(diff.clone());
+        } else {
+            let idx = grouped.len();
+            idx_by_rel.insert(rel_str.clone(), idx);
+            grouped.push((rel_str, canonical_target, vec![diff.clone()]));
+        }
+    }
+
+    let mut files = Vec::new();
+    let mut external_conflicts = Vec::new();
+
+    for (rel_path, canonical_target, file_diffs) in grouped {
+        let creates_file = file_diffs.iter().any(|d| diff_header_indicates_new_file(d));
+        let mut reverse_parts: Vec<String> = Vec::new();
+        let mut has_external_conflict = false;
+
+        if creates_file {
+            if let Ok(cur) = tokio::fs::read_to_string(&canonical_target).await {
+                let line_count = cur.lines().count();
+                let mut diff_out = format!(
+                    "diff --git a/{rel_path} b/{rel_path}\n--- a/{rel_path}\n+++ /dev/null\n@@ -1,{line_count} +0,0 @@\n"
+                );
+                for line in cur.lines() {
+                    diff_out.push('-');
+                    diff_out.push_str(line);
+                    diff_out.push('\n');
+                }
+                reverse_parts.push(diff_out);
+            }
+        } else if let Ok(mut simulated) = tokio::fs::read_to_string(&canonical_target).await {
+            for d in file_diffs.iter().rev() {
+                if let Some(reverted) = reverse_apply_unified_diff_to_text(&simulated, d) {
+                    simulated = reverted;
+                    reverse_parts.push(invert_unified_diff(d));
+                } else {
+                    has_external_conflict = true;
+                    reverse_parts.push(invert_unified_diff(d));
+                }
+            }
+        } else {
+            has_external_conflict = true;
+        }
+
+        let reverse_unified_diff = reverse_parts.join("\n");
+        let (additions, deletions) = count_diff_add_del(&reverse_unified_diff);
+        if has_external_conflict {
+            external_conflicts.push(rel_path.clone());
+        }
+        files.push(RewindPreviewFile {
+            path: rel_path,
+            action: if creates_file {
+                "delete".into()
+            } else {
+                "modify".into()
+            },
+            additions,
+            deletions,
+            reverse_unified_diff,
+            has_external_conflict,
+        });
+    }
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    external_conflicts.sort();
+    external_conflicts.dedup();
+    (files, external_conflicts)
+}
+
+/// Restore only the files within `cwd` that changed since `target_tree_oid`, leaving untouched
+/// files, monorepo sibling subdirectories, and the user's real `.git/index` intact.
+pub async fn restore_git_tree_snapshot(cwd: &Path, target_tree_oid: &str) -> anyhow::Result<u32> {
+    restore_git_tree_snapshot_filtered(cwd, target_tree_oid, None).await
+}
+
+/// Restore changed files within `cwd` back to `target_tree_oid`, optionally restricted to an
+/// explicit user-selected subset `restore_paths` (validated against path traversal).
+pub async fn restore_git_tree_snapshot_filtered(
+    cwd: &Path,
+    target_tree_oid: &str,
+    restore_paths: Option<&[String]>,
+) -> anyhow::Result<u32> {
+    if !is_valid_git_oid(target_tree_oid) {
+        anyhow::bail!("invalid checkpoint tree id");
+    }
+    let (repo_root, subdir_scope) = resolve_git_scope(cwd)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("workspace is not a git repository"))?;
+    let allowed_repo_paths = validate_restore_path_filter(restore_paths, subdir_scope.as_deref())?;
+    if let Some(ref allowed) = allowed_repo_paths
+        && allowed.is_empty()
+    {
+        return Ok(0);
+    }
 
     let type_out = Command::new("git")
         .args(["cat-file", "-t", target_tree_oid])
@@ -1236,6 +1743,11 @@ pub async fn restore_git_tree_snapshot(cwd: &Path, target_tree_oid: &str) -> any
         let status = String::from_utf8_lossy(status_bytes);
         let rel_path = String::from_utf8_lossy(path_bytes).into_owned();
         if !is_safe_relative_repo_path(&rel_path) {
+            continue;
+        }
+        if let Some(ref allowed) = allowed_repo_paths
+            && !allowed.contains(&rel_path)
+        {
             continue;
         }
         if status.starts_with('A') {
@@ -1452,8 +1964,25 @@ fn diff_header_indicates_new_file(diff: &str) -> bool {
 /// Fallback restoration when no Git tree checkpoint exists: reverse-applies recorded `FileEdit`
 /// unified diffs in reverse chronological order, strictly contained inside canonical `cwd`.
 pub async fn reverse_apply_file_edit_diffs(cwd: &Path, edits: &[(String, String)]) -> u32 {
+    reverse_apply_file_edit_diffs_filtered(cwd, edits, None)
+        .await
+        .unwrap_or(0)
+}
+
+/// Filtered fallback restoration with strict path traversal guards.
+pub async fn reverse_apply_file_edit_diffs_filtered(
+    cwd: &Path,
+    edits: &[(String, String)],
+    restore_paths: Option<&[String]>,
+) -> anyhow::Result<u32> {
+    let allowed = validate_restore_path_filter(restore_paths, None)?;
+    if let Some(ref set) = allowed
+        && set.is_empty()
+    {
+        return Ok(0);
+    }
     let Ok(canonical_cwd) = crate::platform::canonicalize_clean_async(cwd).await else {
-        return 0;
+        return Ok(0);
     };
     let mut restored_paths = std::collections::HashSet::new();
 
@@ -1482,8 +2011,14 @@ pub async fn reverse_apply_file_edit_diffs(cwd: &Path, edits: &[(String, String)
         else {
             continue;
         };
-        if !canonical_target.starts_with(&canonical_cwd) {
+        let Ok(rel_target) = canonical_target.strip_prefix(&canonical_cwd) else {
             continue;
+        };
+        if let Some(ref allowed_set) = allowed {
+            let rel_str = rel_target.to_string_lossy().replace('\\', "/");
+            if !allowed_set.contains(&rel_str) {
+                continue;
+            }
         }
 
         if diff_header_indicates_new_file(diff) {
@@ -1502,7 +2037,7 @@ pub async fn reverse_apply_file_edit_diffs(cwd: &Path, edits: &[(String, String)
         }
     }
 
-    restored_paths.len() as u32
+    Ok(restored_paths.len() as u32)
 }
 
 #[cfg(test)]
@@ -2055,5 +2590,111 @@ mod tests {
         }
 
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn preview_and_filtered_restore_git_snapshot_detects_conflicts_and_blocks_traversal() {
+        let dir =
+            std::env::temp_dir().join(format!("orbit_rewind_preview_{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.expect("mkdir");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.email", "test@orbit.local"]);
+        run_git(&["config", "user.name", "Orbit Test"]);
+        run_git(&["config", "core.autocrlf", "false"]);
+
+        tokio::fs::write(dir.join("a.txt"), "alpha-v1\n")
+            .await
+            .expect("write a");
+        tokio::fs::write(dir.join("b.txt"), "beta-v1\n")
+            .await
+            .expect("write b");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "init"]);
+
+        let snap = capture_git_tree_snapshot(&dir)
+            .await
+            .expect("capture pre-turn checkpoint");
+
+        // Agent edits a.txt; external user edits b.txt; agent creates c.txt
+        tokio::fs::write(dir.join("a.txt"), "alpha-v2\n")
+            .await
+            .expect("edit a");
+        tokio::fs::write(dir.join("b.txt"), "beta-external\n")
+            .await
+            .expect("edit b");
+        tokio::fs::write(dir.join("c.txt"), "created\n")
+            .await
+            .expect("create c");
+
+        let recorded = vec![(
+            "a.txt".to_string(),
+            "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-alpha-v1\n+alpha-v2\n".to_string(),
+        )];
+
+        let (preview_files, conflicts) = preview_git_tree_snapshot_restore(&dir, &snap, &recorded)
+            .await
+            .expect("preview rewind");
+
+        assert_eq!(preview_files.len(), 3);
+        let a_prev = preview_files
+            .iter()
+            .find(|f| f.path == "a.txt")
+            .expect("a.txt");
+        assert_eq!(a_prev.action, "modify");
+        assert!(!a_prev.has_external_conflict);
+        assert!(a_prev.reverse_unified_diff.contains("-alpha-v2"));
+        assert!(a_prev.reverse_unified_diff.contains("+alpha-v1"));
+
+        let b_prev = preview_files
+            .iter()
+            .find(|f| f.path == "b.txt")
+            .expect("b.txt");
+        assert!(b_prev.has_external_conflict);
+        assert!(conflicts.contains(&"b.txt".to_string()));
+
+        let c_prev = preview_files
+            .iter()
+            .find(|f| f.path == "c.txt")
+            .expect("c.txt");
+        assert_eq!(c_prev.action, "delete");
+
+        // Path traversal guard MUST reject `..`, absolute paths, and `.git/...`
+        for bad in ["../escape.txt", "/etc/passwd", ".git/config", "sub/../../x"] {
+            let err =
+                restore_git_tree_snapshot_filtered(&dir, &snap, Some(&[bad.to_string()])).await;
+            assert!(err.is_err(), "expected traversal rejection for {bad}");
+        }
+
+        // Filtered restore: only restore a.txt & c.txt, leaving external edit in b.txt untouched
+        let selected = vec!["a.txt".to_string(), "c.txt".to_string()];
+        let restored = restore_git_tree_snapshot_filtered(&dir, &snap, Some(&selected))
+            .await
+            .expect("filtered restore");
+        assert_eq!(restored, 2);
+        assert_eq!(
+            tokio::fs::read_to_string(dir.join("a.txt"))
+                .await
+                .expect("read a")
+                .replace("\r\n", "\n"),
+            "alpha-v1\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(dir.join("b.txt"))
+                .await
+                .expect("read b")
+                .replace("\r\n", "\n"),
+            "beta-external\n"
+        );
+        assert!(!dir.join("c.txt").exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

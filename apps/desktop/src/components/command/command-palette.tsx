@@ -60,8 +60,9 @@ import {
 } from "@/lib/fuzzy-match";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { type MessageKey, type TranslationParams, useI18n } from "@/lib/i18n";
-import { modSymbol } from "@/lib/keybindings";
-import { type ConversationSearchHit, orbitIpc } from "@/lib/orbit-ipc";
+import { getActionShortcutDisplay, modSymbol } from "@/lib/keybindings";
+import { isMacDesktop, type ConversationSearchHit, orbitIpc } from "@/lib/orbit-ipc";
+import type { ShortcutActionId } from "@/lib/shortcut-registry";
 import { orbitActions, threadScopeKey, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -306,6 +307,10 @@ function CommandPaletteDialog() {
   const itemRefs = useRef<Map<number, HTMLButtonElement>>(new Map());
   const searchReqIdRef = useRef(0);
   const mod = modSymbol();
+  const isMac = isMacDesktop();
+  const customKeybindings = useOrbitSelector((s) => s.customKeybindings);
+  const shortcutOf = (actionId: ShortcutActionId) =>
+    getActionShortcutDisplay(actionId, customKeybindings, isMac);
   const isMultiHost = fleet.hosts.length > 1;
 
   const { mode, term } = useMemo(() => parsePaletteQuery(query), [query]);
@@ -412,7 +417,7 @@ function CommandPaletteDialog() {
             section: t("palette.sectionApproval"),
             title: threadCustomTitles[tKey] || ag.title,
             subtitle: `${h.display_name} · ${ag.cwd}`,
-            shortcut: `${mod}⇧A`,
+            shortcut: shortcutOf("next_attention"),
             accent: "amber",
             threadKey: tKey,
             icon: <ShieldAlert className="size-3.5 text-amber-400" />,
@@ -436,9 +441,20 @@ function CommandPaletteDialog() {
         title: t("common.newConversation"),
         subtitle: t("palette.newConversationSub"),
         keywords: "new chat thread conversation",
-        shortcut: `${mod}N`,
+        shortcut: shortcutOf("new_conversation"),
         icon: <Plus className="size-3.5" />,
         run: () => orbitActions.startNewThreadDraft(),
+      },
+      {
+        id: "act-global-overview",
+        kind: "command",
+        sectionKey: "palette.sectionActions",
+        section: actionsSection,
+        title: t("overview.globalOverviewTooltip"),
+        keywords: "overview fleet inbox triage personal agent control monitor lanes",
+        shortcut: shortcutOf("open_global_overview"),
+        icon: <Compass className="size-3.5" />,
+        run: () => orbitActions.openGlobalOverview(),
       },
       {
         id: "act-add-project",
@@ -498,7 +514,7 @@ function CommandPaletteDialog() {
               title: t("palette.findInConversation"),
               subtitle: t("palette.findInConversationSub"),
               keywords: "find search transcript history messages cmd+f",
-              shortcut: `${mod}F`,
+              shortcut: shortcutOf("find"),
               icon: <Search className="size-3.5" />,
               run: () => orbitActions.openStageFind(),
             },
@@ -566,7 +582,7 @@ function CommandPaletteDialog() {
         section: actionsSection,
         title: t("palette.toggleOverview"),
         keywords: "overview summary outline",
-        shortcut: `${mod}⌥O`,
+        shortcut: shortcutOf("toggle_overview_hud"),
         icon: <LayoutList className="size-3.5" />,
         run: () => orbitActions.toggleOverviewPanel(),
       },
@@ -577,7 +593,7 @@ function CommandPaletteDialog() {
         section: actionsSection,
         title: t("palette.toggleSidePanel"),
         keywords: "right side panel drawer",
-        shortcut: `${mod}\\`,
+        shortcut: shortcutOf("toggle_side_panel"),
         icon: <PanelRight className="size-3.5" />,
         run: () => orbitActions.toggleSidePanel(),
       },
@@ -588,7 +604,7 @@ function CommandPaletteDialog() {
         section: actionsSection,
         title: t("palette.openFileInSidePanel"),
         keywords: "quick open file jump",
-        shortcut: `${mod}P`,
+        shortcut: shortcutOf("quick_open_file"),
         icon: <Search className="size-3.5" />,
         run: () => {
           orbitActions.setCommandPaletteOpen(false);
@@ -623,7 +639,7 @@ function CommandPaletteDialog() {
         section: actionsSection,
         title: t("palette.toggleDiffReview"),
         keywords: "git diff review changes",
-        shortcut: `${mod}D`,
+        shortcut: shortcutOf("toggle_diff"),
         icon: <GitCompareArrows className="size-3.5" />,
         run: () => orbitActions.toggleReviewTab(),
       },
@@ -634,7 +650,7 @@ function CommandPaletteDialog() {
         section: actionsSection,
         title: t("palette.toggleTerminal"),
         keywords: "terminal pty shell console",
-        shortcut: `${mod}J`,
+        shortcut: shortcutOf("toggle_terminal"),
         icon: <SquareTerminal className="size-3.5" />,
         run: () => orbitActions.toggleTerminalTab(),
       },
@@ -655,7 +671,7 @@ function CommandPaletteDialog() {
         section: actionsSection,
         title: t("palette.askSideQuestion"),
         keywords: "btw side question ask",
-        shortcut: `${mod};`,
+        shortcut: shortcutOf("toggle_side_question"),
         icon: <MessageCircleQuestion className="size-3.5" />,
         run: () => orbitActions.openSideQuestionTab(),
       },
@@ -666,7 +682,7 @@ function CommandPaletteDialog() {
         section: actionsSection,
         title: t("palette.toggleSidebar"),
         keywords: "left sidebar toggle collapse",
-        shortcut: `${mod}B`,
+        shortcut: shortcutOf("toggle_sidebar"),
         icon: <PanelLeft className="size-3.5" />,
         run: () => orbitActions.toggleSidebar(),
       },
@@ -713,7 +729,7 @@ function CommandPaletteDialog() {
         section: openInSection,
         title: t("palette.openInEditor", { editor: ed.label }),
         keywords: `open editor ${ed.label} ${ed.kind}`,
-        shortcut: ed.kind === "cursor" ? `${mod}O` : undefined,
+        shortcut: ed.kind === "cursor" ? shortcutOf("open_external_editor") : undefined,
         icon: <FolderOpen className="size-3.5" />,
         run: () => void orbitActions.openWorkspaceInEditor(ed.kind),
       });
@@ -754,7 +770,7 @@ function CommandPaletteDialog() {
         title: t("palette.openSettings"),
         subtitle: t("palette.openSettingsSub"),
         keywords: "preferences settings config",
-        shortcut: `${mod},`,
+        shortcut: shortcutOf("open_settings"),
         icon: <Settings2 className="size-3.5" />,
         run: () => orbitActions.openSettings("general"),
       },
@@ -942,6 +958,8 @@ function CommandPaletteDialog() {
     activeWorkspaceId,
     workspaceScripts,
     mod,
+    isMac,
+    customKeybindings,
     t,
   ]);
 

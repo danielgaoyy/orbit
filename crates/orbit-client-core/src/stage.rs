@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::app_core::{AgentCardView, TimelineItemView};
 use crate::render::{DiffFileView, RichBlockView, parse_markdown_blocks};
+pub use crate::subagents::{
+    FleetAgentNodeRef, MAX_SUBAGENT_LINEAGE_DEPTH, SubagentLineageStepView,
+    collect_ancestor_lineage, collect_descendant_subagents,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnFileDiffSummaryView {
@@ -251,6 +255,18 @@ pub struct SessionSubagentEntryView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_subagent_id: Option<String>,
     pub last_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_host_id: Option<String>,
+    #[serde(default)]
+    pub depth: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lineage: Vec<SubagentLineageStepView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +316,8 @@ pub struct SessionInsightsView {
     pub touched_files: Vec<SessionTouchedFileView>,
     pub background_tasks: Vec<SessionBackgroundTaskView>,
     pub subagents: Vec<SessionSubagentEntryView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ancestor_lineage: Vec<SubagentLineageStepView>,
     pub detected_local_urls: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pull_requests: Vec<SessionPullRequestView>,
@@ -332,6 +350,117 @@ impl SessionInsightsView {
         self.outline_prompts = full.iter().cloned().map(Into::into).chain(loaded).collect();
         self.outline_prompts.sort_by_key(|prompt| prompt.seq);
         self.outline_prompts.dedup_by_key(|prompt| prompt.seq);
+    }
+
+    /// Enrich `subagents` and `ancestor_lineage` with cycle-safe, depth-bounded (max depth 8)
+    /// recursive multi-level lineage across all connected hosts in the fleet.
+    pub fn apply_fleet_subagent_lineage(
+        &mut self,
+        root_host_id: &str,
+        root_agent_id: &str,
+        root_title: &str,
+        fleet_nodes: &[FleetAgentNodeRef],
+    ) {
+        self.ancestor_lineage = collect_ancestor_lineage(root_host_id, root_agent_id, fleet_nodes);
+        let descendants =
+            collect_descendant_subagents(root_host_id, root_agent_id, root_title, fleet_nodes);
+        if descendants.is_empty() {
+            for entry in &mut self.subagents {
+                if entry.depth == 0 {
+                    entry.depth = 1;
+                }
+            }
+            return;
+        }
+
+        let mut existing_by_child_id: HashMap<String, SessionSubagentEntryView> = HashMap::new();
+        let mut non_managed: Vec<SessionSubagentEntryView> = Vec::new();
+        for mut entry in std::mem::take(&mut self.subagents) {
+            if entry.depth == 0 {
+                entry.depth = 1;
+            }
+            if let Some(ref cid) = entry.child_agent_id {
+                existing_by_child_id.insert(cid.clone(), entry);
+            } else {
+                non_managed.push(entry);
+            }
+        }
+
+        let mut ordered_managed: Vec<SessionSubagentEntryView> =
+            Vec::with_capacity(descendants.len());
+        let mut claimed_child_ids: HashSet<String> = HashSet::new();
+
+        for desc in descendants {
+            let cid = desc.agent.agent_id.clone();
+            claimed_child_ids.insert(cid.clone());
+            let status = if desc.agent.is_running || desc.agent.is_awaiting_permission {
+                ToolCallStatus::Running
+            } else if contains_ascii_case_insensitive(&desc.agent.status_label, "error") {
+                ToolCallStatus::Failed
+            } else {
+                ToolCallStatus::Completed
+            };
+
+            if let Some(mut existing) = existing_by_child_id.remove(&cid) {
+                existing.status = status;
+                existing.host_id = Some(desc.host_id);
+                existing.host_name = Some(desc.host_name);
+                existing.parent_agent_id = Some(desc.parent_agent_id);
+                existing.parent_host_id = Some(desc.parent_host_id);
+                existing.depth = desc.depth;
+                existing.lineage = desc.lineage;
+                if is_generic_subagent_role(&existing.role) {
+                    existing.role = resolve_subagent_display_role(
+                        &desc.agent.title,
+                        desc.agent
+                            .task_summary
+                            .as_deref()
+                            .or((!existing.prompt_preview.is_empty())
+                                .then_some(existing.prompt_preview.as_str())),
+                    );
+                }
+                ordered_managed.push(existing);
+            } else {
+                ordered_managed.push(SessionSubagentEntryView {
+                    id: cid.clone(),
+                    role: resolve_subagent_display_role(
+                        &desc.agent.title,
+                        desc.agent.task_summary.as_deref(),
+                    ),
+                    prompt_preview: desc
+                        .agent
+                        .task_summary
+                        .clone()
+                        .unwrap_or_else(|| desc.agent.status_label.clone()),
+                    status,
+                    child_agent_id: Some(cid),
+                    provider_subagent_id: None,
+                    last_seq: desc.agent.latest_seq,
+                    host_id: Some(desc.host_id),
+                    host_name: Some(desc.host_name),
+                    parent_agent_id: Some(desc.parent_agent_id),
+                    parent_host_id: Some(desc.parent_host_id),
+                    depth: desc.depth,
+                    lineage: desc.lineage,
+                });
+            }
+        }
+
+        // Preserve any remaining timeline-dispatched entries (e.g. peers or historical children)
+        let mut leftover: Vec<SessionSubagentEntryView> = existing_by_child_id
+            .into_iter()
+            .filter(|(cid, _)| !claimed_child_ids.contains(cid))
+            .map(|(_, v)| v)
+            .chain(non_managed)
+            .collect();
+        leftover.sort_by(|a, b| {
+            let a_run = u8::from(a.status == ToolCallStatus::Running);
+            let b_run = u8::from(b.status == ToolCallStatus::Running);
+            b_run.cmp(&a_run).then_with(|| b.last_seq.cmp(&a.last_seq))
+        });
+
+        ordered_managed.extend(leftover);
+        self.subagents = ordered_managed;
     }
 }
 
@@ -4055,6 +4184,12 @@ pub fn derive_session_insights(
                                     child_agent_id: child_agent_id.clone(),
                                     provider_subagent_id: None,
                                     last_seq: *seq,
+                                    host_id: None,
+                                    host_name: None,
+                                    parent_agent_id: current_agent.map(|a| a.agent_id.clone()),
+                                    parent_host_id: None,
+                                    depth: 1,
+                                    lineage: Vec::new(),
                                 },
                             );
                         }
@@ -4238,6 +4373,12 @@ pub fn derive_session_insights(
                             child_agent_id: Some(ag.agent_id.clone()),
                             provider_subagent_id: None,
                             last_seq: ag.latest_seq,
+                            host_id: None,
+                            host_name: None,
+                            parent_agent_id: ag.parent_agent_id.clone(),
+                            parent_host_id: ag.parent_host_id.clone(),
+                            depth: 1,
+                            lineage: Vec::new(),
                         },
                     );
                 }
@@ -4323,6 +4464,12 @@ pub fn derive_session_insights(
                     child_agent_id: None,
                     provider_subagent_id: Some(ps.subagent_id.clone()),
                     last_seq: ps.updated_at.timestamp_millis().max(0) as u64,
+                    host_id: None,
+                    host_name: None,
+                    parent_agent_id: current_agent.map(|a| a.agent_id.clone()),
+                    parent_host_id: None,
+                    depth: 1,
+                    lineage: Vec::new(),
                 },
             );
         }
@@ -4399,6 +4546,7 @@ pub fn derive_session_insights(
         touched_files,
         background_tasks,
         subagents,
+        ancestor_lineage: Vec::new(),
         detected_local_urls,
         pull_requests,
         detected_links,

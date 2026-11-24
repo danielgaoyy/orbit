@@ -122,45 +122,63 @@ export const SubagentCrewList = memo(function SubagentCrewList({
       {subagents.map((sa) => {
         const isActive = isSubagentActiveStatus(sa.status);
         const isAwaiting = sa.status === "awaiting_permission";
-        const subtitle = statusSubtitle(sa, t);
+        const depth = Math.max(1, sa.depth ?? 1);
+        const indentLevels = Math.min(depth - 1, 5);
+        const parentCrumb =
+          depth > 1 && sa.lineage && sa.lineage.length >= 2
+            ? sa.lineage[sa.lineage.length - 2]?.title ?? null
+            : null;
+        const lineageText =
+          sa.lineage && sa.lineage.length > 1
+            ? sa.lineage.map((step) => step.title).join(" → ")
+            : null;
+        const subtitleBase = statusSubtitle(sa, t);
+        const subtitle = parentCrumb ? `${subtitleBase} · ${parentCrumb}` : subtitleBase;
+        const tooltip = [lineageText, sa.promptPreview || sa.title].filter(Boolean).join("\n");
 
         return (
-          <button
-            type="button"
+          <div
             key={sa.key}
-            title={sa.promptPreview || sa.title}
-            onClick={() => openSubagent(agentId, sa)}
-            className={cn(
-              "flex cursor-pointer text-left min-h-[42px] w-full items-center gap-2.5 rounded-[8px] px-2 py-1.5 transition-colors",
-              isAwaiting
-                ? "bg-signal-warning-bg/75 hover:bg-signal-warning-bg"
-                : "hover:bg-accent/70",
-            )}
+            style={indentLevels > 0 ? { paddingLeft: `${indentLevels * 14}px` } : undefined}
+            className="min-w-0"
           >
-            <SubagentAvatar
-              character={sa.character}
-              status={sa.status}
-              size="md"
-              showStatusBadge={!isActive}
-            />
-            <span className="min-w-0 flex-1">
-              <span className="text-ink-primary block truncate text-[13px] leading-[18px] font-medium">
-                {sa.title}
+            <button
+              type="button"
+              title={tooltip}
+              onClick={() => openSubagent(sa.parentAgentId || agentId, sa)}
+              className={cn(
+                "flex cursor-pointer text-left min-h-[42px] w-full items-center gap-2.5 rounded-[8px] px-2 py-1.5 transition-colors",
+                indentLevels > 0 && "border-l border-border-subtle/80 rounded-l-[4px]",
+                isAwaiting
+                  ? "bg-signal-warning-bg/75 hover:bg-signal-warning-bg"
+                  : "hover:bg-accent/70",
+              )}
+            >
+              <SubagentAvatar
+                character={sa.character}
+                status={sa.status}
+                size={indentLevels > 0 ? "sm" : "md"}
+                showStatusBadge={!isActive}
+              />
+              <span className="min-w-0 flex-1">
+                <span className="text-ink-primary block truncate text-[13px] leading-[18px] font-medium">
+                  {sa.title}
+                </span>
+                <span
+                  className={cn(
+                    "block truncate text-[11px] leading-[15px]",
+                    isAwaiting
+                      ? "text-signal-warning font-medium"
+                      : sa.status === "failed"
+                        ? "text-signal-danger"
+                        : "text-ink-tertiary",
+                  )}
+                >
+                  {subtitle}
+                </span>
               </span>
-              <span
-                className={cn(
-                  "block truncate text-[11px] leading-[15px]",
-                  isAwaiting
-                    ? "text-signal-warning font-medium"
-                    : sa.status === "failed"
-                      ? "text-signal-danger"
-                      : "text-ink-tertiary",
-                )}
-              >
-                {subtitle}
-              </span>
-            </span>
-          </button>
+            </button>
+          </div>
         );
       })}
     </div>

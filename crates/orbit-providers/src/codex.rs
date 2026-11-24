@@ -180,6 +180,8 @@ pub async fn spawn_codex_session(
         crate::shell_snapshot::merge_cached_shell_env_into_map(&mut env);
 
         let spec = ShimSpawnSpec {
+            sandbox: cfg.sandbox.clone(),
+            egress_proxy_url: None,
             shim_id: format!("codex_{}", cfg.agent_id),
             mode: ShimMode::Stdio,
             program: cfg.executable.to_string_lossy().to_string(),
@@ -1477,6 +1479,9 @@ async fn dispatch_codex_turn(
     let req_id = *next_id;
     *next_id += 1;
     *pending_turn_start_rpc_id = Some(req_id);
+    if prompt.trim() == "/compact" {
+        return shim.write_stdin_line(json!({"id":req_id,"method":"thread/compact/start","params":{"threadId":thread_id}}).to_string()).await.map_err(|_|());
+    }
     let params = build_codex_turn_start_params(
         cfg,
         thread_id,
@@ -3169,6 +3174,8 @@ mod tests {
 
     fn sample_cfg(fast_mode: bool) -> SessionLaunchConfig {
         SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_codex_test".into(),
             provider: ProviderKind::Codex,
             executable: PathBuf::from("/usr/bin/codex"),
@@ -3747,6 +3754,8 @@ mod tests {
     #[test]
     fn codex_plan_mode_turn_start_params_require_model_and_include_effort() {
         let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_plan".into(),
             provider: ProviderKind::Codex,
             executable: PathBuf::from("/bin/true"),
@@ -4002,6 +4011,8 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let (evt_tx, mut evt_rx) = mpsc::channel(64);
         let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_cdx_err".into(),
             provider: ProviderKind::Codex,
             executable: PathBuf::from("/bin/true"),

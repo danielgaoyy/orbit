@@ -6,6 +6,7 @@ pub mod artifacts;
 pub mod goals;
 pub mod guardian;
 pub mod im_channels;
+pub mod memory;
 pub mod orchestration;
 pub mod permission_rules;
 pub mod push;
@@ -177,7 +178,9 @@ impl StoreError {
     }
 }
 
+pub mod audit_chain;
 pub struct OrbitStore {
+    audit_identity: std::sync::OnceLock<(String, ed25519_dalek::SigningKey)>,
     conn: Mutex<Connection>,
 }
 
@@ -523,6 +526,7 @@ impl OrbitStore {
             ",
         )?;
         search::migrate_fts5_schema(&mut conn)?;
+        memory::migrate(&conn)?;
         // Idempotent Wave 2 column migrations checked via `PRAGMA table_info` (NO `PRAGMA user_version` bump)
         for (table, col, col_type) in [
             ("agents", "forked_from_agent_id", "TEXT"),
@@ -553,7 +557,12 @@ impl OrbitStore {
         workflows::migrate_workflows_schema(&conn)?;
         im_channels::migrate_im_channels_schema(&conn)?;
         push::migrate_push_schema(&conn)?;
+        conn.execute_batch(audit_chain::SCHEMA)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS spend_budget_alerts(period TEXT PRIMARY KEY)",
+        )?;
         Ok(Self {
+            audit_identity: Default::default(),
             conn: Mutex::new(conn),
         })
     }
@@ -1064,6 +1073,26 @@ impl OrbitStore {
         Ok(())
     }
 
+    pub fn latest_user_prompt_seq(&self, agent_id: &str) -> Result<u64, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        Ok(conn.query_row("SELECT COALESCE(MAX(seq),0) FROM timeline_events WHERE agent_id=? AND event_type='user_prompt'",[agent_id],|r|r.get(0))?)
+    }
+
+    pub fn clear_context_for_handoff(&self, agent_id: &str) -> Result<(), StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE agents SET persistence_ref=NULL WHERE agent_id=?",
+            [agent_id],
+        )?;
+        tx.execute(
+            "DELETE FROM agent_context_telemetry WHERE agent_id=?",
+            [agent_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn set_persistence_ref(&self, agent_id: &str, pref: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.execute(
@@ -1243,6 +1272,17 @@ impl OrbitStore {
         let payload_json = serde_json::to_string(&payload)?;
         let event_type = payload_event_type(&payload);
         let ckey = coalesce_key(&payload);
+        if let TimelinePayload::PermissionResolved { decision, .. } = &payload {
+            self.audit_insert(
+                &tx,
+                "permission",
+                "resolve",
+                "daemon",
+                Some(agent_id),
+                decision,
+                &serde_json::Value::Null,
+            )?;
+        }
 
         if matches!(payload, TimelinePayload::AssistantThinking { .. })
             && let Some(ref key_val) = ckey
@@ -2392,6 +2432,12 @@ impl OrbitStore {
              WHERE agent_id = ?1 AND event_type = 'user_prompt' ORDER BY seq ASC",
         )?;
         Self::collect_outline_prompts(&mut stmt, agent_id)
+    }
+
+    pub fn has_prompt_history(&self, agent_id: &str) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM timeline_events WHERE agent_id=?1 AND event_type IN ('user_prompt','agent_message'))",
+            [agent_id], |row| row.get(0))?)
     }
 
     /// Read user-prompt anchors from the local client replica in chronological order using

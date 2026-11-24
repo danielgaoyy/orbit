@@ -1,58 +1,133 @@
-import { useMemo, useState } from "react";
-import { Search } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { AlertTriangle, ArrowLeftRight, RotateCcw, Search } from "lucide-react";
 import {
   SettingCard,
   SettingGroupLabel,
   SettingSectionHeader,
 } from "@/components/settings/settings-primitives";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { ShortcutKbd } from "@/components/ui/kbd";
 import { useI18n } from "@/lib/i18n";
 import { modSymbol } from "@/lib/keybindings";
 import { isMacDesktop } from "@/lib/orbit-ipc";
-import { Input } from "@/components/ui/input";
-import { ShortcutKbd } from "@/components/ui/kbd";
-import { useOrbitSelector } from "@/state/orbit-store";
+import {
+  SHORTCUT_ACTIONS,
+  type ShortcutActionDefinition,
+  type ShortcutActionId,
+  eventToChord,
+  findShortcutConflicts,
+  formatChordForDisplay,
+  getEffectiveChord,
+  isOsReservedChord,
+  swapShortcutBinding,
+} from "@/lib/shortcut-registry";
+import { cn } from "@/lib/utils";
+import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
-interface ShortcutItem {
+interface DisplayShortcutRow {
   group: string;
   action: string;
   keys: string;
+  actionId?: ShortcutActionId;
+  isCustomized?: boolean;
+}
+
+interface PendingConflictState {
+  actionId: ShortcutActionId;
+  candidateChord: string;
+  conflict: ShortcutActionDefinition;
 }
 
 export function ShortcutsSection() {
   const { locale, t } = useI18n();
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
+  const customKeybindings = useOrbitSelector((s) => s.customKeybindings);
+
   const [query, setQuery] = useState("");
+  const [recordingId, setRecordingId] = useState<ShortcutActionId | null>(null);
+  const [reservedWarning, setReservedWarning] = useState<{
+    actionId: ShortcutActionId;
+    chord: string;
+  } | null>(null);
+  const [pendingConflict, setPendingConflict] = useState<PendingConflictState | null>(null);
+
   const isMac = isMacDesktop();
   const mod = modSymbol();
   const shift = isMac ? "⇧" : "Shift+";
-  const alt = isMac ? "⌥" : "Alt+";
-  const ctrl = isMac ? "⌃" : "Ctrl+";
-  const backspace = isMac ? "⌫" : "Backspace";
+
+  const hasAnyCustom = Object.keys(customKeybindings).length > 0;
+
+  // Capture live chord while recording
+  useEffect(() => {
+    if (!recordingId) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (e.key === "Escape" && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+        setRecordingId(null);
+        setReservedWarning(null);
+        return;
+      }
+
+      const chord = eventToChord(e, isMac);
+      if (!chord) return;
+
+      if (isOsReservedChord(chord)) {
+        setReservedWarning({ actionId: recordingId, chord });
+        setPendingConflict(null);
+        return;
+      }
+
+      const conflicts = findShortcutConflicts(recordingId, chord, customKeybindings);
+      if (conflicts.length > 0) {
+        setReservedWarning(null);
+        setPendingConflict({
+          actionId: recordingId,
+          candidateChord: chord,
+          conflict: conflicts[0],
+        });
+        setRecordingId(null);
+        return;
+      }
+
+      orbitActions.setCustomKeybinding(recordingId, chord);
+      setRecordingId(null);
+      setReservedWarning(null);
+      setPendingConflict(null);
+    };
+
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [recordingId, isMac, customKeybindings]);
 
   const groups = useMemo(() => {
     const navGroup = t("settings.groupNavigation");
-    const panelsGroup = t("settings.groupPanels");
     const composerGroup = t("settings.groupComposer");
     const approvalsGroup = t("settings.groupApprovals");
 
-    const all: ShortcutItem[] = [
-      { group: navGroup, action: t("settings.scCommandPalette"), keys: `${mod}K` },
-      { group: navGroup, action: t("settings.scFilterConversations"), keys: `${mod}F` },
-      { group: navGroup, action: t("settings.scSettings"), keys: `${mod},` },
-      { group: navGroup, action: t("settings.scNewConversation"), keys: `${mod}N` },
-      { group: navGroup, action: t("settings.scNextApproval"), keys: `${mod}${shift}A` },
+    const rows: DisplayShortcutRow[] = SHORTCUT_ACTIONS.map((def) => {
+      const effectiveChord = getEffectiveChord(def.id, customKeybindings);
+      const isCustomized = effectiveChord !== def.defaultChord;
+      const displayPrimary = formatChordForDisplay(effectiveChord, isMac);
+      const displayKeys =
+        !isCustomized && def.altDefaultChord
+          ? `${displayPrimary} / ${formatChordForDisplay(def.altDefaultChord, isMac)}`
+          : displayPrimary;
+
+      return {
+        group: t(def.groupKey),
+        action: t(def.labelKey),
+        keys: displayKeys,
+        actionId: def.id,
+        isCustomized,
+      };
+    });
+
+    // Read-only contextual shortcuts (fixed behavior / range chords)
+    rows.push(
       { group: navGroup, action: t("settings.scSwitchConversation"), keys: `${mod}1 .. ${mod}9` },
-
-      { group: panelsGroup, action: t("settings.scToggleSidebar"), keys: `${mod}B` },
-      { group: panelsGroup, action: t("settings.scToggleSidePanel"), keys: `${mod}\\` },
-      { group: panelsGroup, action: t("settings.scNewSideTab"), keys: `${mod}T` },
-      { group: panelsGroup, action: t("settings.scToggleOverview"), keys: `${mod}${alt}O` },
-      { group: panelsGroup, action: t("settings.scQuickOpenFile"), keys: `${mod}P` },
-      { group: panelsGroup, action: t("settings.scToggleDiff"), keys: `${mod}D` },
-      { group: panelsGroup, action: t("settings.scToggleTerminal"), keys: `${mod}J / ${ctrl}\`` },
-      { group: panelsGroup, action: t("settings.scSideQuestion"), keys: `${mod};` },
-      { group: panelsGroup, action: t("settings.scExternalEditor"), keys: `${mod}O` },
-
       {
         group: composerGroup,
         action: t("settings.scSendPrompt"),
@@ -63,28 +138,22 @@ export function ShortcutsSection() {
         action: t("settings.scNewLine"),
         keys: enterToSend ? `${shift}Enter` : "Enter",
       },
-      { group: composerGroup, action: t("settings.scCyclePermissions"), keys: `${shift}Tab` },
       { group: composerGroup, action: t("settings.scSteerAgent"), keys: `${mod}Enter` },
       { group: composerGroup, action: t("settings.scStopGeneration"), keys: "Esc Esc" },
-
-      { group: approvalsGroup, action: t("settings.scAllow"), keys: `${mod}Y` },
-      { group: approvalsGroup, action: t("settings.scAlwaysAllow"), keys: `${mod}${shift}Y` },
-      { group: approvalsGroup, action: t("settings.scDeny"), keys: `${mod}${backspace}` },
-      { group: approvalsGroup, action: t("settings.scSwitchApproval"), keys: `${mod}[ / ${mod}]` },
       { group: approvalsGroup, action: t("settings.scQuickSelectOption"), keys: "1 .. 9" },
-    ];
+    );
 
     const q = query.trim().toLowerCase();
     const filtered = q
-      ? all.filter(
+      ? rows.filter(
           (b) =>
             b.action.toLowerCase().includes(q) ||
             b.group.toLowerCase().includes(q) ||
             b.keys.toLowerCase().includes(q),
         )
-      : all;
+      : rows;
 
-    const map = new Map<string, ShortcutItem[]>();
+    const map = new Map<string, DisplayShortcutRow[]>();
     for (const item of filtered) {
       const list = map.get(item.group) ?? [];
       list.push(item);
@@ -92,17 +161,36 @@ export function ShortcutsSection() {
     }
     return Array.from(map.entries());
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [locale, mod, shift, alt, ctrl, backspace, query, enterToSend]);
+  }, [locale, isMac, mod, shift, query, enterToSend, customKeybindings]);
 
   return (
-    <div className="space-y-5">
-      <SettingSectionHeader
-        title={t("settings.shortcutsTitle")}
-        description={t("settings.shortcutsDesc")}
-      />
+    <div className="flex flex-col gap-5">
+      <div className="flex items-start justify-between gap-3">
+        <SettingSectionHeader
+          title={t("settings.shortcutsTitle")}
+          description={t("settings.shortcutsDesc")}
+        />
+        {hasAnyCustom && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              orbitActions.resetAllCustomKeybindings();
+              setRecordingId(null);
+              setReservedWarning(null);
+              setPendingConflict(null);
+            }}
+            className="shrink-0 gap-1.5 text-[12px]"
+          >
+            <RotateCcw className="size-3" />
+            {t("settings.shortcutsResetAll")}
+          </Button>
+        )}
+      </div>
 
       <div className="relative">
-        <Search className="text-ink-faint pointer-events-none absolute top-1/2 left-3 h-[14px] w-[14px] -translate-y-1/2" />
+        <Search className="text-ink-faint pointer-events-none absolute top-1/2 left-3 size-[14px] -translate-y-1/2" />
         <Input
           type="text"
           value={query}
@@ -117,20 +205,144 @@ export function ShortcutsSection() {
           {t("settings.noMatchingShortcuts")}
         </div>
       ) : (
-        <div className="space-y-5">
+        <div className="flex flex-col gap-5">
           {groups.map(([groupName, items]) => (
-            <div key={groupName} className="space-y-2">
+            <div key={groupName} className="flex flex-col gap-2">
               <SettingGroupLabel>{groupName}</SettingGroupLabel>
               <SettingCard>
-                {items.map((item) => (
-                  <div
-                    key={item.action}
-                    className="flex items-center justify-between gap-4 px-4 py-2.5"
-                  >
-                    <span className="text-foreground text-[13px]">{item.action}</span>
-                    <ShortcutKbd keys={item.keys} className="shrink-0" />
-                  </div>
-                ))}
+                {items.map((item) => {
+                  const isRecording = Boolean(item.actionId && recordingId === item.actionId);
+                  const showReserved =
+                    Boolean(item.actionId && reservedWarning?.actionId === item.actionId);
+                  const showConflict =
+                    Boolean(item.actionId && pendingConflict?.actionId === item.actionId);
+
+                  return (
+                    <div key={item.actionId ?? item.action} className="flex flex-col">
+                      <div className="flex items-center justify-between gap-4 px-4 py-2.5">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <span className="text-foreground truncate text-[13px]">
+                            {item.action}
+                          </span>
+                          {item.isCustomized && (
+                            <span className="bg-surface-recessed text-ink-tertiary rounded px-1.5 py-0.5 text-[10.5px] font-medium">
+                              {t("settings.shortcutsCustomBadge")}
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="flex shrink-0 items-center gap-1.5">
+                          {item.actionId && item.isCustomized && !isRecording && (
+                            <button
+                              type="button"
+                              title={t("settings.shortcutsResetSingle")}
+                              aria-label={t("settings.shortcutsResetSingle")}
+                              onClick={() => {
+                                orbitActions.resetCustomKeybinding(item.actionId!);
+                                setPendingConflict((cur) =>
+                                  cur?.actionId === item.actionId ? null : cur,
+                                );
+                              }}
+                              className="text-ink-faint hover:text-ink-primary hover:bg-accent inline-flex size-[24px] cursor-pointer items-center justify-center rounded-[6px] transition-colors"
+                            >
+                              <RotateCcw className="size-[12px]" />
+                            </button>
+                          )}
+
+                          {item.actionId ? (
+                            <button
+                              type="button"
+                              data-orbit-shortcut-recorder={isRecording ? "true" : undefined}
+                              onClick={() => {
+                                setReservedWarning(null);
+                                setPendingConflict(null);
+                                setRecordingId((cur) =>
+                                  cur === item.actionId ? null : item.actionId!,
+                                );
+                              }}
+                              onBlur={() => {
+                                if (isRecording) setRecordingId(null);
+                              }}
+                              title={t("settings.shortcutsClickToRecord")}
+                              className={cn(
+                                "inline-flex h-[26px] min-w-[68px] cursor-pointer items-center justify-center rounded-[7px] border px-2 font-mono text-[11px] transition-colors",
+                                isRecording
+                                  ? "border-border-strong bg-surface-raised text-ink-primary ring-border-strong ring-1"
+                                  : "border-border-subtle bg-surface-recessed text-ink-secondary hover:border-border-default hover:text-ink-primary",
+                              )}
+                            >
+                              {isRecording ? (
+                                <span className="font-sans text-[11px] font-medium">
+                                  {t("settings.shortcutsPressKeys")}
+                                </span>
+                              ) : (
+                                item.keys
+                              )}
+                            </button>
+                          ) : (
+                            <ShortcutKbd keys={item.keys} className="shrink-0" />
+                          )}
+                        </div>
+                      </div>
+
+                      {showReserved && reservedWarning && (
+                        <div className="border-border-subtle bg-signal-warning-bg text-signal-warning flex items-center justify-between gap-2 border-t px-4 py-2 text-[12px]">
+                          <span className="flex items-center gap-1.5">
+                            <AlertTriangle className="size-3.5 shrink-0" />
+                            <span>
+                              {t("settings.shortcutsReservedError", {
+                                keys: formatChordForDisplay(reservedWarning.chord, isMac),
+                              })}
+                            </span>
+                          </span>
+                        </div>
+                      )}
+
+                      {showConflict && pendingConflict && (
+                        <div className="border-border-subtle bg-signal-warning-bg text-signal-warning flex flex-wrap items-center justify-between gap-2 border-t px-4 py-2 text-[12px]">
+                          <span className="flex min-w-0 items-center gap-1.5">
+                            <AlertTriangle className="size-3.5 shrink-0" />
+                            <span className="truncate">
+                              {t("settings.shortcutsConflictNotice", {
+                                keys: formatChordForDisplay(pendingConflict.candidateChord, isMac),
+                                action: t(pendingConflict.conflict.labelKey),
+                              })}
+                            </span>
+                          </span>
+                          <div className="flex shrink-0 items-center gap-1.5">
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              onClick={() => setPendingConflict(null)}
+                              className="h-[24px] px-2 text-[11px]"
+                            >
+                              {t("common.cancel")}
+                            </Button>
+                            <Button
+                              type="button"
+                              size="sm"
+                              onClick={() => {
+                                const swapped = swapShortcutBinding(
+                                  pendingConflict.actionId,
+                                  pendingConflict.candidateChord,
+                                  pendingConflict.conflict.id,
+                                  customKeybindings,
+                                );
+                                orbitActions.setCustomKeybindings(swapped);
+                                setPendingConflict(null);
+                              }}
+                              className="h-[24px] gap-1 px-2 text-[11px]"
+                            >
+                              <ArrowLeftRight className="size-3" />
+                              {t("settings.shortcutsSwap")}
+                            </Button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </SettingCard>
             </div>
           ))}

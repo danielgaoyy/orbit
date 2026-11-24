@@ -4,6 +4,7 @@ import type { AgentCardView, HostDetailView, SessionSubagentEntryView } from "./
 import {
   type ResolvedSubagentItem,
   filterVisibleSubagents,
+  resolveAgentAncestorLineage,
   resolveToolCallSubagent,
   resolveDelegationDispatches,
   resolveSessionSubagents,
@@ -334,4 +335,103 @@ describe("Orbit managed dispatch resolution", () => {
     assert.equal(legacy.get(second)?.linked, false);
   });
 
+});
+
+describe("multi-level subagent lineage", () => {
+  function makeCard(
+    id: string,
+    title: string,
+    parentAgentId: string | null,
+    parentHostId: string | null = null,
+    running = true,
+  ): AgentCardView {
+    return {
+      agent_id: id,
+      parent_agent_id: parentAgentId,
+      parent_host_id: parentHostId,
+      title,
+      status_label: running ? "Running" : "Idle",
+      is_running: running,
+      is_awaiting_permission: false,
+      created_at_rfc3339: "2026-11-24T10:00:00Z",
+      updated_at_rfc3339: "2026-11-24T10:00:05Z",
+      latest_seq: 10,
+      provider: "codex",
+    } as AgentCardView;
+  }
+
+  it("collects Parent -> Child -> Grandchild across hosts in DFS pre-order and resolves breadcrumbs", () => {
+    const hostDetails: Record<string, HostDetailView> = {
+      "host-mac": {
+        host: { host_id: "host-mac", display_name: "Mac Studio" },
+        agents: [
+          makeCard("ag_root", "Coordinator", null),
+          makeCard("ag_child", "Backend Lead", "ag_root", "host-mac"),
+        ],
+        provider_subagents: {},
+      } as unknown as HostDetailView,
+      "host-linux": {
+        host: { host_id: "host-linux", display_name: "Linux GPU" },
+        agents: [
+          makeCard("ag_grand", "Kernel Profiler", "ag_child", "host-mac"),
+        ],
+        provider_subagents: {},
+      } as unknown as HostDetailView,
+    };
+
+    const resolved = resolveSessionSubagents({
+      hostId: "host-mac",
+      agentId: "ag_root",
+      insightsSubagents: [],
+      hostDetails,
+      fleetHosts: [],
+    });
+
+    assert.deepEqual(
+      resolved.map((sa) => ({ id: sa.childAgentId, depth: sa.depth, remote: sa.remoteHostName })),
+      [
+        { id: "ag_child", depth: 1, remote: null },
+        { id: "ag_grand", depth: 2, remote: "Linux GPU" },
+      ],
+    );
+    assert.deepEqual(
+      resolved[1].lineage?.map((step) => step.title),
+      ["Coordinator", "Backend Lead", "Kernel Profiler"],
+    );
+
+    const crumbs = resolveAgentAncestorLineage({
+      hostId: "host-linux",
+      agentId: "ag_grand",
+      hostDetails,
+      fleetHosts: [],
+    });
+    assert.deepEqual(
+      crumbs.map((c) => `${c.host_name}:${c.title}`),
+      ["Mac Studio:Coordinator", "Mac Studio:Backend Lead", "Linux GPU:Kernel Profiler"],
+    );
+  });
+
+  it("breaks cycles safely and caps depth at 8", () => {
+    const agents: AgentCardView[] = [makeCard("ag_0", "Root", "ag_10")];
+    for (let i = 1; i <= 10; i += 1) {
+      agents.push(makeCard(`ag_${i}`, `Node ${i}`, `ag_${i - 1}`));
+    }
+    const hostDetails: Record<string, HostDetailView> = {
+      "host-a": {
+        host: { host_id: "host-a", display_name: "Host A" },
+        agents,
+        provider_subagents: {},
+      } as unknown as HostDetailView,
+    };
+
+    const resolved = resolveSessionSubagents({
+      hostId: "host-a",
+      agentId: "ag_0",
+      insightsSubagents: [],
+      hostDetails,
+      fleetHosts: [],
+    });
+    assert.equal(resolved.length, 8);
+    assert.equal(resolved[resolved.length - 1]?.depth, 8);
+  });
 });

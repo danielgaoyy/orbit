@@ -964,6 +964,7 @@ export const ReviewTab = memo(function ReviewTab({
 
   return (
     <div
+      data-orbit-review-tab="true"
       className={cn(
         "orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden",
         !visible && "hidden",
@@ -1343,6 +1344,8 @@ export const ReviewTab = memo(function ReviewTab({
       {/* Virtualized Diff Stream Body (O(1) DOM nodes regardless of file/line count) */}
       <DiffFilesViewer
         virtualized
+        hostId={selectedHostId}
+        cwd={selectedCwd}
         files={displayedDiffFiles}
         layout={diffLayout}
         wrapLines={wrapLines}

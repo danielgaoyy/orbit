@@ -33,8 +33,10 @@ pub struct PersistedBackgroundTask {
     pub info: BackgroundTaskInfo,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionLaunchConfig {
+    pub sandbox: Option<orbit_protocol::SandboxPolicy>,
+    pub egress_proxy_url: Option<String>,
     pub agent_id: String,
     pub provider: ProviderKind,
     pub executable: PathBuf,
@@ -85,6 +87,14 @@ pub struct SessionLaunchConfig {
     pub acp_spec: Option<orbit_protocol::AcpAgentSpec>,
 }
 
+impl std::fmt::Debug for SessionLaunchConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionLaunchConfig")
+            .field("agent_id", &self.agent_id)
+            .field("provider", &self.provider)
+            .finish_non_exhaustive()
+    }
+}
 /// Origin of a `DriverCommand::SendPrompt` so provider drivers can distinguish human preemption
 /// from non-interrupting agent/peer notifications.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

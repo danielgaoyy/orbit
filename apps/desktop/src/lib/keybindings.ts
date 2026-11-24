@@ -15,16 +15,28 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import {
+  type ShortcutActionId,
+  getActionShortcutDisplay,
+  matchesActionChord,
+} from "@/lib/shortcut-registry";
+import {
   getFocusedDecisionTarget,
   isAlwaysDecision,
   isDenyDecision,
   stepFocusedDecisionQueue,
 } from "@/lib/timeline-coalesce";
 import { t as translateGlobal } from "@/lib/i18n";
-import { orbitActions } from "@/state/orbit-store";
+import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
 export function modSymbol(): string {
   return isMacDesktop() ? "⌘" : "Ctrl+";
+}
+
+export { getActionShortcutDisplay };
+
+export function useActionShortcutDisplay(actionId: ShortcutActionId): string {
+  const customKeybindings = useOrbitSelector((s) => s.customKeybindings);
+  return getActionShortcutDisplay(actionId, customKeybindings);
 }
 
 export function isConfirmDialogOpen(): boolean {
@@ -34,22 +46,31 @@ export function isConfirmDialogOpen(): boolean {
   );
 }
 
+function isShortcutRecorderActive(): boolean {
+  return (
+    typeof document !== "undefined" &&
+    Boolean(document.querySelector('[data-orbit-shortcut-recorder="true"]'))
+  );
+}
+
 export function useGlobalErgonomicKeybindings(): void {
   const lastEscTimeRef = useRef<number>(0);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const snap = orbitActions.getSnapshot();
-      const mod = isMacDesktop() ? e.metaKey : e.ctrlKey;
+      const custom = snap.customKeybindings;
+      const isMac = isMacDesktop();
+      const mod = isMac ? e.metaKey : e.ctrlKey;
       const keyLower = e.key.toLowerCase();
 
-      // Guard: confirmation alertdialogs own keyboard focus (Enter / Esc / Tab) and must block all global chords
-      if (isConfirmDialogOpen()) {
+      // Guard: shortcut recorder & confirmation alertdialogs own keyboard focus
+      if (isShortcutRecorderActive() || isConfirmDialogOpen()) {
         return;
       }
 
-      // 1. Command Palette (`⌘K` / `Ctrl+K`) — yield to terminal clear/kill-line and inline CodeMirror AI Edit
-      if (mod && !e.shiftKey && !e.altKey && keyLower === "k" && !snap.terminalFocused) {
+      // 1. Command Palette (`⌘K` / custom) — yield to terminal clear/kill-line and inline CodeMirror AI Edit
+      if (matchesActionChord(e, "command_palette", custom, isMac) && !snap.terminalFocused) {
         if (!snap.commandPaletteOpen && isFocusInsideCodeEditor(e.target, document.activeElement)) {
           return;
         }
@@ -59,10 +80,19 @@ export function useGlobalErgonomicKeybindings(): void {
         return;
       }
 
-      // 1a. Focus-aware Find (`⌘F` / `Ctrl+F`) and Sidebar Filter (`⌘⇧F` / `Ctrl+Shift+F`)
-      //     Yields cleanly to Terminal search, Right Side Panel / File Viewer, & modal overlays;
-      //     focuses Sidebar filter when inside Sidebar (or on `⌘⇧F`); otherwise opens in-session `StageFindBar`.
-      if (mod && !e.altKey && keyLower === "f") {
+      // 1a. Focus-aware Find (`⌘F` / custom) and Sidebar Filter (`⌘⇧F` / custom)
+      const isCustomFind = Boolean(custom.find);
+      const isCustomSidebarFilter = Boolean(custom.sidebar_filter);
+      if (isCustomSidebarFilter && matchesActionChord(e, "sidebar_filter", custom, isMac)) {
+        e.preventDefault();
+        if (e.repeat) return;
+        orbitActions.focusSidebarFilter();
+        return;
+      }
+      if (
+        (isCustomFind && matchesActionChord(e, "find", custom, isMac)) ||
+        (!isCustomFind && mod && !e.altKey && keyLower === "f")
+      ) {
         const sidePanelEl = document.querySelector<HTMLElement>(SIDE_PANEL_SELECTOR);
         const focusInsideSidePanelOrFileViewer =
           isFocusInsideSidePanel(e.target, document.activeElement) ||
@@ -85,19 +115,26 @@ export function useGlobalErgonomicKeybindings(): void {
             ),
           );
         const hasOpenConversation = Boolean(
-          snap.selectedHostId && snap.selectedAgentId && !snap.isDraftNewSession,
+          snap.workspacePanel === "conversation" &&
+            snap.selectedHostId &&
+            snap.selectedAgentId &&
+            !snap.isDraftNewSession,
         );
-        const findAction = resolveGlobalFindAction({
-          mod,
-          shiftKey: e.shiftKey,
-          altKey: e.altKey,
-          keyLower,
-          terminalFocused: snap.terminalFocused,
-          focusInsideSidePanel: focusInsideSidePanelOrFileViewer,
-          focusInsideSidebar,
-          isOverlayOpen,
-          hasOpenConversation,
-        });
+        const findAction = isCustomFind
+          ? !snap.terminalFocused && !focusInsideSidePanelOrFileViewer && !isOverlayOpen && hasOpenConversation
+            ? "stage_find"
+            : null
+          : resolveGlobalFindAction({
+              mod,
+              shiftKey: e.shiftKey,
+              altKey: e.altKey,
+              keyLower,
+              terminalFocused: snap.terminalFocused,
+              focusInsideSidePanel: focusInsideSidePanelOrFileViewer,
+              focusInsideSidebar,
+              isOverlayOpen,
+              hasOpenConversation,
+            });
         if (findAction === "stage_find") {
           e.preventDefault();
           if (e.repeat) return;
@@ -112,16 +149,15 @@ export function useGlobalErgonomicKeybindings(): void {
         }
       }
 
-      // 1b. Settings Center (`⌘,` / `Ctrl+,`) — native standard preferences shortcut
-      if (mod && !e.shiftKey && !e.altKey && e.key === ",") {
+      // 1b. Settings Center (`⌘,` / custom)
+      if (matchesActionChord(e, "open_settings", custom, isMac)) {
         e.preventDefault();
         if (e.repeat) return;
         orbitActions.toggleSettings();
         return;
       }
 
-      // 1c. Escape inside Settings View returns instantaneously to Workspace —
-      //     unless an inner dialog, popover, menu, or listbox overlay is open.
+      // 1c. Escape inside Settings View returns instantaneously to Workspace
       if (e.key === "Escape" && snap.activeView === "settings") {
         const hasBlockingOverlay =
           snap.pairDialogOpen ||
@@ -145,11 +181,8 @@ export function useGlobalErgonomicKeybindings(): void {
         }
       }
 
-      // 2. Toggle Terminal Tab in Side Panel (`⌘J` / `Ctrl+J` or `Ctrl+\``) — works even inside terminal
-      if (
-        (mod && !e.shiftKey && !e.altKey && keyLower === "j") ||
-        (e.ctrlKey && !e.shiftKey && !e.altKey && e.key === "`")
-      ) {
+      // 2. Toggle Terminal Tab in Side Panel (`⌘J` / `Ctrl+\`` / custom) — works even inside terminal
+      if (matchesActionChord(e, "toggle_terminal", custom, isMac)) {
         e.preventDefault();
         if (e.repeat) return;
         orbitActions.toggleTerminalTab();
@@ -179,56 +212,68 @@ export function useGlobalErgonomicKeybindings(): void {
         return;
       }
 
-      // 3. New Agent Thread (`⌘N` / `Ctrl+N`)
-      if (mod && !e.shiftKey && !e.altKey && keyLower === "n") {
+      // 3. New Agent Thread (`⌘N` / custom)
+      if (matchesActionChord(e, "new_conversation", custom, isMac)) {
         e.preventDefault();
         if (e.repeat) return;
         orbitActions.startNewThreadDraft();
         return;
       }
 
-      // 4. Jump to Next Attention / Approval Item (`⌘⇧A` / `Ctrl+Shift+A`)
-      if (mod && e.shiftKey && !e.altKey && keyLower === "a") {
+      // 3b. Personal Agent Global Overview (`⌘⇧O` / custom)
+      if (matchesActionChord(e, "open_global_overview", custom, isMac)) {
+        e.preventDefault();
+        if (e.repeat) return;
+        if (snap.workspacePanel === "overview" && snap.selectedHostId && snap.selectedAgentId) {
+          orbitActions.selectAgent(snap.selectedHostId, snap.selectedAgentId);
+        } else {
+          orbitActions.openGlobalOverview();
+        }
+        return;
+      }
+
+      // 4. Jump to Next Attention / Approval Item (`⌘⇧A` / custom)
+      if (matchesActionChord(e, "next_attention", custom, isMac)) {
         e.preventDefault();
         if (e.repeat) return;
         orbitActions.jumpToNextAttentionItem();
         return;
       }
 
-      // 5. Toggle Left Fleet Sidebar (`⌘B` / `Ctrl+B`)
-      if (mod && !e.shiftKey && !e.altKey && keyLower === "b") {
+      // 5. Toggle Left Fleet Sidebar (`⌘B` / custom)
+      if (matchesActionChord(e, "toggle_sidebar", custom, isMac)) {
         e.preventDefault();
         if (e.repeat) return;
         orbitActions.toggleSidebar();
         return;
       }
 
-      // 5b. Toggle Unified Right Side Panel (`⌘\` / `Ctrl+\`)
-      if (mod && !e.shiftKey && !e.altKey && e.key === "\\") {
+      // 5b. Toggle Unified Right Side Panel (`⌘\` / custom)
+      if (matchesActionChord(e, "toggle_side_panel", custom, isMac)) {
         e.preventDefault();
         if (e.repeat) return;
         orbitActions.toggleSidePanel();
         return;
       }
 
-      // 5b-2. Open Side Panel New Tab / Launchpad (`⌘T` / `Ctrl+T`)
-      if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "t") {
+      // 5b-2. Open Side Panel New Tab / Launchpad (`⌘T` / custom)
+      if (matchesActionChord(e, "new_side_tab", custom, isMac)) {
         e.preventDefault();
         if (e.repeat) return;
         orbitActions.openSidePanelNewTab();
         return;
       }
 
-      // 5c. Toggle Main Stage Overview Panel (`⌘⌥O` / `Ctrl+Alt+O`)
-      if (mod && e.altKey && !e.shiftKey && (keyLower === "o" || e.code === "KeyO")) {
+      // 5c. Toggle Main Stage Overview HUD (`⌘⌥O` / custom)
+      if (matchesActionChord(e, "toggle_overview_hud", custom, isMac)) {
         e.preventDefault();
         if (e.repeat) return;
         orbitActions.toggleOverviewPanel();
         return;
       }
 
-      // 6. Toggle Diff Review Tab (`⌘D` / `Ctrl+D`) — yield to CodeMirror multi-cursor `selectNextOccurrence`
-      if (mod && !e.shiftKey && !e.altKey && keyLower === "d") {
+      // 6. Toggle Diff Review Tab (`⌘D` / custom) — yield to CodeMirror multi-cursor
+      if (matchesActionChord(e, "toggle_diff", custom, isMac)) {
         if (isFocusInsideCodeEditor(e.target, document.activeElement)) {
           return;
         }
@@ -238,24 +283,24 @@ export function useGlobalErgonomicKeybindings(): void {
         return;
       }
 
-      // 6b. Quick Open Workspace File (`⌘P` / `Ctrl+P`)
-      if (mod && !e.shiftKey && !e.altKey && keyLower === "p") {
+      // 6b. Quick Open Workspace File (`⌘P` / custom)
+      if (matchesActionChord(e, "quick_open_file", custom, isMac)) {
         e.preventDefault();
         if (e.repeat) return;
         orbitActions.setQuickOpenFilesOpen(true);
         return;
       }
 
-      // 6c. Toggle Side Question (`/btw`) Tab (`⌘;` / `Ctrl+;`)
-      if (mod && !e.shiftKey && !e.altKey && e.key === ";") {
+      // 6c. Toggle Side Question (`/btw`) Tab (`⌘;` / custom)
+      if (matchesActionChord(e, "toggle_side_question", custom, isMac)) {
         e.preventDefault();
         if (e.repeat) return;
         orbitActions.toggleSideQuestionTab();
         return;
       }
 
-      // 7. Open in External Editor (`⌘O` / `Ctrl+O`)
-      if (mod && !e.shiftKey && !e.altKey && keyLower === "o") {
+      // 7. Open in External Editor (`⌘O` / custom)
+      if (matchesActionChord(e, "open_external_editor", custom, isMac)) {
         e.preventDefault();
         void orbitActions.openWorkspaceInEditor();
         return;
@@ -269,8 +314,8 @@ export function useGlobalErgonomicKeybindings(): void {
         return;
       }
 
-      // 9. Cycle Session Mode (`Shift+Tab`) — yield to native reverse tabbing inside secondary form inputs
-      if (e.shiftKey && e.key === "Tab" && !mod && !e.altKey) {
+      // 9. Cycle Session Mode (`Shift+Tab` / custom)
+      if (matchesActionChord(e, "cycle_mode", custom, isMac)) {
         const activeEl = document.activeElement as HTMLElement | null;
         const activeTag = activeEl?.tagName;
         const isMainComposerInput = activeEl?.dataset?.orbitComposerInput === "true";
@@ -296,91 +341,99 @@ export function useGlobalErgonomicKeybindings(): void {
         }
       }
 
-      // 10. Quick Permission Approval Chords (`⌘Y` Allow, `⌘⇧Y` Always Allow, `⌘⌫` Deny)
-      //     and Queue Stepper (`⌘[` / `⌘]`) across both parent AND child subagent permissions.
-      if (mod && !e.altKey && !e.repeat && snap.selectedHostId && snap.selectedAgentId && !snap.isDraftNewSession) {
-        if (!e.shiftKey && (e.key === "[" || e.key === "]")) {
-          const delta: -1 | 1 = e.key === "[" ? -1 : 1;
-          if (stepFocusedDecisionQueue(delta)) {
+      // 10. Quick Permission Approval Chords (`⌘Y`, `⌘⇧Y`, `⌘⌫`, `⌘[`, `⌘]` / custom)
+      if (!e.repeat && snap.selectedHostId && snap.selectedAgentId && !snap.isDraftNewSession) {
+        if (matchesActionChord(e, "approval_prev", custom, isMac)) {
+          if (stepFocusedDecisionQueue(-1)) {
+            e.preventDefault();
+            return;
+          }
+        }
+        if (matchesActionChord(e, "approval_next", custom, isMac)) {
+          if (stepFocusedDecisionQueue(1)) {
             e.preventDefault();
             return;
           }
         }
 
-        const focused = getFocusedDecisionTarget();
-        if (focused?.kind !== "question") {
-          let targetHostId: string | null = null;
-          let targetAgentId: string | null = null;
-          let targetRequestId: string | null = null;
-          let rawDecisions: readonly string[] = [];
-          let resolveHandler: ((decision: string) => void) | undefined;
+        const wantAllow = matchesActionChord(e, "approve_allow", custom, isMac);
+        const wantAlways = matchesActionChord(e, "approve_always", custom, isMac);
+        const wantDeny = matchesActionChord(e, "approve_deny", custom, isMac);
 
-          if (focused?.kind === "permission") {
-            // Strictly honor the exact visible DecisionDock card (parent OR managed child subagent)
-            targetHostId = focused.hostId;
-            targetAgentId = focused.agentId;
-            targetRequestId = focused.requestId;
-            rawDecisions = focused.allowedDecisions;
-            resolveHandler = focused.onResolve;
-          } else {
-            // Fallback when dock has not mounted/registered yet: first unresolved parent permission
-            const stage = snap.stages[`${snap.selectedHostId}::${snap.selectedAgentId}`];
-            const firstPerm = stage?.pending_permissions.find(
-              (it): it is Extract<(typeof stage.pending_permissions)[number], { item_type: "permission_request" }> =>
-                it.item_type === "permission_request" && !it.resolved_decision,
-            );
-            if (firstPerm) {
-              targetHostId = snap.selectedHostId;
-              targetAgentId = snap.selectedAgentId;
-              targetRequestId = firstPerm.request_id;
-              rawDecisions = firstPerm.allowed_decisions;
+        if (wantAllow || wantAlways || wantDeny) {
+          const focused = getFocusedDecisionTarget();
+          if (focused?.kind !== "question") {
+            let targetHostId: string | null = null;
+            let targetAgentId: string | null = null;
+            let targetRequestId: string | null = null;
+            let rawDecisions: readonly string[] = [];
+            let resolveHandler: ((decision: string) => void) | undefined;
+
+            if (focused?.kind === "permission") {
+              targetHostId = focused.hostId;
+              targetAgentId = focused.agentId;
+              targetRequestId = focused.requestId;
+              rawDecisions = focused.allowedDecisions;
+              resolveHandler = focused.onResolve;
+            } else {
+              const stage = snap.stages[`${snap.selectedHostId}::${snap.selectedAgentId}`];
+              const firstPerm = stage?.pending_permissions.find(
+                (it): it is Extract<(typeof stage.pending_permissions)[number], { item_type: "permission_request" }> =>
+                  it.item_type === "permission_request" && !it.resolved_decision,
+              );
+              if (firstPerm) {
+                targetHostId = snap.selectedHostId;
+                targetAgentId = snap.selectedAgentId;
+                targetRequestId = firstPerm.request_id;
+                rawDecisions = firstPerm.allowed_decisions;
+              }
             }
-          }
 
-          if (targetHostId && targetAgentId && targetRequestId) {
-            const decisions =
-              rawDecisions.length > 0 ? rawDecisions : ["allow", "allow_always", "deny"];
-            const allowChoice =
-              decisions.find((d) => !isDenyDecision(d) && !isAlwaysDecision(d)) ?? null;
-            const alwaysChoice = decisions.find((d) => isAlwaysDecision(d)) ?? null;
-            const denyChoice = decisions.find((d) => isDenyDecision(d)) ?? null;
+            if (targetHostId && targetAgentId && targetRequestId) {
+              const decisions =
+                rawDecisions.length > 0 ? rawDecisions : ["allow", "allow_always", "deny"];
+              const allowChoice =
+                decisions.find((d) => !isDenyDecision(d) && !isAlwaysDecision(d)) ?? null;
+              const alwaysChoice = decisions.find((d) => isAlwaysDecision(d)) ?? null;
+              const denyChoice = decisions.find((d) => isDenyDecision(d)) ?? null;
 
-            const dispatchDecision = (choice: string) => {
-              if (resolveHandler) {
-                resolveHandler(choice);
+              const dispatchDecision = (choice: string) => {
+                if (resolveHandler) {
+                  resolveHandler(choice);
+                  return;
+                }
+                void orbitIpc
+                  .resolvePermission(targetHostId!, targetAgentId!, targetRequestId!, choice)
+                  .catch((err) => {
+                    orbitActions.showToast(
+                      translateGlobal("approval.permissionFailed", { error: String(err) }),
+                    );
+                  });
+              };
+
+              if (wantAllow && allowChoice) {
+                e.preventDefault();
+                dispatchDecision(allowChoice);
                 return;
               }
-              void orbitIpc
-                .resolvePermission(targetHostId!, targetAgentId!, targetRequestId!, choice)
-                .catch((err) => {
-                  orbitActions.showToast(
-                    translateGlobal("approval.permissionFailed", { error: String(err) }),
-                  );
-                });
-            };
-
-            if (!e.shiftKey && keyLower === "y" && allowChoice) {
-              e.preventDefault();
-              dispatchDecision(allowChoice);
-              return;
-            }
-            if (e.shiftKey && keyLower === "y" && alwaysChoice) {
-              e.preventDefault();
-              dispatchDecision(alwaysChoice);
-              return;
-            }
-            if (!e.shiftKey && e.key === "Backspace" && denyChoice) {
-              const activeEl = document.activeElement as HTMLElement | null;
-              const activeTag = activeEl?.tagName;
-              const isNonEmptyInput =
-                ((activeTag === "INPUT" || activeTag === "TEXTAREA") &&
-                  (activeEl as HTMLInputElement | HTMLTextAreaElement).value.length > 0) ||
-                (Boolean(activeEl?.isContentEditable) &&
-                  (activeEl?.textContent?.length ?? 0) > 0);
-              if (!isNonEmptyInput) {
+              if (wantAlways && alwaysChoice) {
                 e.preventDefault();
-                dispatchDecision(denyChoice);
+                dispatchDecision(alwaysChoice);
                 return;
+              }
+              if (wantDeny && denyChoice) {
+                const activeEl = document.activeElement as HTMLElement | null;
+                const activeTag = activeEl?.tagName;
+                const isNonEmptyInput =
+                  ((activeTag === "INPUT" || activeTag === "TEXTAREA") &&
+                    (activeEl as HTMLInputElement | HTMLTextAreaElement).value.length > 0) ||
+                  (Boolean(activeEl?.isContentEditable) &&
+                    (activeEl?.textContent?.length ?? 0) > 0);
+                if (!isNonEmptyInput) {
+                  e.preventDefault();
+                  dispatchDecision(denyChoice);
+                  return;
+                }
               }
             }
           }

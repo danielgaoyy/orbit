@@ -1193,6 +1193,10 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<SideQuestionStreamEvent>>,
     pending_rewinds:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<RewindAgentResultView, String>>>,
+    pending_rewind_previews: HashMap<
+        Uuid,
+        tokio::sync::oneshot::Sender<Result<crate::contract::RewindPreviewView, String>>,
+    >,
     pending_forks: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ForkAgentResultView, String>>>,
     pending_handoff_previews:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<WorktreeHandoffPreview, String>>>,
@@ -1435,6 +1439,7 @@ impl HostMemoryState {
             pending_instruction_saves: HashMap::new(),
             pending_side_questions: HashMap::new(),
             pending_rewinds: HashMap::new(),
+            pending_rewind_previews: HashMap::new(),
             pending_forks: HashMap::new(),
             pending_handoff_previews: HashMap::new(),
             pending_handoff_executes: HashMap::new(),
@@ -2467,6 +2472,35 @@ impl OrbitAppCore {
             return reader(None, None);
         };
         let active_subagent_parents = collect_parents_with_running_subagents(&guard);
+        let prefs_snapshot = self.thread_prefs.read().ok();
+        let fleet_nodes: Vec<crate::subagents::FleetAgentNodeRef> = guard
+            .iter()
+            .flat_map(|(hid, hs)| {
+                let hname = hs.profile.effective_display_name();
+                let armed = collect_agents_with_armed_timers(hs);
+                hs.agents
+                    .values()
+                    .map(|ag| {
+                        let pref = prefs_snapshot
+                            .as_ref()
+                            .and_then(|p| p.get(&(hid.clone(), ag.agent_id.clone())));
+                        let has_run =
+                            active_subagent_parents.contains(&(hid.clone(), ag.agent_id.clone()));
+                        crate::subagents::FleetAgentNodeRef {
+                            host_id: hid.clone(),
+                            host_name: hname.clone(),
+                            agent: agent_to_card_view_with_timers(
+                                ag,
+                                pref,
+                                has_run,
+                                armed.contains(&ag.agent_id),
+                            ),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        drop(prefs_snapshot);
         let Some(host_state) = guard.get_mut(host_id) else {
             return reader(None, None);
         };
@@ -2591,6 +2625,11 @@ impl OrbitAppCore {
                     provider_subagents,
                 );
 
+                let root_title = current_agent_card
+                    .as_ref()
+                    .map(|a| a.title.as_str())
+                    .unwrap_or(agent_id);
+                insights.apply_fleet_subagent_lineage(host_id, agent_id, root_title, &fleet_nodes);
                 insights.merge_outline(full_outline);
                 host_state.stage_cache.insert(
                     agent_id.to_string(),
@@ -2690,6 +2729,16 @@ impl OrbitAppCore {
                         &host_agent_cards,
                         provider_subagents,
                     );
+                    let root_title = current_agent_card
+                        .as_ref()
+                        .map(|a| a.title.as_str())
+                        .unwrap_or(agent_id);
+                    insights.apply_fleet_subagent_lineage(
+                        host_id,
+                        agent_id,
+                        root_title,
+                        &fleet_nodes,
+                    );
                     insights.merge_outline(full_outline);
                     cached.pending_permissions = pending_permissions;
                     cached.pending_questions = pending_questions;
@@ -2709,6 +2758,16 @@ impl OrbitAppCore {
                         current_agent_card.as_ref(),
                         &host_agent_cards,
                         provider_subagents,
+                    );
+                    let root_title = current_agent_card
+                        .as_ref()
+                        .map(|a| a.title.as_str())
+                        .unwrap_or(agent_id);
+                    next_insights.apply_fleet_subagent_lineage(
+                        host_id,
+                        agent_id,
+                        root_title,
+                        &fleet_nodes,
                     );
                     next_insights.merge_outline(full_outline);
                     if next_insights != cached.insights {
@@ -3453,6 +3512,7 @@ impl OrbitAppCore {
 
         struct OwnedSidebarHostData {
             host_id: String,
+            host_name: String,
             workspaces: Vec<WorkspaceSummary>,
             discovered_projects: Vec<DiscoveredProject>,
             agents: Vec<(AgentCardView, i64)>,
@@ -3526,6 +3586,7 @@ impl OrbitAppCore {
 
                 host_inputs_owned.push(OwnedSidebarHostData {
                     host_id: hid.clone(),
+                    host_name: state.profile.effective_display_name(),
                     workspaces: state.workspaces.clone(),
                     discovered_projects: state.discovered_projects.clone(),
                     agents: agents_with_order,
@@ -3540,6 +3601,7 @@ impl OrbitAppCore {
             .iter()
             .map(|item| crate::sidebar::SidebarHostInput {
                 host_id: item.host_id.as_str(),
+                host_name: item.host_name.as_str(),
                 workspaces: item.workspaces.as_slice(),
                 discovered_projects: item.discovered_projects.as_slice(),
                 agents: item.agents.clone(),
@@ -6752,6 +6814,45 @@ impl OrbitAppCore {
                     state.enforce_provider_subagent_timeline_bounds(Some(&key));
                     notify_host = true;
                 }
+                WireMessage::RewindPreviewResult {
+                    request_id,
+                    agent_id,
+                    to_seq,
+                    checkpoint_kind,
+                    files,
+                    external_conflicts,
+                } => {
+                    if let Some(tx) = state.pending_rewind_previews.remove(&request_id) {
+                        let mapped_files: Vec<crate::contract::RewindPreviewFileView> = files
+                            .into_iter()
+                            .map(|f| {
+                                let diff_file = if f.reverse_unified_diff.trim().is_empty() {
+                                    None
+                                } else {
+                                    parse_unified_diff(&f.reverse_unified_diff)
+                                        .into_iter()
+                                        .next()
+                                };
+                                crate::contract::RewindPreviewFileView {
+                                    path: f.path,
+                                    action: f.action,
+                                    additions: f.additions,
+                                    deletions: f.deletions,
+                                    reverse_unified_diff: f.reverse_unified_diff,
+                                    has_external_conflict: f.has_external_conflict,
+                                    diff_file,
+                                }
+                            })
+                            .collect();
+                        let _ = tx.send(Ok(crate::contract::RewindPreviewView {
+                            agent_id,
+                            to_seq,
+                            checkpoint_kind,
+                            files: mapped_files,
+                            external_conflicts,
+                        }));
+                    }
+                }
                 WireMessage::AgentRewound {
                     request_id,
                     agent,
@@ -7935,6 +8036,10 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_rewinds.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_rewind_previews.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -14785,6 +14890,96 @@ impl OrbitAppCore {
         false
     }
 
+    /// Preview file-level rewind diff and external conflict status before executing a rewind.
+    pub async fn preview_rewind_agent_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        to_seq: u64,
+    ) -> Result<crate::contract::RewindPreviewView, String> {
+        if agent_id.starts_with("opt_") {
+            return Err("Wait for the session to finish initializing before rewinding".into());
+        }
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to preview rewind".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.to_string();
+        let owned_agent_id = agent_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_rewind_previews.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before previewing rewind".to_string()),
+                        None => Some(format!("host `{owned_host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::PreviewRewindAgent {
+                    request_id: req_id,
+                    agent_id: owned_agent_id,
+                    to_seq,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_rewind_previews.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send rewind preview request: {e}")));
+                return;
+            }
+
+            let outcome = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(view))) => Ok(view),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while previewing rewind".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_rewind_previews.remove(&req_id);
+                    }
+                    Err("Timed out waiting for daemon rewind preview".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "rewind preview task cancelled".to_string())?
+    }
+
     /// Rewind an agent conversation (and optionally restore workspace files) to strictly before `to_before_seq`.
     pub async fn rewind_agent_on_host(
         self: &Arc<Self>,
@@ -14792,6 +14987,7 @@ impl OrbitAppCore {
         agent_id: &str,
         to_before_seq: u64,
         restore_files: bool,
+        restore_paths: Option<Vec<String>>,
     ) -> Result<RewindAgentResultView, String> {
         if agent_id.starts_with("opt_") {
             return Err("Wait for the session to finish initializing before rewinding".into());
@@ -14844,6 +15040,7 @@ impl OrbitAppCore {
                     agent_id: owned_agent_id,
                     to_before_seq,
                     restore_files,
+                    restore_paths,
                 })
                 .await
             {
@@ -20575,6 +20772,7 @@ impl OrbitAppCore {
             agent_id,
             to_before_seq,
             restore_files,
+            None,
         ))
     }
 
@@ -22540,6 +22738,9 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     for (_, tx) in h.pending_rewinds.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
+    for (_, tx) in h.pending_rewind_previews.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
     for (_, tx) in h.pending_forks.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
@@ -24475,17 +24676,21 @@ fn collect_parents_with_running_subagents(
     hosts: &HashMap<String, HostMemoryState>,
 ) -> HashSet<(String, String)> {
     let mut active_parents: HashSet<(String, String)> = HashSet::new();
+    let mut parent_by_agent: HashMap<(String, String), (String, String)> = HashMap::new();
     for (child_host_id, host_state) in hosts {
         for ag in host_state.agents.values() {
-            if ag.archived_at.is_none()
-                && agent_status_is_active_for_subagent(&ag.status)
-                && let Some(ref parent_id) = ag.parent_agent_id
-            {
+            if let Some(ref parent_id) = ag.parent_agent_id {
                 let target_host = ag
                     .parent_host_id
                     .as_deref()
                     .unwrap_or(child_host_id.as_str());
-                active_parents.insert((target_host.to_string(), parent_id.clone()));
+                parent_by_agent.insert(
+                    (child_host_id.clone(), ag.agent_id.clone()),
+                    (target_host.to_string(), parent_id.clone()),
+                );
+                if ag.archived_at.is_none() && agent_status_is_active_for_subagent(&ag.status) {
+                    active_parents.insert((target_host.to_string(), parent_id.clone()));
+                }
             }
         }
         for (parent_agent_id, subs) in &host_state.provider_subagents {
@@ -24497,7 +24702,7 @@ fn collect_parents_with_running_subagents(
             }
         }
     }
-    active_parents
+    crate::subagents::propagate_active_ancestors(active_parents, &parent_by_agent)
 }
 
 fn agent_has_running_subagents(

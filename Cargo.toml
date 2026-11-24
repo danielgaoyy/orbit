@@ -90,7 +90,7 @@ chrono-tz = "0.10"
 thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

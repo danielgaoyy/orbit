@@ -16,6 +16,7 @@ import {
   normalizeSemver,
 } from "@/lib/orbit-ipc";
 import { isBareHomeDir } from "@/lib/projects";
+import { sanitizeCustomKeybindings } from "@/lib/shortcut-registry";
 import {
   SIDEBAR_DEFAULT_WIDTH_PX,
   SIDE_PANEL_DEFAULT_WIDTH_PX,
@@ -149,6 +150,7 @@ export function buildPersistedPrefsPayload(snap: OrbitUiState): PersistedPrefs {
     locale: snap.locale,
     theme: snap.theme,
     enterToSend: snap.enterToSend,
+    customKeybindings: snap.customKeybindings,
     notifyOnApproval: snap.notifyOnApproval,
     notifyOnTurnComplete: snap.notifyOnTurnComplete,
     notifyOnAgentError: snap.notifyOnAgentError,
@@ -597,6 +599,7 @@ export function createDefaultInitialState(
       initialPrefs.sidePanelWidth ?? initialPrefs.inspectorWidth ?? SIDE_PANEL_DEFAULT_WIDTH_PX,
     sidePanelTabs: [],
     activeSidePanelTabId: null,
+    sidePanelSplit: null,
     fileViewCache: {},
     fileEditorDrafts: {},
     pendingUnsavedFileAction: null,
@@ -669,6 +672,7 @@ export function createDefaultInitialState(
 
     activeView: "workspace",
     workspacePanel: "conversation",
+    overviewPinnedLanes: [],
     settingsSection: "general",
     commandPaletteOpen: false,
     onboardingOpen: false,
@@ -738,6 +742,7 @@ export function createDefaultInitialState(
     terminalCursorStyle: initialPrefs.terminalCursorStyle ?? "bar",
     terminalScrollback: initialPrefs.terminalScrollback ?? 5000,
     terminalThemeMode: initialPrefs.terminalThemeMode ?? "harmonized",
+    customKeybindings: sanitizeCustomKeybindings(initialPrefs.customKeybindings),
   };
 }
 

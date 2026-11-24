@@ -1,6 +1,7 @@
 import type { ComposerInlineDirective } from "@/lib/slash-commands";
 import type { DraftPersistenceController } from "@/lib/draft-persistence";
 import type { NotificationSoundTone } from "@/lib/notification-sound";
+import type { ShortcutActionId } from "@/lib/shortcut-registry";
 import type {
   BrowserActionRequest,
   BrowserActionResponseView,
@@ -122,6 +123,19 @@ export interface OrbitCrossSliceActions {
   markOpenFilesStaleForWorkspace(hostId: string, cwd: string): void;
   focusSidePanelTab(tabId: string, opts?: { skipUnsavedGuard?: boolean }): void;
   closeSidePanelTab(tabId: string, opts?: { skipUnsavedGuard?: boolean }): void;
+  reorderSidePanelTabs(sourceTabId: string, targetTabId: string, position: "before" | "after"): void;
+  splitSidePanelTab(tabId?: string | null): void;
+  closeSidePanelSplit(): void;
+  setSidePanelSplitRatio(ratio: number): void;
+  setSidePanelSecondaryTab(tabId: string): void;
+  openGlobalOverview(): void;
+  pinOverviewLane(hostId: string, agentId: string): void;
+  unpinOverviewLane(hostId: string, agentId: string): void;
+  clearOverviewLanes(): void;
+  setCustomKeybinding(actionId: ShortcutActionId, chord: string | null): void;
+  setCustomKeybindings(next: Record<string, string>): void;
+  resetCustomKeybinding(actionId: ShortcutActionId): void;
+  resetAllCustomKeybindings(): void;
   openReviewTab(opts?: { path?: string | null; scope?: ReviewScope }): void;
   toggleReviewTab(openOverride?: boolean): void;
   openFilesExplorerTab(): void;
@@ -266,6 +280,12 @@ export interface OrbitStoreContext {
     tag?: string;
     tone?: NotificationSoundTone;
     forceEvenIfVisible?: boolean;
+    permissionRequestId?: string | null;
+    isPlanApproval?: boolean;
+    humanOnly?: boolean;
+    riskLevel?: string | null;
+    allowDecision?: string | null;
+    denyDecision?: string | null;
   }): boolean;
   syncAttentionIndicators(
     overview: FleetOverviewView,

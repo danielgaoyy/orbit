@@ -35,6 +35,9 @@ pub const MAX_WATCHED_ROOTS: usize = 64;
 /// Maximum relative paths included in a single coalesced `WorkspaceFilesChanged` event.
 pub const MAX_COALESCED_PATHS_PER_EVENT: usize = 64;
 
+/// Maximum relative paths retained per debounced batch for background memory revalidation.
+pub const MAX_REVALIDATION_PATHS_PER_EVENT: usize = 4096;
+
 /// Bounded event queue between the OS watcher callback thread and the Tokio debouncer task.
 const RAW_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
@@ -63,6 +66,8 @@ pub struct WorkspaceWatchBatch {
     pub cwd: String,
     pub canonical_root: PathBuf,
     pub changed_paths: Vec<String>,
+    pub revalidation_paths: Vec<String>,
+    pub is_primary_root_event: bool,
     pub git_changed: bool,
     pub skills_or_rules_changed: bool,
 }
@@ -212,6 +217,7 @@ struct WatcherRegistryState {
 #[derive(Default)]
 struct PendingRootBatch {
     changed_paths: BTreeSet<String>,
+    revalidation_paths: BTreeSet<String>,
     git_changed: bool,
     skills_or_rules_changed: bool,
     first_event_at: Option<Instant>,
@@ -534,7 +540,10 @@ fn ingest_raw_event(
                 entry.first_event_at = Some(now);
             }
             if entry.changed_paths.len() < MAX_COALESCED_PATHS_PER_EVENT {
-                entry.changed_paths.insert(classified.rel_path);
+                entry.changed_paths.insert(classified.rel_path.clone());
+            }
+            if entry.revalidation_paths.len() < MAX_REVALIDATION_PATHS_PER_EVENT {
+                entry.revalidation_paths.insert(classified.rel_path);
             }
             if classified.is_git_state {
                 entry.git_changed = true;
@@ -573,38 +582,54 @@ fn flush_pending_roots(
         let Some(batch) = pending.remove(&root) else {
             continue;
         };
-        if batch.changed_paths.is_empty() && !batch.git_changed && !batch.skills_or_rules_changed {
-            continue;
-        }
-        let targets: Vec<(String, String)> = {
-            let Ok(guard) = state.lock() else {
-                continue;
-            };
-            guard
-                .root_to_workspaces
-                .get(&root)
-                .map(|ws_ids| {
-                    ws_ids
-                        .iter()
-                        .filter_map(|ws_id| {
-                            let (_, cwd) = guard.workspace_to_root.get(ws_id)?;
-                            Some((ws_id.clone(), cwd.clone()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
+        emit_root_batch(state, &root, batch, on_change);
+    }
+}
+
+fn emit_root_batch(
+    state: &Arc<Mutex<WatcherRegistryState>>,
+    root: &Path,
+    batch: PendingRootBatch,
+    on_change: &WatchCallback,
+) {
+    if batch.changed_paths.is_empty() && !batch.git_changed && !batch.skills_or_rules_changed {
+        return;
+    }
+    let targets: Vec<(String, String)> = {
+        let Ok(guard) = state.lock() else {
+            return;
         };
-        let changed_paths: Vec<String> = batch.changed_paths.into_iter().collect();
-        for (workspace_id, cwd) in targets {
-            on_change(WorkspaceWatchBatch {
-                workspace_id,
-                cwd,
-                canonical_root: root.clone(),
-                changed_paths: changed_paths.clone(),
-                git_changed: batch.git_changed,
-                skills_or_rules_changed: batch.skills_or_rules_changed,
-            });
-        }
+        guard
+            .root_to_workspaces
+            .get(root)
+            .map(|ws_ids| {
+                ws_ids
+                    .iter()
+                    .filter_map(|ws_id| {
+                        let (_, cwd) = guard.workspace_to_root.get(ws_id)?;
+                        Some((ws_id.clone(), cwd.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let changed_paths: Vec<String> = batch.changed_paths.into_iter().collect();
+    let revalidation_paths: Vec<String> = batch.revalidation_paths.into_iter().collect();
+    for (idx, (workspace_id, cwd)) in targets.into_iter().enumerate() {
+        on_change(WorkspaceWatchBatch {
+            workspace_id,
+            cwd,
+            canonical_root: root.to_path_buf(),
+            changed_paths: changed_paths.clone(),
+            revalidation_paths: if idx == 0 {
+                revalidation_paths.clone()
+            } else {
+                Vec::new()
+            },
+            is_primary_root_event: idx == 0,
+            git_changed: batch.git_changed,
+            skills_or_rules_changed: batch.skills_or_rules_changed,
+        });
     }
 }
 
@@ -620,6 +645,90 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp watch dir");
         crate::platform::canonicalize_clean(&dir).unwrap_or(dir)
+    }
+
+    #[tokio::test]
+    async fn memory_revalidation_receives_every_path_across_a_full_batch() -> anyhow::Result<()> {
+        let project = tempfile::tempdir()?;
+        let root = crate::platform::canonicalize_clean(project.path())?;
+        let cwd = root
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("workspace path"))?;
+        let store = Arc::new(orbit_store::OrbitStore::open_in_memory()?);
+        let engine = crate::memory::MemoryEngine::new(store.clone(), Default::default(), None);
+        let draft = crate::memory::MemoryDraft {
+            id: Some("watch".into()),
+            title: "Storage".into(),
+            content: "Keep the index local.".into(),
+            category: orbit_protocol::MemoryCategory::Convention,
+            status: Some(orbit_protocol::MemoryStatus::Confirmed),
+            file_paths: vec!["src/index.rs".into()],
+            tags: vec![],
+        };
+        engine.save(cwd, draft, None).await?;
+        let state = Arc::new(Mutex::new(WatcherRegistryState {
+            raw_tx: mpsc::channel(1).0,
+            root_watchers: HashMap::new(),
+            workspace_to_root: HashMap::from([("ws".into(), (root.clone(), cwd.into()))]),
+            root_to_workspaces: HashMap::from([(root.clone(), HashSet::from(["ws".into()]))]),
+        }));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let callback: WatchCallback = Arc::new(move |batch| {
+            let _ = tx.send(batch);
+        });
+        let mut event = Event::new(EventKind::Any);
+        event.paths.extend(
+            (0..MAX_COALESCED_PATHS_PER_EVENT).map(|i| root.join(format!("src/file{i}.rs"))),
+        );
+        event.paths.push(root.join("src/index.rs"));
+        let mut pending = HashMap::new();
+        ingest_raw_event(&state, &mut pending, event);
+        // Must stay debounced (not flushed synchronously before flush_pending_roots).
+        assert!(rx.try_recv().is_err());
+        flush_pending_roots(
+            &state,
+            &mut pending,
+            Duration::ZERO,
+            Duration::ZERO,
+            &callback,
+        );
+        let batch = rx.try_recv()?;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(batch.changed_paths.len(), MAX_COALESCED_PATHS_PER_EVENT);
+        assert_eq!(
+            batch.revalidation_paths.len(),
+            MAX_COALESCED_PATHS_PER_EVENT + 1
+        );
+        assert!(batch.is_primary_root_event);
+        engine.changed(&batch.cwd, batch.revalidation_paths).await?;
+        assert_eq!(
+            store.project_memory(cwd, "watch")?.map(|i| i.status),
+            Some(orbit_protocol::MemoryStatus::NeedsRevalidation)
+        );
+        let path = root.join(".orbit/memory/watch.md");
+        std::fs::write(
+            &path,
+            std::fs::read_to_string(&path)?.replace("Keep the index local.", "Rebuild locally."),
+        )?;
+        ingest_raw_event(
+            &state,
+            &mut pending,
+            Event::new(EventKind::Any).add_path(path),
+        );
+        flush_pending_roots(
+            &state,
+            &mut pending,
+            Duration::ZERO,
+            Duration::ZERO,
+            &callback,
+        );
+        let batch = rx.try_recv()?;
+        engine.changed(&batch.cwd, batch.revalidation_paths).await?;
+        assert_eq!(
+            store.project_memory(cwd, "watch")?.map(|i| i.content),
+            Some("Rebuild locally.".into())
+        );
+        Ok(())
     }
 
     #[test]

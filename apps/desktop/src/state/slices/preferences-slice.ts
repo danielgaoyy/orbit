@@ -9,6 +9,13 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import {
+  type ShortcutActionId,
+  SHORTCUT_ACTION_MAP,
+  isOsReservedChord,
+  normalizeChord,
+  sanitizeCustomKeybindings,
+} from "@/lib/shortcut-registry";
+import {
   applyDocumentTheme,
   formatCloudSyncToast,
   loadPrefs,
@@ -206,6 +213,59 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
     },
 
 
+    setCustomKeybinding(actionId: ShortcutActionId, chord: string | null): void {
+      const def = SHORTCUT_ACTION_MAP[actionId];
+      if (!def) return;
+      let nextBindings: Record<string, string> = {};
+      setState((s) => {
+        const next = { ...s.customKeybindings };
+        if (!chord) {
+          delete next[actionId];
+        } else {
+          const norm = normalizeChord(chord);
+          if (!norm || isOsReservedChord(norm)) return s;
+          if (norm === def.defaultChord) {
+            delete next[actionId];
+          } else {
+            next[actionId] = norm;
+          }
+        }
+        nextBindings = next;
+        return { ...s, customKeybindings: next };
+      }, true);
+      void pushCloudPrefPatch({ customKeybindings: nextBindings });
+    },
+
+
+    setCustomKeybindings(next: Record<string, string>): void {
+      const sanitized = sanitizeCustomKeybindings(next);
+      setState((s) => ({ ...s, customKeybindings: sanitized }), true);
+      void pushCloudPrefPatch({ customKeybindings: sanitized });
+    },
+
+
+    resetCustomKeybinding(actionId: ShortcutActionId): void {
+      let nextBindings: Record<string, string> = {};
+      setState((s) => {
+        if (!(actionId in s.customKeybindings)) {
+          nextBindings = s.customKeybindings;
+          return s;
+        }
+        const next = { ...s.customKeybindings };
+        delete next[actionId];
+        nextBindings = next;
+        return { ...s, customKeybindings: next };
+      }, true);
+      void pushCloudPrefPatch({ customKeybindings: nextBindings });
+    },
+
+
+    resetAllCustomKeybindings(): void {
+      setState((s) => ({ ...s, customKeybindings: {} }), true);
+      void pushCloudPrefPatch({ customKeybindings: {} });
+    },
+
+
     setNotificationPrefs(patch: {
       notifyOnApproval?: boolean;
       notifyOnTurnComplete?: boolean;
@@ -381,6 +441,10 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
               prefs.draftMode === "full_access"
                 ? prefs.draftMode
                 : s.draftMode,
+            customKeybindings:
+              prefs.customKeybindings && typeof prefs.customKeybindings === "object"
+                ? sanitizeCustomKeybindings(prefs.customKeybindings)
+                : s.customKeybindings,
           }),
           true,
         );

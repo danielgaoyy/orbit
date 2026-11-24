@@ -19,9 +19,7 @@ use orbit_client_core::{
     connect_direct, connect_direct_verified, connect_smart,
 };
 use orbit_crypto::PairingOffer;
-use orbit_daemon::{
-    DaemonConfig, DaemonPersistedConfig, DaemonRuntime, discover_lan_ws_endpoints, run_daemon,
-};
+use orbit_daemon::{DaemonConfig, DaemonPersistedConfig, DaemonRuntime, discover_lan_ws_endpoints};
 use orbit_protocol::{
     ActiveTurnBehavior, AgentStatus, GuardianAssessment, ProviderKind, SessionMode,
     TimelinePayload, ToolCallDetail, WireMessage, WorktreeCreateMode,
@@ -32,7 +30,7 @@ use orbit_providers::{
 };
 use orbit_relay::{RelayConfig, RelayPersistedConfig, run_relay};
 use orbit_relay_transport::{is_ssh_relay_url, redact_relay_url};
-use orbit_shim::{read_spawn_spec_from_stdin, run_shim};
+use orbit_shim::read_spawn_spec_from_stdin;
 use uuid::Uuid;
 
 use crate::acp_cli::{AcpAction, cmd_acp};
@@ -158,6 +156,9 @@ impl From<CliMode> for SessionMode {
 enum DaemonAction {
     /// Install & start (or restart) `orbit daemon` in the background (systemd / launchd / daemon).
     Up {
+        /// Install under Windows Service Control Manager.
+        #[arg(long)]
+        service: bool,
         #[arg(long)]
         port: Option<u16>,
         #[arg(long)]
@@ -226,9 +227,49 @@ enum RelayAction {
 }
 
 #[derive(Subcommand)]
+enum AuditAction {
+    Verify,
+    Export {
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+#[derive(Subcommand)]
 enum Commands {
+    #[cfg(windows)]
+    #[command(hide = true)]
+    ServiceRun {
+        #[arg(value_parser=["daemon","relay"])]
+        role: String,
+    },
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    SandboxBridge {
+        port: u16,
+        #[arg(last = true, required = true)]
+        command: Vec<std::ffi::OsString>,
+    },
     /// Inspect current host environment, identity keypair, Relay attachment, and installed AI CLIs.
-    Doctor,
+    Doctor {
+        #[arg(long)]
+        bundle: Option<PathBuf>,
+    },
+    /// Preview or apply a migration from a coding CLI or IDE.
+    Migrate {
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long,default_value="skip",value_parser=["skip","overwrite","rename"])]
+        conflict: String,
+    },
+    /// Verify or export the signed host security history.
+    Audit {
+        #[command(subcommand)]
+        action: AuditAction,
+    },
 
     /// Fetch live 5-hour / weekly usage quotas & remaining credits across Antigravity, Codex, and Claude Code.
     Quotas,
@@ -617,6 +658,78 @@ fn main_impl() -> anyhow::Result<()> {
     rt.block_on(Box::pin(run_cli(cli)))
 }
 
+fn setup_logging(
+    home_dir: &std::path::Path,
+    use_rotating_daemon_log: bool,
+) -> anyhow::Result<Option<std::sync::Arc<orbit_daemon::telemetry::Exporter>>> {
+    let mut exporter = None;
+    let mut env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // Cap WebSocket dependency crates at INFO so RUST_LOG=trace can never dump signed
+    // Feishu/Slack WSS URLs or Discord Gateway IDENTIFY bot tokens into daemon logs.
+    for directive in ["tungstenite=info", "tokio_tungstenite=info"] {
+        if let Ok(parsed) = directive.parse() {
+            env_filter = env_filter.add_directive(parsed);
+        }
+    }
+    use tracing_subscriber::{fmt::writer::BoxMakeWriter, prelude::*};
+    let writer = if use_rotating_daemon_log {
+        orbit_client_core::logging::RotatingLogWriter::open(
+            home_dir.join("logs/daemon.log"),
+            orbit_client_core::logging::DEFAULT_LOG_MAX_BYTES,
+            orbit_client_core::logging::DEFAULT_LOG_MAX_BACKUPS,
+            std::io::stderr().is_terminal(),
+        )
+        .ok()
+    } else {
+        None
+    };
+    let writer = match writer {
+        Some(w) => BoxMakeWriter::new(move || w.clone()),
+        None => BoxMakeWriter::new(std::io::stderr),
+    };
+    let endpoint = use_rotating_daemon_log
+        .then(|| {
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    DaemonPersistedConfig::load(home_dir)
+                        .telemetry_endpoint
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                })
+        })
+        .flatten();
+    let log_layer = if let Some(endpoint) = endpoint {
+        match orbit_daemon::telemetry::start(&endpoint) {
+            Ok((layer, handle)) => {
+                exporter = Some(handle);
+                Some(layer)
+            }
+            Err(err) => {
+                eprintln!("warning: ignoring invalid OTLP telemetry endpoint `{endpoint}`: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let base = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(log_layer);
+    let fmt = tracing_subscriber::fmt::layer()
+        .with_writer(writer)
+        .with_ansi(false);
+    if std::env::var("ORBIT_LOG_FORMAT").as_deref() == Ok("json") {
+        base.with(fmt.json()).init()
+    } else {
+        base.with(fmt).init()
+    }
+    Ok(exporter)
+}
+
 async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     let home_dir = resolve_home(cli.home);
     let json_mode = cli.json;
@@ -624,41 +737,101 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     let explicit_server = cli.server.clone();
     let server = resolve_server_url(&home_dir, cli.server);
 
-    let is_mcp_stdio = matches!(cli.command, Commands::Mcp { .. });
-    if !is_mcp_stdio {
-        let mut env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-        // Cap WebSocket dependency crates at INFO so RUST_LOG=trace can never dump signed
-        // Feishu/Slack WSS URLs or Discord Gateway IDENTIFY bot tokens into daemon logs.
-        for directive in ["tungstenite=info", "tokio_tungstenite=info"] {
-            if let Ok(parsed) = directive.parse() {
-                env_filter = env_filter.add_directive(parsed);
-            }
-        }
-        let use_rotating_daemon_log = matches!(cli.command, Commands::Daemon { action: None, .. });
-        if use_rotating_daemon_log
-            && let Ok(log_writer) = orbit_client_core::logging::RotatingLogWriter::open(
-                home_dir.join("logs").join("daemon.log"),
-                orbit_client_core::logging::DEFAULT_LOG_MAX_BYTES,
-                orbit_client_core::logging::DEFAULT_LOG_MAX_BACKUPS,
-                std::io::stderr().is_terminal(),
-            )
-        {
-            tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_env_filter(env_filter)
-                .with_writer(move || log_writer.clone())
-                .init();
-        } else {
-            tracing_subscriber::fmt()
-                .with_writer(std::io::stderr)
-                .with_env_filter(env_filter)
-                .init();
-        }
-    }
+    let initialize_logging = !matches!(cli.command, Commands::Mcp { .. });
+    #[cfg(target_os = "linux")]
+    let initialize_logging =
+        initialize_logging && !matches!(cli.command, Commands::SandboxBridge { .. });
+    #[cfg(windows)]
+    let initialize_logging =
+        initialize_logging && !matches!(cli.command, Commands::ServiceRun { .. });
+    let exporter = if initialize_logging {
+        setup_logging(
+            &home_dir,
+            matches!(cli.command, Commands::Daemon { action: None, .. }),
+        )?
+    } else {
+        None
+    };
 
     match cli.command {
-        Commands::Doctor => {
+        #[cfg(windows)]
+        Commands::ServiceRun { role } => service::dispatch(
+            if role == "relay" {
+                ServiceRole::Relay
+            } else {
+                ServiceRole::Daemon
+            },
+            home_dir,
+        )?,
+        #[cfg(target_os = "linux")]
+        Commands::SandboxBridge { port, command } => {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+            let mut child = tokio::process::Command::new(&command[0])
+                .args(&command[1..])
+                .kill_on_drop(true)
+                .spawn()?;
+            let mut clients = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    status=child.wait()=>std::process::exit(status?.code().unwrap_or(1)),
+                    Some(_)=clients.join_next(),if !clients.is_empty()=>{},
+                    item=listener.accept(),if clients.len()<64=>{
+                        let (mut src,_)=item?;clients.spawn(async move{if let Ok(mut dst)=tokio::net::UnixStream::connect("/tmp/.orbit-egress.sock").await{let _=tokio::io::copy_bidirectional(&mut src,&mut dst).await;}});
+                    }
+                }
+            }
+        }
+        Commands::Migrate {
+            from,
+            apply,
+            cwd,
+            conflict,
+        } => {
+            let user = orbit_daemon::platform::resolve_user_home_dir()
+                .ok_or_else(|| anyhow::anyhow!("user home unavailable"))?;
+            let policy = serde_json::from_value(serde_json::Value::String(conflict))?;
+            if apply {
+                orbit_shim::ensure_private_dir(&home_dir)?;
+            }
+            let cwd = cwd.or_else(|| std::env::current_dir().ok());
+            let items = orbit_daemon::ide_migrate::migrate(
+                &home_dir,
+                &user,
+                cwd.as_deref(),
+                from.as_deref(),
+                apply,
+                policy,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&items)?);
+        }
+        Commands::Audit { action } => {
+            let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
+            let store = &runtime.store;
+            match action {
+                AuditAction::Verify => {
+                    let result = store.verify_audit_chain(store.audit_verifying_key().as_ref())?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    anyhow::ensure!(result.broken_seq.is_none(), "audit verification failed");
+                }
+                AuditAction::Export { output } => {
+                    let dump = |writer: &mut dyn std::io::Write| -> anyhow::Result<()> {
+                        let mut seq = 0;
+                        loop {
+                            let (s, next) = store.export_audit_chain_jsonl(seq)?;
+                            writer.write_all(s.as_bytes())?;
+                            if let Some(n) = next { seq = n } else { break }
+                        }
+                        Ok(())
+                    };
+                    if let Some(p) = output {
+                        orbit_daemon::diagnostics::write_private(&p, |f| dump(f))?;
+                    } else {
+                        dump(&mut std::io::stdout().lock())?;
+                    }
+                }
+            }
+        }
+        Commands::Doctor { bundle } => {
             set_snapshot_orbit_home(&home_dir);
             let _ = resolve_login_shell_env().await;
             let snap_stats = shell_snapshot_stats();
@@ -674,6 +847,28 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             let daemon_live = probe_daemon_port(active_port, &runtime.host_info.host_id).await
                 == PortOwnership::Mine;
 
+            if let Some(path) = bundle {
+                let bundle = if daemon_live {
+                    let addr = format!("ws://127.0.0.1:{active_port}/ws");
+                    let client = connect_cli_server(&home_dir, &addr, false).await?;
+                    let id = Uuid::new_v4();
+                    match client.request(WireMessage::ExportDiagnosticBundle{request_id:id},Duration::from_secs(60),|w|matches!(w,WireMessage::DiagnosticBundleReady{request_id,..} if *request_id==id)).await?{
+                        WireMessage::DiagnosticBundleReady{bundle,..}=>bundle,_=>anyhow::bail!("unexpected diagnostic response")
+                    }
+                } else {
+                    orbit_daemon::diagnostics::bundle(&runtime).await?
+                };
+                orbit_daemon::diagnostics::write_private(&path, |f| {
+                    Ok(serde_json::to_writer_pretty(f, &bundle)?)
+                })?;
+                println!("Wrote diagnostics to {}", path.display());
+                return Ok(());
+            }
+            let probe = orbit_shim::probe_sandbox_support();
+            println!(
+                "Sandbox      : {} (available {}, kernel enforced {})",
+                probe.backend, probe.available, probe.kernel_enforced
+            );
             println!("=== Orbit Host Diagnostics ===");
             println!("Host ID      : {}", runtime.host_info.host_id);
             println!("Hostname     : {}", runtime.host_info.hostname);
@@ -798,7 +993,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
             if clear {
                 persisted.relay_url = None;
-                persisted.save(&home_dir)?;
+                DaemonPersistedConfig::update(&home_dir, |cfg| {
+                    cfg.relay_url = persisted.relay_url.clone();
+                    cfg.listen_addr = persisted.listen_addr;
+                })?;
                 let mgr = install_and_start_service(
                     ServiceRole::Daemon,
                     &home_dir,
@@ -932,7 +1130,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
 
             persisted.relay_url = Some(normalized.clone());
-            persisted.save(&home_dir)?;
+            DaemonPersistedConfig::update(&home_dir, |cfg| {
+                cfg.relay_url = persisted.relay_url.clone();
+                cfg.listen_addr = persisted.listen_addr;
+            })?;
 
             let mgr = install_and_start_service(
                 ServiceRole::Daemon,
@@ -1015,14 +1216,19 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     .or(persisted.listen_addr)
                     .unwrap_or_else(default_daemon_listen);
                 let effective_relay = relay.or(persisted.relay_url);
-                run_daemon(DaemonConfig {
-                    home_dir,
-                    listen_addr: effective_listen,
-                    relay_url: effective_relay,
-                })
+                orbit_daemon::run_daemon_until(
+                    DaemonConfig {
+                        home_dir,
+                        listen_addr: effective_listen,
+                        relay_url: effective_relay,
+                    },
+                    exporter,
+                    orbit_daemon::wait_daemon_shutdown_signal(),
+                )
                 .await?;
             }
             Some(DaemonAction::Up {
+                service,
                 port,
                 listen: sub_listen,
                 relay: sub_relay,
@@ -1044,13 +1250,17 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 if let Some(r) = sub_relay.or(relay) {
                     persisted.relay_url = Some(normalize_relay_url(&r)?);
                 }
-                persisted.save(&home_dir)?;
+                DaemonPersistedConfig::update(&home_dir, |cfg| {
+                    cfg.relay_url = persisted.relay_url.clone();
+                    cfg.listen_addr = persisted.listen_addr;
+                })?;
 
-                let mgr = install_and_start_service(
+                let mgr = service::install_supervised(
                     ServiceRole::Daemon,
                     &home_dir,
                     addr.port(),
                     Some(&expected_host_id),
+                    service,
                 )
                 .await?;
                 println!("[✓] Orbit Daemon running in background via {mgr}");
@@ -1084,7 +1294,9 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 };
                 let addr = resolve_isolated_daemon_listen(preferred, &expected_host_id).await?;
                 persisted.listen_addr = Some(addr);
-                persisted.save(&home_dir)?;
+                DaemonPersistedConfig::update(&home_dir, |cfg| {
+                    cfg.listen_addr = persisted.listen_addr
+                })?;
 
                 let mgr = install_and_start_service(
                     ServiceRole::Daemon,
@@ -1847,7 +2059,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Shim { socket } => {
             let err_sidecar = socket.with_extension("err");
             let res: anyhow::Result<()> = match read_spawn_spec_from_stdin() {
-                Ok(spec) => run_shim(&socket, spec).await.map_err(Into::into),
+                Ok(spec) => orbit_daemon::run_tool_shim(&socket, spec).await,
                 Err(e) => Err(e.into()),
             };
             if let Err(ref e) = res {
@@ -2242,8 +2454,9 @@ async fn print_pairing_summary(
     explicit_relay: Option<String>,
     rotate_secret: bool,
 ) -> anyhow::Result<()> {
+    let runtime = DaemonRuntime::bootstrap(home_dir).await?;
     if rotate_secret {
-        let _ = orbit_daemon::rotate_pairing_secret(home_dir)?;
+        let _ = runtime.rotate_pairing_secret()?;
         eprintln!(
             "[✓] Rotated host pairing secret at {} (active immediately for new connections).",
             home_dir
@@ -2251,7 +2464,6 @@ async fn print_pairing_summary(
                 .display()
         );
     }
-    let runtime = DaemonRuntime::bootstrap(home_dir).await?;
     let persisted = DaemonPersistedConfig::load(home_dir);
     let configured_listen = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
     let live_addr = orbit_daemon::read_live_daemon_addr(home_dir);

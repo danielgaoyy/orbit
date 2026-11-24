@@ -82,6 +82,8 @@ pub async fn spawn_antigravity_session(
         let env = build_agy_launch_env(&cfg);
 
         let spec = ShimSpawnSpec {
+            sandbox: cfg.sandbox.clone(),
+            egress_proxy_url: None,
             shim_id: format!("agy_{}", cfg.agent_id),
             mode: ShimMode::Stdio,
             program: cfg.executable.to_string_lossy().to_string(),
@@ -10719,6 +10721,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         let (evt_tx, mut evt_rx) = mpsc::channel(64);
         let seq_tracker = Arc::new(AtomicU64::new(0));
         let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_evicted".into(),
             provider: ProviderKind::Antigravity,
             executable: PathBuf::from("/bin/true"),
@@ -10904,6 +10908,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         let (evt_tx, mut evt_rx) = mpsc::channel(64);
         let seq_tracker = Arc::new(AtomicU64::new(500));
         let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_reattach".into(),
             provider: ProviderKind::Antigravity,
             executable: PathBuf::from("/bin/true"),
@@ -10980,6 +10986,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         use std::sync::atomic::AtomicU64;
 
         let mut cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_fast".into(),
             provider: ProviderKind::Antigravity,
             executable: PathBuf::from("/bin/true"),
@@ -11225,6 +11233,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let (evt_tx, mut evt_rx) = mpsc::channel(64);
         let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_fast_live".into(),
             provider: ProviderKind::Antigravity,
             executable: PathBuf::from("/bin/true"),
@@ -11442,6 +11452,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             .await
             .expect("connect mock");
         let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_fast_reconcile".into(),
             provider: ProviderKind::Antigravity,
             executable: PathBuf::from("/bin/true"),
@@ -12130,6 +12142,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         let (evt_tx, mut evt_rx) = mpsc::channel(64);
         let seq_tracker = Arc::new(AtomicU64::new(0));
         let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_int_test".into(),
             provider: ProviderKind::Antigravity,
             orbit_exe: PathBuf::from("/bin/true"),
@@ -12588,6 +12602,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         let (evt_tx, mut evt_rx) = mpsc::channel(128);
         let seq_tracker = Arc::new(AtomicU64::new(0));
         let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_deliv_test".into(),
             provider: ProviderKind::Antigravity,
             executable: PathBuf::from("/bin/true"),
@@ -13316,6 +13332,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             tmp_data.to_string_lossy().to_string(),
         );
         let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_empty_iq".into(),
             provider: ProviderKind::Antigravity,
             orbit_exe: PathBuf::from("/bin/true"),
@@ -13730,6 +13748,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             tmp_data.to_string_lossy().to_string(),
         );
         let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_steer_handoff".into(),
             provider: ProviderKind::Antigravity,
             orbit_exe: PathBuf::from("/bin/true"),
@@ -14129,6 +14149,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             tmp_data.to_string_lossy().to_string(),
         );
         let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_sub_fg".into(),
             provider: ProviderKind::Antigravity,
             orbit_exe: PathBuf::from("/bin/true"),
@@ -14382,6 +14404,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let (evt_tx, mut evt_rx) = mpsc::channel(64);
         let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_err_title".into(),
             provider: ProviderKind::Antigravity,
             orbit_exe: PathBuf::from("/bin/true"),

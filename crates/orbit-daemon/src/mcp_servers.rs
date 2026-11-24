@@ -604,7 +604,11 @@ impl Drop for TempFileGuard {
     }
 }
 
-fn write_json_atomic(path: &Path, value: &Value, private_mode: bool) -> Result<(), String> {
+fn write_json_atomic(
+    path: &Path,
+    value: &Value,
+    #[cfg_attr(not(unix), allow(unused_variables))] private_mode: bool,
+) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("Invalid config path `{}`", path.display()))?;
@@ -652,6 +656,29 @@ fn write_json_atomic(path: &Path, value: &Value, private_mode: bool) -> Result<(
     fs::rename(&tmp_path, path).map_err(|e| format!("Failed to save `{}`: {e}", path.display()))?;
     guard.disarm();
     Ok(())
+}
+
+pub(crate) fn migration_value(s: &ResolvedExternalMcpServer) -> Result<Value, String> {
+    validate_server_name(&s.name)?;
+    let transport = match &s.transport {
+        ResolvedTransport::Stdio { command, args } => McpTransportKind::Stdio {
+            command: command.clone(),
+            args: args.clone(),
+        },
+        ResolvedTransport::StreamableHttp { url } => McpTransportKind::StreamableHttp {
+            url: url.clone(),
+            header_keys: s.headers.keys().cloned().collect(),
+        },
+    };
+    validate_transport(&transport)?;
+    let mut v = match &s.transport {
+        ResolvedTransport::Stdio { command, args } => json!({"command":command,"args":args}),
+        ResolvedTransport::StreamableHttp { url } => json!({"url":url}),
+    };
+    v["env"] = json!(validate_env_map(&s.env)?);
+    v["headers"] = json!(validate_headers_map(&s.headers, false)?);
+    v["enabled"] = json!(s.enabled);
+    Ok(v)
 }
 
 /// Returns `true` if ANY server entry in `root["mcpServers"]` contains a secret env var or header key.
@@ -725,7 +752,7 @@ fn parse_string_map(val: Option<&Value>) -> BTreeMap<String, String> {
     map
 }
 
-fn parse_json_mcp_servers_value(
+pub(crate) fn parse_json_mcp_servers_value(
     root: &Value,
     scope: McpServerScope,
     source_path: &Path,
@@ -851,7 +878,7 @@ fn has_unclosed_toml_array(val: &str) -> bool {
 /// Supports `[mcp_servers.<name>]`, subtables `.env` / `.headers` / `.http_headers`,
 /// inline tables, dotted keys (`env.KEY = ...`, `http_headers."X-Api-Key" = ...`),
 /// and multiline `args = [ ... ]`.
-fn parse_codex_toml_mcp_servers(
+pub(crate) fn parse_codex_toml_mcp_servers(
     toml_text: &str,
     source_path: &Path,
 ) -> Vec<ResolvedExternalMcpServer> {
@@ -1796,7 +1823,16 @@ pub(crate) async fn probe_external_mcp_server_with_homes(
 
     match &server.transport {
         ResolvedTransport::Stdio { command, args } => {
-            probe_stdio_mcp(command, args, &server.env, cwd, started, MCP_PROBE_TIMEOUT).await
+            probe_stdio_mcp(
+                orbit_home,
+                command,
+                args,
+                &server.env,
+                cwd,
+                started,
+                MCP_PROBE_TIMEOUT,
+            )
+            .await
         }
         ResolvedTransport::StreamableHttp { url } => {
             match tokio::time::timeout(
@@ -2116,6 +2152,7 @@ async fn exchange_stdio_mcp(
 }
 
 async fn probe_stdio_mcp(
+    orbit_home: &Path,
     command: &str,
     args: &[String],
     env: &BTreeMap<String, String>,
@@ -2147,9 +2184,17 @@ async fn probe_stdio_mcp(
         return fail(format!("Executable `{command}` not found on PATH"));
     };
 
-    let mut cmd = Command::new(&resolved);
-    cmd.args(args)
-        .stdin(Stdio::piped())
+    let boundary = match crate::sandbox::Boundary::load(orbit_home, None).await {
+        Ok(b) => b,
+        Err(e) => return fail(e.to_string()),
+    };
+    let mut original = Command::new(&resolved);
+    original.args(args);
+    let (mut cmd, plan) = match boundary.command_optional_cwd(original, cwd, orbit_home) {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -2175,6 +2220,9 @@ async fn probe_stdio_mcp(
         cmd.current_dir(dir);
     }
 
+    if let Some(p) = plan.as_ref() {
+        p.apply_env(&mut cmd);
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return fail(format!("Failed to spawn `{}`: {e}", resolved.display())),
@@ -2744,6 +2792,7 @@ pub(crate) async fn read_mcp_resource_for_auto_extract_with_homes(
     }
 
     let result = invoke_external_mcp_method(
+        orbit_home,
         &server,
         "resources/read",
         json!({ "uri": clean_uri }),
@@ -2816,7 +2865,9 @@ async fn exchange_stdio_mcp_method(
     Ok(call_resp.get("result").cloned().unwrap_or(Value::Null))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn invoke_stdio_mcp_method(
+    orbit_home: &Path,
     command: &str,
     args: &[String],
     env: &BTreeMap<String, String>,
@@ -2836,9 +2887,13 @@ async fn invoke_stdio_mcp_method(
         .flatten()
         .ok_or_else(|| format!("Executable `{command}` not found on PATH"))?;
 
-    let mut cmd = Command::new(&resolved);
-    cmd.args(args)
-        .stdin(Stdio::piped())
+    let boundary = crate::sandbox::Boundary::load(orbit_home, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut original = Command::new(&resolved);
+    original.args(args);
+    let (mut cmd, plan) = boundary.command_optional_cwd(original, cwd, orbit_home)?;
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -2862,6 +2917,9 @@ async fn invoke_stdio_mcp_method(
         cmd.current_dir(dir);
     }
 
+    if let Some(p) = plan.as_ref() {
+        p.apply_env(&mut cmd);
+    }
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn `{}`: {e}", resolved.display()))?;
@@ -3079,6 +3137,7 @@ async fn invoke_http_mcp_method(
 }
 
 async fn invoke_external_mcp_method(
+    orbit_home: &Path,
     server: &ResolvedExternalMcpServer,
     method: &str,
     params: Value,
@@ -3087,8 +3146,17 @@ async fn invoke_external_mcp_method(
 ) -> Result<Value, String> {
     match &server.transport {
         ResolvedTransport::Stdio { command, args } => {
-            invoke_stdio_mcp_method(command, args, &server.env, cwd, method, params, timeout_dur)
-                .await
+            invoke_stdio_mcp_method(
+                orbit_home,
+                command,
+                args,
+                &server.env,
+                cwd,
+                method,
+                params,
+                timeout_dur,
+            )
+            .await
         }
         ResolvedTransport::StreamableHttp { url } => tokio::time::timeout(
             timeout_dur,
@@ -3122,6 +3190,7 @@ pub(crate) async fn read_mcp_resource_with_homes(
     let server = resolve_enabled_external_server(orbit_home, user_home, server_name, cwd)?;
 
     let result = invoke_external_mcp_method(
+        orbit_home,
         &server,
         "resources/read",
         json!({ "uri": clean_uri }),
@@ -3256,6 +3325,7 @@ pub(crate) async fn call_mcp_tool_with_homes(
     let server = resolve_enabled_external_server(orbit_home, user_home, server_name, cwd)?;
 
     let result = invoke_external_mcp_method(
+        orbit_home,
         &server,
         "tools/call",
         json!({
@@ -4078,6 +4148,7 @@ done
     #[tokio::test]
     async fn stdio_probe_timeout_kills_child_process_group_cleanly() {
         let res = probe_stdio_mcp(
+            Path::new("."),
             "/bin/sleep",
             &["30".to_string()],
             &BTreeMap::new(),

@@ -436,6 +436,15 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
           s.activeSidePanelTabId === tabId
             ? (remaining[Math.min(idx, remaining.length - 1)]?.id ?? null)
             : s.activeSidePanelTabId;
+        let nextSplit = s.sidePanelSplit;
+        if (nextSplit) {
+          if (remaining.length < 2) {
+            nextSplit = null;
+          } else if (nextSplit.secondaryTabId === tabId || nextSplit.secondaryTabId === nextActive) {
+            const replacement = remaining.find((t) => t.id !== nextActive);
+            nextSplit = replacement ? { ...nextSplit, secondaryTabId: replacement.id } : null;
+          }
+        }
         const shouldClosePanel = remaining.length === 0;
         closedPanel = shouldClosePanel;
         const shouldRestoreSidebar =
@@ -460,6 +469,7 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
             : s.sidebarAutoYieldedForSidePanel,
           sidePanelTabs: remaining,
           activeSidePanelTabId: nextActive,
+          sidePanelSplit: nextSplit,
           terminalFocused: nextTerminalFocused,
           fileEditorDrafts: nextDrafts,
           pendingUnsavedFileAction: null,
@@ -473,6 +483,102 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       if (!closedPanel && afterClose.selectedHostId && afterClose.selectedWorkspaceCwd) {
         void ctx.actions.ensureWorkspaceFiles(afterClose.selectedHostId, afterClose.selectedWorkspaceCwd);
       }
+    },
+
+
+    reorderSidePanelTabs(
+      sourceTabId: string,
+      targetTabId: string,
+      position: "before" | "after",
+    ): void {
+      if (!sourceTabId || !targetTabId || sourceTabId === targetTabId) return;
+      setState((s) => {
+        const srcIdx = s.sidePanelTabs.findIndex((t) => t.id === sourceTabId);
+        const dstIdx = s.sidePanelTabs.findIndex((t) => t.id === targetTabId);
+        if (srcIdx < 0 || dstIdx < 0) return s;
+        const next = [...s.sidePanelTabs];
+        const [moved] = next.splice(srcIdx, 1);
+        const newTargetIdx = next.findIndex((t) => t.id === targetTabId);
+        if (newTargetIdx < 0) return s;
+        const insertAt = position === "after" ? newTargetIdx + 1 : newTargetIdx;
+        next.splice(insertAt, 0, moved);
+        return { ...s, sidePanelTabs: next };
+      });
+    },
+
+
+    splitSidePanelTab(tabId?: string | null): void {
+      setState((s) => {
+        if (s.sidePanelTabs.length < 2) return s;
+        const primaryId = s.activeSidePanelTabId ?? s.sidePanelTabs[0].id;
+        // Toggle off if already split with the requested tab or no explicit tab passed while split
+        if (s.sidePanelSplit && (!tabId || s.sidePanelSplit.secondaryTabId === tabId)) {
+          return { ...s, sidePanelSplit: null };
+        }
+        let secondaryId =
+          tabId && tabId !== primaryId && s.sidePanelTabs.some((t) => t.id === tabId)
+            ? tabId
+            : null;
+        if (!secondaryId) {
+          const primaryIdx = s.sidePanelTabs.findIndex((t) => t.id === primaryId);
+          const candidate =
+            s.sidePanelTabs[primaryIdx + 1] ??
+            s.sidePanelTabs[primaryIdx - 1] ??
+            s.sidePanelTabs.find((t) => t.id !== primaryId);
+          secondaryId = candidate?.id ?? null;
+        }
+        if (!secondaryId) return s;
+        return {
+          ...s,
+          sidePanelOpen: true,
+          activeSidePanelTabId: primaryId,
+          sidePanelSplit: {
+            secondaryTabId: secondaryId,
+            ratio: s.sidePanelSplit?.ratio ?? 0.5,
+          },
+        };
+      });
+    },
+
+
+    closeSidePanelSplit(): void {
+      setState((s) => (s.sidePanelSplit ? { ...s, sidePanelSplit: null } : s));
+    },
+
+
+    setSidePanelSplitRatio(ratio: number): void {
+      const clamped = Math.min(0.75, Math.max(0.25, ratio));
+      setState((s) => {
+        if (!s.sidePanelSplit) return s;
+        if (Math.abs(s.sidePanelSplit.ratio - clamped) < 0.002) return s;
+        return { ...s, sidePanelSplit: { ...s.sidePanelSplit, ratio: clamped } };
+      });
+    },
+
+
+    setSidePanelSecondaryTab(tabId: string): void {
+      setState((s) => {
+        if (!s.sidePanelTabs.some((t) => t.id === tabId)) return s;
+        if (s.activeSidePanelTabId === tabId) {
+          // Swap primary and secondary cleanly when clicking the secondary tab into primary or vice versa
+          if (s.sidePanelSplit && s.sidePanelSplit.secondaryTabId !== tabId) {
+            return {
+              ...s,
+              activeSidePanelTabId: s.sidePanelSplit.secondaryTabId,
+              sidePanelSplit: { ...s.sidePanelSplit, secondaryTabId: tabId },
+            };
+          }
+          return s;
+        }
+        return {
+          ...s,
+          sidePanelOpen: true,
+          sidePanelSplit: {
+            secondaryTabId: tabId,
+            ratio: s.sidePanelSplit?.ratio ?? 0.5,
+          },
+        };
+      });
     },
 
 

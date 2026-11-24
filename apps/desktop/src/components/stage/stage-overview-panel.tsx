@@ -46,7 +46,7 @@ import {
   shouldPrefetchOnPointerDown,
 } from "@/lib/file-prefetch";
 import { useI18n } from "@/lib/i18n";
-import { modSymbol } from "@/lib/keybindings";
+import { useActionShortcutDisplay } from "@/lib/keybindings";
 import {
   type AgentCardView,
   type ArtifactSummary,
@@ -118,7 +118,9 @@ const StageOverviewBody = memo(function StageOverviewBody({
   agentForegroundRunning,
 }: StageOverviewContentProps) {
   const { t } = useI18n();
-  const mod = modSymbol();
+  const overviewShortcut = useActionShortcutDisplay("toggle_overview_hud");
+  const reviewShortcut = useActionShortcutDisplay("toggle_diff");
+  const terminalShortcut = useActionShortcutDisplay("toggle_terminal");
   const sessionScopeKey = `${hostId}::${agentId}`;
 
   const collapsedSections = useOrbitSelector((s) => s.overviewCollapsedSections);
@@ -449,7 +451,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
           <IconButton
             size="xs"
             tooltip={t("topbar.hideOverview")}
-            shortcut={`${mod}⌥O`}
+            shortcut={overviewShortcut}
             aria-label={t("topbar.hideOverview")}
             onClick={() => orbitActions.toggleOverviewPanel()}
             className="text-ink-muted hover:text-ink-primary"
@@ -459,7 +461,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
         </div>
 
         <div className="flex flex-col gap-0.5">
-          <SimpleTooltip label={t("overview.review")} shortcut={`${mod}D`} side="left">
+          <SimpleTooltip label={t("overview.review")} shortcut={reviewShortcut} side="left">
             <ListRow
               density="compact"
               selected={isReviewActive}
@@ -499,7 +501,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
             {t("overview.files")}
           </ListRow>
 
-          <SimpleTooltip label={t("overview.terminal")} shortcut={`${mod}J`} side="left">
+          <SimpleTooltip label={t("overview.terminal")} shortcut={terminalShortcut} side="left">
             <ListRow
               density="compact"
               selected={isTerminalActive}

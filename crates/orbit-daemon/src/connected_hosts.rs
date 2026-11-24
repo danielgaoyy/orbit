@@ -597,6 +597,10 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::WorktreeHandoffPreviewResult { request_id, .. }
         | WireMessage::WorktreeHandoffExecuted { request_id, .. }
         | WireMessage::ArtifactsSnapshot { request_id, .. }
+        | WireMessage::ProjectMemorySaved { request_id, .. }
+        | WireMessage::ProjectMemoriesList { request_id, .. }
+        | WireMessage::ProjectMemoryRecallResult { request_id, .. }
+        | WireMessage::ProjectMemoryDeleted { request_id, .. }
         | WireMessage::ArtifactContent { request_id, .. }
         | WireMessage::InstructionFilesSnapshot { request_id, .. }
         | WireMessage::InstructionFileContentResponse { request_id, .. }
@@ -644,7 +648,8 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::PeerBridgeOpened { request_id, .. }
         | WireMessage::PreviewTunnelOpened { request_id, .. }
         | WireMessage::McpResourceResponse { request_id, .. }
-        | WireMessage::ArtifactMcpToolResponse { request_id, .. } => Some(*request_id),
+        | WireMessage::ArtifactMcpToolResponse { request_id, .. }
+        | WireMessage::RewindPreviewResult { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }
         | WireMessage::ArtifactDeleted { request_id, .. }

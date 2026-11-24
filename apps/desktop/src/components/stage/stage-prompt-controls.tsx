@@ -13,6 +13,7 @@ import {
   AlertTriangle,
   Check,
   ChevronRight,
+  ChevronsDownUp,
   Copy,
   Crosshair,
   FileCode2,
@@ -34,6 +35,7 @@ import {
   Undo2,
   type LucideIcon,
 } from "lucide-react";
+import { DiffFilesViewer } from "@/components/diff-viewer";
 import { InlineDirectiveToken } from "@/components/composer/composer-directive-token";
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
 import { resolveSlashCommandIcon } from "@/components/composer/slash-menu";
@@ -65,11 +67,14 @@ import {
 import { useI18n } from "@/lib/i18n";
 import { isImeKeyEvent } from "@/lib/ime";
 import { detectRichMediaKind } from "@/lib/media-utils";
-import type {
-  AgentCardView,
-  PromptBadge,
-  TimelineItemView,
-  TurnFileDiffSummaryView,
+import {
+  orbitIpc,
+  type AgentCardView,
+  type DiffFileView,
+  type PromptBadge,
+  type RewindPreviewView,
+  type TimelineItemView,
+  type TurnFileDiffSummaryView,
 } from "@/lib/orbit-ipc";
 import {
   getCachedPromptImage,
@@ -550,6 +555,38 @@ export const UndoActionButton = memo(function UndoActionButton({
   );
 });
 
+/** Quiet turn-collapse icon button matching `CopyActionButton` / `UndoActionButton`. */
+export const CollapseTurnActionButton = memo(function CollapseTurnActionButton({
+  label,
+  onClick,
+  className,
+}: {
+  label: string;
+  onClick: () => void;
+  className?: string;
+}) {
+  return (
+    <HoverPillTooltip
+      label={label}
+      delay={240}
+      renderTrigger={(handlers) => (
+        <button
+          type="button"
+          aria-label={label}
+          onClick={onClick}
+          {...handlers}
+          className={cn(
+            "text-muted-foreground hover:text-foreground hover:bg-accent/65 orbit-press relative inline-flex size-[22px] cursor-pointer items-center justify-center rounded-md",
+            className,
+          )}
+        >
+          <ChevronsDownUp className="size-[13px] stroke-[1.8]" />
+        </button>
+      )}
+    />
+  );
+});
+
 /**
  * Restrained Fork icon button matching `CopyActionButton` / `UndoActionButton` (`13px` icon in `22×22px` hit target).
  * Directly forks in place for non-git directories; opens a tiny 2-option popover when worktree branching is available.
@@ -680,6 +717,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
   holdViewport,
   animateEntrance = false,
   onRequestRewind,
+  onCollapseTurn,
   onPreviewImage,
 }: {
   item: Extract<TimelineItemView, { item_type: "user_prompt" }>;
@@ -689,6 +727,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
   holdViewport: ViewportAnchorHoldFn;
   animateEntrance?: boolean;
   onRequestRewind?: (seq: number, promptText: string, badges: readonly PromptBadge[]) => void;
+  onCollapseTurn?: () => void;
   onPreviewImage: (img: PromptImagePreviewTarget) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -981,6 +1020,9 @@ export const UserPromptBubble = memo(function UserPromptBubble({
           <RelativeTimestampPill timestampMs={promptTimestampMs} />
         )}
         <StageCopyButton text={copyPayload} />
+        {onCollapseTurn && (
+          <CollapseTurnActionButton label={t("stage.collapseTurn")} onClick={onCollapseTurn} />
+        )}
         {onRequestRewind && item.seq > 0 && (
           <UndoActionButton label={t("stage.undoToHere")} onClick={handleRewindClick} />
         )}
@@ -1083,29 +1125,153 @@ export const ForkedFromBanner = memo(function ForkedFromBanner({
   );
 });
 
+interface RewindSelectableFile {
+  path: string;
+  displayPath: string;
+  basename: string;
+  status: string;
+  additions: number;
+  deletions: number;
+  hasExternalConflict: boolean;
+  diffFile: DiffFileView | null;
+}
+
 export const RewindTurnDialog = memo(function RewindTurnDialog({
+  hostId,
+  agentId,
   target,
   isAgentRunning,
   submitting,
   onOpenChange,
   onConfirm,
 }: {
+  hostId?: string | null;
+  agentId?: string | null;
   target: RewindRequestTarget | null;
   isAgentRunning: boolean;
   submitting: boolean;
   onOpenChange: (open: boolean) => void;
-  onConfirm: (restoreFiles: boolean) => void;
+  onConfirm: (restoreFiles: boolean, restorePaths?: string[] | null) => void;
 }) {
   const { t } = useI18n();
   const [restoreFiles, setRestoreFiles] = useState(true);
-  const files = target?.editedFiles ?? [];
-  const hasFiles = files.length > 0;
+  const [preview, setPreview] = useState<RewindPreviewView | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [selectedPaths, setSelectedPaths] = useState<Set<string>>(() => new Set());
+  const [inspectedPath, setInspectedPath] = useState<string | null>(null);
 
+  // Fetch file-level reverse diff preview & external conflict report from daemon on open
   useEffect(() => {
-    if (target) {
-      setRestoreFiles(target.editedFiles.length > 0);
+    if (!target) {
+      setPreview(null);
+      setPreviewLoading(false);
+      setSelectedPaths(new Set());
+      setInspectedPath(null);
+      return;
     }
-  }, [target]);
+    const fallbackPaths = target.editedFiles.map((f) => f.displayPath);
+    setRestoreFiles(fallbackPaths.length > 0);
+    setSelectedPaths(new Set(fallbackPaths));
+    setInspectedPath(null);
+
+    if (!hostId || !agentId) return;
+    let cancelled = false;
+    setPreviewLoading(true);
+    setPreview(null);
+
+    void orbitIpc
+      .previewRewindAgent(hostId, agentId, target.seq)
+      .then((res) => {
+        if (cancelled) return;
+        setPreview(res);
+        if (res.files.length > 0) {
+          setRestoreFiles(true);
+          setSelectedPaths(new Set(res.files.map((f) => f.path)));
+        }
+      })
+      .catch(() => {
+        // Older daemon or unsupported checkpoint — keep local editedFiles fallback cleanly
+      })
+      .finally(() => {
+        if (!cancelled) setPreviewLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [hostId, agentId, target]);
+
+  const files = useMemo<RewindSelectableFile[]>(() => {
+    if (preview && preview.files.length > 0) {
+      return preview.files.map((f) => {
+        const norm = f.path.replace(/\\/g, "/");
+        const basename = norm.split("/").pop() || norm;
+        return {
+          path: f.path,
+          displayPath: f.path,
+          basename,
+          status: f.action,
+          additions: f.additions,
+          deletions: f.deletions,
+          hasExternalConflict: f.has_external_conflict,
+          diffFile: f.diff_file ?? null,
+        };
+      });
+    }
+    return (target?.editedFiles ?? []).map((f) => ({
+      path: f.displayPath,
+      displayPath: f.displayPath,
+      basename: f.basename,
+      status: "restore",
+      additions: f.additions,
+      deletions: f.deletions,
+      hasExternalConflict: false,
+      diffFile: null,
+    }));
+  }, [preview, target]);
+
+  const hasFiles = files.length > 0;
+  const externalConflicts = preview?.external_conflicts ?? [];
+  const selectedCount = useMemo(
+    () => files.reduce((acc, f) => acc + (selectedPaths.has(f.path) ? 1 : 0), 0),
+    [files, selectedPaths],
+  );
+  const inspectedFile = useMemo(
+    () => (inspectedPath ? files.find((f) => f.path === inspectedPath) ?? null : null),
+    [files, inspectedPath],
+  );
+
+  const handleToggleMasterRestore = useCallback(
+    (checked: boolean) => {
+      setRestoreFiles(checked);
+      if (checked && selectedPaths.size === 0 && files.length > 0) {
+        setSelectedPaths(new Set(files.map((f) => f.path)));
+      }
+    },
+    [files, selectedPaths.size],
+  );
+
+  const handleToggleFilePath = useCallback((path: string, checked: boolean) => {
+    setSelectedPaths((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(path);
+      else next.delete(path);
+      setRestoreFiles(next.size > 0);
+      return next;
+    });
+  }, []);
+
+  const triggerConfirm = useCallback(() => {
+    if (!hasFiles || !restoreFiles || selectedCount === 0) {
+      onConfirm(false, null);
+      return;
+    }
+    const restorePaths =
+      selectedCount < files.length
+        ? files.filter((f) => selectedPaths.has(f.path)).map((f) => f.path)
+        : null;
+    onConfirm(true, restorePaths);
+  }, [files, hasFiles, onConfirm, restoreFiles, selectedCount, selectedPaths]);
 
   useEffect(() => {
     if (!target || submitting) return;
@@ -1114,11 +1280,11 @@ export const RewindTurnDialog = memo(function RewindTurnDialog({
       if (e.key !== "Enter" || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
       if (document.activeElement?.closest('button, input, [role="checkbox"]')) return;
       e.preventDefault();
-      onConfirm(hasFiles ? restoreFiles : false);
+      triggerConfirm();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [target, submitting, hasFiles, restoreFiles, onConfirm]);
+  }, [target, submitting, triggerConfirm]);
 
   const basenameCounts = useMemo(() => {
     const counts = new Map<string, number>();
@@ -1128,11 +1294,14 @@ export const RewindTurnDialog = memo(function RewindTurnDialog({
     return counts;
   }, [files]);
 
-  const effectiveRestore = hasFiles && restoreFiles;
-
   return (
     <Dialog open={target !== null} onOpenChange={(open) => !submitting && onOpenChange(open)}>
-      <DialogContent className="max-w-[440px] gap-3.5 p-5">
+      <DialogContent
+        className={cn(
+          "gap-3.5 p-5 transition-[max-width] duration-150",
+          inspectedFile?.diffFile ? "max-w-[740px]" : "max-w-[500px]",
+        )}
+      >
         <DialogHeader className="gap-1.5 pr-6">
           <DialogTitle className="text-[15px] font-semibold">{t("stage.confirmUndo")}</DialogTitle>
           <DialogDescription className="text-[13px] leading-snug">
@@ -1143,48 +1312,119 @@ export const RewindTurnDialog = memo(function RewindTurnDialog({
           </DialogDescription>
         </DialogHeader>
 
+        {previewLoading && !hasFiles && (
+          <div className="text-ink-tertiary flex items-center gap-2 py-2 text-[12px]">
+            <OrbitSpinner size={13} />
+            <span>{t("stage.rewindPreviewLoading")}</span>
+          </div>
+        )}
+
+        {externalConflicts.length > 0 && restoreFiles && (
+          <div className="flex items-start gap-2 rounded-lg border border-signal-warning-border bg-signal-warning-bg px-3 py-2 text-[12px] leading-[1.45] text-signal-warning">
+            <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+            <span>
+              {t("stage.rewindConflictWarning", { count: externalConflicts.length })}
+            </span>
+          </div>
+        )}
+
         {hasFiles && (
-          <div className="min-w-0 space-y-2.5">
-            <label className="inline-flex cursor-pointer items-center gap-2.5 select-none">
-              <Checkbox
-                checked={restoreFiles}
-                onCheckedChange={setRestoreFiles}
-                disabled={submitting}
-                aria-label={t("stage.revertFiles")}
-              />
-              <span className="text-foreground text-[13px] font-medium">
-                {t("stage.revertFiles")}
-              </span>
-            </label>
+          <div className="flex min-w-0 flex-col gap-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <label className="inline-flex cursor-pointer items-center gap-2.5 select-none">
+                <Checkbox
+                  checked={restoreFiles && selectedCount > 0}
+                  onCheckedChange={handleToggleMasterRestore}
+                  disabled={submitting}
+                  aria-label={t("stage.revertFiles")}
+                />
+                <span className="text-foreground text-[13px] font-medium">
+                  {t("stage.revertFiles")}
+                </span>
+              </label>
+              <div className="flex items-center gap-2 text-[11px] text-ink-tertiary tabular-nums">
+                {previewLoading && <OrbitSpinner size={11} />}
+                <span>
+                  {t("stage.rewindSelectedCount", {
+                    selected: restoreFiles ? selectedCount : 0,
+                    total: files.length,
+                  })}
+                </span>
+              </div>
+            </div>
 
             <div className="relative -mx-5 min-w-0">
               <div
                 className={cn(
-                  "orbit-native-scroll max-h-[216px] space-y-1.5 overflow-y-auto overscroll-contain px-5 transition-opacity duration-150",
+                  "orbit-native-scroll max-h-[216px] flex flex-col gap-1 overflow-y-auto overscroll-contain px-5 transition-opacity duration-150",
                   !restoreFiles && "opacity-45",
                 )}
               >
                 {files.map((file) => {
                   const FileIcon = resolveSemanticFileIcon(file.displayPath);
                   const showRelPath = (basenameCounts.get(file.basename) ?? 0) > 1;
+                  const checked = restoreFiles && selectedPaths.has(file.path);
+                  const isInspected = inspectedPath === file.path;
                   return (
                     <div
-                      key={file.displayPath}
-                      title={file.displayPath}
-                      className="flex min-w-0 items-center gap-2 py-0.5 text-[13px]"
+                      key={file.path}
+                      className={cn(
+                        "flex min-w-0 items-center gap-2 rounded-[6px] px-1.5 py-1 text-[13px] transition-colors",
+                        isInspected ? "bg-accent/80" : "hover:bg-accent/45",
+                      )}
                     >
-                      <FileIcon className="text-muted-foreground/85 size-3.5 shrink-0 stroke-[1.75]" />
-                      <span
+                      <Checkbox
+                        checked={checked}
+                        disabled={submitting}
+                        aria-label={file.displayPath}
+                        onCheckedChange={(val) => handleToggleFilePath(file.path, val)}
+                      />
+                      <button
+                        type="button"
+                        disabled={!file.diffFile}
+                        title={
+                          file.diffFile
+                            ? t("stage.rewindInspectDiffHint", { path: file.displayPath })
+                            : file.displayPath
+                        }
+                        onClick={() =>
+                          setInspectedPath((cur) => (cur === file.path ? null : file.path))
+                        }
                         className={cn(
-                          "text-foreground/90 min-w-0 truncate",
-                          !restoreFiles && "line-through",
+                          "flex min-w-0 flex-1 items-center gap-2 text-left",
+                          file.diffFile ? "cursor-pointer" : "cursor-default",
                         )}
                       >
-                        {showRelPath ? file.displayPath : file.basename}
-                      </span>
-                      {(file.additions > 0 || file.deletions > 0) && (
-                        <DiffStat additions={file.additions} deletions={file.deletions} />
-                      )}
+                        <FileIcon className="text-muted-foreground/85 size-3.5 shrink-0 stroke-[1.75]" />
+                        <span
+                          className={cn(
+                            "text-foreground/90 min-w-0 flex-1 truncate",
+                            !checked && "line-through opacity-60",
+                          )}
+                        >
+                          {showRelPath ? file.displayPath : file.basename}
+                        </span>
+                        {file.hasExternalConflict && (
+                          <span
+                            title={t("stage.rewindFileConflictBadge")}
+                            className="bg-signal-warning-bg text-signal-warning border-signal-warning-border inline-flex shrink-0 items-center gap-0.5 rounded-[5px] border px-1.5 py-0.25 text-[10.5px] font-medium"
+                          >
+                            <AlertTriangle className="size-2.5" />
+                            <span>{t("stage.rewindConflictShort")}</span>
+                          </span>
+                        )}
+                        {(file.additions > 0 || file.deletions > 0) && (
+                          <DiffStat additions={file.additions} deletions={file.deletions} />
+                        )}
+                        {file.diffFile && (
+                          <ChevronRight
+                            className={cn(
+                              "size-3 shrink-0 text-ink-muted transition-transform",
+                              isInspected && "rotate-90 text-ink-primary",
+                            )}
+                          />
+                        )}
+                      </button>
                     </div>
                   );
                 })}
@@ -1199,6 +1439,16 @@ export const RewindTurnDialog = memo(function RewindTurnDialog({
                 />
               )}
             </div>
+
+            {inspectedFile?.diffFile && (
+              <div className="border-border-subtle bg-surface-base max-h-[260px] overflow-auto rounded-lg border p-2">
+                <DiffFilesViewer
+                  files={[inspectedFile.diffFile]}
+                  layout="unified"
+                  virtualized={false}
+                />
+              </div>
+            )}
           </div>
         )}
 
@@ -1223,7 +1473,7 @@ export const RewindTurnDialog = memo(function RewindTurnDialog({
             type="button"
             size="sm"
             disabled={submitting}
-            onClick={() => onConfirm(effectiveRestore)}
+            onClick={triggerConfirm}
             className="gap-1.5"
           >
             {submitting && <OrbitSpinner size={13} />}
@@ -1237,7 +1487,7 @@ export const RewindTurnDialog = memo(function RewindTurnDialog({
 });
 
 /**
- * Completed Turn Footer (`[Copy · Fork · 2m ago]`):
+ * Completed Turn Footer (`[Copy · Fork · Collapse · 2m ago]`):
  * Hidden while a turn is active since live elapsed duration lives inline in `TurnActivityDisclosure`.
  */
 export const TurnFooter = memo(function TurnFooter({
@@ -1248,6 +1498,7 @@ export const TurnFooter = memo(function TurnFooter({
   isLastTurn,
   canForkWorktree = false,
   onRequestFork,
+  onCollapseTurn,
 }: {
   completedAtMs: number | null;
   replyText: string | null;
@@ -1256,7 +1507,9 @@ export const TurnFooter = memo(function TurnFooter({
   isLastTurn?: boolean;
   canForkWorktree?: boolean;
   onRequestFork?: (upToSeq: number | null, worktree: boolean) => void;
+  onCollapseTurn?: () => void;
 }) {
+  const { t } = useI18n();
   const handleFork = useCallback(
     (worktree: boolean) => {
       onRequestFork?.(isLastTurn ? null : forkUpToSeq, worktree);
@@ -1282,6 +1535,14 @@ export const TurnFooter = memo(function TurnFooter({
           align="start"
           onFork={handleFork}
           className={replyText ? undefined : "-ml-1"}
+        />
+      )}
+
+      {onCollapseTurn && (
+        <CollapseTurnActionButton
+          label={t("stage.collapseTurn")}
+          onClick={onCollapseTurn}
+          className={!replyText && !(showFork && onRequestFork) ? "-ml-1" : undefined}
         />
       )}
 

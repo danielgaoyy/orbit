@@ -102,6 +102,7 @@ import {
 } from "./stage-prompt-controls";
 import { PlanReviewCard } from "./plan-review-card";
 import { TurnStageSection } from "./stage-turn-card";
+import { TurnCollapseUtilityBar, useTurnCollapse } from "./use-turn-collapse";
 
 export { PromptImageLightbox, TurnStageSection };
 export type { PromptImagePreviewTarget };
@@ -367,6 +368,8 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   onOpenSubagent,
   queuedNotificationCount,
   onInterruptAndContinue,
+  collapsedTurnKeys,
+  onToggleTurnCollapsed,
 }: {
   selectedHostId: string;
   selectedAgentId: string;
@@ -401,6 +404,8 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   onOpenSubagent: (subagent: ResolvedSubagentItem) => void;
   queuedNotificationCount: number;
   onInterruptAndContinue: (() => void) | null;
+  collapsedTurnKeys: ReadonlySet<string>;
+  onToggleTurnCollapsed: (turnKey: string) => void;
 }) {
   const widthBucket = stageMaxContentWidthPx ? Math.round(stageMaxContentWidthPx / 32) : 24;
   const selectionTurnsRef = useRef<number[]>([]);
@@ -507,9 +512,14 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   );
 
   const heightCachePrefix = `${selectedHostId}::${selectedAgentId}::${widthBucket}::`;
+  const collapsedKeysRef = useRef(collapsedTurnKeys);
+  collapsedKeysRef.current = collapsedTurnKeys;
   const getItemKey = useCallback((index: number) => rows[index].key, [rows]);
   const estimateSize = useCallback((index: number) => {
     const row = rows[index];
+    if (collapsedKeysRef.current.has(row.key)) {
+      return 44 + row.spacingPx;
+    }
     const contentHeight = getCachedTurnHeight(heightCachePrefix + row.key);
     return getTurnItemHeight(turnsRef.current[index], row, contentHeight);
   }, [rows, heightCachePrefix]);
@@ -911,6 +921,8 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
               onOpenSubagent={onOpenSubagent}
               queuedNotificationCount={turnActive ? queuedNotificationCount : 0}
               onInterruptAndContinue={turnActive ? onInterruptAndContinue : null}
+              isCollapsed={!turnActive && collapsedTurnKeys.has(turn.key)}
+              onToggleCollapsed={onToggleTurnCollapsed}
             />
           </div>
         );
@@ -1292,7 +1304,7 @@ export function StreamStage() {
   );
 
   const handleConfirmRewind = useCallback(
-    async (restoreFiles: boolean) => {
+    async (restoreFiles: boolean, restorePaths?: string[] | null) => {
       if (!rewindTarget || !selectedHostId || !selectedAgentId || rewindSubmitting) return;
       setRewindSubmitting(true);
       try {
@@ -1303,6 +1315,7 @@ export function StreamStage() {
           restoreFiles,
           rewindTarget.promptText,
           rewindTarget.promptBadges,
+          restorePaths ?? null,
         );
         if (ok) {
           setRewindTarget(null);
@@ -1315,8 +1328,8 @@ export function StreamStage() {
   );
 
   const handleConfirmRewindSync = useCallback(
-    (restoreFiles: boolean) => {
-      void handleConfirmRewind(restoreFiles);
+    (restoreFiles: boolean, restorePaths?: string[] | null) => {
+      void handleConfirmRewind(restoreFiles, restorePaths);
     },
     [handleConfirmRewind],
   );
@@ -1706,6 +1719,7 @@ export function StreamStage() {
       if (loaded) {
         interruptFollow();
         scrollUiStore.update({ activePromptSeq: seq });
+        expandTurnRef.current(stageTurnsRef.current[loaded.turnIndex]?.key);
         jumpToTurnRef.current?.({ index: loaded.turnIndex, align: "start", behavior: "smooth" });
         return;
       }
@@ -1773,6 +1787,18 @@ export function StreamStage() {
   repaintFindHighlightsRef.current = stageFind.repaintHighlights;
   const resetStageFindRef = useRef(stageFind.resetForSessionChange);
   resetStageFindRef.current = stageFind.resetForSessionChange;
+  const handleAutoExpandedForFind = useCallback(() => repaintFindHighlightsRef.current(), []);
+  const turnCollapse = useTurnCollapse({
+    stageTurns,
+    findOpen: stageFind.open,
+    matchedTurnKeys: stageFind.matchedTurnKeys,
+    activeFindTurnKey: stageFind.activeTurnKey,
+    onAutoExpandedForFind: handleAutoExpandedForFind,
+  });
+  const expandTurnRef = useRef(turnCollapse.expandTurn);
+  expandTurnRef.current = turnCollapse.expandTurn;
+  const expandAllTurnsRef = useRef(turnCollapse.expandAll);
+  expandAllTurnsRef.current = turnCollapse.expandAll;
 
   const hasPendingJumpForActive = Boolean(
     pendingJumpTarget &&
@@ -1845,6 +1871,7 @@ export function StreamStage() {
       activePromptSeq: null,
     });
     setRewindTarget(null);
+    expandAllTurnsRef.current();
 
     if (isTargetedJump) {
       return;
@@ -2003,6 +2030,7 @@ export function StreamStage() {
     cancelHold();
     const turnIdx = match.index;
     const targetTurn = stageTurns[turnIdx];
+    expandTurnRef.current(targetTurn.key);
 
     stickToBottomRef.current = false;
     sessionEntryLockUntilRef.current = 0;
@@ -2303,6 +2331,13 @@ export function StreamStage() {
 
             {stageTurns.length > 0 && (
               <>
+                <TurnCollapseUtilityBar
+                  collapsibleEarlierTurnKeys={turnCollapse.collapsibleEarlierTurnKeys}
+                  collapsedTurnKeys={turnCollapse.collapsedTurnKeys}
+                  onCollapseEarlier={turnCollapse.collapseEarlier}
+                  onExpandAll={turnCollapse.expandAll}
+                />
+
                 <VirtualizedTurnList
                   key={activeSessionScope ?? selectedAgentId}
                   selectedHostId={selectedHostId}
@@ -2338,6 +2373,8 @@ export function StreamStage() {
                   onOpenSubagent={handleOpenSubagent}
                   queuedNotificationCount={queuedNotificationCount}
                   onInterruptAndContinue={handleInterruptAndContinue}
+                  collapsedTurnKeys={turnCollapse.collapsedTurnKeys}
+                  onToggleTurnCollapsed={turnCollapse.toggleTurn}
                 />
 
                 {isLatestTurnActive && <div aria-hidden="true" className="h-[32px] shrink-0" />}
@@ -2413,6 +2450,8 @@ export function StreamStage() {
       />
 
       <RewindTurnDialog
+        hostId={selectedHostId}
+        agentId={selectedAgentId}
         target={rewindTarget}
         isAgentRunning={isAgentRunning}
         submitting={rewindSubmitting}

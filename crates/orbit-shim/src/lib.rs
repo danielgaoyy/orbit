@@ -5,12 +5,16 @@
 //! loopback TCP endpoints (`127.0.0.1` + per-shim 256-bit token descriptor) on Windows
 //! (`$ORBIT_HOME/shims/<id>.sock`).
 
+pub mod sandbox;
+pub use sandbox::{SandboxProbeStatus, probe_sandbox_support};
 use std::collections::{HashMap, VecDeque};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+#[cfg(unix)]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 static TEST_PARENT_PID_WATCHDOG: AtomicU32 = AtomicU32::new(0);
@@ -736,8 +740,12 @@ pub enum ShimMode {
     Pty { cols: u16, rows: u16 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShimSpawnSpec {
+    #[serde(default)]
+    pub sandbox: Option<orbit_protocol::SandboxPolicy>,
+    #[serde(default)]
+    pub egress_proxy_url: Option<String>,
     pub shim_id: String,
     pub mode: ShimMode,
     pub program: String,
@@ -750,6 +758,15 @@ pub struct ShimSpawnSpec {
     pub cleanup_paths: Vec<PathBuf>,
 }
 
+impl std::fmt::Debug for ShimSpawnSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShimSpawnSpec")
+            .field("shim_id", &self.shim_id)
+            .field("mode", &self.mode)
+            .field("sandbox", &self.sandbox.as_ref().map(|p| p.mode))
+            .finish_non_exhaustive()
+    }
+}
 fn path_contains_nul(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -1196,6 +1213,13 @@ impl ShimClient {
 
 /// Probe whether a shim UDS socket is alive without triggering ring-buffer replay.
 /// Removes stale socket files ONLY when the listener is definitively gone (`ConnectionRefused`/`NotFound`).
+pub async fn shim_socket_reachable(path: &Path) -> bool {
+    matches!(
+        tokio::time::timeout(Duration::from_secs(2), connect_shim_stream(path)).await,
+        Ok(Ok(_))
+    )
+}
+
 pub async fn probe_existing_shim(socket_path: &Path) -> bool {
     if !socket_path.exists() {
         return false;
@@ -1926,7 +1950,60 @@ pub async fn spawn_detached_shim(
 
 /// Entrypoint invoked by `orbit shim --socket <path>` (with `ShimSpawnSpec` JSON piped over stdin).
 pub async fn run_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), ShimError> {
+    run_shim_with_bridge(socket_path, spec, None, None).await
+}
+
+pub async fn run_shim_with_bridge(
+    socket_path: &Path,
+    mut spec: ShimSpawnSpec,
+    bridge_socket: Option<&Path>,
+    bridge_exe: Option<&Path>,
+) -> Result<(), ShimError> {
+    struct EarlyCleanupGuard(Vec<PathBuf>);
+    impl Drop for EarlyCleanupGuard {
+        fn drop(&mut self) {
+            if !self.0.is_empty() {
+                unlink_cleanup_paths(&self.0);
+            }
+        }
+    }
+    let mut early_cleanup = EarlyCleanupGuard(spec.cleanup_paths.clone());
     validate_spawn_spec(&spec)?;
+    let plan = sandbox::SandboxCommand::prepare_with_bridge(
+        spec.program.as_ref(),
+        spec.args.iter().map(Into::into).collect(),
+        &spec.cwd,
+        spec.sandbox.as_ref(),
+        spec.egress_proxy_url.as_deref(),
+        bridge_socket,
+        bridge_exe,
+    )?;
+    spec.program = plan
+        .program
+        .into_string()
+        .map_err(|_| ShimError::InvalidSpec("non-UTF8 program".into()))?;
+    spec.args = plan
+        .args
+        .into_iter()
+        .map(|v| {
+            v.into_string()
+                .map_err(|_| ShimError::InvalidSpec("non-UTF8 argument".into()))
+        })
+        .collect::<Result<_, _>>()?;
+    #[cfg(windows)]
+    if spec
+        .sandbox
+        .as_ref()
+        .is_some_and(|p| p.mode != orbit_protocol::SandboxMode::Off)
+    {
+        spec.env.retain(|k, _| !sandbox::sensitive_env(k));
+    }
+    spec.env.extend(plan.env);
+    if let Some(path) = plan.profile {
+        spec.cleanup_paths.push(path.keep().map_err(|e| e.error)?);
+    }
+    // Ownership of `cleanup_paths` now passes to run_stdio_shim / run_pty_shim.
+    early_cleanup.0.clear();
     match spec.mode {
         ShimMode::Stdio => run_stdio_shim(socket_path, spec).await,
         ShimMode::Pty { cols, rows } => run_pty_shim(socket_path, spec, cols, rows).await,
@@ -2034,6 +2111,18 @@ async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), S
     write_pid_file(socket_path, std::process::id(), None, None);
 
     let mut cmd = Command::new(&spec.program);
+    #[cfg(windows)]
+    if spec
+        .sandbox
+        .as_ref()
+        .is_some_and(|p| p.mode != orbit_protocol::SandboxMode::Off)
+    {
+        for (k, _) in std::env::vars_os() {
+            if sandbox::sensitive_env(&k.to_string_lossy()) {
+                cmd.env_remove(k);
+            }
+        }
+    }
     cmd.args(&spec.args)
         .current_dir(&spec.cwd)
         .envs(&spec.env)
@@ -2234,6 +2323,18 @@ async fn run_pty_shim(
     let mut cmd = CommandBuilder::new(&spec.program);
     cmd.args(&spec.args);
     cmd.cwd(&spec.cwd);
+    #[cfg(windows)]
+    if spec
+        .sandbox
+        .as_ref()
+        .is_some_and(|p| p.mode != orbit_protocol::SandboxMode::Off)
+    {
+        for (k, _) in std::env::vars_os() {
+            if sandbox::sensitive_env(&k.to_string_lossy()) {
+                cmd.env_remove(k);
+            }
+        }
+    }
     for (k, v) in build_pty_env_pairs(&spec.program, &spec.env) {
         cmd.env(k, v);
     }
@@ -2670,10 +2771,11 @@ fn spawn_optional_parent_watchdog(spec: &ShimSpawnSpec, kill_tx: mpsc::Sender<()
 mod tests {
     use super::*;
 
-    // On macOS, `UnixListener::bind` lacks atomic `SOCK_CLOEXEC`, so concurrent `fork()` calls
-    // from sibling tests in the same binary can momentarily inherit a test listener FD before
-    // `fcntl(FD_CLOEXEC)` runs. Serialize fork-spawning / socket-cleanup tests cleanly.
-    static SHIM_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // Serialize fork-spawning / socket-cleanup tests cleanly across Unix platforms:
+    // on macOS `UnixListener::bind` lacks atomic `SOCK_CLOEXEC`, and on Linux a concurrent
+    // sibling test's `fork()` holds a transient reference to a newly dropped listener FD until
+    // `execve()` closes `SOCK_CLOEXEC` descriptors.
+    pub(crate) static SHIM_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[cfg(unix)]
     #[tokio::test]
@@ -2682,6 +2784,8 @@ mod tests {
         let sock_path =
             std::env::temp_dir().join(format!("orbit_test_shim_{}.sock", std::process::id()));
         let spec = ShimSpawnSpec {
+            sandbox: None,
+            egress_proxy_url: None,
             shim_id: "test_cat".into(),
             mode: ShimMode::Stdio,
             program: "/bin/cat".into(),
@@ -2766,6 +2870,8 @@ mod tests {
             std::process::id()
         ));
         let spec = ShimSpawnSpec {
+            sandbox: None,
+            egress_proxy_url: None,
             shim_id: "test_cat_cursor".into(),
             mode: ShimMode::Stdio,
             program: "/bin/cat".into(),
@@ -2937,6 +3043,8 @@ mod tests {
         // Guaranteed non-existent PID
         env.insert("ORBIT_SHIM_WATCHDOG_PID".into(), "4194300".into());
         let spec = ShimSpawnSpec {
+            sandbox: None,
+            egress_proxy_url: None,
             shim_id: "test_watchdog".into(),
             mode: ShimMode::Stdio,
             program: "/bin/cat".into(),
@@ -2969,6 +3077,8 @@ mod tests {
         let _ = std::fs::remove_file(&pid_path);
 
         let spec = ShimSpawnSpec {
+            sandbox: None,
+            egress_proxy_url: None,
             shim_id: "test_pid_sidecar".into(),
             mode: ShimMode::Stdio,
             program: "/bin/cat".into(),
@@ -3014,6 +3124,8 @@ mod tests {
             std::env::temp_dir().join(format!("orbit_lag_resync_{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock_path);
         let spec = ShimSpawnSpec {
+            sandbox: None,
+            egress_proxy_url: None,
             shim_id: "test_lag".into(),
             mode: ShimMode::Stdio,
             program: "/bin/cat".into(),
@@ -3089,6 +3201,8 @@ mod tests {
             std::env::temp_dir().join(format!("orbit_pgid_kill_{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock_path);
         let spec = ShimSpawnSpec {
+            sandbox: None,
+            egress_proxy_url: None,
             shim_id: "test_pgid".into(),
             mode: ShimMode::Stdio,
             program: "/bin/sh".into(),
@@ -3274,6 +3388,8 @@ mod tests {
             )
         };
         let spec = ShimSpawnSpec {
+            sandbox: None,
+            egress_proxy_url: None,
             shim_id: "pty_echo_test".into(),
             mode: ShimMode::Pty { cols: 80, rows: 24 },
             program,
@@ -3339,6 +3455,8 @@ mod tests {
         env.insert("ANTHROPIC_API_KEY".into(), "sk-ant-secret-12345".into());
         env.insert("ORBIT_MCP_TOKEN".into(), "tok-super-secret-xyz".into());
         let spec = ShimSpawnSpec {
+            sandbox: None,
+            egress_proxy_url: None,
             shim_id: "claude_ag_1".into(),
             mode: ShimMode::Stdio,
             program: "/usr/bin/claude".into(),
@@ -3418,6 +3536,8 @@ mod tests {
             let mut env = HashMap::new();
             env.insert("ORBIT_SECRET".into(), secret.into());
             let spec = ShimSpawnSpec {
+                sandbox: None,
+                egress_proxy_url: None,
                 shim_id: "secret_shim".into(),
                 mode: ShimMode::Stdio,
                 program: "/bin/true".into(),
@@ -3505,6 +3625,8 @@ mod tests {
         let sock_path = shims_dir.join("live.sock");
 
         let live_spec = ShimSpawnSpec {
+            sandbox: None,
+            egress_proxy_url: None,
             shim_id: "live_keep".into(),
             mode: ShimMode::Stdio,
             program: "/bin/cat".into(),
@@ -3537,6 +3659,8 @@ mod tests {
         eq_env_key.insert("A=B".into(), "ok".into());
         let bad_specs = [
             ShimSpawnSpec {
+                sandbox: None,
+                egress_proxy_url: None,
                 shim_id: "oversized".into(),
                 mode: ShimMode::Stdio,
                 program: "/bin/true".into(),
@@ -3546,6 +3670,8 @@ mod tests {
                 cleanup_paths: Vec::new(),
             },
             ShimSpawnSpec {
+                sandbox: None,
+                egress_proxy_url: None,
                 shim_id: "empty_program".into(),
                 mode: ShimMode::Stdio,
                 program: "   ".into(),
@@ -3555,6 +3681,8 @@ mod tests {
                 cleanup_paths: Vec::new(),
             },
             ShimSpawnSpec {
+                sandbox: None,
+                egress_proxy_url: None,
                 shim_id: "nul_program".into(),
                 mode: ShimMode::Stdio,
                 program: "/bin/tr\0ue".into(),
@@ -3564,6 +3692,8 @@ mod tests {
                 cleanup_paths: Vec::new(),
             },
             ShimSpawnSpec {
+                sandbox: None,
+                egress_proxy_url: None,
                 shim_id: "nul_arg".into(),
                 mode: ShimMode::Stdio,
                 program: "/bin/true".into(),
@@ -3573,6 +3703,8 @@ mod tests {
                 cleanup_paths: Vec::new(),
             },
             ShimSpawnSpec {
+                sandbox: None,
+                egress_proxy_url: None,
                 shim_id: "nul_env_val".into(),
                 mode: ShimMode::Stdio,
                 program: "/bin/true".into(),
@@ -3582,6 +3714,8 @@ mod tests {
                 cleanup_paths: Vec::new(),
             },
             ShimSpawnSpec {
+                sandbox: None,
+                egress_proxy_url: None,
                 shim_id: "nul_env_key".into(),
                 mode: ShimMode::Stdio,
                 program: "/bin/true".into(),
@@ -3591,6 +3725,8 @@ mod tests {
                 cleanup_paths: Vec::new(),
             },
             ShimSpawnSpec {
+                sandbox: None,
+                egress_proxy_url: None,
                 shim_id: "empty_env_key".into(),
                 mode: ShimMode::Stdio,
                 program: "/bin/true".into(),
@@ -3600,6 +3736,8 @@ mod tests {
                 cleanup_paths: Vec::new(),
             },
             ShimSpawnSpec {
+                sandbox: None,
+                egress_proxy_url: None,
                 shim_id: "eq_env_key".into(),
                 mode: ShimMode::Stdio,
                 program: "/bin/true".into(),
@@ -3609,6 +3747,8 @@ mod tests {
                 cleanup_paths: Vec::new(),
             },
             ShimSpawnSpec {
+                sandbox: None,
+                egress_proxy_url: None,
                 shim_id: "nul_cwd".into(),
                 mode: ShimMode::Stdio,
                 program: "/bin/true".into(),

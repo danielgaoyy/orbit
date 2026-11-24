@@ -11,7 +11,9 @@ pub mod attachments;
 pub mod browser;
 pub mod connected_hosts;
 pub mod cron;
+pub mod diagnostics;
 pub mod discovery;
+mod egress_proxy;
 pub mod fast_copy;
 pub mod finish_subscriptions;
 pub mod git;
@@ -21,6 +23,7 @@ pub mod goals;
 pub mod guardian;
 pub mod guardian_llm;
 pub mod hooks;
+pub mod ide_migrate;
 pub mod idle_cleanup;
 pub mod im_channels;
 pub mod im_longconn;
@@ -30,6 +33,7 @@ pub mod lsp;
 pub mod manager;
 pub mod mcp;
 pub mod mcp_servers;
+mod memory;
 pub mod messaging;
 pub mod permission_rules;
 pub mod personal_router;
@@ -37,10 +41,12 @@ pub mod plan_approval;
 pub mod platform;
 pub mod push;
 pub mod rules;
+mod sandbox;
 pub mod scheduler;
 pub mod skills;
 pub mod skills_manager;
 pub mod symbols;
+pub mod telemetry;
 pub mod timers;
 pub mod tools;
 pub mod triggers;
@@ -341,10 +347,22 @@ pub(crate) fn verify_bearer_token(headers: &HeaderMap, expected_secret: &str) ->
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DaemonPersistedConfig {
+    #[serde(default)]
+    pub sandbox_policy: Option<orbit_protocol::SandboxPolicy>,
+    #[serde(default)]
+    pub daily_budget_usd: Option<f64>,
+    #[serde(default)]
+    pub monthly_budget_usd: Option<f64>,
+    #[serde(default)]
+    pub auto_compact_threshold_pct: Option<u8>,
+    #[serde(default)]
+    pub telemetry_endpoint: Option<String>,
     pub listen_addr: Option<SocketAddr>,
     pub relay_url: Option<String>,
     #[serde(default)]
     pub orchestration: OrchestrationConfig,
+    #[serde(default)]
+    pub memory_embedding: orbit_protocol::MemoryEmbeddingConfig,
 }
 
 fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
@@ -359,16 +377,31 @@ impl DaemonPersistedConfig {
             .unwrap_or_default()
     }
 
+    /// Serialize read-modify-write operations across daemon, shim and CLI processes.
+    pub fn update(home: &Path, edit: impl FnOnce(&mut Self)) -> std::io::Result<()> {
+        ensure_private_dir(home)?;
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(home.join("config.lock"))?;
+        lock.lock()?;
+        let mut cfg = match std::fs::read(home.join("config.json")) {
+            Ok(b) => serde_json::from_slice(&b).map_err(std::io::Error::other)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => return Err(e),
+        };
+        edit(&mut cfg);
+        cfg.save(home)
+    }
     pub fn save(&self, home_dir: &Path) -> std::io::Result<()> {
         ensure_private_dir(home_dir)?;
         let raw = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         let config_path = home_dir.join("config.json");
-        std::fs::write(&config_path, raw)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
-        }
+        use std::io::Write;
+        let mut temp = tempfile::NamedTempFile::new_in(home_dir)?;
+        temp.write_all(raw.as_bytes())?;
+        temp.persist(config_path)?;
         Ok(())
     }
 }
@@ -444,6 +477,9 @@ pub struct DaemonConfig {
 }
 
 pub struct DaemonRuntime {
+    exporter: std::sync::OnceLock<Arc<telemetry::Exporter>>,
+    rpc_count: std::sync::atomic::AtomicU64,
+    relay_connected: std::sync::atomic::AtomicBool,
     pub host_info: HostInfo,
     pub keypair: HostIdentityKeypair,
     pub store: Arc<OrbitStore>,
@@ -482,7 +518,126 @@ pub struct DaemonRuntime {
     upgrade_lock: AsyncMutex<()>,
 }
 
+fn open_signed_store(
+    home_dir: &Path,
+    keypair: &HostIdentityKeypair,
+) -> anyhow::Result<Arc<OrbitStore>> {
+    let store = Arc::new(OrbitStore::open(home_dir.join("orbit.db"))?);
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"orbit/audit-ed25519/v1");
+    digest.update(*zeroize::Zeroizing::new(keypair.private_bytes()?));
+    let key_bytes = zeroize::Zeroizing::new(<[u8; 32]>::from(digest.finalize()));
+    store.set_audit_identity(
+        keypair.host_id()?,
+        ed25519_dalek::SigningKey::from_bytes(&key_bytes),
+    )?;
+    Ok(store)
+}
+
+/// Own the child egress listener in the detached shim so daemon restarts preserve its address and token.
+pub async fn run_tool_shim(
+    socket: &Path,
+    mut spec: orbit_shim::ShimSpawnSpec,
+) -> anyhow::Result<()> {
+    struct CleanupPathsGuard(Vec<PathBuf>);
+    impl Drop for CleanupPathsGuard {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    let mut early_cleanup = CleanupPathsGuard(spec.cleanup_paths.clone());
+    let Some(policy) = spec
+        .sandbox
+        .clone()
+        .filter(|p| p.mode != orbit_protocol::SandboxMode::Off)
+    else {
+        early_cleanup.0.clear();
+        return Ok(orbit_shim::run_shim(socket, spec).await?);
+    };
+    let home = spec
+        .env
+        .get("ORBIT_HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("sandbox host home missing"))?;
+    let store = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let keypair =
+            serde_json::from_reader(std::fs::File::open(home.join("host-keypair.json"))?)?;
+        open_signed_store(&home, &keypair)
+    })
+    .await??;
+    let agent = spec.env.get("ORBIT_AGENT_ID").cloned();
+    let proxy = if policy.allow_network && spec.egress_proxy_url.is_none() {
+        let proxy = egress_proxy::start(policy, store.clone(), agent.clone()).await?;
+        spec.egress_proxy_url = Some(proxy.url.clone());
+        Some(proxy)
+    } else {
+        None
+    };
+    let bridge_socket = proxy
+        .as_ref()
+        .and_then(|p| p.bridge_socket())
+        .map(Path::to_path_buf);
+    let orbit_exe = crate::manager::resolve_orbit_exe();
+    early_cleanup.0.clear();
+    let result = orbit_shim::run_shim_with_bridge(
+        socket,
+        spec,
+        bridge_socket.as_deref(),
+        Some(orbit_exe.as_path()),
+    )
+    .await;
+    if result.is_err() {
+        let store_bg = store.clone();
+        let agent_bg = agent.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = store_bg.append_audit_event(
+                "sandbox",
+                "launch",
+                "shim",
+                agent_bg.as_deref(),
+                "block",
+                &serde_json::Value::Null,
+            );
+        })
+        .await;
+    }
+    drop(proxy);
+    Ok(result?)
+}
+
 impl DaemonRuntime {
+    fn spawn_memory_rpc<F: Future<Output = anyhow::Result<WireMessage>> + Send + 'static>(
+        &self,
+        request_id: Uuid,
+        path: PathBuf,
+        out_tx: &mpsc::Sender<SessionFrame>,
+        zstd: bool,
+        run: impl FnOnce(memory::MemoryEngine, String) -> F + Send + 'static,
+    ) {
+        let store = self.store.clone();
+        let engine = self.orchestrator.memory.clone();
+        let tx = out_tx.clone();
+        tokio::spawn(async move {
+            let msg = match authorize_workspace_mutation_cwd(&store, &path).await {
+                Ok(root) => match root.to_str() {
+                    Some(root) => run(engine, root.to_owned())
+                        .await
+                        .unwrap_or_else(|e| rpc_err(request_id, "project_memory_error", e)),
+                    None => rpc_err(
+                        request_id,
+                        "project_memory_error",
+                        "workspace path must be UTF-8",
+                    ),
+                },
+                Err(e) => rpc_err(request_id, "workspace_denied", e),
+            };
+            let _ = tx.send(SessionFrame::Wire { msg, zstd }).await;
+        });
+    }
+
     /// Lightweight, side-effect-free runtime bootstrap (safe for `orbit pair`, `orbit status`,
     /// and tests). Call [`DaemonRuntime::activate_server`] after binding the TCP listener to start
     /// shim recovery, connected hosts, finish subscriptions, scheduler, and idle cleanup.
@@ -517,11 +672,13 @@ impl DaemonRuntime {
         let orch_config = Arc::new(RwLock::new(persisted.orchestration));
 
         let host_id = keypair.host_id()?;
-        let store = Arc::new(OrbitStore::open(home_dir.join("orbit.db"))?);
+        let store = open_signed_store(home_dir, &keypair)?;
+        sandbox::register(home_dir, &store);
         let scripts = WorkspaceScriptRegistry::new();
         let keep_awake = Arc::new(KeepAwakeManager::new(keep_awake_enabled));
         let provider_catalogs = Arc::new(RwLock::new(None));
         let hooks = HooksEngine::new(home_dir.to_path_buf());
+        let _ = hooks.audit_store.set(store.clone());
         let orchestrator = AgentOrchestrator::new(
             home_dir.to_path_buf(),
             host_id.clone(),
@@ -667,7 +824,23 @@ impl DaemonRuntime {
         let bcast_for_watch = orchestrator.broadcast_tx.clone();
         let workspace_watcher =
             crate::workspace_watcher::WorkspaceWatcherManager::new(move |batch| {
-                sym_for_watch.invalidate(&batch.canonical_root);
+                if batch.is_primary_root_event {
+                    sym_for_watch.invalidate(&batch.canonical_root);
+                    let memory = orch_for_watch.memory.clone();
+                    let root = batch.canonical_root.clone();
+                    let paths = if batch.revalidation_paths.is_empty() {
+                        batch.changed_paths.clone()
+                    } else {
+                        batch.revalidation_paths
+                    };
+                    tokio::spawn(async move {
+                        if let Some(cwd) = root.to_str()
+                            && let Err(error) = memory.changed(cwd, paths).await
+                        {
+                            tracing::warn!(%error, "project memory watcher reconciliation failed");
+                        }
+                    });
+                }
                 if batch.skills_or_rules_changed {
                     let orch_bg = Arc::clone(&orch_for_watch);
                     let ws_id = batch.workspace_id.clone();
@@ -688,6 +861,9 @@ impl DaemonRuntime {
             .await;
 
         Ok(Arc::new(Self {
+            exporter: Default::default(),
+            rpc_count: Default::default(),
+            relay_connected: Default::default(),
             host_info,
             keypair,
             store,
@@ -875,6 +1051,14 @@ impl DaemonRuntime {
     pub fn rotate_pairing_secret(&self) -> anyhow::Result<String> {
         let rotated = rotate_pairing_secret(&self.home_dir)?;
         let _ = self.pairing_secret_rotated_tx.send(());
+        self.store.append_audit_event(
+            "pairing",
+            "rotate",
+            "host",
+            None,
+            "success",
+            &serde_json::Value::Null,
+        )?;
         Ok(rotated)
     }
 
@@ -924,9 +1108,9 @@ impl DaemonRuntime {
             };
 
             if persist {
-                let mut persisted = DaemonPersistedConfig::load(&self.home_dir);
-                persisted.relay_url = normalized.clone();
-                persisted.save(&self.home_dir)?;
+                DaemonPersistedConfig::update(&self.home_dir, |cfg| {
+                    cfg.relay_url = normalized.clone()
+                })?;
             }
 
             let mut task_guard = self.relay_task.lock().await;
@@ -941,6 +1125,8 @@ impl DaemonRuntime {
 
             if let Some(prev) = task_guard.take() {
                 prev.abort();
+                self.relay_connected
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
             }
             *self.relay_url.write().await = normalized.clone();
 
@@ -1028,6 +1214,7 @@ fn build_http_router(runtime: Arc<DaemonRuntime>) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz_handler))
+        .route("/metrics", get(metrics_handler))
         .route("/ws", get(ws_handler))
         .route("/ws/e2ee", get(ws_e2ee_handler))
         .route("/mcp/agents", post(crate::mcp::mcp_agents_handler))
@@ -1096,7 +1283,14 @@ async fn not_found_fallback() -> Response {
 }
 
 pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
-    let mut persisted = DaemonPersistedConfig::load(&config.home_dir);
+    run_daemon_until(config, None, wait_daemon_shutdown_signal()).await
+}
+pub async fn run_daemon_until(
+    config: DaemonConfig,
+    exporter: Option<Arc<telemetry::Exporter>>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    let persisted = DaemonPersistedConfig::load(&config.home_dir);
     let effective_relay = config.relay_url.or_else(|| persisted.relay_url.clone());
     let cleaned_sockets =
         orbit_shim::cleanup_stale_shim_sockets(&config.home_dir.join("shims")).await;
@@ -1107,6 +1301,9 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         );
     }
     let runtime = DaemonRuntime::bootstrap(&config.home_dir).await?;
+    if let Some(handle) = exporter {
+        let _ = runtime.exporter.set(handle);
+    }
     let listener = match tokio::net::TcpListener::bind(config.listen_addr).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && config.listen_addr.port() != 0 => {
@@ -1122,8 +1319,9 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                         rebound = %addr,
                         "Requested port already in use by another user/process; automatically isolated onto free port"
                     );
-                    persisted.listen_addr = Some(addr);
-                    let _ = persisted.save(&config.home_dir);
+                    DaemonPersistedConfig::update(&config.home_dir, |cfg| {
+                        cfg.listen_addr = Some(addr)
+                    })?;
                     fallback_listener = Some(l);
                     break;
                 }
@@ -1160,27 +1358,33 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
 
     let runtime_shutdown = runtime.clone();
     let app = build_http_router(runtime);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            wait_daemon_shutdown_signal().await;
-            runtime_shutdown.shutdown_outbound_relay().await;
-            runtime_shutdown.orchestrator.flush_all_shim_cursors().await;
-            runtime_shutdown.orchestrator.shutdown_worktree_pool().await;
-            runtime_shutdown.conditional_timers.shutdown().await;
-            runtime_shutdown.goals.shutdown_all().await;
-            runtime_shutdown.triggers.shutdown().await;
-            runtime_shutdown.workflows.shutdown_all().await;
-            runtime_shutdown.im_channels.shutdown_all().await;
-            runtime_shutdown.push.shutdown_all().await;
-            runtime_shutdown.lsp.shutdown_all().await;
-            runtime_shutdown.browser.shutdown_all().await;
-            runtime_shutdown.keep_awake.shutdown();
-        })
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown.await;
+        runtime_shutdown.shutdown_outbound_relay().await;
+        runtime_shutdown.orchestrator.flush_all_shim_cursors().await;
+        runtime_shutdown.orchestrator.shutdown_worktree_pool().await;
+        runtime_shutdown.conditional_timers.shutdown().await;
+        runtime_shutdown.goals.shutdown_all().await;
+        runtime_shutdown.triggers.shutdown().await;
+        runtime_shutdown.workflows.shutdown_all().await;
+        runtime_shutdown.im_channels.shutdown_all().await;
+        runtime_shutdown.push.shutdown_all().await;
+        runtime_shutdown.lsp.shutdown_all().await;
+        runtime_shutdown.browser.shutdown_all().await;
+        runtime_shutdown.keep_awake.shutdown();
+        if let Some(exporter) = runtime_shutdown.exporter.get() {
+            exporter.flush_and_shutdown().await;
+        }
+    })
+    .await?;
     Ok(())
 }
 
-async fn wait_daemon_shutdown_signal() {
+pub async fn wait_daemon_shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -1226,12 +1430,63 @@ pub async fn spawn_embedded_daemon(
 
     let app = build_http_router(runtime.clone());
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
     });
 
     Ok((addr, runtime))
 }
 
+async fn metrics_handler(
+    State(rt): State<Arc<DaemonRuntime>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if !peer.ip().is_loopback()
+        || validate_request_origin(&headers).is_err()
+        || !rt
+            .active_pairing_secret()
+            .is_some_and(|s| verify_bearer_token(&headers, &s))
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let agents = rt.orchestrator.list_live_agent_ids().await.len() as u64;
+    let store = rt.store.clone();
+    let home = rt.home_dir.clone();
+    let rpc = rt.rpc_count.load(std::sync::atomic::Ordering::Relaxed);
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        let shims = std::fs::read_dir(home.join("shims"))?
+            .flatten()
+            .filter(|f| f.path().extension().is_some_and(|s| s == "sock"))
+            .count() as u64;
+        Ok(telemetry::openmetrics([
+            agents,
+            shims,
+            store.audit_count(Some("permission"), Some("allow"))?
+                + store.audit_count(Some("permission"), Some("allow_always"))?,
+            store.audit_count(Some("permission"), Some("deny"))?,
+            store.audit_count(Some("egress"), Some("block"))?,
+            store.audit_count(None, None)?,
+            rpc,
+            store.audit_count(Some("compaction"), None)?,
+        ]))
+    })
+    .await
+    {
+        Ok(Ok(s)) => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/openmetrics-text; version=1.0.0; charset=utf-8",
+            )],
+            s,
+        )
+            .into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
 async fn healthz_handler(State(runtime): State<Arc<DaemonRuntime>>) -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "status": "ok",
@@ -1477,6 +1732,9 @@ async fn outbound_relay_loop(runtime: Arc<DaemonRuntime>, relay_base: String) {
                 let (mut sink, mut stream) = ws.split();
                 match complete_relay_control_pop(&mut sink, &mut stream, &priv_bytes).await {
                     Ok(mut control_chan) => {
+                        runtime
+                            .relay_connected
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                         info!(
                             relay = %active_display,
                             "Authenticated (PoP) and connected outbound to Orbit Relay"
@@ -1561,6 +1819,9 @@ async fn outbound_relay_loop(runtime: Arc<DaemonRuntime>, relay_base: String) {
                                 }
                             }
                         }
+                        runtime
+                            .relay_connected
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
                         warn!(relay = %active_display, "Disconnected from Relay, reconnecting...");
                     }
                     Err(e) => {
@@ -3305,6 +3566,9 @@ async fn handle_wire_rpc(
     active_side_questions: &mut Vec<tokio::task::AbortHandle>,
     out_tx: &mpsc::Sender<SessionFrame>,
 ) -> Option<WireMessage> {
+    runtime
+        .rpc_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     match req {
         WireMessage::Hello { supports_zstd, .. } => {
             *use_zstd = supports_zstd;
@@ -4468,6 +4732,130 @@ async fn handle_wire_rpc(
             });
             None
         }
+        WireMessage::ListProjectMemories {
+            request_id,
+            cwd,
+            status,
+            category,
+            query,
+            limit,
+        } => {
+            runtime.spawn_memory_rpc(
+                request_id,
+                expand_host_path(&cwd),
+                out_tx,
+                *use_zstd,
+                move |engine, root| async move {
+                    let items = engine.list(&root, status, category, query, limit).await?;
+                    Ok(WireMessage::ProjectMemoriesList {
+                        request_id,
+                        cwd,
+                        items,
+                    })
+                },
+            );
+            None
+        }
+        WireMessage::UpsertProjectMemory {
+            request_id,
+            cwd,
+            id,
+            title,
+            content,
+            category,
+            status,
+            file_paths,
+            tags,
+        } => {
+            runtime.spawn_memory_rpc(
+                request_id,
+                expand_host_path(&cwd),
+                out_tx,
+                *use_zstd,
+                move |engine, root| async move {
+                    let item = engine
+                        .save(
+                            &root,
+                            memory::MemoryDraft {
+                                id,
+                                title,
+                                content,
+                                category,
+                                status,
+                                file_paths,
+                                tags,
+                            },
+                            None,
+                        )
+                        .await?;
+                    Ok(WireMessage::ProjectMemorySaved { request_id, item })
+                },
+            );
+            None
+        }
+        WireMessage::ConfirmProjectMemory {
+            request_id,
+            cwd,
+            id,
+        } => {
+            runtime.spawn_memory_rpc(
+                request_id,
+                expand_host_path(&cwd),
+                out_tx,
+                *use_zstd,
+                move |engine, root| async move {
+                    let item = engine.confirm(&root, id).await?;
+                    Ok(WireMessage::ProjectMemorySaved { request_id, item })
+                },
+            );
+            None
+        }
+        WireMessage::DeleteProjectMemory {
+            request_id,
+            cwd,
+            id,
+        } => {
+            runtime.spawn_memory_rpc(
+                request_id,
+                expand_host_path(&cwd),
+                out_tx,
+                *use_zstd,
+                move |engine, root| async move {
+                    let deleted = engine.forget(&root, id.clone()).await?;
+                    Ok(WireMessage::ProjectMemoryDeleted {
+                        request_id,
+                        id,
+                        deleted,
+                    })
+                },
+            );
+            None
+        }
+        WireMessage::RecallProjectMemories {
+            request_id,
+            cwd,
+            query,
+            limit,
+            include_unconfirmed,
+        } => {
+            runtime.spawn_memory_rpc(
+                request_id,
+                expand_host_path(&cwd),
+                out_tx,
+                *use_zstd,
+                move |engine, root| async move {
+                    let hits = engine
+                        .recall(&root, query, limit, include_unconfirmed.unwrap_or(false))
+                        .await?;
+                    Ok(WireMessage::ProjectMemoryRecallResult {
+                        request_id,
+                        cwd,
+                        hits,
+                    })
+                },
+            );
+            None
+        }
         WireMessage::ListWorkspaceFiles { request_id, cwd } => {
             let tx = out_tx.clone();
             let zstd = *use_zstd;
@@ -5517,14 +5905,40 @@ async fn handle_wire_rpc(
                 permissions,
             })
         }
+        WireMessage::PreviewRewindAgent {
+            request_id,
+            agent_id,
+            to_seq,
+        } => match runtime
+            .orchestrator
+            .preview_rewind_agent(&agent_id, to_seq)
+            .await
+        {
+            Ok(outcome) => Some(WireMessage::RewindPreviewResult {
+                request_id,
+                agent_id: outcome.agent_id,
+                to_seq: outcome.to_seq,
+                checkpoint_kind: outcome.checkpoint_kind,
+                files: outcome.files,
+                external_conflicts: outcome.external_conflicts,
+            }),
+            Err(e) => Some(rpc_err(request_id, "preview_rewind_failed", e)),
+        },
         WireMessage::RewindAgent {
             request_id,
             agent_id,
             to_before_seq,
             restore_files,
+            restore_paths,
         } => match runtime
             .orchestrator
-            .rewind_agent(&agent_id, to_before_seq, restore_files, session_id)
+            .rewind_agent(
+                &agent_id,
+                to_before_seq,
+                restore_files,
+                restore_paths,
+                session_id,
+            )
             .await
         {
             Ok(outcome) => Some(WireMessage::AgentRewound {
@@ -8136,9 +8550,9 @@ async fn handle_wire_rpc(
             runtime
                 .keep_awake
                 .set_enabled(config.keep_awake_while_running);
-            let mut persisted = DaemonPersistedConfig::load(&runtime.home_dir);
-            persisted.orchestration = config.clone();
-            match persisted.save(&runtime.home_dir) {
+            match DaemonPersistedConfig::update(&runtime.home_dir, |cfg| {
+                cfg.orchestration = config.clone()
+            }) {
                 Ok(()) => Some(WireMessage::OrchestrationConfigSnapshot { request_id, config }),
                 Err(e) => Some(rpc_err(request_id, "save_config_failed", e)),
             }
@@ -8225,9 +8639,9 @@ async fn handle_wire_rpc(
                     {
                         let mut cfg = runtime.orch_config.write().await;
                         cfg.installed_skills = skill_ids;
-                        let mut persisted = DaemonPersistedConfig::load(&runtime.home_dir);
-                        persisted.orchestration = cfg.clone();
-                        let _ = persisted.save(&runtime.home_dir);
+                        let _ = DaemonPersistedConfig::update(&runtime.home_dir, |c| {
+                            c.orchestration = cfg.clone()
+                        });
                     }
                     Some(WireMessage::OrchestrationSkillsSnapshot { request_id, skills })
                 }
@@ -8468,6 +8882,170 @@ async fn handle_wire_rpc(
                     .await;
             });
             None
+        }
+        WireMessage::InspectExternalIdeMigration { .. }
+        | WireMessage::ExecuteExternalIdeMigration { .. } => {
+            let apply = matches!(&req, WireMessage::ExecuteExternalIdeMigration { .. });
+            let (WireMessage::InspectExternalIdeMigration {
+                request_id,
+                from,
+                cwd,
+                conflict,
+            }
+            | WireMessage::ExecuteExternalIdeMigration {
+                request_id,
+                from,
+                cwd,
+                conflict,
+            }) = req
+            else {
+                return None;
+            };
+            let cwd = match authorize_optional_skills_cwd(&runtime.store, cwd).await {
+                Ok(c) => c,
+                Err(e) => return Some(rpc_err(request_id, "migration", e)),
+            };
+            let home = runtime.home_dir.clone();
+            let _lock = runtime.mcp_config_lock.lock().await;
+            Some(
+                match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                    Ok(serde_json::to_value(ide_migrate::migrate(
+                        &home,
+                        &resolve_user_home(),
+                        cwd.as_deref().map(Path::new),
+                        from.as_deref(),
+                        apply,
+                        conflict,
+                    )?)?)
+                })
+                .await
+                {
+                    Ok(Ok(items)) => WireMessage::ExternalIdeMigrationResult { request_id, items },
+                    Ok(Err(e)) => rpc_err(request_id, "migration", e),
+                    Err(e) => rpc_err(request_id, "migration", e),
+                },
+            )
+        }
+        WireMessage::CompactAgentContext {
+            request_id,
+            agent_id,
+        } => Some(
+            match runtime.orchestrator.compact_agent(&agent_id, None).await {
+                Ok(()) => WireMessage::Ack { request_id },
+                Err(e) => rpc_err(request_id, "compaction", e),
+            },
+        ),
+        WireMessage::GetSandboxConfig { request_id } => {
+            let home = runtime.home_dir.clone();
+            Some(
+                match tokio::task::spawn_blocking(move || {
+                    DaemonPersistedConfig::load(&home).sandbox_policy
+                })
+                .await
+                {
+                    Ok(sandbox_policy) => WireMessage::SandboxConfig {
+                        request_id,
+                        sandbox_policy,
+                    },
+                    Err(e) => rpc_err(request_id, "sandbox_config", e),
+                },
+            )
+        }
+        WireMessage::UpdateSandboxConfig {
+            request_id,
+            sandbox_policy,
+        } => {
+            if let Some(ref policy) = sandbox_policy {
+                let bad_path = policy
+                    .writable_roots
+                    .iter()
+                    .chain(policy.denied_read_paths.iter())
+                    .any(|p| p.trim().is_empty() || p.chars().any(char::is_control));
+                if bad_path {
+                    return Some(rpc_err(
+                        request_id,
+                        "sandbox_config",
+                        "sandbox paths must be non-empty and free of control characters",
+                    ));
+                }
+            }
+            let home = runtime.home_dir.clone();
+            let store = runtime.store.clone();
+            let policy_to_save = sandbox_policy.clone();
+            Some(
+                match tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    DaemonPersistedConfig::update(&home, |c| {
+                        c.sandbox_policy = policy_to_save.clone();
+                    })?;
+                    let mode_label = policy_to_save
+                        .as_ref()
+                        .map(|p| format!("{:?}", p.mode))
+                        .unwrap_or_else(|| "None".to_string());
+                    let _ = store.append_audit_event(
+                        "sandbox",
+                        "update_config",
+                        "client",
+                        None,
+                        "allow",
+                        &serde_json::json!({
+                            "mode": mode_label,
+                            "allow_network": policy_to_save.as_ref().is_some_and(|p| p.allow_network),
+                        }),
+                    );
+                    Ok(())
+                })
+                .await
+                {
+                    Ok(Ok(())) => WireMessage::SandboxConfig {
+                        request_id,
+                        sandbox_policy,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "sandbox_config", e),
+                    Err(e) => rpc_err(request_id, "sandbox_config", e),
+                },
+            )
+        }
+        WireMessage::GetAuditChainStatus { request_id } => {
+            let s = runtime.store.clone();
+            Some(
+                match tokio::task::spawn_blocking(move || {
+                    s.verify_audit_chain(s.audit_verifying_key().as_ref())
+                })
+                .await
+                {
+                    Ok(Ok(verification)) => WireMessage::AuditChainStatus {
+                        request_id,
+                        verification,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "audit", e),
+                    Err(e) => rpc_err(request_id, "audit", e),
+                },
+            )
+        }
+        WireMessage::ExportAuditChain {
+            request_id,
+            after_seq,
+        } => {
+            let s = runtime.store.clone();
+            Some(
+                match tokio::task::spawn_blocking(move || s.export_audit_chain_jsonl(after_seq))
+                    .await
+                {
+                    Ok(Ok((jsonl, next_after_seq))) => WireMessage::AuditChainExport {
+                        request_id,
+                        jsonl,
+                        next_after_seq,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "audit", e),
+                    Err(e) => rpc_err(request_id, "audit", e),
+                },
+            )
+        }
+        WireMessage::ExportDiagnosticBundle { request_id } => {
+            Some(match diagnostics::bundle(runtime).await {
+                Ok(bundle) => WireMessage::DiagnosticBundleReady { request_id, bundle },
+                Err(e) => rpc_err(request_id, "diagnostics", e),
+            })
         }
         WireMessage::GetUsageInsights { request_id, days } => {
             let store = Arc::clone(&runtime.store);

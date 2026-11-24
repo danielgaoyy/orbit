@@ -395,7 +395,18 @@ export type DiffLayoutMode = "unified" | "split";
 export type ThemeMode = "system" | "light" | "dark";
 export type ResolvedTheme = "light" | "dark";
 export type ActiveViewMode = "workspace" | "settings";
-export type WorkspacePanelMode = "conversation" | "automations";
+export type WorkspacePanelMode = "conversation" | "automations" | "overview";
+
+export interface SidePanelSplitState {
+  secondaryTabId: string;
+  /** Fraction [0.25, 0.75] of side-panel width allocated to the left/primary pane. */
+  ratio: number;
+}
+
+export interface OverviewPinnedLane {
+  hostId: string;
+  agentId: string;
+}
 export type TerminalCursorStyle = "bar" | "block" | "underline";
 export type TerminalThemeMode = "harmonized" | "high_contrast";
 export type SidebarProjectSort = "recent" | "alphabetical" | "manual";
@@ -503,6 +514,7 @@ export interface OrbitUiState {
   sidePanelWidth: number;
   sidePanelTabs: SidePanelTab[];
   activeSidePanelTabId: string | null;
+  sidePanelSplit: SidePanelSplitState | null;
   fileViewCache: Record<string, FileViewCacheEntry>;
   fileEditorDrafts: Record<string, FileEditorDraftState>;
   pendingUnsavedFileAction: PendingUnsavedFileAction | null;
@@ -555,6 +567,7 @@ export interface OrbitUiState {
   // Modals, Views & Overlays
   activeView: ActiveViewMode;
   workspacePanel: WorkspacePanelMode;
+  overviewPinnedLanes: OverviewPinnedLane[];
   settingsSection: SettingsSection;
   commandPaletteOpen: boolean;
   onboardingOpen: boolean;
@@ -706,12 +719,14 @@ export interface OrbitUiState {
   terminalCursorStyle: TerminalCursorStyle;
   terminalScrollback: number;
   terminalThemeMode: TerminalThemeMode;
+  customKeybindings: Record<string, string>;
 }
 
 export interface PersistedPrefs {
   locale?: OrbitLocale;
   theme?: ThemeMode;
   enterToSend?: boolean;
+  customKeybindings?: Record<string, string>;
   notifyOnApproval?: boolean;
   notifyOnTurnComplete?: boolean;
   notifyOnAgentError?: boolean;

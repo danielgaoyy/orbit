@@ -1,6 +1,9 @@
 import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { ArrowUp } from "lucide-react";
+import { SimpleTooltip } from "@/components/ui/overlays";
+import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
+import { modSymbol } from "@/lib/keybindings";
 import { cn } from "@/lib/utils";
 
 export interface ConversationComposerProps {
@@ -32,7 +35,7 @@ export const ConversationComposer = memo(function ConversationComposer({
   onInterrupt,
   isBusy = false,
   enterToSend = true,
-  placeholder = "Ask a follow-up…",
+  placeholder,
   focusNonce,
   promptHistory,
   variant = "docked",
@@ -41,8 +44,11 @@ export const ConversationComposer = memo(function ConversationComposer({
   rightControlsSlot,
   className,
 }: ConversationComposerProps) {
+  const { t } = useI18n();
+  const effectivePlaceholder = placeholder ?? t("composer.conversationFallbackPlaceholder");
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const mirrorRef = useRef<HTMLDivElement | null>(null);
+  const lastEscTimeRef = useRef<number>(0);
   const [historyIdx, setHistoryIdx] = useState<number>(-1);
   const [widthTick, setWidthTick] = useState(0);
   const [composerWidthPx, setComposerWidthPx] = useState(0);
@@ -109,8 +115,14 @@ export const ConversationComposer = memo(function ConversationComposer({
     }
 
     if (e.key === "Escape" && isBusy && onInterrupt) {
-      e.preventDefault();
-      onInterrupt();
+      const now = Date.now();
+      if (now - lastEscTimeRef.current < 420) {
+        lastEscTimeRef.current = 0;
+        e.preventDefault();
+        onInterrupt();
+      } else {
+        lastEscTimeRef.current = now;
+      }
       return;
     }
 
@@ -157,7 +169,7 @@ export const ConversationComposer = memo(function ConversationComposer({
   return (
     <div
       className={cn(
-        "bg-canvas shrink-0",
+        "bg-surface-base shrink-0",
         variant === "compact" ? "px-3 pt-1 pb-3" : "px-3 pt-0 pb-4",
         className,
       )}
@@ -193,10 +205,10 @@ export const ConversationComposer = memo(function ConversationComposer({
             }}
             {...ime.compositionProps}
             onKeyDown={handleKeyDown}
-            placeholder={placeholder}
+            placeholder={effectivePlaceholder}
             style={{ minHeight: `${minHeight}px`, maxHeight: `${maxHeight}px` }}
             className={cn(
-              "text-foreground placeholder:text-foreground/45 block w-full resize-none overflow-y-hidden bg-transparent outline-none",
+              "text-ink-primary placeholder:text-ink-faint block w-full resize-none overflow-y-hidden bg-transparent outline-none",
               textStyleClass,
             )}
           />
@@ -210,44 +222,51 @@ export const ConversationComposer = memo(function ConversationComposer({
           <div className="flex shrink-0 items-center gap-1.5">
             {resolvedRightControls}
             {showStop ? (
-              <button
-                type="button"
-                onClick={onInterrupt}
-                title="Stop generating (Esc)"
-                aria-label="Stop generating"
-                className={cn(
-                  "orbit-press inline-flex shrink-0 cursor-pointer items-center justify-center rounded-full bg-black/[0.06] hover:bg-black/[0.10] dark:bg-white/[0.09] dark:hover:bg-white/[0.14]",
-                  variant === "compact" ? "size-[30px]" : "size-8.5",
-                )}
-              >
-                <span className="bg-signal-danger size-[11px] rounded-[2.5px]" />
-              </button>
+              <SimpleTooltip label={t("composer.stopGeneration")} shortcut="Esc Esc" side="top">
+                <button
+                  type="button"
+                  onClick={onInterrupt}
+                  aria-label={t("composer.stopGeneration")}
+                  className={cn(
+                    "orbit-press bg-surface-recessed hover:bg-accent inline-flex shrink-0 cursor-pointer items-center justify-center rounded-full",
+                    variant === "compact" ? "size-[30px]" : "size-8.5",
+                  )}
+                >
+                  <span className="bg-signal-danger size-[11px] rounded-[2.5px]" />
+                </button>
+              </SimpleTooltip>
             ) : (
-              <button
-                type="button"
-                disabled={!canSend}
-                onClick={() => {
-                  if (!canSend) return;
-                  setHistoryIdx(-1);
-                  onSubmit();
-                }}
-                aria-label="Send message"
-                className={cn(
-                  "orbit-press inline-flex shrink-0 cursor-pointer items-center justify-center rounded-full",
-                  variant === "compact" ? "size-[30px]" : "size-8.5",
-                  canSend
-                    ? "bg-action-primary-bg text-action-primary-fg hover:bg-action-primary-hover"
-                    : "text-ink-faint pointer-events-none bg-accent/60",
-                )}
+              <SimpleTooltip
+                label={t("common.send")}
+                shortcut={enterToSend ? "↵" : `${modSymbol()}↵`}
+                side="top"
               >
-                <ArrowUp
-                  className={
-                    variant === "compact"
-                      ? "h-[15px] w-[15px] stroke-[2.2]"
-                      : "size-[17px] stroke-[2.15]"
-                  }
-                />
-              </button>
+                <button
+                  type="button"
+                  disabled={!canSend}
+                  onClick={() => {
+                    if (!canSend) return;
+                    setHistoryIdx(-1);
+                    onSubmit();
+                  }}
+                  aria-label={t("common.send")}
+                  className={cn(
+                    "orbit-press inline-flex shrink-0 cursor-pointer items-center justify-center rounded-full",
+                    variant === "compact" ? "size-[30px]" : "size-8.5",
+                    canSend
+                      ? "bg-action-primary-bg text-action-primary-fg hover:bg-action-primary-hover"
+                      : "text-ink-muted bg-surface-recessed pointer-events-none opacity-65",
+                  )}
+                >
+                  <ArrowUp
+                    className={
+                      variant === "compact"
+                        ? "h-[15px] w-[15px] stroke-[2.2]"
+                        : "size-[17px] stroke-[2.15]"
+                    }
+                  />
+                </button>
+              </SimpleTooltip>
             )}
           </div>
         </div>

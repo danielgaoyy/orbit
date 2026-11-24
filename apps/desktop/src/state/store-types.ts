@@ -1,3 +1,4 @@
+import type { ComposerInlineDirective } from "@/lib/slash-commands";
 import type {
   HostSettingsTab,
   SettingsCoreSectionId,
@@ -205,6 +206,13 @@ export type ContextMentionItem =
       stagedHostId?: string;
       localFile?: File;
       uploading?: boolean;
+    }
+  | {
+      id: string;
+      kind: "skill";
+      slug: string;
+      label: string;
+      description?: string;
     };
 
 export interface TerminalTabSession {
@@ -409,7 +417,7 @@ export interface OrbitUiState {
 
   // Composer drafts, slash workflow directives, context mentions, pasted attachments, diff quotes, and queued prompts
   composerDrafts: Record<string, string>;
-  slashDirectives: Record<string, SlashDirective | null>;
+  slashDirectives: Record<string, ComposerInlineDirective | null>;
   inlineMentions: Record<string, InlineMentionTarget[]>;
   contextItems: Record<string, ContextMentionItem[]>;
   pastedAttachments: Record<string, PastedAttachment[]>;

@@ -24,12 +24,15 @@ import {
   GitBranch,
   GitCompareArrows,
   GitFork,
+  Layers,
   ListTodo,
   Music,
   Quote,
+  Send,
   Sparkles,
   SquareTerminal,
   Undo2,
+  Users,
   type LucideIcon,
 } from "lucide-react";
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
@@ -87,6 +90,12 @@ function resolvePromptBadgeIcon(badge: PromptBadge): LucideIcon {
       if (badge.label === "/plan") return ListTodo;
       if (badge.label === "/review") return FileSearch;
       if (badge.label === "/compact") return FoldVertical;
+      if (badge.label === "/orbit") return Layers;
+      if (badge.label === "/orbit-handoff") return Send;
+      if (badge.label === "/orbit-committee") return Users;
+      if (badge.label === "/orbit-advisor") return Sparkles;
+      return Sparkles;
+    case "skill":
       return Sparkles;
     case "file":
       return resolveSemanticFileIcon(badge.label);
@@ -788,10 +797,14 @@ export const UserPromptBubble = memo(function UserPromptBubble({
                         ? detectRichMediaKind(badge.path || badge.label)
                         : null;
                   const isMono =
-                    badge.kind === "file" || badge.kind === "quote" || mediaKind !== null;
+                    badge.kind === "file" ||
+                    badge.kind === "quote" ||
+                    badge.kind === "skill" ||
+                    mediaKind !== null;
                   const fileTarget = badge.path?.trim() || badge.label;
                   const isClickableMediaBadge = mediaKind !== null && fileTarget.trim().length > 0;
-                  const isClickableFileBadge = isMono && fileTarget.trim().length > 0;
+                  const isClickableFileBadge =
+                    badge.kind !== "skill" && isMono && fileTarget.trim().length > 0;
                   if (isClickableMediaBadge && mediaKind) {
                     return (
                       <button
@@ -853,9 +866,16 @@ export const UserPromptBubble = memo(function UserPromptBubble({
 
             {slashBadge && SlashIcon ? (
               <p className="selectable-text text-foreground text-[14.5px] leading-[1.68] whitespace-pre-wrap">
-                <span className="mr-1.5 inline-flex items-center gap-1.5 align-baseline select-none">
-                  <SlashIcon className="text-muted-foreground relative top-[2px] size-[14px] shrink-0 stroke-[1.75]" />
-                  <span className="text-foreground font-medium">{slashLabel}</span>
+                <span
+                  className={cn(
+                    "mr-1.5 inline-flex items-center gap-1 rounded-md border px-1.5 py-[1px] align-baseline font-mono text-[12px] leading-[18px] font-medium select-none",
+                    slashBadge.label === "/plan"
+                      ? "bg-signal-info-bg border-signal-info-border text-signal-info"
+                      : "bg-surface-recessed border-border-subtle text-ink-primary",
+                  )}
+                >
+                  <SlashIcon className="size-[12.5px] shrink-0 stroke-[1.8]" />
+                  <span>/{slashLabel}</span>
                 </span>
                 {cleanText}
               </p>

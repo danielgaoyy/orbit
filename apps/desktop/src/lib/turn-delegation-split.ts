@@ -1,5 +1,5 @@
 import type { TimelineItemView, WorkSummaryResultView } from "@/lib/orbit-ipc";
-import { classifyGenericSubagentTool } from "./subagents.ts";
+import { classifyGenericSubagentTool, resolveToolCallSubagent } from "./subagents.ts";
 
 export type ToolCallTimelineItem = Extract<TimelineItemView, { item_type: "tool_call" }>;
 
@@ -88,7 +88,7 @@ export function isDelegationMilestoneToolCall(
       !item.detail.child_agent_id &&
       !item.detail.prompt_preview.trim() &&
       item.detail.role.trim().toLowerCase() === "subagent";
-    return !isLegacyPlaceholder;
+    return !isLegacyPlaceholder || item.status === "running";
   }
   if (item.detail.kind === "generic") {
     return (
@@ -173,48 +173,12 @@ export function extractFallbackDispatchCall(
   item: ToolCallTimelineItem,
 ): FallbackDispatchCallInfo | null {
   if (item.detail.kind !== "generic") return null;
-  if (classifyGenericSubagentTool(item.detail.tool_name) !== "dispatch") return null;
-
-  let label = "";
-  let preview = "";
-  const rawArgs = item.detail.arguments_json.trim();
-  if (rawArgs.startsWith("{")) {
-    try {
-      const parsed: unknown = JSON.parse(rawArgs);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        const obj = parsed as Record<string, unknown>;
-        for (const k of ["Role", "role", "title", "handle", "TypeName", "type_name"]) {
-          const v = obj[k];
-          if (typeof v === "string" && v.trim()) {
-            label = v.trim();
-            break;
-          }
-        }
-        for (const k of ["Prompt", "prompt", "initial_prompt", "brief", "task"]) {
-          const v = obj[k];
-          if (typeof v === "string" && v.trim()) {
-            preview = v.trim();
-            break;
-          }
-        }
-      }
-    } catch {
-      // Ignore partial JSON while streaming
-    }
-  }
-
-  if (!label) {
-    const parsedName = parseGenericToolName(item.detail.tool_name);
-    label = parsedName.displayLabel || "Run subagent";
-  }
-  if (!preview && rawArgs && rawArgs !== "{}" && rawArgs !== "null") {
-    preview = rawArgs;
-  }
-
+  const resolved = resolveToolCallSubagent(item, []);
+  if (resolved?.action !== "dispatch") return null;
   return {
-    callId: item.call_id || `dispatch-${item.seq}`,
-    label,
-    preview,
+    callId: resolved.subagent.callId,
+    label: resolved.subagent.title,
+    preview: resolved.subagent.promptPreview,
     status: item.status,
   };
 }

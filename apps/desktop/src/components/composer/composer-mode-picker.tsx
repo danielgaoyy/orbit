@@ -7,15 +7,15 @@ import {
   normalizePermissionMode,
 } from "@/components/composer/composer-constants";
 import { useI18n } from "@/lib/i18n";
-import type { SessionMode } from "@/lib/orbit-ipc";
+import type { ProviderKind, SessionMode } from "@/lib/orbit-ipc";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuTrigger,
-  Kbd,
-  KbdGroup,
+  SimpleTooltip,
 } from "@/components/ui/overlays";
 import { cn } from "@/lib/utils";
 
@@ -26,12 +26,14 @@ import { cn } from "@/lib/utils";
 export const ComposerModePicker = memo(function ComposerModePicker({
   mode,
   onSelectMode,
+  provider,
   iconOnly = false,
   disabled = false,
   disabledTitle,
 }: {
   mode: SessionMode;
   onSelectMode?: (m: SessionMode) => void;
+  provider?: ProviderKind | null;
   iconOnly?: boolean;
   disabled?: boolean;
   disabledTitle?: string;
@@ -39,82 +41,115 @@ export const ComposerModePicker = memo(function ComposerModePicker({
   const { t } = useI18n();
   const activeMode = normalizePermissionMode(mode);
   const activeModeLabel = modeLabel(activeMode, t);
+  const customModeName = typeof activeMode === "object" ? activeMode.custom : null;
 
   if (disabled) {
     return (
-      <button
-        type="button"
-        disabled
-        title={disabledTitle ?? activeModeLabel}
-        aria-label={t("composer.accessPermissionsAria", { mode: activeModeLabel })}
-        className={cn(
-          "text-foreground/78 inline-flex h-8.5 shrink-0 cursor-not-allowed items-center rounded-full text-[13.5px] font-normal opacity-60",
-          iconOnly ? "justify-center gap-0.5 px-2" : "gap-1.5 px-2.5",
-        )}
-      >
-        <ModeIcon mode={activeMode} className="opacity-75" />
-        {!iconOnly && (
-          <span className="hidden whitespace-nowrap sm:inline">{activeModeLabel}</span>
-        )}
-        <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
-      </button>
+      <SimpleTooltip label={disabledTitle ?? activeModeLabel} side="top">
+        <span className="inline-flex shrink-0">
+          <button
+            type="button"
+            disabled
+            aria-label={t("composer.accessPermissionsAria", { mode: activeModeLabel })}
+            className={cn(
+              "text-ink-secondary inline-flex h-8.5 shrink-0 cursor-not-allowed items-center rounded-full text-[13.5px] font-normal opacity-60",
+              iconOnly ? "justify-center gap-0.5 px-2" : "gap-1.5 px-2.5",
+            )}
+          >
+            <ModeIcon mode={activeMode} className="opacity-75" />
+            {!iconOnly && <span className="whitespace-nowrap">{activeModeLabel}</span>}
+            <ChevronDown className="text-ink-faint size-3.5 shrink-0 stroke-[1.75]" />
+          </button>
+        </span>
+      </SimpleTooltip>
     );
   }
 
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          title={`${activeModeLabel} (⇧Tab)`}
-          aria-label={t("composer.accessPermissionsAria", { mode: activeModeLabel })}
-          className={cn(
-            "text-foreground/78 hover:text-foreground inline-flex h-8.5 shrink-0 cursor-pointer items-center rounded-full text-[13.5px] font-normal transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]",
-            iconOnly ? "justify-center gap-0.5 px-2" : "gap-1.5 px-2.5",
-          )}
-        >
-          <ModeIcon mode={activeMode} className="opacity-75" />
-          {!iconOnly && <span className="hidden whitespace-nowrap sm:inline">{activeModeLabel}</span>}
-          <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" side="top" className="w-[368px] p-1.5">
-        <DropdownMenuLabel className="flex items-center justify-between">
-          <span>{t("composer.accessPermissions")}</span>
-          <KbdGroup>
-            <Kbd>⇧</Kbd>
-            <Kbd>Tab</Kbd>
-          </KbdGroup>
-        </DropdownMenuLabel>
-        {PERMISSION_MODE_KEYS.map((m) => {
-          const selected = m.id === activeMode;
-          return (
+      <SimpleTooltip label={activeModeLabel} shortcut="⇧Tab" side="top">
+        <DropdownMenuTrigger asChild>
+          <button
+            type="button"
+            aria-label={t("composer.accessPermissionsAria", { mode: activeModeLabel })}
+            className={cn(
+              "text-ink-secondary hover:text-ink-primary hover:bg-accent inline-flex h-8.5 shrink-0 cursor-pointer items-center rounded-full text-[13.5px] font-normal transition-colors",
+              iconOnly ? "justify-center gap-0.5 px-2" : "gap-1.5 px-2.5",
+            )}
+          >
+            <ModeIcon mode={activeMode} className="opacity-75" />
+            {!iconOnly && <span className="whitespace-nowrap">{activeModeLabel}</span>}
+            <ChevronDown className="text-ink-faint size-3.5 shrink-0 stroke-[1.75]" />
+          </button>
+        </DropdownMenuTrigger>
+      </SimpleTooltip>
+      <DropdownMenuContent
+        align="end"
+        side="top"
+        className="w-[356px] max-w-[calc(100vw-24px)] p-1.5"
+      >
+        <DropdownMenuGroup>
+          <DropdownMenuLabel>{t("composer.accessPermissions")}</DropdownMenuLabel>
+
+          {customModeName && (
             <DropdownMenuItem
-              key={m.id}
-              onSelect={() => onSelectMode?.(m.id)}
+              onSelect={() => onSelectMode?.({ custom: customModeName })}
               className="items-start gap-3 px-2.5 py-2"
             >
               <div className="flex min-w-0 flex-1 items-start gap-2.5">
                 <ModeIcon
-                  mode={m.id}
-                  className={cn(
-                    "mt-0.5 size-4 shrink-0",
-                    selected ? "text-foreground" : "text-muted-foreground",
-                  )}
+                  mode={activeMode}
+                  className="text-ink-primary mt-0.5 size-4 shrink-0"
                 />
                 <div className="flex min-w-0 flex-col gap-0.5">
-                  <span className="text-foreground text-[13px] leading-tight font-medium whitespace-nowrap">
-                    {t(m.labelKey)}
+                  <span className="text-ink-primary text-[13px] leading-tight font-medium">
+                    {customModeName}
                   </span>
-                  <span className="text-muted-foreground text-[11.5px] leading-snug whitespace-nowrap">
-                    {t(m.descKey)}
+                  <span className="text-ink-muted text-[11.5px] leading-snug">
+                    {t("common.custom")}
                   </span>
                 </div>
               </div>
-              {selected && <Check className="text-foreground mt-0.5 size-3.5 shrink-0" />}
+              <Check className="text-ink-primary mt-0.5 size-3.5 shrink-0" />
             </DropdownMenuItem>
-          );
-        })}
+          )}
+
+          {PERMISSION_MODE_KEYS.map((m) => {
+            const selected = m.id === activeMode;
+            return (
+              <DropdownMenuItem
+                key={m.id}
+                onSelect={() => onSelectMode?.(m.id)}
+                className="items-start gap-3 px-2.5 py-2"
+              >
+                <div className="flex min-w-0 flex-1 items-start gap-2.5">
+                  <ModeIcon
+                    mode={m.id}
+                    className={cn(
+                      "mt-0.5 size-4 shrink-0",
+                      selected ? "text-ink-primary" : "text-ink-muted",
+                    )}
+                  />
+                  <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                    <span className="text-ink-primary text-[13px] leading-tight font-medium">
+                      {t(m.labelKey)}
+                    </span>
+                    <span className="text-ink-muted text-[11.5px] leading-snug [text-wrap:pretty]">
+                      {t(m.descKey)}
+                    </span>
+                  </div>
+                </div>
+                {selected && <Check className="text-ink-primary mt-0.5 size-3.5 shrink-0" />}
+              </DropdownMenuItem>
+            );
+          })}
+        </DropdownMenuGroup>
+
+        {provider === "pi" && (
+          <div className="text-ink-faint px-2.5 pt-1 pb-1.5 text-[11px] leading-snug [text-wrap:pretty]">
+            {t("composer.piModeLimitedHint")}
+          </div>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );

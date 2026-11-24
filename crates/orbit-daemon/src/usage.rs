@@ -10,7 +10,7 @@ use orbit_protocol::{
     TimelineEvent, TimelinePayload, ToolCallDetail, UsageDailyPoint, UsageInsightsSnapshot,
     UsageModelBreakdown, UsageProjectBreakdown,
 };
-use orbit_store::{OrbitStore, QuotaSampleRecord, StoreError};
+use orbit_store::{AgentContextTelemetry, OrbitStore, QuotaSampleRecord, StoreError};
 
 use crate::rules::estimate_tokens;
 
@@ -132,6 +132,17 @@ pub fn pricing_for_model(provider: &str, model: &str) -> ModelPricing {
             cache_read_per_mtok: 0.3125,
             cache_write_per_mtok: 1.25,
             context_window_tokens: 1_000_000,
+        };
+    }
+
+    // GPT-OSS family (128K context window, distinct from Antigravity's 1M Gemini fallback)
+    if m.contains("gpt-oss") {
+        return ModelPricing {
+            input_per_mtok: 0.40,
+            output_per_mtok: 1.60,
+            cache_read_per_mtok: 0.10,
+            cache_write_per_mtok: 0.40,
+            context_window_tokens: 128_000,
         };
     }
 
@@ -626,11 +637,26 @@ pub fn estimate_fallback_turn_tokens(events: &[TimelineEvent]) -> (u64, u64) {
     (input_tokens, output_tokens)
 }
 
+/// Returns whether a discovered instruction file applies to `provider_slug`.
+fn instruction_applies_to_provider(provider_hint: Option<&str>, provider_slug: &str) -> bool {
+    let Some(hint) = provider_hint.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    if hint.eq_ignore_ascii_case("orbit") || hint.eq_ignore_ascii_case(provider_slug) {
+        return true;
+    }
+    // Antigravity & Gemini CLI both consume `GEMINI.md`
+    (hint.eq_ignore_ascii_case("gemini_cli") && provider_slug.eq_ignore_ascii_case("antigravity"))
+        || (hint.eq_ignore_ascii_case("antigravity")
+            && provider_slug.eq_ignore_ascii_case("gemini_cli"))
+}
+
 /// Pure computation of non-overlapping `ContextOccupancyBreakdown` segments.
 ///
-/// `reported_prompt_tokens` accepts an optional `(single_call_prompt_tokens, recorded_at_ms)`
-/// tuple from the provider's most recent single LLM API call (never a multi-step turn sum).
-/// It is ignored if a context-compaction notice occurred at or after `recorded_at_ms`.
+/// `reported_telemetry` accepts optional single-call provider telemetry `(prompt_tokens,
+/// context_window_tokens, recorded_at_ms)` from the most recent LLM API call (never a
+/// multi-step turn sum). Prompt tokens are ignored if a context-compaction notice occurred
+/// at or after `recorded_at_ms`, while authoritative `context_window_tokens` is always honored.
 #[allow(clippy::too_many_arguments)]
 pub fn build_context_occupancy_breakdown(
     agent_id: &str,
@@ -640,9 +666,13 @@ pub fn build_context_occupancy_breakdown(
     rules_tokens: u64,
     skills_tokens: u64,
     events: &[TimelineEvent],
-    reported_prompt_tokens: Option<(u64, i64)>,
+    reported_telemetry: Option<AgentContextTelemetry>,
 ) -> ContextOccupancyBreakdown {
-    let context_window_tokens = context_window_for_model(provider, model).max(1);
+    let context_window_tokens = reported_telemetry
+        .and_then(|t| t.context_window_tokens)
+        .filter(|&w| w > 0)
+        .unwrap_or_else(|| context_window_for_model(provider, model))
+        .max(1);
 
     // Only count events after the latest explicit context compaction notice.
     let latest_compaction =
@@ -681,40 +711,65 @@ pub fn build_context_occupancy_breakdown(
                 tool_output_tokens =
                     tool_output_tokens.saturating_add(estimate_tool_detail_tokens(detail));
             }
-            TimelinePayload::PermissionRequest { detail, .. } => {
-                tool_output_tokens =
-                    tool_output_tokens.saturating_add(estimate_tool_detail_tokens(detail));
-            }
             _ => {}
         }
     }
 
-    let static_tokens = instructions_tokens
+    let mut system_tools_tokens = instructions_tokens
         .saturating_add(rules_tokens)
         .saturating_add(skills_tokens);
-    let dynamic_tokens = history_tokens
+    let estimated_total = system_tools_tokens
+        .saturating_add(history_tokens)
         .saturating_add(tool_output_tokens)
         .saturating_add(reasoning_tokens);
-    let estimated_total = static_tokens.saturating_add(dynamic_tokens);
 
-    // Apply provider-reported single-call prompt occupancy ONLY when recorded strictly after
-    // the latest context compaction notice (if any), attributing unmeasured overhead cleanly.
-    if let Some((reported, recorded_at_ms)) = reported_prompt_tokens
-        && compaction_ts_ms.is_none_or(|cts| recorded_at_ms > cts)
-        && reported > estimated_total
+    // Apply provider-reported single-call prompt occupancy unconditionally when recorded strictly
+    // after the latest explicit compaction notice (if any):
+    // - If `reported > estimated_total`: attribute unmeasured system prompt / MCP tool schema /
+    //   full file-read overhead cleanly to `system_tools` instead of distorting conversation history.
+    // - If `reported < estimated_total` (e.g. silent provider-side compaction or truncated turns):
+    //   scale segments down proportionally so total matches the authoritative provider count.
+    if let Some(telemetry) = reported_telemetry
+        && telemetry.prompt_tokens > 0
+        && compaction_ts_ms.is_none_or(|cts| telemetry.recorded_at_ms > cts)
     {
-        let extra = reported.saturating_sub(estimated_total);
-        if tool_output_tokens > 0 {
-            let to_tools = extra / 2;
-            let to_history = extra.saturating_sub(to_tools);
-            tool_output_tokens = tool_output_tokens.saturating_add(to_tools);
-            history_tokens = history_tokens.saturating_add(to_history);
-        } else {
-            history_tokens = history_tokens.saturating_add(extra);
+        let reported = telemetry.prompt_tokens;
+        if reported >= estimated_total {
+            let extra = reported.saturating_sub(estimated_total);
+            system_tools_tokens = system_tools_tokens.saturating_add(extra);
+        } else if estimated_total > 0 {
+            let scale = reported as f64 / estimated_total as f64;
+            let scaled_sys = ((system_tools_tokens as f64) * scale).round() as u64;
+            let scaled_hist = ((history_tokens as f64) * scale).round() as u64;
+            let scaled_tools = ((tool_output_tokens as f64) * scale).round() as u64;
+            let sum_three = scaled_sys
+                .saturating_add(scaled_hist)
+                .saturating_add(scaled_tools);
+            let scaled_reason = reported.saturating_sub(sum_three);
+            system_tools_tokens = scaled_sys.min(reported);
+            history_tokens = scaled_hist.min(reported.saturating_sub(system_tools_tokens));
+            tool_output_tokens = scaled_tools.min(
+                reported
+                    .saturating_sub(system_tools_tokens)
+                    .saturating_sub(history_tokens),
+            );
+            reasoning_tokens = scaled_reason.min(
+                reported
+                    .saturating_sub(system_tools_tokens)
+                    .saturating_sub(history_tokens)
+                    .saturating_sub(tool_output_tokens),
+            );
+            let residual = reported.saturating_sub(
+                system_tools_tokens
+                    .saturating_add(history_tokens)
+                    .saturating_add(tool_output_tokens)
+                    .saturating_add(reasoning_tokens),
+            );
+            history_tokens = history_tokens.saturating_add(residual);
         }
     }
 
-    let total_used_tokens = static_tokens
+    let total_used_tokens = system_tools_tokens
         .saturating_add(history_tokens)
         .saturating_add(tool_output_tokens)
         .saturating_add(reasoning_tokens);
@@ -729,22 +784,10 @@ pub fn build_context_occupancy_breakdown(
 
     let segments = vec![
         ContextSegment {
-            category: "instructions".into(),
-            label: "Instructions".into(),
-            tokens: instructions_tokens,
-            percent: pct(instructions_tokens),
-        },
-        ContextSegment {
-            category: "rules".into(),
-            label: "Rules".into(),
-            tokens: rules_tokens,
-            percent: pct(rules_tokens),
-        },
-        ContextSegment {
-            category: "skills".into(),
-            label: "Skills".into(),
-            tokens: skills_tokens,
-            percent: pct(skills_tokens),
+            category: "system_tools".into(),
+            label: "System & tools".into(),
+            tokens: system_tools_tokens,
+            percent: pct(system_tools_tokens),
         },
         ContextSegment {
             category: "history".into(),
@@ -788,19 +831,24 @@ pub fn build_context_occupancy_breakdown(
 
 /// Compute live `ContextOccupancyBreakdown` for an agent from SQLite + workspace instruction/rule/skill footprints.
 ///
-/// Uses `last_call_prompt_tokens` (instantaneous single-call prompt tokens from the active driver)
-/// when available and strictly newer than the last compaction notice; never uses cumulative
-/// multi-call turn sums from `usage_ledger`.
+/// Uses `last_call_telemetry` (in-memory instantaneous single-call telemetry from the active driver,
+/// falling back to SQLite `agent_context_telemetry` after daemon restart) when available and strictly
+/// newer than the last compaction notice; never uses cumulative multi-call turn sums from `usage_ledger`.
 pub fn compute_context_occupancy(
     store: &OrbitStore,
     orbit_home: &Path,
     user_home: &Path,
     agent_id: &str,
-    last_call_prompt_tokens: Option<(u64, i64)>,
+    last_call_telemetry: Option<AgentContextTelemetry>,
 ) -> anyhow::Result<ContextOccupancyBreakdown> {
     let agent = store
         .get_agent(agent_id)?
         .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"))?;
+
+    let effective_telemetry = match last_call_telemetry {
+        Some(t) => Some(t),
+        None => store.get_agent_context_telemetry(agent_id).ok().flatten(),
+    };
 
     let provider_slug = agent.provider.slug();
     let model_name = agent
@@ -816,11 +864,19 @@ pub fn compute_context_occupancy(
         None
     };
 
-    let instructions_tokens = cwd_opt
+    let instructions_tokens: u64 = cwd_opt
         .and_then(|p| {
             crate::instructions::discover_instruction_hierarchy_with_home(p, Some(user_home)).ok()
         })
-        .map(|res| u64::from(res.total_tokens))
+        .map(|res| {
+            res.files
+                .iter()
+                .filter(|f| {
+                    instruction_applies_to_provider(f.provider_hint.as_deref(), provider_slug)
+                })
+                .map(|f| u64::from(f.approx_tokens))
+                .sum()
+        })
         .unwrap_or(0);
 
     let rules_tokens =
@@ -847,7 +903,7 @@ pub fn compute_context_occupancy(
         rules_tokens,
         skills_tokens,
         &events,
-        last_call_prompt_tokens,
+        effective_telemetry,
     ))
 }
 
@@ -994,7 +1050,15 @@ mod tests {
         );
 
         assert_eq!(breakdown.context_window_tokens, 200_000);
-        assert_eq!(breakdown.segments.len(), 7);
+        assert_eq!(breakdown.segments.len(), 5);
+        assert_eq!(
+            breakdown
+                .segments
+                .iter()
+                .find(|s| s.category == "system_tools")
+                .map(|s| s.tokens),
+            Some(4_000)
+        );
         let pct_sum: f64 = breakdown.segments.iter().map(|s| s.percent).sum();
         assert!((pct_sum - 100.0).abs() < 1e-6, "pct_sum={pct_sum}");
         let tok_sum: u64 = breakdown.segments.iter().map(|s| s.tokens).sum();
@@ -1218,7 +1282,11 @@ mod tests {
             0,
             0,
             &events,
-            Some((165_000, t_pre.timestamp_millis())),
+            Some(AgentContextTelemetry {
+                prompt_tokens: 165_000,
+                context_window_tokens: None,
+                recorded_at_ms: t_pre.timestamp_millis(),
+            }),
         );
         assert!(
             stale.total_used_tokens < 5_000,
@@ -1236,10 +1304,94 @@ mod tests {
             0,
             0,
             &events,
-            Some((22_000, t_post.timestamp_millis())),
+            Some(AgentContextTelemetry {
+                prompt_tokens: 22_000,
+                context_window_tokens: None,
+                recorded_at_ms: t_post.timestamp_millis(),
+            }),
         );
         assert_eq!(fresh.total_used_tokens, 22_000);
         assert!((fresh.occupancy_percent - 11.0).abs() < 1e-6);
+
+        // Silent compaction: reported prompt tokens LOWER than local estimate MUST scale total down
+        // to exact provider-reported tokens, and provider-reported 1M window MUST override 200K fallback.
+        let silent_compact = build_context_occupancy_breakdown(
+            "ag_compact",
+            "claude_code",
+            "claude-opus-4-7",
+            10_000,
+            2_000,
+            1_000,
+            &events[..1],
+            Some(AgentContextTelemetry {
+                prompt_tokens: 5_000,
+                context_window_tokens: Some(1_000_000),
+                recorded_at_ms: t_post.timestamp_millis(),
+            }),
+        );
+        assert_eq!(silent_compact.context_window_tokens, 1_000_000);
+        assert_eq!(silent_compact.total_used_tokens, 5_000);
+        assert!((silent_compact.occupancy_percent - 0.5).abs() < 1e-6);
+
+        // GPT-OSS 128K window (must not fall back to Antigravity's 1M Gemini window)
+        assert_eq!(
+            context_window_for_model("antigravity", "gpt-oss-120b-medium"),
+            128_000
+        );
+    }
+
+    #[test]
+    fn context_occupancy_does_not_double_count_permission_requests() {
+        let now = Utc::now();
+        let detail = ToolCallDetail::Shell {
+            command: "cargo test --workspace ".repeat(40),
+            cwd: None,
+            exit_code: None,
+            output_preview: None,
+        };
+        let events = vec![
+            TimelineEvent {
+                seq: 1,
+                epoch: 1,
+                agent_id: "ag_perm".into(),
+                turn_id: Some("t1".into()),
+                timestamp: now,
+                payload: TimelinePayload::PermissionRequest {
+                    request_id: "req_1".into(),
+                    title: "Run command".into(),
+                    detail: detail.clone(),
+                    allowed_decisions: vec!["allow".into()],
+                    guardian_assessment: None,
+                },
+            },
+            TimelineEvent {
+                seq: 2,
+                epoch: 1,
+                agent_id: "ag_perm".into(),
+                turn_id: Some("t1".into()),
+                timestamp: now,
+                payload: TimelinePayload::ToolCall {
+                    call_id: "c1".into(),
+                    detail,
+                    status: ToolCallStatus::Completed,
+                    background_task: None,
+                },
+            },
+        ];
+        let with_perm = build_context_occupancy_breakdown(
+            "ag_perm", "codex", "gpt-5.4", 0, 0, 0, &events, None,
+        );
+        let without_perm = build_context_occupancy_breakdown(
+            "ag_perm",
+            "codex",
+            "gpt-5.4",
+            0,
+            0,
+            0,
+            &events[1..],
+            None,
+        );
+        assert_eq!(with_perm.total_used_tokens, without_perm.total_used_tokens);
     }
 
     #[test]
@@ -1340,7 +1492,11 @@ mod tests {
             &tmp,
             &tmp,
             "ag_multi",
-            Some((40_000, now.timestamp_millis())),
+            Some(AgentContextTelemetry {
+                prompt_tokens: 40_000,
+                context_window_tokens: None,
+                recorded_at_ms: now.timestamp_millis(),
+            }),
         )
         .expect("compute occupancy with single call");
         assert_eq!(with_single_call.total_used_tokens, 40_000);
@@ -1354,6 +1510,23 @@ mod tests {
             "must not peg gauge from cumulative usage_ledger sum, got {}%",
             without_single_call.occupancy_percent
         );
+
+        // Persisted SQLite telemetry survives daemon restart (in-memory `None`) with exact window & count.
+        store
+            .upsert_agent_context_telemetry(
+                "ag_multi",
+                AgentContextTelemetry {
+                    prompt_tokens: 60_000,
+                    context_window_tokens: Some(1_000_000),
+                    recorded_at_ms: now.timestamp_millis(),
+                },
+            )
+            .expect("persist telemetry");
+        let after_restart = compute_context_occupancy(&store, &tmp, &tmp, "ag_multi", None)
+            .expect("compute occupancy from persisted telemetry");
+        assert_eq!(after_restart.context_window_tokens, 1_000_000);
+        assert_eq!(after_restart.total_used_tokens, 60_000);
+        assert!((after_restart.occupancy_percent - 6.0).abs() < 1e-6);
     }
 
     #[test]

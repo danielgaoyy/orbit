@@ -3703,6 +3703,7 @@ public struct FfiAgentCard: Equatable, Hashable {
     public var acpAgentId: String?
     public var attentionLabel: String?
     public var latestSeq: UInt64
+    public var createdAtRfc3339: String?
     public var updatedAtRfc3339: String
     public var isPinned: Bool
     public var seenSeq: UInt64
@@ -3711,7 +3712,7 @@ public struct FfiAgentCard: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(agentId: String, workspaceId: String, cwd: String, title: String, provider: FfiProviderKind, providerLabel: String, model: String?, effort: FfiReasoningEffort?, fastMode: Bool, mode: FfiSessionMode, statusLabel: String, isRunning: Bool, hasBackgroundTasks: Bool, isAwaitingPermission: Bool, parentAgentId: String?, parentHostId: String?, archivedAtRfc3339: String?, handle: String?, clusterSuggestion: FfiWorkspaceClusterSuggestion?, worktreeBranch: String?, taskSummary: String?, forkedFromAgentId: String?, forkedAtSeq: UInt64?, acpAgentId: String?, attentionLabel: String?, latestSeq: UInt64, updatedAtRfc3339: String, isPinned: Bool, seenSeq: UInt64, isUnread: Bool, queuedPrompts: [FfiQueuedPrompt]) {
+    public init(agentId: String, workspaceId: String, cwd: String, title: String, provider: FfiProviderKind, providerLabel: String, model: String?, effort: FfiReasoningEffort?, fastMode: Bool, mode: FfiSessionMode, statusLabel: String, isRunning: Bool, hasBackgroundTasks: Bool, isAwaitingPermission: Bool, parentAgentId: String?, parentHostId: String?, archivedAtRfc3339: String?, handle: String?, clusterSuggestion: FfiWorkspaceClusterSuggestion?, worktreeBranch: String?, taskSummary: String?, forkedFromAgentId: String?, forkedAtSeq: UInt64?, acpAgentId: String?, attentionLabel: String?, latestSeq: UInt64, createdAtRfc3339: String?, updatedAtRfc3339: String, isPinned: Bool, seenSeq: UInt64, isUnread: Bool, queuedPrompts: [FfiQueuedPrompt]) {
         self.agentId = agentId
         self.workspaceId = workspaceId
         self.cwd = cwd
@@ -3738,6 +3739,7 @@ public struct FfiAgentCard: Equatable, Hashable {
         self.acpAgentId = acpAgentId
         self.attentionLabel = attentionLabel
         self.latestSeq = latestSeq
+        self.createdAtRfc3339 = createdAtRfc3339
         self.updatedAtRfc3339 = updatedAtRfc3339
         self.isPinned = isPinned
         self.seenSeq = seenSeq
@@ -3787,6 +3789,7 @@ public struct FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer {
                 acpAgentId: FfiConverterOptionString.read(from: &buf), 
                 attentionLabel: FfiConverterOptionString.read(from: &buf), 
                 latestSeq: FfiConverterUInt64.read(from: &buf), 
+                createdAtRfc3339: FfiConverterOptionString.read(from: &buf), 
                 updatedAtRfc3339: FfiConverterString.read(from: &buf), 
                 isPinned: FfiConverterBool.read(from: &buf), 
                 seenSeq: FfiConverterUInt64.read(from: &buf), 
@@ -3822,6 +3825,7 @@ public struct FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.acpAgentId, into: &buf)
         FfiConverterOptionString.write(value.attentionLabel, into: &buf)
         FfiConverterUInt64.write(value.latestSeq, into: &buf)
+        FfiConverterOptionString.write(value.createdAtRfc3339, into: &buf)
         FfiConverterString.write(value.updatedAtRfc3339, into: &buf)
         FfiConverterBool.write(value.isPinned, into: &buf)
         FfiConverterUInt64.write(value.seenSeq, into: &buf)

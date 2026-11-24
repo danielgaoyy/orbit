@@ -1,25 +1,31 @@
 import { memo } from "react";
-import { Archive, ArrowUpRight, ShieldAlert, Square } from "lucide-react";
-import { IconButton } from "@/components/ui/icon-button";
 import { SimpleTooltip } from "@/components/ui/overlays";
 import { SubagentAvatar } from "@/components/ui/subagent-avatar";
 import { useI18n } from "@/lib/i18n";
-import { orbitIpc } from "@/lib/orbit-ipc";
-import { isSubagentActiveStatus } from "@/lib/subagents";
+import { isSubagentActiveStatus, type ResolvedSubagentItem } from "@/lib/subagents";
 import type { SessionSubagentWithAvatar } from "@/state/selectors/session-selectors";
-import { orbitActions } from "@/state/orbit-store";
+import { getOrbitState, orbitActions } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
-function openSubagent(
-  parentAgentId: string,
-  sa: SessionSubagentWithAvatar,
+export function openSubagent(
+  parentAgentId: string | undefined,
+  sa: ResolvedSubagentItem,
 ) {
+  // A managed peer can appear in the transcript before the fleet publishes its card.
+  // Keep the call-scoped tab usable until the card supplies its host.
+  const managedId = sa.childAgentId?.startsWith("ag_") ? sa.childAgentId : null;
+  const hosts = getOrbitState().hostDetails;
+  const knownHost = managedId && hosts[sa.childHostId]?.agents.some((a) => a.agent_id === managedId)
+    ? sa.childHostId
+    : managedId && Object.values(hosts).find((detail) =>
+        detail.agents.some((a) => a.agent_id === managedId),
+      )?.host.host_id;
   orbitActions.openSubagentTab({
     callId: sa.callId,
     role: sa.title,
     promptPreview: sa.promptPreview,
-    childAgentId: sa.childAgentId,
-    childHostId: sa.childHostId || undefined,
+    childAgentId: managedId && !knownHost ? null : sa.childAgentId,
+    childHostId: knownHost || sa.childHostId || undefined,
     providerSubagentId: sa.providerSubagentId,
     parentAgentId,
   });
@@ -68,11 +74,10 @@ export function archiveSettledSubagentsList(
 
 /**
  * Form 1A — Living Subagent Crew list rendered inside the Overview HUD.
- * Every subagent shows its collision-free OneWorks 3D character: bouncing while working,
+ * Every subagent shows its assigned animal avatar: bouncing while working,
  * tilted with an amber halo when awaiting approval, and resting quietly once completed.
  */
 export const SubagentCrewList = memo(function SubagentCrewList({
-  hostId,
   agentId,
   subagents,
 }: {
@@ -88,116 +93,45 @@ export const SubagentCrewList = memo(function SubagentCrewList({
       {subagents.map((sa) => {
         const isActive = isSubagentActiveStatus(sa.status);
         const isAwaiting = sa.status === "awaiting_permission";
-        const canManage = sa.isManaged && Boolean(sa.childAgentId);
-        const canStop = canManage && sa.status === "running";
-        const canArchive = !isActive;
         const subtitle = statusSubtitle(sa, t);
 
         return (
-          <div
+          <button
+            type="button"
             key={sa.key}
+            title={sa.promptPreview || sa.title}
+            onClick={() => openSubagent(agentId, sa)}
             className={cn(
-              "group/crew relative flex min-h-[42px] w-full items-center gap-2 rounded-[8px] px-2 py-1.5 transition-colors",
+              "flex cursor-pointer text-left min-h-[42px] w-full items-center gap-2.5 rounded-[8px] px-2 py-1.5 transition-colors",
               isAwaiting
                 ? "bg-signal-warning-bg/75 hover:bg-signal-warning-bg"
                 : "hover:bg-accent/70",
             )}
           >
-            <button
-              type="button"
-              title={sa.promptPreview || sa.title}
-              onClick={() => openSubagent(agentId, sa)}
-              className="flex min-w-0 flex-1 cursor-pointer items-center gap-2.5 text-left outline-none"
-            >
-              <SubagentAvatar
-                character={sa.character}
-                status={sa.status}
-                size="md"
-                showStatusBadge={!isActive}
-              />
-              <span className="min-w-0 flex-1">
-                <span className="text-ink-primary block truncate text-[12px] leading-[16px] font-medium">
-                  {sa.title}
-                </span>
-                <span
-                  className={cn(
-                    "block truncate text-[11px] leading-[15px]",
-                    isAwaiting
-                      ? "text-signal-warning font-medium"
-                      : sa.status === "failed"
-                        ? "text-signal-danger"
-                        : "text-ink-tertiary",
-                  )}
-                >
-                  {subtitle}
-                </span>
+            <SubagentAvatar
+              character={sa.character}
+              status={sa.status}
+              size="md"
+              showStatusBadge={!isActive}
+            />
+            <span className="min-w-0 flex-1">
+              <span className="text-ink-primary block truncate text-[12px] leading-[16px] font-medium">
+                {sa.title}
               </span>
-            </button>
-
-            {isAwaiting ? (
-              <div className="flex shrink-0 items-center">
-                <button
-                  type="button"
-                  onClick={() => openSubagent(agentId, sa)}
-                  className="bg-signal-warning-bg text-signal-warning border-signal-warning-border hover:bg-signal-warning/20 inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-[6px] border px-2 text-[11px] font-medium transition-colors"
-                >
-                  <ShieldAlert className="size-3 shrink-0" />
-                  <span>{t("overview.subagentReview")}</span>
-                </button>
-              </div>
-            ) : (
-              <div className="bg-[var(--overview-surface,var(--surface-raised))]/95 border-border-subtle pointer-events-none absolute top-1/2 right-1.5 flex -translate-y-1/2 items-center gap-0.5 rounded-[7px] border p-0.5 opacity-0 shadow-xs backdrop-blur-[6px] transition-opacity duration-150 group-focus-within/crew:pointer-events-auto group-focus-within/crew:opacity-100 group-hover/crew:pointer-events-auto group-hover/crew:opacity-100">
-                {canStop && sa.childAgentId && (
-                  <IconButton
-                    size="xs"
-                    tone="danger"
-                    tooltip={t("overview.stopSubagent")}
-                    onClick={() => {
-                      void orbitIpc.interruptAgent(sa.childHostId, sa.childAgentId!).then(
-                        () =>
-                          orbitActions.showToast(
-                            t("overview.stoppedSubagentToast", { name: sa.title }),
-                          ),
-                        (err) =>
-                          orbitActions.showToast(
-                            t("overview.stopSubagentFailedToast", { error: String(err) }),
-                          ),
-                      );
-                    }}
-                  >
-                    <Square className="size-[9px] fill-current" />
-                  </IconButton>
+              <span
+                className={cn(
+                  "block truncate text-[11px] leading-[15px]",
+                  isAwaiting
+                    ? "text-signal-warning font-medium"
+                    : sa.status === "failed"
+                      ? "text-signal-danger"
+                      : "text-ink-tertiary",
                 )}
-                {canArchive && (
-                  <IconButton
-                    size="xs"
-                    tooltip={t("overview.archiveSubagent")}
-                    onClick={() => {
-                      if (canManage && sa.childAgentId) {
-                        orbitActions.archiveThread(sa.childHostId, sa.childAgentId);
-                      } else {
-                        orbitActions.archiveSubagent(hostId, agentId, {
-                          id: sa.callId,
-                          providerSubagentId: sa.providerSubagentId,
-                          childAgentId: sa.childAgentId,
-                          role: sa.title,
-                        });
-                      }
-                    }}
-                  >
-                    <Archive className="size-3" />
-                  </IconButton>
-                )}
-                <IconButton
-                  size="xs"
-                  tooltip={t("overview.openSubagent", { name: sa.title })}
-                  onClick={() => openSubagent(agentId, sa)}
-                >
-                  <ArrowUpRight className="size-3" />
-                </IconButton>
-              </div>
-            )}
-          </div>
+              >
+                {subtitle}
+              </span>
+            </span>
+          </button>
         );
       })}
     </div>

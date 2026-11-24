@@ -6,43 +6,16 @@ import {
   type ReasoningEffort,
 } from "@/lib/orbit-ipc";
 
-export function formatEffortLabel(effort: ReasoningEffort): string {
-  switch (effort) {
-    case "off":
-      return "Off";
-    case "low":
-      return "Low";
-    case "medium":
-      return "Medium";
-    case "high":
-      return "High";
-    case "xhigh":
-      return "Extra High";
-    case "max":
-      return "Max";
-    case "ultra":
-      return "Ultra";
-  }
-}
-
-export function defaultEffortDescription(effort: ReasoningEffort): string {
-  switch (effort) {
-    case "off":
-      return "Thinking disabled";
-    case "low":
-      return "Fast & concise";
-    case "medium":
-      return "Balanced speed & depth";
-    case "high":
-      return "Greater reasoning depth";
-    case "xhigh":
-      return "Extra high reasoning depth";
-    case "max":
-      return "Maximum reasoning budget";
-    case "ultra":
-      return "Max reasoning + delegation";
-  }
-}
+export {
+  defaultEffortDescription,
+  effortDescriptionKey,
+  effortLabelKey,
+  estimateContextWindowLabel,
+  formatEffortLabel,
+  groupAntigravityOrchestratorModels,
+  type BrowsedModelEntry,
+  type BrowsedModelLeaf,
+} from "./model-metadata";
 
 function emptyCatalog(provider: ProviderKind): ProviderModelCatalog {
   return {

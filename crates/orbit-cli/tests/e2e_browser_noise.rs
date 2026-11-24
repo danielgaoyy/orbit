@@ -8,11 +8,11 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, client::IntoClientRequest},
 };
-use uuid::Uuid;
 
 #[tokio::test]
 async fn browser_json_rpc_over_direct_and_relay() -> anyhow::Result<()> {
-    let home = std::env::temp_dir().join(format!("orbit-web-{}", Uuid::new_v4()));
+    let tmp = tempfile::tempdir()?;
+    let home = tmp.path().to_path_buf();
     let key = orbit_daemon::DaemonRuntime::bootstrap(&home)
         .await?
         .keypair
@@ -81,14 +81,15 @@ async fn browser_json_rpc_over_direct_and_relay() -> anyhow::Result<()> {
         .await??;
     }
     relay.abort();
-    std::fs::remove_dir_all(home)?;
+    drop(runtime);
     Ok(())
 }
 
 #[tokio::test]
 async fn foreground_pwa_preserves_api_routes_and_confines_asset_reads() -> anyhow::Result<()> {
     use tokio::process::Command;
-    let tmp = std::env::temp_dir().join(format!("orbit-web-{}", Uuid::new_v4()));
+    let tmp_dir = tempfile::tempdir()?;
+    let tmp = tmp_dir.path();
     let assets = tmp.join("dist");
     std::fs::create_dir_all(&assets)?;
     std::fs::write(assets.join("index.html"), "Orbit shell")?;
@@ -170,7 +171,7 @@ async fn foreground_pwa_preserves_api_routes_and_confines_asset_reads() -> anyho
             );
         }
         child.kill().await?;
+        let _ = child.wait().await;
     }
-    std::fs::remove_dir_all(tmp)?;
     Ok(())
 }

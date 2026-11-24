@@ -18,17 +18,24 @@ pub(super) fn open_root(canonical: &Path) -> Result<Dir> {
         canonical.is_absolute(),
         "expected a canonical workspace path"
     );
-    let anchor = canonical
-        .ancestors()
-        .last()
-        .context("missing filesystem root")?;
-    let mut dir = Dir::open_ambient_dir(anchor, ambient_authority())?;
-    for part in canonical.components() {
-        if let std::path::Component::Normal(name) = part {
-            dir = dir.open_dir_nofollow(name)?;
-        }
+    #[cfg(windows)]
+    {
+        return Ok(Dir::open_ambient_dir(canonical, ambient_authority())?);
     }
-    Ok(dir)
+    #[cfg(not(windows))]
+    {
+        let anchor = canonical
+            .ancestors()
+            .last()
+            .context("missing filesystem root")?;
+        let mut dir = Dir::open_ambient_dir(anchor, ambient_authority())?;
+        for part in canonical.components() {
+            if let std::path::Component::Normal(name) = part {
+                dir = dir.open_dir_nofollow(name)?;
+            }
+        }
+        Ok(dir)
+    }
 }
 
 pub(super) fn read_relative(root: &Dir, name: &str, cap: usize) -> Result<Vec<u8>> {

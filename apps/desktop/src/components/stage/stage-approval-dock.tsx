@@ -3,6 +3,7 @@ import {
   ArrowUpRight,
   Bot,
   Check,
+  CheckCheck,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -54,6 +55,7 @@ import type {
 } from "@/state/selectors/session-selectors";
 import { orbitActions } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
+import { selectSafeBatchPermissions } from "./stage-helpers";
 
 type PendingPermissionItem = Extract<TimelineItemView, { item_type: "permission_request" }>;
 type PendingQuestionItem = Extract<TimelineItemView, { item_type: "question_request" }>;
@@ -167,6 +169,7 @@ type QueuedDecision =
       allowedDecisions: string[];
       guardianAssessment?: GuardianAssessment | null;
       subagent?: SessionSubagentWithAvatar;
+      isPlanApproval?: boolean;
     }
   | {
       kind: "question";
@@ -560,10 +563,14 @@ function PermissionApprovalCard({
   allowedDecisions,
   guardianAssessment,
   subagent,
+  isPlanApproval = false,
   queueIndex,
   queueTotal,
   onStepPrev,
   onStepNext,
+  safeBatchCount = 0,
+  batchSubmitting = false,
+  onApproveSafeBatch,
   registerGlobalShortcuts = true,
 }: {
   queueKey: string;
@@ -577,10 +584,14 @@ function PermissionApprovalCard({
   allowedDecisions: string[];
   guardianAssessment?: GuardianAssessment | null;
   subagent?: SessionSubagentWithAvatar;
+  isPlanApproval?: boolean;
   queueIndex: number;
   queueTotal: number;
   onStepPrev: () => void;
   onStepNext: () => void;
+  safeBatchCount?: number;
+  batchSubmitting?: boolean;
+  onApproveSafeBatch?: () => void;
   registerGlobalShortcuts?: boolean;
 }) {
   const { t } = useI18n();
@@ -620,14 +631,29 @@ function PermissionApprovalCard({
       submittingRef.current = dec;
       setSubmittingDecision(dec);
       try {
-        await orbitIpc.resolvePermission(hostId, agentId, requestId, dec);
+        if (isPlanApproval) {
+          const isDeny = isDenyDecision(dec);
+          await orbitIpc.resolvePlanApproval(
+            hostId,
+            agentId,
+            requestId,
+            isDeny ? "dismiss" : "approve_and_build",
+            {
+              editedPlanMarkdown: null,
+              feedback: null,
+              targetMode: isDeny ? null : "default",
+            },
+          );
+        } else {
+          await orbitIpc.resolvePermission(hostId, agentId, requestId, dec);
+        }
       } catch (err) {
         submittingRef.current = null;
         setSubmittingDecision(null);
         orbitActions.showToast(t("approval.permissionFailed", { error: String(err) }));
       }
     },
-    [hostId, agentId, requestId, t],
+    [hostId, agentId, requestId, isPlanApproval, t],
   );
 
   // Register exact target (parent OR child subagent) and live resolve handler for `⌘Y / ⌘⇧Y / ⌘⌫`
@@ -675,11 +701,18 @@ function PermissionApprovalCard({
     [title, detail, target],
   );
   const guardianTierLabel =
-    guardianAssessment?.classifier_tier === "ai_rubric"
-      ? t("approval.guardianAiClassifier")
-      : guardianAssessment?.classifier_tier === "deterministic"
-        ? t("approval.guardianRulePolicy")
-        : null;
+    guardianAssessment?.classifier_tier === "llm_tier2"
+      ? t("approval.guardianLlmTier2")
+      : guardianAssessment?.classifier_tier === "heuristic_fallback" ||
+          guardianAssessment?.classifier_tier === "ai_rubric"
+        ? t("approval.guardianHeuristicFallback")
+        : guardianAssessment?.classifier_tier === "deterministic_tier1" ||
+            guardianAssessment?.classifier_tier === "deterministic" ||
+            guardianAssessment?.classifier_tier === "tier1"
+          ? t("approval.guardianRulePolicy")
+          : guardianAssessment?.classifier_tier === "fail_closed"
+            ? t("approval.guardianFailClosedTier")
+            : null;
   const guardianSignals = useMemo(
     () => (guardianAssessment?.signals ?? []).filter(Boolean).slice(0, 3),
     [guardianAssessment?.signals],
@@ -904,7 +937,35 @@ function PermissionApprovalCard({
         )}
       </div>
 
-      <div className="border-border-subtle flex flex-wrap items-center justify-end gap-1.5 border-t px-4 py-2.5">
+      <div
+        className={cn(
+          "border-border-subtle flex flex-wrap items-center gap-2 border-t px-4 py-2.5",
+          safeBatchCount >= 2 ? "justify-between" : "justify-end",
+        )}
+      >
+        {safeBatchCount >= 2 && onApproveSafeBatch && (
+          <SimpleTooltip label={t("approval.approveSafeBatchTooltip")} side="top">
+            <button
+              type="button"
+              disabled={batchSubmitting || submittingDecision !== null}
+              onClick={onApproveSafeBatch}
+              className="orbit-press border-border-default bg-surface-recessed/80 text-ink-secondary hover:bg-accent hover:text-ink-primary inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-full border px-2.5 text-[12px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {batchSubmitting ? (
+                <OrbitSpinner size={12} className="shrink-0" />
+              ) : (
+                <CheckCheck className="size-3.5 shrink-0 stroke-[1.8]" />
+              )}
+              <span className="tabular-nums">
+                {batchSubmitting
+                  ? t("approval.approveSafeBatchSubmitting")
+                  : t("approval.approveSafeBatch", { count: safeBatchCount })}
+              </span>
+            </button>
+          </SimpleTooltip>
+        )}
+
+        <div className="flex flex-wrap items-center justify-end gap-1.5">
         {decisions.map((dec) => {
           const isDeny = isDenyDecision(dec);
           const isAlways = isAlwaysDecision(dec);
@@ -913,7 +974,7 @@ function PermissionApprovalCard({
           const isMatchedDeny = dec === primaryDenyChoice;
           const label = formatDecisionLabel(dec, t);
           const isThisSubmitting = submittingDecision === dec;
-          const disabled = submittingDecision !== null;
+          const disabled = submittingDecision !== null || batchSubmitting;
 
           const buttonEl = (
             <button
@@ -942,7 +1003,7 @@ function PermissionApprovalCard({
             return (
               <SimpleTooltip
                 key={dec}
-                label={t("approval.alwaysAllowSessionTooltip")}
+                label={t("approval.alwaysAllowProjectTooltip")}
                 shortcut={registerGlobalShortcuts ? `${mod}⇧Y` : undefined}
                 side="top"
               >
@@ -966,6 +1027,7 @@ function PermissionApprovalCard({
 
           return buttonEl;
         })}
+        </div>
       </div>
     </div>
   );
@@ -1447,10 +1509,14 @@ export const DecisionDock = memo(
     registerGlobalShortcuts?: boolean;
     compact?: boolean;
   }) {
+    const { t } = useI18n();
     const [focusedKey, setFocusedKey] = useState<string | null>(null);
     const [fallbackSlotIndex, setFallbackSlotIndex] = useState<number>(0);
     const [questionDrafts, setQuestionDrafts] = useState<Record<string, QuestionDraftState>>({});
     const [stepDirection, setStepDirection] = useState<-1 | 1>(1);
+    const [batchSubmitting, setBatchSubmitting] = useState(false);
+    const batchSubmittingRef = useRef(false);
+    batchSubmittingRef.current = batchSubmitting;
     const pendingStepDirRef = useRef<-1 | 1 | null>(null);
     const prevQueueKeyRef = useRef<string | null>(null);
     const stepContentRef = useRef<HTMLDivElement | null>(null);
@@ -1460,6 +1526,7 @@ export const DecisionDock = memo(
       const merged: QueuedDecision[] = [];
 
       for (const item of permissions) {
+        if (item.plan_approval != null) continue;
         const key = `permission:${hostId}:${agentId}:${item.request_id}`;
         if (!seen.has(key)) {
           seen.add(key);
@@ -1511,6 +1578,7 @@ export const DecisionDock = memo(
             allowedDecisions: subPerm.permission.allowed_decisions,
             guardianAssessment: subPerm.permission.guardian_assessment,
             subagent: subPerm.subagent,
+            isPlanApproval: subPerm.permission.plan_approval != null,
           });
         }
       }
@@ -1546,6 +1614,55 @@ export const DecisionDock = memo(
 
     const activeEntry = queue[activeIndex] ?? null;
     const activeQueueKey = activeEntry?.queueKey ?? null;
+    const safeBatch = useMemo(() => selectSafeBatchPermissions(queue), [queue]);
+
+    const handleApproveSafeBatch = useCallback(async () => {
+      if (batchSubmittingRef.current || safeBatch.length < 2) return;
+      batchSubmittingRef.current = true;
+      setBatchSubmitting(true);
+      try {
+        // Multi-host fleet first: group eligible permissions by targetHostId.
+        const byHost = new Map<string, Array<[string, string]>>();
+        for (const item of safeBatch) {
+          const list = byHost.get(item.targetHostId) ?? [];
+          list.push([item.targetAgentId, item.requestId]);
+          byHost.set(item.targetHostId, list);
+        }
+
+        const settled = await Promise.allSettled(
+          Array.from(byHost.entries()).map(([targetHostId, pairs]) =>
+            orbitIpc.resolvePermissionsBatch(targetHostId, pairs, "allow"),
+          ),
+        );
+
+        let resolved = 0;
+        let skipped = 0;
+        let firstError: string | null = null;
+        for (const res of settled) {
+          if (res.status === "fulfilled") {
+            resolved += res.value.resolved_count;
+            skipped += res.value.skipped_count;
+          } else if (!firstError) {
+            firstError = String(res.reason);
+          }
+        }
+
+        if (firstError && resolved === 0) {
+          orbitActions.showToast(t("approval.permissionFailed", { error: firstError }));
+        } else if (resolved > 0 && skipped > 0) {
+          orbitActions.showToast(t("approval.approveSafeBatchPartial", { resolved, skipped }));
+        } else if (resolved > 0) {
+          orbitActions.showToast(t("approval.approveSafeBatchDone", { resolved }));
+        } else if (skipped > 0) {
+          orbitActions.showToast(t("approval.approveSafeBatchNone", { skipped }));
+        }
+      } catch (err) {
+        orbitActions.showToast(t("approval.permissionFailed", { error: String(err) }));
+      } finally {
+        batchSubmittingRef.current = false;
+        setBatchSubmitting(false);
+      }
+    }, [safeBatch, t]);
 
     const handleStep = useCallback(
       (delta: -1 | 1) => {
@@ -1652,10 +1769,14 @@ export const DecisionDock = memo(
               allowedDecisions={activeEntry.allowedDecisions}
               guardianAssessment={activeEntry.guardianAssessment}
               subagent={activeEntry.subagent}
+              isPlanApproval={activeEntry.isPlanApproval}
               queueIndex={activeIndex}
               queueTotal={queue.length}
               onStepPrev={() => handleStep(-1)}
               onStepNext={() => handleStep(1)}
+              safeBatchCount={safeBatch.length}
+              batchSubmitting={batchSubmitting}
+              onApproveSafeBatch={() => void handleApproveSafeBatch()}
               registerGlobalShortcuts={registerGlobalShortcuts}
             />
           ) : (
@@ -1706,6 +1827,8 @@ export const DecisionDock = memo(
         sp.key === nsp.key &&
         sp.subagent.title === nsp.subagent.title &&
         sp.subagent.character === nsp.subagent.character &&
+        sp.permission.allowed_decisions.length === nsp.permission.allowed_decisions.length &&
+        (sp.permission.plan_approval != null) === (nsp.permission.plan_approval != null) &&
         sameGuardian(sp.permission.guardian_assessment, nsp.permission.guardian_assessment)
       );
     }),

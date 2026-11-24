@@ -30,6 +30,8 @@ export interface ArtifactSandboxFrameProps {
   html: string;
   isMcpApp?: boolean;
   resourceUri?: string | null;
+  hostId?: string | null;
+  mcpServerName?: string | null;
 }
 
 /**
@@ -37,11 +39,14 @@ export interface ArtifactSandboxFrameProps {
  *
  * Isolation guarantees:
  * - `sandbox="allow-scripts"` ONLY (no `allow-same-origin`, no `allow-top-navigation`, no `allow-popups`).
- * - Unbypassable byte-0 CSP (`default-src 'none'; base-uri 'none'; form-action 'none'; ...`).
+ * - Unbypassable byte-0 CSP (`default-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; ...`).
  * - Every `postMessage` validates `event.source === iframeRef.current?.contentWindow` AND `event.origin === "null"`.
  * - Every host-facing request (`tools/call`, `ui/open-link`, `ui/message`, `ui/update-model-context`) requires
  *   explicit user confirmation, refuses bait-and-switch overwrites (`-32002`), and disables confirm buttons
  *   for 300ms after opening to defeat clickjacking.
+ * - `resources/read` and `tools/call` are strictly bound to `(artifactId, version)` and resolved on the
+ *   daemon in the artifact's persisted workspace (never using active-agent cwd or cross-server overrides).
+ * - Any iframe load/navigation increments the bridge navigation epoch and drops in-flight replies.
  */
 export const ArtifactSandboxFrame = memo(function ArtifactSandboxFrame({
   artifactId,
@@ -50,6 +55,8 @@ export const ArtifactSandboxFrame = memo(function ArtifactSandboxFrame({
   html,
   isMcpApp = false,
   resourceUri = null,
+  hostId = null,
+  mcpServerName = null,
 }: ArtifactSandboxFrameProps) {
   const resolvedTheme = useOrbitSelector((s) => s.resolvedTheme);
   const theme: SandboxTheme = resolvedTheme === "dark" ? "dark" : "light";
@@ -57,6 +64,15 @@ export const ArtifactSandboxFrame = memo(function ArtifactSandboxFrame({
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const themeRef = useRef<SandboxTheme>(theme);
   themeRef.current = theme;
+  const hostIdRef = useRef<string | null>(hostId);
+  hostIdRef.current = hostId;
+  const artifactIdRef = useRef<string>(artifactId);
+  artifactIdRef.current = artifactId;
+  const versionRef = useRef<number>(version);
+  versionRef.current = version;
+  const mcpServerNameRef = useRef<string | null>(mcpServerName);
+  mcpServerNameRef.current = mcpServerName;
+  const artifactGenRef = useRef<number>(0);
 
   const [frameHeight, setFrameHeight] = useState<number>(460);
   const [bridgeReady, setBridgeReady] = useState<boolean>(false);
@@ -99,6 +115,7 @@ export const ArtifactSandboxFrame = memo(function ArtifactSandboxFrame({
       createMcpAppHostBridge({
         getExpectedSource: () => iframeRef.current?.contentWindow ?? null,
         getTheme: () => themeRef.current,
+        getOwningMcpServerName: () => mcpServerNameRef.current?.trim() || null,
         onInitialized: () => {
           setBridgeReady(true);
         },
@@ -118,13 +135,60 @@ export const ArtifactSandboxFrame = memo(function ArtifactSandboxFrame({
         onToolCallRequest: (req) => {
           setPendingToolCall(req);
         },
+        onReadResourceRequest: (req) => {
+          const activeHost = hostIdRef.current?.trim() || "";
+          const activeArtifactId = artifactIdRef.current;
+          const activeVersion = versionRef.current;
+          const gen = artifactGenRef.current;
+          const reqEpoch = req.navigationEpoch;
+          if (!activeHost) {
+            bridge.resolveResourceRead(
+              req.id,
+              null,
+              "No active host connected for resources/read",
+              reqEpoch,
+            );
+            return;
+          }
+          void orbitIpc
+            .readMcpResource(activeHost, activeArtifactId, activeVersion, req.uri)
+            .then((res) => {
+              if (artifactGenRef.current !== gen || bridge.getNavigationEpoch() !== reqEpoch) {
+                return;
+              }
+              bridge.resolveResourceRead(
+                req.id,
+                {
+                  uri: res.uri,
+                  mimeType: res.mime_type,
+                  text: res.text,
+                  blob: res.blob_base64,
+                },
+                undefined,
+                reqEpoch,
+              );
+            })
+            .catch(() => {
+              if (artifactGenRef.current !== gen || bridge.getNavigationEpoch() !== reqEpoch) {
+                return;
+              }
+              // Never echo raw host/process stderr or internal transport traces into iframe JS.
+              bridge.resolveResourceRead(
+                req.id,
+                null,
+                "Failed to read MCP resource from owning server",
+                reqEpoch,
+              );
+            });
+        },
       }),
     [],
   );
 
-  // Reset per-artifact transient prompts when switching artifact/version
+  // Reset per-artifact transient prompts & invalidate pending async replies on artifact/version switch
   useEffect(() => {
-    bridge.resetConfirmations();
+    artifactGenRef.current += 1;
+    bridge.invalidateNavigation();
     setBridgeReady(false);
     setPendingToolCall(null);
     setPendingLink(null);
@@ -147,32 +211,81 @@ export const ArtifactSandboxFrame = memo(function ArtifactSandboxFrame({
   }, [bridge, theme]);
 
   const handleConfirmToolCall = useCallback(
-    (approved: boolean) => {
+    async (approved: boolean) => {
       if (!pendingToolCall) return;
       if (approved && confirmLocked) return;
       const req = pendingToolCall;
+      const reqEpoch = req.navigationEpoch;
       setPendingToolCall(null);
-      if (approved) {
-        const hasArgs = Object.keys(req.arguments).length > 0;
-        const promptLine = hasArgs
-          ? `Run tool \`${req.name}\` requested by Artifact "${title}" (v${version}):\n\`\`\`json\n${req.argsPreview}\n\`\`\``
-          : `Run tool \`${req.name}\` requested by Artifact "${title}" (v${version})`;
-        orbitActions.quoteDiffLineToComposer(
-          `Artifact "${title}" (v${version}, tools/call)`,
-          null,
-          promptLine,
-        );
-        bridge.resolveToolCall(
-          req.id,
-          true,
-          `Tool request "${req.name}" attached to active conversation composer.`,
-        );
-        orbitActions.showToast(`Attached tool request: ${req.name}`);
-      } else {
-        bridge.resolveToolCall(req.id, false, "Tool request denied by user");
+      if (!approved) {
+        bridge.resolveToolCall(req.id, false, "Tool request denied by user", reqEpoch);
+        return;
       }
+
+      const activeHost = hostIdRef.current?.trim() || "";
+      const boundServer = mcpServerNameRef.current?.trim() || "";
+      const gen = artifactGenRef.current;
+
+      if (activeHost && boundServer) {
+        try {
+          const outcome = await orbitIpc.callArtifactMcpTool(
+            activeHost,
+            artifactId,
+            version,
+            req.name,
+            req.arguments,
+          );
+          if (artifactGenRef.current !== gen || bridge.getNavigationEpoch() !== reqEpoch) return;
+          bridge.resolveToolCallResult(
+            req.id,
+            {
+              ok: outcome.ok,
+              isError: outcome.is_error,
+              content: outcome.content,
+              structuredContent: outcome.structured_content,
+              error: outcome.error,
+            },
+            reqEpoch,
+          );
+          if (!outcome.ok && outcome.error) {
+            orbitActions.showToast(`MCP tool ${req.name} failed: ${outcome.error}`);
+          }
+        } catch (err) {
+          if (artifactGenRef.current !== gen || bridge.getNavigationEpoch() !== reqEpoch) return;
+          // Return concise protocol-safe error to iframe; show toast only in trusted host UI.
+          bridge.resolveToolCallResult(
+            req.id,
+            {
+              ok: false,
+              isError: true,
+              content: [],
+              error: "MCP tool execution failed on owning server",
+            },
+            reqEpoch,
+          );
+          orbitActions.showToast(`MCP tool ${req.name} failed: ${String(err)}`);
+        }
+        return;
+      }
+
+      const hasArgs = Object.keys(req.arguments).length > 0;
+      const promptLine = hasArgs
+        ? `Run tool \`${req.name}\` requested by Artifact "${title}" (v${version}):\n\`\`\`json\n${req.argsPreview}\n\`\`\``
+        : `Run tool \`${req.name}\` requested by Artifact "${title}" (v${version})`;
+      orbitActions.quoteDiffLineToComposer(
+        `Artifact "${title}" (v${version}, tools/call)`,
+        null,
+        promptLine,
+      );
+      bridge.resolveToolCall(
+        req.id,
+        true,
+        `Tool request "${req.name}" attached to active conversation composer.`,
+        reqEpoch,
+      );
+      orbitActions.showToast(`Attached tool request: ${req.name}`);
     },
-    [bridge, confirmLocked, pendingToolCall, title, version],
+    [artifactId, bridge, confirmLocked, pendingToolCall, title, version],
   );
 
   const handleConfirmOpenLink = useCallback(
@@ -256,7 +369,9 @@ export const ArtifactSandboxFrame = memo(function ArtifactSandboxFrame({
               {resourceUri || (isMcpApp ? "MCP App (SEP-1865)" : "Sandboxed HTML")}
             </span>
           </span>
-          <span className="text-muted-foreground/70 shrink-0">Sandboxed · No network</span>
+          <span className="text-muted-foreground/70 shrink-0">
+            {mcpServerName ? `MCP · ${mcpServerName} · Sandboxed` : "Sandboxed · No network"}
+          </span>
         </div>
       )}
 
@@ -274,7 +389,7 @@ export const ArtifactSandboxFrame = memo(function ArtifactSandboxFrame({
             <div className="flex shrink-0 items-center gap-1.5">
               <button
                 type="button"
-                onClick={() => handleConfirmToolCall(false)}
+                onClick={() => void handleConfirmToolCall(false)}
                 className="border-border hover:bg-accent text-foreground/80 cursor-pointer rounded-md border px-2 py-0.5 text-[11.5px]"
               >
                 Deny
@@ -282,7 +397,7 @@ export const ArtifactSandboxFrame = memo(function ArtifactSandboxFrame({
               <button
                 type="button"
                 disabled={confirmLocked}
-                onClick={() => handleConfirmToolCall(true)}
+                onClick={() => void handleConfirmToolCall(true)}
                 className="bg-foreground text-background inline-flex cursor-pointer items-center gap-1 rounded-md px-2.5 py-0.5 text-[11.5px] font-medium hover:opacity-90 disabled:cursor-default disabled:opacity-45"
               >
                 <Check className="h-3 w-3" />
@@ -403,6 +518,13 @@ export const ArtifactSandboxFrame = memo(function ArtifactSandboxFrame({
           referrerPolicy="no-referrer"
           srcDoc={srcDoc}
           onLoad={() => {
+            // Invalidate any in-flight MCP replies whenever the iframe loads or navigates.
+            bridge.invalidateNavigation();
+            setBridgeReady(false);
+            setPendingToolCall(null);
+            setPendingLink(null);
+            setPendingMessage(null);
+            setPendingContext(null);
             bridge.pushThemeChange(themeRef.current);
           }}
           style={{ minHeight: `${frameHeight}px` }}

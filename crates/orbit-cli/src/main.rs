@@ -594,8 +594,15 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
     let is_mcp_stdio = matches!(cli.command, Commands::Mcp { .. });
     if !is_mcp_stdio {
-        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        let mut env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        // Cap WebSocket dependency crates at INFO so RUST_LOG=trace can never dump signed
+        // Feishu/Slack WSS URLs or Discord Gateway IDENTIFY bot tokens into daemon logs.
+        for directive in ["tungstenite=info", "tokio_tungstenite=info"] {
+            if let Ok(parsed) = directive.parse() {
+                env_filter = env_filter.add_directive(parsed);
+            }
+        }
         let use_rotating_daemon_log = matches!(cli.command, Commands::Daemon { action: None, .. });
         if use_rotating_daemon_log
             && let Ok(log_writer) = orbit_client_core::logging::RotatingLogWriter::open(
@@ -2176,6 +2183,7 @@ where
         agent_id: agent_id.to_string(),
         permission_request_id: permission_request_id.to_string(),
         decision: decision.to_string(),
+        agent_originated: false,
     };
     if let Err(e) = send_wire(msg).await {
         let _ = writeln!(
@@ -2274,6 +2282,7 @@ where
                                 detail,
                                 allowed_decisions,
                                 guardian_assessment,
+                                ..
                             } => {
                                 let summary = format_permission_summary(&title, &detail);
                                 let choices = AllowedPermissionChoices::from_wire(&allowed_decisions);
@@ -2830,6 +2839,7 @@ mod tests {
                     signals: Vec::new(),
                     latency_ms: 4,
                 }),
+                plan_approval: None,
             },
         ))
         .expect("send perm_allow");
@@ -2841,6 +2851,7 @@ mod tests {
                 detail: sample_shell_detail(),
                 allowed_decisions: vec!["deny".into()],
                 guardian_assessment: None,
+                plan_approval: None,
             },
         ))
         .expect("send perm_deny_only");
@@ -2930,6 +2941,7 @@ mod tests {
                 detail: sample_shell_detail(),
                 allowed_decisions: vec!["allow".into(), "deny".into()],
                 guardian_assessment: None,
+                plan_approval: None,
             },
         ))
         .expect("send perm");
@@ -3019,6 +3031,7 @@ mod tests {
                     detail: sample_shell_detail(),
                     allowed_decisions: vec!["allow".into(), "allow_always".into(), "deny".into()],
                     guardian_assessment: None,
+                    plan_approval: None,
                 },
             ));
             let _ = tx.send(timeline_event(
@@ -3029,6 +3042,7 @@ mod tests {
                     detail: sample_shell_detail(),
                     allowed_decisions: vec!["allow".into(), "deny".into()],
                     guardian_assessment: None,
+                    plan_approval: None,
                 },
             ));
             assert_eq!(ask_rx.recv().await.as_deref(), Some("perm_ext"));
@@ -3156,6 +3170,7 @@ mod tests {
                 detail: sample_shell_detail(),
                 allowed_decisions: vec!["allow".into(), "deny".into()],
                 guardian_assessment: None,
+                plan_approval: None,
             },
         ));
         let mut failing_send = |_msg: WireMessage| async { Err(anyhow::anyhow!("ws broken")) };

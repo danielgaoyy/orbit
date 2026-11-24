@@ -447,11 +447,15 @@ impl AcpStreamSegmentState {
 
 struct PendingAcpPerm {
     rpc_id: Value,
-    allow_option_id: String,
-    allow_always_option_id: String,
-    deny_option_id: String,
+    perm_options: crate::AcpPermissionOptions,
     is_question: bool,
     raw_questions: Vec<QuestionItem>,
+}
+
+struct PendingAcpPlanModeSwitch {
+    target_mode: SessionMode,
+    previous_mode: SessionMode,
+    deferred_perm: Option<(PendingAcpPerm, Value)>,
 }
 
 struct OpenedAcpSession {
@@ -730,13 +734,7 @@ async fn send_acp_initialize(
         "initialize",
         json!({
             "protocolVersion": 1,
-            "clientCapabilities": {
-                "fs": {
-                    "readTextFile": false,
-                    "writeTextFile": false
-                },
-                "terminal": false
-            },
+            "clientCapabilities": crate::acp_callbacks::acp_client_capabilities(),
             "clientInfo": {
                 "name": "orbit",
                 "version": env!("CARGO_PKG_VERSION")
@@ -1317,15 +1315,24 @@ async fn run_acp_actor(
     };
     let mut tool_cache: HashMap<String, ToolCallDetail> = HashMap::new();
     let mut pending_perms: HashMap<String, PendingAcpPerm> = HashMap::new();
+    let mut pending_plan_mode_switches: HashMap<String, PendingAcpPlanModeSwitch> = HashMap::new();
     let mut pending_prompts: VecDeque<QueuedDriverPrompt> = VecDeque::new();
     let mut pending_interrupt_replacement: Option<QueuedDriverPrompt> = None;
     let mut active_turn_message_ids: Vec<String> = Vec::new();
     let mut user_interrupted = false;
     let mut cancelling_active_turn = false;
     let mut cancel_deadline: Option<tokio::time::Instant> = None;
+    let (mut acp_cb_host, mut acp_cb_reply_rx) =
+        crate::acp_callbacks::AcpCallbackHost::new(std::path::PathBuf::from(&cfg.cwd));
 
     loop {
         tokio::select! {
+            Some(reply_line) = acp_cb_reply_rx.recv() => {
+                if shim.write_stdin_line(reply_line).await.is_err() {
+                    finalize_and_emit_unexpected_exit(&mut seg_state, &evt_tx).await;
+                    break;
+                }
+            }
             maybe_cmd = cmd_rx.recv() => {
                 let Some(cmd) = maybe_cmd else { break; };
                 match cmd {
@@ -1763,19 +1770,99 @@ async fn run_acp_actor(
                     }
                     DriverCommand::ResolvePermission { request_id, decision } => {
                         if let Some(p) = pending_perms.remove(&request_id) {
-                            let chosen_opt = match decision.as_str() {
-                                "allow_always" => &p.allow_always_option_id,
-                                "allow" => &p.allow_option_id,
-                                _ => &p.deny_option_id,
-                            };
+                            let outcome = p.perm_options.outcome_for_decision(decision.as_str());
                             let resp = json!({
                                 "jsonrpc": "2.0",
                                 "id": p.rpc_id,
                                 "result": {
-                                    "outcome": {
-                                        "outcome": "selected",
-                                        "optionId": chosen_opt
+                                    "outcome": outcome
+                                }
+                            })
+                            .to_string();
+                            if shim.write_stdin_line(resp).await.is_err() {
+                                finalize_and_emit_unexpected_exit(&mut seg_state, &evt_tx).await;
+                                break;
+                            }
+                            emit_status_after_perm_resolve(
+                                &active_turn_id,
+                                &pending_perms,
+                                &evt_tx,
+                            )
+                            .await;
+                        }
+                    }
+                    DriverCommand::ResolvePlanApproval {
+                        request_id,
+                        action,
+                        edited_plan_markdown,
+                        feedback: _,
+                        target_mode,
+                    } => {
+                        let perm = pending_perms.remove(&request_id);
+                        // ACP permission responses do not carry native inline edited plan bodies.
+                        // When the user edited the plan on `ApproveAndBuild`, decline the stale
+                        // unedited plan gate so the daemon starts one clean build turn carrying
+                        // the approved edited plan text after mode switch succeeds.
+                        let has_edits = edited_plan_markdown
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty());
+                        let compute_outcome = |p: &PendingAcpPerm| -> Value {
+                            match action {
+                                orbit_protocol::PlanApprovalAction::ApproveAndBuild
+                                    if !has_edits =>
+                                {
+                                    p.perm_options.outcome_for_decision("allow")
+                                }
+                                _ => p.perm_options.deny_outcome(),
+                            }
+                        };
+
+                        if matches!(action, orbit_protocol::PlanApprovalAction::ApproveAndBuild) {
+                            if let Some(mode_id) =
+                                resolve_acp_mode_id(&target_mode, &available_modes)
+                            {
+                                let id = next_rpc_id;
+                                next_rpc_id += 1;
+                                let rpc_key = RpcId::Num(id).as_key();
+                                let req = json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "method": "session/set_mode",
+                                    "params": {
+                                        "sessionId": session_id,
+                                        "modeId": mode_id
                                     }
+                                })
+                                .to_string();
+                                if shim.write_stdin_line(req).await.is_err() {
+                                    finalize_and_emit_unexpected_exit(&mut seg_state, &evt_tx)
+                                        .await;
+                                    break;
+                                }
+                                let deferred_perm = perm.map(|p| {
+                                    let outcome = compute_outcome(&p);
+                                    (p, outcome)
+                                });
+                                pending_plan_mode_switches.insert(
+                                    rpc_key,
+                                    PendingAcpPlanModeSwitch {
+                                        target_mode,
+                                        previous_mode: mode.clone(),
+                                        deferred_perm,
+                                    },
+                                );
+                                continue;
+                            }
+                            mode = target_mode;
+                        }
+
+                        if let Some(p) = perm {
+                            let outcome = compute_outcome(&p);
+                            let resp = json!({
+                                "jsonrpc": "2.0",
+                                "id": p.rpc_id,
+                                "result": {
+                                    "outcome": outcome
                                 }
                             })
                             .to_string();
@@ -1809,7 +1896,7 @@ async fn run_acp_actor(
                                 "result": {
                                     "outcome": {
                                         "outcome": "selected",
-                                        "optionId": p.allow_option_id,
+                                        "optionId": p.perm_options.question_option_id(),
                                         "updatedInput": { "answers": answers_map }
                                     }
                                 }
@@ -1870,6 +1957,75 @@ async fn run_acp_actor(
                         if has_id && method.is_none() {
                             if let Ok(rid) = serde_json::from_value::<RpcId>(val["id"].clone()) {
                                 let key = rid.as_key();
+                                if let Some(pending_switch) = pending_plan_mode_switches.remove(&key)
+                                {
+                                    if let Some(err_obj) =
+                                        val.get("error").filter(|v| !v.is_null())
+                                    {
+                                        let err_msg = err_obj
+                                            .get("message")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("session/set_mode failed");
+                                        mode = pending_switch.previous_mode;
+                                        let _ = evt_tx
+                                            .send(DriverEvent::Notice {
+                                                level: "error".into(),
+                                                message: format!(
+                                                    "Failed to switch session mode before approving plan: {err_msg}"
+                                                ),
+                                            })
+                                            .await;
+                                        if let Some((p, _)) = pending_switch.deferred_perm {
+                                            let resp = json!({
+                                                "jsonrpc": "2.0",
+                                                "id": p.rpc_id,
+                                                "result": {
+                                                    "outcome": p.perm_options.deny_outcome()
+                                                }
+                                            })
+                                            .to_string();
+                                            if shim.write_stdin_line(resp).await.is_err() {
+                                                finalize_and_emit_unexpected_exit(
+                                                    &mut seg_state,
+                                                    &evt_tx,
+                                                )
+                                                .await;
+                                                break;
+                                            }
+                                            emit_status_after_perm_resolve(
+                                                &active_turn_id,
+                                                &pending_perms,
+                                                &evt_tx,
+                                            )
+                                            .await;
+                                        }
+                                    } else {
+                                        mode = pending_switch.target_mode;
+                                        if let Some((p, outcome)) = pending_switch.deferred_perm {
+                                            let resp = json!({
+                                                "jsonrpc": "2.0",
+                                                "id": p.rpc_id,
+                                                "result": { "outcome": outcome }
+                                            })
+                                            .to_string();
+                                            if shim.write_stdin_line(resp).await.is_err() {
+                                                finalize_and_emit_unexpected_exit(
+                                                    &mut seg_state,
+                                                    &evt_tx,
+                                                )
+                                                .await;
+                                                break;
+                                            }
+                                            emit_status_after_perm_resolve(
+                                                &active_turn_id,
+                                                &pending_perms,
+                                                &evt_tx,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    continue;
+                                }
                                 if non_prompt_rpcs.remove(&key) {
                                     continue;
                                 }
@@ -1885,6 +2041,7 @@ async fn run_acp_actor(
                                     cancel_deadline = None;
                                     active_prompt_rpc_key = None;
                                     pending_perms.clear();
+                                    pending_plan_mode_switches.clear();
                                     seg_state.finalize_all_messages(&evt_tx).await;
                                     let finished_turn_id = active_turn_id.take();
 
@@ -2091,6 +2248,7 @@ async fn run_acp_actor(
                             handle_acp_permission_request(
                                 &val,
                                 &mode,
+                                &cfg.cwd,
                                 cfg.attachments_dir.as_deref(),
                                 &active_turn_id,
                                 &shim,
@@ -2098,23 +2256,42 @@ async fn run_acp_actor(
                                 &evt_tx,
                             )
                             .await;
-                        } else if has_id && let Some(unknown_method) = method {
-                            debug!(
-                                agent_id = %cfg.agent_id,
-                                provider = %provider_slug,
-                                method = %unknown_method,
-                                "Replying -32601 to unsupported ACP server->client RPC"
-                            );
-                            let resp = json!({
-                                "jsonrpc": "2.0",
-                                "id": val["id"],
-                                "error": {
-                                    "code": -32601,
-                                    "message": format!("Method not supported by client: {unknown_method}")
+                        } else if has_id
+                            && let Some(unknown_method) = method
+                            && let Some(id_val) = val.get("id").filter(|v| !v.is_null())
+                        {
+                            let params = val.get("params").unwrap_or(&Value::Null);
+                            match acp_cb_host
+                                .handle_request(id_val, unknown_method, params)
+                                .await
+                            {
+                                crate::acp_callbacks::AcpCallbackOutcome::Reply(resp) => {
+                                    if shim.write_stdin_line(resp).await.is_err() {
+                                        finalize_and_emit_unexpected_exit(&mut seg_state, &evt_tx)
+                                            .await;
+                                        break;
+                                    }
                                 }
-                            })
-                            .to_string();
-                            let _ = shim.write_stdin_line(resp).await;
+                                crate::acp_callbacks::AcpCallbackOutcome::Deferred => {}
+                                crate::acp_callbacks::AcpCallbackOutcome::Unsupported => {
+                                    debug!(
+                                        agent_id = %cfg.agent_id,
+                                        provider = %provider_slug,
+                                        method = %unknown_method,
+                                        "Replying -32601 to unsupported ACP server->client RPC"
+                                    );
+                                    let resp = json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id_val,
+                                        "error": {
+                                            "code": -32601,
+                                            "message": format!("Method not supported by client: {unknown_method}")
+                                        }
+                                    })
+                                    .to_string();
+                                    let _ = shim.write_stdin_line(resp).await;
+                                }
+                            }
                         }
                     }
                     ShimFrame::Exited { code } => {
@@ -2552,14 +2729,10 @@ fn map_acp_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCal
                 _ => None,
             })
             .unwrap_or_else(|| title.to_string());
-        let cwd = raw_in
-            .and_then(|i| i.get("cwd").or_else(|| i.get("workdir")))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .or_else(|| match prev {
-                Some(ToolCallDetail::Shell { cwd, .. }) => cwd.clone(),
-                _ => None,
-            });
+        let cwd = crate::extract_acp_shell_cwd(raw_in).or_else(|| match prev {
+            Some(ToolCallDetail::Shell { cwd, .. }) => cwd.clone(),
+            _ => None,
+        });
         let exit_code = raw_out
             .and_then(|o| o.get("exitCode").or_else(|| o.get("exit_code")))
             .and_then(Value::as_i64)
@@ -2680,39 +2853,6 @@ fn map_acp_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCal
     }
 }
 
-fn select_acp_option_id(options: &[Value], target_kind: &str, fallback_id: &str) -> String {
-    for opt in options {
-        if opt.get("kind").and_then(Value::as_str) == Some(target_kind)
-            && let Some(id) = opt.get("optionId").and_then(Value::as_str)
-        {
-            return id.to_string();
-        }
-    }
-    if target_kind == "reject_once" {
-        for opt in options {
-            if opt.get("kind").and_then(Value::as_str) == Some("reject_always")
-                && let Some(id) = opt.get("optionId").and_then(Value::as_str)
-            {
-                return id.to_string();
-            }
-        }
-    }
-    for opt in options {
-        if let Some(id) = opt.get("optionId").and_then(Value::as_str) {
-            let lower = id.to_ascii_lowercase();
-            let matched = if target_kind.starts_with("allow") {
-                lower.contains("allow") || lower.contains("approve")
-            } else {
-                lower.contains("reject") || lower.contains("deny") || lower.contains("cancel")
-            };
-            if matched {
-                return id.to_string();
-            }
-        }
-    }
-    fallback_id.to_string()
-}
-
 fn parse_acp_question_items(q_arr: &[Value]) -> Vec<QuestionItem> {
     q_arr
         .iter()
@@ -2759,9 +2899,11 @@ fn parse_acp_question_items(q_arr: &[Value]) -> Vec<QuestionItem> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_acp_permission_request(
     val: &Value,
     mode: &SessionMode,
+    workspace_cwd: &Path,
     attachments_dir: Option<&Path>,
     active_turn_id: &Option<String>,
     shim: &ShimClient,
@@ -2773,9 +2915,7 @@ async fn handle_acp_permission_request(
     let tool_call = &params["toolCall"];
     let options = params["options"].as_array().cloned().unwrap_or_default();
 
-    let allow_opt = select_acp_option_id(&options, "allow_once", "allow");
-    let allow_always_opt = select_acp_option_id(&options, "allow_always", &allow_opt);
-    let deny_opt = select_acp_option_id(&options, "reject_once", "deny");
+    let perm_options = crate::AcpPermissionOptions::parse(&options);
 
     if let Some(q_arr) = tool_call
         .pointer("/rawInput/questions")
@@ -2788,9 +2928,7 @@ async fn handle_acp_permission_request(
             req_id.clone(),
             PendingAcpPerm {
                 rpc_id,
-                allow_option_id: allow_opt,
-                allow_always_option_id: allow_always_opt,
-                deny_option_id: deny_opt,
+                perm_options,
                 is_question: true,
                 raw_questions: parsed_questions.clone(),
             },
@@ -2832,15 +2970,23 @@ async fn handle_acp_permission_request(
                 .is_some_and(|p| is_path_within_dir(Path::new(p), dir))
         });
 
-    let auto_approve = is_attachment_read
-        || matches!(mode, SessionMode::FullAccess)
-        || (matches!(mode, SessionMode::AcceptEdits)
-            && matches!(
-                kind_str,
-                "edit" | "write" | "delete" | "move" | "read" | "search"
-            ));
+    let plan_approval = crate::plan_approval::extract_plan_approval_from_acp_tool_call(
+        tool_call,
+        mode,
+        workspace_cwd,
+        "acp_plan",
+    );
 
-    if auto_approve {
+    let auto_approve = plan_approval.is_none()
+        && (is_attachment_read
+            || matches!(mode, SessionMode::FullAccess)
+            || (matches!(mode, SessionMode::AcceptEdits)
+                && matches!(
+                    kind_str,
+                    "edit" | "write" | "delete" | "move" | "read" | "search"
+                )));
+
+    if auto_approve && let Some(ref allow_opt) = perm_options.allow_once {
         let resp = json!({
             "jsonrpc": "2.0",
             "id": rpc_id,
@@ -2857,20 +3003,29 @@ async fn handle_acp_permission_request(
     }
 
     let req_id = format!("acp_perm_{}", uuid::Uuid::new_v4().simple());
-    let title = tool_call
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or("Approve tool execution")
-        .to_string();
-    let detail = map_acp_tool_detail(tool_call, None);
+    let title = plan_approval
+        .as_ref()
+        .and_then(|p| p.plan_title.clone())
+        .unwrap_or_else(|| {
+            tool_call
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("Approve tool execution")
+                .to_string()
+        });
+    let authoritative = crate::acp_tool_call_has_authoritative_identity(tool_call);
+    let detail = if plan_approval.is_none() && !authoritative {
+        crate::acp_title_only_detail(&title, tool_call)
+    } else {
+        map_acp_tool_detail(tool_call, None)
+    };
+    let allowed_decisions = perm_options.allowed_decisions(plan_approval.is_some(), authoritative);
 
     pending_perms.insert(
         req_id.clone(),
         PendingAcpPerm {
             rpc_id,
-            allow_option_id: allow_opt,
-            allow_always_option_id: allow_always_opt,
-            deny_option_id: deny_opt,
+            perm_options,
             is_question: false,
             raw_questions: Vec::new(),
         },
@@ -2881,7 +3036,8 @@ async fn handle_acp_permission_request(
             request_id: req_id.clone(),
             title,
             detail,
-            allowed_decisions: vec!["allow".into(), "allow_always".into(), "deny".into()],
+            allowed_decisions,
+            plan_approval,
         })
         .await;
     let _ = evt_tx
@@ -3017,19 +3173,21 @@ mod tests {
             } if command == "cargo test" && preview.contains("test result: ok.")
         ));
 
-        // P1 #13: reject_always and deny/cancel fallback option selection
+        // P1 #13: reject_always and deny/cancel fallback option selection + strict allow_once boundary
         let opts = vec![
             json!({"optionId": "allow_1", "kind": "allow_once"}),
             json!({"optionId": "deny_all", "kind": "reject_always"}),
         ];
         assert_eq!(
-            select_acp_option_id(&opts, "reject_once", "deny"),
-            "deny_all"
+            crate::AcpPermissionOptions::parse(&opts).deny.as_deref(),
+            Some("deny_all")
         );
         let cancel_opts = vec![json!({"optionId": "cancel_action"})];
         assert_eq!(
-            select_acp_option_id(&cancel_opts, "reject_once", "deny"),
-            "cancel_action"
+            crate::AcpPermissionOptions::parse(&cancel_opts)
+                .deny
+                .as_deref(),
+            Some("cancel_action")
         );
     }
 

@@ -18,8 +18,8 @@ use axum::{
 use chrono::Utc;
 use orbit_protocol::{
     AgentStatus, ImChannelRecord, ImConnectionStatus, ImPlatform, ImRoutingMode, ImThreadBinding,
-    ProviderKind, RouterImMirrorPolicy, SessionMode, TimelinePayload, ToolCallDetail,
-    WorktreeCreateMode, sanitize_im_allowlist,
+    ImTransportMode, ProviderKind, RouterImMirrorPolicy, SessionMode, TimelinePayload,
+    ToolCallDetail, WorktreeCreateMode, sanitize_im_allowlist,
 };
 use orbit_store::{OrbitStore, StoredImChannel};
 use serde_json::{Value, json};
@@ -30,6 +30,10 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::DaemonRuntime;
+use crate::im_longconn::{
+    ParsedDiscordInteraction, is_valid_ed25519_public_key_hex, parse_discord_interaction_create,
+    verify_discord_ed25519_signature,
+};
 use crate::manager::{AgentOrchestrator, CreateAgentSpec, DaemonBroadcast};
 
 pub const MAX_WEBHOOK_BODY_BYTES: usize = 512 * 1024;
@@ -61,9 +65,12 @@ pub struct UpsertImChannelSpec {
     pub name: String,
     pub platform: ImPlatform,
     pub enabled: bool,
+    pub transport_mode: ImTransportMode,
     pub app_id: Option<String>,
     pub primary_secret: Option<String>,
     pub signing_secret: Option<String>,
+    pub app_token: Option<String>,
+    pub public_key: Option<String>,
     pub keep_existing_secrets: bool,
     pub allowed_chat_ids: Vec<String>,
     pub allowed_user_ids: Vec<String>,
@@ -82,6 +89,7 @@ impl std::fmt::Debug for UpsertImChannelSpec {
             .field("name", &self.name)
             .field("platform", &self.platform)
             .field("enabled", &self.enabled)
+            .field("transport_mode", &self.transport_mode)
             .field("app_id", &self.app_id)
             .field(
                 "primary_secret",
@@ -91,6 +99,8 @@ impl std::fmt::Debug for UpsertImChannelSpec {
                 "signing_secret",
                 &self.signing_secret.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("app_token", &self.app_token.as_ref().map(|_| "[REDACTED]"))
+            .field("public_key", &self.public_key)
             .field("keep_existing_secrets", &self.keep_existing_secrets)
             .field("allowed_chat_ids", &self.allowed_chat_ids)
             .field("allowed_user_ids", &self.allowed_user_ids)
@@ -197,6 +207,55 @@ struct PollerHandle {
     abort: AbortHandle,
 }
 
+/// Strictly FIFO arrival-order serializer keyed by `(channel_id, chat_id, thread_id)`.
+/// Enqueueing never blocks the WebSocket read loop, guarantees tasks for the same key run
+/// strictly in arrival order (preventing concurrent duplicate-agent creation races), and
+/// automatically prunes completed keys so memory stays bounded.
+pub struct KeyedFifoDispatcher {
+    tails: std::sync::Mutex<HashMap<(String, String, String), tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl KeyedFifoDispatcher {
+    pub fn new() -> Self {
+        Self {
+            tails: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn enqueue<F>(&self, key: (String, String, String), fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let prev = if let Ok(mut guard) = self.tails.lock() {
+            if guard.len() >= 128 {
+                guard.retain(|_, tail_rx| {
+                    matches!(
+                        tail_rx.try_recv(),
+                        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                    )
+                });
+            }
+            guard.insert(key, rx)
+        } else {
+            None
+        };
+        tokio::spawn(async move {
+            if let Some(prev_rx) = prev {
+                let _ = prev_rx.await;
+            }
+            fut.await;
+            let _ = tx.send(());
+        });
+    }
+}
+
+impl Default for KeyedFifoDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Pure-Rust Bidirectional IM Bridge manager owned by `DaemonRuntime`.
 pub struct ImChannelBridge {
     store: Arc<OrbitStore>,
@@ -209,6 +268,7 @@ pub struct ImChannelBridge {
     callback_refs: Arc<Mutex<VecDeque<(String, CallbackApprovalRef)>>>,
     pollers: Arc<Mutex<HashMap<String, PollerHandle>>>,
     broadcast_task: Arc<Mutex<Option<AbortHandle>>>,
+    inbound_dispatcher: Arc<KeyedFifoDispatcher>,
     personal_router: RwLock<Option<Arc<crate::personal_router::PersonalRouterManager>>>,
     /// Test hook: skip `authorize_workspace_mutation_cwd` only in isolated unit tests.
     enforce_workspace_auth: bool,
@@ -231,6 +291,7 @@ impl ImChannelBridge {
             callback_refs: Arc::new(Mutex::new(VecDeque::new())),
             pollers: Arc::new(Mutex::new(HashMap::new())),
             broadcast_task: Arc::new(Mutex::new(None)),
+            inbound_dispatcher: Arc::new(KeyedFifoDispatcher::new()),
             personal_router: RwLock::new(None),
             enforce_workspace_auth: true,
         })
@@ -241,6 +302,38 @@ impl ImChannelBridge {
         router: Arc<crate::personal_router::PersonalRouterManager>,
     ) {
         *self.personal_router.write().await = Some(router);
+    }
+
+    pub(crate) fn store(&self) -> &Arc<OrbitStore> {
+        &self.store
+    }
+
+    pub(crate) async fn check_and_mark_dedup(&self, key: String) -> bool {
+        self.dedup.lock().await.check_and_insert(key)
+    }
+
+    /// Serialize inbound message execution in strict arrival order per `(channel_id, chat_id, thread_id)`.
+    pub(crate) fn spawn_serialized_inbound_message(
+        self: &Arc<Self>,
+        channel: StoredImChannel,
+        inbound: InboundImMessage,
+    ) {
+        let key = (
+            channel.channel_id.clone(),
+            inbound.chat_id.clone(),
+            inbound.thread_id.clone(),
+        );
+        let bridge = Arc::clone(self);
+        self.inbound_dispatcher.enqueue(key, async move {
+            if let Ok(Some(reply)) = bridge
+                .handle_inbound_message(&channel, inbound.clone())
+                .await
+            {
+                let _ = bridge
+                    .send_text_message(&channel, &inbound.chat_id, &inbound.thread_id, &reply)
+                    .await;
+            }
+        });
     }
 
     #[cfg(test)]
@@ -256,6 +349,7 @@ impl ImChannelBridge {
             callback_refs: Arc::new(Mutex::new(VecDeque::new())),
             pollers: Arc::new(Mutex::new(HashMap::new())),
             broadcast_task: Arc::new(Mutex::new(None)),
+            inbound_dispatcher: Arc::new(KeyedFifoDispatcher::new()),
             personal_router: RwLock::new(None),
             enforce_workspace_auth: false,
         })
@@ -418,17 +512,36 @@ impl ImChannelBridge {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(ToOwned::to_owned);
+        let clean_app_token_input = spec
+            .app_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
 
-        let (primary_secret, signing_secret) = if spec.keep_existing_secrets {
+        let (primary_secret, signing_secret, app_token) = if spec.keep_existing_secrets {
             (
                 clean_primary_input
                     .or_else(|| existing.as_ref().and_then(|e| e.primary_secret.clone())),
                 clean_signing_input
                     .or_else(|| existing.as_ref().and_then(|e| e.signing_secret.clone())),
+                clean_app_token_input
+                    .or_else(|| existing.as_ref().and_then(|e| e.app_token.clone())),
             )
         } else {
-            (clean_primary_input, clean_signing_input)
+            (
+                clean_primary_input,
+                clean_signing_input,
+                clean_app_token_input,
+            )
         };
+
+        let public_key = spec
+            .public_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase());
 
         let app_id = spec
             .app_id
@@ -437,14 +550,38 @@ impl ImChannelBridge {
             .filter(|s| !s.is_empty())
             .map(ToOwned::to_owned);
 
+        // Prevent duplicate enabled Slack Socket Mode channels sharing the same App-Level Token
+        // (Slack Socket Mode load-balances envelopes across sockets on the same `xapp-...` token,
+        // so a second active socket would steal events from the first channel).
+        if spec.enabled
+            && spec.platform == ImPlatform::Slack
+            && spec.transport_mode == ImTransportMode::LongConnection
+            && let Some(new_tok) = app_token.as_deref()
+        {
+            for other in self.store.list_im_channels()? {
+                if other.channel_id != channel_id
+                    && other.enabled
+                    && other.platform == ImPlatform::Slack
+                    && other.transport_mode == ImTransportMode::LongConnection
+                    && let Some(other_tok) = other.app_token.as_deref().map(str::trim)
+                    && constant_time_eq(new_tok.as_bytes(), other_tok.as_bytes())
+                {
+                    anyhow::bail!(
+                        "Another enabled Slack Socket Mode channel (`{}`) already uses this App-Level Token; disable it or switch to Webhook mode first",
+                        other.name
+                    );
+                }
+            }
+        }
+
         let allowed_chat_ids = sanitize_im_allowlist(spec.allowed_chat_ids);
         let allowed_user_ids = sanitize_im_allowlist(spec.allowed_user_ids);
 
         let (initial_status, initial_msg) = if !spec.enabled {
             (ImConnectionStatus::Disconnected, Some("Disabled".into()))
         } else {
-            match spec.platform {
-                ImPlatform::Telegram => {
+            match (spec.platform, spec.transport_mode) {
+                (ImPlatform::Telegram, ImTransportMode::LongConnection) => {
                     if primary_secret.is_some() {
                         (
                             ImConnectionStatus::Connecting,
@@ -454,24 +591,62 @@ impl ImChannelBridge {
                         (ImConnectionStatus::Error, Some("Bot token required".into()))
                     }
                 }
-                ImPlatform::Discord => {
+                (ImPlatform::Telegram, ImTransportMode::Webhook) => {
+                    if primary_secret.is_some() && signing_secret.is_some() {
+                        (ImConnectionStatus::Connected, Some("Webhook ready".into()))
+                    } else {
+                        (
+                            ImConnectionStatus::Disconnected,
+                            Some("Bot Token and Webhook Secret Token required".into()),
+                        )
+                    }
+                }
+                (ImPlatform::Discord, ImTransportMode::LongConnection) => {
                     if primary_secret.is_some() {
-                        if !allowed_chat_ids.is_empty() {
-                            (
-                                ImConnectionStatus::Connecting,
-                                Some("Starting channel polling".into()),
-                            )
-                        } else {
-                            (
-                                ImConnectionStatus::Connected,
-                                Some("Ready (add allowed chat IDs)".into()),
-                            )
-                        }
+                        (
+                            ImConnectionStatus::Connecting,
+                            Some("Connecting (WS)".into()),
+                        )
                     } else {
                         (ImConnectionStatus::Error, Some("Bot token required".into()))
                     }
                 }
-                ImPlatform::Lark => {
+                (ImPlatform::Discord, ImTransportMode::Webhook) => {
+                    if let Some(pk) = public_key.as_deref() {
+                        if !is_valid_ed25519_public_key_hex(pk) {
+                            (
+                                ImConnectionStatus::Error,
+                                Some("Invalid Ed25519 Public Key (expected 64 hex chars)".into()),
+                            )
+                        } else if primary_secret.is_some() {
+                            (ImConnectionStatus::Connected, Some("Webhook ready".into()))
+                        } else {
+                            (
+                                ImConnectionStatus::Disconnected,
+                                Some("Bot Token required for outbound replies".into()),
+                            )
+                        }
+                    } else {
+                        (
+                            ImConnectionStatus::Disconnected,
+                            Some("Ed25519 Public Key required for Discord webhooks".into()),
+                        )
+                    }
+                }
+                (ImPlatform::Lark, ImTransportMode::LongConnection) => {
+                    if app_id.is_some() && primary_secret.is_some() {
+                        (
+                            ImConnectionStatus::Connecting,
+                            Some("Connecting (WS)".into()),
+                        )
+                    } else {
+                        (
+                            ImConnectionStatus::Error,
+                            Some("App ID and App Secret required".into()),
+                        )
+                    }
+                }
+                (ImPlatform::Lark, ImTransportMode::Webhook) => {
                     if app_id.is_some() && primary_secret.is_some() && signing_secret.is_some() {
                         (ImConnectionStatus::Connected, Some("Webhook ready".into()))
                     } else {
@@ -481,7 +656,20 @@ impl ImChannelBridge {
                         )
                     }
                 }
-                ImPlatform::Slack => {
+                (ImPlatform::Slack, ImTransportMode::LongConnection) => {
+                    if primary_secret.is_some() && app_token.is_some() {
+                        (
+                            ImConnectionStatus::Connecting,
+                            Some("Connecting (WS)".into()),
+                        )
+                    } else {
+                        (
+                            ImConnectionStatus::Error,
+                            Some("Bot Token and App-Level Token (xapp-...) required".into()),
+                        )
+                    }
+                }
+                (ImPlatform::Slack, ImTransportMode::Webhook) => {
                     if primary_secret.is_some() && signing_secret.is_some() {
                         (ImConnectionStatus::Connected, Some("Webhook ready".into()))
                     } else {
@@ -499,12 +687,15 @@ impl ImChannelBridge {
             name,
             platform: spec.platform,
             enabled: spec.enabled,
+            transport_mode: spec.transport_mode,
             status: initial_status,
             status_message: initial_msg,
             webhook_path: spec.platform.webhook_path_for(&channel_id),
             app_id,
             primary_secret,
             signing_secret,
+            app_token,
+            public_key,
             allowed_chat_ids,
             allowed_user_ids,
             default_workspace_cwd: authorized_cwd,
@@ -604,7 +795,11 @@ impl ImChannelBridge {
         }
     }
 
-    /// Reconcile background NAT-friendly pollers for Telegram (`getUpdates`) and Discord (REST channel polling).
+    /// Reconcile background NAT-friendly runners:
+    /// - Feishu / Lark WebSocket Long-Connection (`pbbp2.Frame`)
+    /// - Slack Socket Mode (WSS)
+    /// - Discord Gateway v10 (WSS)
+    /// - Telegram `getUpdates` long-polling
     pub async fn reconcile_pollers(self: &Arc<Self>) {
         let channels = match self.store.list_im_channels() {
             Ok(list) => list,
@@ -615,24 +810,53 @@ impl ImChannelBridge {
         };
 
         let mut desired: HashMap<String, (String, StoredImChannel)> = HashMap::new();
+        let mut seen_slack_app_token_hashes: HashSet<String> = HashSet::new();
         for ch in channels {
-            if !ch.enabled {
+            if !ch.enabled || ch.transport_mode != ImTransportMode::LongConnection {
                 continue;
             }
             match ch.platform {
-                ImPlatform::Telegram if ch.primary_secret.is_some() => {
+                ImPlatform::Lark if ch.app_id.is_some() && ch.primary_secret.is_some() => {
                     let fp = format!(
-                        "tg:{}:{}",
+                        "lark-ws:{}:{}",
+                        ch.app_id.as_deref().unwrap_or(""),
                         sha256_hex(ch.primary_secret.as_deref().unwrap_or("").as_bytes()),
-                        ch.allowed_chat_ids.join(",")
                     );
                     desired.insert(ch.channel_id.clone(), (fp, ch));
                 }
-                ImPlatform::Discord
-                    if ch.primary_secret.is_some() && !ch.allowed_chat_ids.is_empty() =>
-                {
+                ImPlatform::Slack if ch.primary_secret.is_some() && ch.app_token.is_some() => {
+                    let app_tok_hash =
+                        sha256_hex(ch.app_token.as_deref().unwrap_or("").trim().as_bytes());
+                    if !seen_slack_app_token_hashes.insert(app_tok_hash.clone()) {
+                        warn!(
+                            channel_id = %ch.channel_id,
+                            "Skipping duplicate active Slack Socket Mode channel sharing the same App-Level Token"
+                        );
+                        let _ = self.store.update_im_channel_status(
+                            &ch.channel_id,
+                            ImConnectionStatus::Error,
+                            Some("Duplicate Slack App-Level Token active on another channel"),
+                            now_unix_ms(),
+                        );
+                        continue;
+                    }
                     let fp = format!(
-                        "dc:{}:{}",
+                        "slack-ws:{}:{}",
+                        sha256_hex(ch.primary_secret.as_deref().unwrap_or("").as_bytes()),
+                        app_tok_hash,
+                    );
+                    desired.insert(ch.channel_id.clone(), (fp, ch));
+                }
+                ImPlatform::Discord if ch.primary_secret.is_some() => {
+                    let fp = format!(
+                        "dc-ws:{}",
+                        sha256_hex(ch.primary_secret.as_deref().unwrap_or("").as_bytes()),
+                    );
+                    desired.insert(ch.channel_id.clone(), (fp, ch));
+                }
+                ImPlatform::Telegram if ch.primary_secret.is_some() => {
+                    let fp = format!(
+                        "tg:{}:{}",
                         sha256_hex(ch.primary_secret.as_deref().unwrap_or("").as_bytes()),
                         ch.allowed_chat_ids.join(",")
                     );
@@ -643,7 +867,7 @@ impl ImChannelBridge {
         }
 
         let mut pollers = self.pollers.lock().await;
-        // Stop removed or changed pollers
+        // Stop removed or changed runners
         let existing_ids: Vec<String> = pollers.keys().cloned().collect();
         for cid in existing_ids {
             let keep = desired
@@ -654,7 +878,7 @@ impl ImChannelBridge {
             }
         }
 
-        // Start new pollers
+        // Start new runners
         for (cid, (fp, ch)) in desired {
             if pollers.contains_key(&cid) {
                 continue;
@@ -664,9 +888,16 @@ impl ImChannelBridge {
             let platform = ch.platform;
             let handle = tokio::spawn(async move {
                 match platform {
+                    ImPlatform::Lark => {
+                        crate::im_longconn::run_lark_ws(bridge, channel_id_clone).await
+                    }
+                    ImPlatform::Slack => {
+                        crate::im_longconn::run_slack_socket_mode(bridge, channel_id_clone).await
+                    }
+                    ImPlatform::Discord => {
+                        crate::im_longconn::run_discord_gateway(bridge, channel_id_clone).await
+                    }
                     ImPlatform::Telegram => bridge.run_telegram_poller(channel_id_clone).await,
-                    ImPlatform::Discord => bridge.run_discord_poller(channel_id_clone).await,
-                    _ => {}
                 }
             });
             pollers.insert(
@@ -1473,10 +1704,15 @@ impl ImChannelBridge {
                 .await
             }
             ImPlatform::Discord => {
-                let body = format!(
-                    "**Orbit Approval Required**\n**Action:** {title}\n```\n{tool_summary}\n```\nReply `/approve {request_id}` or `/deny {request_id}`."
-                );
-                self.send_discord_text(channel, chat_id, &body).await
+                self.send_discord_approval_prompt(
+                    channel,
+                    chat_id,
+                    agent_id,
+                    request_id,
+                    title,
+                    tool_summary,
+                )
+                .await
             }
         }
     }
@@ -1977,7 +2213,348 @@ impl ImChannelBridge {
         Ok(())
     }
 
-    // ==================== NAT-FRIENDLY POLLING LOOPS (TELEGRAM & DISCORD) ====================
+    #[allow(clippy::too_many_arguments)]
+    async fn send_discord_approval_prompt(
+        &self,
+        channel: &StoredImChannel,
+        chat_id: &str,
+        agent_id: &str,
+        request_id: &str,
+        title: &str,
+        tool_summary: &str,
+    ) -> Result<(), String> {
+        let token = channel
+            .primary_secret
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| "Discord Bot Token is not configured".to_string())?;
+        if chat_id.is_empty() || !chat_id.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!(
+                "Discord target channel ID `{chat_id}` must be a numeric snowflake"
+            ));
+        }
+        let cb_token = self
+            .register_callback_token(&channel.channel_id, chat_id, agent_id, request_id)
+            .await;
+        let url = format!("https://discord.com/api/v10/channels/{chat_id}/messages");
+        let content = truncate_utf8_chars(
+            &format!(
+                "**Orbit Approval Required**\n**Action:** {title}\n```\n{tool_summary}\n```\nFallback: `/approve {request_id}` or `/deny {request_id}`."
+            ),
+            DISCORD_MAX_CHARS,
+        );
+        let payload = json!({
+            "content": content,
+            "components": [{
+                "type": 1,
+                "components": [
+                    {
+                        "type": 2,
+                        "style": 3,
+                        "label": "Approve",
+                        "custom_id": format!("orbit:allow:{cb_token}")
+                    },
+                    {
+                        "type": 2,
+                        "style": 4,
+                        "label": "Deny",
+                        "custom_id": format!("orbit:deny:{cb_token}")
+                    }
+                ]
+            }]
+        });
+        let (client, parsed) = build_pinned_im_client(&url, Duration::from_secs(15)).await?;
+        let resp = client
+            .post(parsed)
+            .header(reqwest::header::AUTHORIZATION, format!("Bot {token}"))
+            .header(reqwest::header::USER_AGENT, "Orbit-IM-Bridge/1.0")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| {
+                format_reqwest_err("Discord approval sendMessage failed", e, Some(token))
+            })?;
+        if !resp.status().is_success() {
+            let code = resp.status().as_u16();
+            let err_body = read_bounded_response_text(resp, Some(token))
+                .await
+                .unwrap_or_default();
+            return Err(format!(
+                "Discord approval API error (HTTP {code}): {}",
+                truncate_short(&err_body, 180)
+            ));
+        }
+        Ok(())
+    }
+
+    async fn resolve_discord_interaction(
+        self: &Arc<Self>,
+        channel: &StoredImChannel,
+        interaction: &ParsedDiscordInteraction,
+    ) -> Result<String, String> {
+        if !channel.enabled {
+            return Err("IM channel is disabled".to_string());
+        }
+
+        // Message component button click (`type == 3`): require single-use channel+chat callback token.
+        // Security invariant: check `forward_approvals` and sender authorization BEFORE consuming
+        // the single-use callback token so an unauthorized user in a shared chat cannot burn it.
+        if interaction.kind == 3
+            && let Some(custom_id) = interaction.custom_id.as_deref()
+        {
+            let parts: Vec<&str> = custom_id.split(':').collect();
+            if parts.len() == 3 && parts[0] == "orbit" && !parts[2].trim().is_empty() {
+                if !channel.forward_approvals {
+                    return Err("Remote approvals are disabled on this IM channel".to_string());
+                }
+                if !is_sender_authorized(channel, &interaction.chat_id, &interaction.user_id) {
+                    return Err("Sender/chat not allowlisted".to_string());
+                }
+                let decision = normalize_decision(parts[1]);
+                let resolved = self
+                    .take_callback_token(
+                        parts[2].trim(),
+                        &channel.channel_id,
+                        &interaction.chat_id,
+                        now_unix_ms(),
+                    )
+                    .await;
+                return match resolved {
+                    Some((agent_id, request_id)) => {
+                        self.handle_inbound_approval_action(
+                            channel,
+                            InboundApprovalAction {
+                                action_id: interaction.interaction_id.clone(),
+                                chat_id: interaction.chat_id.clone(),
+                                thread_id: String::new(),
+                                user_id: interaction.user_id.clone(),
+                                agent_id: Some(agent_id),
+                                request_id: Some(request_id),
+                                decision,
+                            },
+                        )
+                        .await
+                    }
+                    None => Err("Approval prompt expired or invalid.".to_string()),
+                };
+            }
+        }
+
+        // Application command (`type == 2`)
+        if interaction.kind == 2
+            && let Some(cmd_text) = interaction.command_text.as_deref()
+        {
+            return match self
+                .handle_inbound_message(
+                    channel,
+                    InboundImMessage {
+                        message_id: interaction.interaction_id.clone(),
+                        chat_id: interaction.chat_id.clone(),
+                        thread_id: String::new(),
+                        user_id: interaction.user_id.clone(),
+                        text: cmd_text.to_string(),
+                    },
+                )
+                .await
+            {
+                Ok(Some(reply)) => Ok(reply),
+                Ok(None) => Ok("Command accepted.".to_string()),
+                Err(err) => Err(err),
+            };
+        }
+
+        Err("Unsupported Discord interaction".to_string())
+    }
+
+    pub(crate) async fn handle_discord_gateway_interaction(
+        self: &Arc<Self>,
+        channel: &StoredImChannel,
+        interaction: ParsedDiscordInteraction,
+    ) {
+        // Deduplicate by Discord interaction.id so retries never double-execute
+        let inter_id = interaction.interaction_id.trim();
+        if !inter_id.is_empty()
+            && !self
+                .check_and_mark_dedup(format!("discord_inter:{}:{inter_id}", channel.channel_id))
+                .await
+        {
+            return;
+        }
+
+        let app_id_valid = is_safe_discord_snowflake(interaction.application_id.trim());
+        if app_id_valid {
+            // Immediately ACK within Discord's 3-second SLA using ephemeral type-5 DEFERRED response,
+            // then run resolution and PATCH `@original` so slow commands/approvals never time out.
+            if let Err(e) = self
+                .defer_discord_interaction(
+                    &interaction.interaction_id,
+                    &interaction.interaction_token,
+                )
+                .await
+            {
+                warn!(
+                    channel_id = %channel.channel_id,
+                    error = %e,
+                    "Failed to send Discord deferred interaction ACK"
+                );
+            }
+            let feedback = match self
+                .resolve_discord_interaction(channel, &interaction)
+                .await
+            {
+                Ok(msg) => msg,
+                Err(err) => err,
+            };
+            if let Err(e) = self
+                .edit_discord_original_response(
+                    &interaction.application_id,
+                    &interaction.interaction_token,
+                    &feedback,
+                )
+                .await
+            {
+                warn!(
+                    channel_id = %channel.channel_id,
+                    error = %e,
+                    "Failed to edit deferred Discord Gateway interaction response"
+                );
+            }
+            return;
+        }
+
+        // Fallback when application_id is absent: resolve inside a detached task with 2.2s ACK budget
+        let b = Arc::clone(self);
+        let ch = channel.clone();
+        let inter_clone = interaction.clone();
+        let feedback = crate::im_longconn::await_detached_with_deadline(
+            Duration::from_millis(2_200),
+            "Processing request…",
+            async move { b.resolve_discord_interaction(&ch, &inter_clone).await },
+        )
+        .await;
+        if let Err(e) = self
+            .respond_discord_interaction(
+                &interaction.interaction_id,
+                &interaction.interaction_token,
+                &feedback,
+            )
+            .await
+        {
+            warn!(
+                channel_id = %channel.channel_id,
+                error = %e,
+                "Failed to answer Discord Gateway interaction"
+            );
+        }
+    }
+
+    async fn defer_discord_interaction(
+        &self,
+        interaction_id: &str,
+        interaction_token: &str,
+    ) -> Result<(), String> {
+        let (id_trim, tok_trim) =
+            validate_discord_interaction_coords(interaction_id, interaction_token)?;
+        let url = format!("https://discord.com/api/v10/interactions/{id_trim}/{tok_trim}/callback");
+        let (client, parsed) = build_pinned_im_client(&url, Duration::from_secs(10)).await?;
+        let resp = client
+            .post(parsed)
+            .header(reqwest::header::USER_AGENT, "Orbit-IM-Bridge/1.0")
+            .json(&json!({
+                "type": 5,
+                "data": { "flags": 64 }
+            }))
+            .send()
+            .await
+            .map_err(|e| {
+                format_reqwest_err("Discord deferred callback failed", e, Some(tok_trim))
+            })?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "Discord deferred callback HTTP {}",
+                resp.status().as_u16()
+            ));
+        }
+        Ok(())
+    }
+
+    async fn edit_discord_original_response(
+        &self,
+        application_id: &str,
+        interaction_token: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        let app_trim = application_id.trim();
+        let tok_trim = interaction_token.trim();
+        if !is_safe_discord_snowflake(app_trim) {
+            return Err("Invalid Discord application ID".to_string());
+        }
+        if !is_safe_discord_interaction_token(tok_trim) {
+            return Err("Invalid Discord interaction token".to_string());
+        }
+        let url = format!(
+            "https://discord.com/api/v10/webhooks/{app_trim}/{tok_trim}/messages/@original"
+        );
+        let (client, parsed) = build_pinned_im_client(&url, Duration::from_secs(15)).await?;
+        let resp = client
+            .patch(parsed)
+            .header(reqwest::header::USER_AGENT, "Orbit-IM-Bridge/1.0")
+            .json(&json!({
+                "content": truncate_utf8_chars(content, DISCORD_MAX_CHARS)
+            }))
+            .send()
+            .await
+            .map_err(|e| {
+                format_reqwest_err(
+                    "Discord interaction followup edit failed",
+                    e,
+                    Some(tok_trim),
+                )
+            })?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "Discord interaction followup edit HTTP {}",
+                resp.status().as_u16()
+            ));
+        }
+        Ok(())
+    }
+
+    async fn respond_discord_interaction(
+        &self,
+        interaction_id: &str,
+        interaction_token: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        let (id_trim, tok_trim) =
+            validate_discord_interaction_coords(interaction_id, interaction_token)?;
+        let url = format!("https://discord.com/api/v10/interactions/{id_trim}/{tok_trim}/callback");
+        let (client, parsed) = build_pinned_im_client(&url, Duration::from_secs(10)).await?;
+        let resp = client
+            .post(parsed)
+            .header(reqwest::header::USER_AGENT, "Orbit-IM-Bridge/1.0")
+            .json(&json!({
+                "type": 4,
+                "data": {
+                    "content": truncate_utf8_chars(content, DISCORD_MAX_CHARS),
+                    "flags": 64
+                }
+            }))
+            .send()
+            .await
+            .map_err(|e| {
+                format_reqwest_err("Discord interaction callback failed", e, Some(tok_trim))
+            })?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "Discord interaction callback HTTP {}",
+                resp.status().as_u16()
+            ));
+        }
+        Ok(())
+    }
+
+    // ==================== NAT-FRIENDLY POLLING LOOP (TELEGRAM) ====================
 
     async fn run_telegram_poller(self: Arc<Self>, channel_id: String) {
         let mut offset: i64 = 0;
@@ -1985,7 +2562,13 @@ impl ImChannelBridge {
 
         loop {
             let channel = match self.store.get_im_channel(&channel_id) {
-                Ok(Some(ch)) if ch.enabled && ch.platform == ImPlatform::Telegram => ch,
+                Ok(Some(ch))
+                    if ch.enabled
+                        && ch.platform == ImPlatform::Telegram
+                        && ch.transport_mode == ImTransportMode::LongConnection =>
+                {
+                    ch
+                }
                 _ => break,
             };
             let Some(token) = channel
@@ -2072,29 +2655,44 @@ impl ImChannelBridge {
         update: &Value,
     ) {
         if let Some(cb) = parse_telegram_callback_query(update) {
-            // Require a valid, single-use, channel+chat-owned callback token — never accept forged raw IDs
-            let resolved = match cb.callback_token.as_deref() {
-                Some(tok) => {
-                    self.take_callback_token(tok, &channel.channel_id, &cb.chat_id, now_unix_ms())
+            // Check authorization & forward_approvals BEFORE consuming the single-use callback token
+            // so unauthorized users in a shared chat cannot burn an authorized approver's token.
+            let outcome = if !channel.enabled {
+                Err("IM channel is disabled".to_string())
+            } else if !channel.forward_approvals {
+                Err("Remote approvals are disabled on this IM channel".to_string())
+            } else if !is_sender_authorized(channel, &cb.chat_id, &cb.user_id) {
+                Err("Sender/chat not allowlisted".to_string())
+            } else {
+                // Require a valid, single-use, channel+chat-owned callback token — never accept forged raw IDs
+                let resolved = match cb.callback_token.as_deref() {
+                    Some(tok) => {
+                        self.take_callback_token(
+                            tok,
+                            &channel.channel_id,
+                            &cb.chat_id,
+                            now_unix_ms(),
+                        )
                         .await
-                }
-                None => None,
-            };
+                    }
+                    None => None,
+                };
 
-            let outcome = match resolved {
-                Some((resolved_agent, resolved_req)) => {
-                    let action = InboundApprovalAction {
-                        action_id: cb.callback_query_id.clone(),
-                        chat_id: cb.chat_id.clone(),
-                        thread_id: cb.thread_id.clone(),
-                        user_id: cb.user_id.clone(),
-                        agent_id: Some(resolved_agent),
-                        request_id: Some(resolved_req),
-                        decision: cb.decision.clone(),
-                    };
-                    self.handle_inbound_approval_action(channel, action).await
+                match resolved {
+                    Some((resolved_agent, resolved_req)) => {
+                        let action = InboundApprovalAction {
+                            action_id: cb.callback_query_id.clone(),
+                            chat_id: cb.chat_id.clone(),
+                            thread_id: cb.thread_id.clone(),
+                            user_id: cb.user_id.clone(),
+                            agent_id: Some(resolved_agent),
+                            request_id: Some(resolved_req),
+                            decision: cb.decision.clone(),
+                        };
+                        self.handle_inbound_approval_action(channel, action).await
+                    }
+                    None => Err("Approval prompt expired or invalid.".to_string()),
                 }
-                None => Err("Approval prompt expired or invalid.".to_string()),
             };
 
             match outcome {
@@ -2125,166 +2723,6 @@ impl ImChannelBridge {
         }
     }
 
-    async fn run_discord_poller(self: Arc<Self>, channel_id: String) {
-        let mut last_msg_by_chat: HashMap<String, String> = HashMap::new();
-        let mut backoff_secs: u64 = 4;
-
-        loop {
-            let channel = match self.store.get_im_channel(&channel_id) {
-                Ok(Some(ch)) if ch.enabled && ch.platform == ImPlatform::Discord => ch,
-                _ => break,
-            };
-            let Some(token) = channel
-                .primary_secret
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .map(ToOwned::to_owned)
-            else {
-                break;
-            };
-            if channel.allowed_chat_ids.is_empty() {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-
-            let mut any_ok = false;
-            let mut last_err: Option<String> = None;
-
-            for chat_id in &channel.allowed_chat_ids {
-                if chat_id.is_empty() || !chat_id.chars().all(|c| c.is_ascii_digit()) {
-                    continue;
-                }
-                let seeded = last_msg_by_chat.get(chat_id).cloned();
-                let url = match seeded
-                    .as_deref()
-                    .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
-                {
-                    Some(after) => format!(
-                        "https://discord.com/api/v10/channels/{chat_id}/messages?after={after}&limit=10"
-                    ),
-                    None => {
-                        format!("https://discord.com/api/v10/channels/{chat_id}/messages?limit=1")
-                    }
-                };
-
-                let fetch = async {
-                    let (client, parsed) =
-                        build_pinned_im_client(&url, Duration::from_secs(15)).await?;
-                    let resp = client
-                        .get(parsed)
-                        .header(reqwest::header::AUTHORIZATION, format!("Bot {token}"))
-                        .header(reqwest::header::USER_AGENT, "Orbit-IM-Bridge/1.0")
-                        .send()
-                        .await
-                        .map_err(|e| format_reqwest_err("Discord poll error", e, Some(&token)))?;
-                    if !resp.status().is_success() {
-                        return Err(format!("Discord poll HTTP {}", resp.status().as_u16()));
-                    }
-                    let val =
-                        read_bounded_response_json(resp, "Discord poll", Some(&token)).await?;
-                    serde_json::from_value::<Vec<Value>>(val)
-                        .map_err(|e| format!("Discord poll JSON array error: {e}"))
-                }
-                .await;
-
-                match fetch {
-                    Ok(mut msgs) => {
-                        any_ok = true;
-                        // Discord returns newest-first; sort ascending by numeric snowflake ID
-                        msgs.sort_by_key(|m| {
-                            m.get("id")
-                                .and_then(Value::as_str)
-                                .and_then(|s| s.parse::<u128>().ok())
-                                .unwrap_or(0)
-                        });
-                        if seeded.is_none() {
-                            // Seed cursor without replaying historical chat messages
-                            if let Some(latest_id) = msgs
-                                .last()
-                                .and_then(|m| m.get("id"))
-                                .and_then(Value::as_str)
-                                .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
-                            {
-                                last_msg_by_chat.insert(chat_id.clone(), latest_id.to_string());
-                            } else {
-                                last_msg_by_chat.insert(chat_id.clone(), "0".to_string());
-                            }
-                            continue;
-                        }
-                        for m in msgs {
-                            let Some(mid) = m
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
-                            else {
-                                continue;
-                            };
-                            last_msg_by_chat.insert(chat_id.clone(), mid.to_string());
-                            if m.pointer("/author/bot")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false)
-                            {
-                                continue;
-                            }
-                            let user_id = m
-                                .pointer("/author/id")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            let content = m
-                                .get("content")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .trim()
-                                .to_string();
-                            if content.is_empty() {
-                                continue;
-                            }
-                            let inbound = InboundImMessage {
-                                message_id: mid.to_string(),
-                                chat_id: chat_id.clone(),
-                                thread_id: String::new(),
-                                user_id,
-                                text: content,
-                            };
-                            if let Ok(Some(reply)) =
-                                self.handle_inbound_message(&channel, inbound).await
-                            {
-                                let _ = self.send_discord_text(&channel, chat_id, &reply).await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        last_err = Some(e);
-                    }
-                }
-            }
-
-            if any_ok {
-                backoff_secs = 4;
-                if channel.status != ImConnectionStatus::Connected {
-                    let _ = self.store.update_im_channel_status(
-                        &channel_id,
-                        ImConnectionStatus::Connected,
-                        Some("Channel polling active"),
-                        now_unix_ms(),
-                    );
-                }
-            } else if let Some(err) = last_err {
-                warn!(channel_id = %channel_id, error = %err, "Discord poll failed");
-                let _ = self.store.update_im_channel_status(
-                    &channel_id,
-                    ImConnectionStatus::Error,
-                    Some(&truncate_for_status(&err)),
-                    now_unix_ms(),
-                );
-                backoff_secs = (backoff_secs * 2).min(30);
-            }
-
-            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-        }
-    }
-
     // ==================== INBOUND WEBHOOK HANDLERS ====================
 
     pub async fn handle_lark_webhook(
@@ -2299,7 +2737,10 @@ impl ImChannelBridge {
         let Ok(Some(channel)) = self.store.get_im_channel(channel_id) else {
             return (StatusCode::NOT_FOUND, "Channel not found").into_response();
         };
-        if channel.platform != ImPlatform::Lark || !channel.enabled {
+        if channel.platform != ImPlatform::Lark
+            || !channel.enabled
+            || channel.transport_mode != ImTransportMode::Webhook
+        {
             return (StatusCode::FORBIDDEN, "Channel unavailable").into_response();
         }
 
@@ -2359,18 +2800,7 @@ impl ImChannelBridge {
 
         // 3. `im.message.receive_v1` text event
         if let Some(inbound) = parse_lark_message_event(&payload) {
-            let bridge = Arc::clone(self);
-            let ch_clone = channel.clone();
-            tokio::spawn(async move {
-                if let Ok(Some(reply)) = bridge
-                    .handle_inbound_message(&ch_clone, inbound.clone())
-                    .await
-                {
-                    let _ = bridge
-                        .send_lark_text(&ch_clone, &inbound.chat_id, &inbound.thread_id, &reply)
-                        .await;
-                }
-            });
+            self.spawn_serialized_inbound_message(channel, inbound);
         }
 
         (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
@@ -2388,7 +2818,10 @@ impl ImChannelBridge {
         let Ok(Some(channel)) = self.store.get_im_channel(channel_id) else {
             return (StatusCode::NOT_FOUND, "Channel not found").into_response();
         };
-        if channel.platform != ImPlatform::Slack || !channel.enabled {
+        if channel.platform != ImPlatform::Slack
+            || !channel.enabled
+            || channel.transport_mode != ImTransportMode::Webhook
+        {
             return (StatusCode::FORBIDDEN, "Channel unavailable").into_response();
         }
 
@@ -2448,18 +2881,7 @@ impl ImChannelBridge {
         }
 
         if let Some(inbound) = parse_slack_event_callback(&payload) {
-            let bridge = Arc::clone(self);
-            let ch_clone = channel.clone();
-            tokio::spawn(async move {
-                if let Ok(Some(reply)) = bridge
-                    .handle_inbound_message(&ch_clone, inbound.clone())
-                    .await
-                {
-                    let _ = bridge
-                        .send_slack_text(&ch_clone, &inbound.chat_id, &inbound.thread_id, &reply)
-                        .await;
-                }
-            });
+            self.spawn_serialized_inbound_message(channel, inbound);
         }
 
         (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
@@ -2477,7 +2899,10 @@ impl ImChannelBridge {
         let Ok(Some(channel)) = self.store.get_im_channel(channel_id) else {
             return (StatusCode::NOT_FOUND, "Channel not found").into_response();
         };
-        if channel.platform != ImPlatform::Telegram || !channel.enabled {
+        if channel.platform != ImPlatform::Telegram
+            || !channel.enabled
+            || channel.transport_mode != ImTransportMode::Webhook
+        {
             return (StatusCode::FORBIDDEN, "Channel unavailable").into_response();
         }
 
@@ -2518,18 +2943,29 @@ impl ImChannelBridge {
         let Ok(Some(channel)) = self.store.get_im_channel(channel_id) else {
             return (StatusCode::NOT_FOUND, "Channel not found").into_response();
         };
-        if channel.platform != ImPlatform::Discord || !channel.enabled {
+        if channel.platform != ImPlatform::Discord
+            || !channel.enabled
+            || channel.transport_mode != ImTransportMode::Webhook
+        {
             return (StatusCode::FORBIDDEN, "Channel unavailable").into_response();
         }
 
-        let secret_hdr = header_str(headers, "x-orbit-im-secret")
-            .or_else(|| header_str(headers, "x-signature-secret"));
-        if let Err(reason) = verify_webhook_secret_header(
-            channel.signing_secret.as_deref().unwrap_or(""),
-            secret_hdr,
-            "Discord webhook secret",
+        // Fail-closed strict Ed25519 signature verification (`X-Signature-Ed25519` + `X-Signature-Timestamp`)
+        let sig_hdr = header_str(headers, "x-signature-ed25519").unwrap_or("");
+        let ts_hdr = header_str(headers, "x-signature-timestamp").unwrap_or("");
+        let now_secs = Utc::now().timestamp();
+        if let Err(reason) = verify_discord_ed25519_signature(
+            channel.public_key.as_deref().unwrap_or(""),
+            ts_hdr,
+            sig_hdr,
+            body,
+            now_secs,
         ) {
-            warn!(channel_id = %channel.channel_id, reason = %reason, "Rejected Discord webhook");
+            warn!(
+                channel_id = %channel.channel_id,
+                reason = %reason,
+                "Rejected Discord webhook (Ed25519 verification failed)"
+            );
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
 
@@ -2537,27 +2973,128 @@ impl ImChannelBridge {
             return (StatusCode::BAD_REQUEST, "Invalid JSON").into_response();
         };
 
-        // Discord interaction PING
+        // 1. Discord interaction PING (`type == 1`)
         if payload.get("type").and_then(Value::as_u64) == Some(1) {
             return (StatusCode::OK, Json(json!({ "type": 1 }))).into_response();
         }
 
-        if let Some(inbound) = parse_discord_webhook_message(&payload) {
+        // 2. Discord component button (`type == 3`) or slash command (`type == 2`) interaction
+        if let Some(interaction) = parse_discord_interaction_create(&payload)
+            && matches!(interaction.kind, 2 | 3)
+        {
+            let inter_id = interaction.interaction_id.trim();
+            if !inter_id.is_empty()
+                && !self
+                    .check_and_mark_dedup(format!(
+                        "discord_inter:{}:{inter_id}",
+                        channel.channel_id
+                    ))
+                    .await
+            {
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "type": 4,
+                        "data": { "content": "Already processed.", "flags": 64 }
+                    })),
+                )
+                    .into_response();
+            }
+
+            let can_followup = is_safe_discord_snowflake(interaction.application_id.trim())
+                && is_safe_discord_interaction_token(interaction.interaction_token.trim());
+
+            // Potentially slow slash commands (`type == 2`): acknowledge immediately with
+            // ephemeral `type: 5` (DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE) and PATCH `@original`
+            // so Discord never hits its 3-second timeout and prompts duplicate retries.
+            if interaction.kind == 2 && can_followup {
+                let bridge = Arc::clone(self);
+                let ch_clone = channel.clone();
+                let inter_clone = interaction.clone();
+                tokio::spawn(async move {
+                    let feedback = match bridge
+                        .resolve_discord_interaction(&ch_clone, &inter_clone)
+                        .await
+                    {
+                        Ok(msg) => msg,
+                        Err(err) => err,
+                    };
+                    let _ = bridge
+                        .edit_discord_original_response(
+                            &inter_clone.application_id,
+                            &inter_clone.interaction_token,
+                            &feedback,
+                        )
+                        .await;
+                });
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "type": 5,
+                        "data": { "flags": 64 }
+                    })),
+                )
+                    .into_response();
+            }
+
+            // Button approvals (`type == 3`) or interactions without `application_id`: run inside
+            // a detached task (never cancelled mid-flight!) and return instant `type: 4` if done
+            // within 2s, or `type: 5` deferred + background PATCH `@original` if it runs longer.
+            let (tx, rx) = tokio::sync::oneshot::channel();
             let bridge = Arc::clone(self);
             let ch_clone = channel.clone();
+            let inter_clone = interaction.clone();
             tokio::spawn(async move {
-                if let Ok(Some(reply)) = bridge
-                    .handle_inbound_message(&ch_clone, inbound.clone())
+                let feedback = match bridge
+                    .resolve_discord_interaction(&ch_clone, &inter_clone)
                     .await
                 {
+                    Ok(msg) => msg,
+                    Err(err) => err,
+                };
+                if tx.send(feedback.clone()).is_err() && can_followup {
                     let _ = bridge
-                        .send_discord_text(&ch_clone, &inbound.chat_id, &reply)
+                        .edit_discord_original_response(
+                            &inter_clone.application_id,
+                            &inter_clone.interaction_token,
+                            &feedback,
+                        )
                         .await;
                 }
             });
+
+            return match tokio::time::timeout(Duration::from_millis(2_000), rx).await {
+                Ok(Ok(feedback)) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "type": 4,
+                        "data": {
+                            "content": truncate_utf8_chars(&feedback, DISCORD_MAX_CHARS),
+                            "flags": 64
+                        }
+                    })),
+                )
+                    .into_response(),
+                _ if can_followup => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "type": 5,
+                        "data": { "flags": 64 }
+                    })),
+                )
+                    .into_response(),
+                _ => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "type": 4,
+                        "data": { "content": "Processing request…", "flags": 64 }
+                    })),
+                )
+                    .into_response(),
+            };
         }
 
-        (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+        (StatusCode::BAD_REQUEST, "Unsupported Discord interaction").into_response()
     }
 }
 
@@ -2658,7 +3195,7 @@ async fn read_bounded_response_bytes(
     Ok(buf)
 }
 
-async fn read_bounded_response_json(
+pub(crate) async fn read_bounded_response_json(
     resp: reqwest::Response,
     label: &str,
     redact_secret: Option<&str>,
@@ -2864,7 +3401,7 @@ pub fn is_sender_authorized(channel: &StoredImChannel, chat_id: &str, user_id: &
 }
 
 /// DNS-pinned, no-redirect, `.no_proxy()` HTTPS client restricted strictly to known IM platform hosts.
-async fn build_pinned_im_client(
+pub(crate) async fn build_pinned_im_client(
     url_raw: &str,
     timeout: Duration,
 ) -> Result<(reqwest::Client, reqwest::Url), String> {
@@ -3475,52 +4012,31 @@ pub fn parse_slack_interactive_action(payload: &Value) -> Option<InboundApproval
     })
 }
 
-fn parse_discord_webhook_message(payload: &Value) -> Option<InboundImMessage> {
-    if payload
-        .pointer("/author/bot")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return None;
+fn is_safe_discord_snowflake(raw: &str) -> bool {
+    !raw.is_empty() && raw.len() <= 32 && raw.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_safe_discord_interaction_token(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.len() <= 512
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+fn validate_discord_interaction_coords<'a>(
+    interaction_id: &'a str,
+    interaction_token: &'a str,
+) -> Result<(&'a str, &'a str), String> {
+    let id_trim = interaction_id.trim();
+    let tok_trim = interaction_token.trim();
+    if !is_safe_discord_snowflake(id_trim) {
+        return Err("Invalid Discord interaction ID".to_string());
     }
-    let text = payload
-        .get("content")
-        .and_then(Value::as_str)
-        .or_else(|| payload.get("text").and_then(Value::as_str))?
-        .trim()
-        .to_string();
-    if text.is_empty() {
-        return None;
+    if !is_safe_discord_interaction_token(tok_trim) {
+        return Err("Invalid Discord interaction token".to_string());
     }
-    let chat_id = payload
-        .get("channel_id")
-        .and_then(Value::as_str)
-        .or_else(|| payload.get("chat_id").and_then(Value::as_str))?
-        .to_string();
-    let user_id = payload
-        .pointer("/author/id")
-        .and_then(Value::as_str)
-        .or_else(|| payload.get("user_id").and_then(Value::as_str))
-        .unwrap_or("")
-        .to_string();
-    let message_id = payload
-        .get("id")
-        .and_then(Value::as_str)
-        .or_else(|| payload.get("message_id").and_then(Value::as_str))
-        .unwrap_or("")
-        .to_string();
-    let thread_id = payload
-        .get("thread_id")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    Some(InboundImMessage {
-        message_id,
-        chat_id,
-        thread_id,
-        user_id,
-        text,
-    })
+    Ok((id_trim, tok_trim))
 }
 
 // ==================== SLASH COMMANDS & UTF-8 CHUNKING ====================
@@ -3619,7 +4135,7 @@ fn truncate_short(text: &str, max_chars: usize) -> String {
     truncate_utf8_chars(text.trim(), max_chars)
 }
 
-fn truncate_for_status(text: &str) -> String {
+pub(crate) fn truncate_for_status(text: &str) -> String {
     truncate_utf8_chars(text.trim(), 160)
 }
 
@@ -3719,7 +4235,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-fn now_unix_ms() -> u64 {
+pub(crate) fn now_unix_ms() -> u64 {
     u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0)
 }
 
@@ -3766,12 +4282,15 @@ mod tests {
             name: "Feishu Bot".into(),
             platform: ImPlatform::Lark,
             enabled: true,
+            transport_mode: ImTransportMode::Webhook,
             status: ImConnectionStatus::Connected,
             status_message: None,
             webhook_path: "/im/lark/im_lark_test".into(),
             app_id: Some("cli_abc".into()),
             primary_secret: Some("app_secret_9999".into()),
             signing_secret: Some("lark_verify_secret_1234".into()),
+            app_token: None,
+            public_key: None,
             allowed_chat_ids: vec!["oc_allowed_1".into()],
             allowed_user_ids: vec!["ou_allowed_1".into()],
             default_workspace_cwd: "/tmp".into(),
@@ -3884,11 +4403,14 @@ mod tests {
         let spec = UpsertImChannelSpec {
             channel_id: Some("im_1".into()),
             name: "Bot".into(),
-            platform: ImPlatform::Telegram,
+            platform: ImPlatform::Slack,
             enabled: true,
+            transport_mode: ImTransportMode::LongConnection,
             app_id: None,
             primary_secret: Some("super_secret_bot_token".into()),
             signing_secret: Some("super_secret_signing".into()),
+            app_token: Some("xapp-1-SUPER-SECRET-APP-TOKEN".into()),
+            public_key: None,
             keep_existing_secrets: true,
             allowed_chat_ids: vec!["123".into()],
             allowed_user_ids: Vec::new(),
@@ -3902,6 +4424,7 @@ mod tests {
         let dbg = format!("{spec:?}");
         assert!(!dbg.contains("super_secret_bot_token"));
         assert!(!dbg.contains("super_secret_signing"));
+        assert!(!dbg.contains("xapp-1-SUPER-SECRET-APP-TOKEN"));
         assert!(dbg.contains("[REDACTED]"));
 
         let tok = CachedLarkToken {
@@ -4148,9 +4671,12 @@ mod tests {
                 name: "Ops Telegram".into(),
                 platform: ImPlatform::Telegram,
                 enabled: false,
+                transport_mode: ImTransportMode::LongConnection,
                 app_id: None,
                 primary_secret: Some("123456:ABCDEF_SECRET_TOKEN".into()),
                 signing_secret: Some("tg_hook_secret_9876".into()),
+                app_token: Some("xapp-1-A123-SECRET-5555".into()),
+                public_key: None,
                 keep_existing_secrets: true,
                 allowed_chat_ids: vec!["10001".into()],
                 allowed_user_ids: Vec::new(),
@@ -4166,9 +4692,14 @@ mod tests {
         assert_eq!(snap.channels.len(), 1);
         assert!(snap.channels[0].has_primary_secret);
         assert!(snap.channels[0].has_signing_secret);
+        assert!(snap.channels[0].has_app_token);
         assert_eq!(
             snap.channels[0].masked_primary_secret.as_deref(),
             Some("••••OKEN")
+        );
+        assert_eq!(
+            snap.channels[0].masked_app_token.as_deref(),
+            Some("••••5555")
         );
 
         let snap2 = bridge
@@ -4177,9 +4708,12 @@ mod tests {
                 name: "Ops Telegram Renamed".into(),
                 platform: ImPlatform::Telegram,
                 enabled: false,
+                transport_mode: ImTransportMode::LongConnection,
                 app_id: None,
                 primary_secret: None,
                 signing_secret: None,
+                app_token: None,
+                public_key: None,
                 keep_existing_secrets: true,
                 allowed_chat_ids: vec!["10001".into()],
                 allowed_user_ids: Vec::new(),
@@ -4194,6 +4728,7 @@ mod tests {
             .expect("update keeping secrets");
         assert!(snap2.channels[0].has_primary_secret);
         assert!(snap2.channels[0].has_signing_secret);
+        assert!(snap2.channels[0].has_app_token);
 
         let snap3 = bridge
             .upsert_channel(UpsertImChannelSpec {
@@ -4201,9 +4736,12 @@ mod tests {
                 name: "Ops Telegram Cleared".into(),
                 platform: ImPlatform::Telegram,
                 enabled: false,
+                transport_mode: ImTransportMode::LongConnection,
                 app_id: None,
                 primary_secret: Some("new_bot_token_1111".into()),
                 signing_secret: None,
+                app_token: None,
+                public_key: None,
                 keep_existing_secrets: false,
                 allowed_chat_ids: vec!["10001".into()],
                 allowed_user_ids: Vec::new(),
@@ -4218,12 +4756,15 @@ mod tests {
             .expect("update clearing signing secret");
         assert!(snap3.channels[0].has_primary_secret);
         assert!(!snap3.channels[0].has_signing_secret);
+        assert!(!snap3.channels[0].has_app_token);
         assert_eq!(snap3.channels[0].masked_signing_secret, None);
+        assert_eq!(snap3.channels[0].masked_app_token, None);
         let stored = store
             .get_im_channel("im_tg_1")
             .expect("load")
             .expect("exists");
         assert_eq!(stored.signing_secret, None);
+        assert_eq!(stored.app_token, None);
         assert_eq!(stored.primary_secret.as_deref(), Some("new_bot_token_1111"));
     }
 
@@ -4259,6 +4800,8 @@ mod tests {
                 },
                 allowed_decisions: vec!["allow".into(), "deny".into()],
                 guardian_assessment: None,
+                plan_approval: None,
+                human_only: false,
                 created_at: Utc::now(),
             })
             .await;
@@ -4318,6 +4861,8 @@ mod tests {
                     },
                     allowed_decisions: vec!["allow".into(), "deny".into()],
                     guardian_assessment: None,
+                    plan_approval: None,
+                    human_only: false,
                     created_at: Utc::now(),
                 })
                 .await;
@@ -4530,6 +5075,8 @@ mod tests {
                 },
                 allowed_decisions: vec!["allow".into(), "deny".into()],
                 guardian_assessment: None,
+                plan_approval: None,
+                human_only: false,
                 created_at: Utc::now(),
             })
             .await;
@@ -4584,6 +5131,8 @@ mod tests {
                 },
                 allowed_decisions: vec!["allow".into(), "deny".into()],
                 guardian_assessment: None,
+                plan_approval: None,
+                human_only: false,
                 created_at: Utc::now(),
             })
             .await;
@@ -4628,5 +5177,624 @@ mod tests {
         let (ok2, msg2) = bridge.test_channel("im_any", &long_id, "hi").await;
         assert!(!ok2);
         assert!(msg2.contains("invalid"));
+    }
+
+    #[tokio::test]
+    async fn discord_webhook_enforces_ed25519_and_resolves_button_approval() {
+        use axum::http::HeaderValue;
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let (store, orchestrator, bridge) = build_test_bridge().await;
+        let signing_key = SigningKey::from_bytes(&[0x5au8; 32]);
+        let pubkey_hex = hex_encode(signing_key.verifying_key().as_bytes());
+
+        let dc_ch = StoredImChannel {
+            channel_id: "im_dc_ed25519".into(),
+            name: "Discord Webhook".into(),
+            platform: ImPlatform::Discord,
+            enabled: true,
+            transport_mode: ImTransportMode::Webhook,
+            status: ImConnectionStatus::Connected,
+            status_message: Some("Webhook ready".into()),
+            webhook_path: "/im/discord/im_dc_ed25519".into(),
+            app_id: None,
+            primary_secret: Some("dc_bot_token_secret".into()),
+            signing_secret: None,
+            app_token: None,
+            public_key: Some(pubkey_hex),
+            allowed_chat_ids: vec!["9988776655".into()],
+            allowed_user_ids: vec!["444333".into()],
+            default_workspace_cwd: "/tmp".into(),
+            default_provider: ProviderKind::ClaudeCode,
+            default_mode: SessionMode::Default,
+            forward_approvals: true,
+            routing_mode: ImRoutingMode::PerThreadAgent,
+            router_mirror_policy: RouterImMirrorPolicy::MilestonesAndApprovals,
+            message_count: 0,
+            last_activity_at_ms: None,
+            created_at_ms: now_unix_ms(),
+            updated_at_ms: now_unix_ms(),
+        };
+        store.upsert_im_channel(&dc_ch).expect("save dc channel");
+        store
+            .upsert_im_binding(&ImThreadBinding {
+                channel_id: dc_ch.channel_id.clone(),
+                external_chat_id: "9988776655".into(),
+                external_thread_id: String::new(),
+                agent_id: "ag_dc_1".into(),
+                updated_at_ms: now_unix_ms(),
+            })
+            .expect("save dc binding");
+
+        let sign_headers = |body: &[u8], ts: i64| -> HeaderMap {
+            let ts_str = ts.to_string();
+            let mut msg = Vec::new();
+            msg.extend_from_slice(ts_str.as_bytes());
+            msg.extend_from_slice(body);
+            let sig_hex = hex_encode(&signing_key.sign(&msg).to_bytes());
+            let mut map = HeaderMap::new();
+            map.insert(
+                "x-signature-ed25519",
+                HeaderValue::from_str(&sig_hex).expect("sig hdr"),
+            );
+            map.insert(
+                "x-signature-timestamp",
+                HeaderValue::from_str(&ts_str).expect("ts hdr"),
+            );
+            map
+        };
+
+        let now_secs = Utc::now().timestamp();
+        let ping_body = br#"{"type":1}"#;
+
+        // 1. Missing headers -> 401 UNAUTHORIZED (fail-closed)
+        let resp_missing = bridge
+            .handle_discord_webhook("im_dc_ed25519", &HeaderMap::new(), ping_body)
+            .await;
+        assert_eq!(resp_missing.status(), StatusCode::UNAUTHORIZED);
+
+        // 2. Stale timestamp (> 5 min) -> 401 UNAUTHORIZED
+        let stale_hdrs = sign_headers(ping_body, now_secs - 400);
+        let resp_stale = bridge
+            .handle_discord_webhook("im_dc_ed25519", &stale_hdrs, ping_body)
+            .await;
+        assert_eq!(resp_stale.status(), StatusCode::UNAUTHORIZED);
+
+        // 3. Valid Ed25519 PING -> 200 OK
+        let valid_ping_hdrs = sign_headers(ping_body, now_secs);
+        let resp_ping = bridge
+            .handle_discord_webhook("im_dc_ed25519", &valid_ping_hdrs, ping_body)
+            .await;
+        assert_eq!(resp_ping.status(), StatusCode::OK);
+
+        // 4. Tampered body with valid signature for original body -> 401 UNAUTHORIZED
+        let resp_tampered = bridge
+            .handle_discord_webhook("im_dc_ed25519", &valid_ping_hdrs, br#"{"type":2}"#)
+            .await;
+        assert_eq!(resp_tampered.status(), StatusCode::UNAUTHORIZED);
+
+        // 5. Signed type=3 button approval resolves pending permission
+        orchestrator
+            .insert_pending_permission_for_test(PendingPermissionSummary {
+                agent_id: "ag_dc_1".into(),
+                agent_title: "Discord Agent".into(),
+                workspace_id: "ws_1".into(),
+                request_id: "perm_dc_1".into(),
+                title: "Run tests".into(),
+                detail: ToolCallDetail::Shell {
+                    command: "cargo test".into(),
+                    cwd: Some("/tmp".into()),
+                    exit_code: None,
+                    output_preview: None,
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                guardian_assessment: None,
+                plan_approval: None,
+                human_only: false,
+                created_at: Utc::now(),
+            })
+            .await;
+        let cb_tok = bridge
+            .register_callback_token("im_dc_ed25519", "9988776655", "ag_dc_1", "perm_dc_1")
+            .await;
+        let btn_body = serde_json::to_vec(&json!({
+            "id": "8877665544",
+            "token": "interaction_tok",
+            "type": 3,
+            "channel_id": "9988776655",
+            "member": { "user": { "id": "444333" } },
+            "data": { "custom_id": format!("orbit:allow:{cb_tok}") }
+        }))
+        .expect("btn json");
+        let btn_hdrs = sign_headers(&btn_body, now_secs);
+        let resp_btn = bridge
+            .handle_discord_webhook("im_dc_ed25519", &btn_hdrs, &btn_body)
+            .await;
+        assert_eq!(resp_btn.status(), StatusCode::OK);
+        assert!(
+            !orchestrator.has_pending_permissions("ag_dc_1").await,
+            "signed Discord button click must resolve pending permission"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_channel_validates_transport_modes_and_never_leaks_secrets() {
+        use ed25519_dalek::SigningKey;
+
+        let (_store, _orch, bridge) = build_test_bridge().await;
+
+        // 1. Slack LongConnection without app_token -> Error status (no WS runner spawned)
+        let slack_missing = bridge
+            .upsert_channel(UpsertImChannelSpec {
+                channel_id: Some("im_slack_lc".into()),
+                name: "Slack Socket".into(),
+                platform: ImPlatform::Slack,
+                enabled: true,
+                transport_mode: ImTransportMode::LongConnection,
+                app_id: None,
+                primary_secret: Some("xoxb-secret-bot-token-9999".into()),
+                signing_secret: None,
+                app_token: None,
+                public_key: None,
+                keep_existing_secrets: false,
+                allowed_chat_ids: vec!["C1".into()],
+                allowed_user_ids: Vec::new(),
+                default_workspace_cwd: "/tmp".into(),
+                default_provider: ProviderKind::ClaudeCode,
+                default_mode: SessionMode::Default,
+                forward_approvals: true,
+                routing_mode: ImRoutingMode::PerThreadAgent,
+                router_mirror_policy: RouterImMirrorPolicy::MilestonesAndApprovals,
+            })
+            .await
+            .expect("upsert slack missing app_token");
+        let rec = slack_missing
+            .channels
+            .iter()
+            .find(|c| c.channel_id == "im_slack_lc")
+            .expect("slack channel present");
+        assert_eq!(rec.status, ImConnectionStatus::Error);
+        assert!(
+            rec.status_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("xapp-")
+        );
+
+        // 2. Discord Webhook with invalid hex public_key -> Error; with valid Ed25519 key -> Webhook ready
+        let dc_bad = bridge
+            .upsert_channel(UpsertImChannelSpec {
+                channel_id: Some("im_dc_wh".into()),
+                name: "Discord WH".into(),
+                platform: ImPlatform::Discord,
+                enabled: true,
+                transport_mode: ImTransportMode::Webhook,
+                app_id: None,
+                primary_secret: Some("dc_bot_secret_8888".into()),
+                signing_secret: None,
+                app_token: None,
+                public_key: Some("not-valid-hex".into()),
+                keep_existing_secrets: false,
+                allowed_chat_ids: vec!["12345".into()],
+                allowed_user_ids: Vec::new(),
+                default_workspace_cwd: "/tmp".into(),
+                default_provider: ProviderKind::ClaudeCode,
+                default_mode: SessionMode::Default,
+                forward_approvals: true,
+                routing_mode: ImRoutingMode::PerThreadAgent,
+                router_mirror_policy: RouterImMirrorPolicy::MilestonesAndApprovals,
+            })
+            .await
+            .expect("upsert dc bad key");
+        let bad_rec = dc_bad
+            .channels
+            .iter()
+            .find(|c| c.channel_id == "im_dc_wh")
+            .expect("dc channel");
+        assert_eq!(bad_rec.status, ImConnectionStatus::Error);
+
+        let valid_pk = hex_encode(
+            SigningKey::from_bytes(&[0x33u8; 32])
+                .verifying_key()
+                .as_bytes(),
+        );
+        let dc_ok = bridge
+            .upsert_channel(UpsertImChannelSpec {
+                channel_id: Some("im_dc_wh".into()),
+                name: "Discord WH".into(),
+                platform: ImPlatform::Discord,
+                enabled: true,
+                transport_mode: ImTransportMode::Webhook,
+                app_id: None,
+                primary_secret: Some("dc_bot_secret_8888".into()),
+                signing_secret: None,
+                app_token: None,
+                public_key: Some(valid_pk.clone()),
+                keep_existing_secrets: false,
+                allowed_chat_ids: vec!["12345".into()],
+                allowed_user_ids: Vec::new(),
+                default_workspace_cwd: "/tmp".into(),
+                default_provider: ProviderKind::ClaudeCode,
+                default_mode: SessionMode::Default,
+                forward_approvals: true,
+                routing_mode: ImRoutingMode::PerThreadAgent,
+                router_mirror_policy: RouterImMirrorPolicy::MilestonesAndApprovals,
+            })
+            .await
+            .expect("upsert dc valid key");
+        let ok_rec = dc_ok
+            .channels
+            .iter()
+            .find(|c| c.channel_id == "im_dc_wh")
+            .expect("dc channel ok");
+        assert_eq!(ok_rec.status, ImConnectionStatus::Connected);
+        assert_eq!(ok_rec.status_message.as_deref(), Some("Webhook ready"));
+        assert_eq!(ok_rec.public_key.as_deref(), Some(valid_pk.as_str()));
+
+        let json_out = serde_json::to_string(&dc_ok.channels).expect("serialize snapshot");
+        assert!(!json_out.contains("xoxb-secret-bot-token-9999"));
+        assert!(!json_out.contains("dc_bot_secret_8888"));
+    }
+
+    #[tokio::test]
+    async fn webhook_handlers_reject_channels_in_long_connection_mode() {
+        let (store, _orch, bridge) = build_test_bridge().await;
+        let now = now_unix_ms();
+
+        for (cid, platform) in [
+            ("im_lc_lark", ImPlatform::Lark),
+            ("im_lc_slack", ImPlatform::Slack),
+            ("im_lc_tg", ImPlatform::Telegram),
+            ("im_lc_dc", ImPlatform::Discord),
+        ] {
+            store
+                .upsert_im_channel(&StoredImChannel {
+                    channel_id: cid.into(),
+                    name: format!("LC {cid}"),
+                    platform,
+                    enabled: true,
+                    transport_mode: ImTransportMode::LongConnection,
+                    status: ImConnectionStatus::Connected,
+                    status_message: Some("Connected (WS)".into()),
+                    webhook_path: platform.webhook_path_for(cid),
+                    app_id: Some("cli_abc".into()),
+                    primary_secret: Some("secret_123456789".into()),
+                    signing_secret: Some("signing_123456789".into()),
+                    app_token: Some("xapp-1-token-1234".into()),
+                    public_key: Some("a".repeat(64)),
+                    allowed_chat_ids: vec!["12345".into()],
+                    allowed_user_ids: Vec::new(),
+                    default_workspace_cwd: "/tmp".into(),
+                    default_provider: ProviderKind::ClaudeCode,
+                    default_mode: SessionMode::Default,
+                    forward_approvals: true,
+                    routing_mode: ImRoutingMode::PerThreadAgent,
+                    router_mirror_policy: RouterImMirrorPolicy::MilestonesAndApprovals,
+                    message_count: 0,
+                    last_activity_at_ms: None,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                })
+                .expect("save lc channel");
+        }
+
+        assert_eq!(
+            bridge
+                .handle_lark_webhook("im_lc_lark", &HeaderMap::new(), b"{}")
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            bridge
+                .handle_slack_webhook("im_lc_slack", &HeaderMap::new(), b"{}")
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            bridge
+                .handle_telegram_webhook("im_lc_tg", &HeaderMap::new(), b"{}")
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            bridge
+                .handle_discord_webhook("im_lc_dc", &HeaderMap::new(), b"{}")
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_unauthorized_click_does_not_burn_callback_token_and_interaction_dedups() {
+        use axum::http::HeaderValue;
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let (store, orchestrator, bridge) = build_test_bridge().await;
+        let signing_key = SigningKey::from_bytes(&[0x7bu8; 32]);
+        let pubkey_hex = hex_encode(signing_key.verifying_key().as_bytes());
+
+        let dc_ch = StoredImChannel {
+            channel_id: "im_dc_auth_first".into(),
+            name: "Discord Auth First".into(),
+            platform: ImPlatform::Discord,
+            enabled: true,
+            transport_mode: ImTransportMode::Webhook,
+            status: ImConnectionStatus::Connected,
+            status_message: Some("Webhook ready".into()),
+            webhook_path: "/im/discord/im_dc_auth_first".into(),
+            app_id: None,
+            primary_secret: Some("dc_bot_secret".into()),
+            signing_secret: None,
+            app_token: None,
+            public_key: Some(pubkey_hex),
+            allowed_chat_ids: vec!["9988776655".into()],
+            allowed_user_ids: vec!["444333".into()],
+            default_workspace_cwd: "/tmp".into(),
+            default_provider: ProviderKind::ClaudeCode,
+            default_mode: SessionMode::Default,
+            forward_approvals: true,
+            routing_mode: ImRoutingMode::PerThreadAgent,
+            router_mirror_policy: RouterImMirrorPolicy::MilestonesAndApprovals,
+            message_count: 0,
+            last_activity_at_ms: None,
+            created_at_ms: now_unix_ms(),
+            updated_at_ms: now_unix_ms(),
+        };
+        store.upsert_im_channel(&dc_ch).expect("save dc channel");
+        store
+            .upsert_im_binding(&ImThreadBinding {
+                channel_id: dc_ch.channel_id.clone(),
+                external_chat_id: "9988776655".into(),
+                external_thread_id: String::new(),
+                agent_id: "ag_dc_auth".into(),
+                updated_at_ms: now_unix_ms(),
+            })
+            .expect("save dc binding");
+
+        orchestrator
+            .insert_pending_permission_for_test(PendingPermissionSummary {
+                agent_id: "ag_dc_auth".into(),
+                agent_title: "Discord Agent".into(),
+                workspace_id: "ws_1".into(),
+                request_id: "perm_auth_1".into(),
+                title: "Deploy".into(),
+                detail: ToolCallDetail::Shell {
+                    command: "echo deploy".into(),
+                    cwd: Some("/tmp".into()),
+                    exit_code: None,
+                    output_preview: None,
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                guardian_assessment: None,
+                plan_approval: None,
+                human_only: false,
+                created_at: Utc::now(),
+            })
+            .await;
+
+        let cb_tok = bridge
+            .register_callback_token(
+                "im_dc_auth_first",
+                "9988776655",
+                "ag_dc_auth",
+                "perm_auth_1",
+            )
+            .await;
+
+        let sign_headers = |body: &[u8], ts: i64| -> HeaderMap {
+            let ts_str = ts.to_string();
+            let mut msg = Vec::new();
+            msg.extend_from_slice(ts_str.as_bytes());
+            msg.extend_from_slice(body);
+            let sig_hex = hex_encode(&signing_key.sign(&msg).to_bytes());
+            let mut map = HeaderMap::new();
+            map.insert(
+                "x-signature-ed25519",
+                HeaderValue::from_str(&sig_hex).expect("sig hdr"),
+            );
+            map.insert(
+                "x-signature-timestamp",
+                HeaderValue::from_str(&ts_str).expect("ts hdr"),
+            );
+            map
+        };
+        let now_secs = Utc::now().timestamp();
+
+        // 1. Unauthorized user in the same chat clicks first -> MUST NOT burn the callback token!
+        let unauth_body = serde_json::to_vec(&json!({
+            "id": "1000001",
+            "token": "tok_unauth",
+            "type": 3,
+            "channel_id": "9988776655",
+            "member": { "user": { "id": "999999" } },
+            "data": { "custom_id": format!("orbit:allow:{cb_tok}") }
+        }))
+        .expect("unauth body");
+        let resp_unauth = bridge
+            .handle_discord_webhook(
+                "im_dc_auth_first",
+                &sign_headers(&unauth_body, now_secs),
+                &unauth_body,
+            )
+            .await;
+        assert_eq!(resp_unauth.status(), StatusCode::OK);
+        assert!(
+            orchestrator.has_pending_permissions("ag_dc_auth").await,
+            "unauthorized click must leave pending permission unresolved"
+        );
+
+        // 2. Authorized user clicks the exact same token -> MUST SUCCEED because token wasn't burned!
+        let auth_body = serde_json::to_vec(&json!({
+            "id": "1000002",
+            "token": "tok_auth",
+            "type": 3,
+            "channel_id": "9988776655",
+            "member": { "user": { "id": "444333" } },
+            "data": { "custom_id": format!("orbit:allow:{cb_tok}") }
+        }))
+        .expect("auth body");
+        let resp_auth = bridge
+            .handle_discord_webhook(
+                "im_dc_auth_first",
+                &sign_headers(&auth_body, now_secs),
+                &auth_body,
+            )
+            .await;
+        assert_eq!(resp_auth.status(), StatusCode::OK);
+        assert!(
+            !orchestrator.has_pending_permissions("ag_dc_auth").await,
+            "authorized click must succeed because unauthorized click did not burn callback token"
+        );
+
+        // 3. Replaying same interaction_id returns immediate deduped 200 OK
+        let resp_dup = bridge
+            .handle_discord_webhook(
+                "im_dc_auth_first",
+                &sign_headers(&auth_body, now_secs),
+                &auth_body,
+            )
+            .await;
+        assert_eq!(resp_dup.status(), StatusCode::OK);
+
+        // 4. Non-interaction MESSAGE_CREATE payload is rejected (dead fallback stripped)
+        let msg_body = serde_json::to_vec(&json!({
+            "id": "555",
+            "channel_id": "9988776655",
+            "author": { "id": "444333", "bot": false },
+            "content": "hello"
+        }))
+        .expect("msg body");
+        let resp_msg = bridge
+            .handle_discord_webhook(
+                "im_dc_auth_first",
+                &sign_headers(&msg_body, now_secs),
+                &msg_body,
+            )
+            .await;
+        assert_eq!(resp_msg.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn duplicate_slack_socket_mode_app_token_rejected_on_upsert_and_reconcile() {
+        let (store, _orch, bridge) = build_test_bridge().await;
+        let shared_xapp = "xapp-1-SHARED-SOCKET-TOKEN-9999";
+
+        // 1. First Slack channel with shared_xapp (disabled initially so reconcile doesn't dial network,
+        //    then inserted directly as enabled for duplicate check)
+        let now = now_unix_ms();
+        store
+            .upsert_im_channel(&StoredImChannel {
+                channel_id: "im_slack_1".into(),
+                name: "Slack Primary".into(),
+                platform: ImPlatform::Slack,
+                enabled: true,
+                transport_mode: ImTransportMode::LongConnection,
+                status: ImConnectionStatus::Connected,
+                status_message: Some("Connected (WS)".into()),
+                webhook_path: "/im/slack/im_slack_1".into(),
+                app_id: None,
+                primary_secret: Some("xoxb-primary-1111".into()),
+                signing_secret: None,
+                app_token: Some(shared_xapp.into()),
+                public_key: None,
+                allowed_chat_ids: vec!["C1".into()],
+                allowed_user_ids: Vec::new(),
+                default_workspace_cwd: "/tmp".into(),
+                default_provider: ProviderKind::ClaudeCode,
+                default_mode: SessionMode::Default,
+                forward_approvals: true,
+                routing_mode: ImRoutingMode::PerThreadAgent,
+                router_mirror_policy: RouterImMirrorPolicy::MilestonesAndApprovals,
+                message_count: 0,
+                last_activity_at_ms: None,
+                created_at_ms: now,
+                updated_at_ms: now,
+            })
+            .expect("seed primary slack channel");
+
+        // 2. Upserting a second enabled Slack LongConnection channel with the SAME xapp token MUST fail
+        let dup_err = bridge
+            .upsert_channel(UpsertImChannelSpec {
+                channel_id: Some("im_slack_2".into()),
+                name: "Slack Competing".into(),
+                platform: ImPlatform::Slack,
+                enabled: true,
+                transport_mode: ImTransportMode::LongConnection,
+                app_id: None,
+                primary_secret: Some("xoxb-second-2222".into()),
+                signing_secret: None,
+                app_token: Some(shared_xapp.into()),
+                public_key: None,
+                keep_existing_secrets: false,
+                allowed_chat_ids: vec!["C2".into()],
+                allowed_user_ids: Vec::new(),
+                default_workspace_cwd: "/tmp".into(),
+                default_provider: ProviderKind::ClaudeCode,
+                default_mode: SessionMode::Default,
+                forward_approvals: true,
+                routing_mode: ImRoutingMode::PerThreadAgent,
+                router_mirror_policy: RouterImMirrorPolicy::MilestonesAndApprovals,
+            })
+            .await
+            .expect_err("duplicate enabled Slack app_token must be rejected");
+        let err_str = dup_err.to_string();
+        assert!(err_str.contains("Slack Primary"));
+        assert!(
+            !err_str.contains(shared_xapp),
+            "error must never leak raw app_token"
+        );
+
+        // 3. Defense-in-depth: if SQLite has two enabled Slack channels with the same xapp token,
+        //    reconcile_pollers refuses to spawn the second socket and marks it Error
+        store
+            .upsert_im_channel(&StoredImChannel {
+                channel_id: "im_slack_2".into(),
+                name: "Slack Competing".into(),
+                platform: ImPlatform::Slack,
+                enabled: true,
+                transport_mode: ImTransportMode::LongConnection,
+                status: ImConnectionStatus::Connecting,
+                status_message: None,
+                webhook_path: "/im/slack/im_slack_2".into(),
+                app_id: None,
+                primary_secret: Some("xoxb-second-2222".into()),
+                signing_secret: None,
+                app_token: Some(shared_xapp.into()),
+                public_key: None,
+                allowed_chat_ids: vec!["C2".into()],
+                allowed_user_ids: Vec::new(),
+                default_workspace_cwd: "/tmp".into(),
+                default_provider: ProviderKind::ClaudeCode,
+                default_mode: SessionMode::Default,
+                forward_approvals: true,
+                routing_mode: ImRoutingMode::PerThreadAgent,
+                router_mirror_policy: RouterImMirrorPolicy::MilestonesAndApprovals,
+                message_count: 0,
+                last_activity_at_ms: None,
+                created_at_ms: now + 100,
+                updated_at_ms: now + 100,
+            })
+            .expect("seed duplicate slack channel");
+
+        bridge.reconcile_pollers().await;
+        let second = store
+            .get_im_channel("im_slack_2")
+            .expect("load second")
+            .expect("present");
+        assert_eq!(second.status, ImConnectionStatus::Error);
+        assert!(
+            second
+                .status_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("Duplicate Slack App-Level Token")
+        );
+        // Ensure only 1 poller task spawned (not 2)
+        assert_eq!(bridge.pollers.lock().await.len(), 1);
+        bridge.shutdown_all().await;
     }
 }

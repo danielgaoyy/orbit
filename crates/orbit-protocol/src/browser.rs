@@ -1,5 +1,7 @@
 //! Wire types for Pure-Rust CDP Browser Automation & Guarded Computer Use.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Hard upper bound on concurrent live CDP browser sessions per Orbit host daemon.
@@ -118,6 +120,32 @@ pub struct BrowserSessionSummary {
     pub updated_at_ms: u64,
 }
 
+/// Bounding box of a picked DOM element in viewport CSS pixels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PickedElementBox {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// Structured DOM element metadata captured by `BrowserActionRequest::PickElement`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PickedElementInfo {
+    pub selector: String,
+    pub tag: String,
+    #[serde(default)]
+    pub text_preview: String,
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computed_box: Option<PickedElementBox>,
+    #[serde(default)]
+    pub outer_html_excerpt: String,
+    #[serde(default)]
+    pub page_url: String,
+}
+
 /// Typed browser automation action executed against a live CDP session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -153,6 +181,53 @@ pub enum BrowserActionRequest {
     },
     Back,
     Reload,
+    /// Dispatch CDP `Input.dispatchKeyEvent` (`rawKeyDown` + optional `char` + `keyUp`) supporting
+    /// special keys (`Enter`, `Escape`, `Tab`, `Backspace`, `ArrowUp/Down/Left/Right`, `Space`)
+    /// and modifier chords (`Meta+A`, `Control+C`, `Ctrl+Shift+K`, etc.).
+    PressKey {
+        key: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        modifiers: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+    },
+    /// Select an `<option>` inside a `<select>` element by `value`, `label`, or `index` and
+    /// dispatch `input` + `change` events.
+    SelectOption {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<u32>,
+    },
+    /// Attach one or more strictly workspace-confined files to an `<input type="file">` via
+    /// CDP `DOM.setFileInputFiles`.
+    UploadFile {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        files: Vec<String>,
+    },
+    /// Inspect a DOM element at viewport `(x, y)`, CSS `selector`, snapshot `ref_id`, or via an
+    /// interactive hover-highlight overlay inside the CDP page.
+    PickElement {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        y: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ref_id: Option<String>,
+        #[serde(default)]
+        interactive: bool,
+    },
 }
 
 #[cfg(test)]
@@ -262,6 +337,7 @@ mod tests {
                 headless: Some(true),
                 viewport_width: Some(1280),
                 viewport_height: Some(800),
+                workspace_root: Some("/tmp/repo".into()),
             },
             WireMessage::BrowserSessionUpdated {
                 request_id: req_id,
@@ -293,6 +369,46 @@ mod tests {
                     delta_y: 400.0,
                 },
             },
+            WireMessage::ExecuteBrowserAction {
+                request_id: req_id,
+                session_id: "br_abc123".into(),
+                action: BrowserActionRequest::PressKey {
+                    key: "Meta+A".into(),
+                    modifiers: vec!["Shift".into()],
+                    ref_id: Some("e2".into()),
+                },
+            },
+            WireMessage::ExecuteBrowserAction {
+                request_id: req_id,
+                session_id: "br_abc123".into(),
+                action: BrowserActionRequest::SelectOption {
+                    ref_id: Some("e3".into()),
+                    selector: None,
+                    value: Some("us".into()),
+                    label: None,
+                    index: None,
+                },
+            },
+            WireMessage::ExecuteBrowserAction {
+                request_id: req_id,
+                session_id: "br_abc123".into(),
+                action: BrowserActionRequest::UploadFile {
+                    ref_id: Some("e4".into()),
+                    selector: None,
+                    files: vec!["fixtures/logo.png".into()],
+                },
+            },
+            WireMessage::ExecuteBrowserAction {
+                request_id: req_id,
+                session_id: "br_abc123".into(),
+                action: BrowserActionRequest::PickElement {
+                    x: Some(120.5),
+                    y: Some(240.0),
+                    selector: None,
+                    ref_id: None,
+                    interactive: false,
+                },
+            },
             WireMessage::BrowserActionResponse {
                 request_id: req_id,
                 session,
@@ -300,6 +416,39 @@ mod tests {
                 screenshot_base64: Some("iVBORw0KGgo=".into()),
                 text_excerpt: Some("Welcome to Local App".into()),
                 captcha_detected: true,
+                picked_element: Some(PickedElementInfo {
+                    selector: "button#submit".into(),
+                    tag: "button".into(),
+                    text_preview: "Submit".into(),
+                    attributes: BTreeMap::from([("id".into(), "submit".into())]),
+                    computed_box: Some(PickedElementBox {
+                        x: 100.0,
+                        y: 200.0,
+                        width: 80.0,
+                        height: 32.0,
+                    }),
+                    outer_html_excerpt: "<button id=\"submit\">Submit</button>".into(),
+                    page_url: "http://localhost:3000/".into(),
+                }),
+            },
+            WireMessage::PreviewTunnelOpen {
+                request_id: req_id,
+                tunnel_id: Uuid::new_v4(),
+                target_port: 5173,
+                proxy_host: Some("web--orbit.localhost".into()),
+            },
+            WireMessage::PreviewTunnelOpened {
+                request_id: req_id,
+                tunnel_id: Uuid::new_v4(),
+                target_port: 5173,
+            },
+            WireMessage::PreviewTunnelData {
+                tunnel_id: Uuid::new_v4(),
+                payload_b64: "R0VUIC8gSFRUUC8xLjENCg0K".into(),
+            },
+            WireMessage::PreviewTunnelClose {
+                tunnel_id: Uuid::new_v4(),
+                reason: Some("eof".into()),
             },
             WireMessage::CloseBrowserSession {
                 request_id: req_id,

@@ -3,6 +3,7 @@
 pub mod acp;
 pub mod artifacts;
 pub mod browser;
+pub mod git_collab;
 pub mod goals;
 pub mod guardian;
 pub mod handoff;
@@ -13,6 +14,8 @@ pub mod lsp;
 pub mod mcp_servers;
 pub mod media;
 pub mod orchestration;
+pub mod permission_rules;
+pub mod plan_approval;
 pub mod push;
 pub mod router;
 pub mod rules;
@@ -24,6 +27,7 @@ pub mod workflows;
 pub use acp::*;
 pub use artifacts::*;
 pub use browser::*;
+pub use git_collab::*;
 pub use goals::*;
 pub use guardian::*;
 pub use handoff::*;
@@ -34,6 +38,8 @@ pub use lsp::*;
 pub use mcp_servers::*;
 pub use media::*;
 pub use orchestration::*;
+pub use permission_rules::*;
+pub use plan_approval::*;
 pub use push::*;
 pub use router::*;
 pub use rules::*;
@@ -671,6 +677,9 @@ pub enum GitMutationOutcome {
     Committed(GitCommitResult),
     Pushed(GitPushResult),
     PrCreated(GitCreatePrResult),
+    StashMutated(GitStashMutationResult),
+    RebaseAction(GitRebaseActionResult),
+    ConflictResolved(GitResolveConflictResult),
 }
 
 /// Synchronized follow-up prompt queued on the host daemon for multi-device visibility & offline drain.
@@ -1020,6 +1029,8 @@ pub enum TimelinePayload {
         allowed_decisions: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         guardian_assessment: Option<GuardianAssessment>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_approval: Option<PlanApprovalPayload>,
     },
     PermissionResolved {
         request_id: String,
@@ -1105,6 +1116,25 @@ pub struct WorkspaceSymbolEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
     pub language: String,
+}
+
+/// Full-text search match returned by a Daemon's authoritative SQLite FTS5 index
+/// (`timeline_events_fts`), covering full conversation history independent of client pagination.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteMessageSearchHit {
+    pub agent_id: String,
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub role: String,
+    pub snippet: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    pub bm25_score: f64,
+    #[serde(default)]
+    pub agent_title: String,
+    #[serde(default)]
+    pub cwd: String,
 }
 
 /// Client-to-Daemon and Daemon-to-Client RPC envelope over WebSocket / E2EE Relay.
@@ -1199,6 +1229,18 @@ pub enum WireMessage {
     },
     WorkspaceUpdated {
         workspace: WorkspaceSummary,
+    },
+    /// Coalesced OS-native filesystem invalidation pushed when files, Git state, or skills/rules
+    /// change inside an active workspace root.
+    WorkspaceFilesChanged {
+        workspace_id: String,
+        cwd: String,
+        #[serde(default)]
+        changed_paths: Vec<String>,
+        #[serde(default)]
+        git_changed: bool,
+        #[serde(default)]
+        skills_or_rules_changed: bool,
     },
     WorkspaceSetupProgress {
         progress: WorkspaceSetupProgress,
@@ -1344,6 +1386,91 @@ pub enum WireMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<GitStatusSnapshot>,
     },
+    GitStashList {
+        request_id: Uuid,
+        cwd: String,
+    },
+    GitStashPush {
+        request_id: Uuid,
+        cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(default)]
+        include_untracked: bool,
+    },
+    GitStashApply {
+        request_id: Uuid,
+        cwd: String,
+        stash_ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_oid: Option<String>,
+    },
+    GitStashPop {
+        request_id: Uuid,
+        cwd: String,
+        stash_ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_oid: Option<String>,
+    },
+    GitStashDrop {
+        request_id: Uuid,
+        cwd: String,
+        stash_ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_oid: Option<String>,
+    },
+    GitRebaseStatus {
+        request_id: Uuid,
+        cwd: String,
+    },
+    GitRebaseStart {
+        request_id: Uuid,
+        cwd: String,
+        onto_ref: String,
+    },
+    GitRebaseContinue {
+        request_id: Uuid,
+        cwd: String,
+    },
+    GitRebaseAbort {
+        request_id: Uuid,
+        cwd: String,
+    },
+    GitRebaseSkip {
+        request_id: Uuid,
+        cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_step: Option<u32>,
+    },
+    GitListConflicts {
+        request_id: Uuid,
+        cwd: String,
+    },
+    GitResolveConflict {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        block_index: Option<u32>,
+        resolution: GitConflictResolution,
+        #[serde(default = "wire_default_true")]
+        auto_stage: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_sha256: Option<String>,
+    },
+    GitPrStatus {
+        request_id: Uuid,
+        cwd: String,
+    },
+    GitGenerateCommitMessage {
+        request_id: Uuid,
+        cwd: String,
+    },
+    GitCollabResponse {
+        request_id: Uuid,
+        cwd: String,
+        payload: GitCollabQueryResult,
+    },
     ListWorkspaceFiles {
         request_id: Uuid,
         cwd: String,
@@ -1366,6 +1493,22 @@ pub enum WireMessage {
         symbols: Vec<WorkspaceSymbolEntry>,
         #[serde(default)]
         truncated: bool,
+    },
+    /// Query the daemon's authoritative full-history SQLite FTS5 index (`timeline_events_fts`).
+    /// When `agent_id` is `Some`, returns individual matching events within that session
+    /// (for in-session `Cmd+F` across unloaded historical turns); when `None`, returns the
+    /// highest-ranked match per conversation across all sessions on this host.
+    SearchMessages {
+        request_id: Uuid,
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    SearchMessagesResult {
+        request_id: Uuid,
+        hits: Vec<RemoteMessageSearchHit>,
     },
     ReadWorkspaceFile {
         request_id: Uuid,
@@ -1718,6 +1861,25 @@ pub enum WireMessage {
         agent_id: String,
         permission_request_id: String,
         decision: String,
+        /// When `true`, this resolution was initiated by an agent/router MCP tool (not a human)
+        /// and MUST route through the daemon's agent-originated guard (forbidding `allow_always`
+        /// and human-only plan approval gates).
+        #[serde(default, skip_serializing_if = "wire_is_false")]
+        agent_originated: bool,
+    },
+    /// Resolve a pending structured plan approval gate (`ExitPlanMode`, Codex Plan Mode,
+    /// Antigravity plan review, or ACP plan approval).
+    ResolvePlanApproval {
+        request_id: Uuid,
+        agent_id: String,
+        permission_request_id: String,
+        action: PlanApprovalAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edited_plan_markdown: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feedback: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_mode: Option<SessionMode>,
     },
     AnswerQuestion {
         request_id: Uuid,
@@ -2420,6 +2582,8 @@ pub enum WireMessage {
         mime_type: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resource_uri: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mcp_server_name: Option<String>,
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary_note: Option<String>,
@@ -2437,6 +2601,38 @@ pub enum WireMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<Uuid>,
         artifact_id: String,
+    },
+    /// Read a SEP-1865 `ui://` resource strictly scoped to the owning external MCP server and
+    /// persisted workspace of `artifact_id` (and optional historical `artifact_version`).
+    ReadMcpResource {
+        request_id: Uuid,
+        artifact_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact_version: Option<u32>,
+        uri: String,
+    },
+    McpResourceResponse {
+        request_id: Uuid,
+        server_name: String,
+        uri: String,
+        content: McpResourceContent,
+    },
+    /// Invoke a tool on the external MCP server that owns `artifact_id` (and optional `artifact_version`),
+    /// resolved strictly inside the artifact's persisted workspace.
+    CallArtifactMcpTool {
+        request_id: Uuid,
+        artifact_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact_version: Option<u32>,
+        tool_name: String,
+        #[serde(default)]
+        arguments: serde_json::Value,
+    },
+    ArtifactMcpToolResponse {
+        request_id: Uuid,
+        artifact_id: String,
+        tool_name: String,
+        outcome: McpToolCallOutcome,
     },
 
     // Project Instruction Hierarchy Discovery & Atomic Editing
@@ -2636,6 +2832,91 @@ pub enum WireMessage {
         cwd: String,
         locations: Vec<LspLocation>,
     },
+    LspHover {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        line: u32,
+        col: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+    },
+    LspHoverResponse {
+        request_id: Uuid,
+        cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hover: Option<LspHoverInfo>,
+    },
+    LspReferences {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        line: u32,
+        col: u32,
+        #[serde(default = "wire_default_true")]
+        include_declaration: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+    },
+    LspReferencesResponse {
+        request_id: Uuid,
+        cwd: String,
+        references: Vec<LspReferenceLocation>,
+    },
+    LspCompletion {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        line: u32,
+        col: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger_character: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+    },
+    LspCompletionResponse {
+        request_id: Uuid,
+        cwd: String,
+        items: Vec<LspCompletionItem>,
+    },
+    LspCodeActionRequest {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        line: u32,
+        col: u32,
+        end_line: u32,
+        end_col: u32,
+        #[serde(default)]
+        diagnostics: Vec<LspDiagnostic>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+    },
+    LspCodeActionResponse {
+        request_id: Uuid,
+        cwd: String,
+        actions: Vec<LspCodeAction>,
+    },
+    LspRename {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        line: u32,
+        col: u32,
+        new_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+    },
+    LspApplyWorkspaceEdit {
+        request_id: Uuid,
+        cwd: String,
+        edit: LspWorkspaceEdit,
+    },
+    LspWorkspaceEditResponse {
+        request_id: Uuid,
+        cwd: String,
+        result: LspWorkspaceEditResult,
+    },
     RestartLspServer {
         request_id: Uuid,
         cwd: String,
@@ -2759,6 +3040,47 @@ pub enum WireMessage {
         config: GuardianPolicyConfig,
         #[serde(default)]
         recent_audits: Vec<GuardianAuditEntry>,
+    },
+
+    // Fine-Grained Persistent Permission Rules Engine & Safe Batch Approval
+    ListPermissionRules {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_cwd: Option<String>,
+    },
+    PermissionRulesSnapshot {
+        request_id: Uuid,
+        #[serde(default)]
+        rules: Vec<PermissionRuleRecord>,
+    },
+    UpsertPermissionRule {
+        request_id: Uuid,
+        rule: UpsertPermissionRuleInput,
+    },
+    PermissionRuleUpdated {
+        request_id: Uuid,
+        rule: PermissionRuleRecord,
+    },
+    DeletePermissionRule {
+        request_id: Uuid,
+        rule_id: String,
+    },
+    PermissionRuleDeleted {
+        request_id: Uuid,
+        rule_id: String,
+        deleted: bool,
+    },
+    ResolvePermissionsBatch {
+        request_id: Uuid,
+        items: Vec<(String, String)>,
+        decision: String,
+    },
+    PermissionsBatchResolved {
+        request_id: Uuid,
+        resolved_count: usize,
+        skipped_count: usize,
+        #[serde(default)]
+        skipped_reasons: Vec<BatchPermissionSkipReason>,
     },
 
     // --- Unattended Autonomous Goal Mode & Streaming Monitor Engine ---
@@ -2900,6 +3222,8 @@ pub enum WireMessage {
         viewport_width: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         viewport_height: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_root: Option<String>,
     },
     BrowserSessionUpdated {
         request_id: Uuid,
@@ -2921,6 +3245,8 @@ pub enum WireMessage {
         text_excerpt: Option<String>,
         #[serde(default)]
         captcha_detected: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        picked_element: Option<PickedElementInfo>,
     },
     CloseBrowserSession {
         request_id: Uuid,
@@ -3013,11 +3339,17 @@ pub enum WireMessage {
         platform: ImPlatform,
         enabled: bool,
         #[serde(default)]
+        transport_mode: ImTransportMode,
+        #[serde(default)]
         app_id: Option<String>,
         #[serde(default)]
         primary_secret: Option<String>,
         #[serde(default)]
         signing_secret: Option<String>,
+        #[serde(default)]
+        app_token: Option<String>,
+        #[serde(default)]
+        public_key: Option<String>,
         #[serde(default = "wire_default_true")]
         keep_existing_secrets: bool,
         #[serde(default)]
@@ -3112,6 +3444,33 @@ pub enum WireMessage {
     /// Either side closed the Peer Bridge stream cleanly or due to an upstream error.
     PeerBridgeClosed {
         bridge_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
+    /// Request a remote Orbit daemon to open a strictly allowlisted loopback preview tunnel
+    /// targeting a running registered workspace service (HTTP/SSE/WebSocket HMR).
+    PreviewTunnelOpen {
+        request_id: Uuid,
+        tunnel_id: Uuid,
+        target_port: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proxy_host: Option<String>,
+    },
+    /// Daemon validated the target service port and opened the preview tunnel stream.
+    PreviewTunnelOpened {
+        request_id: Uuid,
+        tunnel_id: Uuid,
+        target_port: u16,
+    },
+    /// Raw stream bytes carried across an established preview tunnel over the existing E2EE session.
+    PreviewTunnelData {
+        tunnel_id: Uuid,
+        payload_b64: String,
+    },
+    /// Either side closed the preview tunnel stream cleanly or due to an upstream error.
+    PreviewTunnelClose {
+        tunnel_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
@@ -3646,6 +4005,78 @@ mod tests {
                 );
                 assert_eq!(symbols[0].start_line, 42);
                 assert_eq!(symbols[0].end_line, 78);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_messages_rpc_wire_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let scoped_req = WireMessage::SearchMessages {
+            request_id: req_id,
+            query: "数据库连接 timeout".into(),
+            agent_id: Some("ag_42".into()),
+            limit: Some(50),
+        };
+        let encoded = scoped_req.encode_zstd(3).expect("encode search messages");
+        match WireMessage::decode_zstd(&encoded).expect("decode search messages") {
+            WireMessage::SearchMessages {
+                request_id,
+                query,
+                agent_id,
+                limit,
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(query, "数据库连接 timeout");
+                assert_eq!(agent_id.as_deref(), Some("ag_42"));
+                assert_eq!(limit, Some(50));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // Minimal request omitting optional agent_id / limit
+        let minimal_req = serde_json::json!({
+            "op": "search_messages",
+            "request_id": req_id,
+            "query": "rust fts5"
+        });
+        match serde_json::from_value::<WireMessage>(minimal_req).expect("decode minimal search") {
+            WireMessage::SearchMessages {
+                agent_id, limit, ..
+            } => {
+                assert_eq!(agent_id, None);
+                assert_eq!(limit, None);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let resp = WireMessage::SearchMessagesResult {
+            request_id: req_id,
+            hits: vec![RemoteMessageSearchHit {
+                agent_id: "ag_42".into(),
+                seq: 17,
+                turn_id: Some("turn_3".into()),
+                role: "assistant".into(),
+                snippet: "Fixed <mark>数据库连接</mark> <mark>timeout</mark>".into(),
+                timestamp: Some("2026-11-24T12:00:00Z".into()),
+                bm25_score: -4.25,
+                agent_title: "DB Pool Hardening".into(),
+                cwd: "/workspace/orbit".into(),
+            }],
+        };
+        let z_resp = resp.encode_zstd(3).expect("encode search result");
+        match WireMessage::decode_zstd(&z_resp).expect("decode search result") {
+            WireMessage::SearchMessagesResult { request_id, hits } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].agent_id, "ag_42");
+                assert_eq!(hits[0].seq, 17);
+                assert_eq!(hits[0].turn_id.as_deref(), Some("turn_3"));
+                assert_eq!(hits[0].role, "assistant");
+                assert!((hits[0].bm25_score - (-4.25)).abs() < 1e-6);
+                assert_eq!(hits[0].agent_title, "DB Pool Hardening");
+                assert_eq!(hits[0].cwd, "/workspace/orbit");
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -4638,6 +5069,10 @@ mod tests {
             allow_workspace_tests: true,
             blocked_command_patterns: vec!["rm -rf".into()],
             trusted_command_prefixes: vec!["just test".into()],
+            llm_tier2_enabled: true,
+            llm_provider: Some(ProviderKind::ClaudeCode),
+            llm_model: Some("claude-haiku-4-5".into()),
+            llm_timeout_ms: 8_000,
         };
         let audit = GuardianAuditEntry {
             id: "ga_1".into(),
@@ -4671,6 +5106,90 @@ mod tests {
         for msg in messages {
             let encoded = msg.encode_zstd(3).expect("encode guardian wire msg");
             let decoded = WireMessage::decode_zstd(&encoded).expect("decode guardian wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn permission_rules_and_batch_wire_messages_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let now = Utc::now();
+        let rule_input = UpsertPermissionRuleInput {
+            id: None,
+            scope_kind: PermissionRuleScopeKind::Project,
+            project_cwd: Some("/workspace/orbit".into()),
+            provider: None,
+            tool_kind: PermissionRuleToolKind::Shell,
+            pattern_kind: PermissionRulePatternKind::CommandPrefix,
+            pattern: "cargo test".into(),
+            decision: PermissionRuleDecision::Allow,
+            source: PermissionRuleSource::AlwaysAllowGrant,
+            note: Some("Granted via Always allow".into()),
+        };
+        let rule_record = PermissionRuleRecord {
+            id: "pr_1".into(),
+            scope_kind: PermissionRuleScopeKind::Project,
+            project_cwd: Some("/workspace/orbit".into()),
+            provider: None,
+            tool_kind: PermissionRuleToolKind::Shell,
+            pattern_kind: PermissionRulePatternKind::CommandPrefix,
+            pattern: "cargo test".into(),
+            decision: PermissionRuleDecision::Allow,
+            source: PermissionRuleSource::AlwaysAllowGrant,
+            note: Some("Granted via Always allow".into()),
+            created_at: now,
+            last_matched_at: Some(now),
+            match_count: 3,
+        };
+        let messages = vec![
+            WireMessage::ListPermissionRules {
+                request_id: req_id,
+                project_cwd: Some("/workspace/orbit".into()),
+            },
+            WireMessage::PermissionRulesSnapshot {
+                request_id: req_id,
+                rules: vec![rule_record.clone()],
+            },
+            WireMessage::UpsertPermissionRule {
+                request_id: req_id,
+                rule: rule_input,
+            },
+            WireMessage::PermissionRuleUpdated {
+                request_id: req_id,
+                rule: rule_record,
+            },
+            WireMessage::DeletePermissionRule {
+                request_id: req_id,
+                rule_id: "pr_1".into(),
+            },
+            WireMessage::PermissionRuleDeleted {
+                request_id: req_id,
+                rule_id: "pr_1".into(),
+                deleted: true,
+            },
+            WireMessage::ResolvePermissionsBatch {
+                request_id: req_id,
+                items: vec![("ag_1".into(), "perm_1".into())],
+                decision: "allow".into(),
+            },
+            WireMessage::PermissionsBatchResolved {
+                request_id: req_id,
+                resolved_count: 1,
+                skipped_count: 1,
+                skipped_reasons: vec![BatchPermissionSkipReason {
+                    agent_id: "ag_1".into(),
+                    permission_request_id: "perm_2".into(),
+                    reason: "high_or_critical_risk".into(),
+                }],
+            },
+        ];
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode permission rule wire msg");
+            let decoded =
+                WireMessage::decode_zstd(&encoded).expect("decode permission rule wire msg");
             assert_eq!(
                 serde_json::to_value(&msg).expect("orig"),
                 serde_json::to_value(&decoded).expect("decoded")
@@ -5022,14 +5541,18 @@ mod tests {
             name: "Feishu Eng".into(),
             platform: ImPlatform::Lark,
             enabled: true,
+            transport_mode: ImTransportMode::LongConnection,
             status: ImConnectionStatus::Connected,
-            status_message: Some("Listening".into()),
+            status_message: Some("Connected (WS)".into()),
             webhook_path: "/im/lark/im_lark_01".into(),
             app_id: Some("cli_12345".into()),
             has_primary_secret: true,
             has_signing_secret: true,
+            has_app_token: false,
             masked_primary_secret: Some("••••9999".into()),
             masked_signing_secret: Some("••••8888".into()),
+            masked_app_token: None,
+            public_key: None,
             allowed_chat_ids: vec!["oc_1".into()],
             allowed_user_ids: vec!["ou_1".into()],
             default_workspace_cwd: "/workspace/orbit".into(),
@@ -5064,9 +5587,12 @@ mod tests {
                 name: "Feishu Eng".into(),
                 platform: ImPlatform::Lark,
                 enabled: true,
+                transport_mode: ImTransportMode::LongConnection,
                 app_id: Some("cli_12345".into()),
                 primary_secret: None,
                 signing_secret: None,
+                app_token: None,
+                public_key: None,
                 keep_existing_secrets: true,
                 allowed_chat_ids: vec!["oc_1".into()],
                 allowed_user_ids: vec!["ou_1".into()],
@@ -5303,6 +5829,253 @@ mod tests {
         assert_eq!(committed_json["kind"], "committed");
         assert_eq!(committed_json["commit_sha"], "abc");
         assert_eq!(committed_json["branch"], "main");
+    }
+
+    #[test]
+    fn git_collab_wire_messages_roundtrip_and_preserve_json_shapes() {
+        let req_id = Uuid::new_v4();
+        let stash_list = GitStashListResult {
+            entries: vec![GitStashEntry {
+                stash_ref: "stash@{0}".into(),
+                index: 0,
+                branch: Some("feat/git-collab".into()),
+                message: "WIP savepoint".into(),
+                oid: Some("1234abcdef1234abcdef1234abcdef1234abcdef".into()),
+                short_sha: Some("1234abc".into()),
+                created_at: Some("2026-11-24T12:00:00Z".into()),
+            }],
+        };
+        let rebase_status = GitRebaseStatus {
+            in_progress: true,
+            kind: GitRebaseKind::Merge,
+            current_step: Some(2),
+            total_steps: Some(4),
+            head_name: Some("feat/git-collab".into()),
+            onto: Some("main".into()),
+            stopped_message: Some("feat: add conflict parser".into()),
+            conflicted_files: vec!["src/lib.rs".into()],
+            merge_in_progress: false,
+            cherry_pick_in_progress: false,
+        };
+        let conflict_list = GitConflictListResult {
+            files: vec![GitConflictFile {
+                path: "src/lib.rs".into(),
+                blocks: vec![GitConflictBlock {
+                    index: 0,
+                    start_line: 10,
+                    end_line: 18,
+                    ours_label: "HEAD".into(),
+                    base_label: Some("base".into()),
+                    theirs_label: "feat/other".into(),
+                    ours: "let x = 1;".into(),
+                    base: Some("let x = 0;".into()),
+                    theirs: "let x = 2;".into(),
+                    context_before: vec!["fn main() {".into()],
+                    context_after: vec!["}".into()],
+                }],
+                is_binary: false,
+                unmerged_in_index: true,
+                total_blocks: 1,
+                content_sha256: Some("a".repeat(64)),
+            }],
+        };
+        let pr_status = GitPrStatus {
+            availability: GitPrAvailability::Available,
+            reason: None,
+            number: Some(99),
+            title: Some("Deep Git Collaboration Loop".into()),
+            url: Some("https://github.com/danielgaoyy/orbit/pull/99".into()),
+            state: Some("OPEN".into()),
+            is_draft: false,
+            mergeable: Some("MERGEABLE".into()),
+            review_decision: Some("CHANGES_REQUESTED".into()),
+            head_ref: Some("feat/git-collab".into()),
+            base_ref: Some("main".into()),
+            checks: vec![GitPrCheckItem {
+                name: "cargo test".into(),
+                state: GitCiCheckState::Failing,
+                workflow: Some("CI".into()),
+                raw_status: Some("COMPLETED".into()),
+                raw_conclusion: Some("FAILURE".into()),
+                details_url: Some("https://github.com/danielgaoyy/orbit/actions/runs/1".into()),
+            }],
+            passing_checks: 3,
+            failing_checks: 1,
+            pending_checks: 0,
+            review_comments: vec![GitPrReviewComment {
+                id: "c1".into(),
+                author: "reviewer".into(),
+                body: "Please handle CRLF line endings.".into(),
+                path: Some("crates/orbit-daemon/src/git_collab.rs".into()),
+                line: Some(42),
+                start_line: Some(38),
+                url: Some("https://github.com/danielgaoyy/orbit/pull/99#discussion_r1".into()),
+                created_at: Some("2026-11-24T12:10:00Z".into()),
+                is_resolved: false,
+                is_outdated: false,
+                kind: "review_thread".into(),
+            }],
+            unresolved_comment_count: 1,
+        };
+        let commit_msg = GitGeneratedCommitMessage {
+            message: "feat(daemon): add git_collab module\n\n- Add git_collab.rs (+120/-0)".into(),
+            subject: "feat(daemon): add git_collab module".into(),
+            body: Some("- Add git_collab.rs (+120/-0)".into()),
+            commit_type: "feat".into(),
+            scope: Some("daemon".into()),
+            diff_source: "staged".into(),
+            files_analyzed: 1,
+            generator: "deterministic".into(),
+        };
+
+        let messages = vec![
+            WireMessage::GitStashList {
+                request_id: req_id,
+                cwd: "/repo".into(),
+            },
+            WireMessage::GitStashPush {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                message: Some("checkpoint".into()),
+                include_untracked: true,
+            },
+            WireMessage::GitStashApply {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                stash_ref: "stash@{0}".into(),
+                expected_oid: Some("1234abcdef1234abcdef1234abcdef1234abcdef".into()),
+            },
+            WireMessage::GitStashPop {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                stash_ref: "stash@{0}".into(),
+                expected_oid: Some("1234abcdef1234abcdef1234abcdef1234abcdef".into()),
+            },
+            WireMessage::GitStashDrop {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                stash_ref: "stash@{0}".into(),
+                expected_oid: Some("1234abcdef1234abcdef1234abcdef1234abcdef".into()),
+            },
+            WireMessage::GitRebaseStatus {
+                request_id: req_id,
+                cwd: "/repo".into(),
+            },
+            WireMessage::GitRebaseStart {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                onto_ref: "origin/main".into(),
+            },
+            WireMessage::GitRebaseContinue {
+                request_id: req_id,
+                cwd: "/repo".into(),
+            },
+            WireMessage::GitRebaseAbort {
+                request_id: req_id,
+                cwd: "/repo".into(),
+            },
+            WireMessage::GitRebaseSkip {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                expected_step: Some(2),
+            },
+            WireMessage::GitListConflicts {
+                request_id: req_id,
+                cwd: "/repo".into(),
+            },
+            WireMessage::GitResolveConflict {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                path: "src/lib.rs".into(),
+                block_index: Some(0),
+                resolution: GitConflictResolution::ManualContent {
+                    content: "let x = 3;".into(),
+                },
+                auto_stage: true,
+                expected_sha256: Some("a".repeat(64)),
+            },
+            WireMessage::GitPrStatus {
+                request_id: req_id,
+                cwd: "/repo".into(),
+            },
+            WireMessage::GitGenerateCommitMessage {
+                request_id: req_id,
+                cwd: "/repo".into(),
+            },
+            WireMessage::GitCollabResponse {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                payload: GitCollabQueryResult::StashList(stash_list),
+            },
+            WireMessage::GitCollabResponse {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                payload: GitCollabQueryResult::RebaseStatus(rebase_status.clone()),
+            },
+            WireMessage::GitCollabResponse {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                payload: GitCollabQueryResult::ConflictList(conflict_list),
+            },
+            WireMessage::GitCollabResponse {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                payload: GitCollabQueryResult::PrStatus(pr_status),
+            },
+            WireMessage::GitCollabResponse {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                payload: GitCollabQueryResult::CommitMessage(commit_msg),
+            },
+            WireMessage::GitMutationResult {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                result: GitMutationOutcome::StashMutated(GitStashMutationResult {
+                    action: "push".into(),
+                    stash_ref: Some("stash@{0}".into()),
+                    summary: "Saved working tree".into(),
+                    had_conflicts: false,
+                }),
+                status: None,
+            },
+            WireMessage::GitMutationResult {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                result: GitMutationOutcome::RebaseAction(GitRebaseActionResult {
+                    action: "start".into(),
+                    status: rebase_status,
+                    summary: "Paused on conflicts".into(),
+                }),
+                status: None,
+            },
+            WireMessage::GitMutationResult {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                result: GitMutationOutcome::ConflictResolved(GitResolveConflictResult {
+                    path: "src/lib.rs".into(),
+                    remaining_blocks: 0,
+                    staged: true,
+                    summary: "Resolved and staged src/lib.rs".into(),
+                }),
+                status: None,
+            },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode git collab wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode git collab wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+
+        let res_json = serde_json::to_value(GitConflictResolution::ManualContent {
+            content: "merged".into(),
+        })
+        .expect("serialize resolution");
+        assert_eq!(res_json["strategy"], "manual_content");
+        assert_eq!(res_json["content"], "merged");
     }
 
     #[test]

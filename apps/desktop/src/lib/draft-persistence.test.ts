@@ -898,4 +898,144 @@ describe("draft-persistence", () => {
       { id: "good_skill", kind: "skill", slug: "shadcn", label: "shadcn" },
     ]);
   });
+
+  it("persists, validates, and LRU-bounds inlineMentions (file, folder, pr, web, code_symbol, git_diff, terminal_output) across restarts", () => {
+    const nowMs = 1_785_000_000_000;
+    const storage = new MemoryStorage();
+    const slices: DraftStateSlices = {
+      ...emptySlices(),
+      composerDrafts: {
+        "host-1::mentions": "Check @src/app.ts @folder:src/lib @pr#42 @web:https://docs.rs/tokio",
+      },
+      inlineMentions: {
+        "host-1::mentions": [
+          { token: "@src/app.ts", kind: "file", path: "src/app.ts" },
+          { token: "@folder:src/lib", kind: "folder", path: "src/lib", fileCount: 9 },
+          {
+            token: "@pr#42",
+            kind: "pr",
+            number: 42,
+            title: "Add terminal splits",
+            url: "https://github.com/org/orbit/pull/42",
+            state: "OPEN",
+            headRef: "feat/splits",
+            baseRef: "main",
+            summary: "2/2 checks passing",
+          },
+          {
+            token: "@web:https://docs.rs/tokio",
+            kind: "web",
+            url: "https://docs.rs/tokio",
+            label: "docs.rs/tokio",
+          },
+          { token: "@git:working", kind: "git_diff", staged: false, label: "Working diff" },
+          {
+            token: "@terminal",
+            kind: "terminal_output",
+            label: "Terminal · 2 lines",
+            lineCount: 2,
+            content: "ok\ndone",
+          },
+          {
+            token: "@render.rs:L10",
+            kind: "code_symbol",
+            path: "crates/orbit-client-core/src/render.rs",
+            startLine: 10,
+            endLine: 40,
+            symbolName: "render_markdown_blocks",
+            symbolKind: "function",
+            signature: "pub fn render_markdown_blocks()",
+            container: null,
+            language: "rust",
+          },
+        ],
+      },
+    };
+
+    assert.equal(hasNonEmptyScopeDraft(slices, "host-1::mentions"), true);
+
+    const writer = createDraftPersistenceController(() => slices, {
+      storage,
+      windowTarget: null,
+      documentTarget: null,
+      now: () => nowMs,
+    });
+    writer.markDirty("host-1::mentions");
+    writer.flushNow();
+    writer.dispose();
+
+    const reader = createDraftPersistenceController(emptySlices, {
+      storage,
+      windowTarget: null,
+      documentTarget: null,
+      now: () => nowMs + 1_000,
+    });
+    const hydrated = reader.hydrate();
+    reader.dispose();
+
+    assert.equal(hydrated.inlineMentions["host-1::mentions"]?.length, 7);
+    assert.deepEqual(hydrated.inlineMentions["host-1::mentions"]?.[1], {
+      token: "@folder:src/lib",
+      kind: "folder",
+      path: "src/lib",
+      fileCount: 9,
+    });
+    assert.deepEqual(hydrated.inlineMentions["host-1::mentions"]?.[3], {
+      token: "@web:https://docs.rs/tokio",
+      kind: "web",
+      url: "https://docs.rs/tokio",
+      label: "docs.rs/tokio",
+    });
+
+    // Strict validation rejects non-https URLs, duplicate tokens, malformed PR numbers, and oversized lists
+    const corrupt = JSON.stringify({
+      version: DRAFT_SCHEMA_VERSION,
+      drafts: {
+        "host-1::bad": {
+          updatedAt: nowMs,
+          inlineMentions: [
+            { token: "@web:http://insecure.local", kind: "web", url: "http://insecure.local", label: "bad" },
+            { token: "@web:file:///etc/passwd", kind: "web", url: "file:///etc/passwd", label: "bad" },
+            { token: "@pr#0", kind: "pr", number: 0, title: "Invalid PR" },
+            { token: "@src/good.ts", kind: "file", path: "src/good.ts" },
+            { token: "@src/good.ts", kind: "file", path: "src/dup.ts" },
+          ],
+        },
+      },
+    });
+    const parsed = parseAndValidatePersistedDrafts(corrupt, { nowMs });
+    assert.deepEqual(parsed.inlineMentions["host-1::bad"], [
+      { token: "@src/good.ts", kind: "file", path: "src/good.ts" },
+    ]);
+
+    // Entry byte budget sheds heavy terminal_output inline mentions first while preserving lightweight file/web mentions
+    const heavySlices: DraftStateSlices = {
+      ...emptySlices(),
+      composerDrafts: { "host-1::heavy": "Look at @src/a.ts and @terminal" },
+      inlineMentions: {
+        "host-1::heavy": [
+          { token: "@src/a.ts", kind: "file", path: "src/a.ts" },
+          {
+            token: "@terminal",
+            kind: "terminal_output",
+            label: "Huge log",
+            lineCount: 1000,
+            content: "x".repeat(200_000),
+          },
+        ],
+      },
+    };
+    const serialized = buildSerializedDraftPayload(
+      heavySlices,
+      { "host-1::heavy": nowMs },
+      { nowMs },
+    );
+    assert.ok(serialized.json !== null);
+    assert.ok(utf8ByteLength(serialized.json) <= MAX_TOTAL_DRAFT_BYTES);
+    const hydratedHeavy = parseAndValidatePersistedDrafts(serialized.json, { nowMs });
+    assert.ok(
+      hydratedHeavy.inlineMentions["host-1::heavy"]?.some((m) => m.token === "@src/a.ts"),
+      "lightweight inline mention should survive budget trimming",
+    );
+  });
 });

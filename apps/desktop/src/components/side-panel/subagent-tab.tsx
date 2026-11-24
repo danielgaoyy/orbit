@@ -4,6 +4,7 @@ import {
   useViewportAnchorHold,
 } from "@/components/conversation/conversation-viewport";
 import { DecisionDock } from "@/components/stage/stage-approval-dock";
+import { PlanReviewCard } from "@/components/stage/plan-review-card";
 import {
   PromptImageLightbox,
   type PromptImagePreviewTarget,
@@ -53,24 +54,33 @@ export function mergeAgentPendingPermissions(
   stagePendingPermissions: readonly PendingPermissionTimelineItem[],
   stageRawPermissions: readonly TimelineItemView[] | undefined,
   hostPendingPermissions: readonly PendingPermissionSummary[] | undefined,
+  excludeRequestId?: string | null,
 ): readonly PendingPermissionTimelineItem[] {
   if (!agentId || !hostPendingPermissions || hostPendingPermissions.length === 0) {
     return stagePendingPermissions;
   }
   const knownIds = new Set<string>();
+  if (excludeRequestId) {
+    knownIds.add(excludeRequestId);
+  }
   for (const item of stagePendingPermissions) {
     knownIds.add(item.request_id);
   }
   if (stageRawPermissions) {
     for (const item of stageRawPermissions) {
-      if (item.item_type === "permission_request" && item.resolved_decision !== null) {
+      if (
+        item.item_type === "permission_request" &&
+        (item.resolved_decision !== null || item.plan_approval != null)
+      ) {
         knownIds.add(item.request_id);
       }
     }
   }
   let extras: PendingPermissionTimelineItem[] | null = null;
   for (const perm of hostPendingPermissions) {
-    if (perm.agent_id !== agentId || knownIds.has(perm.request_id)) continue;
+    if (perm.agent_id !== agentId || perm.plan_approval != null || knownIds.has(perm.request_id)) {
+      continue;
+    }
     knownIds.add(perm.request_id);
     const ts = Date.parse(perm.created_at);
     extras ??= [...stagePendingPermissions];
@@ -83,6 +93,7 @@ export function mergeAgentPendingPermissions(
       allowed_decisions: perm.allowed_decisions,
       resolved_decision: null,
       guardian_assessment: perm.guardian_assessment ?? null,
+      plan_approval: perm.plan_approval ?? null,
       timestamp_ms: Number.isFinite(ts) ? ts : null,
     });
   }
@@ -335,6 +346,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
   const { subagents: children, decisions: childDecisions } = useOrbitSelector(selectChildren);
   const { subagents: siblings, decisions: parentDecisions } = useOrbitSelector(selectSiblings);
   const effectiveCwd = childAgent?.cwd || cwd || "";
+  const pendingPlanApproval = isManaged ? childDecisions.pendingPlanApproval : null;
   const pendingPermissions = useMemo(
     () =>
       isManaged
@@ -343,6 +355,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
             childDecisions.parentPermissions,
             childStage?.pending_permissions,
             hostPendingPermissions,
+            pendingPlanApproval?.request_id ?? null,
           )
         : childDecisions.parentPermissions,
     [
@@ -351,6 +364,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
       childDecisions.parentPermissions,
       childStage?.pending_permissions,
       hostPendingPermissions,
+      pendingPlanApproval?.request_id,
     ],
   );
   const pendingQuestions = isManaged ? childDecisions.parentQuestions : EMPTY_QUESTIONS;
@@ -359,7 +373,8 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
     isManaged &&
       hostId &&
       tab.childAgentId &&
-      (pendingPermissions.length > 0 ||
+      (pendingPlanApproval !== null ||
+        pendingPermissions.length > 0 ||
         pendingQuestions.length > 0 ||
         nestedSubagentPermissions.length > 0),
   );
@@ -369,7 +384,8 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
     isActiveProviderSubagent &&
       parentHostId &&
       parentAgentId &&
-      (parentDecisions.parentPermissions.length > 0 ||
+      (parentDecisions.pendingPlanApproval !== null ||
+        parentDecisions.parentPermissions.length > 0 ||
         parentDecisions.parentQuestions.length > 0),
   );
   const currentPeer = siblings.find((sa) =>
@@ -620,6 +636,15 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
 
       {hasManagedDecisions && hostId && tab.childAgentId ? (
         <div className="bg-surface-base relative z-20 shrink-0 pt-2">
+          {pendingPlanApproval && (
+            <PlanReviewCard
+              hostId={hostId}
+              agentId={tab.childAgentId}
+              cwd={effectiveCwd}
+              plan={pendingPlanApproval}
+              compact
+            />
+          )}
           <DecisionDock
             hostId={hostId}
             agentId={tab.childAgentId}
@@ -633,6 +658,15 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
         </div>
       ) : showParentFallbackDock && parentHostId && parentAgentId ? (
         <div className="bg-surface-base relative z-20 shrink-0 pt-2">
+          {parentDecisions.pendingPlanApproval && (
+            <PlanReviewCard
+              hostId={parentHostId}
+              agentId={parentAgentId}
+              cwd={effectiveCwd}
+              plan={parentDecisions.pendingPlanApproval}
+              compact
+            />
+          )}
           <DecisionDock
             hostId={parentHostId}
             agentId={parentAgentId}

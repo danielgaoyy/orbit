@@ -10,12 +10,23 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { ArrowUpRight, Check, Copy } from "lucide-react";
+import { ArrowUpRight, Check, ChevronDown, ChevronRight, Copy, Play } from "lucide-react";
 import { DiagramBlock } from "@/components/diagram-block";
 import { InlineMathSpan, MathBlockView } from "@/components/math-block";
+import { SimpleTooltip } from "@/components/ui/overlays";
 import { resolveTokenColor } from "@/lib/code-highlight";
 import { useI18n } from "@/lib/i18n";
+import {
+  CODE_BLOCK_COLLAPSE_THRESHOLD,
+  type GroupedRenderNode,
+  type ListItemBlock,
+  type NestedListGroupNode,
+  buildNestedListForest,
+  classifyRunnableShellSnippet,
+  groupMarkdownBlocks,
+} from "@/lib/markdown-helpers";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { orbitActions } from "@/state/orbit-store";
 import {
   type InlineSpanView,
   type RichBlockView,
@@ -163,6 +174,7 @@ function richBlockIsEqual(a: RichBlockView, b: RichBlockView): boolean {
         a.ordered === b.ordered &&
         a.index === b.index &&
         a.checked === b.checked &&
+        (a.depth ?? 0) === (b.depth ?? 0) &&
         spansAreEqual(a.spans, b.spans)
       );
     case "code_block":
@@ -380,7 +392,33 @@ export const HighlightedCodeBlock = memo(
     settled?: boolean;
   }) {
     const { t } = useI18n();
+    const linkCtx = useContext(MarkdownLinkContext);
     const { copied, copy } = useClipboardCopy(raw_code);
+    const [collapsed, setCollapsed] = useState(false);
+    const [justRan, setJustRan] = useState(false);
+    const runTimerRef = useRef<number | undefined>(undefined);
+
+    useEffect(() => () => {
+      window.clearTimeout(runTimerRef.current);
+    }, []);
+
+    const canCollapse = !embedded && lines.length > CODE_BLOCK_COLLAPSE_THRESHOLD;
+    const shellMeta = useMemo(
+      () => (embedded ? null : classifyRunnableShellSnippet(language, raw_code)),
+      [embedded, language, raw_code],
+    );
+
+    const handleRunInTerminal = useCallback(() => {
+      if (!shellMeta?.runnable) return;
+      orbitActions.runCommandInTerminal(shellMeta.cleanedCommand, {
+        execute: shellMeta.safeToAutoExecute,
+        hostId: linkCtx.hostId,
+        cwd: linkCtx.cwd,
+      });
+      setJustRan(true);
+      window.clearTimeout(runTimerRef.current);
+      runTimerRef.current = window.setTimeout(() => setJustRan(false), 1500);
+    }, [shellMeta, linkCtx.hostId, linkCtx.cwd]);
 
     const codeBody = (
       <ScrollArea
@@ -415,7 +453,7 @@ export const HighlightedCodeBlock = memo(
       return codeBody;
     }
 
-    const intrinsicHeight = Math.max(84, lines.length * 21 + 52);
+    const intrinsicHeight = collapsed ? 40 : Math.max(84, lines.length * 21 + 52);
 
     return (
       <div
@@ -427,29 +465,99 @@ export const HighlightedCodeBlock = memo(
           settled && "orbit-heavy-block-settled",
         )}
       >
-        <div className="border-border-subtle text-ink-muted flex items-center justify-between border-b px-3.5 py-1.5 text-[11px] select-none">
-          <span className="font-mono text-[11px]">{language || "text"}</span>
-          <button
-            type="button"
-            onClick={copy}
-            className="text-ink-muted hover:text-ink-primary hover:bg-accent orbit-press inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-[11px]"
-          >
-            <span className="relative inline-flex size-3.5 items-center justify-center">
-              <Copy
-                className={`size-3.5 transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)] ${
-                  copied ? "scale-50 -rotate-12 opacity-0" : "scale-100 rotate-0 opacity-100"
-                }`}
-              />
-              <Check
-                className={`text-signal-success absolute size-3.5 transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)] ${
-                  copied ? "scale-100 rotate-0 opacity-100" : "scale-50 rotate-12 opacity-0"
-                }`}
-              />
-            </span>
-            <span>{t(copied ? "common.copied" : "common.copy")}</span>
-          </button>
+        <div
+          className={cn(
+            "border-border-subtle text-ink-muted flex items-center justify-between gap-2 px-3.5 py-1.5 text-[11px] select-none",
+            !collapsed && "border-b",
+          )}
+        >
+          <div className="flex min-w-0 items-center gap-2">
+            {canCollapse ? (
+              <button
+                type="button"
+                aria-expanded={!collapsed}
+                onClick={() => setCollapsed((prev) => !prev)}
+                className="text-ink-muted hover:text-ink-primary hover:bg-accent -ml-1 inline-flex cursor-pointer items-center gap-1 rounded-md px-1.5 py-0.5 font-mono text-[11px] transition-colors"
+              >
+                {collapsed ? (
+                  <ChevronRight className="size-3 shrink-0" />
+                ) : (
+                  <ChevronDown className="size-3 shrink-0" />
+                )}
+                <span>{language || "text"}</span>
+                <span className="text-ink-faint tabular-nums">
+                  · {t("markdown.lineCount", { count: lines.length })}
+                </span>
+              </button>
+            ) : (
+              <span className="font-mono text-[11px]">{language || "text"}</span>
+            )}
+          </div>
+
+          <div className="flex shrink-0 items-center gap-1">
+            {shellMeta?.runnable && (
+              <SimpleTooltip
+                label={
+                  shellMeta.safeToAutoExecute
+                    ? t("markdown.runInTerminal")
+                    : t("markdown.pasteInTerminal")
+                }
+              >
+                <button
+                  type="button"
+                  onClick={handleRunInTerminal}
+                  aria-label={
+                    shellMeta.safeToAutoExecute
+                      ? t("markdown.runInTerminal")
+                      : t("markdown.pasteInTerminal")
+                  }
+                  className="text-ink-muted hover:text-ink-primary hover:bg-accent orbit-press inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-[11px] transition-colors"
+                >
+                  <span className="relative inline-flex size-3.5 items-center justify-center">
+                    <Play
+                      className={`size-3 transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)] ${
+                        justRan ? "scale-50 opacity-0" : "scale-100 opacity-100"
+                      }`}
+                    />
+                    <Check
+                      className={`text-signal-success absolute size-3.5 transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)] ${
+                        justRan ? "scale-100 opacity-100" : "scale-50 opacity-0"
+                      }`}
+                    />
+                  </span>
+                  <span>
+                    {justRan
+                      ? t("markdown.sentToTerminal")
+                      : shellMeta.safeToAutoExecute
+                        ? t("markdown.run")
+                        : t("markdown.pasteToTerminalShort")}
+                  </span>
+                </button>
+              </SimpleTooltip>
+            )}
+
+            <button
+              type="button"
+              onClick={copy}
+              className="text-ink-muted hover:text-ink-primary hover:bg-accent orbit-press inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-[11px]"
+            >
+              <span className="relative inline-flex size-3.5 items-center justify-center">
+                <Copy
+                  className={`size-3.5 transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)] ${
+                    copied ? "scale-50 -rotate-12 opacity-0" : "scale-100 rotate-0 opacity-100"
+                  }`}
+                />
+                <Check
+                  className={`text-signal-success absolute size-3.5 transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)] ${
+                    copied ? "scale-100 rotate-0 opacity-100" : "scale-50 rotate-12 opacity-0"
+                  }`}
+                />
+              </span>
+              <span>{t(copied ? "common.copied" : "common.copy")}</span>
+            </button>
+          </div>
         </div>
-        {codeBody}
+        {!collapsed && codeBody}
       </div>
     );
   },
@@ -568,35 +676,87 @@ const MarkdownTableBlock = memo(
     tableRowsAreEqual(prev.rows, next.rows),
 );
 
-type ListItemBlock = Extract<RichBlockView, { kind: "list_item" }>;
-type ListGroupKind = "ordered" | "unordered" | "checklist";
-
-type GroupedRenderNode =
-  | { kind: "block"; block: RichBlockView; keyIndex: number }
-  | { kind: "list_group"; listKind: ListGroupKind; items: ListItemBlock[]; keyIndex: number };
-
-function classifyListItem(item: ListItemBlock): ListGroupKind {
-  if (item.checked !== null) return "checklist";
-  return item.ordered ? "ordered" : "unordered";
+function unorderedMarkerClass(depth: number): string {
+  const mod = depth % 3;
+  if (mod === 1) return "list-[circle]";
+  if (mod === 2) return "list-[square]";
+  return "list-disc";
 }
 
-function groupMarkdownBlocks(blocks: RichBlockView[]): GroupedRenderNode[] {
-  const nodes: GroupedRenderNode[] = [];
-  for (let i = 0; i < blocks.length; i += 1) {
-    const block = blocks[i];
-    if (block.kind === "list_item") {
-      const listKind = classifyListItem(block);
-      const prev = nodes[nodes.length - 1];
-      if (prev && prev.kind === "list_group" && prev.listKind === listKind) {
-        prev.items.push(block);
-      } else {
-        nodes.push({ kind: "list_group", listKind, items: [block], keyIndex: i });
-      }
-    } else {
-      nodes.push({ kind: "block", block, keyIndex: i });
-    }
+function renderNestedListGroup(
+  group: NestedListGroupNode,
+  listSpacingClass: string,
+  key: string,
+): ReactNode {
+  const isRoot = group.depth === 0;
+  const spacing = isRoot ? listSpacingClass : "mt-1 [&>li+li]:mt-1";
+
+  if (group.listKind === "ordered") {
+    return (
+      <ol
+        key={key}
+        data-list-depth={group.depth}
+        start={group.startIndex}
+        className={cn(
+          "marker:text-foreground/70 marker:tabular-nums list-decimal",
+          isRoot ? "pl-6" : "pl-[20px]",
+          spacing,
+        )}
+      >
+        {group.items.map((entry, idx) => (
+          <li key={idx} value={entry.item.index} className="pl-1 whitespace-pre-wrap">
+            <InlineSpans spans={entry.item.spans} />
+            {entry.children.map((child, childIdx) =>
+              renderNestedListGroup(child, listSpacingClass, `${key}-${idx}-${childIdx}`),
+            )}
+          </li>
+        ))}
+      </ol>
+    );
   }
-  return nodes;
+
+  if (group.listKind === "unordered") {
+    return (
+      <ul
+        key={key}
+        data-list-depth={group.depth}
+        className={cn(
+          "marker:text-foreground/65 pl-[20px]",
+          unorderedMarkerClass(group.depth),
+          spacing,
+        )}
+      >
+        {group.items.map((entry, idx) => (
+          <li key={idx} className="pl-1 whitespace-pre-wrap">
+            <InlineSpans spans={entry.item.spans} />
+            {entry.children.map((child, childIdx) =>
+              renderNestedListGroup(child, listSpacingClass, `${key}-${idx}-${childIdx}`),
+            )}
+          </li>
+        ))}
+      </ul>
+    );
+  }
+
+  return (
+    <ul
+      key={key}
+      data-list-depth={group.depth}
+      className={cn("list-none", isRoot ? "pl-0.5" : "pl-[20px]", spacing)}
+    >
+      {group.items.map((entry, idx) => (
+        <li key={idx} className="relative pl-5 whitespace-pre-wrap">
+          <span className="text-foreground/75 absolute top-0 left-0 select-none">
+            {entry.item.checked ? "✓" : "○"}
+          </span>
+          <InlineSpans spans={entry.item.spans} />
+          {entry.children.map((child, childIdx) =>
+            renderNestedListGroup(child, listSpacingClass, `${key}-${idx}-${childIdx}`),
+          )}
+        </li>
+      ))}
+    </ul>
+  );
 }
 
 function groupedNodeIsEqual(a: GroupedRenderNode, b: GroupedRenderNode): boolean {
@@ -622,45 +782,16 @@ function renderGroupedNodeContent(
   isStreamingBlock: boolean,
 ) {
   if (node.kind === "list_group") {
-    if (node.listKind === "ordered") {
-      return (
-        <ol
-          start={node.items[0]?.index ?? 1}
-          className={cn(
-            "marker:text-foreground/70 marker:tabular-nums list-decimal pl-6",
-            listSpacingClass,
-          )}
-        >
-          {node.items.map((item, itemIdx) => (
-            <li key={itemIdx} value={item.index} className="pl-1 whitespace-pre-wrap">
-              <InlineSpans spans={item.spans} />
-            </li>
-          ))}
-        </ol>
-      );
-    }
-    if (node.listKind === "unordered") {
-      return (
-        <ul className={cn("marker:text-foreground/65 list-disc pl-[20px]", listSpacingClass)}>
-          {node.items.map((item, itemIdx) => (
-            <li key={itemIdx} className="pl-1 whitespace-pre-wrap">
-              <InlineSpans spans={item.spans} />
-            </li>
-          ))}
-        </ul>
-      );
+    const forest = buildNestedListForest(node.items);
+    if (forest.length === 1) {
+      return renderNestedListGroup(forest[0], listSpacingClass, `lg-${node.keyIndex}-0`);
     }
     return (
-      <ul className={cn("list-none pl-0.5", listSpacingClass)}>
-        {node.items.map((item, itemIdx) => (
-          <li key={itemIdx} className="relative pl-5 whitespace-pre-wrap">
-            <span className="text-foreground/75 absolute top-0 left-0 select-none">
-              {item.checked ? "✓" : "○"}
-            </span>
-            <InlineSpans spans={item.spans} />
-          </li>
-        ))}
-      </ul>
+      <div className="flex flex-col gap-1.5">
+        {forest.map((group, idx) =>
+          renderNestedListGroup(group, listSpacingClass, `lg-${node.keyIndex}-${idx}`),
+        )}
+      </div>
     );
   }
 

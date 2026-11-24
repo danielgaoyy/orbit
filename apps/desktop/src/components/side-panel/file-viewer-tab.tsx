@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   AlertCircle,
@@ -26,7 +26,9 @@ import {
   MarkdownBlocksView,
   MarkdownLinkProvider,
 } from "@/components/markdown-blocks";
-import { WorkspaceCodeEditor } from "@/components/side-panel/workspace-code-editor";
+const LazyWorkspaceCodeEditor = lazy(
+  () => import("@/components/side-panel/workspace-code-editor"),
+);
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { MediaPlayer } from "@/components/viewers/media-player";
 import { PdfViewer } from "@/components/viewers/pdf-viewer";
@@ -123,6 +125,7 @@ export const FileViewerTab = memo(function FileViewerTab({
     col?: number;
     nonce: number;
   } | null>(null);
+  const [editEntryFocusLine, setEditEntryFocusLine] = useState<number | null>(null);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const findInputRef = useRef<HTMLInputElement | null>(null);
@@ -143,6 +146,7 @@ export const FileViewerTab = memo(function FileViewerTab({
     lazyHighlightSeqRef.current += 1;
     lazyHighlightRequestedChunksRef.current.clear();
     setLazyHighlights({});
+    setEditEntryFocusLine(null);
   }, [hostId, cwd, path, isTaskLogPath]);
 
   useEffect(() => {
@@ -264,6 +268,31 @@ export const FileViewerTab = memo(function FileViewerTab({
     [isLspEligible, hostId, cwd, path],
   );
 
+  const handleJumpToFileLocation = useCallback(
+    (targetPath: string, line: number, col = 1) => {
+      const normalizedTarget = targetPath.replace(/\\/g, "/").replace(/^\.\//, "");
+      const normalizedCurrent = relPath.replace(/\\/g, "/").replace(/^\.\//, "");
+      if (normalizedTarget === normalizedCurrent) {
+        jumpToDiagnosticLine(line, col);
+        return;
+      }
+      orbitActions.openFileInSidePanel(targetPath, {
+        hostId,
+        cwd,
+        focusLine: line,
+        initialMode: isEditMode ? "edit" : "view",
+      });
+    },
+    [relPath, jumpToDiagnosticLine, hostId, cwd, isEditMode],
+  );
+
+  const handleAfterLspWorkspaceEdit = useCallback(
+    async (modifiedFiles: readonly string[]) => {
+      await orbitActions.refreshWorkspaceFilesAfterLspEdit(hostId, cwd, modifiedFiles);
+    },
+    [hostId, cwd],
+  );
+
   // Apply deferred Markdown mode switch once the unsaved-changes guard resolves out of Edit mode
   useEffect(() => {
     if (!pendingMarkdownTarget) return;
@@ -355,6 +384,26 @@ export const FileViewerTab = memo(function FileViewerTab({
   // Lazily syntax-highlight unhighlighted visible 250-line chunks (e.g. lines beyond pre-highlighted prefix or Markdown Source)
   const firstVisibleIdx = virtualCodeItems[0]?.index ?? -1;
   const lastVisibleIdx = virtualCodeItems[virtualCodeItems.length - 1]?.index ?? -1;
+
+  const enterEditPreservingLine = useCallback(
+    (explicitLine?: number | null) => {
+      let targetLine = explicitLine ?? null;
+      if (targetLine == null) {
+        const scrollEl = codeViewportRef.current;
+        if (scrollEl && isCodeViewActive && codeLineCount > 0) {
+          const topLine = Math.floor(scrollEl.scrollTop / 20) + 1;
+          targetLine = Math.max(1, Math.min(topLine + 4, codeLineCount));
+        } else if (firstVisibleIdx >= 0) {
+          targetLine = firstVisibleIdx + 1;
+        }
+      }
+      setEditEntryFocusLine(targetLine);
+      setFindOpen(false);
+      setPendingMarkdownTarget(null);
+      orbitActions.enterFileEditMode(hostId, cwd, path);
+    },
+    [isCodeViewActive, codeLineCount, firstVisibleIdx, hostId, cwd, path],
+  );
   useEffect(() => {
     if (!isCodeViewActive || !data || data.language === "text" || firstVisibleIdx < 0) return;
     const CHUNK_SIZE = 250;
@@ -603,8 +652,7 @@ export const FileViewerTab = memo(function FileViewerTab({
         if (isEditMode) {
           orbitActions.requestFileViewMode(hostId, cwd, path);
         } else {
-          setFindOpen(false);
-          orbitActions.enterFileEditMode(hostId, cwd, path);
+          enterEditPreservingLine();
         }
       } else if (action === "save") {
         e.preventDefault();
@@ -630,6 +678,7 @@ export const FileViewerTab = memo(function FileViewerTab({
     path,
     tab.id,
     closeFindBar,
+    enterEditPreservingLine,
   ]);
 
   const stepMatch = (delta: number) => {
@@ -796,11 +845,7 @@ export const FileViewerTab = memo(function FileViewerTab({
                 <SimpleTooltip label="Edit file" shortcut={`${mod}E`}>
                   <button
                     type="button"
-                    onClick={() => {
-                      setFindOpen(false);
-                      setPendingMarkdownTarget(null);
-                      orbitActions.enterFileEditMode(hostId, cwd, path);
-                    }}
+                    onClick={() => enterEditPreservingLine()}
                     className={cn(
                       "inline-flex h-[20px] cursor-pointer items-center gap-1 rounded px-1.5 font-medium transition-colors",
                       isEditMode
@@ -832,10 +877,7 @@ export const FileViewerTab = memo(function FileViewerTab({
                 <SimpleTooltip label="Edit file" shortcut={`${mod}E`}>
                   <button
                     type="button"
-                    onClick={() => {
-                      setFindOpen(false);
-                      orbitActions.enterFileEditMode(hostId, cwd, path);
-                    }}
+                    onClick={() => enterEditPreservingLine()}
                     className={cn(
                       "inline-flex h-[20px] cursor-pointer items-center gap-1 rounded px-1.5 font-medium transition-colors",
                       isEditMode
@@ -1143,36 +1185,50 @@ export const FileViewerTab = memo(function FileViewerTab({
           </div>
         </div>
       ) : isEditMode && draft ? (
-        <WorkspaceCodeEditor
-          value={draft.content}
-          language={data.language}
-          lineEnding={draft.lineEnding}
-          initialHighlightedLines={data.highlighted_lines}
-          initialContent={data.content.replace(/\r\n/g, "\n")}
-          isDark={isDark}
-          dirty={draft.dirty}
-          saving={draft.saving}
-          saveError={draft.saveError}
-          conflict={draft.conflict}
-          initialFocusLine={focusRange.startLine}
-          diagnostics={diagnostics}
-          jumpTarget={editorJumpTarget}
-          onGotoDefinition={isLspEligible ? handleGotoDefinition : undefined}
-          onChange={(nextValue) =>
-            orbitActions.updateFileEditorDraft(hostId, cwd, path, nextValue)
+        <Suspense
+          fallback={
+            <div className="bg-surface-base text-ink-tertiary flex min-h-0 flex-1 items-center justify-center gap-2 text-[12px]">
+              <OrbitSpinner size={14} />
+            </div>
           }
-          onSave={(force) => {
-            void orbitActions.saveWorkspaceFile(hostId, cwd, path, Boolean(force));
-          }}
-          onReloadFromConflict={() => {
-            void orbitActions.reloadWorkspaceFileFromConflict(hostId, cwd, path);
-          }}
-          onDismissError={() => orbitActions.clearFileEditorError(hostId, cwd, path)}
-          onCopyMine={() => {
-            void navigator.clipboard.writeText(draft.content);
-            orbitActions.showToast("Copied editor buffer to clipboard");
-          }}
-        />
+        >
+          <LazyWorkspaceCodeEditor
+            key={cKey}
+            hostId={hostId}
+            cwd={cwd}
+            filePath={path}
+            relPath={relPath}
+            value={draft.content}
+            language={data.language}
+            lineEnding={draft.lineEnding}
+            isDark={isDark}
+            dirty={draft.dirty}
+            saving={draft.saving}
+            saveError={draft.saveError}
+            conflict={draft.conflict}
+            isLspEligible={isLspEligible}
+            initialFocusLine={editEntryFocusLine ?? focusRange.startLine}
+            diagnostics={diagnostics}
+            jumpTarget={editorJumpTarget}
+            onGotoDefinition={isLspEligible ? handleGotoDefinition : undefined}
+            onJumpToFileLocation={handleJumpToFileLocation}
+            onAfterLspWorkspaceEdit={handleAfterLspWorkspaceEdit}
+            onChange={(nextValue) =>
+              orbitActions.updateFileEditorDraft(hostId, cwd, path, nextValue)
+            }
+            onSave={(force) =>
+              orbitActions.saveWorkspaceFile(hostId, cwd, path, Boolean(force))
+            }
+            onReloadFromConflict={() => {
+              void orbitActions.reloadWorkspaceFileFromConflict(hostId, cwd, path);
+            }}
+            onDismissError={() => orbitActions.clearFileEditorError(hostId, cwd, path)}
+            onCopyMine={() => {
+              void navigator.clipboard.writeText(draft.content);
+              orbitActions.showToast("Copied editor buffer to clipboard");
+            }}
+          />
+        </Suspense>
       ) : isMarkdown && markdownMode === "preview" ? (
         <ScrollArea className="min-h-0 flex-1" viewportClassName="px-5 py-4">
           <MarkdownLinkProvider hostId={hostId} cwd={cwd} baseFilePath={relPath}>
@@ -1399,8 +1455,7 @@ export const FileViewerTab = memo(function FileViewerTab({
                     }}
                     onDoubleClick={() => {
                       if (isEditable) {
-                        setFindOpen(false);
-                        orbitActions.enterFileEditMode(hostId, cwd, path);
+                        enterEditPreservingLine(lineNumber);
                       }
                     }}
                     className={cn(

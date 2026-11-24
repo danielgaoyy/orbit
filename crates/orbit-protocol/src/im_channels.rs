@@ -65,6 +65,34 @@ impl ImPlatform {
     }
 }
 
+/// Inbound event transport mode for an IM channel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImTransportMode {
+    /// NAT-friendly outbound connection (Feishu/Lark WS, Slack Socket Mode WSS,
+    /// Discord Gateway v10 WSS, Telegram long-polling). Requires no public webhook URL.
+    #[default]
+    LongConnection,
+    /// Inbound HTTP webhook callback exposed on the daemon HTTP listener.
+    Webhook,
+}
+
+impl ImTransportMode {
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::LongConnection => "long_connection",
+            Self::Webhook => "webhook",
+        }
+    }
+
+    pub fn from_slug(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "webhook" => Self::Webhook,
+            _ => Self::LongConnection,
+        }
+    }
+}
+
 /// Live connection/poller state for an IM channel bridge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,6 +100,7 @@ pub enum ImConnectionStatus {
     #[default]
     Disconnected,
     Connecting,
+    Reconnecting,
     Connected,
     Error,
 }
@@ -81,6 +110,7 @@ impl ImConnectionStatus {
         match self {
             Self::Disconnected => "disconnected",
             Self::Connecting => "connecting",
+            Self::Reconnecting => "reconnecting",
             Self::Connected => "connected",
             Self::Error => "error",
         }
@@ -89,6 +119,7 @@ impl ImConnectionStatus {
     pub fn from_slug(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
             "connecting" => Self::Connecting,
+            "reconnecting" => Self::Reconnecting,
             "connected" => Self::Connected,
             "error" => Self::Error,
             _ => Self::Disconnected,
@@ -104,6 +135,8 @@ pub struct ImChannelRecord {
     pub name: String,
     pub platform: ImPlatform,
     pub enabled: bool,
+    #[serde(default)]
+    pub transport_mode: ImTransportMode,
     pub status: ImConnectionStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_message: Option<String>,
@@ -112,10 +145,16 @@ pub struct ImChannelRecord {
     pub app_id: Option<String>,
     pub has_primary_secret: bool,
     pub has_signing_secret: bool,
+    #[serde(default)]
+    pub has_app_token: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub masked_primary_secret: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub masked_signing_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub masked_app_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
     #[serde(default)]
     pub allowed_chat_ids: Vec<String>,
     #[serde(default)]
@@ -203,5 +242,49 @@ mod tests {
             "oc_456".into(),
         ]);
         assert_eq!(res, vec!["oc_123".to_string(), "oc_456".to_string()]);
+    }
+
+    #[test]
+    fn im_transport_mode_and_reconnecting_status_roundtrip_and_compat() {
+        assert_eq!(
+            ImTransportMode::from_slug("long_connection"),
+            ImTransportMode::LongConnection
+        );
+        assert_eq!(
+            ImTransportMode::from_slug("webhook"),
+            ImTransportMode::Webhook
+        );
+        assert_eq!(
+            ImTransportMode::from_slug("unknown"),
+            ImTransportMode::LongConnection
+        );
+        assert_eq!(
+            ImConnectionStatus::from_slug("reconnecting"),
+            ImConnectionStatus::Reconnecting
+        );
+        assert_eq!(ImConnectionStatus::Reconnecting.slug(), "reconnecting");
+
+        // Legacy JSON missing new transport_mode/app_token/public_key fields deserializes cleanly
+        let legacy_json = r#"{
+            "channel_id": "im_old",
+            "name": "Legacy",
+            "platform": "slack",
+            "enabled": true,
+            "status": "connected",
+            "webhook_path": "/im/slack/im_old",
+            "has_primary_secret": true,
+            "has_signing_secret": true,
+            "default_workspace_cwd": "/tmp",
+            "default_provider": "claude_code",
+            "default_mode": "default",
+            "created_at_ms": 1,
+            "updated_at_ms": 2
+        }"#;
+        let decoded: ImChannelRecord =
+            serde_json::from_str(legacy_json).expect("decode legacy ImChannelRecord");
+        assert_eq!(decoded.transport_mode, ImTransportMode::LongConnection);
+        assert!(!decoded.has_app_token);
+        assert_eq!(decoded.masked_app_token, None);
+        assert_eq!(decoded.public_key, None);
     }
 }

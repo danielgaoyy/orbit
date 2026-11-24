@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use orbit_protocol::{
     GuardianAssessment, GuardianAuditEntry, GuardianDecision, GuardianPolicyConfig,
-    GuardianRiskLevel, ToolCallDetail,
+    GuardianRiskLevel, ProviderKind, ToolCallDetail,
 };
 use orbit_store::OrbitStore;
 use tokio::sync::RwLock;
@@ -39,6 +39,7 @@ pub struct GuardianEvalRequest<'a> {
     pub title: &'a str,
     pub detail: &'a ToolCallDetail,
     pub workspace_cwd: &'a str,
+    pub agent_provider: Option<ProviderKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +47,24 @@ struct OwnedEvalRequest {
     title: String,
     detail: ToolCallDetail,
     workspace_cwd: String,
+}
+
+/// Honest provenance tag for a Tier-2 classification verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier2Source {
+    /// Real fast-model LLM returned a valid, schema-verified JSON verdict.
+    LlmTier2,
+    /// Deterministic pure-Rust rubric or fail-closed fallback ran (never mislabeled as LLM).
+    HeuristicFallback,
+}
+
+impl Tier2Source {
+    pub const fn as_tier_str(self) -> &'static str {
+        match self {
+            Self::LlmTier2 => "llm_tier2",
+            Self::HeuristicFallback => "heuristic_fallback",
+        }
+    }
 }
 
 /// Normalized input passed to Tier-2 classification for `Medium`-risk requests.
@@ -57,6 +76,12 @@ pub struct Tier2Request {
     pub detail: ToolCallDetail,
     pub workspace_cwd: String,
     pub tier1_signals: Vec<String>,
+    pub tier1_floor_risk: GuardianRiskLevel,
+    pub agent_provider: Option<ProviderKind>,
+    pub llm_tier2_enabled: bool,
+    pub llm_provider: Option<ProviderKind>,
+    pub llm_model: Option<String>,
+    pub llm_timeout_ms: u64,
 }
 
 /// Output verdict from a Tier-2 evaluator before fail-closed validation.
@@ -67,14 +92,20 @@ pub struct Tier2Verdict {
     pub confidence: f32,
     pub reason: String,
     pub signals: Vec<String>,
+    pub source: Tier2Source,
 }
 
 pub type Tier2Future<'a> = Pin<Box<dyn Future<Output = Result<Tier2Verdict, String>> + Send + 'a>>;
 
-/// Pluggable Tier-2 evaluator (defaults to pure-Rust structured rubric; injectable in tests for
-/// deterministic timeout/error/panic/fail-closed verification).
+/// Pluggable Tier-2 evaluator (production wires `LlmGuardianClassifier`; tests may inject
+/// `StructuredRubricClassifier` or custom mock classifiers for deterministic verification).
 pub trait Tier2Classifier: Send + Sync {
     fn classify<'a>(&'a self, req: &'a Tier2Request) -> Tier2Future<'a>;
+
+    /// Returns `true` when this classifier invokes an LLM governed by `llm_timeout_ms`.
+    fn uses_llm(&self) -> bool {
+        false
+    }
 }
 
 /// Built-in pure-Rust structured rubric classifier for `Medium`-risk actions.
@@ -166,6 +197,13 @@ impl GuardianManager {
             assessment: assessment.clone(),
             decided_at_ms,
         };
+        self.record_audit_entry(entry).await;
+        assessment
+    }
+
+    /// Record a pre-built audit entry (e.g. from deterministic persistent permission rules)
+    /// into the in-memory ring and SQLite audit log.
+    pub async fn record_audit_entry(&self, entry: GuardianAuditEntry) {
         {
             let mut ring = self.recent_audits.write().await;
             ring.push_front(entry.clone());
@@ -181,7 +219,6 @@ impl GuardianManager {
                 }
             });
         }
-        assessment
     }
 
     /// Evaluate a permission request against an explicit policy without mutating persisted config.
@@ -198,7 +235,7 @@ impl GuardianManager {
                 risk_level: GuardianRiskLevel::Medium,
                 decision: GuardianDecision::RequireHuman,
                 confidence: 1.0,
-                classifier_tier: "deterministic".into(),
+                classifier_tier: "deterministic_tier1".into(),
                 reason: "Guardian auto-approval disabled".into(),
                 signals: vec!["guardian_disabled".into()],
                 latency_ms: elapsed_ms(started),
@@ -237,13 +274,17 @@ impl GuardianManager {
                 assessment.latency_ms = elapsed_ms(started);
                 assessment
             }
-            Tier1Outcome::NeedsTier2 { reason, signals } => {
+            Tier1Outcome::NeedsTier2 {
+                floor_risk,
+                reason,
+                signals,
+            } => {
                 if !config.use_ai_classifier_for_medium {
                     return GuardianAssessment {
-                        risk_level: GuardianRiskLevel::Medium,
+                        risk_level: floor_risk.max(GuardianRiskLevel::Medium),
                         decision: GuardianDecision::RequireHuman,
                         confidence: 0.75,
-                        classifier_tier: "deterministic".into(),
+                        classifier_tier: "deterministic_tier1".into(),
                         reason,
                         signals,
                         latency_ms: elapsed_ms(started),
@@ -258,14 +299,28 @@ impl GuardianManager {
                     detail: req.detail.clone(),
                     workspace_cwd: req.workspace_cwd.to_string(),
                     tier1_signals: signals.clone(),
+                    tier1_floor_risk: floor_risk,
+                    agent_provider: req.agent_provider,
+                    llm_tier2_enabled: config.llm_tier2_enabled,
+                    llm_provider: config.llm_provider,
+                    llm_model: config.llm_model.clone(),
+                    llm_timeout_ms: config.llm_timeout_ms,
                 };
-                let timeout = Duration::from_millis(config.classifier_timeout_ms);
+                let timeout = if config.llm_tier2_enabled && self.tier2.uses_llm() {
+                    Duration::from_millis(config.llm_timeout_ms.saturating_add(500))
+                } else {
+                    Duration::from_millis(config.classifier_timeout_ms)
+                };
                 let tier2 = Arc::clone(&self.tier2);
                 let mut handle = tokio::spawn(async move { tier2.classify(&tier2_req).await });
                 match tokio::time::timeout(timeout, &mut handle).await {
-                    Ok(Ok(Ok(verdict))) => {
-                        finalize_tier2_verdict(verdict, &config, signals, elapsed_ms(started))
-                    }
+                    Ok(Ok(Ok(verdict))) => finalize_tier2_verdict(
+                        verdict,
+                        floor_risk,
+                        &config,
+                        signals,
+                        elapsed_ms(started),
+                    ),
                     Ok(Ok(Err(err))) => GuardianAssessment {
                         risk_level: GuardianRiskLevel::High,
                         decision: GuardianDecision::RequireHuman,
@@ -294,10 +349,7 @@ impl GuardianManager {
                             decision: GuardianDecision::RequireHuman,
                             confidence: 0.0,
                             classifier_tier: "fail_closed".into(),
-                            reason: format!(
-                                "Classifier timed out after {}ms",
-                                config.classifier_timeout_ms
-                            ),
+                            reason: format!("Classifier timed out after {}ms", timeout.as_millis()),
                             signals: extend_signals(signals, "classifier_timeout"),
                             latency_ms: elapsed_ms(started),
                         }
@@ -308,8 +360,9 @@ impl GuardianManager {
     }
 }
 
-fn finalize_tier2_verdict(
+pub(crate) fn finalize_tier2_verdict(
     verdict: Tier2Verdict,
+    tier1_floor_risk: GuardianRiskLevel,
     config: &GuardianPolicyConfig,
     mut base_signals: Vec<String>,
     latency_ms: u64,
@@ -320,7 +373,7 @@ fn finalize_tier2_verdict(
         || verdict.reason.trim().is_empty()
     {
         return GuardianAssessment {
-            risk_level: GuardianRiskLevel::High,
+            risk_level: tier1_floor_risk.max(GuardianRiskLevel::High),
             decision: GuardianDecision::RequireHuman,
             confidence: 0.0,
             classifier_tier: "fail_closed".into(),
@@ -336,10 +389,25 @@ fn finalize_tier2_verdict(
         }
     }
 
-    // Security invariant: High and Critical risk actions NEVER auto-allow.
-    let safe_to_allow = verdict.decision == GuardianDecision::AutoAllow
-        && verdict.risk_level <= config.auto_approve_max_risk
-        && verdict.risk_level <= GuardianRiskLevel::Medium
+    // Fail-closed monotonicity: Tier-2 can NEVER downgrade a Tier-1 risk floor
+    // (e.g. High/Critical -> Low) and High/Critical risk actions NEVER auto-allow.
+    let effective_risk = verdict.risk_level.max(tier1_floor_risk);
+    if verdict.risk_level < tier1_floor_risk
+        && !base_signals.iter().any(|s| s == "tier1_floor_preserved")
+    {
+        base_signals.push("tier1_floor_preserved".to_string());
+    }
+
+    let policy_disabled = base_signals.iter().any(|s| {
+        matches!(
+            s.as_str(),
+            "read_only_disabled" | "workspace_tests_disabled"
+        )
+    });
+    let safe_to_allow = !policy_disabled
+        && verdict.decision == GuardianDecision::AutoAllow
+        && effective_risk <= config.auto_approve_max_risk
+        && effective_risk <= GuardianRiskLevel::Medium
         && verdict.confidence >= MIN_AUTO_ALLOW_CONFIDENCE;
 
     let final_decision = if safe_to_allow {
@@ -351,14 +419,50 @@ fn finalize_tier2_verdict(
     };
 
     GuardianAssessment {
-        risk_level: verdict.risk_level,
+        risk_level: effective_risk,
         decision: final_decision,
         confidence: verdict.confidence,
-        classifier_tier: "ai_rubric".into(),
+        classifier_tier: verdict.source.as_tier_str().into(),
         reason: truncate_reason(verdict.reason.trim(), 120),
         signals: base_signals,
         latency_ms,
     }
+}
+
+/// Returns `true` whenever a Guardian assessment MUST be resolved strictly by a human operator
+/// and NEVER delegated to Personal Router or approved by an agent:
+/// - `High` or `Critical` risk level
+/// - `fail_closed` classifier tier
+/// - Fail-closed / fallback LLM errors, hook blocks, or explicit policy-disabled signals
+pub fn assessment_requires_human_only(assessment: &GuardianAssessment) -> bool {
+    if assessment.risk_level >= GuardianRiskLevel::High {
+        return true;
+    }
+    if assessment.classifier_tier == "fail_closed" {
+        return true;
+    }
+    if assessment.classifier_tier == "heuristic_fallback"
+        && assessment.decision == GuardianDecision::RequireHuman
+        && assessment.confidence <= 0.0
+    {
+        return true;
+    }
+    assessment.signals.iter().any(|s| {
+        matches!(
+            s.as_str(),
+            "fail_closed"
+                | "pre_tool_use_hook_blocked"
+                | "read_only_disabled"
+                | "workspace_tests_disabled"
+                | "llm_timeout"
+                | "llm_malformed_json"
+                | "llm_unavailable"
+                | "llm_error"
+                | "llm_provider_unavailable"
+                | "llm_provider_unsupported"
+                | "invalid_classifier_response"
+        )
+    })
 }
 
 fn extend_signals(mut signals: Vec<String>, extra: &str) -> Vec<String> {
@@ -493,6 +597,7 @@ fn extract_generic_summary(arguments_json: &str) -> Option<String> {
 enum Tier1Outcome {
     Final(GuardianAssessment),
     NeedsTier2 {
+        floor_risk: GuardianRiskLevel,
         reason: String,
         signals: Vec<String>,
     },
@@ -515,7 +620,7 @@ impl Tier1Result {
                 risk_level,
                 decision,
                 confidence,
-                classifier_tier: "deterministic".into(),
+                classifier_tier: "deterministic_tier1".into(),
                 reason: reason.into(),
                 signals,
                 latency_ms: 0,
@@ -526,6 +631,7 @@ impl Tier1Result {
     fn escalate_or_tier2(reason: impl Into<String>, signals: Vec<String>) -> Self {
         Self {
             outcome: Tier1Outcome::NeedsTier2 {
+                floor_risk: GuardianRiskLevel::Medium,
                 reason: reason.into(),
                 signals,
             },
@@ -572,7 +678,9 @@ fn classify_tier1(req: &OwnedEvalRequest, config: &GuardianPolicyConfig) -> Tier
         ToolCallDetail::FileRead { path, .. } => {
             classify_file_read(path, &req.workspace_cwd, config)
         }
-        ToolCallDetail::FileEdit { path, .. } => classify_file_edit(path, &req.workspace_cwd),
+        ToolCallDetail::FileEdit { path, unified_diff } => {
+            classify_file_edit(path, unified_diff.as_deref(), &req.workspace_cwd)
+        }
         ToolCallDetail::Search { scope, .. } => {
             classify_search(scope.as_deref(), &req.workspace_cwd, config)
         }
@@ -606,7 +714,14 @@ fn match_blocked_pattern<'a>(
                 haystacks.push(collapsed.to_ascii_lowercase());
             }
         }
-        ToolCallDetail::FileEdit { path, .. } | ToolCallDetail::FileRead { path, .. } => {
+        ToolCallDetail::FileEdit { path, unified_diff } => {
+            for touched in
+                crate::hooks::extract_paths_from_unified_diff(path, unified_diff.as_deref())
+            {
+                haystacks.push(touched.to_ascii_lowercase());
+            }
+        }
+        ToolCallDetail::FileRead { path, .. } => {
             haystacks.push(path.to_ascii_lowercase());
         }
         ToolCallDetail::Generic {
@@ -650,6 +765,15 @@ fn classify_file_read(
         );
     }
     if !is_path_within_workspace(path, workspace_cwd) {
+        if !config.allow_read_only_tools {
+            return Tier1Result::final_decision(
+                GuardianRiskLevel::Medium,
+                GuardianDecision::RequireHuman,
+                1.0,
+                "Read-only auto-approval disabled by policy",
+                vec!["outside_workspace_read".into(), "read_only_disabled".into()],
+            );
+        }
         return Tier1Result::escalate_or_tier2(
             "File read outside workspace",
             vec!["outside_workspace_read".into()],
@@ -664,8 +788,11 @@ fn classify_file_read(
             vec!["read_only_tool".into(), "in_workspace".into()],
         );
     }
-    Tier1Result::escalate_or_tier2(
-        "Read-only auto-approval disabled",
+    Tier1Result::final_decision(
+        GuardianRiskLevel::Medium,
+        GuardianDecision::RequireHuman,
+        1.0,
+        "Read-only auto-approval disabled by policy",
         vec!["read_only_disabled".into()],
     )
 }
@@ -686,6 +813,15 @@ fn classify_search(
             );
         }
         if !is_path_within_workspace(sc, workspace_cwd) {
+            if !config.allow_read_only_tools {
+                return Tier1Result::final_decision(
+                    GuardianRiskLevel::Medium,
+                    GuardianDecision::RequireHuman,
+                    1.0,
+                    "Read-only auto-approval disabled by policy",
+                    vec!["outside_workspace_read".into(), "read_only_disabled".into()],
+                );
+            }
             return Tier1Result::escalate_or_tier2(
                 "Search outside workspace",
                 vec!["outside_workspace_read".into()],
@@ -701,29 +837,71 @@ fn classify_search(
             vec!["read_only_tool".into(), "in_workspace".into()],
         );
     }
-    Tier1Result::escalate_or_tier2(
-        "Read-only auto-approval disabled",
+    Tier1Result::final_decision(
+        GuardianRiskLevel::Medium,
+        GuardianDecision::RequireHuman,
+        1.0,
+        "Read-only auto-approval disabled by policy",
         vec!["read_only_disabled".into()],
     )
 }
 
-fn classify_file_edit(path: &str, workspace_cwd: &str) -> Tier1Result {
-    if let Some(reason) = detect_sensitive_path_with_resolution(path, workspace_cwd, false) {
-        return Tier1Result::final_decision(
-            GuardianRiskLevel::Critical,
-            GuardianDecision::RequireHuman,
-            1.0,
-            reason,
-            vec!["sensitive_path".into()],
-        );
+fn classify_file_edit(path: &str, unified_diff: Option<&str>, workspace_cwd: &str) -> Tier1Result {
+    // Check ALL touched paths in multi-file diffs so later files cannot evade Tier-1 floors.
+    let touched_paths = crate::hooks::extract_paths_from_unified_diff(path, unified_diff);
+    for p in &touched_paths {
+        if let Some(reason) = detect_sensitive_path_with_resolution(p, workspace_cwd, false) {
+            return Tier1Result::final_decision(
+                GuardianRiskLevel::Critical,
+                GuardianDecision::RequireHuman,
+                1.0,
+                reason,
+                vec!["sensitive_path".into()],
+            );
+        }
     }
-    if !is_path_within_workspace(path, workspace_cwd) {
+    for p in &touched_paths {
+        if !is_path_within_workspace(p, workspace_cwd) {
+            return Tier1Result::final_decision(
+                GuardianRiskLevel::High,
+                GuardianDecision::RequireHuman,
+                0.99,
+                "Outside workspace write",
+                vec!["outside_workspace_write".into()],
+            );
+        }
+    }
+    // Enforce deterministic High-risk floor for protected build/CI/config files BEFORE Tier-2 LLM
+    // so an LLM verdict can NEVER downgrade or auto-approve edits to `build.rs`, `Cargo.toml`,
+    // `.github/workflows/*`, etc.
+    for p in &touched_paths {
+        if is_high_impact_project_file(p) {
+            return Tier1Result::final_decision(
+                GuardianRiskLevel::High,
+                GuardianDecision::RequireHuman,
+                0.94,
+                "Sensitive build, CI, or config file edit",
+                vec!["sensitive_project_file".into()],
+            );
+        }
+    }
+    let changed_lines = unified_diff
+        .map(|d| {
+            d.lines()
+                .filter(|l| {
+                    (l.starts_with('+') && !l.starts_with("+++"))
+                        || (l.starts_with('-') && !l.starts_with("---"))
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    if changed_lines > 400 {
         return Tier1Result::final_decision(
             GuardianRiskLevel::High,
             GuardianDecision::RequireHuman,
-            0.99,
-            "Outside workspace write",
-            vec!["outside_workspace_write".into()],
+            0.85,
+            format!("Large file modification ({changed_lines} lines)"),
+            vec!["large_diff".into()],
         );
     }
     Tier1Result::escalate_or_tier2(
@@ -838,6 +1016,15 @@ fn classify_generic_tool(
             .iter()
             .any(|p| !is_path_within_workspace(p, workspace_cwd))
         {
+            if !config.allow_read_only_tools {
+                return Tier1Result::final_decision(
+                    GuardianRiskLevel::Medium,
+                    GuardianDecision::RequireHuman,
+                    1.0,
+                    "Read-only auto-approval disabled by policy",
+                    vec!["outside_workspace_read".into(), "read_only_disabled".into()],
+                );
+            }
             return Tier1Result::escalate_or_tier2(
                 "Read outside workspace",
                 vec!["outside_workspace_read".into()],
@@ -852,8 +1039,11 @@ fn classify_generic_tool(
                 vec!["read_only_tool".into(), "in_workspace".into()],
             );
         }
-        return Tier1Result::escalate_or_tier2(
-            "Read-only auto-approval disabled",
+        return Tier1Result::final_decision(
+            GuardianRiskLevel::Medium,
+            GuardianDecision::RequireHuman,
+            1.0,
+            "Read-only auto-approval disabled by policy",
             vec!["read_only_disabled".into()],
         );
     }
@@ -871,6 +1061,18 @@ fn classify_generic_tool(
                 0.98,
                 "Outside workspace write",
                 vec!["outside_workspace_write".into()],
+            );
+        }
+        if extracted_paths
+            .iter()
+            .any(|p| is_high_impact_project_file(p))
+        {
+            return Tier1Result::final_decision(
+                GuardianRiskLevel::High,
+                GuardianDecision::RequireHuman,
+                0.94,
+                "Sensitive build, CI, or config file edit",
+                vec!["sensitive_project_file".into()],
             );
         }
         return Tier1Result::escalate_or_tier2(
@@ -1148,6 +1350,45 @@ fn classify_shell_command(
         }
     };
 
+    // Deterministic High-risk floor for git hook-bypass / force-add commands BEFORE Tier-2 LLM.
+    {
+        let prog = Path::new(&cmd_tokens[0])
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&cmd_tokens[0])
+            .to_ascii_lowercase();
+        if prog == "git" {
+            let sub = cmd_tokens.get(1).map(|s| s.to_ascii_lowercase());
+            let rest_lower: Vec<String> = cmd_tokens
+                .iter()
+                .skip(2)
+                .map(|a| a.to_ascii_lowercase())
+                .collect();
+            if sub.as_deref() == Some("commit")
+                && rest_lower.iter().any(|a| a == "--no-verify" || a == "-n")
+            {
+                return Tier1Result::final_decision(
+                    GuardianRiskLevel::High,
+                    GuardianDecision::RequireHuman,
+                    0.96,
+                    "Git commit bypassing hooks (`--no-verify`) requires approval",
+                    vec!["git_bypass_hooks".into()],
+                );
+            }
+            if sub.as_deref() == Some("add")
+                && rest_lower.iter().any(|a| a == "-f" || a == "--force")
+            {
+                return Tier1Result::final_decision(
+                    GuardianRiskLevel::High,
+                    GuardianDecision::RequireHuman,
+                    0.95,
+                    "Forced git add (`--force`) requires approval",
+                    vec!["git_force_add".into()],
+                );
+            }
+        }
+    }
+
     // 6. Check strictly read-only inspection commands (Low risk).
     if is_safe_read_only_shell(cmd_tokens, workspace_cwd) {
         if config.allow_read_only_tools && GuardianRiskLevel::Low <= config.auto_approve_max_risk {
@@ -1159,8 +1400,11 @@ fn classify_shell_command(
                 vec!["read_only_shell".into()],
             );
         }
-        return Tier1Result::escalate_or_tier2(
-            "Read-only auto-approval disabled",
+        return Tier1Result::final_decision(
+            GuardianRiskLevel::Medium,
+            GuardianDecision::RequireHuman,
+            1.0,
+            "Read-only auto-approval disabled by policy",
             vec!["read_only_disabled".into()],
         );
     }
@@ -1176,8 +1420,11 @@ fn classify_shell_command(
                 vec!["workspace_test".into()],
             );
         }
-        return Tier1Result::escalate_or_tier2(
-            "Workspace test auto-approval disabled",
+        return Tier1Result::final_decision(
+            GuardianRiskLevel::Medium,
+            GuardianDecision::RequireHuman,
+            1.0,
+            "Workspace test auto-approval disabled by policy",
             vec!["workspace_tests_disabled".into()],
         );
     }
@@ -2733,7 +2980,7 @@ fn match_trusted_prefix<'a>(
 // Tier 2: Pure-Rust Structured Rubric Classifier for Medium-Risk Actions
 // ================================================================================================
 
-fn evaluate_structured_rubric(req: &Tier2Request) -> Tier2Verdict {
+pub(crate) fn evaluate_structured_rubric(req: &Tier2Request) -> Tier2Verdict {
     match &req.detail {
         ToolCallDetail::FileEdit { path, unified_diff } => {
             if is_high_impact_project_file(path) {
@@ -2743,6 +2990,7 @@ fn evaluate_structured_rubric(req: &Tier2Request) -> Tier2Verdict {
                     confidence: 0.94,
                     reason: "Sensitive build, CI, or config file edit".into(),
                     signals: vec!["sensitive_project_file".into()],
+                    source: Tier2Source::HeuristicFallback,
                 };
             }
             let changed_lines = unified_diff
@@ -2763,6 +3011,7 @@ fn evaluate_structured_rubric(req: &Tier2Request) -> Tier2Verdict {
                     confidence: 0.85,
                     reason: format!("Large file modification ({changed_lines} lines)"),
                     signals: vec!["large_diff".into()],
+                    source: Tier2Source::HeuristicFallback,
                 };
             }
             Tier2Verdict {
@@ -2771,6 +3020,7 @@ fn evaluate_structured_rubric(req: &Tier2Request) -> Tier2Verdict {
                 confidence: 0.85,
                 reason: "Scoped in-workspace source edit".into(),
                 signals: vec!["rubric_in_workspace_edit".into()],
+                source: Tier2Source::HeuristicFallback,
             }
         }
         ToolCallDetail::Shell { command, .. } => {
@@ -2781,6 +3031,7 @@ fn evaluate_structured_rubric(req: &Tier2Request) -> Tier2Verdict {
                     confidence: 0.9,
                     reason: "Ambiguous shell syntax requires human review".into(),
                     signals: vec!["rubric_ambiguous_shell".into()],
+                    source: Tier2Source::HeuristicFallback,
                 };
             };
             let Ok(cmd_tokens) = strip_safe_env_prefix(&tokens) else {
@@ -2790,6 +3041,7 @@ fn evaluate_structured_rubric(req: &Tier2Request) -> Tier2Verdict {
                     confidence: 0.99,
                     reason: "Dangerous environment override".into(),
                     signals: vec!["dangerous_env_override".into()],
+                    source: Tier2Source::HeuristicFallback,
                 };
             };
             if cmd_tokens.is_empty() {
@@ -2799,6 +3051,7 @@ fn evaluate_structured_rubric(req: &Tier2Request) -> Tier2Verdict {
                     confidence: 0.5,
                     reason: "Empty shell command".into(),
                     signals: vec!["rubric_unrecognized_shell".into()],
+                    source: Tier2Source::HeuristicFallback,
                 };
             }
             let prog = Path::new(&cmd_tokens[0])
@@ -2850,6 +3103,7 @@ fn evaluate_structured_rubric(req: &Tier2Request) -> Tier2Verdict {
                     confidence: 0.82,
                     reason: "Scoped workspace-local command".into(),
                     signals: vec!["rubric_local_command".into()],
+                    source: Tier2Source::HeuristicFallback,
                 };
             }
             Tier2Verdict {
@@ -2858,6 +3112,7 @@ fn evaluate_structured_rubric(req: &Tier2Request) -> Tier2Verdict {
                 confidence: 0.45,
                 reason: "Unrecognized shell command requires human review".into(),
                 signals: vec!["rubric_unrecognized_shell".into()],
+                source: Tier2Source::HeuristicFallback,
             }
         }
         ToolCallDetail::FileRead { .. } | ToolCallDetail::Search { .. } => Tier2Verdict {
@@ -2866,6 +3121,7 @@ fn evaluate_structured_rubric(req: &Tier2Request) -> Tier2Verdict {
             confidence: 0.65,
             reason: "Read outside workspace or read-only auto-approval disabled".into(),
             signals: vec!["rubric_read_escalated".into()],
+            source: Tier2Source::HeuristicFallback,
         },
         ToolCallDetail::Subagent { .. } => Tier2Verdict {
             risk_level: GuardianRiskLevel::Medium,
@@ -2873,6 +3129,7 @@ fn evaluate_structured_rubric(req: &Tier2Request) -> Tier2Verdict {
             confidence: 0.70,
             reason: "Subagent delegation requires human review".into(),
             signals: vec!["rubric_subagent".into()],
+            source: Tier2Source::HeuristicFallback,
         },
         ToolCallDetail::Generic { tool_name, .. } => Tier2Verdict {
             risk_level: GuardianRiskLevel::Medium,
@@ -2880,6 +3137,7 @@ fn evaluate_structured_rubric(req: &Tier2Request) -> Tier2Verdict {
             confidence: 0.50,
             reason: format!("Tool `{tool_name}` requires human review"),
             signals: vec!["rubric_generic_tool".into()],
+            source: Tier2Source::HeuristicFallback,
         },
     }
 }
@@ -3003,6 +3261,7 @@ mod tests {
             title: "Run command",
             detail: &detail,
             workspace_cwd: ws,
+            agent_provider: None,
         };
         mgr.assess_with_config(&req, cfg).await
     }
@@ -3036,7 +3295,7 @@ mod tests {
                 "expected AutoAllow for `{cmd}`, got {res:?}"
             );
             assert_eq!(res.risk_level, GuardianRiskLevel::Low, "cmd={cmd}");
-            assert_eq!(res.classifier_tier, "deterministic");
+            assert_eq!(res.classifier_tier, "deterministic_tier1");
         }
 
         // In-workspace FileRead
@@ -3051,6 +3310,7 @@ mod tests {
             title: "Read file",
             detail: &read_detail,
             workspace_cwd: &ws,
+            agent_provider: None,
         };
         let read_res = mgr.assess_with_config(&read_req, &cfg).await;
         assert_eq!(read_res.decision, GuardianDecision::AutoAllow);
@@ -3155,6 +3415,7 @@ mod tests {
                     title: "read_file",
                     detail: &ssh_cap,
                     workspace_cwd: &ws,
+                    agent_provider: None,
                 },
                 &cfg,
             )
@@ -3175,6 +3436,7 @@ mod tests {
                     title: "read_file",
                     detail: &malformed,
                     workspace_cwd: &ws,
+                    agent_provider: None,
                 },
                 &cfg,
             )
@@ -3195,6 +3457,7 @@ mod tests {
                     title: "read_file",
                     detail: &missing,
                     workspace_cwd: &ws,
+                    agent_provider: None,
                 },
                 &cfg,
             )
@@ -3214,6 +3477,7 @@ mod tests {
                     title: "read_file",
                     detail: &nested,
                     workspace_cwd: &ws,
+                    agent_provider: None,
                 },
                 &cfg,
             )
@@ -3290,6 +3554,7 @@ mod tests {
                     title: "Edit",
                     detail: &trav,
                     workspace_cwd: &ws,
+                    agent_provider: None,
                 },
                 &cfg,
             )
@@ -3312,6 +3577,7 @@ mod tests {
                     title: "Edit",
                     detail: &dangling,
                     workspace_cwd: &ws,
+                    agent_provider: None,
                 },
                 &cfg,
             )
@@ -3336,6 +3602,7 @@ mod tests {
                     title: "Read",
                     detail: &sym_secret,
                     workspace_cwd: &ws,
+                    agent_provider: None,
                 },
                 &cfg,
             )
@@ -3358,6 +3625,7 @@ mod tests {
                         title: "Read",
                         detail: &det,
                         workspace_cwd: &ws,
+                        agent_provider: None,
                     },
                     &cfg,
                 )
@@ -3440,6 +3708,7 @@ mod tests {
                     title: "Edit file",
                     detail: &outside_edit,
                     workspace_cwd: &ws,
+                    agent_provider: None,
                 },
                 &cfg,
             )
@@ -3459,6 +3728,7 @@ mod tests {
                     title: "Edit file",
                     detail: &traversal_edit,
                     workspace_cwd: &ws,
+                    agent_provider: None,
                 },
                 &cfg,
             )
@@ -3479,6 +3749,7 @@ mod tests {
                     title: "Read file",
                     detail: &ssh_read,
                     workspace_cwd: &ws,
+                    agent_provider: None,
                 },
                 &cfg,
             )
@@ -3498,6 +3769,7 @@ mod tests {
                     confidence: 1.0,
                     reason: "too slow".into(),
                     signals: vec![],
+                    source: Tier2Source::HeuristicFallback,
                 })
             })
         }
@@ -3513,6 +3785,7 @@ mod tests {
                     confidence: f32::NAN,
                     reason: "".into(),
                     signals: vec![],
+                    source: Tier2Source::HeuristicFallback,
                 })
             })
         }
@@ -3553,6 +3826,7 @@ mod tests {
             title: "Edit file",
             detail: &edit_detail,
             workspace_cwd: &ws,
+            agent_provider: None,
         };
 
         // Timeout -> fail_closed -> RequireHuman
@@ -3609,6 +3883,10 @@ mod tests {
             allow_workspace_tests: true,
             blocked_command_patterns: vec!["cargo publish".into(), "DENY:rm -rf".into()],
             trusted_command_prefixes: vec!["just test".into()],
+            llm_tier2_enabled: true,
+            llm_provider: Some(ProviderKind::ClaudeCode),
+            llm_model: Some("claude-haiku-4-5".into()),
+            llm_timeout_ms: 6_000,
         };
         let (saved, _) = mgr.update_config(custom_cfg.clone()).await.expect("save");
         assert_eq!(saved, custom_cfg);
@@ -3628,6 +3906,7 @@ mod tests {
                 title: "Run just",
                 detail: &detail_trusted,
                 workspace_cwd: &ws,
+                agent_provider: None,
             })
             .await;
         assert_eq!(res_trusted.decision, GuardianDecision::AutoAllow);
@@ -3646,6 +3925,7 @@ mod tests {
                 title: "Delete build",
                 detail: &detail_deny,
                 workspace_cwd: &ws,
+                agent_provider: None,
             })
             .await;
         assert_eq!(res_deny.decision, GuardianDecision::AutoDeny);

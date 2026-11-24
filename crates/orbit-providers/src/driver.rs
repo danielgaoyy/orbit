@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentMessageDeliveryStatus, AgentStatus, BackgroundTaskInfo, ProviderKind,
-    ProviderSubagentDescriptor, QuestionItem, ReasoningEffort, SessionMode, TimelinePayload,
-    ToolCallDetail, ToolCallStatus,
+    ActiveTurnBehavior, AgentMessageDeliveryStatus, AgentStatus, BackgroundTaskInfo,
+    PlanApprovalAction, PlanApprovalPayload, ProviderKind, ProviderSubagentDescriptor,
+    QuestionItem, ReasoningEffort, SessionMode, TimelinePayload, ToolCallDetail, ToolCallStatus,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -129,6 +129,13 @@ pub enum DriverCommand {
         /// `"allow"` | `"allow_always"` | `"deny"`
         decision: String,
     },
+    ResolvePlanApproval {
+        request_id: String,
+        action: PlanApprovalAction,
+        edited_plan_markdown: Option<String>,
+        feedback: Option<String>,
+        target_mode: SessionMode,
+    },
     AnswerQuestion {
         request_id: String,
         answers: Vec<Vec<String>>,
@@ -168,6 +175,7 @@ pub enum DriverEvent {
         title: String,
         detail: ToolCallDetail,
         allowed_decisions: Vec<String>,
+        plan_approval: Option<PlanApprovalPayload>,
     },
     QuestionRequest {
         request_id: String,

@@ -1,4 +1,7 @@
 export const SIDE_PANEL_SELECTOR = '[data-orbit-side-panel="true"]';
+export const CODE_EDITOR_SELECTOR = '[data-orbit-code-editor="true"]';
+export const SIDEBAR_SELECTOR = '[data-orbit-sidebar="true"]';
+export const STAGE_SELECTOR = '[data-orbit-stage="true"]';
 export const COMPOSER_INPUT_SELECTOR = '[data-orbit-composer-input="true"]';
 export const SETTINGS_ESCAPE_OVERLAY_SELECTOR =
   '[data-slot="dialog-content"], [role="dialog"], [role="alertdialog"], [data-slot="popover-content"], [role="menu"], [role="listbox"]';
@@ -187,6 +190,97 @@ export function isFocusInsideSidePanel(
     return isFocusInsideFileViewerPane(sidePanelEl, eventTarget, activeElement);
   }
   return false;
+}
+
+/**
+ * Returns true when focus (or event target) resides inside the mounted CodeMirror 6
+ * editor surface (`[data-orbit-code-editor="true"]`), so editor chords (`⌘K` inline AI edit,
+ * `⌘D` multi-cursor select next occurrence) yield cleanly from global window handlers.
+ */
+export function isFocusInsideCodeEditor(
+  eventTarget: EventTarget | null,
+  activeElement: Element | null,
+  doc: ShortcutDocumentLike | null = typeof document !== "undefined" ? document : null,
+): boolean {
+  const isSpecificActive =
+    activeElement !== null &&
+    activeElement !== doc?.body &&
+    activeElement !== doc?.documentElement;
+
+  const candidate = isSpecificActive ? activeElement : eventTarget;
+  return matchesClosestSelector(candidate, CODE_EDITOR_SELECTOR);
+}
+
+/**
+ * Returns true when focus (or event target when no specific element is focused)
+ * resides inside the Left Fleet Sidebar (`[data-orbit-sidebar="true"]`).
+ */
+export function isFocusInsideSidebar(
+  eventTarget: EventTarget | null,
+  activeElement: Element | null,
+  doc: ShortcutDocumentLike | null = typeof document !== "undefined" ? document : null,
+): boolean {
+  const isSpecificActive =
+    activeElement !== null &&
+    activeElement !== doc?.body &&
+    activeElement !== doc?.documentElement;
+
+  const candidate = isSpecificActive ? activeElement : eventTarget;
+  if (matchesClosestSelector(candidate, SIDEBAR_SELECTOR)) {
+    return true;
+  }
+
+  const sidebarEl = (doc?.querySelector?.(SIDEBAR_SELECTOR) as HTMLElement | null) ?? null;
+  if (sidebarEl && typeof Node !== "undefined") {
+    const candidateNode = candidate instanceof Node ? candidate : null;
+    return nodeInsideElement(sidebarEl, candidateNode);
+  }
+  return false;
+}
+
+export type GlobalFindAction = "stage_find" | "sidebar_filter" | "yield";
+
+export interface GlobalFindContext {
+  mod: boolean;
+  shiftKey: boolean;
+  altKey: boolean;
+  keyLower: string;
+  terminalFocused: boolean;
+  focusInsideSidePanel: boolean;
+  focusInsideSidebar: boolean;
+  isOverlayOpen: boolean;
+  hasOpenConversation: boolean;
+}
+
+/**
+ * Canonical focus-precedence contract for `⌘F` / `Ctrl+F` and `⌘⇧F` / `Ctrl+Shift+F`:
+ * 1. Terminal or blocking modal overlays always own `⌘F` (`"yield"`).
+ * 2. `⌘⇧F` / `Ctrl+Shift+F` focuses the Sidebar thread filter from anywhere in the workspace.
+ * 3. Inside the Right Side Panel (File Viewer / Code Editor), `⌘F` yields to Find-in-File.
+ * 4. Inside the Left Sidebar, `⌘F` focuses the Sidebar thread filter.
+ * 5. In Main Stage (or default when an agent conversation is open), `⌘F` opens `StageFindBar`.
+ * 6. When no conversation is open (e.g. launchpad/draft), `⌘F` falls back to Sidebar filter.
+ */
+export function resolveGlobalFindAction(ctx: GlobalFindContext): GlobalFindAction {
+  if (!ctx.mod || ctx.altKey || ctx.keyLower !== "f") {
+    return "yield";
+  }
+  if (ctx.terminalFocused || ctx.isOverlayOpen) {
+    return "yield";
+  }
+  if (ctx.shiftKey) {
+    return "sidebar_filter";
+  }
+  if (ctx.focusInsideSidePanel) {
+    return "yield";
+  }
+  if (ctx.focusInsideSidebar) {
+    return "sidebar_filter";
+  }
+  if (ctx.hasOpenConversation) {
+    return "stage_find";
+  }
+  return "sidebar_filter";
 }
 
 /**

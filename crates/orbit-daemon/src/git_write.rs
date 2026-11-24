@@ -32,8 +32,8 @@ use tokio::process::{Child, Command};
 
 use crate::workspace_files::is_path_inside_git;
 
-const LOCAL_GIT_TIMEOUT: Duration = Duration::from_secs(20);
-const NETWORK_GIT_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const LOCAL_GIT_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const NETWORK_GIT_TIMEOUT: Duration = Duration::from_secs(60);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PATHS_PER_CALL: usize = 1000;
 const MAX_REL_PATH_BYTES: usize = 4096;
@@ -41,8 +41,8 @@ const MAX_PATCH_BYTES: usize = 2 * 1024 * 1024;
 const MAX_COMMIT_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_PR_TITLE_BYTES: usize = 512;
 const MAX_PR_BODY_BYTES: usize = 128 * 1024;
-const MAX_REF_NAME_BYTES: usize = 256;
-const MAX_OUTPUT_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_REF_NAME_BYTES: usize = 256;
+pub(crate) const MAX_OUTPUT_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GitWriteError {
@@ -83,14 +83,14 @@ impl GitWriteError {
 }
 
 #[derive(Debug, Clone)]
-struct GitRepoContext {
-    repo_root: PathBuf,
-    cwd: PathBuf,
+pub(crate) struct GitRepoContext {
+    pub(crate) repo_root: PathBuf,
+    pub(crate) cwd: PathBuf,
 }
 
 /// Drive a spawned child process by writing optional `stdin_bytes` and draining `stdout`/`stderr`
 /// concurrently under ONE unified deadline, explicitly killing and reaping the child on timeout.
-async fn drive_child_with_stdin_timeout(
+pub(crate) async fn drive_child_with_stdin_timeout(
     mut child: Child,
     stdin_bytes: Option<&[u8]>,
     timeout: Duration,
@@ -153,7 +153,7 @@ async fn drive_child_with_stdin_timeout(
     }
 }
 
-async fn run_git_output(
+pub(crate) async fn run_git_output(
     dir: &Path,
     args: &[&str],
     timeout: Duration,
@@ -192,7 +192,7 @@ async fn run_git_with_stdin(
     drive_child_with_stdin_timeout(child, Some(stdin_bytes), timeout, &format!("git {label}")).await
 }
 
-fn format_process_failure(out: &std::process::Output) -> String {
+pub(crate) fn format_process_failure(out: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if !stderr.is_empty() {
         return truncate_utf8(&stderr, MAX_OUTPUT_BYTES);
@@ -210,7 +210,7 @@ fn format_process_failure(out: &std::process::Output) -> String {
     )
 }
 
-fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+pub(crate) fn truncate_utf8(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
@@ -233,7 +233,7 @@ pub async fn resolve_repo_root(cwd: &Path) -> Result<PathBuf, GitWriteError> {
 
 /// Verify that `cwd` is an existing non-bare Git repository working directory and resolve its
 /// canonical repository root and canonical working directory.
-async fn resolve_git_repo_context(cwd: &Path) -> Result<GitRepoContext, GitWriteError> {
+pub(crate) async fn resolve_git_repo_context(cwd: &Path) -> Result<GitRepoContext, GitWriteError> {
     let canon_cwd = crate::platform::canonicalize_clean_async(cwd)
         .await
         .map_err(|e| GitWriteError::NotAGitRepo(format!("{}: {e}", cwd.display())))?;
@@ -310,7 +310,10 @@ async fn resolve_git_repo_context(cwd: &Path) -> Result<GitRepoContext, GitWrite
 ///
 /// Preserves the exact caller-supplied path string (never calls `.trim()` so filenames with
 /// leading or trailing spaces are never silently rewritten into another file).
-fn validate_git_rel_path(ctx: &GitRepoContext, raw_path: &str) -> Result<String, GitWriteError> {
+pub(crate) fn validate_git_rel_path(
+    ctx: &GitRepoContext,
+    raw_path: &str,
+) -> Result<String, GitWriteError> {
     let err = |reason: &str| GitWriteError::InvalidPath {
         path: raw_path.to_string(),
         reason: reason.to_string(),
@@ -407,7 +410,7 @@ fn validate_path_list(
 
 /// Verify no intermediate ancestor between `ctx.repo_root` and `rel_path` is a symlink, and
 /// verify that the canonical parent directory stays inside both `ctx.repo_root` and `ctx.cwd`.
-async fn verify_no_symlink_escape(
+pub(crate) async fn verify_no_symlink_escape(
     ctx: &GitRepoContext,
     rel_path: &str,
 ) -> Result<PathBuf, GitWriteError> {
@@ -876,7 +879,7 @@ async fn current_branch_name(repo_root: &Path) -> Result<Option<String>, GitWrit
     }
 }
 
-fn parse_nul_delimited_paths(bytes: &[u8]) -> Vec<String> {
+pub(crate) fn parse_nul_delimited_paths(bytes: &[u8]) -> Vec<String> {
     bytes
         .split(|&b| b == 0)
         .filter(|s| !s.is_empty())

@@ -107,11 +107,15 @@ pub async fn spawn_antigravity_session(
 
 struct PendingPerm {
     rpc_id: Value,
-    allow_option_id: String,
-    allow_always_option_id: String,
-    deny_option_id: String,
+    perm_options: crate::AcpPermissionOptions,
     is_question: bool,
     raw_questions: Vec<QuestionItem>,
+}
+
+struct PendingAgyPlanModeSwitch {
+    target_mode: SessionMode,
+    previous_mode: SessionMode,
+    deferred_perm: Option<(PendingPerm, Value)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -879,6 +883,7 @@ async fn run_agy_actor(
     };
     let mut tool_cache: HashMap<String, ToolCallDetail> = HashMap::new();
     let mut pending_perms: HashMap<String, PendingPerm> = HashMap::new();
+    let mut pending_plan_mode_switches: HashMap<String, PendingAgyPlanModeSwitch> = HashMap::new();
     let mut pending_elicits: HashMap<String, PendingElicitation> = HashMap::new();
     let mut pending_prompts: VecDeque<QueuedDriverPrompt> = VecDeque::new();
     let mut pending_interrupt_replacement: Option<QueuedDriverPrompt> = None;
@@ -1569,19 +1574,99 @@ async fn run_agy_actor(
                     }
                     DriverCommand::ResolvePermission { request_id, decision } => {
                         if let Some(p) = pending_perms.remove(&request_id) {
-                            let chosen_opt = match decision.as_str() {
-                                "allow_always" => &p.allow_always_option_id,
-                                "allow" => &p.allow_option_id,
-                                _ => &p.deny_option_id,
-                            };
+                            let outcome = p.perm_options.outcome_for_decision(decision.as_str());
                             let resp = json!({
                                 "jsonrpc": "2.0",
                                 "id": p.rpc_id,
                                 "result": {
-                                    "outcome": {
-                                        "outcome": "selected",
-                                        "optionId": chosen_opt
+                                    "outcome": outcome
+                                }
+                            })
+                            .to_string();
+                            let _ = shim.write_stdin_line(resp).await;
+                            if let Some(ref tid) = active_turn_id {
+                                let _ = evt_tx
+                                    .send(DriverEvent::StatusChanged(AgentStatus::Running {
+                                        turn_id: tid.clone(),
+                                    }))
+                                    .await;
+                            }
+                        }
+                    }
+                    DriverCommand::ResolvePlanApproval {
+                        request_id,
+                        action,
+                        edited_plan_markdown,
+                        feedback: _,
+                        target_mode,
+                    } => {
+                        let perm = pending_perms.remove(&request_id);
+                        // Antigravity ACP permission responses do not carry inline edited plan
+                        // bodies. When the user edited the plan on `ApproveAndBuild`, decline
+                        // the stale unedited gate cleanly so the daemon starts one clean build
+                        // turn carrying the approved edited plan text after mode switch succeeds.
+                        let has_edits = edited_plan_markdown
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty());
+                        let compute_outcome = |p: &PendingPerm| -> Value {
+                            match action {
+                                orbit_protocol::PlanApprovalAction::ApproveAndBuild
+                                    if !has_edits =>
+                                {
+                                    p.perm_options.outcome_for_decision("allow")
+                                }
+                                _ => p.perm_options.deny_outcome(),
+                            }
+                        };
+
+                        if matches!(action, orbit_protocol::PlanApprovalAction::ApproveAndBuild) {
+                            if !matches!(target_mode, SessionMode::FullAccess) {
+                                let mode_str = match target_mode {
+                                    SessionMode::AcceptEdits => "accept-edits",
+                                    SessionMode::Plan => "plan",
+                                    SessionMode::Auto => "default",
+                                    _ => "default",
+                                };
+                                let id = next_rpc_id;
+                                next_rpc_id += 1;
+                                let rpc_key = RpcId::Num(id).as_key();
+                                let req = json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "method": "session/set_mode",
+                                    "params": {
+                                        "sessionId": session_id,
+                                        "modeId": mode_str
                                     }
+                                })
+                                .to_string();
+                                if shim.write_stdin_line(req).await.is_err() {
+                                    break;
+                                }
+                                let deferred_perm = perm.map(|p| {
+                                    let outcome = compute_outcome(&p);
+                                    (p, outcome)
+                                });
+                                pending_plan_mode_switches.insert(
+                                    rpc_key,
+                                    PendingAgyPlanModeSwitch {
+                                        target_mode,
+                                        previous_mode: mode.clone(),
+                                        deferred_perm,
+                                    },
+                                );
+                                continue;
+                            }
+                            mode = target_mode;
+                        }
+
+                        if let Some(p) = perm {
+                            let outcome = compute_outcome(&p);
+                            let resp = json!({
+                                "jsonrpc": "2.0",
+                                "id": p.rpc_id,
+                                "result": {
+                                    "outcome": outcome
                                 }
                             })
                             .to_string();
@@ -1615,7 +1700,7 @@ async fn run_agy_actor(
                                 "result": {
                                     "outcome": {
                                         "outcome": "selected",
-                                        "optionId": p.allow_option_id,
+                                        "optionId": p.perm_options.question_option_id(),
                                         "updatedInput": { "answers": answers_map }
                                     },
                                     "updatedInput": { "answers": answers_map },
@@ -1705,6 +1790,67 @@ async fn run_agy_actor(
                                     }
                                     continue;
                                 }
+                                if let Some(pending_switch) = pending_plan_mode_switches.remove(&key)
+                                {
+                                    if let Some(err_obj) =
+                                        val.get("error").filter(|v| !v.is_null())
+                                    {
+                                        let err_msg = err_obj
+                                            .get("message")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("session/set_mode failed");
+                                        mode = pending_switch.previous_mode;
+                                        let _ = evt_tx
+                                            .send(DriverEvent::Notice {
+                                                level: "error".into(),
+                                                message: format!(
+                                                    "Failed to switch session mode before approving plan: {err_msg}"
+                                                ),
+                                            })
+                                            .await;
+                                        if let Some((p, _)) = pending_switch.deferred_perm {
+                                            let resp = json!({
+                                                "jsonrpc": "2.0",
+                                                "id": p.rpc_id,
+                                                "result": {
+                                                    "outcome": p.perm_options.deny_outcome()
+                                                }
+                                            })
+                                            .to_string();
+                                            let _ = shim.write_stdin_line(resp).await;
+                                            if let Some(ref tid) = active_turn_id {
+                                                let _ = evt_tx
+                                                    .send(DriverEvent::StatusChanged(
+                                                        AgentStatus::Running {
+                                                            turn_id: tid.clone(),
+                                                        },
+                                                    ))
+                                                    .await;
+                                            }
+                                        }
+                                    } else {
+                                        mode = pending_switch.target_mode;
+                                        if let Some((p, outcome)) = pending_switch.deferred_perm {
+                                            let resp = json!({
+                                                "jsonrpc": "2.0",
+                                                "id": p.rpc_id,
+                                                "result": { "outcome": outcome }
+                                            })
+                                            .to_string();
+                                            let _ = shim.write_stdin_line(resp).await;
+                                            if let Some(ref tid) = active_turn_id {
+                                                let _ = evt_tx
+                                                    .send(DriverEvent::StatusChanged(
+                                                        AgentStatus::Running {
+                                                            turn_id: tid.clone(),
+                                                        },
+                                                    ))
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
                                 if post_reattach_non_prompt_rpcs.remove(&key) {
                                     continue;
                                 }
@@ -1729,6 +1875,7 @@ async fn run_agy_actor(
                                     cancel_deadline = None;
                                     active_prompt_rpc_key = None;
                                     pending_perms.clear();
+                                    pending_plan_mode_switches.clear();
                                     pending_elicits.clear();
                                     last_ask_question_raw = None;
                                     // Finalize any streaming message buffers
@@ -2128,6 +2275,7 @@ async fn run_agy_actor(
                             handle_acp_permission_request(
                                 &val,
                                 &mode,
+                                &cfg.cwd,
                                 cfg.attachments_dir.as_deref(),
                                 &active_turn_id,
                                 &shim,
@@ -4220,11 +4368,19 @@ fn map_agy_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCal
 
     if kind == "execute"
         || raw_in
-            .and_then(|i| i.get("CommandLine").or_else(|| i.get("command")))
+            .and_then(|i| {
+                i.get("CommandLine")
+                    .or_else(|| i.get("command"))
+                    .or_else(|| i.get("cmd"))
+            })
             .is_some()
     {
         let cmd = raw_in
-            .and_then(|i| i.get("CommandLine").or_else(|| i.get("command")))
+            .and_then(|i| {
+                i.get("CommandLine")
+                    .or_else(|| i.get("command"))
+                    .or_else(|| i.get("cmd"))
+            })
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned)
             .or_else(|| match prev {
@@ -4232,13 +4388,17 @@ fn map_agy_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCal
                 _ => None,
             })
             .unwrap_or_else(|| title.to_string());
+        let cwd = crate::extract_acp_shell_cwd(raw_in).or_else(|| match prev {
+            Some(ToolCallDetail::Shell { cwd, .. }) => cwd.clone(),
+            _ => None,
+        });
         let exit_code = raw_out
             .and_then(|o| o.get("exitCode"))
             .and_then(|v| v.as_i64())
             .map(|c| c as i32);
         return ToolCallDetail::Shell {
             command: cmd,
-            cwd: None,
+            cwd,
             exit_code,
             output_preview: out_preview,
         };
@@ -4406,9 +4566,11 @@ fn parse_raw_question_items(q_arr: &[Value]) -> Vec<QuestionItem> {
     parsed_questions
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_acp_permission_request(
     val: &Value,
     mode: &SessionMode,
+    workspace_cwd: &Path,
     attachments_dir: Option<&Path>,
     active_turn_id: &Option<String>,
     shim: &orbit_shim::ShimClient,
@@ -4420,9 +4582,7 @@ async fn handle_acp_permission_request(
     let tool_call = &params["toolCall"];
     let options = params["options"].as_array().cloned().unwrap_or_default();
 
-    let allow_opt = select_option_id(&options, "allow_once", "allow");
-    let allow_always_opt = select_option_id(&options, "allow_always", "allow");
-    let deny_opt = select_option_id(&options, "reject_once", "deny");
+    let perm_options = crate::AcpPermissionOptions::parse(&options);
 
     // Check if this is `ask_question` disguised as `session/request_permission`
     let raw_questions_arr = tool_call
@@ -4437,9 +4597,7 @@ async fn handle_acp_permission_request(
             req_id.clone(),
             PendingPerm {
                 rpc_id,
-                allow_option_id: allow_opt,
-                allow_always_option_id: allow_always_opt,
-                deny_option_id: deny_opt,
+                perm_options,
                 is_question: true,
                 raw_questions: parsed_questions.clone(),
             },
@@ -4461,7 +4619,15 @@ async fn handle_acp_permission_request(
         return;
     }
 
-    // Auto-approve logic for staged attachment reads, `FullAccess`, or native file edits in `AcceptEdits`
+    let plan_approval = crate::plan_approval::extract_plan_approval_from_acp_tool_call(
+        tool_call,
+        mode,
+        workspace_cwd,
+        "antigravity_plan",
+    );
+
+    // Auto-approve logic for staged attachment reads, `FullAccess`, or native file edits in `AcceptEdits`.
+    // Plan approval gates always require explicit human review.
     let kind_str = tool_call.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     let is_attachment_read = kind_str == "read"
         && attachments_dir.is_some_and(|dir| {
@@ -4480,15 +4646,16 @@ async fn handle_acp_permission_request(
                 })
                 .is_some_and(|p| is_path_within_dir(Path::new(p), dir))
         });
-    let auto_approve = is_attachment_read
-        || matches!(mode, SessionMode::FullAccess)
-        || (matches!(mode, SessionMode::AcceptEdits)
-            && matches!(
-                kind_str,
-                "edit" | "write" | "delete" | "move" | "read" | "search"
-            ));
+    let auto_approve = plan_approval.is_none()
+        && (is_attachment_read
+            || matches!(mode, SessionMode::FullAccess)
+            || (matches!(mode, SessionMode::AcceptEdits)
+                && matches!(
+                    kind_str,
+                    "edit" | "write" | "delete" | "move" | "read" | "search"
+                )));
 
-    if auto_approve {
+    if auto_approve && let Some(ref allow_opt) = perm_options.allow_once {
         let resp = json!({
             "jsonrpc": "2.0",
             "id": rpc_id,
@@ -4505,20 +4672,29 @@ async fn handle_acp_permission_request(
     }
 
     let req_id = format!("perm_{}", uuid::Uuid::new_v4().simple());
-    let title = tool_call
-        .get("title")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Approve tool execution")
-        .to_string();
-    let detail = map_agy_tool_detail(tool_call, None);
+    let title = plan_approval
+        .as_ref()
+        .and_then(|p| p.plan_title.clone())
+        .unwrap_or_else(|| {
+            tool_call
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Approve tool execution")
+                .to_string()
+        });
+    let authoritative = crate::acp_tool_call_has_authoritative_identity(tool_call);
+    let detail = if plan_approval.is_none() && !authoritative {
+        crate::acp_title_only_detail(&title, tool_call)
+    } else {
+        map_agy_tool_detail(tool_call, None)
+    };
+    let allowed_decisions = perm_options.allowed_decisions(plan_approval.is_some(), authoritative);
 
     pending_perms.insert(
         req_id.clone(),
         PendingPerm {
             rpc_id,
-            allow_option_id: allow_opt,
-            allow_always_option_id: allow_always_opt,
-            deny_option_id: deny_opt,
+            perm_options,
             is_question: false,
             raw_questions: Vec::new(),
         },
@@ -4529,7 +4705,8 @@ async fn handle_acp_permission_request(
             request_id: req_id.clone(),
             title,
             detail,
-            allowed_decisions: vec!["allow".into(), "allow_always".into(), "deny".into()],
+            allowed_decisions,
+            plan_approval,
         })
         .await;
     let _ = evt_tx
@@ -4881,24 +5058,6 @@ async fn handle_acp_elicitation_request(
             questions,
         })
         .await;
-}
-
-fn select_option_id(options: &[Value], exact_kind: &str, fallback_sub: &str) -> String {
-    for opt in options {
-        if opt.get("kind").and_then(|v| v.as_str()) == Some(exact_kind)
-            && let Some(id) = opt.get("optionId").and_then(|v| v.as_str())
-        {
-            return id.to_string();
-        }
-    }
-    for opt in options {
-        if let Some(id) = opt.get("optionId").and_then(|v| v.as_str())
-            && id.to_ascii_lowercase().contains(fallback_sub)
-        {
-            return id.to_string();
-        }
-    }
-    fallback_sub.to_string()
 }
 
 // --- Post-turn `transcript_full.jsonl` incremental reader, unified tool reconciliation & self-healing ---
@@ -12950,6 +13109,28 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         assert!(settled_out.iter().any(|s| matches!(s, WakeupStep::Settled)));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn map_agy_tool_detail_preserves_explicit_shell_cwd() {
+        let detail = map_agy_tool_detail(
+            &json!({
+                "kind": "execute",
+                "title": "Run shell command",
+                "rawInput": {
+                    "CommandLine": "cargo test",
+                    "Cwd": "/outside/other-repo"
+                }
+            }),
+            None,
+        );
+        match detail {
+            ToolCallDetail::Shell { command, cwd, .. } => {
+                assert_eq!(command, "cargo test");
+                assert_eq!(cwd.as_deref(), Some("/outside/other-repo"));
+            }
+            other => panic!("expected Shell detail, got {other:?}"),
+        }
     }
 
     #[tokio::test]

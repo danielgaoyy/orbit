@@ -109,3 +109,29 @@ pub struct ExternalMcpServerRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_probe: Option<McpProbeResult>,
 }
+
+/// Content payload returned by an external MCP server for a SEP-1865 `ui://` `resources/read` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpResourceContent {
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_base64: Option<String>,
+}
+
+/// Outcome returned when a SEP-1865 MCP App invokes a tool strictly scoped to its owning MCP server.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpToolCallOutcome {
+    pub ok: bool,
+    #[serde(default)]
+    pub is_error: bool,
+    #[serde(default)]
+    pub content: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}

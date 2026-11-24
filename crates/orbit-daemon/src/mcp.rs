@@ -15,7 +15,10 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::DaemonRuntime;
-use crate::tools::{execute_tool, list_tool_definitions_for_caller, resolve_caller_policy};
+use crate::hooks::{HOOK_ORIGIN_TOKEN_HTTP_HEADER, HookOriginContext};
+use crate::tools::{
+    execute_tool_with_context, list_tool_definitions_for_caller, resolve_caller_policy,
+};
 
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 
@@ -80,11 +83,15 @@ pub async fn mcp_agents_handler(
         .map(String::as_str)
         .filter(|s| !s.trim().is_empty());
 
+    let hook_origin = extract_verified_hook_origin(&runtime, &headers);
+
     // Handle JSON-RPC batch or single request
     if let Some(batch) = body.as_array() {
         let mut responses = Vec::new();
         for item in batch {
-            if let Some(resp) = handle_single_rpc(&runtime, caller_agent_id, item).await {
+            if let Some(resp) =
+                handle_single_rpc(&runtime, caller_agent_id, &hook_origin, item).await
+            {
                 responses.push(resp);
             }
         }
@@ -94,15 +101,32 @@ pub async fn mcp_agents_handler(
         return (StatusCode::OK, Json(Value::Array(responses))).into_response();
     }
 
-    match handle_single_rpc(&runtime, caller_agent_id, &body).await {
+    match handle_single_rpc(&runtime, caller_agent_id, &hook_origin, &body).await {
         Some(resp) => (StatusCode::OK, Json(resp)).into_response(),
         None => StatusCode::ACCEPTED.into_response(),
     }
 }
 
+/// Extract authenticated hook-origin provenance from MCP request headers.
+///
+/// Only accepts a live, daemon-issued 256-bit `x-orbit-hook-origin-token` registered for a
+/// currently running hook rule so normal agents cannot forge `x-orbit-hook-origin` headers to
+/// bypass `PreToolUse` security rules or silence `PostToolUse` auditing.
+pub(crate) fn extract_verified_hook_origin(
+    runtime: &DaemonRuntime,
+    headers: &HeaderMap,
+) -> HookOriginContext {
+    headers
+        .get(HOOK_ORIGIN_TOKEN_HTTP_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|token| runtime.hooks.verify_hook_origin_token(token))
+        .unwrap_or_default()
+}
+
 async fn handle_single_rpc(
     runtime: &Arc<DaemonRuntime>,
     caller_agent_id: Option<&str>,
+    hook_origin: &HookOriginContext,
     req: &Value,
 ) -> Option<Value> {
     let id = req.get("id").cloned();
@@ -169,7 +193,14 @@ async fn handle_single_rpc(
                 .pointer("/params/arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let exec = execute_tool(runtime, caller_agent_id, tool_name, args).await;
+            let exec = Box::pin(execute_tool_with_context(
+                runtime,
+                caller_agent_id,
+                tool_name,
+                args,
+                hook_origin,
+            ))
+            .await;
             Some(json!({
                 "jsonrpc": "2.0",
                 "id": id_val,

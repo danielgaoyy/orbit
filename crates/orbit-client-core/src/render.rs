@@ -96,6 +96,8 @@ pub enum RichBlockView {
         ordered: bool,
         index: u32,
         checked: Option<bool>,
+        #[serde(default)]
+        depth: u8,
         spans: Vec<InlineSpanView>,
     },
     BlockQuote {
@@ -841,10 +843,12 @@ fn flush_active_list_item_prefix(
             }
             _ => (false, 0),
         };
+        let depth = u8::try_from(list_stack.len().saturating_sub(1)).unwrap_or(u8::MAX);
         blocks.push(RichBlockView::ListItem {
             ordered,
             index: idx,
             checked: checked.take(),
+            depth,
             spans: std::mem::take(cur_spans),
         });
         *already_flushed = true;
@@ -1050,10 +1054,13 @@ pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockVi
                                 _ => (false, 0),
                             };
                             if !cur_spans.is_empty() {
+                                let depth = u8::try_from(list_stack.len().saturating_sub(1))
+                                    .unwrap_or(u8::MAX);
                                 blocks.push(RichBlockView::ListItem {
                                     ordered,
                                     index: idx,
                                     checked,
+                                    depth,
                                     spans: std::mem::take(&mut cur_spans),
                                 });
                             }
@@ -2424,5 +2431,61 @@ diff --git a/src/lib.rs b/src/lib.rs
             avg_light < avg_dark,
             "light-theme ink luminance ({avg_light:.3}) must be darker than dark-theme ink ({avg_dark:.3})"
         );
+    }
+
+    #[test]
+    fn nested_lists_emit_exact_zero_based_depth_across_three_levels_and_mixed_kinds() {
+        let md = "\
+- Level 0 first
+  - Level 1 bullet
+    1. Level 2 ordered one
+    2. Level 2 ordered two
+  - [x] Level 1 checklist done
+- Level 0 second";
+        let blocks = parse_markdown_blocks(md, false);
+        assert_eq!(blocks.len(), 6, "blocks: {blocks:#?}");
+
+        let extracted: Vec<(bool, u32, Option<bool>, u8, String)> = blocks
+            .into_iter()
+            .map(|b| match b {
+                RichBlockView::ListItem {
+                    ordered,
+                    index,
+                    checked,
+                    depth,
+                    spans,
+                } => (
+                    ordered,
+                    index,
+                    checked,
+                    depth,
+                    spans.into_iter().map(|s| s.text).collect::<String>(),
+                ),
+                other => panic!("expected ListItem, got {other:?}"),
+            })
+            .collect();
+
+        assert_eq!(
+            extracted,
+            vec![
+                (false, 0, None, 0, "Level 0 first".to_string()),
+                (false, 0, None, 1, "Level 1 bullet".to_string()),
+                (true, 1, None, 2, "Level 2 ordered one".to_string()),
+                (true, 2, None, 2, "Level 2 ordered two".to_string()),
+                (
+                    false,
+                    0,
+                    Some(true),
+                    1,
+                    "Level 1 checklist done".to_string()
+                ),
+                (false, 0, None, 0, "Level 0 second".to_string()),
+            ]
+        );
+
+        // Verify backward-compatible deserialization defaults `depth` to 0 when omitted
+        let legacy_json = r#"{"kind":"list_item","ordered":false,"index":0,"checked":null,"spans":[{"text":"old","bold":false,"italic":false,"strikethrough":false,"inline_code":false,"link_url":null}]}"#;
+        let parsed: RichBlockView = serde_json::from_str(legacy_json).expect("legacy json");
+        assert!(matches!(parsed, RichBlockView::ListItem { depth: 0, .. }));
     }
 }

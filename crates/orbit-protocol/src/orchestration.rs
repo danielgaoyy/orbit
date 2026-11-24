@@ -115,6 +115,13 @@ pub struct PendingPermissionSummary {
     pub allowed_decisions: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guardian_assessment: Option<crate::GuardianAssessment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_approval: Option<crate::PlanApprovalPayload>,
+    /// True when explicit human approval is required (plan approval gate, PreToolUse fail-closed,
+    /// High/Critical risk, or Guardian fail-closed/fallback verdict). Must never be delegated to
+    /// Personal Router or resolved by an agent.
+    #[serde(default)]
+    pub human_only: bool,
     pub created_at: DateTime<Utc>,
 }
 

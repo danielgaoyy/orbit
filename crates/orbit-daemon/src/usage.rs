@@ -1362,6 +1362,7 @@ mod tests {
                     detail: detail.clone(),
                     allowed_decisions: vec!["allow".into()],
                     guardian_assessment: None,
+                    plan_approval: None,
                 },
             },
             TimelineEvent {

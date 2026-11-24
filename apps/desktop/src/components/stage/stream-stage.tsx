@@ -24,6 +24,8 @@ import { OmniComposer } from "@/components/composer/omni-composer";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
 import { useViewportTracking } from "@/components/conversation/conversation-viewport";
 import { DecisionDock } from "@/components/stage/stage-approval-dock";
+import { StageFindBar } from "@/components/stage/stage-find-bar";
+import { useStageFind } from "@/components/stage/use-stage-find";
 import { ChatOutlineRail, type OutlinePromptItem } from "@/components/stage/stage-outline-rail";
 import { resolveOutlinePrompts } from "@/lib/outline-rail";
 import { StageOverviewPanel } from "@/components/stage/stage-overview-panel";
@@ -98,6 +100,7 @@ import {
   PromptImageLightbox,
   RewindTurnDialog,
 } from "./stage-prompt-controls";
+import { PlanReviewCard } from "./plan-review-card";
 import { TurnStageSection } from "./stage-turn-card";
 
 export { PromptImageLightbox, TurnStageSection };
@@ -924,9 +927,12 @@ export function StreamStage() {
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
   const sessionScrollNonce = useOrbitSelector((s) => s.sessionScrollNonce);
   const pendingJumpTarget = useOrbitSelector((s) => s.pendingJumpTarget);
+  const stageFindFocusNonce = useOrbitSelector((s) => s.stageFindFocusNonce);
   const coalesceExploration = useOrbitSelector((s) => s.coalesceExploration);
   const [highlightedTurnKey, setHighlightedTurnKey] = useState<string | null>(null);
   const [jumpFallbackNonce, setJumpFallbackNonce] = useState<number | null>(null);
+  const pendingJumpPaginateReqIdRef = useRef(0);
+  const repaintFindHighlightsRef = useRef<() => void>(() => {});
   const highlightTimerRef = useRef<number | null>(null);
   const jumpFallbackTimerRef = useRef<number | null>(null);
   const jumpRafRef = useRef<{ raf1: number | null; raf2: number | null }>({
@@ -1101,6 +1107,7 @@ export function StreamStage() {
     [selectedHostId, selectedAgentId],
   );
   const { subagents: sessionSubagents, decisions: unifiedDecisions } = useOrbitSelector(selectSession);
+  const pendingPlanApproval = unifiedDecisions.pendingPlanApproval;
   const pendingPermissions = unifiedDecisions.parentPermissions;
   const pendingQuestions = unifiedDecisions.parentQuestions;
   const subagentPermissions = unifiedDecisions.subagentPermissions;
@@ -1108,6 +1115,7 @@ export function StreamStage() {
   // A child approval yields the shelf while the parent can still be working.
   const isPlanForegroundRunning =
     isAgentRunning && !currentAgent?.is_awaiting_permission &&
+    pendingPlanApproval === null &&
     pendingPermissions.length === 0 && pendingQuestions.length === 0;
   const sessionTurnDiffs = stageView?.session_turn_diffs ?? EMPTY_DIFF_FILES;
   const stageInsights = stageView?.insights ?? EMPTY_INSIGHTS;
@@ -1527,6 +1535,7 @@ export function StreamStage() {
     scrollRafRef.current = window.requestAnimationFrame(() => {
       scrollRafRef.current = null;
       syncScrollMetrics();
+      repaintFindHighlightsRef.current();
     });
   }, [syncScrollMetrics]);
 
@@ -1656,6 +1665,41 @@ export function StreamStage() {
     el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
   }, [cancelHold, scrollUiStore, syncScrollMetrics]);
 
+  const paginateUntilSeqLoaded = useCallback(
+    async (
+      hostId: string,
+      agentId: string,
+      scope: string,
+      seq: number,
+      isCancelled: () => boolean,
+    ): Promise<{ index: number; exact: boolean }> => {
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        if (isCancelled() || activeSessionScopeRef.current !== scope) {
+          return { index: -1, exact: false };
+        }
+        const match = findTurnIndexForSeq(stageTurnsRef.current, seq);
+        if (match.exact && match.index >= 0) {
+          return match;
+        }
+        if (windowStartTurnIndexRef.current <= 0 && !hasOlderHistoryRef.current) {
+          return match;
+        }
+        const loadedCount = await orbitActions.loadEarlierStageTurns(hostId, agentId, 0);
+        if (isCancelled() || activeSessionScopeRef.current !== scope) {
+          return { index: -1, exact: false };
+        }
+        if (loadedCount === 0) break;
+        // Wait one frame for React & virtualizer rows to settle before re-checking `stageTurnsRef`.
+        await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+      }
+      if (isCancelled() || activeSessionScopeRef.current !== scope) {
+        return { index: -1, exact: false };
+      }
+      return findTurnIndexForSeq(stageTurnsRef.current, seq);
+    },
+    [],
+  );
+
   const jumpToPromptSeq = useCallback(
     (seq: number) => {
       const loaded = loadedOutlineAnchorsRef.current.find((p) => p.seq === seq);
@@ -1678,30 +1722,16 @@ export function StreamStage() {
 
       void (async () => {
         try {
-          for (let attempt = 0; attempt < 24; attempt += 1) {
-            if (outlineJumpReqIdRef.current !== reqId || activeSessionScopeRef.current !== scope) {
-              return;
-            }
-            const match = findTurnIndexForSeq(stageTurnsRef.current, seq);
-            if (match.exact && match.index >= 0) {
-              break;
-            }
-            if (windowStartTurnIndexRef.current <= 0 && !hasOlderHistoryRef.current) {
-              break;
-            }
-            const loadedCount = await orbitActions.loadEarlierStageTurns(hostId, agentId, 0);
-            if (outlineJumpReqIdRef.current !== reqId || activeSessionScopeRef.current !== scope) {
-              return;
-            }
-            if (loadedCount === 0) break;
-            // Wait one frame for React & virtualizer rows to settle before re-checking `stageTurnsRef`.
-            await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
-          }
-
+          const finalMatch = await paginateUntilSeqLoaded(
+            hostId,
+            agentId,
+            scope,
+            seq,
+            () => outlineJumpReqIdRef.current !== reqId,
+          );
           if (outlineJumpReqIdRef.current !== reqId || activeSessionScopeRef.current !== scope) {
             return;
           }
-          const finalMatch = findTurnIndexForSeq(stageTurnsRef.current, seq);
           if (finalMatch.index >= 0) {
             const idx = finalMatch.index;
             jumpToTurnRef.current?.({ index: idx, align: "start", behavior: "auto" });
@@ -1718,8 +1748,31 @@ export function StreamStage() {
         }
       })();
     },
-    [interruptFollow, scrollUiStore, syncScrollMetrics],
+    [interruptFollow, paginateUntilSeqLoaded, scrollUiStore, syncScrollMetrics],
   );
+
+  const stageFind = useStageFind({
+    selectedHostId,
+    selectedAgentId,
+    activeSessionScope,
+    isDraft,
+    stageFindFocusNonce,
+    stageTurns,
+    oldestLoadedSeq: stageView?.oldest_loaded_seq ?? 0,
+    windowStartTurnIndex,
+    hasOlderHistory,
+    stageContainerRef,
+    scrollRef,
+    contentRef,
+    jumpToTurnRef,
+    activeSessionScopeRef,
+    interruptFollow,
+    syncScrollMetrics,
+    paginateUntilSeqLoaded,
+  });
+  repaintFindHighlightsRef.current = stageFind.repaintHighlights;
+  const resetStageFindRef = useRef(stageFind.resetForSessionChange);
+  resetStageFindRef.current = stageFind.resetForSessionChange;
 
   const hasPendingJumpForActive = Boolean(
     pendingJumpTarget &&
@@ -1734,7 +1787,9 @@ export function StreamStage() {
   useLayoutEffect(() => {
     earlierLoadReqIdRef.current += 1;
     outlineJumpReqIdRef.current += 1;
+    pendingJumpPaginateReqIdRef.current += 1;
     setJumpingToOutlineSeq(null);
+    resetStageFindRef.current();
     loadingEarlierTurnsRef.current = false;
     setLoadingEarlierTurns(false);
     pendingTurnPrependRef.current = null;
@@ -1898,7 +1953,27 @@ export function StreamStage() {
         stickToBottomRef.current = false;
         sessionEntryLockUntilRef.current = 0;
         jumpEarlierAttemptedNonceRef.current = pendingJumpTarget.nonce;
-        triggerLoadEarlierTurns(0, false);
+        const reqId = (pendingJumpPaginateReqIdRef.current += 1);
+        const targetSeq = pendingJumpTarget.seq;
+        const hostId = selectedHostId;
+        const agentId = selectedAgentId;
+        const scope = activeSessionScope;
+        void (async () => {
+          setLoadingEarlierTurns(true);
+          try {
+            await paginateUntilSeqLoaded(
+              hostId,
+              agentId,
+              scope,
+              targetSeq,
+              () => pendingJumpPaginateReqIdRef.current !== reqId,
+            );
+          } finally {
+            if (pendingJumpPaginateReqIdRef.current === reqId) {
+              setLoadingEarlierTurns(false);
+            }
+          }
+        })();
         return;
       }
     }
@@ -1992,7 +2067,7 @@ export function StreamStage() {
     jumpFallbackNonce,
     cancelHold,
     syncScrollMetrics,
-    triggerLoadEarlierTurns,
+    paginateUntilSeqLoaded,
   ]);
 
   useEffect(() => {
@@ -2087,15 +2162,19 @@ export function StreamStage() {
 
   const effectiveCwd = selectedCwd || currentAgent?.cwd || "";
 
+  const effectiveHighlightedTurnKey = stageFind.activeTurnKey ?? highlightedTurnKey;
+
   return (
     <div
       ref={stageContainerRef}
+      data-orbit-stage="true"
+      tabIndex={-1}
       style={
         stageMaxContentWidthPx
           ? ({ "--orbit-stage-max-w": `${stageMaxContentWidthPx}px` } as CSSProperties)
           : undefined
       }
-      className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
+      className="relative flex min-h-0 flex-1 flex-col overflow-hidden outline-none"
     >
       {/* Peripheral Megathread Outline Rail (clean left gutter >= 800px / < 776px) */}
       {outlinePrompts.length >= 1 && (
@@ -2128,6 +2207,23 @@ export function StreamStage() {
 
       {/* 1. Unified Scrollable Conversation Viewport + Floating Overlays */}
       <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+        <StageFindBar
+          open={stageFind.open}
+          focusNonce={stageFindFocusNonce}
+          query={stageFind.query}
+          onQueryChange={stageFind.onQueryChange}
+          activeIndex={stageFind.activeIndex}
+          totalMatches={stageFind.totalMatches}
+          hasUnloadedMatches={stageFind.hasUnloadedMatches}
+          isActiveMatchUnloaded={stageFind.isActiveMatchUnloaded}
+          isRemoteSearching={stageFind.isRemoteSearching}
+          isPaginatingJump={stageFind.isPaginatingJump}
+          overviewReservePx={overviewReservePx}
+          overviewReserveTransition={overviewReserveTransition}
+          onStep={stageFind.onStep}
+          onClose={stageFind.onClose}
+        />
+
         {loadingEarlierTurns && (
           <div
             style={{
@@ -2215,7 +2311,7 @@ export function StreamStage() {
                   hasPlanSteps={planSteps.length > 0}
                   rows={turnRows}
                   jumpToTurnRef={jumpToTurnRef}
-                  highlightedTurnKey={highlightedTurnKey}
+                  highlightedTurnKey={effectiveHighlightedTurnKey}
                   hasPendingJump={hasPendingJumpForActive}
                   isLatestTurnActive={isLatestTurnActive}
                   agentStatusLabel={isLatestTurnActive ? (currentAgent?.status_label ?? null) : null}
@@ -2269,6 +2365,14 @@ export function StreamStage() {
           }}
         >
           <div style={stagePushStyle}>
+            {pendingPlanApproval && (
+              <PlanReviewCard
+                hostId={selectedHostId}
+                agentId={selectedAgentId}
+                cwd={effectiveCwd}
+                plan={pendingPlanApproval}
+              />
+            )}
             <DecisionDock
               hostId={selectedHostId}
               agentId={selectedAgentId}

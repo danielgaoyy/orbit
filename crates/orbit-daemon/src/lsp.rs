@@ -15,8 +15,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use orbit_protocol::{
-    LspConfigSource, LspDiagnostic, LspDiagnosticSeverity, LspLocation, LspServerConfig,
-    LspServerState, LspServerStatus, LspSymbolInfo,
+    LspCodeAction, LspCommand, LspCompletionItem, LspConfigSource, LspDiagnostic,
+    LspDiagnosticSeverity, LspFileTextEdits, LspHoverInfo, LspLocation, LspRange,
+    LspReferenceLocation, LspServerConfig, LspServerState, LspServerStatus, LspSymbolInfo,
+    LspTextEdit, LspWorkspaceEdit, LspWorkspaceEditResult,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -28,7 +30,9 @@ use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use crate::workspace_files::{canonicalize_workspace_root, is_path_inside_git, sha256_hex};
+use crate::workspace_files::{
+    canonicalize_workspace_root, is_path_inside_git, sha256_hex, write_workspace_file,
+};
 
 /// Maximum JSON-RPC message body size accepted from an LSP server (16 MiB).
 pub const MAX_LSP_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -48,6 +52,18 @@ const MAX_TOTAL_DIAGNOSTICS: usize = 2000;
 const MAX_SYMBOLS_LIMIT: usize = 200;
 /// Maximum definition locations returned by a single query.
 const MAX_LOCATIONS_LIMIT: usize = 50;
+/// Maximum hover payload size returned over the wire (32 KiB).
+const MAX_HOVER_BYTES: usize = 32 * 1024;
+/// Maximum reference locations returned by a single query.
+const MAX_REFERENCES_LIMIT: usize = 200;
+/// Maximum completion items returned by a single query.
+const MAX_COMPLETION_ITEMS: usize = 80;
+/// Maximum code actions returned by a single query.
+const MAX_CODE_ACTIONS_LIMIT: usize = 50;
+/// Maximum files modified in a single workspace edit (`rename` / `codeAction`).
+const MAX_WORKSPACE_EDIT_FILES: usize = 200;
+/// Maximum total text edits applied in a single workspace edit.
+const MAX_WORKSPACE_EDIT_TOTAL_EDITS: usize = 5000;
 /// Default timeout for regular LSP requests (`workspace/symbol`, `definition`, etc.).
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default timeout for LSP `initialize` handshake.
@@ -1183,6 +1199,10 @@ impl LspClientSession {
             }],
             "capabilities": {
                 "workspace": {
+                    "applyEdit": true,
+                    "workspaceEdit": {
+                        "documentChanges": true
+                    },
                     "symbol": {
                         "dynamicRegistration": false
                     },
@@ -1196,6 +1216,43 @@ impl LspClientSession {
                     "definition": {
                         "dynamicRegistration": false,
                         "linkSupport": true
+                    },
+                    "references": {
+                        "dynamicRegistration": false
+                    },
+                    "hover": {
+                        "dynamicRegistration": false,
+                        "contentFormat": ["markdown", "plaintext"]
+                    },
+                    "completion": {
+                        "dynamicRegistration": false,
+                        "completionItem": {
+                            "snippetSupport": false,
+                            "documentationFormat": ["markdown", "plaintext"],
+                            "deprecatedSupport": true
+                        }
+                    },
+                    "codeAction": {
+                        "dynamicRegistration": false,
+                        "isPreferredSupport": true,
+                        "codeActionLiteralSupport": {
+                            "codeActionKind": {
+                                "valueSet": [
+                                    "",
+                                    "quickfix",
+                                    "refactor",
+                                    "refactor.extract",
+                                    "refactor.inline",
+                                    "refactor.rewrite",
+                                    "source",
+                                    "source.organizeImports"
+                                ]
+                            }
+                        }
+                    },
+                    "rename": {
+                        "dynamicRegistration": false,
+                        "prepareSupport": false
                     },
                     "documentSymbol": {
                         "dynamicRegistration": false,
@@ -1545,6 +1602,216 @@ impl LspClientSession {
                 .map_err(|e| format!("LSP definition parse task failed: {e}"))?;
         locs.truncate(MAX_LOCATIONS_LIMIT);
         Ok(locs)
+    }
+
+    /// Resolve `textDocument/hover` at a 1-based `(line, utf16_col)` coordinate.
+    pub async fn hover(
+        &self,
+        canonical_file: &Path,
+        line_1based: u32,
+        col_1based: u32,
+        override_text: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Option<LspHoverInfo>, String> {
+        let (_, synced_text) = self
+            .ensure_document_synced(canonical_file, override_text)
+            .await?;
+        let uri = path_to_file_uri(canonical_file);
+        let (lsp_line, lsp_char) = clamp_utf16_col_for_line(&synced_text, line_1based, col_1based);
+
+        let raw = self
+            .send_request(
+                "textDocument/hover",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": lsp_line, "character": lsp_char },
+                }),
+                timeout,
+            )
+            .await?;
+
+        Ok(parse_hover_response(&raw))
+    }
+
+    /// Resolve `textDocument/references` strictly confined to the canonical workspace root.
+    pub async fn references(
+        &self,
+        canonical_file: &Path,
+        line_1based: u32,
+        col_1based: u32,
+        include_declaration: bool,
+        override_text: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Vec<LspReferenceLocation>, String> {
+        let (_, synced_text) = self
+            .ensure_document_synced(canonical_file, override_text)
+            .await?;
+        let uri = path_to_file_uri(canonical_file);
+        let (lsp_line, lsp_char) = clamp_utf16_col_for_line(&synced_text, line_1based, col_1based);
+
+        let raw = self
+            .send_request(
+                "textDocument/references",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": lsp_line, "character": lsp_char },
+                    "context": { "includeDeclaration": include_declaration },
+                }),
+                timeout,
+            )
+            .await?;
+
+        let cwd_for_parse = self.canonical_cwd.clone();
+        let mut refs =
+            tokio::task::spawn_blocking(move || parse_reference_locations(&raw, &cwd_for_parse))
+                .await
+                .map_err(|e| format!("LSP references parse task failed: {e}"))?;
+        refs.truncate(MAX_REFERENCES_LIMIT);
+        Ok(refs)
+    }
+
+    /// Resolve `textDocument/completion` at a 1-based `(line, utf16_col)` coordinate (bounded to 80 items).
+    pub async fn completion(
+        &self,
+        canonical_file: &Path,
+        line_1based: u32,
+        col_1based: u32,
+        trigger_character: Option<&str>,
+        override_text: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Vec<LspCompletionItem>, String> {
+        let (_, synced_text) = self
+            .ensure_document_synced(canonical_file, override_text)
+            .await?;
+        let uri = path_to_file_uri(canonical_file);
+        let (lsp_line, lsp_char) = clamp_utf16_col_for_line(&synced_text, line_1based, col_1based);
+
+        let clean_trigger = trigger_character
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= 4);
+        let context = match clean_trigger {
+            Some(ch) => json!({
+                "triggerKind": 2,
+                "triggerCharacter": ch,
+            }),
+            None => json!({ "triggerKind": 1 }),
+        };
+
+        let raw = self
+            .send_request(
+                "textDocument/completion",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": lsp_line, "character": lsp_char },
+                    "context": context,
+                }),
+                timeout,
+            )
+            .await?;
+
+        Ok(parse_completion_items(&raw))
+    }
+
+    /// Resolve `textDocument/codeAction` for a 1-based range and diagnostics.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn code_action(
+        &self,
+        canonical_file: &Path,
+        rel_path: &str,
+        range: LspRange,
+        diagnostics: &[LspDiagnostic],
+        override_text: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Vec<LspCodeAction>, String> {
+        let (_, synced_text) = self
+            .ensure_document_synced(canonical_file, override_text)
+            .await?;
+        let uri = path_to_file_uri(canonical_file);
+        let (start_line, start_char) =
+            clamp_utf16_col_for_line(&synced_text, range.line, range.col);
+        let (end_line, end_char) =
+            clamp_utf16_col_for_line(&synced_text, range.end_line, range.end_col);
+
+        let effective_diags: Vec<LspDiagnostic> = if diagnostics.is_empty() {
+            self.cached_diagnostics(Some(rel_path))
+                .into_iter()
+                .filter(|d| d.line <= range.end_line && d.end_line >= range.line)
+                .take(32)
+                .collect()
+        } else {
+            diagnostics.iter().take(32).cloned().collect()
+        };
+
+        let diag_values: Vec<Value> = effective_diags.iter().map(diagnostic_to_lsp_json).collect();
+
+        let raw = self
+            .send_request(
+                "textDocument/codeAction",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "range": {
+                        "start": { "line": start_line, "character": start_char },
+                        "end": { "line": end_line, "character": end_char },
+                    },
+                    "context": {
+                        "diagnostics": diag_values,
+                        "triggerKind": 1,
+                    },
+                }),
+                timeout,
+            )
+            .await?;
+
+        let cwd_for_parse = self.canonical_cwd.clone();
+        tokio::task::spawn_blocking(move || parse_code_actions(&raw, &cwd_for_parse))
+            .await
+            .map_err(|e| format!("LSP codeAction parse task failed: {e}"))
+    }
+
+    /// Compute a workspace-confined `LspWorkspaceEdit` via `textDocument/rename`.
+    pub async fn rename(
+        &self,
+        canonical_file: &Path,
+        line_1based: u32,
+        col_1based: u32,
+        new_name: &str,
+        override_text: Option<&str>,
+        timeout: Duration,
+    ) -> Result<LspWorkspaceEdit, String> {
+        let trimmed = new_name.trim();
+        if trimmed.is_empty()
+            || trimmed.len() > 256
+            || trimmed.chars().any(|c| c == '\0' || c.is_control())
+        {
+            return Err("Invalid rename identifier".into());
+        }
+
+        let (_, synced_text) = self
+            .ensure_document_synced(canonical_file, override_text)
+            .await?;
+        let uri = path_to_file_uri(canonical_file);
+        let (lsp_line, lsp_char) = clamp_utf16_col_for_line(&synced_text, line_1based, col_1based);
+
+        let raw = self
+            .send_request(
+                "textDocument/rename",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": lsp_line, "character": lsp_char },
+                    "newName": trimmed,
+                }),
+                timeout,
+            )
+            .await?;
+
+        if raw.is_null() {
+            return Ok(LspWorkspaceEdit::default());
+        }
+
+        let cwd_for_parse = self.canonical_cwd.clone();
+        tokio::task::spawn_blocking(move || parse_workspace_edit(&raw, &cwd_for_parse))
+            .await
+            .map_err(|e| format!("LSP rename parse task failed: {e}"))?
     }
 
     /// Gracefully shut down the LSP server (`shutdown` + await reply up to 300ms -> `exit` -> kill child).
@@ -2044,6 +2311,882 @@ pub fn read_line_preview(uri: &str, canonical_cwd: &Path, line_1based: u32) -> O
         .filter(|s| !s.is_empty())
 }
 
+fn extract_full_range_1based(range: &Value) -> LspRange {
+    let start = range.get("start");
+    let end = range.get("end").or(start);
+    let line = start
+        .and_then(|s| s.get("line"))
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    let col = start
+        .and_then(|s| s.get("character"))
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    let end_line = end
+        .and_then(|s| s.get("line"))
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(0)
+        .saturating_add(1)
+        .max(line);
+    let end_col = end
+        .and_then(|s| s.get("character"))
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    LspRange {
+        line,
+        col,
+        end_line,
+        end_col: if end_line == line {
+            end_col.max(col)
+        } else {
+            end_col
+        },
+    }
+}
+
+/// Strictly resolve a `file://` URI to a canonical path + workspace-relative Unix path inside `canonical_cwd`.
+/// Rejects URIs outside the workspace, inside `.git`, symlinks escaping workspace, or non-regular files.
+fn resolve_confined_uri_to_rel_path(uri: &str, canonical_cwd: &Path) -> Option<(PathBuf, String)> {
+    let raw_path = file_uri_to_path(uri)?;
+    let canon = crate::platform::canonicalize_clean(&raw_path).ok()?;
+    if !canon.starts_with(canonical_cwd) {
+        return None;
+    }
+    if is_path_inside_git(canonical_cwd, &canon) {
+        return None;
+    }
+    let meta = std::fs::metadata(&canon).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let rel = canon.strip_prefix(canonical_cwd).ok()?;
+    let rel_str = path_to_unix_string(rel);
+    if rel_str.is_empty() {
+        return None;
+    }
+    Some((canon, rel_str))
+}
+
+fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+fn format_marked_string(val: &Value) -> Option<(String, bool)> {
+    match val {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some((trimmed.to_string(), true))
+            }
+        }
+        Value::Object(map) => {
+            let value = map.get("value").and_then(Value::as_str)?.trim();
+            if value.is_empty() {
+                return None;
+            }
+            if let Some(lang) = map.get("language").and_then(Value::as_str) {
+                let clean_lang = lang.trim();
+                Some((format!("```{clean_lang}\n{value}\n```"), true))
+            } else {
+                let is_md = map
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_none_or(|k| !k.eq_ignore_ascii_case("plaintext"));
+                Some((value.to_string(), is_md))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Parse an LSP `textDocument/hover` response (`MarkupContent | MarkedString | MarkedString[]`).
+pub fn parse_hover_response(val: &Value) -> Option<LspHoverInfo> {
+    if val.is_null() {
+        return None;
+    }
+    let contents_val = val.get("contents")?;
+    let (joined, is_markdown) = match contents_val {
+        Value::Array(items) => {
+            let mut parts = Vec::new();
+            let mut any_md = false;
+            for item in items {
+                if let Some((part, md)) = format_marked_string(item) {
+                    parts.push(part);
+                    any_md |= md;
+                }
+            }
+            if parts.is_empty() {
+                return None;
+            }
+            (parts.join("\n\n---\n\n"), any_md)
+        }
+        other => format_marked_string(other)?,
+    };
+
+    let contents = truncate_utf8_bytes(&joined, MAX_HOVER_BYTES);
+    let range = val.get("range").map(extract_full_range_1based);
+    Some(LspHoverInfo {
+        contents,
+        format: if is_markdown {
+            "markdown".to_string()
+        } else {
+            "plaintext".to_string()
+        },
+        range,
+    })
+}
+
+/// Parse an LSP `textDocument/references` response, strictly confining every hit inside `canonical_cwd`.
+pub fn parse_reference_locations(val: &Value, canonical_cwd: &Path) -> Vec<LspReferenceLocation> {
+    let Some(items) = val.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut file_cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
+
+    for item in items {
+        if out.len() >= MAX_REFERENCES_LIMIT {
+            break;
+        }
+        let Some(uri) = item
+            .get("uri")
+            .or_else(|| item.get("targetUri"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Some(range_val) = item
+            .get("range")
+            .or_else(|| item.get("targetSelectionRange"))
+            .or_else(|| item.get("targetRange"))
+        else {
+            continue;
+        };
+        let Some((canon_path, rel_path)) = resolve_confined_uri_to_rel_path(uri, canonical_cwd)
+        else {
+            continue;
+        };
+        let range = extract_full_range_1based(range_val);
+
+        let lines = file_cache.entry(canon_path.clone()).or_insert_with(|| {
+            std::fs::metadata(&canon_path)
+                .ok()
+                .filter(|m| m.is_file() && (m.len() as usize) <= MAX_LSP_DOC_BYTES)
+                .and_then(|_| std::fs::read_to_string(&canon_path).ok())
+                .map(|s| s.lines().map(ToOwned::to_owned).collect())
+                .unwrap_or_default()
+        });
+        let preview_line = usize::try_from(range.line.saturating_sub(1))
+            .ok()
+            .and_then(|idx| lines.get(idx))
+            .map(|l| l.trim().chars().take(160).collect::<String>())
+            .filter(|s| !s.is_empty());
+
+        out.push(LspReferenceLocation {
+            path: rel_path,
+            line: range.line,
+            character: range.col,
+            end_line: range.end_line,
+            end_character: range.end_col,
+            preview_line,
+        });
+    }
+    out
+}
+
+fn lsp_completion_kind_label(code: u64) -> &'static str {
+    match code {
+        1 => "text",
+        2 => "method",
+        3 => "function",
+        4 => "constructor",
+        5 => "field",
+        6 => "variable",
+        7 => "class",
+        8 => "interface",
+        9 => "module",
+        10 => "property",
+        11 => "unit",
+        12 => "value",
+        13 => "enum",
+        14 => "keyword",
+        15 => "snippet",
+        16 => "color",
+        17 => "file",
+        18 => "reference",
+        19 => "folder",
+        20 => "enum_member",
+        21 => "constant",
+        22 => "struct",
+        23 => "event",
+        24 => "operator",
+        25 => "type_parameter",
+        _ => "text",
+    }
+}
+
+/// Strip LSP snippet tabstop markers (`$0`, `$1`, `${1:placeholder}`, `${1|a,b|}`) into plain insert text.
+pub fn strip_lsp_snippet_syntax(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            let next = bytes[i + 1];
+            if matches!(next, b'$' | b'}' | b'\\') {
+                out.push(next as char);
+                i += 2;
+                continue;
+            }
+        }
+        if bytes[i] == b'$' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                let mut j = i + 2;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > i + 2 && j < bytes.len() {
+                    if bytes[j] == b'}' {
+                        i = j + 1;
+                        continue;
+                    }
+                    if bytes[j] == b':' || bytes[j] == b'|' {
+                        let sep = bytes[j];
+                        let content_start = j + 1;
+                        let mut depth = 1usize;
+                        let mut k = content_start;
+                        while k < bytes.len() && depth > 0 {
+                            if bytes[k] == b'\\' && k + 1 < bytes.len() {
+                                k += 2;
+                                continue;
+                            }
+                            if bytes[k] == b'{' {
+                                depth += 1;
+                            } else if bytes[k] == b'}' {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            k += 1;
+                        }
+                        if depth == 0 {
+                            let inner = &raw[content_start..k];
+                            if sep == b'|' {
+                                let trimmed = inner.trim_end_matches('|');
+                                if let Some(first_choice) = trimmed.split(',').next() {
+                                    out.push_str(first_choice);
+                                }
+                            } else {
+                                out.push_str(&strip_lsp_snippet_syntax(inner));
+                            }
+                            i = k + 1;
+                            continue;
+                        }
+                    }
+                }
+            } else if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+        }
+        if let Some(ch) = raw[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Parse an LSP `textDocument/completion` response (`CompletionItem[] | CompletionList`), sorted and capped to 80 items.
+pub fn parse_completion_items(val: &Value) -> Vec<LspCompletionItem> {
+    let items_slice = match val {
+        Value::Array(arr) => arr.as_slice(),
+        Value::Object(map) => match map.get("items").and_then(Value::as_array) {
+            Some(arr) => arr.as_slice(),
+            None => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+
+    let mut out = Vec::new();
+    for item in items_slice {
+        let Some(label) = item.get("label").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if label.is_empty() {
+            continue;
+        }
+        let kind = lsp_completion_kind_label(item.get("kind").and_then(Value::as_u64).unwrap_or(1))
+            .to_string();
+        let detail = item
+            .get("detail")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| truncate_utf8_bytes(s, 512));
+
+        let documentation = item.get("documentation").and_then(|doc| match doc {
+            Value::String(s) => {
+                let trimmed = s.trim();
+                (!trimmed.is_empty()).then(|| truncate_utf8_bytes(trimmed, 4096))
+            }
+            Value::Object(map) => map
+                .get("value")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| truncate_utf8_bytes(s, 4096)),
+            _ => None,
+        });
+
+        let is_snippet = item
+            .get("insertTextFormat")
+            .and_then(Value::as_u64)
+            .is_some_and(|f| f == 2);
+
+        let raw_insert = item
+            .get("textEdit")
+            .and_then(|te| te.get("newText"))
+            .and_then(Value::as_str)
+            .or_else(|| item.get("insertText").and_then(Value::as_str));
+
+        let insert_text = raw_insert.map(|s| {
+            let cleaned = if is_snippet {
+                strip_lsp_snippet_syntax(s)
+            } else {
+                s.to_string()
+            };
+            truncate_utf8_bytes(&cleaned, 2048)
+        });
+
+        let sort_text = item
+            .get("sortText")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        let filter_text = item
+            .get("filterText")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+
+        out.push(LspCompletionItem {
+            label: truncate_utf8_bytes(label, 256),
+            kind,
+            detail,
+            documentation,
+            insert_text,
+            sort_text,
+            filter_text,
+        });
+    }
+
+    out.sort_by(|a, b| {
+        let ka = a.sort_text.as_deref().unwrap_or(&a.label);
+        let kb = b.sort_text.as_deref().unwrap_or(&b.label);
+        ka.cmp(kb).then_with(|| a.label.cmp(&b.label))
+    });
+    out.truncate(MAX_COMPLETION_ITEMS);
+    out
+}
+
+fn diagnostic_to_lsp_json(d: &LspDiagnostic) -> Value {
+    let severity: u32 = match d.severity {
+        LspDiagnosticSeverity::Error => 1,
+        LspDiagnosticSeverity::Warning => 2,
+        LspDiagnosticSeverity::Info => 3,
+        LspDiagnosticSeverity::Hint => 4,
+    };
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "range".into(),
+        json!({
+            "start": {
+                "line": d.line.saturating_sub(1),
+                "character": d.col.saturating_sub(1),
+            },
+            "end": {
+                "line": d.end_line.max(d.line).saturating_sub(1),
+                "character": d.end_col.saturating_sub(1),
+            },
+        }),
+    );
+    obj.insert("severity".into(), json!(severity));
+    obj.insert("message".into(), json!(d.message));
+    if let Some(src) = &d.source {
+        obj.insert("source".into(), json!(src));
+    }
+    if let Some(code) = &d.code {
+        obj.insert("code".into(), json!(code));
+    }
+    Value::Object(obj)
+}
+
+fn parse_lsp_text_edit(val: &Value) -> Option<LspTextEdit> {
+    let range_val = val.get("range")?;
+    let new_text = val.get("newText").and_then(Value::as_str)?;
+    let range = extract_full_range_1based(range_val);
+    Some(LspTextEdit {
+        line: range.line,
+        col: range.col,
+        end_line: range.end_line,
+        end_col: range.end_col,
+        new_text: new_text.to_string(),
+    })
+}
+
+/// Parse an LSP `WorkspaceEdit` (`changes` and/or `documentChanges`) with strict fail-closed workspace confinement.
+/// If ANY target URI escapes `canonical_cwd`, targets `.git`, or contains an unsupported resource operation,
+/// returns `Err(...)` so partial edits are never constructed.
+pub fn parse_workspace_edit(val: &Value, canonical_cwd: &Path) -> Result<LspWorkspaceEdit, String> {
+    if val.is_null() {
+        return Ok(LspWorkspaceEdit::default());
+    }
+    let Some(obj) = val.as_object() else {
+        return Err("Invalid LSP WorkspaceEdit payload".into());
+    };
+
+    let mut order: Vec<String> = Vec::new();
+    let mut grouped: HashMap<String, Vec<LspTextEdit>> = HashMap::new();
+    let mut total_edits: usize = 0;
+
+    let mut push_uri_edits = |uri: &str, raw_edits: &[Value]| -> Result<(), String> {
+        let (_, rel_path) =
+            resolve_confined_uri_to_rel_path(uri, canonical_cwd).ok_or_else(|| {
+                format!("LSP workspace edit targets forbidden path outside workspace: `{uri}`")
+            })?;
+        if !grouped.contains_key(&rel_path) {
+            if order.len() >= MAX_WORKSPACE_EDIT_FILES {
+                return Err(format!(
+                    "LSP workspace edit exceeds maximum file limit ({MAX_WORKSPACE_EDIT_FILES})"
+                ));
+            }
+            order.push(rel_path.clone());
+        }
+        let bucket = grouped.entry(rel_path).or_default();
+        for raw_edit in raw_edits {
+            total_edits += 1;
+            if total_edits > MAX_WORKSPACE_EDIT_TOTAL_EDITS {
+                return Err(format!(
+                    "LSP workspace edit exceeds maximum edit count ({MAX_WORKSPACE_EDIT_TOTAL_EDITS})"
+                ));
+            }
+            let edit = parse_lsp_text_edit(raw_edit)
+                .ok_or_else(|| "Malformed TextEdit inside LSP WorkspaceEdit".to_string())?;
+            bucket.push(edit);
+        }
+        Ok(())
+    };
+
+    if let Some(doc_changes) = obj.get("documentChanges").and_then(Value::as_array) {
+        for change in doc_changes {
+            if let Some(kind) = change.get("kind").and_then(Value::as_str) {
+                return Err(format!(
+                    "Unsupported file resource operation `{kind}` in LSP WorkspaceEdit"
+                ));
+            }
+            let uri = change
+                .get("textDocument")
+                .and_then(|td| td.get("uri"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Missing `textDocument.uri` in LSP documentChanges".to_string())?;
+            let edits = change
+                .get("edits")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "Missing `edits` array in LSP documentChanges".to_string())?;
+            push_uri_edits(uri, edits)?;
+        }
+    } else if let Some(changes) = obj.get("changes").and_then(Value::as_object) {
+        let mut uris: Vec<&String> = changes.keys().collect();
+        uris.sort();
+        for uri in uris {
+            let Some(edits) = changes.get(uri).and_then(Value::as_array) else {
+                continue;
+            };
+            push_uri_edits(uri, edits)?;
+        }
+    }
+
+    let file_edits = order
+        .into_iter()
+        .filter_map(|path| {
+            let edits = grouped.remove(&path)?;
+            (!edits.is_empty()).then_some(LspFileTextEdits { path, edits })
+        })
+        .collect();
+
+    Ok(LspWorkspaceEdit { file_edits })
+}
+
+fn parse_lsp_command(val: &Value) -> Option<LspCommand> {
+    let command = val.get("command").and_then(Value::as_str)?.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let title = val
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(command)
+        .to_string();
+    let arguments = val
+        .get("arguments")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Some(LspCommand {
+        title,
+        command: command.to_string(),
+        arguments,
+    })
+}
+
+/// Parse an LSP `textDocument/codeAction` response (`(Command | CodeAction)[]`).
+pub fn parse_code_actions(val: &Value, canonical_cwd: &Path) -> Vec<LspCodeAction> {
+    let Some(items) = val.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items {
+        if out.len() >= MAX_CODE_ACTIONS_LIMIT {
+            break;
+        }
+        // Skip disabled code actions
+        if item.get("disabled").is_some_and(|d| !d.is_null()) {
+            continue;
+        }
+        let Some(title) = item.get("title").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if title.is_empty() {
+            continue;
+        }
+
+        // Case 1: bare LSP Command (`{ title, command: string, arguments? }`)
+        if item.get("command").and_then(Value::as_str).is_some() {
+            if let Some(cmd) = parse_lsp_command(item) {
+                out.push(LspCodeAction {
+                    title: title.to_string(),
+                    kind: None,
+                    is_preferred: false,
+                    edit: None,
+                    command: Some(cmd),
+                });
+            }
+            continue;
+        }
+
+        // Case 2: CodeAction object
+        let kind = item
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        let is_preferred = item
+            .get("isPreferred")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let edit = match item.get("edit") {
+            Some(edit_val) if !edit_val.is_null() => {
+                match parse_workspace_edit(edit_val, canonical_cwd) {
+                    Ok(ws_edit) => Some(ws_edit),
+                    Err(err) => {
+                        debug!(
+                            title = %title,
+                            error = %err,
+                            "Dropping LSP code action whose WorkspaceEdit failed workspace confinement"
+                        );
+                        continue;
+                    }
+                }
+            }
+            _ => None,
+        };
+        let command = item.get("command").and_then(parse_lsp_command);
+        if edit.is_none() && command.is_none() {
+            continue;
+        }
+        out.push(LspCodeAction {
+            title: title.to_string(),
+            kind,
+            is_preferred,
+            edit,
+            command,
+        });
+    }
+
+    // Surface preferred quick fixes first while preserving server ordering among ties
+    out.sort_by_key(|b| std::cmp::Reverse(b.is_preferred));
+    out
+}
+
+/// Convert a 1-based `(line, utf16_col)` position to an exact UTF-8 byte offset inside `content`.
+pub fn utf16_pos_to_byte_offset(
+    content: &str,
+    line_1based: u32,
+    col_1based: u32,
+) -> Result<usize, String> {
+    let target_line_idx = usize::try_from(line_1based.saturating_sub(1))
+        .map_err(|_| "Line index overflow".to_string())?;
+    let target_col_0based = col_1based.saturating_sub(1);
+
+    let mut line_idx = 0usize;
+    let mut byte_offset = 0usize;
+    let total_bytes = content.len();
+
+    for raw_line in content.split('\n') {
+        if line_idx == target_line_idx {
+            let line_no_cr = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            let mut utf16_acc: u32 = 0;
+            for (char_byte_idx, ch) in line_no_cr.char_indices() {
+                if utf16_acc == target_col_0based {
+                    return Ok(byte_offset + char_byte_idx);
+                }
+                let units = u32::try_from(ch.len_utf16()).unwrap_or(1);
+                if target_col_0based < utf16_acc.saturating_add(units) {
+                    return Err(format!(
+                        "LSP edit position {line_1based}:{col_1based} splits a UTF-16 surrogate pair"
+                    ));
+                }
+                utf16_acc = utf16_acc.saturating_add(units);
+            }
+            // Column at or past EOL clamps cleanly to the end of the line (before `\r\n` / `\n`).
+            return Ok(byte_offset + line_no_cr.len());
+        }
+        byte_offset = byte_offset.saturating_add(raw_line.len()).saturating_add(1);
+        line_idx += 1;
+    }
+
+    if target_line_idx == line_idx && target_col_0based == 0 {
+        return Ok(total_bytes);
+    }
+
+    Err(format!(
+        "LSP edit line {line_1based} is out of bounds (file has {line_idx} lines)"
+    ))
+}
+
+/// Apply a set of non-overlapping 1-based UTF-16 `LspTextEdit`s to a UTF-8 string in a single O(N) pass.
+pub fn apply_text_edits_to_str(content: &str, edits: &[LspTextEdit]) -> Result<String, String> {
+    if edits.is_empty() {
+        return Ok(content.to_string());
+    }
+
+    let mut resolved: Vec<(usize, usize, usize, &str)> = Vec::with_capacity(edits.len());
+    for (idx, edit) in edits.iter().enumerate() {
+        let start = utf16_pos_to_byte_offset(content, edit.line, edit.col)?;
+        let end = utf16_pos_to_byte_offset(content, edit.end_line, edit.end_col)?;
+        if start > end {
+            return Err(format!(
+                "LSP text edit has inverted range ({}:{} > {}:{})",
+                edit.line, edit.col, edit.end_line, edit.end_col
+            ));
+        }
+        resolved.push((start, end, idx, edit.new_text.as_str()));
+    }
+
+    resolved.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+
+    for pair in resolved.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return Err("LSP workspace edit contains overlapping text ranges".into());
+        }
+    }
+
+    let mut out = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+    for (start, end, _, new_text) in resolved {
+        out.push_str(&content[cursor..start]);
+        out.push_str(new_text);
+        cursor = end;
+    }
+    out.push_str(&content[cursor..]);
+    Ok(out)
+}
+
+struct StagedWorkspaceFileEdit {
+    rel_path: String,
+    original_etag: String,
+    new_text: String,
+    edit_count: u32,
+}
+
+/// Safely and atomically apply an `LspWorkspaceEdit` to files strictly confined inside `cwd`.
+///
+/// Security & atomicity guarantees:
+/// 1. Validates and resolves EVERY file strictly inside `canonical_cwd` (zero traversal, no `.git`, no symlinks) BEFORE writing any file.
+/// 2. Computes ALL updated file contents in memory first (rejecting out-of-bounds or overlapping ranges with zero disk mutations).
+/// 3. Writes each changed file atomically via `write_workspace_file` using its verified SHA-256 etag.
+/// 4. Notifies any active matching LSP sessions (`didChange` + `didSave`) so open LSP buffers stay synchronized.
+pub async fn lsp_apply_workspace_edit(
+    manager: Option<&LspManager>,
+    cwd: &Path,
+    edit: &LspWorkspaceEdit,
+) -> Result<LspWorkspaceEditResult, String> {
+    let canonical_cwd = validate_workspace_cwd(cwd)?;
+    if edit.file_edits.is_empty() {
+        return Ok(LspWorkspaceEditResult::default());
+    }
+    if edit.file_edits.len() > MAX_WORKSPACE_EDIT_FILES {
+        return Err(format!(
+            "Workspace edit exceeds maximum file limit ({MAX_WORKSPACE_EDIT_FILES})"
+        ));
+    }
+
+    let edit_owned = edit.clone();
+    let cwd_owned = canonical_cwd.clone();
+
+    let staged: Vec<StagedWorkspaceFileEdit> = tokio::task::spawn_blocking(move || {
+        // Merge duplicate file entries by canonical path while validating every single target strictly inside workspace.
+        let mut order: Vec<PathBuf> = Vec::new();
+        let mut by_canon: HashMap<PathBuf, (String, Vec<LspTextEdit>)> = HashMap::new();
+        let mut total_count: usize = 0;
+
+        for fe in &edit_owned.file_edits {
+            if fe.edits.is_empty() {
+                continue;
+            }
+            let (canon_file, rel_path) = resolve_workspace_file(&cwd_owned, &fe.path)?;
+            let raw_candidate = {
+                let p = Path::new(fe.path.trim());
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    cwd_owned.join(p)
+                }
+            };
+            if let Ok(raw_sym_meta) = std::fs::symlink_metadata(&raw_candidate)
+                && raw_sym_meta.file_type().is_symlink()
+            {
+                return Err(format!("Refusing to edit through symlink `{}`", fe.path));
+            }
+            let sym_meta = std::fs::symlink_metadata(&canon_file)
+                .map_err(|e| format!("Cannot inspect `{rel_path}`: {e}"))?;
+            if sym_meta.file_type().is_symlink() {
+                return Err(format!("Refusing to edit through symlink `{rel_path}`"));
+            }
+            if !sym_meta.is_file() {
+                return Err(format!("Target `{rel_path}` is not a regular file"));
+            }
+            if sym_meta.len() as usize > MAX_LSP_DOC_BYTES {
+                return Err(format!(
+                    "File `{rel_path}` exceeds 2 MiB LSP workspace edit limit"
+                ));
+            }
+            total_count = total_count.saturating_add(fe.edits.len());
+            if total_count > MAX_WORKSPACE_EDIT_TOTAL_EDITS {
+                return Err(format!(
+                    "Workspace edit exceeds maximum edit count ({MAX_WORKSPACE_EDIT_TOTAL_EDITS})"
+                ));
+            }
+            if !by_canon.contains_key(&canon_file) {
+                if order.len() >= MAX_WORKSPACE_EDIT_FILES {
+                    return Err(format!(
+                        "Workspace edit exceeds maximum file limit ({MAX_WORKSPACE_EDIT_FILES})"
+                    ));
+                }
+                order.push(canon_file.clone());
+                by_canon.insert(canon_file.clone(), (rel_path, Vec::new()));
+            }
+            if let Some((_, edits_vec)) = by_canon.get_mut(&canon_file) {
+                edits_vec.extend(fe.edits.iter().cloned());
+            }
+        }
+
+        let mut prepared = Vec::with_capacity(order.len());
+        for canon_file in order {
+            let Some((rel_path, edits)) = by_canon.remove(&canon_file) else {
+                continue;
+            };
+            let raw_bytes = std::fs::read(&canon_file)
+                .map_err(|e| format!("Failed reading `{rel_path}`: {e}"))?;
+            let original_etag = sha256_hex(&raw_bytes);
+            let original_text = String::from_utf8(raw_bytes)
+                .map_err(|_| format!("File `{rel_path}` is not valid UTF-8"))?;
+            let new_text = apply_text_edits_to_str(&original_text, &edits)
+                .map_err(|e| format!("Failed applying edits to `{rel_path}`: {e}"))?;
+            if new_text != original_text {
+                let edit_count = u32::try_from(edits.len()).unwrap_or(u32::MAX);
+                prepared.push(StagedWorkspaceFileEdit {
+                    rel_path,
+                    original_etag,
+                    new_text,
+                    edit_count,
+                });
+            }
+        }
+        Ok::<Vec<StagedWorkspaceFileEdit>, String>(prepared)
+    })
+    .await
+    .map_err(|e| format!("Workspace edit preparation task failed: {e}"))??;
+
+    if staged.is_empty() {
+        return Ok(LspWorkspaceEditResult::default());
+    }
+
+    let mut modified_files = Vec::with_capacity(staged.len());
+    let mut total_edits: u32 = 0;
+
+    for item in staged {
+        let outcome = write_workspace_file(
+            &canonical_cwd,
+            &item.rel_path,
+            &item.new_text,
+            Some(&item.original_etag),
+            false,
+        )
+        .await?;
+        if outcome.conflict.is_some() {
+            return Err(format!(
+                "File `{}` changed on disk while applying workspace edit",
+                item.rel_path
+            ));
+        }
+        if let Some(mgr) = manager {
+            mgr.notify_file_saved(&canonical_cwd, &item.rel_path, &item.new_text)
+                .await;
+        }
+        modified_files.push(item.rel_path);
+        total_edits = total_edits.saturating_add(item.edit_count);
+    }
+
+    Ok(LspWorkspaceEditResult {
+        applied: !modified_files.is_empty(),
+        modified_files,
+        total_edits,
+    })
+}
+
 // ============================================================================
 // LspManager: Multi-Workspace Lazy Lifecycle + Bounded Cap + Idle Auto-Shutdown
 // ============================================================================
@@ -2455,6 +3598,158 @@ impl LspManager {
         let sess = self.get_or_start_session(&canonical_cwd, cfg).await?;
         sess.goto_definition(&canon_file, line, col, self.request_timeout)
             .await
+    }
+
+    /// Resolve `textDocument/hover` documentation at a 1-based `(line, utf16_col)` in `path`.
+    pub async fn hover(
+        &self,
+        cwd: &Path,
+        path: &str,
+        line: u32,
+        col: u32,
+        content: Option<&str>,
+    ) -> Result<Option<LspHoverInfo>, String> {
+        let canonical_cwd = validate_workspace_cwd(cwd)?;
+        let (canon_file, _) = resolve_workspace_file(&canonical_cwd, path)?;
+        let Some(cfg) = self
+            .select_config_for_file(&canonical_cwd, &canon_file)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let sess = self.get_or_start_session(&canonical_cwd, cfg).await?;
+        sess.hover(&canon_file, line, col, content, self.request_timeout)
+            .await
+    }
+
+    /// Resolve workspace-confined `textDocument/references` locations at a 1-based `(line, utf16_col)`.
+    pub async fn references(
+        &self,
+        cwd: &Path,
+        path: &str,
+        line: u32,
+        col: u32,
+        include_declaration: bool,
+        content: Option<&str>,
+    ) -> Result<Vec<LspReferenceLocation>, String> {
+        let canonical_cwd = validate_workspace_cwd(cwd)?;
+        let (canon_file, _) = resolve_workspace_file(&canonical_cwd, path)?;
+        let Some(cfg) = self
+            .select_config_for_file(&canonical_cwd, &canon_file)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let sess = self.get_or_start_session(&canonical_cwd, cfg).await?;
+        sess.references(
+            &canon_file,
+            line,
+            col,
+            include_declaration,
+            content,
+            self.request_timeout,
+        )
+        .await
+    }
+
+    /// Resolve `textDocument/completion` candidates at a 1-based `(line, utf16_col)` (capped at 80 items).
+    pub async fn completion(
+        &self,
+        cwd: &Path,
+        path: &str,
+        line: u32,
+        col: u32,
+        trigger_character: Option<&str>,
+        content: Option<&str>,
+    ) -> Result<Vec<LspCompletionItem>, String> {
+        let canonical_cwd = validate_workspace_cwd(cwd)?;
+        let (canon_file, _) = resolve_workspace_file(&canonical_cwd, path)?;
+        let Some(cfg) = self
+            .select_config_for_file(&canonical_cwd, &canon_file)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let sess = self.get_or_start_session(&canonical_cwd, cfg).await?;
+        sess.completion(
+            &canon_file,
+            line,
+            col,
+            trigger_character,
+            content,
+            self.request_timeout,
+        )
+        .await
+    }
+
+    /// Resolve `textDocument/codeAction` quick fixes and refactors for a 1-based range and diagnostics.
+    pub async fn code_action(
+        &self,
+        cwd: &Path,
+        path: &str,
+        range: LspRange,
+        diagnostics: &[LspDiagnostic],
+        content: Option<&str>,
+    ) -> Result<Vec<LspCodeAction>, String> {
+        let canonical_cwd = validate_workspace_cwd(cwd)?;
+        let (canon_file, rel_path) = resolve_workspace_file(&canonical_cwd, path)?;
+        let Some(cfg) = self
+            .select_config_for_file(&canonical_cwd, &canon_file)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let sess = self.get_or_start_session(&canonical_cwd, cfg).await?;
+        sess.code_action(
+            &canon_file,
+            &rel_path,
+            range,
+            diagnostics,
+            content,
+            self.request_timeout,
+        )
+        .await
+    }
+
+    /// Compute a symbol rename via `textDocument/rename` and atomically apply it inside `cwd`.
+    pub async fn rename(
+        &self,
+        cwd: &Path,
+        path: &str,
+        line: u32,
+        col: u32,
+        new_name: &str,
+        content: Option<&str>,
+    ) -> Result<LspWorkspaceEditResult, String> {
+        let canonical_cwd = validate_workspace_cwd(cwd)?;
+        let (canon_file, _) = resolve_workspace_file(&canonical_cwd, path)?;
+        let Some(cfg) = self
+            .select_config_for_file(&canonical_cwd, &canon_file)
+            .await?
+        else {
+            return Err("No language server available for this file type".into());
+        };
+        let sess = self.get_or_start_session(&canonical_cwd, cfg).await?;
+        let ws_edit = sess
+            .rename(
+                &canon_file,
+                line,
+                col,
+                new_name,
+                content,
+                self.request_timeout,
+            )
+            .await?;
+        self.apply_workspace_edit(&canonical_cwd, &ws_edit).await
+    }
+
+    /// Apply a workspace-confined `LspWorkspaceEdit` atomically and synchronize open LSP buffers.
+    pub async fn apply_workspace_edit(
+        &self,
+        cwd: &Path,
+        edit: &LspWorkspaceEdit,
+    ) -> Result<LspWorkspaceEditResult, String> {
+        lsp_apply_workspace_edit(Some(self), cwd, edit).await
     }
 
     /// Notify any already-running matching LSP server that a file was saved in the editor.
@@ -3358,5 +4653,579 @@ mod tests {
         assert_eq!(did_open_msgs, 1);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn lsp_hover_references_completion_code_action_and_rename_end_to_end() {
+        let base = std::env::temp_dir().join(format!("orbit-lsp-full-{}", uuid::Uuid::new_v4()));
+        let ws = base.join("repo");
+        let outside = base.join("outside.rs");
+        std::fs::create_dir_all(ws.join("src")).expect("create src");
+        std::fs::write(
+            ws.join("src/lib.rs"),
+            "pub fn old_name(x: u32) -> u32 {\n    x + 1\n}\n",
+        )
+        .expect("write lib.rs");
+        std::fs::write(
+            ws.join("src/main.rs"),
+            "fn main() {\n    let v = old_name(41);\n    println!(\"{v}\");\n}\n",
+        )
+        .expect("write main.rs");
+        std::fs::write(&outside, "pub fn old_name() {}\n").expect("write outside");
+
+        let canon_cwd = validate_workspace_cwd(&ws).expect("canon cwd");
+        let (canon_lib, rel_lib) = resolve_workspace_file(&canon_cwd, "src/lib.rs").expect("lib");
+        let (canon_main, _) = resolve_workspace_file(&canon_cwd, "src/main.rs").expect("main");
+        let lib_uri = path_to_file_uri(&canon_lib);
+        let main_uri = path_to_file_uri(&canon_main);
+        let outside_uri = path_to_file_uri(
+            &crate::platform::canonicalize_clean(&outside).expect("outside canon"),
+        );
+
+        let (client_read, server_write) = tokio::io::duplex(64 * 1024);
+        let (server_read, client_write) = tokio::io::duplex(64 * 1024);
+
+        let lib_uri_srv = lib_uri.clone();
+        let main_uri_srv = main_uri.clone();
+        let outside_uri_srv = outside_uri.clone();
+
+        let server_handle = tokio::spawn(async move {
+            let mut reader = BufReader::new(server_read);
+            let mut writer = server_write;
+            let mut seen_methods = Vec::new();
+            let mut seen_did_save_uris = Vec::new();
+
+            while let Ok(Some(msg)) = read_lsp_message(&mut reader).await {
+                let method = msg
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let id = msg.get("id").cloned();
+                if !method.is_empty() {
+                    seen_methods.push(method.clone());
+                }
+
+                match method.as_str() {
+                    "initialize" => {
+                        let _ = write_lsp_message(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "capabilities": {
+                                        "hoverProvider": true,
+                                        "referencesProvider": true,
+                                        "completionProvider": { "triggerCharacters": [".", ":"] },
+                                        "codeActionProvider": true,
+                                        "renameProvider": true
+                                    }
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "textDocument/didSave" => {
+                        if let Some(u) = msg
+                            .get("params")
+                            .and_then(|p| p.get("textDocument"))
+                            .and_then(|td| td.get("uri"))
+                            .and_then(Value::as_str)
+                        {
+                            seen_did_save_uris.push(u.to_string());
+                        }
+                    }
+                    "textDocument/hover" => {
+                        let _ = write_lsp_message(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "contents": [
+                                        { "language": "rust", "value": "pub fn old_name(x: u32) -> u32" },
+                                        "Increments `x` by one."
+                                    ],
+                                    "range": {
+                                        "start": { "line": 0, "character": 7 },
+                                        "end": { "line": 0, "character": 15 }
+                                    }
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "textDocument/references" => {
+                        let _ = write_lsp_message(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": [
+                                    {
+                                        "uri": lib_uri_srv,
+                                        "range": {
+                                            "start": { "line": 0, "character": 7 },
+                                            "end": { "line": 0, "character": 15 }
+                                        }
+                                    },
+                                    {
+                                        "uri": main_uri_srv,
+                                        "range": {
+                                            "start": { "line": 1, "character": 12 },
+                                            "end": { "line": 1, "character": 20 }
+                                        }
+                                    },
+                                    {
+                                        // Must be filtered out by strict workspace confinement!
+                                        "uri": outside_uri_srv,
+                                        "range": {
+                                            "start": { "line": 0, "character": 7 },
+                                            "end": { "line": 0, "character": 15 }
+                                        }
+                                    }
+                                ]
+                            }),
+                        )
+                        .await;
+                    }
+                    "textDocument/completion" => {
+                        let mut items = Vec::new();
+                        items.push(json!({
+                            "label": "old_name",
+                            "kind": 3,
+                            "detail": "fn(u32) -> u32",
+                            "documentation": { "kind": "markdown", "value": "Increment helper" },
+                            "insertText": "old_name(${1:x})$0",
+                            "insertTextFormat": 2,
+                            "sortText": "0000",
+                            "filterText": "old_name"
+                        }));
+                        // Add 95 extra items to verify strict 80-item bound
+                        for i in 1..=95 {
+                            items.push(json!({
+                                "label": format!("item_{i:03}"),
+                                "kind": 6,
+                                "sortText": format!("{i:04}")
+                            }));
+                        }
+                        let _ = write_lsp_message(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "isIncomplete": true,
+                                    "items": items
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "textDocument/codeAction" => {
+                        let _ = write_lsp_message(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": [
+                                    {
+                                        "title": "Escape workspace evil fix",
+                                        "kind": "quickfix",
+                                        "isPreferred": true,
+                                        "edit": {
+                                            "changes": {
+                                                outside_uri_srv.clone(): [{
+                                                    "range": {
+                                                        "start": { "line": 0, "character": 0 },
+                                                        "end": { "line": 0, "character": 3 }
+                                                    },
+                                                    "newText": "bad"
+                                                }]
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "title": "Add #[must_use]",
+                                        "kind": "quickfix",
+                                        "isPreferred": true,
+                                        "edit": {
+                                            "changes": {
+                                                lib_uri_srv.clone(): [{
+                                                    "range": {
+                                                        "start": { "line": 0, "character": 0 },
+                                                        "end": { "line": 0, "character": 0 }
+                                                    },
+                                                    "newText": "#[must_use]\n"
+                                                }]
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "title": "Disabled action",
+                                        "disabled": { "reason": "not applicable" }
+                                    },
+                                    {
+                                        "title": "Run cargo check",
+                                        "command": "rust-analyzer.runCheck",
+                                        "arguments": ["all"]
+                                    }
+                                ]
+                            }),
+                        )
+                        .await;
+                    }
+                    "textDocument/rename" => {
+                        let new_name = msg
+                            .get("params")
+                            .and_then(|p| p.get("newName"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("renamed");
+                        let _ = write_lsp_message(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "documentChanges": [
+                                        {
+                                            "textDocument": { "uri": lib_uri_srv, "version": 1 },
+                                            "edits": [{
+                                                "range": {
+                                                    "start": { "line": 0, "character": 7 },
+                                                    "end": { "line": 0, "character": 15 }
+                                                },
+                                                "newText": new_name
+                                            }]
+                                        },
+                                        {
+                                            "textDocument": { "uri": main_uri_srv, "version": 1 },
+                                            "edits": [{
+                                                "range": {
+                                                    "start": { "line": 1, "character": 12 },
+                                                    "end": { "line": 1, "character": 20 }
+                                                },
+                                                "newText": new_name
+                                            }]
+                                        }
+                                    ]
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "shutdown" => {
+                        let _ = write_lsp_message(
+                            &mut writer,
+                            &json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null }),
+                        )
+                        .await;
+                    }
+                    "exit" => break,
+                    _ => {}
+                }
+            }
+            (seen_methods, seen_did_save_uris)
+        });
+
+        let cfg = LspServerConfig {
+            id: "mock-full".into(),
+            name: "Mock Full LS".into(),
+            command: "mock-full".into(),
+            args: Vec::new(),
+            file_extensions: vec!["rs".into()],
+            language_ids: vec!["rust".into()],
+            root_markers: Vec::new(),
+            enabled: true,
+            source: LspConfigSource::Builtin,
+        };
+        let session = LspClientSession::from_transport(
+            cfg,
+            None,
+            canon_cwd.clone(),
+            BufReader::new(client_read),
+            Box::new(client_write),
+            None,
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("init full mock session");
+
+        // 1. textDocument/hover
+        let hover = session
+            .hover(&canon_lib, 1, 8, None, Duration::from_secs(3))
+            .await
+            .expect("hover ok")
+            .expect("hover present");
+        assert_eq!(hover.format, "markdown");
+        assert!(
+            hover
+                .contents
+                .contains("```rust\npub fn old_name(x: u32) -> u32\n```")
+        );
+        assert!(hover.contents.contains("Increments `x` by one."));
+        assert_eq!(
+            hover.range,
+            Some(LspRange {
+                line: 1,
+                col: 8,
+                end_line: 1,
+                end_col: 16
+            })
+        );
+
+        // 2. textDocument/references (outside workspace URI strictly excluded)
+        let refs = session
+            .references(&canon_lib, 1, 8, true, None, Duration::from_secs(3))
+            .await
+            .expect("references ok");
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].path, "src/lib.rs");
+        assert_eq!(refs[0].line, 1);
+        assert_eq!(refs[0].character, 8);
+        assert_eq!(refs[0].end_character, 16);
+        assert_eq!(
+            refs[0].preview_line.as_deref(),
+            Some("pub fn old_name(x: u32) -> u32 {")
+        );
+        assert_eq!(refs[1].path, "src/main.rs");
+        assert_eq!(refs[1].line, 2);
+        assert_eq!(refs[1].character, 13);
+        assert_eq!(
+            refs[1].preview_line.as_deref(),
+            Some("let v = old_name(41);")
+        );
+
+        // 3. textDocument/completion (snippet cleaned + capped to 80 items)
+        let comps = session
+            .completion(&canon_main, 2, 14, Some("."), None, Duration::from_secs(3))
+            .await
+            .expect("completion ok");
+        assert_eq!(comps.len(), MAX_COMPLETION_ITEMS);
+        assert_eq!(comps[0].label, "old_name");
+        assert_eq!(comps[0].kind, "function");
+        assert_eq!(comps[0].detail.as_deref(), Some("fn(u32) -> u32"));
+        assert_eq!(comps[0].documentation.as_deref(), Some("Increment helper"));
+        assert_eq!(comps[0].insert_text.as_deref(), Some("old_name(x)"));
+
+        // 4. textDocument/codeAction (escaping action dropped, disabled skipped, preferred first)
+        let actions = session
+            .code_action(
+                &canon_lib,
+                &rel_lib,
+                LspRange {
+                    line: 1,
+                    col: 1,
+                    end_line: 1,
+                    end_col: 15,
+                },
+                &[],
+                None,
+                Duration::from_secs(3),
+            )
+            .await
+            .expect("codeAction ok");
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].title, "Add #[must_use]");
+        assert!(actions[0].is_preferred);
+        assert_eq!(actions[0].kind.as_deref(), Some("quickfix"));
+        assert!(actions[0].edit.is_some());
+        assert_eq!(actions[1].title, "Run cargo check");
+        assert_eq!(
+            actions[1].command.as_ref().map(|c| c.command.as_str()),
+            Some("rust-analyzer.runCheck")
+        );
+
+        // 5. textDocument/rename + atomic lsp_apply_workspace_edit + didChange/didSave sync
+        let mgr = LspManager::with_timeouts(
+            base.clone(),
+            Duration::from_secs(60),
+            Duration::from_secs(3),
+            Duration::from_secs(3),
+        );
+        mgr.insert_test_session(canon_cwd.clone(), Arc::clone(&session))
+            .await;
+
+        let ws_edit = session
+            .rename(&canon_lib, 1, 8, "new_name", None, Duration::from_secs(3))
+            .await
+            .expect("rename workspace edit");
+        assert_eq!(ws_edit.file_edits.len(), 2);
+
+        let applied = lsp_apply_workspace_edit(Some(&mgr), &canon_cwd, &ws_edit)
+            .await
+            .expect("apply workspace edit");
+        assert!(applied.applied);
+        assert_eq!(applied.total_edits, 2);
+        assert_eq!(applied.modified_files, vec!["src/lib.rs", "src/main.rs"]);
+
+        let lib_after = std::fs::read_to_string(ws.join("src/lib.rs")).expect("read lib");
+        let main_after = std::fs::read_to_string(ws.join("src/main.rs")).expect("read main");
+        assert!(lib_after.starts_with("pub fn new_name(x: u32) -> u32 {"));
+        assert!(main_after.contains("let v = new_name(41);"));
+
+        mgr.shutdown_all().await;
+        let (seen_methods, did_save_uris) = server_handle.await.expect("server exit");
+        assert!(seen_methods.iter().any(|m| m == "textDocument/hover"));
+        assert!(seen_methods.iter().any(|m| m == "textDocument/references"));
+        assert!(seen_methods.iter().any(|m| m == "textDocument/completion"));
+        assert!(seen_methods.iter().any(|m| m == "textDocument/codeAction"));
+        assert!(seen_methods.iter().any(|m| m == "textDocument/rename"));
+        assert!(did_save_uris.contains(&lib_uri));
+        assert!(did_save_uris.contains(&main_uri));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn lsp_apply_workspace_edit_confinement_utf16_and_atomicity() {
+        let base = std::env::temp_dir().join(format!("orbit-lsp-wse-{}", uuid::Uuid::new_v4()));
+        let ws = base.join("repo");
+        let outside = base.join("secret.rs");
+        std::fs::create_dir_all(ws.join("src")).expect("create src");
+        std::fs::create_dir_all(ws.join(".git")).expect("create .git");
+        std::fs::write(ws.join("src/a.rs"), "let s = \"🚀\"; let foo = 1;\r\n").expect("write a");
+        std::fs::write(ws.join("src/b.rs"), "const B: i32 = 2;\n").expect("write b");
+        std::fs::write(ws.join(".git/config"), "[core]\n").expect("write git");
+        std::fs::write(&outside, "secret\n").expect("write secret");
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(ws.join("src/a.rs"), ws.join("src/link_a.rs"));
+            let _ = std::os::unix::fs::symlink(&outside, ws.join("src/link_out.rs"));
+        }
+
+        let canon_cwd = validate_workspace_cwd(&ws).expect("canon cwd");
+
+        // 1. UTF-16 surrogate pair accuracy ("🚀" takes 2 UTF-16 code units!) + CRLF preservation
+        // Line 1: `let s = "🚀"; let foo = 1;`
+        // Cols (1-based UTF-16):
+        // 1..=9: `let s = "` (9 units)
+        // 10..=11: `🚀` (2 units)
+        // 12..=18: `"; let ` (7 units)
+        // 19..=21: `foo` (start col 19, end col 22)
+        let utf16_edit = LspWorkspaceEdit {
+            file_edits: vec![LspFileTextEdits {
+                path: "src/a.rs".into(),
+                edits: vec![LspTextEdit {
+                    line: 1,
+                    col: 19,
+                    end_line: 1,
+                    end_col: 22,
+                    new_text: "bar".into(),
+                }],
+            }],
+        };
+        let res = lsp_apply_workspace_edit(None, &canon_cwd, &utf16_edit)
+            .await
+            .expect("utf16 edit ok");
+        assert!(res.applied);
+        assert_eq!(
+            std::fs::read_to_string(ws.join("src/a.rs")).expect("read a"),
+            "let s = \"🚀\"; let bar = 1;\r\n"
+        );
+
+        // 2. Overlapping edits rejected with zero disk mutations
+        let overlap_edit = LspWorkspaceEdit {
+            file_edits: vec![LspFileTextEdits {
+                path: "src/b.rs".into(),
+                edits: vec![
+                    LspTextEdit {
+                        line: 1,
+                        col: 1,
+                        end_line: 1,
+                        end_col: 8,
+                        new_text: "let".into(),
+                    },
+                    LspTextEdit {
+                        line: 1,
+                        col: 5,
+                        end_line: 1,
+                        end_col: 10,
+                        new_text: "X".into(),
+                    },
+                ],
+            }],
+        };
+        assert!(
+            lsp_apply_workspace_edit(None, &canon_cwd, &overlap_edit)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("src/b.rs")).expect("b unchanged"),
+            "const B: i32 = 2;\n"
+        );
+
+        // 3. Multi-file edit where 2nd file escapes workspace (`../secret.rs` or `.git/config`)
+        // MUST reject ALL files in Phase 1 before modifying src/b.rs!
+        for bad_path in ["../secret.rs", ".git/config", &outside.to_string_lossy()] {
+            let evil_edit = LspWorkspaceEdit {
+                file_edits: vec![
+                    LspFileTextEdits {
+                        path: "src/b.rs".into(),
+                        edits: vec![LspTextEdit {
+                            line: 1,
+                            col: 7,
+                            end_line: 1,
+                            end_col: 8,
+                            new_text: "Z".into(),
+                        }],
+                    },
+                    LspFileTextEdits {
+                        path: bad_path.to_string(),
+                        edits: vec![LspTextEdit {
+                            line: 1,
+                            col: 1,
+                            end_line: 1,
+                            end_col: 2,
+                            new_text: "X".into(),
+                        }],
+                    },
+                ],
+            };
+            assert!(
+                lsp_apply_workspace_edit(None, &canon_cwd, &evil_edit)
+                    .await
+                    .is_err(),
+                "expected `{bad_path}` to be rejected"
+            );
+            assert_eq!(
+                std::fs::read_to_string(ws.join("src/b.rs")).expect("b still untouched"),
+                "const B: i32 = 2;\n"
+            );
+        }
+
+        // 4. Symlinks (both escaping and intra-workspace) rejected in Phase 1
+        #[cfg(unix)]
+        for sym_path in ["src/link_out.rs", "src/link_a.rs"] {
+            let sym_edit = LspWorkspaceEdit {
+                file_edits: vec![LspFileTextEdits {
+                    path: sym_path.into(),
+                    edits: vec![LspTextEdit {
+                        line: 1,
+                        col: 1,
+                        end_line: 1,
+                        end_col: 2,
+                        new_text: "X".into(),
+                    }],
+                }],
+            };
+            assert!(
+                lsp_apply_workspace_edit(None, &canon_cwd, &sym_edit)
+                    .await
+                    .is_err(),
+                "expected symlink `{sym_path}` to be rejected"
+            );
+        }
+
+        // 5. Snippet placeholder stripper unit checks
+        assert_eq!(
+            strip_lsp_snippet_syntax("foo(${1:bar}, ${2|a,b,c|})$0"),
+            "foo(bar, a)"
+        );
+        assert_eq!(strip_lsp_snippet_syntax(r"cost: \$100 $1"), "cost: $100 ");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

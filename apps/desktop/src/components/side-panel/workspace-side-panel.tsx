@@ -494,14 +494,18 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
             );
           })}
 
-        {/* Persistent Review Pool (kept alive across tab switches so comments, viewed state & commit draft survive) */}
+        {/* Persistent Review Pool (kept alive across tab switches within the same workspace; remounted cleanly on host/cwd change) */}
         {hasReviewTab && (
           <PanelErrorBoundary
             panelName="Review"
             resetKey={`${selectedHostId}:${selectedWorkspaceCwd ?? ""}`}
             className={!isReviewVisible ? "hidden" : undefined}
           >
-            <ReviewTab selectedHostId={selectedHostId} visible={isReviewVisible} />
+            <ReviewTab
+              key={`${selectedHostId}:${selectedWorkspaceCwd ?? ""}`}
+              selectedHostId={selectedHostId}
+              visible={isReviewVisible}
+            />
           </PanelErrorBoundary>
         )}
 

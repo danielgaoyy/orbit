@@ -66,6 +66,7 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   rewoundSessions: "stage",
   sessionScrollNonce: "stage",
   pendingJumpTarget: "stage",
+  stageFindFocusNonce: "stage",
   slashCommands: "stage",
 
   // composer
@@ -137,6 +138,7 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
 
   // terminal
   terminalTabs: "terminal",
+  terminalSplits: "terminal",
   activeTerminalTabKey: "terminal",
   terminalFocused: "terminal",
 
@@ -175,6 +177,7 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   lifecycleHooksByScope: "automations",
   browserByHost: "automations",
   guardianByHost: "automations",
+  permissionRulesByHost: "automations",
   eventTriggersByHost: "automations",
   imChannelsByHost: "automations",
   pushByHost: "automations",

@@ -718,6 +718,46 @@ pub enum ComposerContextInput {
         #[serde(default)]
         snippet: Option<String>,
     },
+    DomElement {
+        selector: String,
+        tag: String,
+        #[serde(default)]
+        text_preview: String,
+        #[serde(default)]
+        attributes: std::collections::BTreeMap<String, String>,
+        #[serde(default)]
+        computed_box: Option<orbit_protocol::PickedElementBox>,
+        #[serde(default)]
+        outer_html_excerpt: String,
+        #[serde(default)]
+        page_url: String,
+    },
+    WorkspaceFolder {
+        path: String,
+        #[serde(default)]
+        file_count: u32,
+        #[serde(default)]
+        tree_summary: Option<String>,
+    },
+    PullRequest {
+        number: u32,
+        title: String,
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        state: Option<String>,
+        #[serde(default)]
+        head_ref: Option<String>,
+        #[serde(default)]
+        base_ref: Option<String>,
+        #[serde(default)]
+        summary: Option<String>,
+    },
+    WebUrl {
+        url: String,
+        #[serde(default)]
+        label: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -846,24 +886,69 @@ fn dynamic_backtick_fence(body: &str) -> String {
     "`".repeat(max_run.max(2) + 1)
 }
 
-fn neutralize_symbol_ref_close_tag(body: &str) -> String {
-    const NEEDLE: &str = "</symbol_ref";
+fn neutralize_close_tag(body: &str, needle: &str) -> String {
     let lower = body.to_ascii_lowercase();
-    if !lower.contains(NEEDLE) {
+    if !lower.contains(needle) {
         return body.to_string();
     }
     let mut out = String::with_capacity(body.len() + 8);
     let mut cursor = 0usize;
-    while let Some(rel_pos) = lower[cursor..].find(NEEDLE) {
+    while let Some(rel_pos) = lower[cursor..].find(needle) {
         let abs_pos = cursor + rel_pos;
         out.push_str(&body[cursor..abs_pos]);
-        // Insert a backslash after `<` to prevent premature tag breakout while keeping code readable
+        // Insert a backslash after `<` to prevent premature tag breakout while keeping content readable
         out.push_str("<\\");
-        out.push_str(&body[abs_pos + 1..abs_pos + NEEDLE.len()]);
-        cursor = abs_pos + NEEDLE.len();
+        out.push_str(&body[abs_pos + 1..abs_pos + needle.len()]);
+        cursor = abs_pos + needle.len();
     }
     out.push_str(&body[cursor..]);
     out
+}
+
+fn neutralize_symbol_ref_close_tag(body: &str) -> String {
+    neutralize_close_tag(body, "</symbol_ref")
+}
+
+/// Strictly validate an explicit `https://...` URL reference without performing any network I/O.
+pub fn is_valid_https_reference_url(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.len() < 10 || trimmed.len() > 2048 {
+        return false;
+    }
+    let Some(rest) = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("HTTPS://"))
+    else {
+        return false;
+    };
+    if trimmed
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\''))
+    {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let host = authority.split(':').next().unwrap_or("");
+    !host.is_empty()
+        && host.chars().any(|c| c.is_ascii_alphanumeric())
+        && (host.contains('.') || host.eq_ignore_ascii_case("localhost"))
+}
+
+fn short_web_url_label(url: &str) -> String {
+    let trimmed = url.trim();
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("HTTPS://"))
+        .unwrap_or(trimmed);
+    let clean = without_scheme.trim_end_matches('/');
+    if clean.len() <= 44 {
+        clean.to_string()
+    } else {
+        format!("{}…", clip_utf8_prefix(clean, 43))
+    }
 }
 
 fn is_mention_ident_char(ch: char) -> bool {
@@ -1330,6 +1415,181 @@ pub fn compose_prompt(
                     escape_xml_attr(clean_name),
                 ));
             }
+            ComposerContextInput::DomElement {
+                selector,
+                tag,
+                text_preview,
+                attributes,
+                computed_box,
+                outer_html_excerpt,
+                page_url,
+            } => {
+                let clean_selector = selector.trim();
+                let clean_tag = if tag.trim().is_empty() {
+                    "element"
+                } else {
+                    tag.trim()
+                };
+                let short_label = if clean_selector.is_empty() {
+                    format!("@element <{clean_tag}>")
+                } else {
+                    format!("@element {}", clip_utf8_prefix(clean_selector, 48))
+                };
+                badges.push(PromptBadge {
+                    kind: "element".into(),
+                    label: short_label,
+                    path: (!page_url.trim().is_empty()).then_some(page_url.trim().to_string()),
+                });
+                let box_attr = computed_box
+                    .as_ref()
+                    .map(|b| {
+                        format!(
+                            " box=\"{:.0},{:.0} {:.0}x{:.0}\"",
+                            b.x, b.y, b.width, b.height
+                        )
+                    })
+                    .unwrap_or_default();
+                let mut lines: Vec<String> = Vec::new();
+                if !text_preview.trim().is_empty() {
+                    lines.push(format!(
+                        "Text: {}",
+                        clip_utf8_prefix(text_preview.trim(), 240)
+                    ));
+                }
+                if !attributes.is_empty() {
+                    let attrs_str = attributes
+                        .iter()
+                        .take(16)
+                        .map(|(k, v)| format!("{k}={:?}", clip_utf8_prefix(v, 120)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    lines.push(format!("Attributes: {attrs_str}"));
+                }
+                if !outer_html_excerpt.trim().is_empty() {
+                    let clipped = clip_utf8_prefix(outer_html_excerpt.trim(), 600);
+                    let fence = dynamic_backtick_fence(clipped);
+                    lines.push(format!("{fence}html\n{clipped}\n{fence}"));
+                }
+                let body = lines.join("\n");
+                context_blocks.push(format!(
+                    "<DOM_ELEMENT selector=\"{}\" tag=\"{}\" page_url=\"{}\"{box_attr}>\n{body}\n</DOM_ELEMENT>",
+                    escape_xml_attr(clean_selector),
+                    escape_xml_attr(clean_tag),
+                    escape_xml_attr(page_url.trim()),
+                ));
+            }
+            ComposerContextInput::WorkspaceFolder {
+                path,
+                file_count,
+                tree_summary,
+            } => {
+                let clean_path = path.trim().trim_end_matches('/');
+                if clean_path.is_empty() {
+                    continue;
+                }
+                let token = format!("@folder:{clean_path}");
+                let slash_token = format!("@{clean_path}/");
+                if !clean_user_text.contains(&token) && !clean_user_text.contains(&slash_token) {
+                    badges.push(PromptBadge {
+                        kind: "folder".into(),
+                        label: format!("{clean_path}/"),
+                        path: Some(clean_path.to_string()),
+                    });
+                }
+                let count_attr = if *file_count > 0 {
+                    format!(" files=\"{file_count}\"")
+                } else {
+                    String::new()
+                };
+                let body = tree_summary
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|summary| {
+                        let clipped = clip_utf8_prefix(summary, 6_000);
+                        neutralize_close_tag(clipped, "</folder_ref")
+                    })
+                    .unwrap_or_else(|| {
+                        format!("Inspect workspace directory `{clean_path}/` for relevant files.")
+                    });
+                context_blocks.push(format!(
+                    "<FOLDER_REF path=\"{}\"{count_attr}>\n{body}\n</FOLDER_REF>",
+                    escape_xml_attr(clean_path),
+                ));
+            }
+            ComposerContextInput::PullRequest {
+                number,
+                title,
+                url,
+                state,
+                head_ref,
+                base_ref,
+                summary,
+            } => {
+                let pr_token = format!("@pr#{number}");
+                let pr_label = format!("PR #{number}");
+                if !clean_user_text.contains(&pr_token) && !clean_user_text.contains("@pr") {
+                    badges.push(PromptBadge {
+                        kind: "pr".into(),
+                        label: pr_label,
+                        path: url
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string),
+                    });
+                }
+                let mut attrs = format!(
+                    "number=\"{number}\" title=\"{}\"",
+                    escape_xml_attr(title.trim())
+                );
+                if let Some(st) = state.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    attrs.push_str(&format!(" state=\"{}\"", escape_xml_attr(st)));
+                }
+                if let Some(head) = head_ref.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    attrs.push_str(&format!(" head=\"{}\"", escape_xml_attr(head)));
+                }
+                if let Some(base) = base_ref.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    attrs.push_str(&format!(" base=\"{}\"", escape_xml_attr(base)));
+                }
+                if let Some(u) = url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    attrs.push_str(&format!(" url=\"{}\"", escape_xml_attr(u)));
+                }
+                let body = summary
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| neutralize_close_tag(clip_utf8_prefix(s, 6_000), "</pr_ref"))
+                    .unwrap_or_else(|| {
+                        format!("Active GitHub Pull Request #{number}: {}", title.trim())
+                    });
+                context_blocks.push(format!("<PR_REF {attrs}>\n{body}\n</PR_REF>"));
+            }
+            ComposerContextInput::WebUrl { url, label } => {
+                let clean_url = url.trim();
+                if !is_valid_https_reference_url(clean_url) {
+                    continue;
+                }
+                let display_label = label
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| short_web_url_label(clean_url));
+                let web_token = format!("@web:{clean_url}");
+                if !clean_user_text.contains(&web_token) && !clean_user_text.contains(clean_url) {
+                    badges.push(PromptBadge {
+                        kind: "web".into(),
+                        label: display_label,
+                        path: Some(clean_url.to_string()),
+                    });
+                }
+                context_blocks.push(format!(
+                    "<WEB_REF url=\"{}\">\nUser-referenced external HTTPS URL (reference context only; not fetched by Orbit daemon): {}\n</WEB_REF>",
+                    escape_xml_attr(clean_url),
+                    neutralize_close_tag(clean_url, "</web_ref"),
+                ));
+            }
         }
     }
 
@@ -1560,8 +1820,89 @@ pub fn rank_mention_candidates_with_peers_and_rules(
     limit: usize,
 ) -> Vec<MentionCandidateView> {
     let max_items = if limit == 0 { 40 } else { limit.min(200) };
-    let q = query.trim().to_ascii_lowercase();
+    let raw_trimmed_query = query.trim();
+    let q = raw_trimmed_query.to_ascii_lowercase();
     let mut out: Vec<MentionCandidateView> = Vec::new();
+
+    // Explicit `@folder:<subquery>` directory picker mode
+    if let Some(folder_q) = q.strip_prefix("folder:") {
+        let mut dir_counts: HashMap<String, usize> = HashMap::new();
+        for raw_path in workspace_files
+            .iter()
+            .chain(git_files.iter().map(|(p, _)| p))
+        {
+            let clean = raw_path.trim().replace('\\', "/");
+            let mut cursor = clean.as_str();
+            while let Some((parent, _)) = cursor.rsplit_once('/') {
+                if parent.is_empty() {
+                    break;
+                }
+                *dir_counts.entry(parent.to_string()).or_insert(0) += 1;
+                cursor = parent;
+            }
+        }
+        let fq = folder_q.trim().trim_end_matches('/');
+        let mut dir_candidates: Vec<MentionCandidateView> = Vec::new();
+        for (dir, count) in dir_counts {
+            let dir_lower = dir.to_ascii_lowercase();
+            let base_lower = dir_lower.rsplit('/').next().unwrap_or(dir_lower.as_str());
+            let depth_penalty = (dir.matches('/').count() as i32) * 3;
+            let base_score = if fq.is_empty() {
+                100 - depth_penalty
+            } else {
+                let s = score_file_match(&dir_lower, base_lower, fq);
+                if s < 0 { -1 } else { s + 900 - depth_penalty }
+            };
+            if base_score < 0 {
+                continue;
+            }
+            let file_label = if count == 1 {
+                "1 file".to_string()
+            } else {
+                format!("{count} files")
+            };
+            dir_candidates.push(MentionCandidateView {
+                key: format!("folder::{dir}"),
+                kind: "folder".into(),
+                token_label: format!("@folder:{dir}"),
+                title: format!("{dir}/"),
+                subtitle: file_label,
+                file_path: dir,
+                git_status: String::new(),
+                score: base_score,
+            });
+        }
+        dir_candidates.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| a.file_path.cmp(&b.file_path))
+        });
+        dir_candidates.truncate(max_items);
+        return dir_candidates;
+    }
+
+    // Explicit `@web:https://...` or `@https://...` external HTTPS URL reference chip (zero SSRF)
+    let raw_web_candidate = raw_trimmed_query
+        .strip_prefix("web:")
+        .or_else(|| raw_trimmed_query.strip_prefix("WEB:"))
+        .map(str::trim)
+        .unwrap_or(raw_trimmed_query);
+    if is_valid_https_reference_url(raw_web_candidate) {
+        let clean_url = raw_web_candidate.to_string();
+        let short_label = short_web_url_label(&clean_url);
+        out.push(MentionCandidateView {
+            key: format!("web::{clean_url}"),
+            kind: "web".into(),
+            token_label: format!("@web:{clean_url}"),
+            title: short_label,
+            subtitle: clean_url.clone(),
+            file_path: clean_url,
+            git_status: "HTTPS".into(),
+            score: 1080,
+        });
+        out.truncate(max_items);
+        return out;
+    }
 
     if !path_rules.is_empty() {
         let rule_query = q.strip_prefix("rule:");
@@ -1702,11 +2043,37 @@ pub fn rank_mention_candidates_with_peers_and_rules(
             "Active Terminal Output",
             960i32,
         ),
+        (
+            "builtin_folder",
+            "folder_hint",
+            "@folder:",
+            "Workspace Folder Tree",
+            956i32,
+        ),
+        (
+            "builtin_pr",
+            "pr",
+            "@pr",
+            "Active GitHub Pull Request",
+            954i32,
+        ),
+        (
+            "builtin_web",
+            "web_hint",
+            "@web:https://",
+            "Reference an https:// URL",
+            952i32,
+        ),
     ] {
-        let token_slug = token.trim_start_matches('@');
+        let token_slug = token.trim_start_matches('@').trim_end_matches(':');
         let matched_score = if q.is_empty() {
             base_order
-        } else if token_slug.starts_with(&q) {
+        } else if token_slug.starts_with(&q)
+            || (kind == "web_hint"
+                && ("web".starts_with(&q) || "https".starts_with(&q) || q.starts_with("web:")))
+            || (kind == "folder_hint" && ("folder".starts_with(&q) || "dir".starts_with(&q)))
+            || (kind == "pr" && ("pr".starts_with(&q) || "pull".starts_with(&q)))
+        {
             base_order + 20
         } else if token_slug.contains(&q) || subtitle.to_ascii_lowercase().contains(&q) {
             base_order - 20
@@ -1714,11 +2081,16 @@ pub fn rank_mention_candidates_with_peers_and_rules(
             -1
         };
         if matched_score >= 0 {
+            let display_title = match kind {
+                "folder_hint" => "@folder",
+                "web_hint" => "@web",
+                _ => token,
+            };
             out.push(MentionCandidateView {
                 key: key.into(),
                 kind: kind.into(),
                 token_label: token.into(),
-                title: token.into(),
+                title: display_title.into(),
                 subtitle: subtitle.into(),
                 file_path: String::new(),
                 git_status: String::new(),
@@ -2347,5 +2719,155 @@ mod tests {
                 .iter()
                 .any(|b| b.kind == "symbol" && b.label == "@run")
         );
+    }
+
+    #[test]
+    fn compose_prompt_renders_dom_element_chip_and_block() {
+        let mut attrs = std::collections::BTreeMap::new();
+        attrs.insert("id".into(), "checkout-btn".into());
+        attrs.insert("data-testid".into(), "checkout".into());
+        let composed = compose_prompt(
+            &ComposePromptRequest {
+                provider: ProviderKind::ClaudeCode,
+                raw_text: "Make this button disabled while submitting.".into(),
+                explicit_directive: None,
+                host_id: None,
+                cwd: None,
+                contexts: vec![ComposerContextInput::DomElement {
+                    selector: "button#checkout-btn".into(),
+                    tag: "button".into(),
+                    text_preview: "Pay now".into(),
+                    attributes: attrs,
+                    computed_box: Some(orbit_protocol::PickedElementBox {
+                        x: 24.0,
+                        y: 80.0,
+                        width: 140.0,
+                        height: 36.0,
+                    }),
+                    outer_html_excerpt: "<button id=\"checkout-btn\">Pay now</button>".into(),
+                    page_url: "http://localhost:5173/cart".into(),
+                }],
+                quotes: Vec::new(),
+                pastes: Vec::new(),
+            },
+            None,
+            None,
+        );
+
+        assert!(composed.badges.iter().any(|b| {
+            b.kind == "element"
+                && b.label == "@element button#checkout-btn"
+                && b.path.as_deref() == Some("http://localhost:5173/cart")
+        }));
+        assert!(composed.wire_prompt.contains(
+            "<DOM_ELEMENT selector=\"button#checkout-btn\" tag=\"button\" page_url=\"http://localhost:5173/cart\" box=\"24,80 140x36\">"
+        ));
+        assert!(composed.wire_prompt.contains("Text: Pay now"));
+        assert!(
+            composed
+                .wire_prompt
+                .contains("<button id=\"checkout-btn\">Pay now</button>")
+        );
+    }
+
+    #[test]
+    fn rank_mention_candidates_supports_folder_pr_and_https_web_mentions() {
+        let files = vec![
+            "apps/desktop/src/components/composer/omni-composer.tsx".into(),
+            "apps/desktop/src/components/markdown-blocks.tsx".into(),
+            "crates/orbit-daemon/src/skills_manager.rs".into(),
+        ];
+
+        // 1. `@folder:` lists workspace directories with file counts
+        let folders = rank_mention_candidates("folder:apps", &files, &[], 10);
+        assert!(!folders.is_empty());
+        assert!(folders.iter().all(|c| c.kind == "folder"));
+        assert!(
+            folders
+                .iter()
+                .any(|c| c.file_path == "apps/desktop/src/components" && c.subtitle == "2 files")
+        );
+
+        // 2. `@pr` matches the active GitHub PR candidate
+        let pr_hits = rank_mention_candidates("pr", &files, &[], 10);
+        assert!(
+            pr_hits
+                .iter()
+                .any(|c| c.kind == "pr" && c.token_label == "@pr")
+        );
+
+        // 3. `@web:https://...` validates explicit HTTPS URL and rejects plain HTTP / SSRF schemes
+        let web_hits = rank_mention_candidates("web:https://docs.rs/tokio/latest", &files, &[], 10);
+        assert_eq!(web_hits.len(), 1);
+        assert_eq!(web_hits[0].kind, "web");
+        assert_eq!(web_hits[0].file_path, "https://docs.rs/tokio/latest");
+
+        assert!(is_valid_https_reference_url(
+            "https://github.com/org/repo/pull/42"
+        ));
+        assert!(!is_valid_https_reference_url(
+            "http://169.254.169.254/latest/meta-data"
+        ));
+        assert!(!is_valid_https_reference_url("file:///etc/passwd"));
+        assert!(!is_valid_https_reference_url(
+            "https://user:pass@example.com"
+        ));
+    }
+
+    #[test]
+    fn compose_prompt_renders_folder_pr_and_web_context_blocks_safely() {
+        let composed = compose_prompt(
+            &ComposePromptRequest {
+                provider: ProviderKind::ClaudeCode,
+                raw_text: "Audit @folder:crates/orbit-daemon alongside @pr#61 and @web:https://docs.rs/tokio".into(),
+                explicit_directive: None,
+                host_id: Some("h1".into()),
+                cwd: Some("/repo".into()),
+                contexts: vec![
+                    ComposerContextInput::WorkspaceFolder {
+                        path: "crates/orbit-daemon".into(),
+                        file_count: 14,
+                        tree_summary: Some("- src/lib.rs\n- src/skills_manager.rs".into()),
+                    },
+                    ComposerContextInput::PullRequest {
+                        number: 61,
+                        title: "Release v0.10.3".into(),
+                        url: Some("https://github.com/org/orbit/pull/61".into()),
+                        state: Some("OPEN".into()),
+                        head_ref: Some("feat/b3".into()),
+                        base_ref: Some("main".into()),
+                        summary: Some("Checks: 4 passing, 0 failing".into()),
+                    },
+                    ComposerContextInput::WebUrl {
+                        url: "https://docs.rs/tokio".into(),
+                        label: Some("docs.rs/tokio".into()),
+                    },
+                    ComposerContextInput::WebUrl {
+                        url: "http://127.0.0.1:8080/internal".into(),
+                        label: None,
+                    },
+                ],
+                quotes: Vec::new(),
+                pastes: Vec::new(),
+            },
+            None,
+            None,
+        );
+
+        assert!(
+            composed
+                .wire_prompt
+                .contains("<FOLDER_REF path=\"crates/orbit-daemon\" files=\"14\">")
+        );
+        assert!(composed.wire_prompt.contains("src/skills_manager.rs"));
+        assert!(composed.wire_prompt.contains("<PR_REF number=\"61\" title=\"Release v0.10.3\" state=\"OPEN\" head=\"feat/b3\" base=\"main\""));
+        assert!(
+            composed
+                .wire_prompt
+                .contains("<WEB_REF url=\"https://docs.rs/tokio\">")
+        );
+        assert!(!composed.wire_prompt.contains("127.0.0.1:8080"));
+        // All three were explicitly inline-mentioned so no duplicate badges are emitted
+        assert!(composed.badges.is_empty());
     }
 }

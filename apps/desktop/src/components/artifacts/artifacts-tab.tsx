@@ -1076,6 +1076,8 @@ export const ArtifactsTab = memo(function ArtifactsTab({ tab }: { tab: SidePanel
             html={currentDetail.content}
             isMcpApp={currentDetail.summary.kind === "mcp_app"}
             resourceUri={currentDetail.summary.resource_uri}
+            hostId={hostId}
+            mcpServerName={currentDetail.summary.mcp_server_name ?? null}
           />
         ) : currentDetail.summary.kind === "svg" ? (
           <SafeSvgPreview

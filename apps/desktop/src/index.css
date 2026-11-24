@@ -903,6 +903,60 @@ html:not(.orbit-mac).dark .orbit-native-scroll {
   animation: orbit-toast-out 160ms var(--ease-exit) forwards;
 }
 
+/* Floating Stage Find Bar (`⌘F` capsule) entrance & crisp exit */
+@keyframes orbit-find-bar-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, -6px, 0) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes orbit-find-bar-out {
+  from {
+    opacity: 1;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translate3d(0, -4px, 0) scale(0.985);
+  }
+}
+
+.orbit-find-bar-enter {
+  transform-origin: top right;
+  animation: orbit-find-bar-in var(--dur-overlay) var(--ease-out-expo);
+}
+
+.orbit-find-bar-exit {
+  transform-origin: top right;
+  animation: orbit-find-bar-out var(--dur-exit) var(--ease-exit) forwards;
+}
+
+/* Zero-DOM-mutation CSS Custom Highlight API styling for in-session `⌘F` matches */
+::highlight(orbit-find-match) {
+  background-color: oklch(0.84 0.14 85 / 38%);
+  color: inherit;
+}
+
+.dark ::highlight(orbit-find-match) {
+  background-color: oklch(0.76 0.14 82 / 28%);
+  color: inherit;
+}
+
+::highlight(orbit-find-active) {
+  background-color: oklch(0.76 0.17 72 / 78%);
+  color: oklch(0.16 0.01 258);
+}
+
+.dark ::highlight(orbit-find-active) {
+  background-color: oklch(0.78 0.16 76 / 82%);
+  color: oklch(0.14 0.01 258);
+}
+
 /* Subtle Tactile Press Compression (layered so Tailwind utilities always win) */
 @layer components {
   .orbit-press {

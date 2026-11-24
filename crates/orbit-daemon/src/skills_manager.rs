@@ -13,6 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::UNIX_EPOCH;
 
+pub use orbit_protocol::expand_command_arguments;
 use orbit_protocol::{ManagedSkillRecord, SkillSource, SkillWriteScope};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -106,6 +107,7 @@ pub struct UpsertSkillParams {
 pub struct ParsedSkillFrontmatter {
     pub name: Option<String>,
     pub description: Option<String>,
+    pub argument_hint: Option<String>,
     pub triggers: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub has_frontmatter: bool,
@@ -181,7 +183,7 @@ fn slugify_label(raw: &str) -> String {
 }
 
 fn title_case_slug(slug: &str) -> String {
-    slug.split(['-', '_'])
+    slug.split(['-', '_', ':'])
         .filter(|s| !s.is_empty())
         .map(|part| {
             let mut chars = part.chars();
@@ -200,6 +202,10 @@ fn title_case_slug(slug: &str) -> String {
 
 fn skill_id_for(source: SkillSource, slug: &str) -> String {
     format!("{}:{slug}", source.as_str())
+}
+
+fn command_id_for(source: SkillSource, slug: &str) -> String {
+    format!("{}:cmd:{slug}", source.as_str())
 }
 
 fn source_priority(source: SkillSource) -> u8 {
@@ -321,7 +327,7 @@ pub fn parse_skill_frontmatter(content: &str) -> (ParsedSkillFrontmatter, &str) 
         let val = raw_val.trim();
 
         match key.as_str() {
-            "name" | "description" => {
+            "name" | "description" | "argument-hint" | "argument_hint" => {
                 let value = if matches!(val, ">" | ">-" | "|" | "|-") {
                     let is_folded = val.starts_with('>');
                     let mut block_lines = Vec::new();
@@ -357,8 +363,10 @@ pub fn parse_skill_frontmatter(content: &str) -> (ParsedSkillFrontmatter, &str) 
                 if !value.is_empty() {
                     if key == "name" {
                         parsed.name = Some(value);
-                    } else {
+                    } else if key == "description" {
                         parsed.description = Some(value);
+                    } else {
+                        parsed.argument_hint = Some(value);
                     }
                 }
             }
@@ -685,6 +693,7 @@ struct SkillRecordInput<'a> {
     has_scripts: bool,
     has_references: bool,
     updated_at_ms: u64,
+    is_command: bool,
 }
 
 fn build_record_from_content(
@@ -698,7 +707,11 @@ fn build_record_from_content(
         .or(fallback_heading)
         .unwrap_or_else(|| title_case_slug(input.slug));
     let description = fm.description.unwrap_or(fallback_desc);
-    let id = skill_id_for(input.source, input.slug);
+    let id = if input.is_command {
+        command_id_for(input.source, input.slug)
+    } else {
+        skill_id_for(input.source, input.slug)
+    };
     let enabled = state.enabled_overrides.get(&id).copied().unwrap_or(true);
 
     ManagedSkillRecord {
@@ -709,13 +722,164 @@ fn build_record_from_content(
         source: input.source,
         path: input.path,
         enabled,
-        editable: input.source.is_editable(),
+        editable: !input.is_command && input.source.is_editable(),
         triggers: fm.triggers,
         allowed_tools: fm.allowed_tools,
         has_scripts: input.has_scripts,
         has_references: input.has_references,
         approx_tokens: approx_tokens_for(input.content),
         updated_at_ms: input.updated_at_ms,
+        argument_hint: fm.argument_hint,
+        is_command: input.is_command,
+    }
+}
+
+const MAX_COMMAND_NAMESPACE_DEPTH: usize = 6;
+const MAX_DISCOVERED_COMMANDS: usize = 256;
+
+fn command_root_specs(user_home: &Path, cwd: Option<&Path>) -> Vec<DiscoveryRootSpec> {
+    let mut specs = Vec::new();
+    if let Some(project_root) = cwd {
+        specs.push(DiscoveryRootSpec {
+            source: SkillSource::ClaudeProject,
+            boundary: project_root.to_path_buf(),
+            segments: &[".claude", "commands"],
+        });
+    }
+    specs.push(DiscoveryRootSpec {
+        source: SkillSource::ClaudeUser,
+        boundary: user_home.to_path_buf(),
+        segments: &[".claude", "commands"],
+    });
+    specs
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_claude_commands_recursive(
+    source: SkillSource,
+    canonical_root: &Path,
+    current_dir: &Path,
+    namespace_parts: &mut Vec<String>,
+    depth: usize,
+    state: &SkillsStateFile,
+    seen_canonical_paths: &mut HashSet<PathBuf>,
+    seen_command_slugs: &mut HashSet<String>,
+    records: &mut Vec<ManagedSkillRecord>,
+    discovered_count: &mut usize,
+) {
+    if depth > MAX_COMMAND_NAMESPACE_DEPTH || *discovered_count >= MAX_DISCOVERED_COMMANDS {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(current_dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|entry| entry.path()))
+        .collect();
+    paths.sort();
+
+    for entry_path in paths {
+        if *discovered_count >= MAX_DISCOVERED_COMMANDS {
+            break;
+        }
+        let Ok(meta) = fs::symlink_metadata(&entry_path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let Some(file_name) = entry_path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if file_name.starts_with('.') {
+            continue;
+        }
+
+        if meta.is_dir() {
+            let Ok(seg) = validate_skill_slug(&file_name.to_ascii_lowercase()) else {
+                continue;
+            };
+            let Ok(canonical_dir) = crate::platform::canonicalize_clean(&entry_path) else {
+                continue;
+            };
+            if !canonical_dir.starts_with(canonical_root) {
+                continue;
+            }
+            namespace_parts.push(seg);
+            collect_claude_commands_recursive(
+                source,
+                canonical_root,
+                &canonical_dir,
+                namespace_parts,
+                depth + 1,
+                state,
+                seen_canonical_paths,
+                seen_command_slugs,
+                records,
+                discovered_count,
+            );
+            namespace_parts.pop();
+            continue;
+        }
+
+        if !meta.is_file() {
+            continue;
+        }
+        let is_md = entry_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+        if !is_md {
+            continue;
+        }
+        let Some(stem) = entry_path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(stem_slug) = validate_skill_slug(&stem.to_ascii_lowercase()) else {
+            continue;
+        };
+        let slug = if namespace_parts.is_empty() {
+            stem_slug
+        } else {
+            format!("{}:{stem_slug}", namespace_parts.join(":"))
+        };
+        if slug.len() > 64 {
+            continue;
+        }
+
+        let Ok(canonical_md) = crate::platform::canonicalize_clean(&entry_path) else {
+            continue;
+        };
+        if !canonical_md.starts_with(canonical_root) {
+            continue;
+        }
+        if !seen_canonical_paths.insert(canonical_md.clone()) {
+            continue;
+        }
+        if !seen_command_slugs.insert(slug.clone()) {
+            continue;
+        }
+        if meta.len() > MAX_SKILL_CONTENT_BYTES as u64 {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&canonical_md) else {
+            continue;
+        };
+
+        *discovered_count += 1;
+        records.push(build_record_from_content(
+            SkillRecordInput {
+                source,
+                slug: &slug,
+                path: canonical_md.to_string_lossy().to_string(),
+                content: &content,
+                has_scripts: false,
+                has_references: false,
+                updated_at_ms: mtime_ms(&canonical_md),
+                is_command: true,
+            },
+            state,
+        ));
     }
 }
 
@@ -830,10 +994,38 @@ pub fn list_managed_skills(
                     has_scripts,
                     has_references,
                     updated_at_ms,
+                    is_command: false,
                 },
                 &state,
             ));
         }
+    }
+
+    // Discover project `.claude/commands/**/*.md` and user `~/.claude/commands/**/*.md` custom slash commands
+    let mut seen_command_slugs: HashSet<String> = HashSet::new();
+    let mut discovered_commands = 0usize;
+    for spec in command_root_specs(user_home, resolved_cwd.as_deref()) {
+        let Ok(canonical_boundary) = crate::platform::canonicalize_clean(&spec.boundary) else {
+            continue;
+        };
+        let Ok(canonical_root) =
+            walk_contained_dir_segments(&canonical_boundary, spec.segments, false)
+        else {
+            continue;
+        };
+        let mut ns = Vec::new();
+        collect_claude_commands_recursive(
+            spec.source,
+            &canonical_root,
+            &canonical_root,
+            &mut ns,
+            0,
+            &state,
+            &mut seen_canonical_paths,
+            &mut seen_command_slugs,
+            &mut records,
+            &mut discovered_commands,
+        );
     }
 
     // Append bundled built-in Orbit orchestration skills unless shadowed by a higher-priority source
@@ -850,6 +1042,7 @@ pub fn list_managed_skills(
                 has_scripts: false,
                 has_references: false,
                 updated_at_ms: 0,
+                is_command: false,
             },
             &state,
         ));
@@ -858,6 +1051,7 @@ pub fn list_managed_skills(
     records.sort_by(|a, b| {
         source_priority(a.source)
             .cmp(&source_priority(b.source))
+            .then_with(|| a.is_command.cmp(&b.is_command))
             .then_with(|| a.slug.cmp(&b.slug))
     });
 
@@ -2173,5 +2367,113 @@ Run static checks first.
                 .expect("skill present");
             assert!(!rec.enabled, "skill-{idx} override lost under concurrency");
         }
+    }
+
+    #[test]
+    fn discovers_claude_commands_with_nested_namespaces_frontmatter_and_arguments() {
+        let sb = TempSandbox::new("claude-commands");
+        let cwd_str = sb.workspace.to_string_lossy().to_string();
+
+        // Project nested command `.claude/commands/ops/deploy.md`
+        let proj_ops = sb.workspace.join(".claude").join("commands").join("ops");
+        fs::create_dir_all(&proj_ops).expect("mkdir project ops");
+        fs::write(
+            proj_ops.join("deploy.md"),
+            "---\ndescription: \"Deploy service to target environment\"\nargument-hint: \"[env] [tag]\"\n---\nDeploy target `$ARGUMENTS` and verify health checks for `$ARGUMENTS`.\n",
+        )
+        .expect("write project deploy command");
+
+        // Project root command overriding user command with same slug
+        fs::write(
+            sb.workspace.join(".claude").join("commands").join("release.md"),
+            "---\ndescription: Project release checklist\n---\nCut project release for $ARGUMENTS.\n",
+        )
+        .expect("write project release");
+
+        // User commands `~/.claude/commands/release.md` (shadowed) and `~/.claude/commands/review-pr.md`
+        let user_cmds = sb.user_home.join(".claude").join("commands");
+        fs::create_dir_all(&user_cmds).expect("mkdir user cmds");
+        fs::write(
+            user_cmds.join("release.md"),
+            "---\ndescription: User release fallback\n---\nUser fallback.\n",
+        )
+        .expect("write user release");
+        fs::write(
+            user_cmds.join("review-pr.md"),
+            "# Review Pull Request\nInspect PR diff and summarize risks.\n",
+        )
+        .expect("write user review-pr");
+
+        let skills = list_managed_skills(&sb.orbit_home, &sb.user_home, Some(&cwd_str));
+
+        let deploy = skills
+            .iter()
+            .find(|s| s.is_command && s.slug == "ops:deploy")
+            .expect("nested ops:deploy command discovered");
+        assert_eq!(deploy.source, SkillSource::ClaudeProject);
+        assert_eq!(deploy.id, "claude_project:cmd:ops:deploy");
+        assert_eq!(deploy.description, "Deploy service to target environment");
+        assert_eq!(deploy.argument_hint.as_deref(), Some("[env] [tag]"));
+        assert!(!deploy.editable);
+
+        let release_matches: Vec<_> = skills
+            .iter()
+            .filter(|s| s.is_command && s.slug == "release")
+            .collect();
+        assert_eq!(release_matches.len(), 1, "project command overrides user");
+        assert_eq!(release_matches[0].source, SkillSource::ClaudeProject);
+        assert_eq!(release_matches[0].description, "Project release checklist");
+
+        let review_pr = skills
+            .iter()
+            .find(|s| s.is_command && s.slug == "review-pr")
+            .expect("user review-pr command discovered");
+        assert_eq!(review_pr.source, SkillSource::ClaudeUser);
+        assert_eq!(review_pr.name, "Review Pull Request");
+        assert_eq!(
+            review_pr.description,
+            "Inspect PR diff and summarize risks."
+        );
+
+        // `read_managed_skill` reads the command markdown cleanly and `expand_command_arguments` substitutes `$ARGUMENTS`
+        let read = read_managed_skill(&sb.orbit_home, &sb.user_home, &deploy.id, Some(&cwd_str))
+            .expect("read deploy command");
+        assert_eq!(
+            expand_command_arguments(&read.content, "staging v1.2.0"),
+            "Deploy target `staging v1.2.0` and verify health checks for `staging v1.2.0`."
+        );
+        assert_eq!(
+            expand_command_arguments(&read.content, ""),
+            "Deploy target `` and verify health checks for ``."
+        );
+
+        let read_review =
+            read_managed_skill(&sb.orbit_home, &sb.user_home, &review_pr.id, Some(&cwd_str))
+                .expect("read review-pr");
+        assert_eq!(
+            expand_command_arguments(&read_review.content, "#61 focus on security"),
+            "# Review Pull Request\nInspect PR diff and summarize risks.\n\n#61 focus on security"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_commands_discovery_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+        let sb = TempSandbox::new("claude-commands-sym");
+        let cwd_str = sb.workspace.to_string_lossy().to_string();
+
+        let outside = sb.root.join("secret.md");
+        fs::write(&outside, "---\ndescription: Secret\n---\nSecret body").expect("write outside");
+
+        let proj_cmds = sb.workspace.join(".claude").join("commands");
+        fs::create_dir_all(&proj_cmds).expect("mkdir cmds");
+        symlink(&outside, proj_cmds.join("leak.md")).expect("symlink leak");
+
+        let skills = list_managed_skills(&sb.orbit_home, &sb.user_home, Some(&cwd_str));
+        assert!(
+            !skills.iter().any(|s| s.slug == "leak"),
+            "symlinked command file must be rejected"
+        );
     }
 }

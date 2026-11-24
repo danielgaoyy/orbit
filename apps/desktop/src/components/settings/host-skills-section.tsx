@@ -868,7 +868,13 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
                         </span>
                         <code className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 font-mono text-[11px]">
                           /{skill.slug}
+                          {skill.argument_hint ? ` ${skill.argument_hint}` : ""}
                         </code>
+                        {skill.is_command && (
+                          <span className="border-border bg-muted/70 text-foreground/80 rounded border px-1.5 py-0.5 text-[10.5px] font-medium">
+                            Command
+                          </span>
+                        )}
                         <span
                           className={cn(
                             "rounded border px-1.5 py-0.5 text-[10.5px] font-medium",

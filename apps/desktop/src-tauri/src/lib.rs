@@ -54,11 +54,11 @@ use orbit_client_core::contract::{
     InstructionFilesSnapshotView, ListInstructionFilesRequest, MatchPathRulesRequest,
     MatchedPathRulesView, MentionRankRequest, ModelSelectionRequest, PathRulesSnapshotView,
     PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RenameWorkspaceEntryRequest,
-    RenderDiagramRequest, RenderDiagramView, SaveInstructionFileRequest,
-    SearchWorkspaceSymbolsRequest, SpawnWorkspacePeerRequest, UpsertArtifactRequest,
-    UpsertEventTriggerRequest, UpsertExternalMcpServerRequest, UpsertPathRuleRequest,
-    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WorkspaceSymbolsView,
-    WriteWorkspaceFileRequest,
+    RenderDiagramRequest, RenderDiagramView, SaveInstructionFileRequest, SearchMessagesRequest,
+    SearchMessagesResponse, SearchWorkspaceSymbolsRequest, SpawnWorkspacePeerRequest,
+    UpsertArtifactRequest, UpsertEventTriggerRequest, UpsertExternalMcpServerRequest,
+    UpsertPathRuleRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
+    WorkspaceSymbolsView, WriteWorkspaceFileRequest,
 };
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, LocalMachineInfo, SshHostItem, StagedAttachmentInfo,
@@ -78,14 +78,18 @@ use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnVie
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
     ArtifactDetail, ArtifactSummary, ConditionalTimerRecord, ContextOccupancyBreakdown,
-    EventTriggerDelivery, ExternalMcpServerRecord, GitCommitResult, GitCreatePrResult,
-    GitMutationOutcome, GitPushResult, GuardianPolicyConfig, HookExecutionRecord, HookScope,
-    LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
-    ManagedSkillRecord, McpProbeResult, OrchestrationConfig, PromptBadge, ProviderKind,
-    ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
-    ScheduleTarget, SessionMode, SkillWriteScope, TimerCondition, UsageInsightsSnapshot,
-    WorkspaceBoardSnapshot, WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode,
-    WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    EventTriggerDelivery, ExternalMcpServerRecord, GitCommitResult, GitConflictListResult,
+    GitConflictResolution, GitCreatePrResult, GitGeneratedCommitMessage, GitMutationOutcome,
+    GitPrStatus, GitPushResult, GitRebaseActionResult, GitRebaseStatus, GitResolveConflictResult,
+    GitStashListResult, GitStashMutationResult, GuardianPolicyConfig, HookExecutionRecord,
+    HookScope, LifecycleHookRule, LspCodeAction, LspCompletionItem, LspDiagnostic, LspHoverInfo,
+    LspLocation, LspReferenceLocation, LspServerStatus, LspSymbolInfo, LspWorkspaceEdit,
+    LspWorkspaceEditResult, ManagedSkillRecord, McpProbeResult, McpResourceContent,
+    McpToolCallOutcome, OrchestrationConfig, PermissionRuleRecord, PromptBadge, ProviderKind,
+    ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ResolvePermissionsBatchResult,
+    ScheduleRunRecord, ScheduleTarget, SessionMode, SkillWriteScope, TimerCondition,
+    UpsertPermissionRuleInput, UsageInsightsSnapshot, WorkspaceBoardSnapshot, WorkspaceEventRecord,
+    WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 use orbit_providers::{
     ProviderReadinessInfo, SideQuestionSpec,
@@ -286,6 +290,25 @@ async fn search_messages(
     tauri::async_runtime::spawn_blocking(move || core.search_messages(&query, max_hits))
         .await
         .map_err(|e| format!("search messages task error: {e}"))
+}
+
+#[tauri::command]
+async fn search_messages_remote(
+    state: State<'_, DesktopAppState>,
+    query: String,
+    host_id: Option<String>,
+    agent_id: Option<String>,
+    limit: Option<u32>,
+) -> Result<SearchMessagesResponse, String> {
+    let core = Arc::clone(&state.core);
+    Ok(core
+        .search_messages_remote(SearchMessagesRequest {
+            query,
+            host_id,
+            agent_id,
+            limit,
+        })
+        .await)
 }
 
 #[tauri::command]
@@ -1410,6 +1433,41 @@ async fn delete_artifact(
 }
 
 #[tauri::command]
+async fn read_mcp_resource(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    artifact_id: String,
+    artifact_version: Option<u32>,
+    uri: String,
+) -> Result<McpResourceContent, String> {
+    state
+        .core
+        .read_mcp_resource_async(&host_id, &artifact_id, artifact_version, &uri)
+        .await
+}
+
+#[tauri::command]
+async fn call_artifact_mcp_tool(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    artifact_id: String,
+    artifact_version: Option<u32>,
+    tool_name: String,
+    arguments: serde_json::Value,
+) -> Result<McpToolCallOutcome, String> {
+    state
+        .core
+        .call_artifact_mcp_tool_async(
+            &host_id,
+            &artifact_id,
+            artifact_version,
+            &tool_name,
+            arguments,
+        )
+        .await
+}
+
+#[tauri::command]
 fn list_acp_agents(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -1880,6 +1938,32 @@ fn resolve_permission(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn resolve_plan_approval(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    permission_request_id: String,
+    action: orbit_protocol::PlanApprovalAction,
+    edited_plan_markdown: Option<String>,
+    feedback: Option<String>,
+    target_mode: Option<SessionMode>,
+) -> Result<(), String> {
+    state
+        .core
+        .resolve_plan_approval_on_host(
+            &host_id,
+            &agent_id,
+            &permission_request_id,
+            action,
+            edited_plan_markdown,
+            feedback,
+            target_mode,
+        )
+        .await
+}
+
+#[tauri::command]
 fn answer_question(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -2029,6 +2113,180 @@ async fn git_create_pr(
             base,
             draft.unwrap_or(false),
         )
+        .await
+}
+
+#[tauri::command]
+async fn git_stash_list(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<GitStashListResult, String> {
+    state.core.git_stash_list_on_host(&host_id, &cwd).await
+}
+
+#[tauri::command]
+async fn git_stash_push(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    message: Option<String>,
+    include_untracked: Option<bool>,
+) -> Result<GitStashMutationResult, String> {
+    state
+        .core
+        .git_stash_push_on_host(&host_id, &cwd, message, include_untracked.unwrap_or(false))
+        .await
+}
+
+#[tauri::command]
+async fn git_stash_apply(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    stash_ref: String,
+    expected_oid: Option<String>,
+) -> Result<GitStashMutationResult, String> {
+    state
+        .core
+        .git_stash_apply_on_host(&host_id, &cwd, stash_ref, expected_oid)
+        .await
+}
+
+#[tauri::command]
+async fn git_stash_pop(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    stash_ref: String,
+    expected_oid: Option<String>,
+) -> Result<GitStashMutationResult, String> {
+    state
+        .core
+        .git_stash_pop_on_host(&host_id, &cwd, stash_ref, expected_oid)
+        .await
+}
+
+#[tauri::command]
+async fn git_stash_drop(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    stash_ref: String,
+    expected_oid: Option<String>,
+) -> Result<GitStashMutationResult, String> {
+    state
+        .core
+        .git_stash_drop_on_host(&host_id, &cwd, stash_ref, expected_oid)
+        .await
+}
+
+#[tauri::command]
+async fn git_rebase_status(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<GitRebaseStatus, String> {
+    state.core.git_rebase_status_on_host(&host_id, &cwd).await
+}
+
+#[tauri::command]
+async fn git_rebase_start(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    onto_ref: String,
+) -> Result<GitRebaseActionResult, String> {
+    state
+        .core
+        .git_rebase_start_on_host(&host_id, &cwd, onto_ref)
+        .await
+}
+
+#[tauri::command]
+async fn git_rebase_continue(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<GitRebaseActionResult, String> {
+    state.core.git_rebase_continue_on_host(&host_id, &cwd).await
+}
+
+#[tauri::command]
+async fn git_rebase_abort(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<GitRebaseActionResult, String> {
+    state.core.git_rebase_abort_on_host(&host_id, &cwd).await
+}
+
+#[tauri::command]
+async fn git_rebase_skip(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    expected_step: Option<u32>,
+) -> Result<GitRebaseActionResult, String> {
+    state
+        .core
+        .git_rebase_skip_on_host(&host_id, &cwd, expected_step)
+        .await
+}
+
+#[tauri::command]
+async fn git_list_conflicts(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<GitConflictListResult, String> {
+    state.core.git_list_conflicts_on_host(&host_id, &cwd).await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn git_resolve_conflict(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    block_index: Option<u32>,
+    resolution: GitConflictResolution,
+    auto_stage: Option<bool>,
+    expected_sha256: Option<String>,
+) -> Result<GitResolveConflictResult, String> {
+    state
+        .core
+        .git_resolve_conflict_on_host(
+            &host_id,
+            &cwd,
+            path,
+            block_index,
+            resolution,
+            auto_stage.unwrap_or(true),
+            expected_sha256,
+        )
+        .await
+}
+
+#[tauri::command]
+async fn git_pr_status(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<GitPrStatus, String> {
+    state.core.git_pr_status_on_host(&host_id, &cwd).await
+}
+
+#[tauri::command]
+async fn git_generate_commit_message(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<GitGeneratedCommitMessage, String> {
+    state
+        .core
+        .git_generate_commit_message_on_host(&host_id, &cwd)
         .await
 }
 
@@ -2685,6 +2943,127 @@ async fn lsp_goto_definition(
 }
 
 #[tauri::command]
+async fn lsp_hover(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    line: u32,
+    col: u32,
+    content: Option<String>,
+) -> Result<Option<LspHoverInfo>, String> {
+    state
+        .core
+        .lsp_hover_on_host(&host_id, &cwd, &path, line, col, content)
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn lsp_references(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    line: u32,
+    col: u32,
+    include_declaration: Option<bool>,
+    content: Option<String>,
+) -> Result<Vec<LspReferenceLocation>, String> {
+    state
+        .core
+        .lsp_references_on_host(
+            &host_id,
+            &cwd,
+            &path,
+            line,
+            col,
+            include_declaration.unwrap_or(true),
+            content,
+        )
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn lsp_completion(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    line: u32,
+    col: u32,
+    trigger_character: Option<String>,
+    content: Option<String>,
+) -> Result<Vec<LspCompletionItem>, String> {
+    state
+        .core
+        .lsp_completion_on_host(&host_id, &cwd, &path, line, col, trigger_character, content)
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn lsp_code_action(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    line: u32,
+    col: u32,
+    end_line: u32,
+    end_col: u32,
+    diagnostics: Option<Vec<LspDiagnostic>>,
+    content: Option<String>,
+) -> Result<Vec<LspCodeAction>, String> {
+    state
+        .core
+        .lsp_code_action_on_host(
+            &host_id,
+            &cwd,
+            &path,
+            line,
+            col,
+            end_line,
+            end_col,
+            diagnostics.unwrap_or_default(),
+            content,
+        )
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn lsp_rename(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    line: u32,
+    col: u32,
+    new_name: String,
+    content: Option<String>,
+) -> Result<LspWorkspaceEditResult, String> {
+    state
+        .core
+        .lsp_rename_on_host(&host_id, &cwd, &path, line, col, &new_name, content)
+        .await
+}
+
+#[tauri::command]
+async fn lsp_apply_workspace_edit(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    edit: LspWorkspaceEdit,
+) -> Result<LspWorkspaceEditResult, String> {
+    state
+        .core
+        .lsp_apply_workspace_edit_on_host(&host_id, &cwd, edit)
+        .await
+}
+
+#[tauri::command]
 async fn restart_lsp_server(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -2843,6 +3222,55 @@ async fn update_guardian_config(
     state
         .core
         .update_guardian_config_on_host(&host_id, config)
+        .await
+}
+
+#[tauri::command]
+async fn list_permission_rules(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    project_cwd: Option<String>,
+) -> Result<Vec<PermissionRuleRecord>, String> {
+    state
+        .core
+        .list_permission_rules_on_host(&host_id, project_cwd)
+        .await
+}
+
+#[tauri::command]
+async fn upsert_permission_rule(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    rule: UpsertPermissionRuleInput,
+) -> Result<PermissionRuleRecord, String> {
+    state
+        .core
+        .upsert_permission_rule_on_host(&host_id, rule)
+        .await
+}
+
+#[tauri::command]
+async fn delete_permission_rule(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    rule_id: String,
+) -> Result<bool, String> {
+    state
+        .core
+        .delete_permission_rule_on_host(&host_id, rule_id)
+        .await
+}
+
+#[tauri::command]
+async fn resolve_permissions_batch(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    items: Vec<(String, String)>,
+    decision: String,
+) -> Result<ResolvePermissionsBatchResult, String> {
+    state
+        .core
+        .resolve_permissions_batch_on_host(&host_id, items, decision)
         .await
 }
 
@@ -3142,6 +3570,7 @@ async fn list_browser_sessions(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn create_browser_session(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -3150,6 +3579,7 @@ async fn create_browser_session(
     headless: Option<bool>,
     viewport_width: Option<u32>,
     viewport_height: Option<u32>,
+    workspace_root: Option<String>,
 ) -> Result<orbit_protocol::BrowserSessionSummary, String> {
     state
         .core
@@ -3160,6 +3590,7 @@ async fn create_browser_session(
             headless,
             viewport_width,
             viewport_height,
+            workspace_root,
         })
         .await
 }
@@ -3203,6 +3634,31 @@ async fn update_browser_policy(
         .core
         .update_browser_policy_on_host(&host_id, policy)
         .await
+}
+
+#[tauri::command]
+async fn open_remote_preview_tunnel(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    target_port: u16,
+    proxy_host: Option<String>,
+) -> Result<orbit_client_core::contract::RemotePreviewTunnelView, String> {
+    state
+        .core
+        .open_remote_preview_tunnel(&host_id, target_port, proxy_host)
+        .await
+}
+
+#[tauri::command]
+fn close_remote_preview_tunnel(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    target_port: u16,
+    proxy_host: Option<String>,
+) -> Result<bool, String> {
+    state
+        .core
+        .close_remote_preview_tunnel(&host_id, target_port, proxy_host)
 }
 
 #[tauri::command]
@@ -3991,8 +4447,13 @@ fn init_desktop_file_logging() {
         .map(|home| home.join(".orbit").join("logs").join("desktop.log"))
         .unwrap_or_else(|| PathBuf::from("orbit-desktop.log"));
 
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+    let mut env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    for directive in ["tungstenite=info", "tokio_tungstenite=info"] {
+        if let Ok(parsed) = directive.parse() {
+            env_filter = env_filter.add_directive(parsed);
+        }
+    }
 
     if let Ok(writer) = orbit_client_core::logging::RotatingLogWriter::open(
         log_path,
@@ -4064,6 +4525,7 @@ pub fn run() {
             get_bridge_info,
             get_fleet_overview,
             search_messages,
+            search_messages_remote,
             get_fleet_sidebar,
             get_host_detail,
             get_agent_stage,
@@ -4156,6 +4618,8 @@ pub fn run() {
             get_artifact,
             upsert_artifact,
             delete_artifact,
+            read_mcp_resource,
+            call_artifact_mcp_tool,
             list_acp_agents,
             refresh_acp_agents,
             upsert_custom_acp_agent,
@@ -4198,6 +4662,7 @@ pub fn run() {
             preview_worktree_handoff,
             execute_worktree_handoff,
             resolve_permission,
+            resolve_plan_approval,
             answer_question,
             fetch_git_status,
             fetch_git_diff,
@@ -4208,6 +4673,20 @@ pub fn run() {
             git_commit,
             git_push,
             git_create_pr,
+            git_stash_list,
+            git_stash_push,
+            git_stash_apply,
+            git_stash_pop,
+            git_stash_drop,
+            git_rebase_status,
+            git_rebase_start,
+            git_rebase_continue,
+            git_rebase_abort,
+            git_rebase_skip,
+            git_list_conflicts,
+            git_resolve_conflict,
+            git_pr_status,
+            git_generate_commit_message,
             start_terminal,
             attach_terminal,
             kill_terminal,
@@ -4243,6 +4722,12 @@ pub fn run() {
             lsp_query_symbols,
             lsp_get_diagnostics,
             lsp_goto_definition,
+            lsp_hover,
+            lsp_references,
+            lsp_completion,
+            lsp_code_action,
+            lsp_rename,
+            lsp_apply_workspace_edit,
             restart_lsp_server,
             get_usage_insights,
             get_context_occupancy,
@@ -4257,6 +4742,10 @@ pub fn run() {
             fire_conditional_timer_now,
             get_guardian_config,
             update_guardian_config,
+            list_permission_rules,
+            upsert_permission_rule,
+            delete_permission_rule,
+            resolve_permissions_batch,
             list_im_channels,
             upsert_im_channel,
             delete_im_channel,
@@ -4291,6 +4780,8 @@ pub fn run() {
             execute_browser_action,
             close_browser_session,
             update_browser_policy,
+            open_remote_preview_tunnel,
+            close_remote_preview_tunnel,
             start_batch_fanout,
             start_dag_workflow,
             start_best_of_n,

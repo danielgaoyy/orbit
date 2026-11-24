@@ -74,6 +74,16 @@ function formatCompactScriptUrl(rawUrl: string): string {
   }
 }
 
+function extractProxyHostname(rawUrl: string | null | undefined): string | null {
+  if (!rawUrl) return null;
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase();
+    return host.endsWith(".localhost") ? host : null;
+  } catch {
+    return null;
+  }
+}
+
 export function useWorkspaceScripts(hostId: string | null) {
   const workspaceId = useOrbitSelector((s) => {
     if (!hostId) return null;
@@ -132,14 +142,22 @@ const WorkspaceScriptRow = memo(function WorkspaceScriptRow({
   compact = false,
 }: WorkspaceScriptRowProps) {
   const { t } = useI18n();
+  const isRemoteHost = useOrbitSelector((s) => {
+    const h = s.fleet.hosts.find((x) => x.host_id === hostId);
+    return Boolean(h && !h.is_local);
+  });
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [tunneledUrl, setTunneledUrl] = useState<string | null>(null);
   const copiedTimerRef = useRef<number | null>(null);
   const busyTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     // Clear transient busy spinner as soon as daemon reports updated status
     setBusy(false);
+    if (script.status !== "running") {
+      setTunneledUrl(null);
+    }
     if (busyTimerRef.current !== null) {
       window.clearTimeout(busyTimerRef.current);
       busyTimerRef.current = null;
@@ -155,7 +173,25 @@ const WorkspaceScriptRow = memo(function WorkspaceScriptRow({
 
   const isRunning = script.status === "running";
   const isFailed = script.status === "failed";
-  const url = resolveScriptUrl(script);
+  const rawUrl = resolveScriptUrl(script);
+  const url = isRemoteHost && tunneledUrl ? tunneledUrl : rawUrl;
+
+  const resolveEffectivePreviewUrl = async (): Promise<string | null> => {
+    if (!rawUrl) return null;
+    if (isRemoteHost && isRunning && script.port != null && script.port > 0) {
+      const tunnel = await orbitIpc.openRemotePreviewTunnel(
+        hostId,
+        script.port,
+        extractProxyHostname(script.proxy_url),
+      );
+      if (tunnel.is_tunneled && tunnel.local_url) {
+        setTunneledUrl(tunnel.local_url);
+        return tunnel.local_url;
+      }
+      return tunnel.local_url || rawUrl;
+    }
+    return rawUrl;
+  };
 
   const handleToggle = async () => {
     if (busy) return;
@@ -166,6 +202,16 @@ const WorkspaceScriptRow = memo(function WorkspaceScriptRow({
     try {
       if (isRunning) {
         await orbitIpc.stopWorkspaceScript(hostId, workspaceId, script.name);
+        if (isRemoteHost && script.port != null && script.port > 0) {
+          void orbitIpc
+            .closeRemotePreviewTunnel(
+              hostId,
+              script.port,
+              extractProxyHostname(script.proxy_url),
+            )
+            .catch(() => undefined);
+        }
+        setTunneledUrl(null);
       } else {
         await orbitIpc.startWorkspaceScript(hostId, workspaceId, script.name);
       }
@@ -178,25 +224,38 @@ const WorkspaceScriptRow = memo(function WorkspaceScriptRow({
   };
 
   const handleOpenUrl = () => {
-    if (!url) return;
-    void orbitIpc.openExternalBrowserUrl(url).catch(() => {
-      orbitActions.showToast(t("common.actionFailed"));
-    });
+    if (!rawUrl) return;
+    void (async () => {
+      try {
+        const targetUrl = await resolveEffectivePreviewUrl();
+        if (!targetUrl) return;
+        if (isRemoteHost && isRunning) {
+          orbitActions.openBrowserTab(rawUrl);
+        } else {
+          await orbitIpc.openExternalBrowserUrl(targetUrl);
+        }
+      } catch {
+        orbitActions.showToast(t("common.actionFailed"));
+      }
+    })();
   };
 
   const handleCopyUrl = () => {
-    if (!url) return;
-    void navigator.clipboard
-      .writeText(url)
-      .then(() => {
+    if (!rawUrl) return;
+    void (async () => {
+      try {
+        const targetUrl = (await resolveEffectivePreviewUrl()) ?? rawUrl;
+        await navigator.clipboard.writeText(targetUrl);
         setCopied(true);
         if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current);
         copiedTimerRef.current = window.setTimeout(() => setCopied(false), 1_500);
-        orbitActions.showToast(t("sidePanel.scriptCopiedUrl", { url: formatCompactScriptUrl(url) }));
-      })
-      .catch(() => {
+        orbitActions.showToast(
+          t("sidePanel.scriptCopiedUrl", { url: formatCompactScriptUrl(targetUrl) }),
+        );
+      } catch {
         orbitActions.showToast(t("common.actionFailed"));
-      });
+      }
+    })();
   };
 
   const statusLabel = isRunning

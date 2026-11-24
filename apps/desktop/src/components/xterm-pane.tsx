@@ -1,10 +1,29 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { type ILink, type ITheme, Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
-import { AlertCircle, ChevronDown, ChevronUp, Search, X } from "lucide-react";
+import {
+  AlertCircle,
+  Check,
+  ChevronDown,
+  ChevronUp,
+  Copy,
+  CornerUpLeft,
+  Search,
+  X,
+} from "lucide-react";
+import { SimpleTooltip } from "@/components/ui/overlays";
 import { useI18n } from "@/lib/i18n";
+import { modSymbol } from "@/lib/keybindings";
 import { isTauriRuntime, orbitIpc } from "@/lib/orbit-ipc";
+import {
+  type Osc133CommandBlock,
+  type Osc133Tracker,
+  createOsc133Tracker,
+  extractOsc133BlockOutput,
+  findAdjacentOsc133Block,
+  resolveTerminalPaneShortcut,
+} from "@/lib/xterm-osc133";
 import {
   type XtermSearchMatch,
   resolveXtermSearchShortcut,
@@ -16,7 +35,7 @@ import { createXtermWriteBatcher } from "@/lib/xterm-write-batcher";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
-import type { TerminalThemeMode } from "@/state/orbit-store";
+import type { TerminalSplitDirection, TerminalThemeMode } from "@/state/orbit-store";
 
 /**
  * Hand-tuned 16-color OKLCH-balanced ANSI palettes harmonized with Orbit's 258° cool-neutral shell.
@@ -116,17 +135,31 @@ export function XtermPane({
   terminalId,
   slot = 1,
   active,
+  focused,
   visible,
   detached = false,
+  paneTitle,
+  isSplit = false,
+  onPaneFocus,
+  onRequestSplit,
+  onRequestClosePane,
 }: {
   hostId: string;
   terminalId?: string | null;
   slot?: number;
   active: boolean;
+  focused?: boolean;
   visible: boolean;
   detached?: boolean;
+  paneTitle?: string;
+  isSplit?: boolean;
+  onPaneFocus?: () => void;
+  onRequestSplit?: (direction: TerminalSplitDirection) => void;
+  onRequestClosePane?: () => void;
 }) {
   const { t } = useI18n();
+  const mod = modSymbol();
+  const isFocusedPane = focused ?? active;
   const resolvedTheme = useOrbitSelector((s) => s.resolvedTheme);
   const terminalFontSize = useOrbitSelector((s) => s.terminalFontSize);
   const terminalCursorStyle = useOrbitSelector((s) => s.terminalCursorStyle);
@@ -137,6 +170,7 @@ export function XtermPane({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const osc133TrackerRef = useRef<Osc133Tracker | null>(null);
   const lastSizeRef = useRef<{ cols: number; rows: number }>({ cols: 0, rows: 0 });
   const resizeTimerRef = useRef<number | null>(null);
   const isFocusedRef = useRef<boolean>(false);
@@ -150,11 +184,125 @@ export function XtermPane({
   const [searchError, setSearchError] = useState<string | null>(null);
   const [searchTruncated, setSearchTruncated] = useState(false);
 
+  const [oscBlocks, setOscBlocks] = useState<Osc133CommandBlock[]>([]);
+  const [activeOscBlockId, setActiveOscBlockId] = useState<number | null>(null);
+  const [copiedBlockOutput, setCopiedBlockOutput] = useState(false);
+  const copiedBlockTimerRef = useRef<number | null>(null);
+
   const findInputRef = useRef<HTMLInputElement | null>(null);
   const findOpenRef = useRef(false);
   findOpenRef.current = findOpen;
+  const oscBlocksRef = useRef<Osc133CommandBlock[]>(oscBlocks);
+  oscBlocksRef.current = oscBlocks;
+  const activeOscBlockIdRef = useRef<number | null>(activeOscBlockId);
+  activeOscBlockIdRef.current = activeOscBlockId;
+  const onRequestSplitRef = useRef(onRequestSplit);
+  onRequestSplitRef.current = onRequestSplit;
+  const onPaneFocusRef = useRef(onPaneFocus);
+  onPaneFocusRef.current = onPaneFocus;
 
   const effectiveTerminalId = terminalId?.trim() ?? "";
+
+  useEffect(() => {
+    return () => {
+      if (copiedBlockTimerRef.current !== null) {
+        window.clearTimeout(copiedBlockTimerRef.current);
+      }
+    };
+  }, []);
+
+  const selectedOscBlock = useMemo(() => {
+    if (oscBlocks.length === 0) return null;
+    if (activeOscBlockId !== null) {
+      const found = oscBlocks.find((b) => b.id === activeOscBlockId);
+      if (found) return found;
+    }
+    return oscBlocks[oscBlocks.length - 1] ?? null;
+  }, [oscBlocks, activeOscBlockId]);
+
+  const selectedOscBlockIndex = useMemo(() => {
+    if (!selectedOscBlock) return -1;
+    return oscBlocks.findIndex((b) => b.id === selectedOscBlock.id);
+  }, [oscBlocks, selectedOscBlock]);
+
+  const jumpOscBlock = useCallback((direction: "prev" | "next") => {
+    const term = termRef.current;
+    const blocks = oscBlocksRef.current;
+    if (!term || blocks.length === 0) return;
+    const target = findAdjacentOsc133Block(
+      blocks,
+      term.buffer.active.viewportY,
+      direction,
+      activeOscBlockIdRef.current,
+    );
+    if (!target) return;
+    setActiveOscBlockId(target.id);
+    term.scrollToLine(Math.max(0, target.promptRow - 1));
+  }, []);
+
+  const readSelectedOscBlockOutput = useCallback((): {
+    block: Osc133CommandBlock;
+    output: string;
+  } | null => {
+    const term = termRef.current;
+    const blocks = oscBlocksRef.current;
+    if (!term || blocks.length === 0) return null;
+    const target =
+      (activeOscBlockIdRef.current !== null
+        ? blocks.find((b) => b.id === activeOscBlockIdRef.current)
+        : null) ?? blocks[blocks.length - 1];
+    if (!target) return null;
+    const buf = term.buffer.active;
+    const output = extractOsc133BlockOutput(
+      target,
+      (row) => buf.getLine(row)?.translateToString(true) ?? "",
+      buf.length,
+    );
+    return { block: target, output };
+  }, []);
+
+  const copyOscBlockOutput = useCallback(() => {
+    const res = readSelectedOscBlockOutput();
+    if (!res || !res.output) {
+      orbitActions.showToast(t("terminal.noBlockOutput"));
+      return;
+    }
+    void navigator.clipboard
+      ?.writeText(res.output)
+      .then(() => {
+        setCopiedBlockOutput(true);
+        if (copiedBlockTimerRef.current !== null) {
+          window.clearTimeout(copiedBlockTimerRef.current);
+        }
+        copiedBlockTimerRef.current = window.setTimeout(() => setCopiedBlockOutput(false), 1400);
+      })
+      .catch(() => {});
+  }, [readSelectedOscBlockOutput, t]);
+
+  const sendOscBlockToComposer = useCallback(() => {
+    if (detached) return;
+    const res = readSelectedOscBlockOutput();
+    if (!res || !res.output) {
+      orbitActions.showToast(t("terminal.noBlockOutput"));
+      return;
+    }
+    const lineCount = res.output.split("\n").length;
+    const cmdLabel = res.block.commandLine
+      ? `$ ${res.block.commandLine.slice(0, 40)}${res.block.commandLine.length > 40 ? "…" : ""}`
+      : paneTitle || t("sidePanel.actionTerminal");
+    const content = res.block.commandLine
+      ? `$ ${res.block.commandLine}\n${res.output}`
+      : res.output;
+    orbitActions.addContextMention({
+      id: `term_osc_${res.block.id}_${Date.now()}`,
+      kind: "terminal_output",
+      label: `${cmdLabel} · ${lineCount}L`,
+      lineCount,
+      content,
+    });
+    orbitActions.focusComposer();
+    orbitActions.showToast(t("terminal.sentOutputToComposer"));
+  }, [detached, paneTitle, readSelectedOscBlockOutput, t]);
 
   const syncRemoteSize = useCallback(
     (term: Terminal) => {
@@ -245,11 +393,13 @@ export function XtermPane({
     openSearch,
     closeSearch,
     stepSearch,
+    jumpOscBlock,
   });
   shortcutActionsRef.current = {
     openSearch,
     closeSearch,
     stepSearch,
+    jumpOscBlock,
   };
 
   useEffect(() => {
@@ -344,7 +494,27 @@ export function XtermPane({
       },
     });
 
-    // Scoped terminal-local shortcuts: Cmd+K (clear) and Cmd/Ctrl+F, Cmd/Ctrl+G, Esc (search)
+    // Register FinalTerm / iTerm2 / VSCode OSC 133 shell-integration command-block handler
+    const osc133Tracker = createOsc133Tracker({ maxBlocks: 200 });
+    osc133TrackerRef.current = osc133Tracker;
+    const osc133Disposable = term.parser.registerOscHandler(133, (data) => {
+      if (disposed) return true;
+      const buf = term.buffer.active;
+      const updated = osc133Tracker.handleOsc(
+        data,
+        { row: buf.baseY + buf.cursorY, col: buf.cursorX },
+        (row) => buf.getLine(row)?.translateToString(true) ?? "",
+      );
+      if (updated) {
+        setOscBlocks(updated);
+        const latest = updated[updated.length - 1] ?? null;
+        setActiveOscBlockId(latest ? latest.id : null);
+      }
+      return true;
+    });
+
+    // Scoped terminal-local shortcuts: Cmd+K (clear), Cmd+Shift/Alt+D (split), Cmd+Up/Down (OSC 133),
+    // and Cmd/Ctrl+F, Cmd/Ctrl+G, Esc (search)
     const isMac = /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent);
     term.attachCustomKeyEventHandler((ev) => {
       if (ev.type !== "keydown") return true;
@@ -353,6 +523,52 @@ export function XtermPane({
         ev.preventDefault();
         ev.stopPropagation();
         term.clear();
+        osc133Tracker.reset();
+        setOscBlocks([]);
+        setActiveOscBlockId(null);
+        return false;
+      }
+      const paneAction = resolveTerminalPaneShortcut(
+        {
+          key: ev.key,
+          code: ev.code,
+          metaKey: ev.metaKey,
+          ctrlKey: ev.ctrlKey,
+          shiftKey: ev.shiftKey,
+          altKey: ev.altKey,
+          isComposing: ev.isComposing,
+          defaultPrevented: ev.defaultPrevented,
+        },
+        {
+          isMac,
+          terminalHasFocus: true,
+          findOpen: findOpenRef.current,
+          hasCommandBlocks: oscBlocksRef.current.length > 0,
+          canSplit: !detached && Boolean(onRequestSplitRef.current),
+        },
+      );
+      if (paneAction === "split_horizontal") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        onRequestSplitRef.current?.("horizontal");
+        return false;
+      }
+      if (paneAction === "split_vertical") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        onRequestSplitRef.current?.("vertical");
+        return false;
+      }
+      if (paneAction === "prev_command") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        shortcutActionsRef.current.jumpOscBlock("prev");
+        return false;
+      }
+      if (paneAction === "next_command") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        shortcutActionsRef.current.jumpOscBlock("next");
         return false;
       }
       const action = resolveXtermSearchShortcut(ev, {
@@ -491,6 +707,8 @@ export function XtermPane({
         resizeTimerRef.current = null;
       }
       resizeObserver.disconnect();
+      osc133Disposable.dispose();
+      osc133TrackerRef.current = null;
       linkDisposable.dispose();
       dataDisposable.dispose();
       unsubscribeFallback?.();
@@ -549,11 +767,13 @@ export function XtermPane({
       fitRef.current?.fit();
       if (termRef.current) {
         syncRemoteSize(termRef.current);
-        termRef.current.focus();
+        if (isFocusedPane) {
+          termRef.current.focus();
+        }
       }
     });
     return () => cancelAnimationFrame(id);
-  }, [active, visible, detached, syncRemoteSize]);
+  }, [active, isFocusedPane, visible, detached, syncRemoteSize]);
 
   const handleWrapperKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLDivElement>) => {
@@ -562,6 +782,42 @@ export function XtermPane({
       const terminalHasFocus = Boolean(wrapper && activeEl && wrapper.contains(activeEl));
       const inSearchInput = activeEl === findInputRef.current;
       const isMac = /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent);
+
+      if (!inSearchInput) {
+        const paneAction = resolveTerminalPaneShortcut(
+          {
+            key: e.key,
+            code: e.code,
+            metaKey: e.metaKey,
+            ctrlKey: e.ctrlKey,
+            shiftKey: e.shiftKey,
+            altKey: e.altKey,
+            isComposing: e.nativeEvent.isComposing,
+            defaultPrevented: e.defaultPrevented,
+          },
+          {
+            isMac,
+            terminalHasFocus,
+            findOpen,
+            hasCommandBlocks: oscBlocks.length > 0,
+            canSplit: !detached && Boolean(onRequestSplit),
+          },
+        );
+        if (paneAction) {
+          e.preventDefault();
+          e.stopPropagation();
+          if (paneAction === "split_horizontal") {
+            onRequestSplit?.("horizontal");
+          } else if (paneAction === "split_vertical") {
+            onRequestSplit?.("vertical");
+          } else if (paneAction === "prev_command") {
+            jumpOscBlock("prev");
+          } else if (paneAction === "next_command") {
+            jumpOscBlock("next");
+          }
+          return;
+        }
+      }
 
       const action = resolveXtermSearchShortcut(
         {
@@ -595,7 +851,16 @@ export function XtermPane({
         closeSearch();
       }
     },
-    [findOpen, openSearch, stepSearch, closeSearch],
+    [
+      findOpen,
+      openSearch,
+      stepSearch,
+      closeSearch,
+      oscBlocks.length,
+      detached,
+      onRequestSplit,
+      jumpOscBlock,
+    ],
   );
 
   const matchCountLabel =
@@ -605,12 +870,24 @@ export function XtermPane({
         ? `${findMatchIdx + 1} / ${findMatches.length}${searchTruncated ? "+" : ""}`
         : "0 / 0";
 
+  const showMicroHeader = isSplit || oscBlocks.length > 0;
+  const jumpPrevShortcut = mod === "⌘" ? "⌘↑" : "Ctrl+Alt+↑";
+  const jumpNextShortcut = mod === "⌘" ? "⌘↓" : "Ctrl+Alt+↓";
+
   return (
     <div
       ref={wrapperRef}
       onKeyDown={handleWrapperKeyDown}
+      onMouseDown={() => {
+        if (!isFocusedPane) {
+          onPaneFocusRef.current?.();
+        }
+      }}
       onFocusCapture={() => {
         isFocusedRef.current = true;
+        if (!isFocusedPane) {
+          onPaneFocusRef.current?.();
+        }
         if (!detached) {
           orbitActions.setTerminalFocused(true);
         }
@@ -626,13 +903,147 @@ export function XtermPane({
         }
       }}
       className={cn(
-        "relative h-full w-full overflow-hidden px-3.5 py-2.5",
+        "relative flex h-full w-full flex-col overflow-hidden",
         terminalThemeMode === "high_contrast"
           ? "bg-white dark:bg-[#0C0D12]"
           : "bg-surface-recessed",
+        isSplit && (isFocusedPane ? "ring-border-strong ring-1 ring-inset" : "opacity-[0.94]"),
         !active && "hidden",
       )}
     >
+      {showMicroHeader && (
+        <div className="border-border-subtle bg-surface-base/95 flex h-[26px] shrink-0 items-center justify-between gap-2 border-b px-2 text-[11px] select-none">
+          <div className="flex min-w-0 items-center gap-1.5">
+            {isSplit && (
+              <>
+                <span
+                  className={cn(
+                    "size-1.5 shrink-0 rounded-full",
+                    isFocusedPane ? "bg-signal-success" : "bg-ink-faint",
+                  )}
+                />
+                {paneTitle && (
+                  <span className="text-ink-secondary max-w-36 truncate font-mono font-medium">
+                    {paneTitle}
+                  </span>
+                )}
+              </>
+            )}
+
+            {selectedOscBlock && (
+              <div className="flex min-w-0 items-center gap-1.5">
+                {isSplit && <span className="text-ink-faint">·</span>}
+                <span
+                  aria-label={
+                    selectedOscBlock.exitCode === null
+                      ? t("terminal.blockRunning")
+                      : selectedOscBlock.exitCode === 0
+                        ? t("terminal.blockExitOk")
+                        : t("terminal.blockExitFailed", { code: selectedOscBlock.exitCode })
+                  }
+                  className={cn(
+                    "size-1.5 shrink-0 rounded-full",
+                    selectedOscBlock.exitCode === null
+                      ? "bg-ink-muted"
+                      : selectedOscBlock.exitCode === 0
+                        ? "bg-signal-success"
+                        : "bg-signal-danger",
+                  )}
+                />
+                {selectedOscBlock.commandLine && (
+                  <span
+                    title={selectedOscBlock.commandLine}
+                    className="text-ink-muted max-w-44 truncate font-mono"
+                  >
+                    {selectedOscBlock.commandLine}
+                  </span>
+                )}
+                {selectedOscBlock.exitCode !== null && selectedOscBlock.exitCode !== 0 && (
+                  <span className="text-signal-danger shrink-0 font-mono tabular-nums">
+                    exit {selectedOscBlock.exitCode}
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+
+          <div className="flex shrink-0 items-center gap-0.5">
+            {oscBlocks.length > 0 && (
+              <>
+                <span className="text-ink-faint mr-0.5 font-mono tabular-nums">
+                  {selectedOscBlockIndex + 1}/{oscBlocks.length}
+                </span>
+                <SimpleTooltip label={t("terminal.prevCommand")} shortcut={jumpPrevShortcut}>
+                  <button
+                    type="button"
+                    aria-label={t("terminal.prevCommand")}
+                    disabled={selectedOscBlockIndex <= 0}
+                    onClick={() => jumpOscBlock("prev")}
+                    className="text-ink-muted hover:bg-accent hover:text-ink-primary inline-flex size-5 cursor-pointer items-center justify-center rounded transition-colors disabled:cursor-default disabled:opacity-35"
+                  >
+                    <ChevronUp className="size-3.5" />
+                  </button>
+                </SimpleTooltip>
+                <SimpleTooltip label={t("terminal.nextCommand")} shortcut={jumpNextShortcut}>
+                  <button
+                    type="button"
+                    aria-label={t("terminal.nextCommand")}
+                    disabled={selectedOscBlockIndex >= oscBlocks.length - 1}
+                    onClick={() => jumpOscBlock("next")}
+                    className="text-ink-muted hover:bg-accent hover:text-ink-primary inline-flex size-5 cursor-pointer items-center justify-center rounded transition-colors disabled:cursor-default disabled:opacity-35"
+                  >
+                    <ChevronDown className="size-3.5" />
+                  </button>
+                </SimpleTooltip>
+                <SimpleTooltip label={t("terminal.copyLastOutput")}>
+                  <button
+                    type="button"
+                    aria-label={t("terminal.copyLastOutput")}
+                    onClick={copyOscBlockOutput}
+                    className="text-ink-muted hover:bg-accent hover:text-ink-primary inline-flex size-5 cursor-pointer items-center justify-center rounded transition-colors"
+                  >
+                    {copiedBlockOutput ? (
+                      <Check className="text-signal-success size-3" />
+                    ) : (
+                      <Copy className="size-3" />
+                    )}
+                  </button>
+                </SimpleTooltip>
+                {!detached && (
+                  <SimpleTooltip label={t("terminal.sendOutputToComposer")}>
+                    <button
+                      type="button"
+                      aria-label={t("terminal.sendOutputToComposer")}
+                      onClick={sendOscBlockToComposer}
+                      className="text-ink-muted hover:bg-accent hover:text-ink-primary inline-flex size-5 cursor-pointer items-center justify-center rounded transition-colors"
+                    >
+                      <CornerUpLeft className="size-3" />
+                    </button>
+                  </SimpleTooltip>
+                )}
+              </>
+            )}
+
+            {isSplit && onRequestClosePane && (
+              <SimpleTooltip label={t("terminal.closePane")}>
+                <button
+                  type="button"
+                  aria-label={t("terminal.closePane")}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onRequestClosePane();
+                  }}
+                  className="text-ink-muted hover:bg-accent hover:text-ink-primary ml-0.5 inline-flex size-5 cursor-pointer items-center justify-center rounded transition-colors"
+                >
+                  <X className="size-3" />
+                </button>
+              </SimpleTooltip>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="relative min-h-0 flex-1 overflow-hidden px-3.5 py-2.5">
       {findOpen && (
         <div
           role="search"
@@ -748,6 +1159,7 @@ export function XtermPane({
         </div>
       )}
       <div ref={containerRef} className="h-full w-full overflow-hidden" />
+      </div>
     </div>
   );
 }

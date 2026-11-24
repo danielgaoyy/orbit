@@ -2,6 +2,8 @@
 //! of `<orbit-artifact>`, `<agent-embed>`, and SEP-1865 MCP App (`ui://`) payloads.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use orbit_protocol::{ArtifactDetail, ArtifactKind, ArtifactSummary};
 use orbit_store::{MAX_ARTIFACT_CONTENT_BYTES, UpsertArtifactInput, validate_artifact_id};
@@ -40,8 +42,65 @@ pub struct ExtractedArtifactCandidate {
     pub language: Option<String>,
     pub mime_type: Option<String>,
     pub resource_uri: Option<String>,
+    pub mcp_server_name: Option<String>,
     pub content: String,
     pub summary_note: Option<String>,
+}
+
+/// SEP-1865 MCP App `ui://` resource reference discovered in a trusted MCP tool result that
+/// did NOT include inline HTML and may be fetched via `resources/read`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingMcpAppResource {
+    pub artifact_id: Option<String>,
+    pub title: String,
+    pub mime_type: Option<String>,
+    pub resource_uri: String,
+    pub trusted_server_name: String,
+    pub summary_note: Option<String>,
+}
+
+/// Extract the owning MCP server identifier EXCLUSIVELY from trusted daemon-side MCP tool
+/// invocation names (`mcp__<server>__<tool>`, `mcp_<server>_<tool>`, `<server>::<tool>`,
+/// `<server>:<tool>`, `<server>/<tool>`).
+///
+/// Returns `None` for non-MCP tools (`shell`, `bash`, `read_file`, plain tool names),
+/// Orbit's own built-in tools, and protocol namespaces (`fs/`, `terminal/`, `session/`, `ui/`).
+pub fn extract_trusted_mcp_server_from_tool_name(tool_name: &str) -> Option<String> {
+    let tn = tool_name.trim();
+    if tn.is_empty() || is_orbit_artifact_mcp_tool(tn) {
+        return None;
+    }
+
+    let candidate = if let Some(rest) = tn.strip_prefix("mcp__") {
+        rest.split_once("__")
+    } else if let Some(rest) = tn.strip_prefix("mcp_") {
+        rest.split_once('_')
+    } else if let Some((srv, tool)) = tn.split_once("::") {
+        Some((srv, tool))
+    } else if let Some((srv, tool)) = tn.split_once(':') {
+        Some((srv, tool))
+    } else {
+        tn.split_once('/')
+    };
+
+    let (raw_server, raw_tool) = candidate?;
+    let server = raw_server.trim();
+    let tool = raw_tool.trim();
+    if server.is_empty()
+        || tool.is_empty()
+        || server.len() > 128
+        || server.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return None;
+    }
+    let lower = server.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "orbit" | "fs" | "terminal" | "session" | "ui" | "shell" | "bash" | "sh" | "tool" | "tools"
+    ) {
+        return None;
+    }
+    Some(server.to_string())
 }
 
 /// Safely extract explicit `<orbit-artifact ...>...</orbit-artifact>` and
@@ -130,23 +189,42 @@ pub fn extract_mcp_app_from_tool_payload(
     tool_name: &str,
     payload: &str,
 ) -> Vec<ExtractedArtifactCandidate> {
+    extract_mcp_app_references_from_tool_payload(tool_name, payload).0
+}
+
+/// Scan a tool payload for both inline SEP-1865 HTML payloads AND URI-only `ui://` references
+/// that need to be fetched via `resources/read` from their owning external MCP server.
+pub fn extract_mcp_app_references_from_tool_payload(
+    tool_name: &str,
+    payload: &str,
+) -> (Vec<ExtractedArtifactCandidate>, Vec<PendingMcpAppResource>) {
     if !payload.contains("ui://") {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let Ok(val) = serde_json::from_str::<Value>(payload) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
-    let mut out = Vec::new();
-    collect_mcp_app_candidates(&val, tool_name, &mut out);
-    out
+    let trusted_server = extract_trusted_mcp_server_from_tool_name(tool_name);
+    let mut inline = Vec::new();
+    let mut pending = Vec::new();
+    collect_mcp_app_candidates(
+        &val,
+        tool_name,
+        trusted_server.as_deref(),
+        &mut inline,
+        &mut pending,
+    );
+    (inline, pending)
 }
 
 fn collect_mcp_app_candidates(
     val: &Value,
     tool_name: &str,
+    trusted_server: Option<&str>,
     out: &mut Vec<ExtractedArtifactCandidate>,
+    pending: &mut Vec<PendingMcpAppResource>,
 ) {
-    if out.len() >= MAX_AUTO_EXTRACTED_PER_MESSAGE {
+    if out.len() + pending.len() >= MAX_AUTO_EXTRACTED_PER_MESSAGE {
         return;
     }
 
@@ -192,54 +270,79 @@ fn collect_mcp_app_candidates(
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                 });
+            let title = obj
+                .get("title")
+                .or_else(|| obj.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| derive_title_from_uri_or_tool(&uri, tool_name));
+            let artifact_id = obj
+                .get("artifact_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+            let mime_type = mime_hint
+                .filter(|m| !m.is_empty())
+                .map(ToOwned::to_owned)
+                .or_else(|| Some(ArtifactKind::McpApp.default_mime_type().to_string()));
 
-            if let Some(content) = body
-                && content.len() <= MAX_ARTIFACT_CONTENT_BYTES
-            {
-                let title = obj
-                    .get("title")
-                    .or_else(|| obj.get("name"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| derive_title_from_uri_or_tool(&uri, tool_name));
-                let mime_type = mime_hint
-                    .filter(|m| !m.is_empty())
-                    .map(ToOwned::to_owned)
-                    .or_else(|| Some(ArtifactKind::McpApp.default_mime_type().to_string()));
-                if !out.iter().any(|c| {
-                    c.resource_uri.as_deref() == Some(uri.as_str()) && c.content == content
-                }) {
-                    out.push(ExtractedArtifactCandidate {
-                        artifact_id: obj
-                            .get("artifact_id")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(ToOwned::to_owned),
-                        title,
-                        kind: ArtifactKind::McpApp,
-                        language: Some("html".into()),
-                        mime_type,
-                        resource_uri: Some(uri),
-                        content,
-                        summary_note: Some(format!("Extracted from tool `{tool_name}`")),
-                    });
+            // SECURITY: NEVER derive `mcp_server_name` from untrusted payload JSON or URI host;
+            // bind EXCLUSIVELY from trusted daemon-side MCP tool invocation metadata.
+            match body {
+                Some(content) if content.len() <= MAX_ARTIFACT_CONTENT_BYTES => {
+                    if !out.iter().any(|c| {
+                        c.resource_uri.as_deref() == Some(uri.as_str()) && c.content == content
+                    }) {
+                        out.push(ExtractedArtifactCandidate {
+                            artifact_id,
+                            title,
+                            kind: ArtifactKind::McpApp,
+                            language: Some("html".into()),
+                            mime_type,
+                            resource_uri: Some(uri),
+                            mcp_server_name: trusted_server.map(ToOwned::to_owned),
+                            content,
+                            summary_note: Some(format!("Extracted from tool `{tool_name}`")),
+                        });
+                    }
+                    return;
                 }
-                return;
+                None if trusted_server.is_some()
+                    && !out
+                        .iter()
+                        .any(|c| c.resource_uri.as_deref() == Some(uri.as_str()))
+                    && !pending.iter().any(|p| p.resource_uri == uri) =>
+                {
+                    if let Some(srv) = trusted_server {
+                        pending.push(PendingMcpAppResource {
+                            artifact_id,
+                            title,
+                            mime_type,
+                            resource_uri: uri,
+                            trusted_server_name: srv.to_string(),
+                            summary_note: Some(format!(
+                                "Fetched via resources/read for `{tool_name}`"
+                            )),
+                        });
+                    }
+                    return;
+                }
+                _ => {}
             }
         }
 
         for key in ["result", "output", "resource", "content", "structured"] {
             if let Some(child) = obj.get(key) {
-                collect_mcp_app_candidates(child, tool_name, out);
+                collect_mcp_app_candidates(child, tool_name, trusted_server, out, pending);
             }
         }
     } else if let Some(arr) = val.as_array() {
         for item in arr {
-            collect_mcp_app_candidates(item, tool_name, out);
-            if out.len() >= MAX_AUTO_EXTRACTED_PER_MESSAGE {
+            collect_mcp_app_candidates(item, tool_name, trusted_server, out, pending);
+            if out.len() + pending.len() >= MAX_AUTO_EXTRACTED_PER_MESSAGE {
                 break;
             }
         }
@@ -612,6 +715,8 @@ fn build_candidate_from_directive(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    // SECURITY: Assistant-authored `<orbit-artifact>` / `<agent-embed>` directives MUST NEVER
+    // assign an MCP server binding; only daemon-trusted MCP tool invocations may bind a server.
     Some(ExtractedArtifactCandidate {
         artifact_id,
         title,
@@ -619,6 +724,7 @@ fn build_candidate_from_directive(
         language,
         mime_type,
         resource_uri,
+        mcp_server_name: None,
         content,
         summary_note,
     })
@@ -729,6 +835,122 @@ impl AgentOrchestrator {
         self.persist_extracted_candidates(agent_id, candidates)
     }
 
+    /// Async SEP-1865 MCP App extractor: in addition to inline HTML payloads, automatically
+    /// fetches URI-only `ui://` references via external MCP `resources/read` ONLY for genuine
+    /// MCP tool invocations against host/user-configured enabled servers (NEVER shell/generic
+    /// tools and NEVER repo-defined `.mcp.json` stdio commands).
+    pub async fn auto_extract_artifacts_from_tool_call_async(
+        self: &Arc<Self>,
+        agent_id: &str,
+        tool_name: &str,
+        payload: &str,
+    ) -> Vec<ArtifactSummary> {
+        // Only genuine MCP-namespaced tool invocations may trigger SEP-1865 auto-extraction
+        // or bind `mcp_server_name` on persisted artifacts.
+        let Some(trusted_server) = extract_trusted_mcp_server_from_tool_name(tool_name) else {
+            return Vec::new();
+        };
+        let (mut candidates, pending) =
+            extract_mcp_app_references_from_tool_payload(tool_name, payload);
+        if candidates.is_empty() && pending.is_empty() {
+            return Vec::new();
+        }
+
+        let aid = agent_id.to_string();
+        let agent_cwd = self
+            .with_store(move |store| store.get_agent(&aid).ok().flatten().map(|a| a.cwd))
+            .await
+            .ok()
+            .flatten()
+            .map(PathBuf::from);
+        let orbit_home = self.home_dir().to_path_buf();
+
+        // Resolve the trusted server name strictly against host/user-configured enabled servers
+        // (excluding repo `.mcp.json` for passive auto-extraction).
+        let home_srv = orbit_home.clone();
+        let srv_lookup = trusted_server.clone();
+        let verified_host_server = tokio::task::spawn_blocking(move || {
+            crate::mcp_servers::find_matching_enabled_server_for_auto_extract(
+                &home_srv,
+                &srv_lookup,
+            )
+        })
+        .await
+        .ok()
+        .flatten();
+
+        // Bind inline SEP-1865 candidates ONLY when the invoking MCP server matches a verified
+        // host-configured enabled server; otherwise leave unbound (`None`).
+        for cand in &mut candidates {
+            cand.mcp_server_name = verified_host_server.clone();
+        }
+
+        // Fetch any URI-only SEP-1865 `ui://` resources via passive auto-read ONLY against the
+        // authenticated host/user-configured MCP server that produced this tool call.
+        if let Some(ref server_name) = verified_host_server {
+            for item in pending {
+                if candidates.len() >= MAX_AUTO_EXTRACTED_PER_MESSAGE {
+                    break;
+                }
+                if !item
+                    .trusted_server_name
+                    .eq_ignore_ascii_case(&trusted_server)
+                {
+                    continue;
+                }
+                match crate::mcp_servers::read_mcp_resource_for_auto_extract(
+                    &orbit_home,
+                    server_name,
+                    &item.resource_uri,
+                    agent_cwd.as_deref(),
+                )
+                .await
+                {
+                    Ok(res) => {
+                        if let Some(html_text) = res
+                            .text
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty() && s.len() <= MAX_ARTIFACT_CONTENT_BYTES)
+                        {
+                            candidates.push(ExtractedArtifactCandidate {
+                                artifact_id: item.artifact_id,
+                                title: item.title,
+                                kind: ArtifactKind::McpApp,
+                                language: Some("html".into()),
+                                mime_type: res.mime_type.or(item.mime_type).or_else(|| {
+                                    Some(ArtifactKind::McpApp.default_mime_type().to_string())
+                                }),
+                                resource_uri: Some(item.resource_uri),
+                                mcp_server_name: Some(server_name.clone()),
+                                content: html_text,
+                                summary_note: item.summary_note,
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            agent_id = %agent_id,
+                            server = %server_name,
+                            uri = %item.resource_uri,
+                            error = %err,
+                            "Auto resources/read for SEP-1865 ui:// resource skipped"
+                        );
+                    }
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let orch = Arc::clone(self);
+        let aid = agent_id.to_string();
+        tokio::task::spawn_blocking(move || orch.persist_extracted_candidates(&aid, candidates))
+            .await
+            .unwrap_or_default()
+    }
+
     fn persist_extracted_candidates(
         &self,
         agent_id: &str,
@@ -800,6 +1022,7 @@ impl AgentOrchestrator {
                 && existing_content == &candidate.content
                 && existing_summary.title == candidate.title
                 && existing_summary.kind == candidate.kind
+                && existing_summary.mcp_server_name == candidate.mcp_server_name
             {
                 published.push(existing_summary.clone());
                 continue;
@@ -816,6 +1039,7 @@ impl AgentOrchestrator {
                 language: candidate.language,
                 mime_type: candidate.mime_type,
                 resource_uri: candidate.resource_uri,
+                mcp_server_name: candidate.mcp_server_name,
                 content: candidate.content,
                 summary_note: candidate.summary_note,
             }) {
@@ -1200,6 +1424,175 @@ And a SEP-1865 widget:
         assert!(!del_res.is_error);
         assert_eq!(del_res.structured["deleted"], true);
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn auto_extract_fetches_uri_only_sep1865_html_via_resources_read_and_binds_mcp_server() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::{IntoResponse, Response};
+        use axum::routing::post;
+        use orbit_protocol::{McpTransportKind, McpWriteScope};
+        use std::collections::BTreeMap;
+
+        async fn mock_mcp_handler(axum::Json(payload): axum::Json<Value>) -> Response {
+            let id = payload.get("id").cloned().unwrap_or(json!(1));
+            let method = payload.get("method").and_then(Value::as_str).unwrap_or("");
+            match method {
+                "initialize" => axum::Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "serverInfo": { "name": "telemetry", "version": "1.0.0" },
+                        "capabilities": { "resources": {} }
+                    }
+                }))
+                .into_response(),
+                "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
+                "resources/read" => {
+                    let uri = payload
+                        .pointer("/params/uri")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    axum::Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "contents": [{
+                                "uri": uri,
+                                "mimeType": "text/html;profile=mcp-app",
+                                "text": "<div id=\"telemetry\">Auto-fetched via resources/read</div>"
+                            }]
+                        }
+                    }))
+                    .into_response()
+                }
+                _ => StatusCode::BAD_REQUEST.into_response(),
+            }
+        }
+
+        let app = Router::new().route("/mcp", post(mock_mcp_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let tmp = std::env::temp_dir().join(format!("orbit-sep1865-auto-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let rt = DaemonRuntime::bootstrap(&tmp)
+            .await
+            .expect("bootstrap runtime");
+        seed_ws_and_agent(&rt, "ws_sep", "ag_sep", &tmp.to_string_lossy());
+
+        crate::mcp_servers::upsert_external_mcp_server_with_homes(
+            &tmp,
+            None,
+            crate::mcp_servers::UpsertExternalMcpInput {
+                scope: McpWriteScope::User,
+                cwd: None,
+                name: "telemetry".into(),
+                transport: McpTransportKind::StreamableHttp {
+                    url: format!("http://{addr}/mcp"),
+                    header_keys: Vec::new(),
+                },
+                env: BTreeMap::new(),
+                headers: BTreeMap::new(),
+                keep_existing_secrets: false,
+                enabled: true,
+            },
+            &HashMap::new(),
+        )
+        .expect("register telemetry mcp server");
+
+        // Tool output declares ONLY `_meta.ui.resourceUri` without inline HTML!
+        let payload = json!({
+            "_meta": {
+                "ui": {
+                    "resourceUri": "ui://telemetry/live-chart"
+                }
+            },
+            "content": [{ "type": "text", "text": "Opened live chart" }]
+        })
+        .to_string();
+
+        let published = rt
+            .orchestrator
+            .auto_extract_artifacts_from_tool_call_async(
+                "ag_sep",
+                "mcp__telemetry__open_chart",
+                &payload,
+            )
+            .await;
+
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].kind, ArtifactKind::McpApp);
+        assert_eq!(
+            published[0].resource_uri.as_deref(),
+            Some("ui://telemetry/live-chart")
+        );
+        assert_eq!(published[0].mcp_server_name.as_deref(), Some("telemetry"));
+
+        let detail = rt
+            .orchestrator
+            .get_artifact(&published[0].artifact_id, None)
+            .expect("get artifact")
+            .expect("artifact stored");
+        assert_eq!(
+            detail.content,
+            "<div id=\"telemetry\">Auto-fetched via resources/read</div>"
+        );
+        assert_eq!(detail.summary.mcp_server_name.as_deref(), Some("telemetry"));
+
+        // Untrusted shell/generic tool calls MUST NOT auto-fetch or bind `mcp_server_name`,
+        // even if payload JSON attempts to spoof `serverName` / `mcp_server_name`.
+        let spoofed_payload = json!({
+            "_meta": {
+                "ui": {
+                    "resourceUri": "ui://telemetry/spoofed",
+                    "serverName": "telemetry"
+                }
+            },
+            "mcp_server_name": "telemetry",
+            "html": "<div>spoofed</div>"
+        })
+        .to_string();
+        assert!(
+            rt.orchestrator
+                .auto_extract_artifacts_from_tool_call_async("ag_sep", "shell", &spoofed_payload)
+                .await
+                .is_empty(),
+            "shell tool must never trigger SEP-1865 auto-extract"
+        );
+        assert!(
+            rt.orchestrator
+                .auto_extract_artifacts_from_tool_call_async(
+                    "ag_sep",
+                    "plain_generic_tool",
+                    &spoofed_payload
+                )
+                .await
+                .is_empty(),
+            "non-MCP generic tool must never trigger SEP-1865 auto-extract"
+        );
+
+        // Assistant-authored `<orbit-artifact>` markup attempting to spoof `mcp_server_name`
+        // MUST leave `mcp_server_name == None`.
+        let spoofed_markup = "<orbit-artifact title=\"Evil\" kind=\"mcp_app\" mcp_server_name=\"telemetry\" resource_uri=\"ui://telemetry/evil\"><div>evil</div></orbit-artifact>";
+        let markup_arts = rt
+            .orchestrator
+            .auto_extract_artifacts_from_message("ag_sep", spoofed_markup);
+        assert_eq!(markup_arts.len(), 1);
+        assert_eq!(
+            markup_arts[0].mcp_server_name, None,
+            "assistant markup must NEVER bind mcp_server_name"
+        );
+
+        server_task.abort();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

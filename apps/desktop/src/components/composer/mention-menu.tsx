@@ -13,7 +13,11 @@ import {
   FileTerminal,
   FileText,
   Film,
+  Folder,
+  FolderTree,
   GitCompareArrows,
+  GitPullRequest,
+  Globe,
   Music,
   SquareTerminal,
   Users,
@@ -413,6 +417,120 @@ export function MentionMenu({
                     {isBroadcast
                       ? t("composer.mentionBadgeBroadcast")
                       : t("composer.mentionBadgePeer")}
+                  </span>
+                </button>
+              );
+            }
+
+            if (item.kind === "folder" || item.kind === "folder_hint") {
+              const FolderIcon = item.kind === "folder" ? Folder : FolderTree;
+              return (
+                <button
+                  key={item.key}
+                  id={mentionOptionId(idx)}
+                  role="option"
+                  aria-selected={active}
+                  type="button"
+                  data-mention-idx={idx}
+                  onMouseEnter={() => onHoverIndex(idx)}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    onSelect(item);
+                  }}
+                  className={cn(
+                    "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
+                    active
+                      ? "bg-accent text-ink-primary"
+                      : "text-ink-secondary hover:bg-accent/60 hover:text-ink-primary",
+                  )}
+                >
+                  <div className="flex min-w-0 items-center gap-2.5">
+                    <FolderIcon className={iconClass} />
+                    <span className="text-ink-primary truncate font-mono text-[13px] font-medium">
+                      {item.title}
+                    </span>
+                    <span className="text-ink-muted shrink-0 truncate text-[11px]">
+                      {item.kind === "folder_hint"
+                        ? t("composer.mentionFolderDesc")
+                        : item.subtitle}
+                    </span>
+                  </div>
+                  <span className="bg-surface-recessed text-ink-muted shrink-0 rounded-[4px] px-1.5 py-0.5 text-[11px] font-medium">
+                    {t("composer.mentionBadgeFolder")}
+                  </span>
+                </button>
+              );
+            }
+
+            if (item.kind === "pr") {
+              return (
+                <button
+                  key={item.key}
+                  id={mentionOptionId(idx)}
+                  role="option"
+                  aria-selected={active}
+                  type="button"
+                  data-mention-idx={idx}
+                  onMouseEnter={() => onHoverIndex(idx)}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    onSelect(item);
+                  }}
+                  className={cn(
+                    "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
+                    active
+                      ? "bg-accent text-ink-primary"
+                      : "text-ink-secondary hover:bg-accent/60 hover:text-ink-primary",
+                  )}
+                >
+                  <div className="flex min-w-0 items-center gap-2.5">
+                    <GitPullRequest className={iconClass} />
+                    <span className="text-ink-primary shrink-0 font-mono text-[13px] font-medium">
+                      {item.title}
+                    </span>
+                    <span className="text-ink-muted truncate text-[11px]">
+                      {t("composer.mentionPrDesc")}
+                    </span>
+                  </div>
+                  <span className="bg-surface-recessed text-ink-muted shrink-0 rounded-[4px] px-1.5 py-0.5 text-[11px] font-medium">
+                    {t("composer.mentionBadgePr")}
+                  </span>
+                </button>
+              );
+            }
+
+            if (item.kind === "web" || item.kind === "web_hint") {
+              return (
+                <button
+                  key={item.key}
+                  id={mentionOptionId(idx)}
+                  role="option"
+                  aria-selected={active}
+                  type="button"
+                  data-mention-idx={idx}
+                  onMouseEnter={() => onHoverIndex(idx)}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    onSelect(item);
+                  }}
+                  className={cn(
+                    "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
+                    active
+                      ? "bg-accent text-ink-primary"
+                      : "text-ink-secondary hover:bg-accent/60 hover:text-ink-primary",
+                  )}
+                >
+                  <div className="flex min-w-0 items-center gap-2.5">
+                    <Globe className={iconClass} />
+                    <span className="text-ink-primary truncate font-mono text-[13px] font-medium">
+                      {item.title}
+                    </span>
+                    <span className="text-ink-muted truncate text-[11px]">
+                      {item.kind === "web_hint" ? t("composer.mentionWebDesc") : item.subtitle}
+                    </span>
+                  </div>
+                  <span className="bg-surface-recessed text-ink-muted shrink-0 rounded-[4px] px-1.5 py-0.5 text-[11px] font-medium">
+                    {t("composer.mentionBadgeWeb")}
                   </span>
                 </button>
               );

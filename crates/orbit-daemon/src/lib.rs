@@ -15,12 +15,15 @@ pub mod discovery;
 pub mod fast_copy;
 pub mod finish_subscriptions;
 pub mod git;
+pub mod git_collab;
 pub mod git_write;
 pub mod goals;
 pub mod guardian;
+pub mod guardian_llm;
 pub mod hooks;
 pub mod idle_cleanup;
 pub mod im_channels;
+pub mod im_longconn;
 pub mod instructions;
 pub mod keep_awake;
 pub mod lsp;
@@ -28,7 +31,9 @@ pub mod manager;
 pub mod mcp;
 pub mod mcp_servers;
 pub mod messaging;
+pub mod permission_rules;
 pub mod personal_router;
+pub mod plan_approval;
 pub mod platform;
 pub mod push;
 pub mod rules;
@@ -46,6 +51,7 @@ pub mod workspace_cluster;
 pub mod workspace_files;
 pub mod workspace_organizer;
 pub mod workspace_runtime;
+pub mod workspace_watcher;
 pub mod worktree_handoff;
 pub mod worktree_pool;
 
@@ -460,6 +466,7 @@ pub struct DaemonRuntime {
     pub triggers: Arc<EventTriggerEngine>,
     pub workflows: Arc<WorkflowEngine>,
     pub symbol_index: Arc<WorkspaceSymbolIndex>,
+    pub workspace_watcher: Arc<crate::workspace_watcher::WorkspaceWatcherManager>,
     pub lsp: Arc<LspManager>,
     pub browser: Arc<BrowserManager>,
     pub hooks: Arc<HooksEngine>,
@@ -650,6 +657,34 @@ impl DaemonRuntime {
             .set_personal_router(personal_router.clone())
             .await;
 
+        let symbol_index = Arc::new(WorkspaceSymbolIndex::with_external_provider(Arc::new(
+            crate::lsp::LspExternalSymbolProvider::new(Arc::clone(&lsp)),
+        )));
+        let sym_for_watch = Arc::clone(&symbol_index);
+        let orch_for_watch = Arc::clone(&orchestrator);
+        let bcast_for_watch = orchestrator.broadcast_tx.clone();
+        let workspace_watcher =
+            crate::workspace_watcher::WorkspaceWatcherManager::new(move |batch| {
+                sym_for_watch.invalidate(&batch.canonical_root);
+                if batch.skills_or_rules_changed {
+                    let orch_bg = Arc::clone(&orch_for_watch);
+                    let ws_id = batch.workspace_id.clone();
+                    tokio::spawn(async move {
+                        orch_bg.invalidate_workspace_rules_cache(&ws_id).await;
+                    });
+                }
+                let _ = bcast_for_watch.send(DaemonBroadcast::WorkspaceFilesChanged {
+                    workspace_id: batch.workspace_id,
+                    cwd: batch.cwd,
+                    changed_paths: batch.changed_paths,
+                    git_changed: batch.git_changed,
+                    skills_or_rules_changed: batch.skills_or_rules_changed,
+                });
+            });
+        orchestrator
+            .set_workspace_watcher(Arc::clone(&workspace_watcher))
+            .await;
+
         Ok(Arc::new(Self {
             host_info,
             keypair,
@@ -672,9 +707,8 @@ impl DaemonRuntime {
             goals,
             triggers,
             workflows,
-            symbol_index: Arc::new(WorkspaceSymbolIndex::with_external_provider(Arc::new(
-                crate::lsp::LspExternalSymbolProvider::new(Arc::clone(&lsp)),
-            ))),
+            symbol_index,
+            workspace_watcher,
             lsp,
             browser,
             hooks,
@@ -717,6 +751,72 @@ impl DaemonRuntime {
         drop(self.idle_cleanup.spawn_background());
         drop(self.lsp.spawn_idle_reaper());
         drop(self.browser.spawn_idle_reaper());
+
+        // 4a. Start OS-native debounced file watching for all active (non-archived) workspace roots
+        if let Ok(active_workspaces) = crate::manager::with_store(&self.store, |s| {
+            s.list_workspaces_filtered(false, true)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|w| (w.workspace_id, PathBuf::from(w.cwd)))
+                .collect::<Vec<_>>()
+        })
+        .await
+        {
+            self.workspace_watcher
+                .watch_active_workspaces(&active_workspaces);
+        }
+
+        // 4b. Incrementally backfill legacy daemon `timeline_events` into `timeline_events_fts`
+        //     without blocking startup so full-history remote search covers pre-v6 histories.
+        if !self.store.is_daemon_fts_backfill_done() {
+            let store_bg = Arc::clone(&self.store);
+            tokio::spawn(async move {
+                const BACKFILL_BATCH_SIZE: usize = 200;
+                const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+                let mut consecutive_errors: u32 = 0;
+                loop {
+                    let store_step = Arc::clone(&store_bg);
+                    let step = tokio::task::spawn_blocking(move || {
+                        store_step.backfill_daemon_fts_batch(BACKFILL_BATCH_SIZE)
+                    })
+                    .await;
+                    match step {
+                        Ok(Ok(progress)) => {
+                            consecutive_errors = 0;
+                            if progress.done {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                        }
+                        Ok(Err(err)) => {
+                            consecutive_errors += 1;
+                            warn!(
+                                error = %err,
+                                attempt = consecutive_errors,
+                                "daemon FTS5 backfill batch failed"
+                            );
+                            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                                warn!(
+                                    "aborting daemon FTS5 background backfill after repeated errors"
+                                );
+                                break;
+                            }
+                            let backoff_ms = 50u64
+                                .saturating_mul(1u64 << (consecutive_errors - 1).min(4))
+                                .min(1000);
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        }
+                        Err(join_err) => {
+                            warn!(
+                                error = %join_err,
+                                "daemon FTS5 backfill worker task aborted"
+                            );
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
         // 5. Warm login-shell environment snapshot & provider model catalogs in background (non-blocking)
         orbit_providers::set_snapshot_orbit_home(&self.home_dir);
@@ -932,30 +1032,60 @@ fn build_http_router(runtime: Arc<DaemonRuntime>) -> Router {
             )),
         )
         .merge(im_webhook_routes)
-        .fallback(service_reverse_proxy_fallback)
+        .fallback(not_found_fallback)
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&runtime),
+            service_reverse_proxy_host_middleware,
+        ))
         .with_state(runtime)
 }
 
-async fn service_reverse_proxy_fallback(
+/// Intercept requests targeting a registered `*.localhost` workspace service BEFORE daemon routes
+/// (`/ws`, `/healthz`, etc.) so Webpack/Vite/Next.js HMR endpoints on `/ws` proxy cleanly.
+async fn service_reverse_proxy_host_middleware(
     State(runtime): State<Arc<DaemonRuntime>>,
     req: Request<Body>,
+    next: axum::middleware::Next,
 ) -> Response {
-    if let Some(host_val) = req
-        .headers()
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        && let Some(target_port) = runtime
+    let mut host_iter = req.headers().get_all(axum::http::header::HOST).iter();
+    let first_host = host_iter.next();
+    if host_iter.next().is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Multiple Host headers are not allowed",
+        )
+            .into_response();
+    }
+    if let Some(host_val) = first_host.and_then(|v| v.to_str().ok())
+        && let Some(auth) = runtime
             .orchestrator
             .scripts
-            .resolve_proxy_port(host_val)
+            .resolve_proxy_service(host_val)
             .await
     {
+        let listen_port = *runtime.listen_port.read().await;
+        let expected_port = auth
+            .advertised_port
+            .or_else(|| (listen_port > 0).then_some(listen_port));
+        let expected_host = auth.proxy_host.clone().unwrap_or_else(|| {
+            crate::workspace_runtime::parse_http_host_header(host_val)
+                .map(|(h, _)| h)
+                .unwrap_or_else(|| host_val.to_ascii_lowercase())
+        });
+        let authority = crate::workspace_runtime::PreviewAuthority::DotLocalhost {
+            host: expected_host,
+            expected_port,
+        };
         return runtime
             .orchestrator
             .scripts
-            .proxy_http_request(target_port, req)
+            .proxy_http_request_authorized(&auth, &authority, req)
             .await;
     }
+    next.run(req).await
+}
+
+async fn not_found_fallback() -> Response {
     (StatusCode::NOT_FOUND, "Not Found").into_response()
 }
 
@@ -2019,18 +2149,94 @@ enum SessionExitReason {
 }
 
 const MAX_CONCURRENT_PEER_BRIDGES_PER_SESSION: usize = 16;
+const MAX_CONCURRENT_PREVIEW_TUNNELS_PER_SESSION: usize = 64;
+const MAX_PREVIEW_TUNNEL_FRAME_BYTES: usize = 512 * 1024;
+const MAX_PREVIEW_TUNNEL_INBOUND_FRAMES: usize = 64;
+const MAX_PREVIEW_TUNNEL_INBOUND_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SESSION_PREVIEW_TUNNEL_BYTES: usize = 32 * 1024 * 1024;
 
 struct ActivePeerBridge {
     inbound_tx: mpsc::Sender<Vec<u8>>,
     task: tokio::task::AbortHandle,
 }
 
-/// Ensures terminal streaming tasks, peer bridges, and side-question tasks are always aborted immediately even
-/// when `run_client_session_loop` is dropped mid-await on secret revocation.
+/// RAII-accounted preview tunnel payload chunk. Dropping the chunk (either after writing to the
+/// duplex stream or when a tunnel/session is aborted) automatically refunds both per-tunnel and
+/// per-session byte budgets with zero leaks.
+struct QueuedPreviewBytes {
+    data: Vec<u8>,
+    len: usize,
+    tunnel_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    session_bytes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for QueuedPreviewBytes {
+    fn drop(&mut self) {
+        saturating_atomic_sub(&self.tunnel_bytes, self.len);
+        saturating_atomic_sub(&self.session_bytes, self.len);
+    }
+}
+
+fn try_reserve_atomic_budget(
+    counter: &std::sync::atomic::AtomicUsize,
+    amount: usize,
+    limit: usize,
+) -> bool {
+    let mut cur = counter.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        let Some(next) = cur.checked_add(amount).filter(|n| *n <= limit) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(
+            cur,
+            next,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+fn saturating_atomic_sub(counter: &std::sync::atomic::AtomicUsize, amount: usize) {
+    let mut cur = counter.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        let next = cur.saturating_sub(amount);
+        match counter.compare_exchange_weak(
+            cur,
+            next,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+struct ActivePreviewTunnel {
+    inbound_tx: mpsc::Sender<QueuedPreviewBytes>,
+    queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    task: tokio::task::AbortHandle,
+}
+
+struct AbortTaskOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Ensures terminal streaming tasks, peer bridges, preview tunnels, and side-question tasks are
+/// always aborted immediately even when `run_client_session_loop` is dropped mid-await on secret revocation.
 struct SessionCleanupGuard {
     slot_to_terminal: HashMap<u8, (String, tokio::task::AbortHandle)>,
     active_side_questions: Vec<tokio::task::AbortHandle>,
     active_peer_bridges: HashMap<Uuid, ActivePeerBridge>,
+    active_preview_tunnels: HashMap<Uuid, ActivePreviewTunnel>,
+    preview_session_queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SessionCleanupGuard {
@@ -2039,6 +2245,8 @@ impl SessionCleanupGuard {
             slot_to_terminal: HashMap::new(),
             active_side_questions: Vec::new(),
             active_peer_bridges: HashMap::new(),
+            active_preview_tunnels: HashMap::new(),
+            preview_session_queued_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -2053,6 +2261,9 @@ impl Drop for SessionCleanupGuard {
         }
         for (_, bridge) in self.active_peer_bridges.drain() {
             bridge.task.abort();
+        }
+        for (_, tunnel) in self.active_preview_tunnels.drain() {
+            tunnel.task.abort();
         }
     }
 }
@@ -2141,7 +2352,7 @@ async fn run_client_session_loop(
             return;
         }
         use_zstd = true;
-        if let Some(reply) = handle_wire_rpc(
+        if let Some(reply) = Box::pin(handle_wire_rpc(
             &runtime,
             session_id,
             msg,
@@ -2151,7 +2362,7 @@ async fn run_client_session_loop(
             &mut cleanup.slot_to_terminal,
             &mut cleanup.active_side_questions,
             &out_tx,
-        )
+        ))
         .await
             && out_tx
                 .send(SessionFrame::Wire {
@@ -2197,6 +2408,9 @@ async fn run_client_session_loop(
                         cleanup
                             .active_peer_bridges
                             .retain(|_, b| !b.task.is_finished());
+                        cleanup
+                            .active_preview_tunnels
+                            .retain(|_, t| !t.task.is_finished());
                         match msg {
                             WireMessage::PeerBridgeOpen {
                                 request_id,
@@ -2230,8 +2444,44 @@ async fn run_client_session_loop(
                                     b.task.abort();
                                 }
                             }
+                            WireMessage::PreviewTunnelOpen {
+                                request_id,
+                                tunnel_id,
+                                target_port,
+                                proxy_host,
+                            } => {
+                                handle_preview_tunnel_open(
+                                    &runtime,
+                                    &mut cleanup.active_preview_tunnels,
+                                    &out_tx,
+                                    use_zstd,
+                                    request_id,
+                                    tunnel_id,
+                                    target_port,
+                                    proxy_host.as_deref(),
+                                )
+                                .await;
+                            }
+                            WireMessage::PreviewTunnelData {
+                                tunnel_id,
+                                payload_b64,
+                            } => {
+                                handle_preview_tunnel_data(
+                                    &mut cleanup.active_preview_tunnels,
+                                    &cleanup.preview_session_queued_bytes,
+                                    &out_tx,
+                                    use_zstd,
+                                    tunnel_id,
+                                    &payload_b64,
+                                );
+                            }
+                            WireMessage::PreviewTunnelClose { tunnel_id, .. } => {
+                                if let Some(t) = cleanup.active_preview_tunnels.remove(&tunnel_id) {
+                                    t.task.abort();
+                                }
+                            }
                             other => {
-                                if let Some(reply) = handle_wire_rpc(
+                                if let Some(reply) = Box::pin(handle_wire_rpc(
                                     &runtime,
                                     session_id,
                                     other,
@@ -2241,7 +2491,7 @@ async fn run_client_session_loop(
                                     &mut cleanup.slot_to_terminal,
                                     &mut cleanup.active_side_questions,
                                     &out_tx,
-                                )
+                                ))
                                 .await
                                     && out_tx
                                         .send(SessionFrame::Wire {
@@ -2290,6 +2540,19 @@ async fn run_client_session_loop(
                     DaemonBroadcast::WorkspaceUpdated(workspace) => {
                         Some(WireMessage::WorkspaceUpdated { workspace })
                     }
+                    DaemonBroadcast::WorkspaceFilesChanged {
+                        workspace_id,
+                        cwd,
+                        changed_paths,
+                        git_changed,
+                        skills_or_rules_changed,
+                    } => Some(WireMessage::WorkspaceFilesChanged {
+                        workspace_id,
+                        cwd,
+                        changed_paths,
+                        git_changed,
+                        skills_or_rules_changed,
+                    }),
                     DaemonBroadcast::WorkspaceSetupProgress(progress) => {
                         Some(WireMessage::WorkspaceSetupProgress { progress })
                     }
@@ -2612,6 +2875,314 @@ async fn handle_peer_bridge_data(
         && let Some(removed) = bridges.remove(&bridge_id)
     {
         removed.task.abort();
+    }
+}
+
+fn send_session_frame_nonblocking(out_tx: &mpsc::Sender<SessionFrame>, frame: SessionFrame) {
+    match out_tx.try_send(frame) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(deferred)) => {
+            let tx = out_tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(deferred).await;
+            });
+        }
+    }
+}
+
+async fn wait_preview_service_cancelled(cancel_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    if *cancel_rx.borrow() {
+        return;
+    }
+    while cancel_rx.changed().await.is_ok() {
+        if *cancel_rx.borrow() {
+            return;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_preview_tunnel_open(
+    runtime: &Arc<DaemonRuntime>,
+    tunnels: &mut HashMap<Uuid, ActivePreviewTunnel>,
+    out_tx: &mpsc::Sender<SessionFrame>,
+    use_zstd: bool,
+    request_id: Uuid,
+    tunnel_id: Uuid,
+    target_port: u16,
+    proxy_host: Option<&str>,
+) {
+    tunnels.retain(|_, t| !t.task.is_finished());
+
+    if tunnels.len() >= MAX_CONCURRENT_PREVIEW_TUNNELS_PER_SESSION {
+        send_session_frame_nonblocking(
+            out_tx,
+            SessionFrame::Wire {
+                msg: rpc_err(
+                    request_id,
+                    "preview_tunnel_limit_reached",
+                    "maximum concurrent preview tunnels reached for this session",
+                ),
+                zstd: use_zstd,
+            },
+        );
+        return;
+    }
+    if tunnels.contains_key(&tunnel_id) {
+        send_session_frame_nonblocking(
+            out_tx,
+            SessionFrame::Wire {
+                msg: rpc_err(
+                    request_id,
+                    "preview_tunnel_duplicate",
+                    "duplicate tunnel_id",
+                ),
+                zstd: use_zstd,
+            },
+        );
+        return;
+    }
+
+    // Strict SSRF allowlist: ONLY loopback ports owned by a currently running registered
+    // workspace service instance on this daemon may be tunneled.
+    let Some(auth) = runtime
+        .orchestrator
+        .scripts
+        .resolve_allowed_preview_service(target_port, proxy_host)
+        .await
+    else {
+        send_session_frame_nonblocking(
+            out_tx,
+            SessionFrame::Wire {
+                msg: rpc_err(
+                    request_id,
+                    "preview_tunnel_forbidden",
+                    format!(
+                        "preview port {target_port} is not owned by a running registered workspace service on this host"
+                    ),
+                ),
+                zstd: use_zstd,
+            },
+        );
+        return;
+    };
+
+    let resolved_port = auth.target_port;
+    let (inbound_tx, mut inbound_rx) =
+        mpsc::channel::<QueuedPreviewBytes>(MAX_PREVIEW_TUNNEL_INBOUND_FRAMES);
+    let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let scripts = Arc::clone(&runtime.orchestrator.scripts);
+    let tx_out = out_tx.clone();
+
+    let handle = tokio::spawn(async move {
+        use base64::Engine as _;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        if tx_out
+            .send(SessionFrame::Wire {
+                msg: WireMessage::PreviewTunnelOpened {
+                    request_id,
+                    tunnel_id,
+                    target_port: resolved_port,
+                },
+                zstd: use_zstd,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let mut cancel_rx = auth.cancel_receiver();
+        let (bridge_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(scripts.serve_preview_tunnel_io(auth, server_io));
+        let _server_guard = AbortTaskOnDrop(server_task.abort_handle());
+
+        let (mut bridge_reader, mut bridge_writer) = tokio::io::split(bridge_io);
+
+        // Separate write and read pumps so a stalled writer never starves upstream reads and
+        // outbound WS backpressure never starves inbound writes.
+        let mut write_task = tokio::spawn(async move {
+            while let Some(chunk) = inbound_rx.recv().await {
+                if let Err(err) = bridge_writer.write_all(&chunk.data).await {
+                    return Err(format!("preview tunnel write failed: {err}"));
+                }
+                drop(chunk);
+            }
+            let _ = bridge_writer.shutdown().await;
+            Ok::<(), String>(())
+        });
+        let _write_guard = AbortTaskOnDrop(write_task.abort_handle());
+
+        let tx_out_read = tx_out.clone();
+        let mut read_task = tokio::spawn(async move {
+            let mut read_buf = vec![0u8; 32 * 1024];
+            loop {
+                match bridge_reader.read(&mut read_buf).await {
+                    Ok(0) => return Ok::<(), String>(()),
+                    Ok(n) => {
+                        let payload_b64 =
+                            base64::engine::general_purpose::STANDARD.encode(&read_buf[..n]);
+                        if tx_out_read
+                            .send(SessionFrame::Wire {
+                                msg: WireMessage::PreviewTunnelData {
+                                    tunnel_id,
+                                    payload_b64,
+                                },
+                                zstd: use_zstd,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return Err("session outbound closed".to_string());
+                        }
+                    }
+                    Err(err) => return Err(format!("preview tunnel read failed: {err}")),
+                }
+            }
+        });
+        let _read_guard = AbortTaskOnDrop(read_task.abort_handle());
+
+        let mut write_done = false;
+        let close_reason: Option<String> = loop {
+            tokio::select! {
+                read_res = &mut read_task => {
+                    break match read_res {
+                        Ok(Ok(())) => None,
+                        Ok(Err(err)) => Some(err),
+                        Err(_) => Some("preview tunnel read task aborted".to_string()),
+                    };
+                }
+                write_res = &mut write_task, if !write_done => {
+                    write_done = true;
+                    match write_res {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => break Some(err),
+                        Err(_) => break Some("preview tunnel write task aborted".to_string()),
+                    }
+                }
+                _ = wait_preview_service_cancelled(&mut cancel_rx) => {
+                    break Some("preview service stopped".to_string());
+                }
+            }
+        };
+
+        drop(_write_guard);
+        drop(_read_guard);
+        drop(_server_guard);
+
+        let _ = tx_out
+            .send(SessionFrame::Wire {
+                msg: WireMessage::PreviewTunnelClose {
+                    tunnel_id,
+                    reason: close_reason,
+                },
+                zstd: use_zstd,
+            })
+            .await;
+    });
+
+    tunnels.insert(
+        tunnel_id,
+        ActivePreviewTunnel {
+            inbound_tx,
+            queued_bytes,
+            task: handle.abort_handle(),
+        },
+    );
+}
+
+/// Strictly non-blocking preview tunnel inbound dispatcher.
+///
+/// NEVER awaits a slow tunnel; enforces per-tunnel frame cap (`MAX_PREVIEW_TUNNEL_INBOUND_FRAMES`),
+/// per-tunnel byte cap (`MAX_PREVIEW_TUNNEL_INBOUND_BYTES`), and session-wide byte cap
+/// (`MAX_SESSION_PREVIEW_TUNNEL_BYTES`). Any overflow or malformed/empty frame closes only the
+/// offending tunnel without stalling RPCs, terminals, or peer closes.
+fn handle_preview_tunnel_data(
+    tunnels: &mut HashMap<Uuid, ActivePreviewTunnel>,
+    session_queued_bytes: &Arc<std::sync::atomic::AtomicUsize>,
+    out_tx: &mpsc::Sender<SessionFrame>,
+    use_zstd: bool,
+    tunnel_id: Uuid,
+    payload_b64: &str,
+) {
+    use base64::Engine as _;
+
+    let close_tunnel = |tunnels: &mut HashMap<Uuid, ActivePreviewTunnel>, reason: &str| {
+        if let Some(removed) = tunnels.remove(&tunnel_id) {
+            removed.task.abort();
+        }
+        send_session_frame_nonblocking(
+            out_tx,
+            SessionFrame::Wire {
+                msg: WireMessage::PreviewTunnelClose {
+                    tunnel_id,
+                    reason: Some(reason.to_string()),
+                },
+                zstd: use_zstd,
+            },
+        );
+    };
+
+    if !tunnels.contains_key(&tunnel_id) {
+        return;
+    }
+    if payload_b64.is_empty() {
+        close_tunnel(tunnels, "empty preview tunnel frame");
+        return;
+    }
+    if payload_b64.len() > (MAX_PREVIEW_TUNNEL_FRAME_BYTES / 3 + 2) * 4 {
+        close_tunnel(tunnels, "preview tunnel frame exceeds size limit");
+        return;
+    }
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload_b64) else {
+        close_tunnel(tunnels, "invalid preview tunnel base64 payload");
+        return;
+    };
+    let len = bytes.len();
+    if len == 0 {
+        close_tunnel(tunnels, "empty preview tunnel frame");
+        return;
+    }
+    if len > MAX_PREVIEW_TUNNEL_FRAME_BYTES {
+        close_tunnel(tunnels, "preview tunnel frame exceeds size limit");
+        return;
+    }
+
+    let send_err_reason = {
+        let Some(tunnel) = tunnels.get(&tunnel_id) else {
+            return;
+        };
+        if !try_reserve_atomic_budget(&tunnel.queued_bytes, len, MAX_PREVIEW_TUNNEL_INBOUND_BYTES) {
+            Some("preview tunnel byte buffer overflow")
+        } else if !try_reserve_atomic_budget(
+            session_queued_bytes,
+            len,
+            MAX_SESSION_PREVIEW_TUNNEL_BYTES,
+        ) {
+            saturating_atomic_sub(&tunnel.queued_bytes, len);
+            Some("session preview tunnel byte budget exceeded")
+        } else {
+            let chunk = QueuedPreviewBytes {
+                data: bytes,
+                len,
+                tunnel_bytes: Arc::clone(&tunnel.queued_bytes),
+                session_bytes: Arc::clone(session_queued_bytes),
+            };
+            match tunnel.inbound_tx.try_send(chunk) {
+                Ok(()) => None,
+                Err(mpsc::error::TrySendError::Full(_dropped_chunk)) => {
+                    Some("preview tunnel frame queue overflow")
+                }
+                Err(mpsc::error::TrySendError::Closed(_dropped_chunk)) => {
+                    Some("preview tunnel closed")
+                }
+            }
+        }
+    };
+
+    if let Some(reason) = send_err_reason {
+        close_tunnel(tunnels, reason);
     }
 }
 
@@ -3347,6 +3918,449 @@ async fn handle_wire_rpc(
             });
             None
         }
+        WireMessage::GitStashList { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved).await {
+                    Ok(auth_cwd) => match crate::git_collab::git_stash_list(&auth_cwd).await {
+                        Ok(res) => WireMessage::GitCollabResponse {
+                            request_id,
+                            cwd,
+                            payload: orbit_protocol::GitCollabQueryResult::StashList(res),
+                        },
+                        Err(e) => rpc_err(request_id, e.code(), e),
+                    },
+                    Err(e) => rpc_err(request_id, "git_mutation_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitStashPush {
+            request_id,
+            cwd,
+            message,
+            include_untracked,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_git_repo_root_mutation(&store, &resolved).await {
+                    Ok(repo_root) => {
+                        match crate::git_collab::git_stash_push(
+                            &repo_root,
+                            message.as_deref(),
+                            include_untracked,
+                        )
+                        .await
+                        {
+                            Ok(res) => {
+                                symbol_index.invalidate(&repo_root);
+                                let mut status = inspect_git_status(&repo_root).await;
+                                status.cwd = cwd.clone();
+                                WireMessage::GitMutationResult {
+                                    request_id,
+                                    cwd,
+                                    result: orbit_protocol::GitMutationOutcome::StashMutated(res),
+                                    status: Some(status),
+                                }
+                            }
+                            Err(e) => rpc_err(request_id, e.code(), e),
+                        }
+                    }
+                    Err((msg, code)) => rpc_err(request_id, code, msg),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitStashApply {
+            request_id,
+            cwd,
+            stash_ref,
+            expected_oid,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_git_repo_root_mutation(&store, &resolved).await {
+                    Ok(repo_root) => {
+                        match crate::git_collab::git_stash_apply(
+                            &repo_root,
+                            &stash_ref,
+                            expected_oid.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(res) => {
+                                symbol_index.invalidate(&repo_root);
+                                let mut status = inspect_git_status(&repo_root).await;
+                                status.cwd = cwd.clone();
+                                WireMessage::GitMutationResult {
+                                    request_id,
+                                    cwd,
+                                    result: orbit_protocol::GitMutationOutcome::StashMutated(res),
+                                    status: Some(status),
+                                }
+                            }
+                            Err(e) => rpc_err(request_id, e.code(), e),
+                        }
+                    }
+                    Err((msg, code)) => rpc_err(request_id, code, msg),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitStashPop {
+            request_id,
+            cwd,
+            stash_ref,
+            expected_oid,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_git_repo_root_mutation(&store, &resolved).await {
+                    Ok(repo_root) => {
+                        match crate::git_collab::git_stash_pop(
+                            &repo_root,
+                            &stash_ref,
+                            expected_oid.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(res) => {
+                                symbol_index.invalidate(&repo_root);
+                                let mut status = inspect_git_status(&repo_root).await;
+                                status.cwd = cwd.clone();
+                                WireMessage::GitMutationResult {
+                                    request_id,
+                                    cwd,
+                                    result: orbit_protocol::GitMutationOutcome::StashMutated(res),
+                                    status: Some(status),
+                                }
+                            }
+                            Err(e) => rpc_err(request_id, e.code(), e),
+                        }
+                    }
+                    Err((msg, code)) => rpc_err(request_id, code, msg),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitStashDrop {
+            request_id,
+            cwd,
+            stash_ref,
+            expected_oid,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_git_repo_root_mutation(&store, &resolved).await {
+                    Ok(repo_root) => {
+                        match crate::git_collab::git_stash_drop(
+                            &repo_root,
+                            &stash_ref,
+                            expected_oid.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(res) => {
+                                let mut status = inspect_git_status(&repo_root).await;
+                                status.cwd = cwd.clone();
+                                WireMessage::GitMutationResult {
+                                    request_id,
+                                    cwd,
+                                    result: orbit_protocol::GitMutationOutcome::StashMutated(res),
+                                    status: Some(status),
+                                }
+                            }
+                            Err(e) => rpc_err(request_id, e.code(), e),
+                        }
+                    }
+                    Err((msg, code)) => rpc_err(request_id, code, msg),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitRebaseStatus { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved).await {
+                    Ok(auth_cwd) => match crate::git_collab::git_rebase_status(&auth_cwd).await {
+                        Ok(res) => WireMessage::GitCollabResponse {
+                            request_id,
+                            cwd,
+                            payload: orbit_protocol::GitCollabQueryResult::RebaseStatus(res),
+                        },
+                        Err(e) => rpc_err(request_id, e.code(), e),
+                    },
+                    Err(e) => rpc_err(request_id, "git_mutation_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitRebaseStart {
+            request_id,
+            cwd,
+            onto_ref,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_git_repo_root_mutation(&store, &resolved).await {
+                    Ok(repo_root) => {
+                        match crate::git_collab::git_rebase_start(&repo_root, &onto_ref).await {
+                            Ok(res) => {
+                                symbol_index.invalidate(&repo_root);
+                                let mut status = inspect_git_status(&repo_root).await;
+                                status.cwd = cwd.clone();
+                                WireMessage::GitMutationResult {
+                                    request_id,
+                                    cwd,
+                                    result: orbit_protocol::GitMutationOutcome::RebaseAction(res),
+                                    status: Some(status),
+                                }
+                            }
+                            Err(e) => rpc_err(request_id, e.code(), e),
+                        }
+                    }
+                    Err((msg, code)) => rpc_err(request_id, code, msg),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitRebaseContinue { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_git_repo_root_mutation(&store, &resolved).await {
+                    Ok(repo_root) => match crate::git_collab::git_rebase_continue(&repo_root).await
+                    {
+                        Ok(res) => {
+                            symbol_index.invalidate(&repo_root);
+                            let mut status = inspect_git_status(&repo_root).await;
+                            status.cwd = cwd.clone();
+                            WireMessage::GitMutationResult {
+                                request_id,
+                                cwd,
+                                result: orbit_protocol::GitMutationOutcome::RebaseAction(res),
+                                status: Some(status),
+                            }
+                        }
+                        Err(e) => rpc_err(request_id, e.code(), e),
+                    },
+                    Err((msg, code)) => rpc_err(request_id, code, msg),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitRebaseAbort { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_git_repo_root_mutation(&store, &resolved).await {
+                    Ok(repo_root) => match crate::git_collab::git_rebase_abort(&repo_root).await {
+                        Ok(res) => {
+                            symbol_index.invalidate(&repo_root);
+                            let mut status = inspect_git_status(&repo_root).await;
+                            status.cwd = cwd.clone();
+                            WireMessage::GitMutationResult {
+                                request_id,
+                                cwd,
+                                result: orbit_protocol::GitMutationOutcome::RebaseAction(res),
+                                status: Some(status),
+                            }
+                        }
+                        Err(e) => rpc_err(request_id, e.code(), e),
+                    },
+                    Err((msg, code)) => rpc_err(request_id, code, msg),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitRebaseSkip {
+            request_id,
+            cwd,
+            expected_step,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_git_repo_root_mutation(&store, &resolved).await {
+                    Ok(repo_root) => {
+                        match crate::git_collab::git_rebase_skip(&repo_root, expected_step).await {
+                            Ok(res) => {
+                                symbol_index.invalidate(&repo_root);
+                                let mut status = inspect_git_status(&repo_root).await;
+                                status.cwd = cwd.clone();
+                                WireMessage::GitMutationResult {
+                                    request_id,
+                                    cwd,
+                                    result: orbit_protocol::GitMutationOutcome::RebaseAction(res),
+                                    status: Some(status),
+                                }
+                            }
+                            Err(e) => rpc_err(request_id, e.code(), e),
+                        }
+                    }
+                    Err((msg, code)) => rpc_err(request_id, code, msg),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitListConflicts { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved).await {
+                    Ok(auth_cwd) => match crate::git_collab::git_list_conflicts(&auth_cwd).await {
+                        Ok(res) => WireMessage::GitCollabResponse {
+                            request_id,
+                            cwd,
+                            payload: orbit_protocol::GitCollabQueryResult::ConflictList(res),
+                        },
+                        Err(e) => rpc_err(request_id, e.code(), e),
+                    },
+                    Err(e) => rpc_err(request_id, "git_mutation_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitResolveConflict {
+            request_id,
+            cwd,
+            path,
+            block_index,
+            resolution,
+            auto_stage,
+            expected_sha256,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved).await {
+                    Ok(auth_cwd) => {
+                        match crate::git_collab::git_resolve_conflict(
+                            &auth_cwd,
+                            &path,
+                            block_index,
+                            &resolution,
+                            auto_stage,
+                            expected_sha256.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(res) => {
+                                symbol_index.invalidate(&auth_cwd);
+                                let mut status = inspect_git_status(&auth_cwd).await;
+                                status.cwd = cwd.clone();
+                                WireMessage::GitMutationResult {
+                                    request_id,
+                                    cwd,
+                                    result: orbit_protocol::GitMutationOutcome::ConflictResolved(
+                                        res,
+                                    ),
+                                    status: Some(status),
+                                }
+                            }
+                            Err(e) => rpc_err(request_id, e.code(), e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "git_mutation_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitPrStatus { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved).await {
+                    Ok(auth_cwd) => match crate::git_collab::git_pr_status(&auth_cwd).await {
+                        Ok(res) => WireMessage::GitCollabResponse {
+                            request_id,
+                            cwd,
+                            payload: orbit_protocol::GitCollabQueryResult::PrStatus(res),
+                        },
+                        Err(e) => rpc_err(request_id, e.code(), e),
+                    },
+                    Err(e) => rpc_err(request_id, "git_mutation_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitGenerateCommitMessage { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved).await {
+                    Ok(auth_cwd) => {
+                        match crate::git_collab::git_generate_commit_message(&auth_cwd).await {
+                            Ok(res) => WireMessage::GitCollabResponse {
+                                request_id,
+                                cwd,
+                                payload: orbit_protocol::GitCollabQueryResult::CommitMessage(res),
+                            },
+                            Err(e) => rpc_err(request_id, e.code(), e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "git_mutation_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
         WireMessage::ListWorkspaceFiles { request_id, cwd } => {
             let tx = out_tx.clone();
             let zstd = *use_zstd;
@@ -3394,6 +4408,71 @@ async fn handle_wire_rpc(
                         }
                     }
                     Err(e) => rpc_err(request_id, "search_symbols_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::SearchMessages {
+            request_id,
+            query,
+            agent_id,
+            limit,
+        } => {
+            let trimmed_query = query.trim().to_string();
+            let scoped_agent_id = agent_id
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let effective_limit = match limit {
+                Some(0) => 0usize,
+                Some(n) => (n as usize).min(100),
+                None => {
+                    if scoped_agent_id.is_some() {
+                        100
+                    } else {
+                        20
+                    }
+                }
+            };
+            if trimmed_query.is_empty() || effective_limit == 0 {
+                return Some(WireMessage::SearchMessagesResult {
+                    request_id,
+                    hits: Vec::new(),
+                });
+            }
+
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let outcome = tokio::task::spawn_blocking(move || {
+                    store.search_daemon_messages_scoped(
+                        &trimmed_query,
+                        scoped_agent_id.as_deref(),
+                        effective_limit,
+                    )
+                })
+                .await;
+                let reply = match outcome {
+                    Ok(Ok(rows)) => WireMessage::SearchMessagesResult {
+                        request_id,
+                        hits: rows
+                            .into_iter()
+                            .map(|h| orbit_protocol::RemoteMessageSearchHit {
+                                agent_id: h.agent_id,
+                                seq: h.seq,
+                                turn_id: h.turn_id,
+                                role: h.role,
+                                snippet: h.snippet,
+                                timestamp: h.timestamp,
+                                bm25_score: h.bm25_score,
+                                agent_title: h.agent_title,
+                                cwd: h.cwd,
+                            })
+                            .collect(),
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "search_messages_failed", e),
+                    Err(e) => rpc_err(request_id, "search_messages_failed", e),
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });
@@ -3483,16 +4562,12 @@ async fn handle_wire_rpc(
                                     "path": &hook_path,
                                     "source": "workspace_editor",
                                 });
-                                tokio::spawn(async move {
-                                    let _ = hooks
-                                        .dispatch_event(
-                                            orbit_protocol::HookEventKind::PostFileEdit,
-                                            Some(&hook_cwd),
-                                            Some(&hook_path),
-                                            hook_payload,
-                                        )
-                                        .await;
-                                });
+                                let _ = hooks.dispatch_event_async_with_targets(
+                                    orbit_protocol::HookEventKind::PostFileEdit,
+                                    Some(hook_cwd),
+                                    vec![hook_path],
+                                    hook_payload,
+                                );
                             }
                             WireMessage::WorkspaceFileWritten {
                                 request_id,
@@ -4361,13 +5436,46 @@ async fn handle_wire_rpc(
             agent_id,
             permission_request_id,
             decision,
+            agent_originated,
+        } => {
+            let res = if agent_originated {
+                runtime
+                    .orchestrator
+                    .resolve_permission_by_agent(&agent_id, permission_request_id, decision)
+                    .await
+            } else {
+                runtime
+                    .orchestrator
+                    .resolve_permission(&agent_id, permission_request_id, decision)
+                    .await
+            };
+            match res {
+                Ok(()) => Some(WireMessage::Ack { request_id }),
+                Err(e) => Some(rpc_err(request_id, "resolve_permission_failed", e)),
+            }
+        }
+        WireMessage::ResolvePlanApproval {
+            request_id,
+            agent_id,
+            permission_request_id,
+            action,
+            edited_plan_markdown,
+            feedback,
+            target_mode,
         } => match runtime
             .orchestrator
-            .resolve_permission(&agent_id, permission_request_id, decision)
+            .resolve_plan_approval(
+                &agent_id,
+                permission_request_id,
+                action,
+                edited_plan_markdown,
+                feedback,
+                target_mode,
+            )
             .await
         {
             Ok(()) => Some(WireMessage::Ack { request_id }),
-            Err(e) => Some(rpc_err(request_id, "resolve_permission_failed", e)),
+            Err(e) => Some(rpc_err(request_id, "resolve_plan_approval_failed", e)),
         },
         WireMessage::AnswerQuestion {
             request_id,
@@ -5116,6 +6224,242 @@ async fn handle_wire_rpc(
             });
             None
         }
+        WireMessage::LspHover {
+            request_id,
+            cwd,
+            path,
+            line,
+            col,
+            content,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match lsp
+                            .hover(&authorized_cwd, &path, line, col, content.as_deref())
+                            .await
+                        {
+                            Ok(hover) => WireMessage::LspHoverResponse {
+                                request_id,
+                                cwd,
+                                hover,
+                            },
+                            Err(e) => rpc_err(request_id, "lsp_hover_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::LspReferences {
+            request_id,
+            cwd,
+            path,
+            line,
+            col,
+            include_declaration,
+            content,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match lsp
+                            .references(
+                                &authorized_cwd,
+                                &path,
+                                line,
+                                col,
+                                include_declaration,
+                                content.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(references) => WireMessage::LspReferencesResponse {
+                                request_id,
+                                cwd,
+                                references,
+                            },
+                            Err(e) => rpc_err(request_id, "lsp_references_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::LspCompletion {
+            request_id,
+            cwd,
+            path,
+            line,
+            col,
+            trigger_character,
+            content,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match lsp
+                            .completion(
+                                &authorized_cwd,
+                                &path,
+                                line,
+                                col,
+                                trigger_character.as_deref(),
+                                content.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(items) => WireMessage::LspCompletionResponse {
+                                request_id,
+                                cwd,
+                                items,
+                            },
+                            Err(e) => rpc_err(request_id, "lsp_completion_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::LspCodeActionRequest {
+            request_id,
+            cwd,
+            path,
+            line,
+            col,
+            end_line,
+            end_col,
+            diagnostics,
+            content,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match lsp
+                            .code_action(
+                                &authorized_cwd,
+                                &path,
+                                orbit_protocol::LspRange {
+                                    line,
+                                    col,
+                                    end_line,
+                                    end_col,
+                                },
+                                &diagnostics,
+                                content.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(actions) => WireMessage::LspCodeActionResponse {
+                                request_id,
+                                cwd,
+                                actions,
+                            },
+                            Err(e) => rpc_err(request_id, "lsp_code_action_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::LspRename {
+            request_id,
+            cwd,
+            path,
+            line,
+            col,
+            new_name,
+            content,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match lsp
+                            .rename(
+                                &authorized_cwd,
+                                &path,
+                                line,
+                                col,
+                                &new_name,
+                                content.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(result) => WireMessage::LspWorkspaceEditResponse {
+                                request_id,
+                                cwd,
+                                result,
+                            },
+                            Err(e) => rpc_err(request_id, "lsp_rename_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::LspApplyWorkspaceEdit {
+            request_id,
+            cwd,
+            edit,
+        } => {
+            let lsp = Arc::clone(&runtime.lsp);
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved_cwd).await {
+                    Ok(authorized_cwd) => {
+                        match lsp.apply_workspace_edit(&authorized_cwd, &edit).await {
+                            Ok(result) => WireMessage::LspWorkspaceEditResponse {
+                                request_id,
+                                cwd,
+                                result,
+                            },
+                            Err(e) => rpc_err(request_id, "lsp_apply_workspace_edit_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "lsp_cwd_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
         WireMessage::RestartLspServer {
             request_id,
             cwd,
@@ -5242,6 +6586,55 @@ async fn handle_wire_rpc(
                 Err(e) => Some(rpc_err(request_id, "update_guardian_config_failed", e)),
             }
         }
+
+        // Fine-Grained Persistent Permission Rules Engine & Safe Batch Approval
+        WireMessage::ListPermissionRules {
+            request_id,
+            project_cwd,
+        } => match runtime
+            .orchestrator
+            .list_permission_rules(project_cwd.as_deref())
+        {
+            Ok(rules) => Some(WireMessage::PermissionRulesSnapshot { request_id, rules }),
+            Err(e) => Some(rpc_err(request_id, "list_permission_rules_failed", e)),
+        },
+        WireMessage::UpsertPermissionRule { request_id, rule } => {
+            match runtime.orchestrator.upsert_permission_rule(rule) {
+                Ok(saved) => Some(WireMessage::PermissionRuleUpdated {
+                    request_id,
+                    rule: saved,
+                }),
+                Err(e) => Some(rpc_err(request_id, "upsert_permission_rule_failed", e)),
+            }
+        }
+        WireMessage::DeletePermissionRule {
+            request_id,
+            rule_id,
+        } => match runtime.orchestrator.delete_permission_rule(&rule_id) {
+            Ok(deleted) => Some(WireMessage::PermissionRuleDeleted {
+                request_id,
+                rule_id,
+                deleted,
+            }),
+            Err(e) => Some(rpc_err(request_id, "delete_permission_rule_failed", e)),
+        },
+        WireMessage::ResolvePermissionsBatch {
+            request_id,
+            items,
+            decision,
+        } => match runtime
+            .orchestrator
+            .resolve_permissions_batch(items, decision)
+            .await
+        {
+            Ok(result) => Some(WireMessage::PermissionsBatchResolved {
+                request_id,
+                resolved_count: result.resolved_count,
+                skipped_count: result.skipped_count,
+                skipped_reasons: result.skipped_reasons,
+            }),
+            Err(e) => Some(rpc_err(request_id, "resolve_permissions_batch_failed", e)),
+        },
 
         // Unattended Autonomous Goal Mode & Streaming Monitor Engine
         WireMessage::StartGoalRun {
@@ -5423,11 +6816,28 @@ async fn handle_wire_rpc(
             headless,
             viewport_width,
             viewport_height,
+            workspace_root,
         } => {
             let browser = Arc::clone(&runtime.browser);
+            let store = Arc::clone(&runtime.store);
             let tx = out_tx.clone();
             let zstd = *use_zstd;
             tokio::spawn(async move {
+                // Security: when owned by an agent, ALWAYS bind workspace_root authoritatively
+                // from the agent's recorded `cwd` so callers cannot widen upload confinement.
+                let resolved_root = if let Some(ref aid) = agent_id {
+                    store
+                        .get_agent(aid)
+                        .ok()
+                        .flatten()
+                        .map(|a| PathBuf::from(a.cwd))
+                } else {
+                    workspace_root
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                };
                 let reply = match browser
                     .create_session(CreateBrowserSessionSpec {
                         agent_id,
@@ -5435,6 +6845,7 @@ async fn handle_wire_rpc(
                         headless,
                         viewport_width,
                         viewport_height,
+                        workspace_root: resolved_root,
                     })
                     .await
                 {
@@ -5455,10 +6866,28 @@ async fn handle_wire_rpc(
             action,
         } => {
             let browser = Arc::clone(&runtime.browser);
+            let store = Arc::clone(&runtime.store);
             let tx = out_tx.clone();
             let zstd = *use_zstd;
             tokio::spawn(async move {
-                let reply = match browser.execute_action(&session_id, action).await {
+                let mut extra_roots: Vec<PathBuf> = Vec::new();
+                if let Ok(Some(owner_agent_id)) = browser.get_session_owner(&session_id).await
+                    && let Ok(Some(agent)) = store.get_agent(&owner_agent_id)
+                {
+                    extra_roots.push(PathBuf::from(&agent.cwd));
+                    if !agent.workspace_id.is_empty()
+                        && let Ok(Some(ws)) = store.get_workspace(&agent.workspace_id)
+                    {
+                        extra_roots.push(PathBuf::from(&ws.cwd));
+                        if let Some(ref src) = ws.source_cwd {
+                            extra_roots.push(PathBuf::from(src));
+                        }
+                    }
+                }
+                let reply = match browser
+                    .execute_action_with_allowed_roots(&session_id, action, &extra_roots)
+                    .await
+                {
                     Ok(outcome) => WireMessage::BrowserActionResponse {
                         request_id,
                         session: outcome.session,
@@ -5466,6 +6895,7 @@ async fn handle_wire_rpc(
                         screenshot_base64: outcome.screenshot_base64,
                         text_excerpt: outcome.text_excerpt,
                         captcha_detected: outcome.captcha_detected,
+                        picked_element: outcome.picked_element,
                     },
                     Err(e) => rpc_err(request_id, "execute_browser_action_failed", e),
                 };
@@ -5746,6 +7176,7 @@ async fn handle_wire_rpc(
             language,
             mime_type,
             resource_uri,
+            mcp_server_name: _,
             content,
             summary_note,
         } => {
@@ -5763,6 +7194,9 @@ async fn handle_wire_rpc(
                         language,
                         mime_type,
                         resource_uri,
+                        // SECURITY: client/user UpsertArtifact RPCs cannot spoof trusted MCP
+                        // server ownership; only daemon-trusted MCP tool extraction binds a server.
+                        mcp_server_name: None,
                         content,
                         summary_note,
                     })
@@ -5775,6 +7209,102 @@ async fn handle_wire_rpc(
                     },
                     Ok(Err(e)) => rpc_err(request_id, "upsert_artifact_failed", e),
                     Err(e) => rpc_err(request_id, "upsert_artifact_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::ReadMcpResource {
+            request_id,
+            artifact_id,
+            artifact_version,
+            uri,
+        } => {
+            let home = runtime.home_dir.clone();
+            let store = Arc::clone(&runtime.store);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                // Strictly resolve the bound MCP server AND workspace cwd from the persisted
+                // artifact revision (never from caller-supplied server_name or active agent cwd).
+                let resolved =
+                    resolve_bound_artifact_mcp_owner(&store, &artifact_id, artifact_version).await;
+                let (owner_server, artifact_ws_cwd) = match resolved {
+                    Ok(pair) => pair,
+                    Err((code, msg)) => {
+                        let _ = tx
+                            .send(SessionFrame::Wire {
+                                msg: rpc_err(request_id, code, msg),
+                                zstd,
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                let reply = match crate::mcp_servers::read_mcp_resource(
+                    &home,
+                    &owner_server,
+                    &uri,
+                    artifact_ws_cwd.as_deref(),
+                )
+                .await
+                {
+                    Ok(content) => WireMessage::McpResourceResponse {
+                        request_id,
+                        server_name: owner_server,
+                        uri,
+                        content,
+                    },
+                    Err(e) => rpc_err(request_id, "read_mcp_resource_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::CallArtifactMcpTool {
+            request_id,
+            artifact_id,
+            artifact_version,
+            tool_name,
+            arguments,
+        } => {
+            let home = runtime.home_dir.clone();
+            let store = Arc::clone(&runtime.store);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                // Strictly resolve the bound MCP server AND workspace cwd from the persisted
+                // artifact revision (never from caller-supplied cwd or active agent cwd).
+                let resolved =
+                    resolve_bound_artifact_mcp_owner(&store, &artifact_id, artifact_version).await;
+                let (owner_server, artifact_ws_cwd) = match resolved {
+                    Ok(pair) => pair,
+                    Err((code, msg)) => {
+                        let _ = tx
+                            .send(SessionFrame::Wire {
+                                msg: rpc_err(request_id, code, msg),
+                                zstd,
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                let reply = match crate::mcp_servers::call_mcp_tool(
+                    &home,
+                    &owner_server,
+                    &tool_name,
+                    arguments,
+                    artifact_ws_cwd.as_deref(),
+                )
+                .await
+                {
+                    Ok(outcome) => WireMessage::ArtifactMcpToolResponse {
+                        request_id,
+                        artifact_id,
+                        tool_name,
+                        outcome,
+                    },
+                    Err(e) => rpc_err(request_id, "call_artifact_mcp_tool_failed", e),
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });
@@ -7040,9 +8570,12 @@ async fn handle_wire_rpc(
             name,
             platform,
             enabled,
+            transport_mode,
             app_id,
             primary_secret,
             signing_secret,
+            app_token,
+            public_key,
             keep_existing_secrets,
             allowed_chat_ids,
             allowed_user_ids,
@@ -7062,9 +8595,12 @@ async fn handle_wire_rpc(
                     name,
                     platform,
                     enabled,
+                    transport_mode,
                     app_id,
                     primary_secret,
                     signing_secret,
+                    app_token,
+                    public_key,
                     keep_existing_secrets,
                     allowed_chat_ids,
                     allowed_user_ids,
@@ -8004,6 +9540,72 @@ async fn authorize_optional_mcp_cwd(
     Ok(Some(authorized))
 }
 
+/// Strictly resolve the owning MCP server name and persisted workspace `cwd` for a stored
+/// artifact revision (`artifact_id`, optional `artifact_version`).
+///
+/// SECURITY: Never accepts caller-supplied `server_name` or active-agent `cwd`, preventing
+/// cross-project server hijacking when identically named servers exist in multiple repos.
+async fn resolve_bound_artifact_mcp_owner(
+    store: &Arc<OrbitStore>,
+    artifact_id: &str,
+    artifact_version: Option<u32>,
+) -> Result<(String, Option<PathBuf>), (&'static str, String)> {
+    let aid_lookup = artifact_id.trim().to_string();
+    if aid_lookup.is_empty() {
+        return Err((
+            "artifact_not_found",
+            "Artifact ID must not be empty".to_string(),
+        ));
+    }
+    let store_lookup = Arc::clone(store);
+    let lookup_res = tokio::task::spawn_blocking(move || {
+        let detail = store_lookup.get_artifact(&aid_lookup, artifact_version)?;
+        let ws_cwd = detail
+            .as_ref()
+            .and_then(|d| {
+                store_lookup
+                    .get_workspace(&d.summary.workspace_id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|w| PathBuf::from(w.cwd));
+        Ok::<_, orbit_store::StoreError>((detail, ws_cwd))
+    })
+    .await;
+
+    let (detail, ws_cwd) = match lookup_res {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return Err(("artifact_lookup_failed", e.to_string())),
+        Err(e) => return Err(("artifact_lookup_failed", e.to_string())),
+    };
+
+    let Some(detail) = detail else {
+        return Err((
+            "artifact_not_found",
+            format!("Artifact `{artifact_id}` not found"),
+        ));
+    };
+
+    let Some(owner_server) = detail
+        .summary
+        .mcp_server_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+    else {
+        return Err((
+            "artifact_mcp_server_unbound",
+            format!(
+                "Artifact `{artifact_id}` (v{}) is not bound to an owning external MCP server",
+                detail.summary.version
+            ),
+        ));
+    };
+
+    Ok((owner_server, ws_cwd))
+}
+
 /// Authorize an optional Lifecycle Hooks workspace `cwd` against registered/discovered host
 /// workspaces (`None`, `""`, or `"~"` maps to user-global hooks only).
 async fn authorize_optional_hooks_cwd(
@@ -8297,6 +9899,86 @@ mod self_upgrade_tests {
                 .await
                 .is_err()
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn resolve_bound_artifact_mcp_owner_scopes_to_persisted_workspace_and_revision() {
+        let root = std::env::temp_dir().join(format!("orbit_art_owner_{}", Uuid::new_v4()));
+        let ws_a = root.join("ws_a");
+        std::fs::create_dir_all(&ws_a).expect("mkdir ws_a");
+        let store = Arc::new(OrbitStore::open(root.join("orbit.db")).expect("open store"));
+        let now = chrono::Utc::now();
+        store
+            .upsert_workspace(&orbit_protocol::WorkspaceSummary {
+                workspace_id: "ws_a".into(),
+                title: "Workspace A".into(),
+                cwd: ws_a.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                is_curated: false,
+                auto_clustered: false,
+            })
+            .expect("upsert ws_a");
+
+        // v1 bound to `analytics`
+        store
+            .upsert_artifact(orbit_store::UpsertArtifactInput {
+                artifact_id: Some("art_scoped".into()),
+                workspace_id: "ws_a".into(),
+                agent_id: None,
+                title: "Scoped App".into(),
+                kind: orbit_protocol::ArtifactKind::McpApp,
+                language: Some("html".into()),
+                mime_type: None,
+                resource_uri: Some("ui://analytics/v1".into()),
+                mcp_server_name: Some("analytics".into()),
+                content: "<div>v1</div>".into(),
+                summary_note: None,
+            })
+            .expect("v1");
+
+        // v2 edited without MCP owner -> must NOT inherit v1's server binding
+        store
+            .upsert_artifact(orbit_store::UpsertArtifactInput {
+                artifact_id: Some("art_scoped".into()),
+                workspace_id: "ws_a".into(),
+                agent_id: None,
+                title: "Scoped App".into(),
+                kind: orbit_protocol::ArtifactKind::Html,
+                language: Some("html".into()),
+                mime_type: None,
+                resource_uri: Some("ui://analytics/v1".into()),
+                mcp_server_name: None,
+                content: "<div>v2</div>".into(),
+                summary_note: None,
+            })
+            .expect("v2");
+
+        // v1 resolves strictly to `analytics` + persisted `ws_a` cwd
+        let (srv, resolved_cwd) = resolve_bound_artifact_mcp_owner(&store, "art_scoped", Some(1))
+            .await
+            .expect("v1 bound");
+        assert_eq!(srv, "analytics");
+        assert_eq!(resolved_cwd, Some(ws_a.clone()));
+
+        // Latest (v2) is unbound and MUST be rejected with `artifact_mcp_server_unbound`
+        let (code, _) = resolve_bound_artifact_mcp_owner(&store, "art_scoped", None)
+            .await
+            .expect_err("v2 unbound");
+        assert_eq!(code, "artifact_mcp_server_unbound");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -9443,6 +11125,408 @@ mod self_upgrade_tests {
                 .expect("join")
                 .expect("valid encrypted Hello must succeed");
             assert!(matches!(decoded, WireMessage::Hello { client_id, .. } if client_id == "c1"));
+        }
+    }
+
+    #[tokio::test]
+    async fn search_messages_rpc_queries_daemon_fts5_with_ascii_cjk_and_agent_scoping() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{
+            connect_async,
+            tungstenite::{
+                Message as TungMsg,
+                client::IntoClientRequest,
+                http::{HeaderValue, header::AUTHORIZATION},
+            },
+        };
+
+        let home = std::env::temp_dir().join(format!("orbit_ws_search_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let (addr, runtime) = spawn_embedded_daemon(home.clone(), None)
+            .await
+            .expect("spawn daemon");
+
+        let now = chrono::Utc::now();
+        runtime
+            .store
+            .upsert_workspace(&orbit_protocol::WorkspaceSummary {
+                workspace_id: "ws_search_rpc".into(),
+                title: "Orbit Search RPC".into(),
+                cwd: "/workspace/orbit-rpc".into(),
+                git_branch: Some("main".into()),
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert workspace");
+
+        let make_agent = |id: &str, title: &str, cwd: &str| orbit_protocol::AgentSummary {
+            agent_id: id.into(),
+            workspace_id: "ws_search_rpc".into(),
+            cwd: cwd.into(),
+            title: title.into(),
+            provider: orbit_protocol::ProviderKind::ClaudeCode,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: orbit_protocol::SessionMode::Default,
+            status: orbit_protocol::AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 1,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: orbit_protocol::AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
+        };
+
+        runtime
+            .store
+            .upsert_agent(
+                &make_agent("ag_s1", "RPC Engine", "/workspace/orbit-rpc"),
+                None,
+            )
+            .expect("ag_s1");
+        runtime
+            .store
+            .upsert_agent(
+                &make_agent("ag_s2", "中文检索测试", "/workspace/orbit-cjk"),
+                None,
+            )
+            .expect("ag_s2");
+
+        let ev1 = runtime
+            .store
+            .append_timeline_event(
+                "ag_s1",
+                1,
+                Some("t_early"),
+                orbit_protocol::TimelinePayload::UserPrompt {
+                    message_id: "u1".into(),
+                    text: "Investigate quasar_rpc_needle on historical turn 1".into(),
+                    badges: Vec::new(),
+                },
+            )
+            .expect("ev1");
+        let ev2 = runtime
+            .store
+            .append_timeline_event(
+                "ag_s1",
+                1,
+                Some("t_late"),
+                orbit_protocol::TimelinePayload::AssistantMessage {
+                    item_id: "a1".into(),
+                    text: "Resolved quasar_rpc_needle with FTS5 remote search".into(),
+                    streaming: false,
+                },
+            )
+            .expect("ev2");
+        let ev3 = runtime
+            .store
+            .append_timeline_event(
+                "ag_s2",
+                1,
+                Some("t_cjk"),
+                orbit_protocol::TimelinePayload::AssistantMessage {
+                    item_id: "a2".into(),
+                    text: "确认 quasar_rpc_needle 在远程历史全文搜索中生效".into(),
+                    streaming: false,
+                },
+            )
+            .expect("ev3");
+
+        let ws_url = format!("ws://{addr}/ws");
+        let mut req = ws_url.as_str().into_client_request().expect("ws req");
+        req.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", runtime.pairing_secret)).expect("hdr"),
+        );
+        let (mut ws, _) = connect_async(req).await.expect("connect ws");
+
+        // Complete Hello handshake
+        let hello = WireMessage::Hello {
+            client_id: "search-test-client".into(),
+            client_name: "Test".into(),
+            protocol_version: orbit_protocol::PROTOCOL_VERSION,
+            supports_zstd: false,
+        };
+        ws.send(TungMsg::Text(
+            serde_json::to_string(&hello).expect("ser hello").into(),
+        ))
+        .await
+        .expect("send hello");
+        let _welcome = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .expect("welcome timeout")
+            .expect("welcome frame")
+            .expect("welcome ok");
+
+        async fn rpc_search(
+            ws: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            query: &str,
+            agent_id: Option<&str>,
+            limit: Option<u32>,
+        ) -> Vec<orbit_protocol::RemoteMessageSearchHit> {
+            let req_id = Uuid::new_v4();
+            let msg = WireMessage::SearchMessages {
+                request_id: req_id,
+                query: query.to_string(),
+                agent_id: agent_id.map(str::to_string),
+                limit,
+            };
+            ws.send(TungMsg::Text(
+                serde_json::to_string(&msg).expect("ser").into(),
+            ))
+            .await
+            .expect("send search");
+            loop {
+                let frame = tokio::time::timeout(Duration::from_secs(3), ws.next())
+                    .await
+                    .expect("resp timeout")
+                    .expect("resp stream")
+                    .expect("resp ok");
+                let text = match frame {
+                    TungMsg::Text(t) => t.to_string(),
+                    TungMsg::Binary(b) => {
+                        match WireMessage::decode_zstd(&b).expect("decode zstd") {
+                            WireMessage::SearchMessagesResult { request_id, hits }
+                                if request_id == req_id =>
+                            {
+                                return hits;
+                            }
+                            _ => continue,
+                        }
+                    }
+                    _ => continue,
+                };
+                if let Ok(WireMessage::SearchMessagesResult { request_id, hits }) =
+                    serde_json::from_str::<WireMessage>(&text)
+                    && request_id == req_id
+                {
+                    return hits;
+                }
+            }
+        }
+
+        // 1. Global search returns 1 best match per conversation (2 total)
+        let global_hits = rpc_search(&mut ws, "quasar_rpc_needle", None, Some(20)).await;
+        assert_eq!(global_hits.len(), 2);
+        assert!(global_hits.iter().any(|h| h.agent_id == "ag_s1"
+            && h.agent_title == "RPC Engine"
+            && h.cwd == "/workspace/orbit-rpc"));
+        assert!(global_hits.iter().any(|h| h.agent_id == "ag_s2"
+            && h.agent_title == "中文检索测试"
+            && h.cwd == "/workspace/orbit-cjk"));
+
+        // 2. Agent-scoped search returns BOTH events in ag_s1 and none from ag_s2
+        let scoped_hits = rpc_search(&mut ws, "quasar_rpc_needle", Some("ag_s1"), Some(50)).await;
+        assert_eq!(scoped_hits.len(), 2);
+        assert!(scoped_hits.iter().all(|h| h.agent_id == "ag_s1"));
+        assert!(
+            scoped_hits
+                .iter()
+                .any(|h| h.seq == ev1.seq && h.turn_id.as_deref() == Some("t_early"))
+        );
+        assert!(
+            scoped_hits
+                .iter()
+                .any(|h| h.seq == ev2.seq && h.turn_id.as_deref() == Some("t_late"))
+        );
+
+        // 3. CJK query matches ag_s2 with highlighted <mark> snippet
+        let cjk_hits = rpc_search(&mut ws, "远程历史全文搜索", None, Some(20)).await;
+        assert_eq!(cjk_hits.len(), 1);
+        assert_eq!(cjk_hits[0].agent_id, "ag_s2");
+        assert_eq!(cjk_hits[0].seq, ev3.seq);
+        assert!(
+            cjk_hits[0]
+                .snippet
+                .contains("<mark>远程历史全文搜索</mark>")
+        );
+
+        // 4. Empty query & limit=0 return empty cleanly
+        assert!(rpc_search(&mut ws, "   ", None, Some(10)).await.is_empty());
+        assert!(
+            rpc_search(&mut ws, "quasar_rpc_needle", None, Some(0))
+                .await
+                .is_empty()
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn preview_tunnel_overflow_closes_tunnel_nonblockingly_and_refunds_budget() {
+        use base64::Engine as _;
+
+        let session_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(16);
+
+        // 1. Frame queue overflow on a stalled tunnel closes non-blockingly and refunds bytes.
+        {
+            let tid = Uuid::new_v4();
+            let (inbound_tx, inbound_rx) =
+                mpsc::channel::<QueuedPreviewBytes>(MAX_PREVIEW_TUNNEL_INBOUND_FRAMES);
+            let stalled_task = tokio::spawn(std::future::pending::<()>());
+            let mut tunnels = HashMap::new();
+            tunnels.insert(
+                tid,
+                ActivePreviewTunnel {
+                    inbound_tx,
+                    queued_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    task: stalled_task.abort_handle(),
+                },
+            );
+
+            let frame_b64 = base64::engine::general_purpose::STANDARD.encode(b"chunk-16-bytes!!");
+            for _ in 0..MAX_PREVIEW_TUNNEL_INBOUND_FRAMES {
+                handle_preview_tunnel_data(
+                    &mut tunnels,
+                    &session_bytes,
+                    &out_tx,
+                    false,
+                    tid,
+                    &frame_b64,
+                );
+            }
+            assert!(tunnels.contains_key(&tid));
+            assert_eq!(
+                session_bytes.load(std::sync::atomic::Ordering::Acquire),
+                MAX_PREVIEW_TUNNEL_INBOUND_FRAMES * 16
+            );
+
+            // 65th frame MUST NOT block and MUST close & evict only the stalled tunnel.
+            handle_preview_tunnel_data(
+                &mut tunnels,
+                &session_bytes,
+                &out_tx,
+                false,
+                tid,
+                &frame_b64,
+            );
+            assert!(
+                !tunnels.contains_key(&tid),
+                "overflowed tunnel must be evicted immediately"
+            );
+            let close_frame = out_rx.try_recv().expect("PreviewTunnelClose emitted");
+            match close_frame {
+                SessionFrame::Wire {
+                    msg:
+                        WireMessage::PreviewTunnelClose {
+                            tunnel_id,
+                            reason: Some(reason),
+                        },
+                    ..
+                } => {
+                    assert_eq!(tunnel_id, tid);
+                    assert!(reason.contains("overflow"), "unexpected reason: {reason}");
+                }
+                _ => panic!("expected PreviewTunnelClose wire frame on overflow"),
+            }
+            // Dropping the stalled receiver refunds every queued byte cleanly.
+            drop(inbound_rx);
+            assert_eq!(session_bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+        }
+
+        // 2. Per-tunnel 4 MiB byte budget overflow closes non-blockingly and refunds bytes.
+        {
+            let tid = Uuid::new_v4();
+            let (inbound_tx, inbound_rx) =
+                mpsc::channel::<QueuedPreviewBytes>(MAX_PREVIEW_TUNNEL_INBOUND_FRAMES);
+            let stalled_task = tokio::spawn(std::future::pending::<()>());
+            let mut tunnels = HashMap::new();
+            tunnels.insert(
+                tid,
+                ActivePreviewTunnel {
+                    inbound_tx,
+                    queued_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    task: stalled_task.abort_handle(),
+                },
+            );
+
+            let big_b64 = base64::engine::general_purpose::STANDARD
+                .encode(vec![0xABu8; MAX_PREVIEW_TUNNEL_FRAME_BYTES]);
+            let max_frames_in_4mib =
+                MAX_PREVIEW_TUNNEL_INBOUND_BYTES / MAX_PREVIEW_TUNNEL_FRAME_BYTES;
+            for _ in 0..max_frames_in_4mib {
+                handle_preview_tunnel_data(
+                    &mut tunnels,
+                    &session_bytes,
+                    &out_tx,
+                    false,
+                    tid,
+                    &big_b64,
+                );
+            }
+            assert!(tunnels.contains_key(&tid));
+            handle_preview_tunnel_data(&mut tunnels, &session_bytes, &out_tx, false, tid, &big_b64);
+            assert!(!tunnels.contains_key(&tid));
+            let close_frame = out_rx.try_recv().expect("byte-budget close emitted");
+            assert!(matches!(
+                close_frame,
+                SessionFrame::Wire {
+                    msg: WireMessage::PreviewTunnelClose { tunnel_id, reason: Some(ref r) },
+                    ..
+                } if tunnel_id == tid && r.contains("byte buffer overflow")
+            ));
+            drop(inbound_rx);
+            assert_eq!(session_bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+        }
+
+        // 3. Empty PreviewTunnelData frame is rejected and closes the tunnel cleanly.
+        {
+            let tid = Uuid::new_v4();
+            let (inbound_tx, _inbound_rx) =
+                mpsc::channel::<QueuedPreviewBytes>(MAX_PREVIEW_TUNNEL_INBOUND_FRAMES);
+            let stalled_task = tokio::spawn(std::future::pending::<()>());
+            let mut tunnels = HashMap::new();
+            tunnels.insert(
+                tid,
+                ActivePreviewTunnel {
+                    inbound_tx,
+                    queued_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    task: stalled_task.abort_handle(),
+                },
+            );
+            handle_preview_tunnel_data(&mut tunnels, &session_bytes, &out_tx, false, tid, "");
+            assert!(!tunnels.contains_key(&tid));
+            let close_frame = out_rx.try_recv().expect("empty-frame close emitted");
+            assert!(matches!(
+                close_frame,
+                SessionFrame::Wire {
+                    msg: WireMessage::PreviewTunnelClose { tunnel_id, reason: Some(ref r) },
+                    ..
+                } if tunnel_id == tid && r.contains("empty")
+            ));
         }
     }
 }

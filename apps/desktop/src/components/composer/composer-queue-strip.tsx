@@ -1,9 +1,13 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CornerDownRight,
+  Folder,
+  GitPullRequest,
+  Globe,
   GripVertical,
   Image as ImageIcon,
   Sparkles,
+  Terminal,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -31,6 +35,10 @@ const MAX_QUEUED_IMAGE_THUMBS = 3;
 
 function resolveQueuedBadgeIcon(badge: PromptBadge): LucideIcon | null {
   if (badge.kind === "skill") return Sparkles;
+  if (badge.kind === "command") return Terminal;
+  if (badge.kind === "folder") return Folder;
+  if (badge.kind === "pr") return GitPullRequest;
+  if (badge.kind === "web") return Globe;
   return null;
 }
 

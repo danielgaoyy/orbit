@@ -2,6 +2,7 @@
 //! OpenCode, Gemini CLI, Cursor Agent, GitHub Copilot, Goose, Pi, Kimi CLI, Cline, Mistral Vibe,
 //! Augment) plus Universal ACP (`acp_generic` + curated 34-agent ACP Registry).
 
+pub mod acp_callbacks;
 pub mod acp_generic;
 pub mod acp_providers;
 pub mod acp_registry;
@@ -12,6 +13,7 @@ pub mod codex;
 pub mod driver;
 mod managed_dispatch;
 pub mod pi;
+pub mod plan_approval;
 pub mod readiness;
 pub mod shell_snapshot;
 pub mod side_question;
@@ -366,6 +368,7 @@ pub use driver::{
     DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, PromptOrigin,
     ProviderSessionHandle, SessionLaunchConfig,
 };
+pub use pi::{reap_snapshotted_pi_mcp_configs, snapshot_pi_mcp_config_files};
 pub use readiness::{
     PRIMARY_READINESS_PROVIDERS, ProviderAuthStatus, ProviderReadinessInfo,
     probe_local_provider_readiness,
@@ -376,7 +379,11 @@ pub use shell_snapshot::{
     resolve_login_shell_env_cached, set_snapshot_orbit_home, shell_snapshot_stats,
     warm_login_shell_env_in_background,
 };
-pub use side_question::{SideQuestionSpec, run_ephemeral_text_prompt, run_side_question};
+pub use side_question::{
+    HardenedGuardianCommandSpec, SideQuestionSpec, build_hardened_guardian_command_spec,
+    is_hardened_guardian_provider, run_ephemeral_text_prompt, run_hardened_guardian_prompt,
+    run_side_question,
+};
 
 static PROVIDER_EXECUTABLE_OVERRIDES: OnceLock<RwLock<HashMap<ProviderKind, PathBuf>>> =
     OnceLock::new();
@@ -866,6 +873,282 @@ pub fn catalogs_to_model_map(
     map
 }
 
+/// Strictly parsed ACP `session/request_permission` option IDs.
+///
+/// Enforces a strict boundary between one-shot `allow_once` and persistent
+/// `allow_always` options so `"allow"` NEVER escalates to an `allow_always`
+/// provider grant when `allow_once` is absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AcpPermissionOptions {
+    pub allow_once: Option<String>,
+    pub allow_always: Option<String>,
+    pub deny: Option<String>,
+}
+
+impl AcpPermissionOptions {
+    pub(crate) fn parse(options: &[serde_json::Value]) -> Self {
+        if options.is_empty() {
+            return Self {
+                allow_once: Some("allow_once".to_string()),
+                allow_always: None,
+                deny: Some("reject_once".to_string()),
+            };
+        }
+
+        fn opt_id(o: &serde_json::Value) -> Option<String> {
+            o.get("optionId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+        }
+        fn opt_kind(o: &serde_json::Value) -> Option<&str> {
+            o.get("kind")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        }
+
+        let mut allow_once = options
+            .iter()
+            .find(|o| opt_kind(o) == Some("allow_once"))
+            .and_then(opt_id);
+        let mut allow_always = options
+            .iter()
+            .find(|o| opt_kind(o) == Some("allow_always"))
+            .and_then(opt_id);
+        let mut deny = options
+            .iter()
+            .find(|o| opt_kind(o) == Some("reject_once"))
+            .and_then(opt_id)
+            .or_else(|| {
+                options
+                    .iter()
+                    .find(|o| opt_kind(o) == Some("reject_always"))
+                    .and_then(opt_id)
+            });
+
+        // Substring fallback applies ONLY to legacy options that omit `kind`,
+        // and NEVER lets `allow_once` match an option mentioning "always".
+        for o in options {
+            if opt_kind(o).is_some() {
+                continue;
+            }
+            let Some(id) = opt_id(o) else {
+                continue;
+            };
+            let id_lower = id.to_ascii_lowercase();
+            let name_lower = o
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+
+            let is_deny = id_lower.contains("reject")
+                || id_lower.contains("deny")
+                || id_lower.contains("cancel")
+                || name_lower.contains("reject")
+                || name_lower.contains("deny")
+                || name_lower.contains("cancel");
+            if is_deny {
+                if deny.is_none() {
+                    deny = Some(id);
+                }
+                continue;
+            }
+
+            let is_allow = id_lower.contains("allow")
+                || id_lower.contains("approve")
+                || name_lower.contains("allow")
+                || name_lower.contains("approve");
+            if !is_allow {
+                continue;
+            }
+
+            let is_always = id_lower.contains("always") || name_lower.contains("always");
+            if is_always {
+                if allow_always.is_none() {
+                    allow_always = Some(id);
+                }
+            } else if allow_once.is_none() {
+                allow_once = Some(id);
+            }
+        }
+
+        Self {
+            allow_once,
+            allow_always,
+            deny,
+        }
+    }
+
+    pub(crate) fn allowed_decisions(
+        &self,
+        is_plan_approval: bool,
+        allow_persistent_grant: bool,
+    ) -> Vec<String> {
+        let mut decisions = Vec::with_capacity(3);
+        if self.allow_once.is_some() {
+            decisions.push("allow".to_string());
+        }
+        if !is_plan_approval && allow_persistent_grant && self.allow_always.is_some() {
+            decisions.push("allow_always".to_string());
+        }
+        decisions.push("deny".to_string());
+        decisions
+    }
+
+    pub(crate) fn outcome_for_decision(&self, decision: &str) -> serde_json::Value {
+        match decision {
+            // Strict: `"allow"` NEVER falls back to `allow_always`.
+            "allow" => match self.allow_once.as_deref() {
+                Some(opt_id) => serde_json::json!({
+                    "outcome": "selected",
+                    "optionId": opt_id
+                }),
+                None => serde_json::json!({ "outcome": "cancelled" }),
+            },
+            "allow_always" => match self.allow_always.as_deref().or(self.allow_once.as_deref()) {
+                Some(opt_id) => serde_json::json!({
+                    "outcome": "selected",
+                    "optionId": opt_id
+                }),
+                None => serde_json::json!({ "outcome": "cancelled" }),
+            },
+            _ => self.deny_outcome(),
+        }
+    }
+
+    pub(crate) fn deny_outcome(&self) -> serde_json::Value {
+        match self.deny.as_deref() {
+            Some(opt_id) => serde_json::json!({
+                "outcome": "selected",
+                "optionId": opt_id
+            }),
+            None => serde_json::json!({ "outcome": "cancelled" }),
+        }
+    }
+
+    pub(crate) fn question_option_id(&self) -> &str {
+        self.allow_once.as_deref().unwrap_or("allow_once")
+    }
+}
+
+/// Extract an explicit shell working directory from ACP `rawInput`, checking all known field names.
+pub(crate) fn extract_acp_shell_cwd(raw_in: Option<&serde_json::Value>) -> Option<String> {
+    raw_in
+        .and_then(|i| {
+            i.get("Cwd")
+                .or_else(|| i.get("cwd"))
+                .or_else(|| i.get("workingDirectory"))
+                .or_else(|| i.get("working_dir"))
+                .or_else(|| i.get("workdir"))
+        })
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// Returns `true` when an ACP `session/request_permission` `toolCall` carries an
+/// authoritative command, path, or tool identifier in structured fields rather than
+/// falling back to a human-readable display `title`.
+///
+/// Title-only confirmations MUST stay individual: Orbit omits `"allow_always"` and
+/// marks the detail with `"__orbit_title_only": true` so display prose can never be
+/// auto-allowed or persisted as a cross-provider permission rule.
+pub(crate) fn acp_tool_call_has_authoritative_identity(tool_call: &serde_json::Value) -> bool {
+    let kind = tool_call
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let raw_in = tool_call.get("rawInput");
+    let non_empty_str = |v: Option<&serde_json::Value>| {
+        v.and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+
+    if kind == "execute"
+        || raw_in
+            .and_then(|i| {
+                i.get("CommandLine")
+                    .or_else(|| i.get("command"))
+                    .or_else(|| i.get("cmd"))
+            })
+            .is_some()
+    {
+        return non_empty_str(raw_in.and_then(|i| {
+            i.get("CommandLine")
+                .or_else(|| i.get("command"))
+                .or_else(|| i.get("cmd"))
+        }));
+    }
+
+    if matches!(kind, "edit" | "write" | "delete" | "move" | "read") {
+        let has_input_path = non_empty_str(raw_in.and_then(|i| {
+            i.get("path")
+                .or_else(|| i.get("Path"))
+                .or_else(|| i.get("file_path"))
+                .or_else(|| i.get("TargetFile"))
+                .or_else(|| i.get("AbsolutePath"))
+        }));
+        let has_location_path = non_empty_str(tool_call.pointer("/locations/0/path"));
+        return has_input_path || has_location_path;
+    }
+
+    let has_non_empty_raw_input = match raw_in {
+        Some(serde_json::Value::Object(map)) => !map.is_empty(),
+        Some(serde_json::Value::Array(arr)) => !arr.is_empty(),
+        Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
+        Some(serde_json::Value::Null) | None => false,
+        Some(_) => true,
+    };
+    let title = tool_call
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let title_is_identifier = !title.is_empty()
+        && !title
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control());
+    title_is_identifier && (has_non_empty_raw_input || !kind.is_empty())
+}
+
+/// Build an explicit title-only `ToolCallDetail::Generic` marked with `"__orbit_title_only": true`
+/// so permission evaluation keeps display-title prompts individual instead of matching shell/path rules.
+pub(crate) fn acp_title_only_detail(
+    title: &str,
+    tool_call: &serde_json::Value,
+) -> orbit_protocol::ToolCallDetail {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "__orbit_title_only".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    payload.insert(
+        "title".to_string(),
+        serde_json::Value::String(title.to_string()),
+    );
+    if let Some(kind) = tool_call.get("kind").and_then(serde_json::Value::as_str)
+        && !kind.trim().is_empty()
+    {
+        payload.insert(
+            "kind".to_string(),
+            serde_json::Value::String(kind.to_string()),
+        );
+    }
+    if let Some(raw_in) = tool_call.get("rawInput")
+        && !raw_in.is_null()
+    {
+        payload.insert("rawInput".to_string(), raw_in.clone());
+    }
+    orbit_protocol::ToolCallDetail::Generic {
+        tool_name: title.to_string(),
+        arguments_json: serde_json::Value::Object(payload).to_string(),
+    }
+}
+
 #[cfg(test)]
 mod discovery_tests {
     use super::*;
@@ -1213,5 +1496,129 @@ mod capability_tests {
                 .map(|n| n.to_string_lossy().to_string()),
             Some("claude.exe".to_string())
         );
+    }
+
+    #[test]
+    fn acp_permission_options_strictly_separates_allow_once_and_allow_always() {
+        // Finding 10: When ACP only offers `allow_always` + `reject_once`, `"allow"` MUST NOT
+        // be advertised and resolving `"allow"` MUST cancel rather than escalate to `allow_always`!
+        let only_always = vec![
+            serde_json::json!({ "optionId": "opt_always", "kind": "allow_always" }),
+            serde_json::json!({ "optionId": "opt_deny", "kind": "reject_once" }),
+        ];
+        let parsed = AcpPermissionOptions::parse(&only_always);
+        assert_eq!(parsed.allow_once, None);
+        assert_eq!(parsed.allow_always.as_deref(), Some("opt_always"));
+        assert_eq!(parsed.deny.as_deref(), Some("opt_deny"));
+        assert_eq!(
+            parsed.allowed_decisions(false, true),
+            vec!["allow_always".to_string(), "deny".to_string()]
+        );
+        assert_eq!(
+            parsed.outcome_for_decision("allow"),
+            serde_json::json!({ "outcome": "cancelled" })
+        );
+        assert_eq!(
+            parsed.outcome_for_decision("allow_always"),
+            serde_json::json!({ "outcome": "selected", "optionId": "opt_always" })
+        );
+        assert_eq!(
+            parsed.outcome_for_decision("deny"),
+            serde_json::json!({ "outcome": "selected", "optionId": "opt_deny" })
+        );
+
+        // When only `allow_once` + `reject_always` are offered, `"allow_always"` is omitted
+        let only_once = vec![
+            serde_json::json!({ "optionId": "a1", "kind": "allow_once" }),
+            serde_json::json!({ "optionId": "r_all", "kind": "reject_always" }),
+        ];
+        let parsed_once = AcpPermissionOptions::parse(&only_once);
+        assert_eq!(
+            parsed_once.allowed_decisions(false, true),
+            vec!["allow".to_string(), "deny".to_string()]
+        );
+        assert_eq!(
+            parsed_once.deny_outcome(),
+            serde_json::json!({ "outcome": "selected", "optionId": "r_all" })
+        );
+
+        // Legacy options without `kind` still never map `allow_always` into `allow_once`
+        let legacy = vec![
+            serde_json::json!({ "optionId": "approve_always", "name": "Always Allow" }),
+            serde_json::json!({ "optionId": "cancel_action" }),
+        ];
+        let parsed_legacy = AcpPermissionOptions::parse(&legacy);
+        assert_eq!(parsed_legacy.allow_once, None);
+        assert_eq!(
+            parsed_legacy.allow_always.as_deref(),
+            Some("approve_always")
+        );
+        assert_eq!(parsed_legacy.deny.as_deref(), Some("cancel_action"));
+
+        // Non-authoritative / plan-approval prompts never advertise `allow_always`
+        let full = vec![
+            serde_json::json!({ "optionId": "once", "kind": "allow_once" }),
+            serde_json::json!({ "optionId": "always", "kind": "allow_always" }),
+            serde_json::json!({ "optionId": "deny", "kind": "reject_once" }),
+        ];
+        let parsed_full = AcpPermissionOptions::parse(&full);
+        assert_eq!(
+            parsed_full.allowed_decisions(false, true),
+            vec![
+                "allow".to_string(),
+                "allow_always".to_string(),
+                "deny".to_string()
+            ]
+        );
+        assert_eq!(
+            parsed_full.allowed_decisions(false, false),
+            vec!["allow".to_string(), "deny".to_string()]
+        );
+        assert_eq!(
+            parsed_full.allowed_decisions(true, true),
+            vec!["allow".to_string(), "deny".to_string()]
+        );
+    }
+
+    #[test]
+    fn acp_authoritative_identity_rejects_title_only_prompts() {
+        // Missing CommandLine/command on execute -> NOT authoritative
+        assert!(!acp_tool_call_has_authoritative_identity(
+            &serde_json::json!({
+                "kind": "execute",
+                "title": "cargo test",
+                "rawInput": {}
+            })
+        ));
+        // Concrete CommandLine -> authoritative
+        assert!(acp_tool_call_has_authoritative_identity(
+            &serde_json::json!({
+                "kind": "execute",
+                "title": "Run tests",
+                "rawInput": { "CommandLine": "cargo test", "Cwd": "/repo" }
+            })
+        ));
+        // Missing path on edit -> NOT authoritative
+        assert!(!acp_tool_call_has_authoritative_identity(
+            &serde_json::json!({
+                "kind": "edit",
+                "title": "src/lib.rs",
+                "rawInput": {}
+            })
+        ));
+        // Concrete path in locations -> authoritative
+        assert!(acp_tool_call_has_authoritative_identity(
+            &serde_json::json!({
+                "kind": "edit",
+                "title": "Edit file",
+                "locations": [{ "path": "src/lib.rs" }]
+            })
+        ));
+        // Prose confirmation title with no structured input -> NOT authoritative
+        assert!(!acp_tool_call_has_authoritative_identity(
+            &serde_json::json!({
+                "title": "Confirm workspace migration"
+            })
+        ));
     }
 }

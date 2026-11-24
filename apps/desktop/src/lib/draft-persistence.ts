@@ -1,3 +1,4 @@
+import { isValidHttpsReferenceUrl, shortWebUrlLabel } from "./inline-mentions.ts";
 import { type ComposerInlineDirective, isComposerInlineDirective } from "./slash-commands.ts";
 import type { RichMediaKind } from "@/lib/media-utils";
 
@@ -14,6 +15,7 @@ export const MAX_DIFF_QUOTE_CODE_BYTES = 16 * 1024;
 export const MAX_PASTES_PER_SCOPE = 16;
 export const MAX_QUOTES_PER_SCOPE = 32;
 export const MAX_CONTEXT_ITEMS_PER_SCOPE = 32;
+export const MAX_INLINE_MENTIONS_PER_SCOPE = 32;
 
 const VALID_RICH_MEDIA_KINDS: ReadonlySet<RichMediaKind> = new Set<RichMediaKind>([
   "pdf",
@@ -93,6 +95,87 @@ export type PersistedContextItem =
       slug: string;
       label: string;
       description?: string;
+    }
+  | {
+      id: string;
+      kind: "dom_element";
+      selector: string;
+      tag: string;
+      textPreview: string;
+      attributes: Record<string, string>;
+      computedBox?: { x: number; y: number; width: number; height: number } | null;
+      outerHtmlExcerpt: string;
+      pageUrl: string;
+    }
+  | {
+      id: string;
+      kind: "folder";
+      path: string;
+      fileCount: number;
+      treeSummary?: string | null;
+    }
+  | {
+      id: string;
+      kind: "pr";
+      number: number;
+      title: string;
+      url?: string | null;
+      state?: string | null;
+      headRef?: string | null;
+      baseRef?: string | null;
+      summary?: string | null;
+    }
+  | {
+      id: string;
+      kind: "web";
+      url: string;
+      label: string;
+    };
+
+export type PersistedInlineMention =
+  | { token: string; kind: "file"; path: string }
+  | { token: string; kind: "git_diff"; staged: boolean; label: string }
+  | {
+      token: string;
+      kind: "terminal_output";
+      label: string;
+      lineCount: number;
+      content: string;
+    }
+  | {
+      token: string;
+      kind: "code_symbol";
+      path: string;
+      startLine: number;
+      endLine: number;
+      symbolName: string;
+      symbolKind: string;
+      signature?: string | null;
+      container?: string | null;
+      language: string;
+    }
+  | {
+      token: string;
+      kind: "folder";
+      path: string;
+      fileCount: number;
+    }
+  | {
+      token: string;
+      kind: "pr";
+      number: number;
+      title: string;
+      url?: string | null;
+      state?: string | null;
+      headRef?: string | null;
+      baseRef?: string | null;
+      summary?: string | null;
+    }
+  | {
+      token: string;
+      kind: "web";
+      url: string;
+      label: string;
     };
 
 export interface PersistedScopeDraft {
@@ -101,6 +184,7 @@ export interface PersistedScopeDraft {
   pastedAttachments?: PersistedPastedAttachment[];
   diffQuotes?: PersistedDiffQuote[];
   contextItems?: PersistedContextItem[];
+  inlineMentions?: PersistedInlineMention[];
   slashDirective?: ComposerInlineDirective;
   sideQuestionDraft?: string;
 }
@@ -122,12 +206,15 @@ export interface DraftStateSlices {
   pastedAttachments: Record<string, PersistedPastedAttachment[]>;
   diffQuotes: Record<string, PersistedDiffQuote[]>;
   contextItems?: Record<string, readonly unknown[]>;
+  inlineMentions?: Record<string, readonly unknown[]>;
   slashDirectives: Record<string, ComposerInlineDirective | null>;
   sideQuestionDrafts: Record<string, string>;
 }
 
-export interface HydratedDraftSlices extends Omit<DraftStateSlices, "contextItems"> {
+export interface HydratedDraftSlices
+  extends Omit<DraftStateSlices, "contextItems" | "inlineMentions"> {
   contextItems: Record<string, PersistedContextItem[]>;
+  inlineMentions: Record<string, PersistedInlineMention[]>;
   updatedAtByScope: Record<string, number>;
   prunedCount: number;
 }
@@ -478,6 +565,238 @@ function normalizeContextItem(
     return item;
   }
 
+  if (raw.kind === "dom_element") {
+    if (typeof raw.selector !== "string" || raw.selector.trim().length === 0) return null;
+    const tag =
+      typeof raw.tag === "string" && raw.tag.trim().length > 0
+        ? truncateUtf8(raw.tag.trim(), 48)
+        : "element";
+    const attrs: Record<string, string> = {};
+    if (isPlainRecord(raw.attributes)) {
+      let count = 0;
+      for (const [k, v] of Object.entries(raw.attributes)) {
+        if (count >= 20) break;
+        if (typeof v === "string") {
+          attrs[truncateUtf8(k, 64)] = truncateUtf8(v, 200);
+          count += 1;
+        }
+      }
+    }
+    let computedBox: { x: number; y: number; width: number; height: number } | null = null;
+    if (
+      isPlainRecord(raw.computedBox) &&
+      typeof raw.computedBox.x === "number" &&
+      typeof raw.computedBox.y === "number" &&
+      typeof raw.computedBox.width === "number" &&
+      typeof raw.computedBox.height === "number" &&
+      Number.isFinite(raw.computedBox.x) &&
+      Number.isFinite(raw.computedBox.y) &&
+      Number.isFinite(raw.computedBox.width) &&
+      Number.isFinite(raw.computedBox.height)
+    ) {
+      computedBox = {
+        x: raw.computedBox.x,
+        y: raw.computedBox.y,
+        width: raw.computedBox.width,
+        height: raw.computedBox.height,
+      };
+    }
+    return {
+      id,
+      kind: "dom_element",
+      selector: truncateUtf8(raw.selector.trim(), 240),
+      tag,
+      textPreview: typeof raw.textPreview === "string" ? truncateUtf8(raw.textPreview, 240) : "",
+      attributes: attrs,
+      computedBox,
+      outerHtmlExcerpt:
+        typeof raw.outerHtmlExcerpt === "string" ? truncateUtf8(raw.outerHtmlExcerpt, 600) : "",
+      pageUrl: typeof raw.pageUrl === "string" ? truncateUtf8(raw.pageUrl, 512) : "",
+    };
+  }
+
+  if (raw.kind === "folder") {
+    if (typeof raw.path !== "string" || raw.path.trim().length === 0) return null;
+    const fileCount =
+      typeof raw.fileCount === "number" && Number.isFinite(raw.fileCount) && raw.fileCount >= 0
+        ? Math.floor(raw.fileCount)
+        : 0;
+    const item: Extract<PersistedContextItem, { kind: "folder" }> = {
+      id,
+      kind: "folder",
+      path: truncateUtf8(raw.path.trim(), 1024),
+      fileCount,
+    };
+    if (typeof raw.treeSummary === "string" && raw.treeSummary.length > 0) {
+      item.treeSummary = truncateUtf8(raw.treeSummary, maxQuoteCodeBytes);
+    }
+    return item;
+  }
+
+  if (raw.kind === "pr") {
+    if (typeof raw.number !== "number" || !Number.isFinite(raw.number) || raw.number <= 0) {
+      return null;
+    }
+    if (typeof raw.title !== "string" || raw.title.trim().length === 0) return null;
+    const item: Extract<PersistedContextItem, { kind: "pr" }> = {
+      id,
+      kind: "pr",
+      number: Math.floor(raw.number),
+      title: truncateUtf8(raw.title.trim(), 256),
+    };
+    if (typeof raw.url === "string" && isValidHttpsReferenceUrl(raw.url)) {
+      item.url = truncateUtf8(raw.url.trim(), 1024);
+    }
+    if (typeof raw.state === "string" && raw.state.trim().length > 0) {
+      item.state = truncateUtf8(raw.state.trim(), 32);
+    }
+    if (typeof raw.headRef === "string" && raw.headRef.trim().length > 0) {
+      item.headRef = truncateUtf8(raw.headRef.trim(), 256);
+    }
+    if (typeof raw.baseRef === "string" && raw.baseRef.trim().length > 0) {
+      item.baseRef = truncateUtf8(raw.baseRef.trim(), 256);
+    }
+    if (typeof raw.summary === "string" && raw.summary.trim().length > 0) {
+      item.summary = truncateUtf8(raw.summary.trim(), 4096);
+    }
+    return item;
+  }
+
+  if (raw.kind === "web") {
+    if (typeof raw.url !== "string" || !isValidHttpsReferenceUrl(raw.url)) return null;
+    const url = truncateUtf8(raw.url.trim(), 2048);
+    const label =
+      typeof raw.label === "string" && raw.label.trim().length > 0
+        ? truncateUtf8(raw.label.trim(), 128)
+        : shortWebUrlLabel(url);
+    return {
+      id,
+      kind: "web",
+      url,
+      label,
+    };
+  }
+
+  return null;
+}
+
+function normalizeInlineMention(
+  raw: unknown,
+  maxPasteBytes: number,
+): PersistedInlineMention | null {
+  if (!isPlainRecord(raw)) return null;
+  if (typeof raw.token !== "string" || raw.token.trim().length === 0) return null;
+  const token = truncateUtf8(raw.token.trim(), 2048);
+
+  if (raw.kind === "file") {
+    if (typeof raw.path !== "string" || raw.path.trim().length === 0) return null;
+    return { token, kind: "file", path: truncateUtf8(raw.path.trim(), 2048) };
+  }
+
+  if (raw.kind === "git_diff") {
+    if (typeof raw.staged !== "boolean") return null;
+    const label =
+      typeof raw.label === "string" && raw.label.trim().length > 0
+        ? truncateUtf8(raw.label.trim(), 256)
+        : raw.staged
+          ? "Staged Diff"
+          : "Working Tree Diff";
+    return { token, kind: "git_diff", staged: raw.staged, label };
+  }
+
+  if (raw.kind === "terminal_output") {
+    if (typeof raw.content !== "string" || raw.content.length === 0) return null;
+    if (utf8ByteLength(raw.content) > maxPasteBytes) return null;
+    const derivedLines = raw.content.split("\n").length;
+    const lineCount =
+      typeof raw.lineCount === "number" && Number.isFinite(raw.lineCount) && raw.lineCount >= 1
+        ? Math.floor(raw.lineCount)
+        : derivedLines;
+    const label =
+      typeof raw.label === "string" && raw.label.trim().length > 0
+        ? truncateUtf8(raw.label.trim(), 256)
+        : `Terminal · ${lineCount} lines`;
+    return { token, kind: "terminal_output", label, lineCount, content: raw.content };
+  }
+
+  if (raw.kind === "code_symbol") {
+    if (typeof raw.path !== "string" || raw.path.trim().length === 0) return null;
+    if (typeof raw.symbolName !== "string" || raw.symbolName.trim().length === 0) return null;
+    if (typeof raw.startLine !== "number" || !Number.isFinite(raw.startLine)) return null;
+    if (typeof raw.endLine !== "number" || !Number.isFinite(raw.endLine)) return null;
+    const item: Extract<PersistedInlineMention, { kind: "code_symbol" }> = {
+      token,
+      kind: "code_symbol",
+      path: truncateUtf8(raw.path.trim(), 1024),
+      startLine: Math.max(1, Math.floor(raw.startLine)),
+      endLine: Math.max(1, Math.floor(raw.endLine)),
+      symbolName: truncateUtf8(raw.symbolName.trim(), 256),
+      symbolKind:
+        typeof raw.symbolKind === "string" && raw.symbolKind.trim().length > 0
+          ? truncateUtf8(raw.symbolKind.trim(), 64)
+          : "symbol",
+      language:
+        typeof raw.language === "string" && raw.language.trim().length > 0
+          ? truncateUtf8(raw.language.trim(), 64)
+          : "text",
+    };
+    if (typeof raw.signature === "string" && raw.signature.length > 0) {
+      item.signature = truncateUtf8(raw.signature, 512);
+    }
+    if (typeof raw.container === "string" && raw.container.length > 0) {
+      item.container = truncateUtf8(raw.container, 256);
+    }
+    return item;
+  }
+
+  if (raw.kind === "folder") {
+    if (typeof raw.path !== "string" || raw.path.trim().length === 0) return null;
+    const fileCount =
+      typeof raw.fileCount === "number" && Number.isFinite(raw.fileCount) && raw.fileCount >= 0
+        ? Math.floor(raw.fileCount)
+        : 0;
+    return { token, kind: "folder", path: truncateUtf8(raw.path.trim(), 1024), fileCount };
+  }
+
+  if (raw.kind === "pr") {
+    if (typeof raw.number !== "number" || !Number.isFinite(raw.number) || raw.number <= 0) {
+      return null;
+    }
+    if (typeof raw.title !== "string" || raw.title.trim().length === 0) return null;
+    const item: Extract<PersistedInlineMention, { kind: "pr" }> = {
+      token,
+      kind: "pr",
+      number: Math.floor(raw.number),
+      title: truncateUtf8(raw.title.trim(), 256),
+    };
+    if (typeof raw.url === "string" && isValidHttpsReferenceUrl(raw.url)) {
+      item.url = truncateUtf8(raw.url.trim(), 1024);
+    }
+    if (typeof raw.state === "string" && raw.state.trim().length > 0) {
+      item.state = truncateUtf8(raw.state.trim(), 32);
+    }
+    if (typeof raw.headRef === "string" && raw.headRef.trim().length > 0) {
+      item.headRef = truncateUtf8(raw.headRef.trim(), 256);
+    }
+    if (typeof raw.baseRef === "string" && raw.baseRef.trim().length > 0) {
+      item.baseRef = truncateUtf8(raw.baseRef.trim(), 256);
+    }
+    if (typeof raw.summary === "string" && raw.summary.trim().length > 0) {
+      item.summary = truncateUtf8(raw.summary.trim(), 4096);
+    }
+    return item;
+  }
+
+  if (raw.kind === "web") {
+    if (typeof raw.url !== "string" || !isValidHttpsReferenceUrl(raw.url)) return null;
+    const url = truncateUtf8(raw.url.trim(), 2048);
+    const label =
+      typeof raw.label === "string" && raw.label.trim().length > 0
+        ? truncateUtf8(raw.label.trim(), 128)
+        : shortWebUrlLabel(url);
+    return { token, kind: "web", url, label };
+  }
+
   return null;
 }
 
@@ -488,6 +807,7 @@ function isScopeDraftPopulated(entry: PersistedScopeDraft): boolean {
   if (entry.pastedAttachments && entry.pastedAttachments.length > 0) return true;
   if (entry.diffQuotes && entry.diffQuotes.length > 0) return true;
   if (entry.contextItems && entry.contextItems.length > 0) return true;
+  if (entry.inlineMentions && entry.inlineMentions.length > 0) return true;
   return false;
 }
 
@@ -555,6 +875,23 @@ function capScopeDraftToBudget(
       next.contextItems = validContexts;
     }
   }
+  if (entry.inlineMentions && entry.inlineMentions.length > 0) {
+    const validInline: PersistedInlineMention[] = [];
+    const seenTokens = new Set<string>();
+    for (const mention of entry.inlineMentions) {
+      const normalized = normalizeInlineMention(mention, budget.maxPasteBytes);
+      if (normalized && !seenTokens.has(normalized.token)) {
+        seenTokens.add(normalized.token);
+        validInline.push(normalized);
+      }
+    }
+    if (validInline.length > MAX_INLINE_MENTIONS_PER_SCOPE) {
+      validInline.splice(0, validInline.length - MAX_INLINE_MENTIONS_PER_SCOPE);
+    }
+    if (validInline.length > 0) {
+      next.inlineMentions = validInline;
+    }
+  }
 
   if (!isScopeDraftPopulated(next)) {
     return null;
@@ -592,6 +929,18 @@ function capScopeDraftToBudget(
       }
       continue;
     }
+    if (next.inlineMentions && next.inlineMentions.length > 0) {
+      const heavyInlineIdx = next.inlineMentions.findIndex((m) => m.kind === "terminal_output");
+      if (heavyInlineIdx >= 0) {
+        next.inlineMentions.splice(heavyInlineIdx, 1);
+      } else {
+        next.inlineMentions.shift();
+      }
+      if (next.inlineMentions.length === 0) {
+        delete next.inlineMentions;
+      }
+      continue;
+    }
     const textBytes = next.text ? utf8ByteLength(next.text) : 0;
     const sqBytes = next.sideQuestionDraft ? utf8ByteLength(next.sideQuestionDraft) : 0;
     if (textBytes === 0 && sqBytes === 0) {
@@ -626,6 +975,7 @@ function emptyHydratedSlices(prunedCount = 0): HydratedDraftSlices {
     pastedAttachments: {},
     diffQuotes: {},
     contextItems: {},
+    inlineMentions: {},
     slashDirectives: {},
     sideQuestionDrafts: {},
     updatedAtByScope: {},
@@ -647,6 +997,14 @@ export function hasNonEmptyScopeDraft(slices: DraftStateSlices, scopeKey: string
         } else if (typeof raw.kind === "string") {
           return true;
         }
+      }
+    }
+  }
+  const inlines = slices.inlineMentions?.[scopeKey];
+  if (Array.isArray(inlines) && inlines.length > 0) {
+    for (const raw of inlines) {
+      if (isPlainRecord(raw) && typeof raw.token === "string" && raw.token.trim().length > 0) {
+        return true;
       }
     }
   }
@@ -774,6 +1132,9 @@ export function buildSerializedDraftPayload(
   if (slices.contextItems) {
     for (const k of Object.keys(slices.contextItems)) scopeKeys.add(k);
   }
+  if (slices.inlineMentions) {
+    for (const k of Object.keys(slices.inlineMentions)) scopeKeys.add(k);
+  }
   for (const k of Object.keys(slices.slashDirectives)) scopeKeys.add(k);
   for (const k of Object.keys(slices.sideQuestionDrafts)) scopeKeys.add(k);
 
@@ -821,6 +1182,17 @@ export function buildSerializedDraftPayload(
       }
       if (normalizedContexts.length > 0) {
         candidate.contextItems = normalizedContexts;
+      }
+    }
+    const inlineMentions = slices.inlineMentions?.[key];
+    if (Array.isArray(inlineMentions) && inlineMentions.length > 0) {
+      const normalizedInline: PersistedInlineMention[] = [];
+      for (const rawMention of inlineMentions) {
+        const normalized = normalizeInlineMention(rawMention, budget.maxPasteBytes);
+        if (normalized) normalizedInline.push(normalized);
+      }
+      if (normalizedInline.length > 0) {
+        candidate.inlineMentions = normalizedInline;
       }
     }
     const directive = slices.slashDirectives[key];
@@ -994,6 +1366,25 @@ export function parseAndValidatePersistedDrafts(
       }
     }
 
+    if (rawEntry.inlineMentions !== undefined) {
+      if (Array.isArray(rawEntry.inlineMentions)) {
+        const cleanInline: PersistedInlineMention[] = [];
+        for (const item of rawEntry.inlineMentions) {
+          const normalized = normalizeInlineMention(item, budget.maxPasteBytes);
+          if (normalized) {
+            cleanInline.push(normalized);
+          } else {
+            entryHadInvalidField = true;
+          }
+        }
+        if (cleanInline.length > 0) {
+          candidate.inlineMentions = cleanInline;
+        }
+      } else {
+        entryHadInvalidField = true;
+      }
+    }
+
     const capped = capScopeDraftToBudget(scopeKey, candidate, budget);
     if (!capped) {
       prunedCount += 1;
@@ -1022,6 +1413,9 @@ export function parseAndValidatePersistedDrafts(
     }
     if (entry.contextItems !== undefined) {
       result.contextItems[scopeKey] = entry.contextItems;
+    }
+    if (entry.inlineMentions !== undefined) {
+      result.inlineMentions[scopeKey] = entry.inlineMentions;
     }
     if (entry.slashDirective !== undefined) {
       result.slashDirectives[scopeKey] = entry.slashDirective;

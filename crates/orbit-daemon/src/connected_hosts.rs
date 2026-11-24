@@ -555,8 +555,10 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::GitStatusResponse { request_id, .. }
         | WireMessage::GitDiffResponse { request_id, .. }
         | WireMessage::GitMutationResult { request_id, .. }
+        | WireMessage::GitCollabResponse { request_id, .. }
         | WireMessage::WorkspaceFilesResponse { request_id, .. }
         | WireMessage::WorkspaceSymbolsResponse { request_id, .. }
+        | WireMessage::SearchMessagesResult { request_id, .. }
         | WireMessage::WorkspaceFileContentResponse { request_id, .. }
         | WireMessage::WorkspaceFileWritten { request_id, .. }
         | WireMessage::WorkspaceEntryMutated { request_id, .. }
@@ -607,6 +609,11 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::LspSymbolsResponse { request_id, .. }
         | WireMessage::LspDiagnosticsResponse { request_id, .. }
         | WireMessage::LspLocationsResponse { request_id, .. }
+        | WireMessage::LspHoverResponse { request_id, .. }
+        | WireMessage::LspReferencesResponse { request_id, .. }
+        | WireMessage::LspCompletionResponse { request_id, .. }
+        | WireMessage::LspCodeActionResponse { request_id, .. }
+        | WireMessage::LspWorkspaceEditResponse { request_id, .. }
         | WireMessage::UsageInsightsResponse { request_id, .. }
         | WireMessage::ContextOccupancyResponse { request_id, .. }
         | WireMessage::LifecycleHooksSnapshot { request_id, .. }
@@ -615,6 +622,10 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::ConditionalTimersSnapshot { request_id, .. }
         | WireMessage::ConditionalTimerUpdated { request_id, .. }
         | WireMessage::GuardianConfigSnapshot { request_id, .. }
+        | WireMessage::PermissionRulesSnapshot { request_id, .. }
+        | WireMessage::PermissionRuleUpdated { request_id, .. }
+        | WireMessage::PermissionRuleDeleted { request_id, .. }
+        | WireMessage::PermissionsBatchResolved { request_id, .. }
         | WireMessage::GoalRunUpdated { request_id, .. }
         | WireMessage::GoalRunsSnapshot { request_id, .. }
         | WireMessage::MonitorWatchUpdated { request_id, .. }
@@ -630,7 +641,10 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::ImChannelTestResponse { request_id, .. }
         | WireMessage::PushDevicesSnapshot { request_id, .. }
         | WireMessage::PushTestResponse { request_id, .. }
-        | WireMessage::PeerBridgeOpened { request_id, .. } => Some(*request_id),
+        | WireMessage::PeerBridgeOpened { request_id, .. }
+        | WireMessage::PreviewTunnelOpened { request_id, .. }
+        | WireMessage::McpResourceResponse { request_id, .. }
+        | WireMessage::ArtifactMcpToolResponse { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }
         | WireMessage::ArtifactDeleted { request_id, .. }
@@ -1444,6 +1458,15 @@ mod tests {
                 screenshot_base64: None,
                 text_excerpt: None,
                 captcha_detected: false,
+                picked_element: None,
+            }),
+            Some(req_id)
+        );
+        assert_eq!(
+            extract_response_request_id(&WireMessage::PreviewTunnelOpened {
+                request_id: req_id,
+                tunnel_id: Uuid::new_v4(),
+                target_port: 5173,
             }),
             Some(req_id)
         );

@@ -1,18 +1,70 @@
 import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
+import { t as translateGlobal } from "@/lib/i18n";
 import {
   hasVisibleActiveTerminal,
 } from "../store-helpers";
 import type { OrbitStoreContext } from "../store-runtime";
+import type { TerminalSplitDirection, TerminalSplitGroup } from "../store-types";
+
+const MAX_SPLIT_PANES = 4;
+const PENDING_SPLIT_TTL_MS = 15_000;
+const PENDING_CMD_TTL_MS = 15_000;
+
+interface PendingTerminalSplit {
+  hostId: string;
+  sourceTabKey: string;
+  direction: TerminalSplitDirection;
+  requestedAtMs: number;
+}
+
+interface PendingTerminalCommand {
+  hostId: string;
+  payload: string;
+  execute: boolean;
+  requestedAtMs: number;
+}
+
+function makeEqualRatios(count: number): number[] {
+  if (count <= 0) return [];
+  const each = 1 / count;
+  return Array.from({ length: count }, () => each);
+}
+
+function pruneSplitsForClosedTab(
+  splits: readonly TerminalSplitGroup[],
+  closedKey: string,
+): TerminalSplitGroup[] {
+  const next: TerminalSplitGroup[] = [];
+  for (const group of splits) {
+    if (!group.paneKeys.includes(closedKey)) {
+      next.push(group);
+      continue;
+    }
+    const remainingKeys = group.paneKeys.filter((k) => k !== closedKey);
+    if (remainingKeys.length >= 2) {
+      next.push({
+        ...group,
+        paneKeys: remainingKeys,
+        ratios: makeEqualRatios(remainingKeys.length),
+      });
+    }
+  }
+  return next;
+}
 
 export function createTerminalSlice(ctx: OrbitStoreContext) {
   const {
     detachedTerminalIds,
     getState,
+    notifyToast,
     setState,
     terminalChannels,
   } = ctx;
+
+  let pendingSplit: PendingTerminalSplit | null = null;
+  let pendingCommand: PendingTerminalCommand | null = null;
 
   return {
 
@@ -66,7 +118,160 @@ export function createTerminalSlice(ctx: OrbitStoreContext) {
 
 
     spawnNewTerminalTab(hostId: string, cwd: string): void {
+      pendingSplit = null;
       void orbitIpc.startTerminal(hostId, cwd, 110, 28);
+    },
+
+
+    splitActiveTerminalPane(direction: TerminalSplitDirection): void {
+      const snap = getState();
+      const hostId = snap.selectedHostId;
+      if (!hostId) return;
+      const hostTabs = snap.terminalTabs.filter((t) => t.hostId === hostId);
+      const activeTab =
+        hostTabs.find((t) => t.key === snap.activeTerminalTabKey) ?? hostTabs[0] ?? null;
+      if (!activeTab) {
+        ctx.actions.openTerminalTab({ spawnIfEmpty: true });
+        return;
+      }
+      const existingSplit = snap.terminalSplits.find(
+        (g) => g.hostId === hostId && g.paneKeys.includes(activeTab.key),
+      );
+      if (existingSplit && existingSplit.paneKeys.length >= MAX_SPLIT_PANES) {
+        notifyToast(translateGlobal("terminal.maxSplitPanes"));
+        return;
+      }
+      pendingSplit = {
+        hostId,
+        sourceTabKey: activeTab.key,
+        direction,
+        requestedAtMs: Date.now(),
+      };
+      ctx.actions.openTerminalTab({ spawnIfEmpty: false });
+      void orbitIpc.startTerminal(hostId, activeTab.cwd || snap.selectedWorkspaceCwd || "~", 90, 24);
+    },
+
+
+    setTerminalSplitRatios(splitId: string, ratios: number[]): void {
+      setState((s) => {
+        const idx = s.terminalSplits.findIndex((g) => g.id === splitId);
+        if (idx < 0) return s;
+        const target = s.terminalSplits[idx];
+        if (ratios.length !== target.paneKeys.length) return s;
+        const next = s.terminalSplits.slice();
+        next[idx] = { ...target, ratios };
+        return { ...s, terminalSplits: next };
+      });
+    },
+
+
+    runCommandInTerminal(
+      command: string,
+      opts?: { execute?: boolean; hostId?: string; cwd?: string },
+    ): void {
+      const cleaned = command.replace(/\r\n/g, "\n").trim();
+      if (!cleaned) return;
+      const snap = getState();
+      const hostId = opts?.hostId ?? snap.selectedHostId;
+      if (!hostId) return;
+      const execute = opts?.execute ?? true;
+      // Single-line safe commands execute cleanly; multi-line or destructive snippets
+      // use bracketed paste without trailing Enter so the user can review before running.
+      const payload = execute ? `${cleaned}\r` : `\x1b[200~${cleaned}\x1b[201~`;
+
+      const hostTabs = snap.terminalTabs.filter((t) => t.hostId === hostId);
+      const activeTab =
+        hostTabs.find((t) => t.key === snap.activeTerminalTabKey) ?? hostTabs[0] ?? null;
+
+      ctx.actions.openTerminalTab({ spawnIfEmpty: false });
+
+      if (activeTab?.terminalId) {
+        setState((s) => ({ ...s, activeTerminalTabKey: activeTab.key }));
+        void orbitIpc.writeTerminalInput(hostId, activeTab.terminalId, payload);
+        notifyToast(
+          translateGlobal(execute ? "terminal.commandSentToast" : "terminal.commandPastedToast"),
+        );
+        return;
+      }
+
+      pendingCommand = {
+        hostId,
+        payload,
+        execute,
+        requestedAtMs: Date.now(),
+      };
+      const targetCwd = opts?.cwd || snap.selectedWorkspaceCwd || "~";
+      void orbitIpc.startTerminal(hostId, targetCwd, 110, 28);
+    },
+
+
+    onTerminalTabAttached(hostId: string, tabKey: string, terminalId: string): void {
+      const now = Date.now();
+      if (
+        pendingSplit &&
+        pendingSplit.hostId === hostId &&
+        now - pendingSplit.requestedAtMs <= PENDING_SPLIT_TTL_MS &&
+        pendingSplit.sourceTabKey !== tabKey
+      ) {
+        const req = pendingSplit;
+        pendingSplit = null;
+        setState((s) => {
+          const sourceStillOpen = s.terminalTabs.some((t) => t.key === req.sourceTabKey);
+          const newStillOpen = s.terminalTabs.some((t) => t.key === tabKey);
+          if (!sourceStillOpen || !newStillOpen) return s;
+
+          const existingIdx = s.terminalSplits.findIndex(
+            (g) => g.hostId === hostId && g.paneKeys.includes(req.sourceTabKey),
+          );
+          if (existingIdx >= 0) {
+            const existing = s.terminalSplits[existingIdx];
+            if (existing.paneKeys.includes(tabKey) || existing.paneKeys.length >= MAX_SPLIT_PANES) {
+              return s;
+            }
+            const sourcePos = existing.paneKeys.indexOf(req.sourceTabKey);
+            const nextKeys = existing.paneKeys.slice();
+            nextKeys.splice(sourcePos + 1, 0, tabKey);
+            const nextSplits = s.terminalSplits.slice();
+            nextSplits[existingIdx] = {
+              ...existing,
+              direction: req.direction,
+              paneKeys: nextKeys,
+              ratios: makeEqualRatios(nextKeys.length),
+            };
+            return { ...s, terminalSplits: nextSplits, activeTerminalTabKey: tabKey };
+          }
+
+          const created: TerminalSplitGroup = {
+            id: `split_${now}_${Math.random().toString(36).slice(2, 6)}`,
+            hostId,
+            direction: req.direction,
+            paneKeys: [req.sourceTabKey, tabKey],
+            ratios: [0.5, 0.5],
+          };
+          return {
+            ...s,
+            terminalSplits: [...s.terminalSplits, created],
+            activeTerminalTabKey: tabKey,
+          };
+        });
+      }
+
+      if (
+        pendingCommand &&
+        pendingCommand.hostId === hostId &&
+        now - pendingCommand.requestedAtMs <= PENDING_CMD_TTL_MS &&
+        terminalId
+      ) {
+        const cmd = pendingCommand;
+        pendingCommand = null;
+        // Brief delay lets the interactive shell finish initial prompt setup on first spawn
+        window.setTimeout(() => {
+          void orbitIpc.writeTerminalInput(hostId, terminalId, cmd.payload);
+          notifyToast(
+            translateGlobal(cmd.execute ? "terminal.commandSentToast" : "terminal.commandPastedToast"),
+          );
+        }, 280);
+      }
     },
 
 
@@ -165,9 +370,16 @@ export function createTerminalSlice(ctx: OrbitStoreContext) {
       terminalChannels.delete(`${target.hostId}::${target.slot}`);
       setState((s) => {
         const remaining = s.terminalTabs.filter((t) => t.key !== tabKey);
+        const existingGroup = s.terminalSplits.find((g) => g.paneKeys.includes(tabKey));
+        const siblingKey = existingGroup?.paneKeys.find((k) => k !== tabKey) ?? null;
+        const nextSplits = pruneSplitsForClosedTab(s.terminalSplits, tabKey);
         const nextActive =
           s.activeTerminalTabKey === tabKey
-            ? (remaining.find((t) => t.hostId === s.selectedHostId)?.key ?? remaining[0]?.key ?? null)
+            ? (siblingKey && remaining.some((t) => t.key === siblingKey)
+                ? siblingKey
+                : remaining.find((t) => t.hostId === s.selectedHostId)?.key ??
+                  remaining[0]?.key ??
+                  null)
             : s.activeTerminalTabKey;
         const nextTerminalFocused =
           s.terminalFocused &&
@@ -182,6 +394,7 @@ export function createTerminalSlice(ctx: OrbitStoreContext) {
         return {
           ...s,
           terminalTabs: remaining,
+          terminalSplits: nextSplits,
           activeTerminalTabKey: nextActive,
           terminalFocused: nextTerminalFocused,
         };

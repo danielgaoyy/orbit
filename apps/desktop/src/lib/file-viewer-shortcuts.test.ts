@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  CODE_EDITOR_SELECTOR,
   type FileViewerShortcutContext,
   type FileViewerShortcutEventLike,
+  isFocusInsideCodeEditor,
   resolveFileViewerShortcut,
 } from "./file-viewer-shortcuts.ts";
 
@@ -154,6 +156,25 @@ describe("file-viewer-shortcuts scope isolation", () => {
         makeKey({ key: "Escape", metaKey: false }),
       ),
       null,
+    );
+  });
+
+  it("detects focus inside the CodeMirror 6 editor so Cmd+K and Cmd+D yield cleanly", () => {
+    const insideNode = {
+      closest: (sel: string) => (sel === CODE_EDITOR_SELECTOR ? {} : null),
+    };
+    const outsideNode = {
+      closest: () => null,
+    };
+    const fakeDoc = { body: {}, documentElement: {} };
+
+    assert.equal(
+      isFocusInsideCodeEditor(outsideNode as unknown as EventTarget, insideNode as unknown as Element, fakeDoc),
+      true,
+    );
+    assert.equal(
+      isFocusInsideCodeEditor(outsideNode as unknown as EventTarget, outsideNode as unknown as Element, fakeDoc),
+      false,
     );
   });
 });

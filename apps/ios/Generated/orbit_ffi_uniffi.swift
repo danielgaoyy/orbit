@@ -15322,7 +15322,7 @@ public enum FfiRichBlock: Equatable, Hashable {
     )
     case codeBlock(language: String, rawCode: String, lines: [FfiHighlightedLine]
     )
-    case listItem(ordered: Bool, index: UInt32, checked: Bool?, spans: [FfiInlineSpan]
+    case listItem(ordered: Bool, index: UInt32, checked: Bool?, depth: UInt8, spans: [FfiInlineSpan]
     )
     case blockQuote(spans: [FfiInlineSpan]
     )
@@ -15361,7 +15361,7 @@ public struct FfiConverterTypeFfiRichBlock: FfiConverterRustBuffer {
         case 3: return .codeBlock(language: try FfiConverterString.read(from: &buf), rawCode: try FfiConverterString.read(from: &buf), lines: try FfiConverterSequenceTypeFfiHighlightedLine.read(from: &buf)
         )
         
-        case 4: return .listItem(ordered: try FfiConverterBool.read(from: &buf), index: try FfiConverterUInt32.read(from: &buf), checked: try FfiConverterOptionBool.read(from: &buf), spans: try FfiConverterSequenceTypeFfiInlineSpan.read(from: &buf)
+        case 4: return .listItem(ordered: try FfiConverterBool.read(from: &buf), index: try FfiConverterUInt32.read(from: &buf), checked: try FfiConverterOptionBool.read(from: &buf), depth: try FfiConverterUInt8.read(from: &buf), spans: try FfiConverterSequenceTypeFfiInlineSpan.read(from: &buf)
         )
         
         case 5: return .blockQuote(spans: try FfiConverterSequenceTypeFfiInlineSpan.read(from: &buf)
@@ -15401,11 +15401,12 @@ public struct FfiConverterTypeFfiRichBlock: FfiConverterRustBuffer {
             FfiConverterSequenceTypeFfiHighlightedLine.write(lines, into: &buf)
             
         
-        case let .listItem(ordered,index,checked,spans):
+        case let .listItem(ordered,index,checked,depth,spans):
             writeInt(&buf, Int32(4))
             FfiConverterBool.write(ordered, into: &buf)
             FfiConverterUInt32.write(index, into: &buf)
             FfiConverterOptionBool.write(checked, into: &buf)
+            FfiConverterUInt8.write(depth, into: &buf)
             FfiConverterSequenceTypeFfiInlineSpan.write(spans, into: &buf)
             
         

@@ -180,6 +180,7 @@ export interface ArtifactSummary {
   language?: string | null;
   mime_type?: string | null;
   resource_uri?: string | null;
+  mcp_server_name?: string | null;
   version: number;
   byte_len: number;
   created_at: string;
@@ -209,8 +210,24 @@ export interface UpsertArtifactRequest {
   language?: string | null;
   mime_type?: string | null;
   resource_uri?: string | null;
+  mcp_server_name?: string | null;
   content: string;
   summary_note?: string | null;
+}
+
+export interface McpResourceContent {
+  uri: string;
+  mime_type?: string | null;
+  text?: string | null;
+  blob_base64?: string | null;
+}
+
+export interface McpToolCallOutcome {
+  ok: boolean;
+  is_error: boolean;
+  content: unknown[];
+  structured_content?: unknown;
+  error?: string | null;
 }
 export type ReasoningEffort =
   | "off"
@@ -241,13 +258,23 @@ export interface GuardianPolicyConfig {
   allow_workspace_tests: boolean;
   blocked_command_patterns: string[];
   trusted_command_prefixes: string[];
+  llm_tier2_enabled?: boolean;
+  llm_provider?: ProviderKind | null;
+  llm_model?: string | null;
+  llm_timeout_ms?: number;
 }
 
 export interface GuardianAssessment {
   risk_level: GuardianRiskLevel;
   decision: GuardianDecision;
   confidence: number;
-  classifier_tier: "deterministic" | "ai_rubric" | "fail_closed" | string;
+  classifier_tier:
+    | "deterministic_tier1"
+    | "deterministic"
+    | "llm_tier2"
+    | "heuristic_fallback"
+    | "fail_closed"
+    | string;
   reason: string;
   signals: string[];
   latency_ms: number;
@@ -268,8 +295,71 @@ export interface GuardianConfigSnapshotView {
   recent_audits: GuardianAuditEntry[];
 }
 
+export type PermissionRuleScopeKind = "host" | "project";
+export type PermissionRuleToolKind =
+  | "shell"
+  | "file_write"
+  | "file_read"
+  | "mcp_tool"
+  | "network"
+  | "any";
+export type PermissionRulePatternKind =
+  | "command_prefix"
+  | "exact_command"
+  | "path_glob"
+  | "tool_name";
+export type PermissionRuleDecision = "allow" | "deny";
+export type PermissionRuleSource = "manual" | "always_allow_grant";
+
+export interface PermissionRuleRecord {
+  id: string;
+  scope_kind: PermissionRuleScopeKind;
+  project_cwd?: string | null;
+  provider?: ProviderKind | null;
+  tool_kind: PermissionRuleToolKind;
+  pattern_kind: PermissionRulePatternKind;
+  pattern: string;
+  decision: PermissionRuleDecision;
+  source: PermissionRuleSource;
+  note?: string | null;
+  created_at: string;
+  last_matched_at?: string | null;
+  match_count: number;
+}
+
+export interface UpsertPermissionRuleInput {
+  id?: string | null;
+  scope_kind: PermissionRuleScopeKind;
+  project_cwd?: string | null;
+  provider?: ProviderKind | null;
+  tool_kind: PermissionRuleToolKind;
+  pattern_kind: PermissionRulePatternKind;
+  pattern: string;
+  decision: PermissionRuleDecision;
+  source?: PermissionRuleSource;
+  note?: string | null;
+}
+
+export interface BatchPermissionSkipReason {
+  agent_id: string;
+  permission_request_id: string;
+  reason: string;
+}
+
+export interface ResolvePermissionsBatchResult {
+  resolved_count: number;
+  skipped_count: number;
+  skipped_reasons: BatchPermissionSkipReason[];
+}
+
 export type ImPlatform = "lark" | "telegram" | "slack" | "discord";
-export type ImConnectionStatus = "disconnected" | "connecting" | "connected" | "error";
+export type ImTransportMode = "long_connection" | "webhook";
+export type ImConnectionStatus =
+  | "disconnected"
+  | "connecting"
+  | "reconnecting"
+  | "connected"
+  | "error";
 
 export type ImRoutingMode = "per_thread_agent" | "personal_router";
 export type RouterScope = "global_fleet" | "local_host_only";
@@ -339,14 +429,18 @@ export interface ImChannelRecord {
   name: string;
   platform: ImPlatform;
   enabled: boolean;
+  transport_mode?: ImTransportMode;
   status: ImConnectionStatus;
   status_message?: string | null;
   webhook_path: string;
   app_id?: string | null;
   has_primary_secret: boolean;
   has_signing_secret: boolean;
+  has_app_token?: boolean;
   masked_primary_secret?: string | null;
   masked_signing_secret?: string | null;
+  masked_app_token?: string | null;
+  public_key?: string | null;
   allowed_chat_ids: string[];
   allowed_user_ids: string[];
   default_workspace_cwd: string;
@@ -447,9 +541,12 @@ export interface UpsertImChannelRequest {
   name: string;
   platform: ImPlatform;
   enabled: boolean;
+  transport_mode?: ImTransportMode;
   app_id?: string | null;
   primary_secret?: string | null;
   signing_secret?: string | null;
+  app_token?: string | null;
+  public_key?: string | null;
   keep_existing_secrets: boolean;
   allowed_chat_ids: string[];
   allowed_user_ids: string[];
@@ -666,11 +763,27 @@ export interface ConversationSearchHit {
   host_name: string;
   agent_id: string;
   seq: number;
+  turn_id?: string | null;
   role: string;
   title: string;
   project_name: string;
   snippet: string;
   updated_at_rfc3339: string;
+  is_remote?: boolean;
+  is_unloaded?: boolean;
+}
+
+export interface SearchMessagesRemoteRequest {
+  query: string;
+  hostId?: string | null;
+  agentId?: string | null;
+  limit?: number;
+}
+
+export interface SearchMessagesRemoteResponse {
+  hits: ConversationSearchHit[];
+  remote_hosts_queried: number;
+  remote_hosts_failed: number;
 }
 
 export type ExportFormat = "markdown" | "json" | "html";
@@ -886,6 +999,32 @@ export interface PermissionCheckpointRef {
   allowed_decisions: string[];
 }
 
+export interface PlanApprovalPayload {
+  plan_markdown: string;
+  plan_title?: string | null;
+  plan_file_path?: string | null;
+  summary?: string | null;
+  plan_file_backed?: boolean;
+  allowed_prompts?: string[];
+  source?: string | null;
+}
+
+export type PlanApprovalAction = "approve_and_build" | "request_changes" | "dismiss";
+
+export interface PendingPlanApprovalView {
+  seq: number;
+  request_id: string;
+  title: string;
+  plan_markdown: string;
+  plan_title?: string | null;
+  plan_file_path?: string | null;
+  summary?: string | null;
+  allowed_prompts?: string[];
+  source?: string | null;
+  blocks: RichBlockView[];
+  timestamp_ms?: number | null;
+}
+
 export interface PendingPermissionSummary {
   agent_id: string;
   agent_title: string;
@@ -894,6 +1033,8 @@ export interface PendingPermissionSummary {
   detail: ToolCallDetail;
   allowed_decisions: string[];
   guardian_assessment?: GuardianAssessment | null;
+  plan_approval?: PlanApprovalPayload | null;
+  human_only?: boolean;
   created_at: string;
 }
 
@@ -974,6 +1115,8 @@ export interface ManagedSkillRecord {
   has_references: boolean;
   approx_tokens: number;
   updated_at_ms: number;
+  argument_hint?: string | null;
+  is_command?: boolean;
 }
 
 export interface ManagedSkillContentView {
@@ -1604,6 +1747,23 @@ export interface BrowserSessionSummary {
   updated_at_ms: number;
 }
 
+export interface PickedElementBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface PickedElementInfo {
+  selector: string;
+  tag: string;
+  text_preview: string;
+  attributes: Record<string, string>;
+  computed_box?: PickedElementBox | null;
+  outer_html_excerpt: string;
+  page_url: string;
+}
+
 export type BrowserActionRequest =
   | { kind: "navigate"; url: string }
   | { kind: "snapshot" }
@@ -1612,7 +1772,30 @@ export type BrowserActionRequest =
   | { kind: "type"; ref_id?: string | null; text: string; submit?: boolean }
   | { kind: "scroll"; delta_x: number; delta_y: number }
   | { kind: "back" }
-  | { kind: "reload" };
+  | { kind: "reload" }
+  | { kind: "press_key"; key: string; modifiers?: string[]; ref_id?: string | null }
+  | {
+      kind: "select_option";
+      ref_id?: string | null;
+      selector?: string | null;
+      value?: string | null;
+      label?: string | null;
+      index?: number | null;
+    }
+  | {
+      kind: "upload_file";
+      ref_id?: string | null;
+      selector?: string | null;
+      files: string[];
+    }
+  | {
+      kind: "pick_element";
+      x?: number | null;
+      y?: number | null;
+      selector?: string | null;
+      ref_id?: string | null;
+      interactive?: boolean;
+    };
 
 export interface BrowserSessionsSnapshotView {
   host_id: string;
@@ -1628,6 +1811,16 @@ export interface BrowserActionResponseView {
   screenshot_base64?: string | null;
   text_excerpt?: string | null;
   captcha_detected?: boolean;
+  picked_element?: PickedElementInfo | null;
+}
+
+export interface RemotePreviewTunnelView {
+  host_id: string;
+  target_port: number;
+  proxy_host?: string | null;
+  local_port: number;
+  local_url: string;
+  is_tunneled: boolean;
 }
 
 export interface InlineSpanView {
@@ -1677,6 +1870,7 @@ export type RichBlockView =
       ordered: boolean;
       index: number;
       checked: boolean | null;
+      depth?: number;
       spans: InlineSpanView[];
     }
   | { kind: "block_quote"; spans: InlineSpanView[] }
@@ -1814,6 +2008,7 @@ export type TimelineItemView =
       allowed_decisions: string[];
       resolved_decision: string | null;
       guardian_assessment?: GuardianAssessment | null;
+      plan_approval?: PlanApprovalPayload | null;
       timestamp_ms?: number | null;
     }
   | {
@@ -1942,6 +2137,145 @@ export interface GitCreatePrResult {
   title: string;
 }
 
+export interface GitStashEntry {
+  stash_ref: string;
+  index: number;
+  branch?: string | null;
+  message: string;
+  oid?: string | null;
+  short_sha?: string | null;
+  created_at?: string | null;
+}
+
+export interface GitStashListResult {
+  entries: GitStashEntry[];
+}
+
+export interface GitStashMutationResult {
+  action: "push" | "apply" | "pop" | "drop" | string;
+  stash_ref?: string | null;
+  summary: string;
+  had_conflicts: boolean;
+}
+
+export type GitRebaseKind = "none" | "merge" | "apply";
+
+export interface GitRebaseStatus {
+  in_progress: boolean;
+  kind: GitRebaseKind;
+  current_step?: number | null;
+  total_steps?: number | null;
+  head_name?: string | null;
+  onto?: string | null;
+  stopped_message?: string | null;
+  conflicted_files: string[];
+  merge_in_progress: boolean;
+  cherry_pick_in_progress: boolean;
+}
+
+export interface GitRebaseActionResult {
+  action: "start" | "continue" | "abort" | "skip" | string;
+  status: GitRebaseStatus;
+  summary: string;
+}
+
+export interface GitConflictBlock {
+  index: number;
+  start_line: number;
+  end_line: number;
+  ours_label: string;
+  base_label?: string | null;
+  theirs_label: string;
+  ours: string;
+  base?: string | null;
+  theirs: string;
+  context_before: string[];
+  context_after: string[];
+}
+
+export interface GitConflictFile {
+  path: string;
+  blocks: GitConflictBlock[];
+  is_binary: boolean;
+  unmerged_in_index: boolean;
+  total_blocks: number;
+  content_sha256?: string | null;
+}
+
+export interface GitConflictListResult {
+  files: GitConflictFile[];
+}
+
+export type GitConflictResolution =
+  | { strategy: "ours" }
+  | { strategy: "theirs" }
+  | { strategy: "both" }
+  | { strategy: "manual_content"; content: string };
+
+export interface GitResolveConflictResult {
+  path: string;
+  remaining_blocks: number;
+  staged: boolean;
+  summary: string;
+}
+
+export type GitPrAvailability = "available" | "no_pull_request" | "unavailable";
+export type GitCiCheckState = "passing" | "failing" | "pending" | "neutral";
+
+export interface GitPrCheckItem {
+  name: string;
+  state: GitCiCheckState;
+  workflow?: string | null;
+  raw_status?: string | null;
+  raw_conclusion?: string | null;
+  details_url?: string | null;
+}
+
+export interface GitPrReviewComment {
+  id: string;
+  author: string;
+  body: string;
+  path?: string | null;
+  line?: number | null;
+  start_line?: number | null;
+  url?: string | null;
+  created_at?: string | null;
+  is_resolved: boolean;
+  is_outdated: boolean;
+  kind: "review_thread" | "review_summary" | "issue_comment" | string;
+}
+
+export interface GitPrStatus {
+  availability: GitPrAvailability;
+  reason?: string | null;
+  number?: number | null;
+  title?: string | null;
+  url?: string | null;
+  state?: string | null;
+  is_draft: boolean;
+  mergeable?: string | null;
+  review_decision?: string | null;
+  head_ref?: string | null;
+  base_ref?: string | null;
+  checks: GitPrCheckItem[];
+  passing_checks: number;
+  failing_checks: number;
+  pending_checks: number;
+  review_comments: GitPrReviewComment[];
+  unresolved_comment_count: number;
+}
+
+export interface GitGeneratedCommitMessage {
+  message: string;
+  subject: string;
+  body?: string | null;
+  commit_type: string;
+  scope?: string | null;
+  diff_source: "staged" | "working_tree" | string;
+  files_analyzed: number;
+  generator: string;
+}
+
 export type GitMutationOutcome =
   | { kind: "files_staged"; paths: string[]; all: boolean }
   | { kind: "files_unstaged"; paths: string[]; all: boolean }
@@ -1949,7 +2283,10 @@ export type GitMutationOutcome =
   | { kind: "files_discarded"; paths: string[]; include_untracked: boolean }
   | ({ kind: "committed" } & GitCommitResult)
   | ({ kind: "pushed" } & GitPushResult)
-  | ({ kind: "pr_created" } & GitCreatePrResult);
+  | ({ kind: "pr_created" } & GitCreatePrResult)
+  | ({ kind: "stash_mutated" } & GitStashMutationResult)
+  | ({ kind: "rebase_action" } & GitRebaseActionResult)
+  | ({ kind: "conflict_resolved" } & GitResolveConflictResult);
 
 export interface WorkspaceFileView {
   host_id: string;
@@ -2400,6 +2737,7 @@ export interface AgentStageView {
   oldest_loaded_seq?: number;
   pending_permissions: TimelineItemView[];
   pending_questions: TimelineItemView[];
+  pending_plan_approval?: PendingPlanApprovalView | null;
   session_turn_diffs: DiffFileView[];
   insights: SessionInsightsView;
   latest_seq: number;
@@ -2419,6 +2757,7 @@ export interface AgentStageDeltaView {
   oldest_loaded_seq?: number;
   pending_permissions: TimelineItemView[];
   pending_questions: TimelineItemView[];
+  pending_plan_approval?: PendingPlanApprovalView | null;
   session_turn_diffs: DiffFileView[];
   insights: SessionInsightsView;
   latest_seq: number;
@@ -2553,6 +2892,8 @@ export interface SlashCommandView {
   icon_key: string;
   keywords: string[];
   desktop_only: boolean;
+  argument_hint?: string | null;
+  skill_id?: string;
 }
 
 export type ComposerContextInput =
@@ -2577,6 +2918,37 @@ export type ComposerContextInput =
       container?: string | null;
       language: string;
       snippet?: string | null;
+    }
+  | {
+      kind: "dom_element";
+      selector: string;
+      tag: string;
+      text_preview: string;
+      attributes: Record<string, string>;
+      computed_box?: PickedElementBox | null;
+      outer_html_excerpt: string;
+      page_url: string;
+    }
+  | {
+      kind: "workspace_folder";
+      path: string;
+      file_count: number;
+      tree_summary?: string | null;
+    }
+  | {
+      kind: "pull_request";
+      number: number;
+      title: string;
+      url?: string | null;
+      state?: string | null;
+      head_ref?: string | null;
+      base_ref?: string | null;
+      summary?: string | null;
+    }
+  | {
+      kind: "web_url";
+      url: string;
+      label?: string | null;
     };
 
 export interface ComposerQuoteInput {
@@ -2766,6 +3138,75 @@ export interface LspLocation {
   col: number;
   end_line: number;
   preview?: string | null;
+}
+
+export interface LspRange {
+  line: number;
+  col: number;
+  end_line: number;
+  end_col: number;
+}
+
+export interface LspHoverInfo {
+  contents: string;
+  format: "markdown" | "plaintext" | string;
+  range?: LspRange | null;
+}
+
+export interface LspReferenceLocation {
+  path: string;
+  line: number;
+  character: number;
+  end_line: number;
+  end_character: number;
+  preview_line?: string | null;
+}
+
+export interface LspCompletionItem {
+  label: string;
+  kind: string;
+  detail?: string | null;
+  documentation?: string | null;
+  insert_text?: string | null;
+  sort_text?: string | null;
+  filter_text?: string | null;
+}
+
+export interface LspTextEdit {
+  line: number;
+  col: number;
+  end_line: number;
+  end_col: number;
+  new_text: string;
+}
+
+export interface LspFileTextEdits {
+  path: string;
+  edits: LspTextEdit[];
+}
+
+export interface LspWorkspaceEdit {
+  file_edits: LspFileTextEdits[];
+}
+
+export interface LspCommand {
+  title: string;
+  command: string;
+  arguments?: unknown[];
+}
+
+export interface LspCodeAction {
+  title: string;
+  kind?: string | null;
+  is_preferred: boolean;
+  edit?: LspWorkspaceEdit | null;
+  command?: LspCommand | null;
+}
+
+export interface LspWorkspaceEditResult {
+  applied: boolean;
+  modified_files: string[];
+  total_edits: number;
 }
 
 export interface MentionRankRequest {
@@ -3982,6 +4423,42 @@ export const orbitIpc = {
     return invoke<string>("delete_artifact", { hostId, artifactId });
   },
 
+  readMcpResource: async (
+    hostId: string,
+    artifactId: string,
+    artifactVersion: number | null,
+    uri: string,
+  ): Promise<McpResourceContent> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime unavailable");
+    }
+    return invoke<McpResourceContent>("read_mcp_resource", {
+      hostId,
+      artifactId,
+      artifactVersion: artifactVersion ?? null,
+      uri,
+    });
+  },
+
+  callArtifactMcpTool: async (
+    hostId: string,
+    artifactId: string,
+    artifactVersion: number | null,
+    toolName: string,
+    argumentsObj: Record<string, unknown>,
+  ): Promise<McpToolCallOutcome> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime unavailable");
+    }
+    return invoke<McpToolCallOutcome>("call_artifact_mcp_tool", {
+      hostId,
+      artifactId,
+      artifactVersion: artifactVersion ?? null,
+      toolName,
+      arguments: argumentsObj,
+    });
+  },
+
   listAcpAgents: async (hostId: string): Promise<AcpAgentAvailability[]> => {
     if (!isTauriRuntime()) return [];
     return invoke<AcpAgentAvailability[]>("list_acp_agents", { hostId });
@@ -4424,6 +4901,29 @@ export const orbitIpc = {
     });
   },
 
+  resolvePlanApproval: async (
+    hostId: string,
+    agentId: string,
+    permissionRequestId: string,
+    action: PlanApprovalAction,
+    options?: {
+      editedPlanMarkdown?: string | null;
+      feedback?: string | null;
+      targetMode?: SessionMode | null;
+    },
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("resolve_plan_approval", {
+      hostId,
+      agentId,
+      permissionRequestId,
+      action,
+      editedPlanMarkdown: options?.editedPlanMarkdown ?? null,
+      feedback: options?.feedback ?? null,
+      targetMode: options?.targetMode ?? null,
+    });
+  },
+
   answerQuestion: async (
     hostId: string,
     agentId: string,
@@ -4578,6 +5078,233 @@ export const orbitIpc = {
       body: params.body ?? "",
       base: params.base ?? null,
       draft: params.draft ?? false,
+    });
+  },
+
+  gitStashList: async (params: {
+    hostId: string;
+    cwd: string;
+  }): Promise<GitStashListResult> => {
+    if (!isTauriRuntime()) {
+      return { entries: [] };
+    }
+    return invoke<GitStashListResult>("git_stash_list", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+    });
+  },
+
+  gitStashPush: async (params: {
+    hostId: string;
+    cwd: string;
+    message?: string | null;
+    includeUntracked?: boolean;
+  }): Promise<GitStashMutationResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to stash changes.");
+    }
+    return invoke<GitStashMutationResult>("git_stash_push", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      message: params.message ?? null,
+      includeUntracked: params.includeUntracked ?? false,
+    });
+  },
+
+  gitStashApply: async (params: {
+    hostId: string;
+    cwd: string;
+    stashRef: string;
+    expectedOid?: string | null;
+  }): Promise<GitStashMutationResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to apply stashes.");
+    }
+    return invoke<GitStashMutationResult>("git_stash_apply", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      stashRef: params.stashRef,
+      expectedOid: params.expectedOid ?? null,
+    });
+  },
+
+  gitStashPop: async (params: {
+    hostId: string;
+    cwd: string;
+    stashRef: string;
+    expectedOid?: string | null;
+  }): Promise<GitStashMutationResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to pop stashes.");
+    }
+    return invoke<GitStashMutationResult>("git_stash_pop", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      stashRef: params.stashRef,
+      expectedOid: params.expectedOid ?? null,
+    });
+  },
+
+  gitStashDrop: async (params: {
+    hostId: string;
+    cwd: string;
+    stashRef: string;
+    expectedOid?: string | null;
+  }): Promise<GitStashMutationResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to drop stashes.");
+    }
+    return invoke<GitStashMutationResult>("git_stash_drop", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      stashRef: params.stashRef,
+      expectedOid: params.expectedOid ?? null,
+    });
+  },
+
+  gitRebaseStatus: async (params: {
+    hostId: string;
+    cwd: string;
+  }): Promise<GitRebaseStatus> => {
+    if (!isTauriRuntime()) {
+      return {
+        in_progress: false,
+        kind: "none",
+        conflicted_files: [],
+        merge_in_progress: false,
+        cherry_pick_in_progress: false,
+      };
+    }
+    return invoke<GitRebaseStatus>("git_rebase_status", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+    });
+  },
+
+  gitRebaseStart: async (params: {
+    hostId: string;
+    cwd: string;
+    ontoRef: string;
+  }): Promise<GitRebaseActionResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to start rebase.");
+    }
+    return invoke<GitRebaseActionResult>("git_rebase_start", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      ontoRef: params.ontoRef,
+    });
+  },
+
+  gitRebaseContinue: async (params: {
+    hostId: string;
+    cwd: string;
+  }): Promise<GitRebaseActionResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to continue rebase.");
+    }
+    return invoke<GitRebaseActionResult>("git_rebase_continue", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+    });
+  },
+
+  gitRebaseAbort: async (params: {
+    hostId: string;
+    cwd: string;
+  }): Promise<GitRebaseActionResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to abort rebase.");
+    }
+    return invoke<GitRebaseActionResult>("git_rebase_abort", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+    });
+  },
+
+  gitRebaseSkip: async (params: {
+    hostId: string;
+    cwd: string;
+    expectedStep?: number | null;
+  }): Promise<GitRebaseActionResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to skip rebase commit.");
+    }
+    return invoke<GitRebaseActionResult>("git_rebase_skip", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      expectedStep: params.expectedStep ?? null,
+    });
+  },
+
+  gitListConflicts: async (params: {
+    hostId: string;
+    cwd: string;
+  }): Promise<GitConflictListResult> => {
+    if (!isTauriRuntime()) {
+      return { files: [] };
+    }
+    return invoke<GitConflictListResult>("git_list_conflicts", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+    });
+  },
+
+  gitResolveConflict: async (params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+    blockIndex?: number | null;
+    resolution: GitConflictResolution;
+    autoStage?: boolean;
+    expectedSha256?: string | null;
+  }): Promise<GitResolveConflictResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to resolve conflicts.");
+    }
+    return invoke<GitResolveConflictResult>("git_resolve_conflict", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      path: params.path,
+      blockIndex: params.blockIndex ?? null,
+      resolution: params.resolution,
+      autoStage: params.autoStage ?? true,
+      expectedSha256: params.expectedSha256 ?? null,
+    });
+  },
+
+  gitPrStatus: async (params: {
+    hostId: string;
+    cwd: string;
+  }): Promise<GitPrStatus> => {
+    if (!isTauriRuntime()) {
+      return {
+        availability: "unavailable",
+        is_draft: false,
+        checks: [],
+        passing_checks: 0,
+        failing_checks: 0,
+        pending_checks: 0,
+        review_comments: [],
+        unresolved_comment_count: 0,
+      };
+    }
+    return invoke<GitPrStatus>("git_pr_status", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+    });
+  },
+
+  gitGenerateCommitMessage: async (params: {
+    hostId: string;
+    cwd: string;
+  }): Promise<GitGeneratedCommitMessage> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to generate commit message.");
+    }
+    return invoke<GitGeneratedCommitMessage>("git_generate_commit_message", {
+      hostId: params.hostId,
+      cwd: params.cwd,
     });
   },
 
@@ -5071,6 +5798,130 @@ export const orbitIpc = {
     });
   },
 
+  lspHover: async (params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+    line: number;
+    col: number;
+    content?: string | null;
+  }): Promise<LspHoverInfo | null> => {
+    if (!isTauriRuntime()) return null;
+    return invoke<LspHoverInfo | null>("lsp_hover", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      path: params.path,
+      line: params.line,
+      col: params.col,
+      content: params.content ?? null,
+    });
+  },
+
+  lspReferences: async (params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+    line: number;
+    col: number;
+    includeDeclaration?: boolean;
+    content?: string | null;
+  }): Promise<LspReferenceLocation[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<LspReferenceLocation[]>("lsp_references", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      path: params.path,
+      line: params.line,
+      col: params.col,
+      includeDeclaration: params.includeDeclaration ?? true,
+      content: params.content ?? null,
+    });
+  },
+
+  lspCompletion: async (params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+    line: number;
+    col: number;
+    triggerCharacter?: string | null;
+    content?: string | null;
+  }): Promise<LspCompletionItem[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<LspCompletionItem[]>("lsp_completion", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      path: params.path,
+      line: params.line,
+      col: params.col,
+      triggerCharacter: params.triggerCharacter ?? null,
+      content: params.content ?? null,
+    });
+  },
+
+  lspCodeAction: async (params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+    line: number;
+    col: number;
+    endLine: number;
+    endCol: number;
+    diagnostics?: LspDiagnostic[];
+    content?: string | null;
+  }): Promise<LspCodeAction[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<LspCodeAction[]>("lsp_code_action", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      path: params.path,
+      line: params.line,
+      col: params.col,
+      endLine: params.endLine,
+      endCol: params.endCol,
+      diagnostics: params.diagnostics ?? [],
+      content: params.content ?? null,
+    });
+  },
+
+  lspRename: async (params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+    line: number;
+    col: number;
+    newName: string;
+    content?: string | null;
+  }): Promise<LspWorkspaceEditResult> => {
+    if (!isTauriRuntime()) {
+      return { applied: false, modified_files: [], total_edits: 0 };
+    }
+    return invoke<LspWorkspaceEditResult>("lsp_rename", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      path: params.path,
+      line: params.line,
+      col: params.col,
+      newName: params.newName,
+      content: params.content ?? null,
+    });
+  },
+
+  lspApplyWorkspaceEdit: async (params: {
+    hostId: string;
+    cwd: string;
+    edit: LspWorkspaceEdit;
+  }): Promise<LspWorkspaceEditResult> => {
+    if (!isTauriRuntime()) {
+      return { applied: false, modified_files: [], total_edits: 0 };
+    }
+    return invoke<LspWorkspaceEditResult>("lsp_apply_workspace_edit", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      edit: params.edit,
+    });
+  },
+
   restartLspServer: async (
     hostId: string,
     cwd: string,
@@ -5169,6 +6020,65 @@ export const orbitIpc = {
       return { config, recent_audits: [] };
     }
     return invoke<GuardianConfigSnapshotView>("update_guardian_config", { hostId, config });
+  },
+
+  listPermissionRules: async (
+    hostId: string,
+    projectCwd?: string | null,
+  ): Promise<PermissionRuleRecord[]> => {
+    if (!isTauriRuntime()) {
+      return [];
+    }
+    return invoke<PermissionRuleRecord[]>("list_permission_rules", {
+      hostId,
+      projectCwd: projectCwd ?? null,
+    });
+  },
+
+  upsertPermissionRule: async (
+    hostId: string,
+    rule: UpsertPermissionRuleInput,
+  ): Promise<PermissionRuleRecord> => {
+    if (!isTauriRuntime()) {
+      return {
+        id: rule.id ?? `pr_mock_${Date.now()}`,
+        scope_kind: rule.scope_kind,
+        project_cwd: rule.scope_kind === "project" ? (rule.project_cwd ?? null) : null,
+        provider: rule.provider ?? null,
+        tool_kind: rule.tool_kind,
+        pattern_kind: rule.pattern_kind,
+        pattern: rule.pattern.trim(),
+        decision: rule.decision,
+        source: rule.source ?? "manual",
+        note: rule.note ?? null,
+        created_at: new Date().toISOString(),
+        last_matched_at: null,
+        match_count: 0,
+      };
+    }
+    return invoke<PermissionRuleRecord>("upsert_permission_rule", { hostId, rule });
+  },
+
+  deletePermissionRule: async (hostId: string, ruleId: string): Promise<boolean> => {
+    if (!isTauriRuntime()) {
+      return true;
+    }
+    return invoke<boolean>("delete_permission_rule", { hostId, ruleId });
+  },
+
+  resolvePermissionsBatch: async (
+    hostId: string,
+    items: Array<[string, string]>,
+    decision = "allow",
+  ): Promise<ResolvePermissionsBatchResult> => {
+    if (!isTauriRuntime()) {
+      return { resolved_count: 0, skipped_count: items.length, skipped_reasons: [] };
+    }
+    return invoke<ResolvePermissionsBatchResult>("resolve_permissions_batch", {
+      hostId,
+      items,
+      decision,
+    });
   },
 
   listImChannels: async (hostId: string): Promise<ImChannelsSnapshotView> => {
@@ -5562,6 +6472,24 @@ export const orbitIpc = {
     });
   },
 
+  searchMessagesRemote: async (
+    req: SearchMessagesRemoteRequest,
+  ): Promise<SearchMessagesRemoteResponse> => {
+    if (!isTauriRuntime()) {
+      return { hits: [], remote_hosts_queried: 0, remote_hosts_failed: 0 };
+    }
+    const trimmed = req.query.trim();
+    if (!trimmed) {
+      return { hits: [], remote_hosts_queried: 0, remote_hosts_failed: 0 };
+    }
+    return invoke<SearchMessagesRemoteResponse>("search_messages_remote", {
+      query: trimmed,
+      hostId: req.hostId ?? null,
+      agentId: req.agentId ?? null,
+      limit: req.limit ?? null,
+    });
+  },
+
   exportAgentTranscript: async (
     hostId: string,
     agentId: string,
@@ -5893,6 +6821,7 @@ export const orbitIpc = {
     headless?: boolean | null;
     viewportWidth?: number | null;
     viewportHeight?: number | null;
+    workspaceRoot?: string | null;
   }): Promise<BrowserSessionSummary> => {
     return invoke<BrowserSessionSummary>("create_browser_session", {
       hostId: req.hostId,
@@ -5901,6 +6830,7 @@ export const orbitIpc = {
       headless: req.headless ?? null,
       viewportWidth: req.viewportWidth ?? null,
       viewportHeight: req.viewportHeight ?? null,
+      workspaceRoot: req.workspaceRoot ?? null,
     });
   },
 
@@ -5933,6 +6863,41 @@ export const orbitIpc = {
     return invoke<BrowserSessionsSnapshotView>("update_browser_policy", {
       hostId,
       policy,
+    });
+  },
+
+  openRemotePreviewTunnel: async (
+    hostId: string,
+    targetPort: number,
+    proxyHost?: string | null,
+  ): Promise<RemotePreviewTunnelView> => {
+    if (!isTauriRuntime()) {
+      return {
+        host_id: hostId,
+        target_port: targetPort,
+        proxy_host: proxyHost ?? null,
+        local_port: targetPort,
+        local_url: `http://127.0.0.1:${targetPort}`,
+        is_tunneled: false,
+      };
+    }
+    return invoke<RemotePreviewTunnelView>("open_remote_preview_tunnel", {
+      hostId,
+      targetPort,
+      proxyHost: proxyHost ?? null,
+    });
+  },
+
+  closeRemotePreviewTunnel: async (
+    hostId: string,
+    targetPort: number,
+    proxyHost?: string | null,
+  ): Promise<boolean> => {
+    if (!isTauriRuntime()) return false;
+    return invoke<boolean>("close_remote_preview_tunnel", {
+      hostId,
+      targetPort,
+      proxyHost: proxyHost ?? null,
     });
   },
 

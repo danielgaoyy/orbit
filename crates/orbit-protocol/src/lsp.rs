@@ -133,6 +133,118 @@ pub struct LspLocation {
     pub preview: Option<String>,
 }
 
+/// A 1-based range in a document (`line >= 1`, `col >= 1`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspRange {
+    pub line: u32,
+    pub col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+}
+
+/// Normalized hover documentation returned by `textDocument/hover`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspHoverInfo {
+    /// Normalized Markdown or plaintext body.
+    pub contents: String,
+    /// `"markdown"` or `"plaintext"`.
+    #[serde(default)]
+    pub format: String,
+    /// Optional 1-based highlight range in the document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<LspRange>,
+}
+
+/// A workspace-confined symbol reference returned by `textDocument/references`.
+///
+/// Coordinates (`line`, `character`, `end_line`, `end_character`) are **1-based**.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspReferenceLocation {
+    pub path: String,
+    pub line: u32,
+    pub character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_line: Option<String>,
+}
+
+/// A normalized completion candidate returned by `textDocument/completion`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspCompletionItem {
+    pub label: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insert_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_text: Option<String>,
+}
+
+/// A single 1-based text replacement edit within a document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspTextEdit {
+    pub line: u32,
+    pub col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+    pub new_text: String,
+}
+
+/// Grouped text edits targeting a single workspace-relative file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspFileTextEdits {
+    pub path: String,
+    #[serde(default)]
+    pub edits: Vec<LspTextEdit>,
+}
+
+/// Normalized workspace-confined edit bundle returned by `codeAction` or `rename`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspWorkspaceEdit {
+    #[serde(default)]
+    pub file_edits: Vec<LspFileTextEdits>,
+}
+
+/// Optional server command attached to a code action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspCommand {
+    pub title: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<serde_json::Value>,
+}
+
+/// Available quick fix or refactor returned by `textDocument/codeAction`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspCodeAction {
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub is_preferred: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit: Option<LspWorkspaceEdit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<LspCommand>,
+}
+
+/// Summary returned after atomically applying a workspace edit (`rename` or `codeAction`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspWorkspaceEditResult {
+    pub applied: bool,
+    #[serde(default)]
+    pub modified_files: Vec<String>,
+    #[serde(default)]
+    pub total_edits: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +293,61 @@ mod tests {
             end_line: 42,
             preview: Some("pub struct LspManager {".into()),
         };
+        let hover = LspHoverInfo {
+            contents: "```rust\npub fn answer() -> u32\n```".into(),
+            format: "markdown".into(),
+            range: Some(LspRange {
+                line: 3,
+                col: 8,
+                end_line: 3,
+                end_col: 14,
+            }),
+        };
+        let reference = LspReferenceLocation {
+            path: "src/lib.rs".into(),
+            line: 10,
+            character: 5,
+            end_line: 10,
+            end_character: 11,
+            preview_line: Some("let x = answer();".into()),
+        };
+        let completion = LspCompletionItem {
+            label: "answer".into(),
+            kind: "function".into(),
+            detail: Some("fn() -> u32".into()),
+            documentation: Some("Computes the answer.".into()),
+            insert_text: Some("answer()".into()),
+            sort_text: Some("0001".into()),
+            filter_text: Some("answer".into()),
+        };
+        let ws_edit = LspWorkspaceEdit {
+            file_edits: vec![LspFileTextEdits {
+                path: "src/lib.rs".into(),
+                edits: vec![LspTextEdit {
+                    line: 3,
+                    col: 8,
+                    end_line: 3,
+                    end_col: 14,
+                    new_text: "compute".into(),
+                }],
+            }],
+        };
+        let code_action = LspCodeAction {
+            title: "Rename to `compute`".into(),
+            kind: Some("quickfix".into()),
+            is_preferred: true,
+            edit: Some(ws_edit.clone()),
+            command: Some(LspCommand {
+                title: "Run check".into(),
+                command: "rust-analyzer.check".into(),
+                arguments: vec![serde_json::json!({"target": "all"})],
+            }),
+        };
+        let edit_result = LspWorkspaceEditResult {
+            applied: true,
+            modified_files: vec!["src/lib.rs".into()],
+            total_edits: 1,
+        };
 
         let messages = vec![
             WireMessage::ListLspServers {
@@ -212,7 +379,7 @@ mod tests {
             WireMessage::LspDiagnosticsResponse {
                 request_id: req_id,
                 cwd: "/workspace/orbit".into(),
-                diagnostics: vec![diag],
+                diagnostics: vec![diag.clone()],
             },
             WireMessage::LspGotoDefinition {
                 request_id: req_id,
@@ -225,6 +392,82 @@ mod tests {
                 request_id: req_id,
                 cwd: "/workspace/orbit".into(),
                 locations: vec![location],
+            },
+            WireMessage::LspHover {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                path: "src/lib.rs".into(),
+                line: 3,
+                col: 9,
+                content: Some("pub fn answer() -> u32 { 42 }".into()),
+            },
+            WireMessage::LspHoverResponse {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                hover: Some(hover),
+            },
+            WireMessage::LspReferences {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                path: "src/lib.rs".into(),
+                line: 3,
+                col: 9,
+                include_declaration: true,
+                content: None,
+            },
+            WireMessage::LspReferencesResponse {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                references: vec![reference],
+            },
+            WireMessage::LspCompletion {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                path: "src/lib.rs".into(),
+                line: 4,
+                col: 10,
+                trigger_character: Some(".".into()),
+                content: None,
+            },
+            WireMessage::LspCompletionResponse {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                items: vec![completion],
+            },
+            WireMessage::LspCodeActionRequest {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                path: "src/lib.rs".into(),
+                line: 12,
+                col: 5,
+                end_line: 12,
+                end_col: 18,
+                diagnostics: vec![diag],
+                content: None,
+            },
+            WireMessage::LspCodeActionResponse {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                actions: vec![code_action],
+            },
+            WireMessage::LspRename {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                path: "src/lib.rs".into(),
+                line: 3,
+                col: 9,
+                new_name: "compute".into(),
+                content: None,
+            },
+            WireMessage::LspApplyWorkspaceEdit {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                edit: ws_edit,
+            },
+            WireMessage::LspWorkspaceEditResponse {
+                request_id: req_id,
+                cwd: "/workspace/orbit".into(),
+                result: edit_result,
             },
             WireMessage::RestartLspServer {
                 request_id: req_id,

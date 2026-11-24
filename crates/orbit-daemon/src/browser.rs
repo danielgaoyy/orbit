@@ -19,10 +19,10 @@
 //!   (zero `unsafe`).
 //! - Host policy persisted atomically (`0o600` on Unix) in `$ORBIT_HOME/browser-policy.json`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,7 +33,7 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use orbit_protocol::{
     BrowserActionAudit, BrowserActionRequest, BrowserElementRef, BrowserPolicyConfig,
-    BrowserSessionSummary, MAX_BROWSER_SESSIONS,
+    BrowserSessionSummary, MAX_BROWSER_SESSIONS, PickedElementInfo,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -50,6 +50,10 @@ use uuid::Uuid;
 
 const BROWSER_POLICY_FILE: &str = "browser-policy.json";
 const BROWSER_PROFILES_DIR: &str = "browser-profiles";
+const BROWSER_UPLOAD_RUNTIME_DIR: &str = "runtime";
+const BROWSER_UPLOAD_STAGING_DIR: &str = "browser-uploads";
+const MAX_UPLOAD_FILE_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_UPLOAD_TOTAL_BYTES: u64 = 200 * 1024 * 1024;
 const MAX_URL_LEN: usize = 4096;
 const MAX_SCREENSHOT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SCREENSHOT_BASE64_LEN: usize = (MAX_SCREENSHOT_BYTES / 3 + 2) * 4;
@@ -76,6 +80,7 @@ pub struct BrowserActionOutcome {
     pub screenshot_base64: Option<String>,
     pub text_excerpt: Option<String>,
     pub captcha_detected: bool,
+    pub picked_element: Option<PickedElementInfo>,
 }
 
 /// Snapshot of active browser sessions, policy, and detected Chrome binary on this host.
@@ -94,6 +99,7 @@ pub struct CreateBrowserSessionSpec {
     pub headless: Option<bool>,
     pub viewport_width: Option<u32>,
     pub viewport_height: Option<u32>,
+    pub workspace_root: Option<PathBuf>,
 }
 
 /// Slot state inside `BrowserManager::sessions` for atomic cap reservation before spawn.
@@ -397,6 +403,8 @@ impl BrowserManager {
         let session = match BrowserSession::connect(
             session_id.clone(),
             spec.agent_id,
+            spec.workspace_root,
+            self.home_dir.clone(),
             &page_ws_url,
             headless,
             viewport_width,
@@ -426,7 +434,7 @@ impl BrowserManager {
 
         if let Some(url) = validated_initial_url
             && let Err(e) = session
-                .execute_action(BrowserActionRequest::Navigate { url }, &policy)
+                .execute_action(BrowserActionRequest::Navigate { url }, &policy, &[])
                 .await
         {
             warn!(session_id = %session_id, error = %e, "Initial browser navigation failed; tearing down session");
@@ -480,6 +488,8 @@ impl BrowserManager {
         let session = match BrowserSession::connect(
             session_id.clone(),
             spec.agent_id,
+            spec.workspace_root,
+            self.home_dir.clone(),
             cdp_ws_url,
             headless,
             viewport_width,
@@ -508,7 +518,7 @@ impl BrowserManager {
 
         if let Some(url) = validated_initial_url
             && let Err(e) = session
-                .execute_action(BrowserActionRequest::Navigate { url }, &policy)
+                .execute_action(BrowserActionRequest::Navigate { url }, &policy, &[])
                 .await
         {
             warn!(session_id = %session_id, error = %e, "Initial browser navigation failed; tearing down session");
@@ -526,6 +536,18 @@ impl BrowserManager {
         session_id: &str,
         action: BrowserActionRequest,
     ) -> Result<BrowserActionOutcome, String> {
+        self.execute_action_with_allowed_roots(session_id, action, &[])
+            .await
+    }
+
+    /// Execute an action against an existing managed browser session, supplying any additional
+    /// daemon-verified workspace roots permitted for `UploadFile` confinement.
+    pub async fn execute_action_with_allowed_roots(
+        &self,
+        session_id: &str,
+        action: BrowserActionRequest,
+        extra_allowed_roots: &[PathBuf],
+    ) -> Result<BrowserActionOutcome, String> {
         let policy = self.policy.read().await.clone();
         if !policy.enabled {
             return Err("Browser automation is disabled by host policy".to_string());
@@ -537,7 +559,9 @@ impl BrowserManager {
                 _ => return Err(format!("browser session `{session_id}` not found")),
             }
         };
-        session.execute_action(action, &policy).await
+        session
+            .execute_action(action, &policy, extra_allowed_roots)
+            .await
     }
 
     /// Close a specific browser session and return the updated host snapshot.
@@ -1248,6 +1272,8 @@ async fn handle_cdp_event(
 struct BrowserSession {
     session_id: String,
     agent_id: Option<String>,
+    workspace_root: Option<PathBuf>,
+    home_dir: PathBuf,
     headless: bool,
     viewport_width: u32,
     viewport_height: u32,
@@ -1262,6 +1288,8 @@ impl BrowserSession {
     async fn connect(
         session_id: String,
         agent_id: Option<String>,
+        workspace_root: Option<PathBuf>,
+        home_dir: PathBuf,
         cdp_ws_url: &str,
         headless: bool,
         viewport_width: u32,
@@ -1328,6 +1356,8 @@ impl BrowserSession {
         Ok(Arc::new(Self {
             session_id,
             agent_id,
+            workspace_root,
+            home_dir,
             headless,
             viewport_width,
             viewport_height,
@@ -1429,6 +1459,7 @@ impl BrowserSession {
         &self,
         action: BrowserActionRequest,
         policy: &BrowserPolicyConfig,
+        extra_allowed_roots: &[PathBuf],
     ) -> Result<BrowserActionOutcome, String> {
         let _guard = self.action_lock.lock().await;
         {
@@ -1492,6 +1523,7 @@ impl BrowserSession {
                             screenshot_base64: None,
                             text_excerpt: Some(text_excerpt),
                             captcha_detected: s.captcha_detected,
+                            picked_element: None,
                         })
                     }
                     Err(e) => {
@@ -1513,6 +1545,7 @@ impl BrowserSession {
                             screenshot_base64: None,
                             text_excerpt: None,
                             captcha_detected: false,
+                            picked_element: None,
                         })
                     }
                 }
@@ -1555,6 +1588,7 @@ impl BrowserSession {
                     screenshot_base64: None,
                     text_excerpt: Some(text_excerpt),
                     captcha_detected: snap.captcha_detected,
+                    picked_element: None,
                 })
             }
 
@@ -1639,6 +1673,7 @@ impl BrowserSession {
                     screenshot_base64: Some(b64),
                     text_excerpt: None,
                     captcha_detected,
+                    picked_element: None,
                 })
             }
 
@@ -1772,6 +1807,7 @@ impl BrowserSession {
                     screenshot_base64: None,
                     text_excerpt: None,
                     captcha_detected,
+                    picked_element: None,
                 })
             }
 
@@ -1948,6 +1984,7 @@ impl BrowserSession {
                     screenshot_base64: None,
                     text_excerpt: None,
                     captcha_detected,
+                    picked_element: None,
                 })
             }
 
@@ -2003,6 +2040,7 @@ impl BrowserSession {
                     screenshot_base64: None,
                     text_excerpt: None,
                     captcha_detected,
+                    picked_element: None,
                 })
             }
 
@@ -2078,6 +2116,7 @@ impl BrowserSession {
                         )
                     }),
                     captcha_detected,
+                    picked_element: None,
                 })
             }
 
@@ -2119,6 +2158,617 @@ impl BrowserSession {
                         )
                     }),
                     captcha_detected,
+                    picked_element: None,
+                })
+            }
+
+            BrowserActionRequest::PressKey {
+                key,
+                modifiers,
+                ref_id,
+            } => {
+                let desc = match parse_key_descriptor(&key, &modifiers) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.record_audit("press_key", &key, false, e.clone()).await;
+                        return Err(e);
+                    }
+                };
+                let target_label = ref_id.as_deref().unwrap_or("active_element").to_string();
+
+                let cached_target = if let Some(ref r) = ref_id {
+                    let st = self.state.read().await;
+                    let found = st.elements.iter().find(|el| el.wire.ref_id == *r).cloned();
+                    if found.is_none() {
+                        drop(st);
+                        let msg = format!(
+                            "Element ref `{r}` not found in latest snapshot; call snapshot first"
+                        );
+                        self.record_audit("press_key", r, false, msg.clone()).await;
+                        return Err(msg);
+                    }
+                    found
+                } else {
+                    None
+                };
+
+                // Block printable keystrokes or clipboard paste into sensitive password/payment inputs.
+                let is_paste_chord = desc.commands.iter().any(|c| c == "paste");
+                let guards_sensitive =
+                    policy.block_password_inputs && (desc.emits_printable_text() || is_paste_chord);
+                if guards_sensitive {
+                    if let Some(ref cached) = cached_target
+                        && (cached.sensitive
+                            || is_sensitive_element_metadata(
+                                cached.wire.input_type.as_deref(),
+                                &cached.wire.name,
+                                &cached.wire.role,
+                            ))
+                    {
+                        let msg = format!(
+                            "Refusing to press input key on sensitive password/payment input `{target_label}` (blocked by host browser policy)"
+                        );
+                        self.record_audit("press_key", &target_label, false, msg.clone())
+                            .await;
+                        return Err(msg);
+                    }
+                    match self.inspect_live_sensitive_input(ref_id.as_deref()).await {
+                        Ok(Some(reason)) => {
+                            let msg = format!(
+                                "Refusing to press input key on sensitive input `{target_label}`: {reason}"
+                            );
+                            self.record_audit("press_key", &target_label, false, msg.clone())
+                                .await;
+                            return Err(msg);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            let msg = format!(
+                                "Refusing press_key on `{target_label}` (fail-closed sensitive input check failed: {e})"
+                            );
+                            self.record_audit("press_key", &target_label, false, msg.clone())
+                                .await;
+                            return Err(msg);
+                        }
+                    }
+                }
+
+                if let Some(ref cached) = cached_target {
+                    let cx = cached.wire.x + (cached.wire.width / 2.0);
+                    let cy = cached.wire.y + (cached.wire.height / 2.0);
+                    for (ev_type, button, click_count) in [
+                        ("mouseMoved", "none", 0),
+                        ("mousePressed", "left", 1),
+                        ("mouseReleased", "left", 1),
+                    ] {
+                        let _ = self
+                            .cdp
+                            .send_command(
+                                "Input.dispatchMouseEvent",
+                                json!({
+                                    "type": ev_type,
+                                    "x": cx,
+                                    "y": cy,
+                                    "button": button,
+                                    "clickCount": click_count,
+                                }),
+                            )
+                            .await;
+                    }
+                    if guards_sensitive {
+                        match self.inspect_live_sensitive_input(None).await {
+                            Ok(Some(reason)) => {
+                                let msg = format!(
+                                    "Refusing to press input key on post-focus sensitive input `{target_label}`: {reason}"
+                                );
+                                self.record_audit("press_key", &target_label, false, msg.clone())
+                                    .await;
+                                return Err(msg);
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                let msg = format!(
+                                    "Refusing press_key on `{target_label}` (fail-closed post-focus sensitive input check failed: {e})"
+                                );
+                                self.record_audit("press_key", &target_label, false, msg.clone())
+                                    .await;
+                                return Err(msg);
+                            }
+                        }
+                    }
+                }
+
+                let mut key_down_params = json!({
+                    "type": "rawKeyDown",
+                    "key": desc.key,
+                    "code": desc.code,
+                    "windowsVirtualKeyCode": desc.windows_virtual_key_code,
+                    "nativeVirtualKeyCode": desc.windows_virtual_key_code,
+                    "modifiers": desc.modifiers_mask,
+                });
+                if !desc.commands.is_empty()
+                    && let Some(obj) = key_down_params.as_object_mut()
+                {
+                    obj.insert("commands".to_string(), json!(desc.commands));
+                }
+                if let Err(e) = self
+                    .cdp
+                    .send_command("Input.dispatchKeyEvent", key_down_params)
+                    .await
+                {
+                    self.record_audit("press_key", &desc.audit_label, false, e.clone())
+                        .await;
+                    return Err(e);
+                }
+
+                if let Some(ref txt) = desc.text
+                    && let Err(e) = self
+                        .cdp
+                        .send_command(
+                            "Input.dispatchKeyEvent",
+                            json!({
+                                "type": "char",
+                                "text": txt,
+                                "unmodifiedText": txt,
+                                "key": desc.key,
+                                "code": desc.code,
+                                "windowsVirtualKeyCode": desc.windows_virtual_key_code,
+                                "nativeVirtualKeyCode": desc.windows_virtual_key_code,
+                                "modifiers": desc.modifiers_mask,
+                            }),
+                        )
+                        .await
+                {
+                    self.record_audit("press_key", &desc.audit_label, false, e.clone())
+                        .await;
+                    return Err(e);
+                }
+
+                if let Err(e) = self
+                    .cdp
+                    .send_command(
+                        "Input.dispatchKeyEvent",
+                        json!({
+                            "type": "keyUp",
+                            "key": desc.key,
+                            "code": desc.code,
+                            "windowsVirtualKeyCode": desc.windows_virtual_key_code,
+                            "nativeVirtualKeyCode": desc.windows_virtual_key_code,
+                            "modifiers": desc.modifiers_mask,
+                        }),
+                    )
+                    .await
+                {
+                    self.record_audit("press_key", &desc.audit_label, false, e.clone())
+                        .await;
+                    return Err(e);
+                }
+
+                self.record_audit(
+                    "press_key",
+                    &target_label,
+                    true,
+                    format!("Dispatched key {}", desc.audit_label),
+                )
+                .await;
+
+                let (elements, captcha_detected) = {
+                    let st = self.state.read().await;
+                    (
+                        st.elements.iter().map(|c| c.wire.clone()).collect(),
+                        st.captcha_detected,
+                    )
+                };
+                Ok(BrowserActionOutcome {
+                    session: self.summary(false).await,
+                    elements,
+                    screenshot_base64: None,
+                    text_excerpt: None,
+                    captcha_detected,
+                    picked_element: None,
+                })
+            }
+
+            BrowserActionRequest::SelectOption {
+                ref_id,
+                selector,
+                value,
+                label,
+                index,
+            } => {
+                let target_label = ref_id
+                    .as_deref()
+                    .or(selector.as_deref())
+                    .unwrap_or("missing")
+                    .to_string();
+                if ref_id.as_deref().map(str::trim).unwrap_or("").is_empty()
+                    && selector.as_deref().map(str::trim).unwrap_or("").is_empty()
+                {
+                    let msg = "SelectOption requires either `ref_id` or `selector`".to_string();
+                    self.record_audit("select_option", &target_label, false, msg.clone())
+                        .await;
+                    return Err(msg);
+                }
+                if value.is_none() && label.is_none() && index.is_none() {
+                    let msg = "SelectOption requires at least one of `value`, `label`, or `index`"
+                        .to_string();
+                    self.record_audit("select_option", &target_label, false, msg.clone())
+                        .await;
+                    return Err(msg);
+                }
+
+                let expr = build_select_option_js(
+                    ref_id.as_deref(),
+                    selector.as_deref(),
+                    value.as_deref(),
+                    label.as_deref(),
+                    index,
+                )?;
+                let res = match self
+                    .cdp
+                    .send_command(
+                        "Runtime.evaluate",
+                        json!({
+                            "expression": expr,
+                            "returnByValue": true,
+                        }),
+                    )
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.record_audit("select_option", &target_label, false, e.clone())
+                            .await;
+                        return Err(e);
+                    }
+                };
+                if res.get("exceptionDetails").is_some() {
+                    let msg = "JavaScript exception while selecting <select> option".to_string();
+                    self.record_audit("select_option", &target_label, false, msg.clone())
+                        .await;
+                    return Err(msg);
+                }
+                let val = res
+                    .get("result")
+                    .and_then(|r| r.get("value"))
+                    .ok_or_else(|| "SelectOption evaluation returned no value".to_string())?;
+                if !val.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                    let err_msg = val
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("failed to select option")
+                        .to_string();
+                    self.record_audit("select_option", &target_label, false, err_msg.clone())
+                        .await;
+                    return Err(err_msg);
+                }
+                let selected_val = val
+                    .get("selectedValue")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let selected_lbl = val
+                    .get("selectedLabel")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let selected_idx = val
+                    .get("selectedIndex")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let detail = format!(
+                    "Selected option #{selected_idx} (value={selected_val:?}, label={selected_lbl:?})"
+                );
+                self.record_audit("select_option", &target_label, true, detail.clone())
+                    .await;
+
+                let (elements, captcha_detected) = {
+                    let st = self.state.read().await;
+                    (
+                        st.elements.iter().map(|c| c.wire.clone()).collect(),
+                        st.captcha_detected,
+                    )
+                };
+                Ok(BrowserActionOutcome {
+                    session: self.summary(false).await,
+                    elements,
+                    screenshot_base64: None,
+                    text_excerpt: Some(detail),
+                    captcha_detected,
+                    picked_element: None,
+                })
+            }
+
+            BrowserActionRequest::UploadFile {
+                ref_id,
+                selector,
+                files,
+            } => {
+                let target_label = ref_id
+                    .as_deref()
+                    .or(selector.as_deref())
+                    .unwrap_or("missing")
+                    .to_string();
+                if ref_id.as_deref().map(str::trim).unwrap_or("").is_empty()
+                    && selector.as_deref().map(str::trim).unwrap_or("").is_empty()
+                {
+                    let msg = "UploadFile requires either `ref_id` or `selector`".to_string();
+                    self.record_audit("upload_file", &target_label, false, msg.clone())
+                        .await;
+                    return Err(msg);
+                }
+
+                // Collect strictly authorized workspace roots (session-bound + daemon-verified).
+                let mut allowed_roots: Vec<PathBuf> = Vec::new();
+                if let Some(ref root) = self.workspace_root {
+                    allowed_roots.push(root.clone());
+                }
+                for r in extra_allowed_roots {
+                    if !allowed_roots.contains(r) {
+                        allowed_roots.push(r.clone());
+                    }
+                }
+
+                let staged_batch = match stage_upload_files_for_session(
+                    &files,
+                    &allowed_roots,
+                    &self.home_dir,
+                    &self.session_id,
+                )
+                .await
+                {
+                    Ok(batch) => batch,
+                    Err(e) => {
+                        self.record_audit("upload_file", &target_label, false, e.clone())
+                            .await;
+                        return Err(e);
+                    }
+                };
+                let staged_file_strings: Vec<String> = staged_batch
+                    .staged_paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect();
+
+                // Locate `<input type="file">` as a live CDP RemoteObject (never by value).
+                let expr = match build_locate_file_input_js(
+                    ref_id.as_deref(),
+                    selector.as_deref(),
+                    staged_file_strings.len(),
+                ) {
+                    Ok(expr) => expr,
+                    Err(e) => {
+                        staged_batch.cleanup_now().await;
+                        return Err(e);
+                    }
+                };
+                let eval_res = match self
+                    .cdp
+                    .send_command(
+                        "Runtime.evaluate",
+                        json!({
+                            "expression": expr,
+                            "returnByValue": false,
+                        }),
+                    )
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        staged_batch.cleanup_now().await;
+                        self.record_audit("upload_file", &target_label, false, e.clone())
+                            .await;
+                        return Err(e);
+                    }
+                };
+                if let Some(ex) = eval_res.get("exceptionDetails") {
+                    staged_batch.cleanup_now().await;
+                    let msg = ex
+                        .get("exception")
+                        .and_then(|e| e.get("description"))
+                        .and_then(Value::as_str)
+                        .or_else(|| ex.get("text").and_then(Value::as_str))
+                        .unwrap_or("failed to locate <input type=\"file\"> element")
+                        .to_string();
+                    self.record_audit("upload_file", &target_label, false, msg.clone())
+                        .await;
+                    return Err(msg);
+                }
+                let object_id = eval_res
+                    .get("result")
+                    .and_then(|r| r.get("objectId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let Some(object_id) = object_id else {
+                    staged_batch.cleanup_now().await;
+                    let msg = format!(
+                        "Target `{target_label}` is not a live <input type=\"file\"> element"
+                    );
+                    self.record_audit("upload_file", &target_label, false, msg.clone())
+                        .await;
+                    return Err(msg);
+                };
+
+                // Pass `objectId` directly to `DOM.setFileInputFiles` with the daemon-private
+                // staged snapshot paths (zero TOCTOU symlink-swap window, zero redundant
+                // `DOM.describeNode` round trip).
+                let upload_res = self
+                    .cdp
+                    .send_command(
+                        "DOM.setFileInputFiles",
+                        json!({
+                            "files": staged_file_strings,
+                            "objectId": object_id,
+                        }),
+                    )
+                    .await;
+                let _ = self
+                    .cdp
+                    .send_command("Runtime.releaseObject", json!({ "objectId": object_id }))
+                    .await;
+
+                if let Err(e) = upload_res {
+                    staged_batch.cleanup_now().await;
+                    self.record_audit("upload_file", &target_label, false, e.clone())
+                        .await;
+                    return Err(e);
+                }
+
+                let file_names: Vec<String> = staged_batch
+                    .staged_paths
+                    .iter()
+                    .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+                    .collect();
+                let detail = format!(
+                    "Attached {} file(s): {}",
+                    file_names.len(),
+                    file_names.join(", ")
+                );
+                self.record_audit("upload_file", &target_label, true, detail.clone())
+                    .await;
+
+                let (elements, captcha_detected) = {
+                    let st = self.state.read().await;
+                    (
+                        st.elements.iter().map(|c| c.wire.clone()).collect(),
+                        st.captcha_detected,
+                    )
+                };
+                Ok(BrowserActionOutcome {
+                    session: self.summary(false).await,
+                    elements,
+                    screenshot_base64: None,
+                    text_excerpt: Some(detail),
+                    captcha_detected,
+                    picked_element: None,
+                })
+            }
+
+            BrowserActionRequest::PickElement {
+                x,
+                y,
+                selector,
+                ref_id,
+                interactive,
+            } => {
+                // Enforce document URL policy before extracting DOM metadata.
+                let live_href = self.query_live_location_href().await;
+                self.enforce_current_document_url(live_href.as_deref(), policy, "pick_element")
+                    .await?;
+
+                let target_label = if let (Some(px), Some(py)) = (x, y) {
+                    if !px.is_finite()
+                        || !py.is_finite()
+                        || px < 0.0
+                        || py < 0.0
+                        || px > 10_000.0
+                        || py > 10_000.0
+                    {
+                        let msg = "PickElement coordinates must be finite values within 0..=10000"
+                            .to_string();
+                        self.record_audit("pick_element", "coords", false, msg.clone())
+                            .await;
+                        return Err(msg);
+                    }
+                    format!("({px:.0}, {py:.0})")
+                } else if let Some(ref r) = ref_id
+                    && !r.trim().is_empty()
+                {
+                    r.trim().to_string()
+                } else if let Some(ref sel) = selector
+                    && !sel.trim().is_empty()
+                {
+                    sel.trim().to_string()
+                } else if interactive {
+                    "interactive".to_string()
+                } else {
+                    let msg = "PickElement requires `(x, y)`, `selector`, `ref_id`, or `interactive: true`".to_string();
+                    self.record_audit("pick_element", "missing", false, msg.clone())
+                        .await;
+                    return Err(msg);
+                };
+
+                let use_interactive = interactive
+                    && x.is_none()
+                    && y.is_none()
+                    && selector.as_deref().map(str::trim).unwrap_or("").is_empty()
+                    && ref_id.as_deref().map(str::trim).unwrap_or("").is_empty();
+
+                let expr = build_pick_element_js(
+                    x,
+                    y,
+                    selector.as_deref(),
+                    ref_id.as_deref(),
+                    use_interactive,
+                    policy.block_password_inputs,
+                )?;
+                let res = match self
+                    .cdp
+                    .send_command(
+                        "Runtime.evaluate",
+                        json!({
+                            "expression": expr,
+                            "returnByValue": true,
+                            "awaitPromise": use_interactive,
+                        }),
+                    )
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.record_audit("pick_element", &target_label, false, e.clone())
+                            .await;
+                        return Err(e);
+                    }
+                };
+                if res.get("exceptionDetails").is_some() {
+                    let msg = "JavaScript exception while inspecting DOM element".to_string();
+                    self.record_audit("pick_element", &target_label, false, msg.clone())
+                        .await;
+                    return Err(msg);
+                }
+                let val = res
+                    .get("result")
+                    .and_then(|r| r.get("value"))
+                    .ok_or_else(|| "PickElement returned no value".to_string())?;
+                if val
+                    .get("cancelled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    let msg = "Element picking cancelled".to_string();
+                    self.record_audit("pick_element", &target_label, false, msg.clone())
+                        .await;
+                    return Err(msg);
+                }
+                if let Some(err_str) = val.get("error").and_then(Value::as_str)
+                    && !err_str.is_empty()
+                {
+                    let msg = err_str.to_string();
+                    self.record_audit("pick_element", &target_label, false, msg.clone())
+                        .await;
+                    return Err(msg);
+                }
+
+                let picked: PickedElementInfo = serde_json::from_value(val.clone())
+                    .map_err(|e| format!("failed to decode PickedElementInfo: {e}"))?;
+                let sanitized = sanitize_picked_element(picked);
+                let detail = format!("Picked <{}> {}", sanitized.tag, sanitized.selector);
+                self.record_audit("pick_element", &target_label, true, detail.clone())
+                    .await;
+
+                let (elements, captcha_detected) = {
+                    let st = self.state.read().await;
+                    (
+                        st.elements.iter().map(|c| c.wire.clone()).collect(),
+                        st.captcha_detected,
+                    )
+                };
+                Ok(BrowserActionOutcome {
+                    session: self.summary(false).await,
+                    elements,
+                    screenshot_base64: None,
+                    text_excerpt: Some(detail),
+                    captcha_detected,
+                    picked_element: Some(sanitized),
                 })
             }
         }
@@ -2491,11 +3141,20 @@ impl BrowserSession {
         }
     }
 
+    fn upload_staging_dir(&self) -> PathBuf {
+        session_upload_staging_dir(&self.home_dir, &self.session_id)
+    }
+
     async fn cleanup_after_disconnect(&self) {
         self.cdp.close().await;
         if let Some(mut proc_handle) = self.process.lock().await.take() {
             proc_handle.terminate_and_cleanup().await;
         }
+        let staging_dir = self.upload_staging_dir();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = remove_profile_dir_if_real(&staging_dir);
+        })
+        .await;
     }
 
     async fn shutdown(&self) {
@@ -2505,6 +3164,12 @@ impl BrowserSession {
         )
         .await;
         self.cleanup_after_disconnect().await;
+    }
+}
+
+impl Drop for BrowserSession {
+    fn drop(&mut self) {
+        let _ = remove_profile_dir_if_real(&self.upload_staging_dir());
     }
 }
 
@@ -3226,6 +3891,1112 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     out
 }
 
+const MAX_UPLOAD_FILES_PER_ACTION: usize = 32;
+
+const CDP_MODIFIER_ALT: u32 = 1;
+const CDP_MODIFIER_CTRL: u32 = 2;
+const CDP_MODIFIER_META: u32 = 4;
+const CDP_MODIFIER_SHIFT: u32 = 8;
+
+/// Resolved CDP keyboard event descriptor parsed from a key name or modifier chord.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyDescriptor {
+    pub key: String,
+    pub code: String,
+    pub windows_virtual_key_code: u32,
+    pub modifiers_mask: u32,
+    pub text: Option<String>,
+    pub commands: Vec<String>,
+    pub audit_label: String,
+}
+
+impl KeyDescriptor {
+    pub fn emits_printable_text(&self) -> bool {
+        self.text.as_deref().is_some_and(|t| t != "\r")
+    }
+}
+
+fn modifier_bit_for_token(token: &str) -> Option<u32> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "alt" | "option" | "opt" => Some(CDP_MODIFIER_ALT),
+        "control" | "ctrl" => Some(CDP_MODIFIER_CTRL),
+        "meta" | "cmd" | "command" | "super" | "win" => Some(CDP_MODIFIER_META),
+        "shift" => Some(CDP_MODIFIER_SHIFT),
+        _ => None,
+    }
+}
+
+/// Split a chord like `"Meta+Shift+A"` or `"Control++"` into `(modifier_tokens, main_key)`.
+fn split_key_chord(raw: &str) -> (Vec<&str>, &str) {
+    if raw == "+" || raw == " " {
+        return (Vec::new(), raw);
+    }
+    // Preserve trailing literal `+` when expressing chords like `Meta++` or `Control++`.
+    if let Some(prefix) = raw.strip_suffix("++") {
+        let mods = prefix
+            .split('+')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        return (mods, "+");
+    }
+    let parts: Vec<&str> = raw.split('+').collect();
+    if parts.len() <= 1 {
+        return (Vec::new(), raw);
+    }
+    let last_idx = parts.len() - 1;
+    let main_key = parts[last_idx];
+    let mods = parts[..last_idx]
+        .iter()
+        .copied()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    (mods, main_key)
+}
+
+/// Parse a key name or chord (e.g. `"Enter"`, `"Escape"`, `"Tab"`, `"ArrowDown"`, `"Space"`,
+/// `"Meta+A"`, `"Control+C"`) plus optional explicit modifier names into a CDP [`KeyDescriptor`].
+pub fn parse_key_descriptor(
+    raw_key: &str,
+    extra_modifiers: &[String],
+) -> Result<KeyDescriptor, String> {
+    if raw_key.is_empty() || raw_key.len() > 64 {
+        return Err("Key descriptor must be between 1 and 64 characters".to_string());
+    }
+    if raw_key.chars().any(|c| c.is_control()) {
+        return Err("Key descriptor must not contain control characters".to_string());
+    }
+
+    let mut modifiers_mask = 0u32;
+    for m in extra_modifiers {
+        let Some(bit) = modifier_bit_for_token(m) else {
+            return Err(format!("Unsupported keyboard modifier `{m}`"));
+        };
+        modifiers_mask |= bit;
+    }
+
+    let (chord_mods, raw_main) = split_key_chord(raw_key);
+    for m in chord_mods {
+        let Some(bit) = modifier_bit_for_token(m) else {
+            return Err(format!(
+                "Unsupported modifier `{m}` in key chord `{raw_key}`"
+            ));
+        };
+        modifiers_mask |= bit;
+    }
+
+    let main_trimmed = if raw_main == " " {
+        " "
+    } else {
+        raw_main.trim()
+    };
+    if main_trimmed.is_empty() {
+        return Err(format!("Missing primary key in `{raw_key}`"));
+    }
+
+    let has_cmd_mod =
+        (modifiers_mask & (CDP_MODIFIER_ALT | CDP_MODIFIER_CTRL | CDP_MODIFIER_META)) != 0;
+    let has_shift = (modifiers_mask & CDP_MODIFIER_SHIFT) != 0;
+
+    let (key, code, vk, text) = match main_trimmed.to_ascii_lowercase().as_str() {
+        "enter" | "return" => (
+            "Enter".to_string(),
+            "Enter".to_string(),
+            13u32,
+            (!has_cmd_mod).then(|| "\r".to_string()),
+        ),
+        "escape" | "esc" => ("Escape".to_string(), "Escape".to_string(), 27, None),
+        "tab" => ("Tab".to_string(), "Tab".to_string(), 9, None),
+        "backspace" => ("Backspace".to_string(), "Backspace".to_string(), 8, None),
+        "delete" | "del" => ("Delete".to_string(), "Delete".to_string(), 46, None),
+        "space" | "spacebar" | " " => (
+            " ".to_string(),
+            "Space".to_string(),
+            32,
+            (!has_cmd_mod).then(|| " ".to_string()),
+        ),
+        "arrowup" | "up" => ("ArrowUp".to_string(), "ArrowUp".to_string(), 38, None),
+        "arrowdown" | "down" => ("ArrowDown".to_string(), "ArrowDown".to_string(), 40, None),
+        "arrowleft" | "left" => ("ArrowLeft".to_string(), "ArrowLeft".to_string(), 37, None),
+        "arrowright" | "right" => ("ArrowRight".to_string(), "ArrowRight".to_string(), 39, None),
+        "home" => ("Home".to_string(), "Home".to_string(), 36, None),
+        "end" => ("End".to_string(), "End".to_string(), 35, None),
+        "pageup" => ("PageUp".to_string(), "PageUp".to_string(), 33, None),
+        "pagedown" => ("PageDown".to_string(), "PageDown".to_string(), 34, None),
+        "insert" => ("Insert".to_string(), "Insert".to_string(), 45, None),
+        "f1" => ("F1".to_string(), "F1".to_string(), 112, None),
+        "f2" => ("F2".to_string(), "F2".to_string(), 113, None),
+        "f3" => ("F3".to_string(), "F3".to_string(), 114, None),
+        "f4" => ("F4".to_string(), "F4".to_string(), 115, None),
+        "f5" => ("F5".to_string(), "F5".to_string(), 116, None),
+        "f6" => ("F6".to_string(), "F6".to_string(), 117, None),
+        "f7" => ("F7".to_string(), "F7".to_string(), 118, None),
+        "f8" => ("F8".to_string(), "F8".to_string(), 119, None),
+        "f9" => ("F9".to_string(), "F9".to_string(), 120, None),
+        "f10" => ("F10".to_string(), "F10".to_string(), 121, None),
+        "f11" => ("F11".to_string(), "F11".to_string(), 122, None),
+        "f12" => ("F12".to_string(), "F12".to_string(), 123, None),
+        _ => {
+            let mut chars = main_trimmed.chars();
+            let Some(ch) = chars.next() else {
+                return Err(format!("Unsupported key `{raw_key}`"));
+            };
+            if chars.next().is_some() {
+                return Err(format!("Unsupported key `{main_trimmed}` in `{raw_key}`"));
+            }
+            if ch.is_ascii_alphabetic() {
+                let upper = ch.to_ascii_uppercase();
+                let rendered = if has_shift || (ch.is_ascii_uppercase() && !has_cmd_mod) {
+                    if ch.is_ascii_uppercase() && !has_cmd_mod {
+                        modifiers_mask |= CDP_MODIFIER_SHIFT;
+                    }
+                    upper.to_string()
+                } else {
+                    ch.to_ascii_lowercase().to_string()
+                };
+                let text = (!has_cmd_mod).then(|| rendered.clone());
+                (
+                    rendered,
+                    format!("Key{upper}"),
+                    u32::from(upper as u8),
+                    text,
+                )
+            } else if ch.is_ascii_digit() {
+                let s = ch.to_string();
+                let text = (!has_cmd_mod).then(|| s.clone());
+                (s, format!("Digit{ch}"), u32::from(ch as u8), text)
+            } else {
+                let (code, vk) = match ch {
+                    '-' | '_' => ("Minus", 189u32),
+                    '=' | '+' => ("Equal", 187),
+                    '[' | '{' => ("BracketLeft", 219),
+                    ']' | '}' => ("BracketRight", 221),
+                    '\\' | '|' => ("Backslash", 220),
+                    ';' | ':' => ("Semicolon", 186),
+                    '\'' | '"' => ("Quote", 222),
+                    ',' | '<' => ("Comma", 188),
+                    '.' | '>' => ("Period", 190),
+                    '/' | '?' => ("Slash", 191),
+                    '`' | '~' => ("Backquote", 192),
+                    _ => ("Unidentified", 0),
+                };
+                let s = ch.to_string();
+                let text = (!has_cmd_mod).then(|| s.clone());
+                (s, code.to_string(), vk, text)
+            }
+        }
+    };
+
+    // Attach Chromium editing commands for common Meta/Control chords so headless Chrome executes
+    // them consistently across macOS and Linux.
+    let mut commands = Vec::new();
+    let is_primary_shortcut_mod = (modifiers_mask & (CDP_MODIFIER_META | CDP_MODIFIER_CTRL)) != 0
+        && (modifiers_mask & CDP_MODIFIER_ALT) == 0;
+    if is_primary_shortcut_mod {
+        match key.to_ascii_lowercase().as_str() {
+            "a" if !has_shift => commands.push("selectAll".to_string()),
+            "c" if !has_shift => commands.push("copy".to_string()),
+            "v" if !has_shift => commands.push("paste".to_string()),
+            "x" if !has_shift => commands.push("cut".to_string()),
+            "z" if !has_shift => commands.push("undo".to_string()),
+            "z" if has_shift => commands.push("redo".to_string()),
+            "y" if !has_shift => commands.push("redo".to_string()),
+            _ => {}
+        }
+    }
+
+    let audit_label =
+        if text.as_deref().is_some_and(|t| t != "\r" && t != " ") && modifiers_mask == 0 {
+            "[char]".to_string()
+        } else {
+            let mut parts: Vec<&str> = Vec::new();
+            if (modifiers_mask & CDP_MODIFIER_META) != 0 {
+                parts.push("Meta");
+            }
+            if (modifiers_mask & CDP_MODIFIER_CTRL) != 0 {
+                parts.push("Control");
+            }
+            if (modifiers_mask & CDP_MODIFIER_ALT) != 0 {
+                parts.push("Alt");
+            }
+            if (modifiers_mask & CDP_MODIFIER_SHIFT) != 0 {
+                parts.push("Shift");
+            }
+            let display_key = if key == " " { "Space" } else { key.as_str() };
+            parts.push(display_key);
+            parts.join("+")
+        };
+
+    Ok(KeyDescriptor {
+        key,
+        code,
+        windows_virtual_key_code: vk,
+        modifiers_mask,
+        text,
+        commands,
+        audit_label,
+    })
+}
+
+/// Sensitive dot-directories and credential filenames strictly forbidden from browser file uploads,
+/// even if a broad directory such as `$HOME` were configured as a workspace root.
+fn is_forbidden_upload_component(component: &str) -> bool {
+    let lower = component.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        ".ssh"
+            | ".gnupg"
+            | ".gpg"
+            | ".aws"
+            | ".kube"
+            | ".docker"
+            | ".azure"
+            | ".gcloud"
+            | ".orbit"
+            | ".git"
+            | ".netrc"
+            | ".npmrc"
+            | ".pypirc"
+            | ".git-credentials"
+            | "authorized_keys"
+            | "known_hosts"
+            | "id_rsa"
+            | "id_ed25519"
+            | "id_ecdsa"
+            | "id_dsa"
+    )
+}
+
+/// Canonicalize and strictly confine all `UploadFile` paths to `allowed_roots`.
+///
+/// Security invariants:
+/// - Fail-closed when `allowed_roots` is empty or cannot be canonicalized.
+/// - Rejects lexical `..` traversal components, NUL/control bytes, and non-regular files.
+/// - Canonicalizes every path via `std::fs::canonicalize` so symlinks escaping `allowed_roots`
+///   are ALWAYS rejected.
+/// - Rejects any path inside `$ORBIT_HOME` or sensitive dot-directories/credential files
+///   (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `.git`, etc.).
+pub fn validate_upload_file_paths(
+    raw_paths: &[String],
+    allowed_roots: &[PathBuf],
+    orbit_home: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    if raw_paths.is_empty() {
+        return Err("UploadFile requires at least one file path".to_string());
+    }
+    if raw_paths.len() > MAX_UPLOAD_FILES_PER_ACTION {
+        return Err(format!(
+            "UploadFile exceeds maximum of {MAX_UPLOAD_FILES_PER_ACTION} files per action"
+        ));
+    }
+
+    let canon_roots: Vec<PathBuf> = allowed_roots
+        .iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .filter(|r| r.is_dir())
+        .collect();
+    if canon_roots.is_empty() {
+        return Err(
+            "UploadFile refused: no valid workspace root is bound to this browser session"
+                .to_string(),
+        );
+    }
+
+    let canon_orbit_home = std::fs::canonicalize(orbit_home).ok();
+    let mut blocked_home_prefixes: Vec<PathBuf> = Vec::new();
+    if let Some(home_dir) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        && let Ok(canon_home) = std::fs::canonicalize(home_dir)
+    {
+        for rel in [
+            ".ssh",
+            ".gnupg",
+            ".aws",
+            ".kube",
+            ".docker",
+            ".azure",
+            ".gcloud",
+            ".orbit",
+            ".config/gh",
+        ] {
+            let candidate = canon_home.join(rel);
+            blocked_home_prefixes.push(std::fs::canonicalize(&candidate).unwrap_or(candidate));
+        }
+    }
+
+    let mut validated = Vec::with_capacity(raw_paths.len());
+    for raw in raw_paths {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.contains('\0') || trimmed.chars().any(|c| c.is_control()) {
+            return Err(
+                "UploadFile path is empty or contains invalid control characters".to_string(),
+            );
+        }
+        let raw_path = Path::new(trimmed);
+        if raw_path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+        {
+            return Err(format!(
+                "UploadFile refused path `{trimmed}`: parent directory traversal (`..`) is forbidden"
+            ));
+        }
+
+        // Resolve relative paths strictly against allowed workspace roots.
+        let candidate = if raw_path.is_absolute() {
+            raw_path.to_path_buf()
+        } else {
+            let mut found = None;
+            for root in &canon_roots {
+                let joined = root.join(raw_path);
+                if joined.exists() {
+                    found = Some(joined);
+                    break;
+                }
+            }
+            match found {
+                Some(p) => p,
+                None => {
+                    return Err(format!(
+                        "UploadFile path `{trimmed}` was not found inside workspace root"
+                    ));
+                }
+            }
+        };
+
+        let canon_file = std::fs::canonicalize(&candidate).map_err(|e| {
+            format!("UploadFile refused path `{trimmed}`: cannot resolve canonical path ({e})")
+        })?;
+        let meta = std::fs::metadata(&canon_file)
+            .map_err(|e| format!("UploadFile refused path `{trimmed}`: cannot stat file ({e})"))?;
+        if !meta.is_file() {
+            return Err(format!(
+                "UploadFile refused path `{trimmed}`: target must be a regular file"
+            ));
+        }
+
+        if !canon_roots.iter().any(|root| canon_file.starts_with(root)) {
+            return Err(format!(
+                "UploadFile refused path `{trimmed}`: resolved path escapes allowed workspace root"
+            ));
+        }
+
+        if let Some(ref oh) = canon_orbit_home
+            && canon_file.starts_with(oh)
+        {
+            return Err(format!(
+                "UploadFile refused path `{trimmed}`: uploading from $ORBIT_HOME is forbidden"
+            ));
+        }
+
+        if blocked_home_prefixes
+            .iter()
+            .any(|prefix| canon_file.starts_with(prefix))
+        {
+            return Err(format!(
+                "UploadFile refused path `{trimmed}`: uploading from sensitive user directory is forbidden"
+            ));
+        }
+
+        for comp in canon_file.components() {
+            if let Component::Normal(os_name) = comp
+                && let Some(name) = os_name.to_str()
+                && is_forbidden_upload_component(name)
+            {
+                return Err(format!(
+                    "UploadFile refused path `{trimmed}`: sensitive directory or credential file `{name}` is forbidden"
+                ));
+            }
+        }
+
+        validated.push(canon_file);
+    }
+
+    Ok(validated)
+}
+
+fn session_upload_staging_dir(home_dir: &Path, session_id: &str) -> PathBuf {
+    let safe_sid: String = session_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .collect();
+    let dir_name = if safe_sid.is_empty() {
+        "session".to_string()
+    } else {
+        safe_sid
+    };
+    home_dir
+        .join(BROWSER_UPLOAD_RUNTIME_DIR)
+        .join(BROWSER_UPLOAD_STAGING_DIR)
+        .join(dir_name)
+}
+
+fn ensure_private_dir_0700(dir: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(format!(
+                    "refusing symlink or non-directory upload staging path `{}`",
+                    dir.display()
+                ));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(dir).map_err(|err| {
+                format!(
+                    "failed to create upload staging dir `{}`: {err}",
+                    dir.display()
+                )
+            })?;
+        }
+        Err(e) => {
+            return Err(format!(
+                "failed to inspect upload staging dir `{}`: {e}",
+                dir.display()
+            ));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::symlink_metadata(dir).map_err(|e| {
+            format!(
+                "failed to verify upload staging dir `{}`: {e}",
+                dir.display()
+            )
+        })?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(format!(
+                "refusing to chmod symlink upload staging path `{}`",
+                dir.display()
+            ));
+        }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("failed to set 0700 permissions on `{}`: {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
+fn create_upload_nonce_dir(home_dir: &Path, session_id: &str) -> Result<PathBuf, String> {
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return Err("UploadFile refused: invalid browser session id".to_string());
+    }
+    std::fs::create_dir_all(home_dir)
+        .map_err(|e| format!("failed to create orbit home dir: {e}"))?;
+    let runtime_dir = home_dir.join(BROWSER_UPLOAD_RUNTIME_DIR);
+    ensure_private_dir_0700(&runtime_dir)?;
+    let uploads_root = runtime_dir.join(BROWSER_UPLOAD_STAGING_DIR);
+    ensure_private_dir_0700(&uploads_root)?;
+    let session_dir = uploads_root.join(session_id);
+    ensure_private_dir_0700(&session_dir)?;
+
+    let nonce_dir = session_dir.join(format!("u-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir(&nonce_dir)
+        .map_err(|e| format!("failed to create upload nonce dir: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::symlink_metadata(&nonce_dir)
+            .map_err(|e| format!("failed to verify upload nonce dir: {e}"))?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err("refusing symlink upload nonce dir".to_string());
+        }
+        std::fs::set_permissions(&nonce_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("failed to chmod upload nonce dir: {e}"))?;
+    }
+    Ok(nonce_dir)
+}
+
+struct StagedUploadBatch {
+    nonce_dir: PathBuf,
+    staged_paths: Vec<PathBuf>,
+}
+
+impl StagedUploadBatch {
+    async fn cleanup_now(&self) {
+        let dir = self.nonce_dir.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = remove_profile_dir_if_real(&dir);
+        })
+        .await;
+    }
+}
+
+/// Validate workspace confinement, open each regular file with `O_NOFOLLOW` + `(dev, ino)`
+/// verification, enforce size bounds on the open handle, and copy its bytes into a `0700`
+/// daemon-private staging directory (`$ORBIT_HOME/runtime/browser-uploads/<session_id>/`).
+///
+/// Eliminates the TOCTOU symlink-swap window between validation and Chrome reading the file.
+async fn stage_upload_files_for_session(
+    raw_paths: &[String],
+    allowed_roots: &[PathBuf],
+    orbit_home: &Path,
+    session_id: &str,
+) -> Result<StagedUploadBatch, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let canonical_files = validate_upload_file_paths(raw_paths, allowed_roots, orbit_home)?;
+    let home_owned = orbit_home.to_path_buf();
+    let sid_owned = session_id.to_string();
+    let nonce_dir =
+        tokio::task::spawn_blocking(move || create_upload_nonce_dir(&home_owned, &sid_owned))
+            .await
+            .map_err(|e| format!("UploadFile staging dir task failed: {e}"))??;
+
+    let stage_result: Result<Vec<PathBuf>, String> = async {
+        let mut staged_paths = Vec::with_capacity(canonical_files.len());
+        let mut used_names = std::collections::HashSet::new();
+        let mut total_bytes: u64 = 0;
+
+        for (idx, (raw, canon_file)) in raw_paths.iter().zip(canonical_files.iter()).enumerate() {
+            let trimmed = raw.trim();
+            let (open_file, fmeta) =
+                crate::git::open_validated_regular_file_async(canon_file, trimmed).await?;
+            if !fmeta.is_file() {
+                return Err(format!(
+                    "UploadFile refused path `{trimmed}`: target must be a regular file"
+                ));
+            }
+            if fmeta.len() > MAX_UPLOAD_FILE_BYTES {
+                return Err(format!(
+                    "UploadFile refused path `{trimmed}`: file exceeds maximum size of {} MiB",
+                    MAX_UPLOAD_FILE_BYTES / (1024 * 1024)
+                ));
+            }
+            if total_bytes.saturating_add(fmeta.len()) > MAX_UPLOAD_TOTAL_BYTES {
+                return Err(format!(
+                    "UploadFile refused path `{trimmed}`: combined upload exceeds maximum size of {} MiB",
+                    MAX_UPLOAD_TOTAL_BYTES / (1024 * 1024)
+                ));
+            }
+
+            let file_name = canon_file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| {
+                    !n.is_empty()
+                        && *n != "."
+                        && *n != ".."
+                        && !n.contains('/')
+                        && !n.contains('\\')
+                        && !n.contains('\0')
+                        && !n.chars().any(|c| c.is_control())
+                })
+                .ok_or_else(|| {
+                    format!("UploadFile refused path `{trimmed}`: invalid file basename")
+                })?;
+
+            let target_dir = if used_names.insert(file_name.to_string()) {
+                nonce_dir.clone()
+            } else {
+                let sub = nonce_dir.join(format!("f{idx}"));
+                let sub_clone = sub.clone();
+                tokio::task::spawn_blocking(move || ensure_private_dir_0700(&sub_clone))
+                    .await
+                    .map_err(|e| format!("UploadFile subdir task failed: {e}"))??;
+                sub
+            };
+            let dest_path = target_dir.join(file_name);
+
+            let mut dst_opts = tokio::fs::OpenOptions::new();
+            dst_opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                dst_opts.mode(0o600);
+                if let Some(flag) = crate::git::unix_o_nofollow_flag() {
+                    dst_opts.custom_flags(flag);
+                }
+            }
+            let mut staged_file = dst_opts
+                .open(&dest_path)
+                .await
+                .map_err(|e| format!("UploadFile failed creating staged file `{file_name}`: {e}"))?;
+
+            let mut limited_reader = open_file.take(MAX_UPLOAD_FILE_BYTES + 1);
+            let copied = tokio::io::copy(&mut limited_reader, &mut staged_file)
+                .await
+                .map_err(|e| format!("UploadFile failed staging `{trimmed}`: {e}"))?;
+            if copied > MAX_UPLOAD_FILE_BYTES {
+                return Err(format!(
+                    "UploadFile refused path `{trimmed}`: file grew past maximum size of {} MiB",
+                    MAX_UPLOAD_FILE_BYTES / (1024 * 1024)
+                ));
+            }
+            total_bytes = total_bytes.saturating_add(copied);
+            if total_bytes > MAX_UPLOAD_TOTAL_BYTES {
+                return Err(format!(
+                    "UploadFile refused path `{trimmed}`: combined upload exceeds maximum size of {} MiB",
+                    MAX_UPLOAD_TOTAL_BYTES / (1024 * 1024)
+                ));
+            }
+            staged_file
+                .flush()
+                .await
+                .map_err(|e| format!("UploadFile failed flushing staged file `{file_name}`: {e}"))?;
+            staged_paths.push(dest_path);
+        }
+
+        Ok(staged_paths)
+    }
+    .await;
+
+    match stage_result {
+        Ok(staged_paths) => Ok(StagedUploadBatch {
+            nonce_dir,
+            staged_paths,
+        }),
+        Err(err) => {
+            let dir = nonce_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = remove_profile_dir_if_real(&dir);
+            })
+            .await;
+            Err(err)
+        }
+    }
+}
+
+fn build_select_option_js(
+    ref_id: Option<&str>,
+    selector: Option<&str>,
+    value: Option<&str>,
+    label: Option<&str>,
+    index: Option<u32>,
+) -> Result<String, String> {
+    let ref_json = serde_json::to_string(&ref_id).map_err(|e| e.to_string())?;
+    let sel_json = serde_json::to_string(&selector).map_err(|e| e.to_string())?;
+    let val_json = serde_json::to_string(&value).map_err(|e| e.to_string())?;
+    let lbl_json = serde_json::to_string(&label).map_err(|e| e.to_string())?;
+    let idx_json = serde_json::to_string(&index).map_err(|e| e.to_string())?;
+    Ok(format!(
+        r#"(() => {{
+  const refId = {ref_json};
+  const selector = {sel_json};
+  const targetValue = {val_json};
+  const targetLabel = {lbl_json};
+  const targetIndex = {idx_json};
+
+  const findDeep = (root, query, depth) => {{
+    if (!root || depth > 8) return null;
+    try {{
+      const direct = root.querySelector(query);
+      if (direct) return direct;
+      const all = root.querySelectorAll('*');
+      for (const n of all) {{
+        if (n.shadowRoot) {{
+          const hit = findDeep(n.shadowRoot, query, depth + 1);
+          if (hit) return hit;
+        }}
+        if (n.tagName === 'IFRAME' || n.tagName === 'FRAME') {{
+          try {{
+            if (n.contentDocument) {{
+              const hit = findDeep(n.contentDocument, query, depth + 1);
+              if (hit) return hit;
+            }}
+          }} catch (_) {{}}
+        }}
+      }}
+    }} catch (_) {{}}
+    return null;
+  }};
+
+  let el = null;
+  if (refId) {{
+    el = findDeep(document, `[data-orbit-ref="${{CSS.escape(refId)}}"]`, 0);
+  }}
+  if (!el && selector) {{
+    try {{
+      el = findDeep(document, selector, 0);
+    }} catch (err) {{
+      return {{ ok: false, error: `Invalid CSS selector: ${{String(err)}}` }};
+    }}
+  }}
+  if (!el) {{
+    return {{ ok: false, error: 'Target <select> element not found' }};
+  }}
+  if ((el.tagName || '').toLowerCase() !== 'select') {{
+    return {{ ok: false, error: `Target element is <${{(el.tagName || '').toLowerCase()}}>, expected <select>` }};
+  }}
+  if (el.disabled) {{
+    return {{ ok: false, error: 'Target <select> element is disabled' }};
+  }}
+
+  const options = Array.from(el.options || []);
+  let matchedIdx = -1;
+  if (targetValue !== null) {{
+    matchedIdx = options.findIndex((o) => o.value === targetValue);
+  }} else if (targetLabel !== null) {{
+    const norm = targetLabel.trim();
+    matchedIdx = options.findIndex((o) => (o.label || o.textContent || '').trim() === norm);
+    if (matchedIdx < 0) {{
+      const lower = norm.toLowerCase();
+      matchedIdx = options.findIndex((o) => (o.label || o.textContent || '').trim().toLowerCase() === lower);
+    }}
+  }} else if (targetIndex !== null) {{
+    if (targetIndex >= 0 && targetIndex < options.length) {{
+      matchedIdx = targetIndex;
+    }}
+  }}
+
+  if (matchedIdx < 0 || !options[matchedIdx]) {{
+    return {{ ok: false, error: 'No matching <option> found in <select>' }};
+  }}
+  const opt = options[matchedIdx];
+  if (opt.disabled) {{
+    return {{ ok: false, error: `Option #${{matchedIdx}} is disabled` }};
+  }}
+
+  try {{ el.focus(); }} catch (_) {{}}
+  const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value')?.set;
+  if (nativeSetter) {{
+    nativeSetter.call(el, opt.value);
+  }} else {{
+    el.value = opt.value;
+  }}
+  el.selectedIndex = matchedIdx;
+  opt.selected = true;
+  el.dispatchEvent(new Event('input', {{ bubbles: true, composed: true }}));
+  el.dispatchEvent(new Event('change', {{ bubbles: true, composed: true }}));
+
+  return {{
+    ok: true,
+    selectedIndex: matchedIdx,
+    selectedValue: opt.value || '',
+    selectedLabel: (opt.label || opt.textContent || '').trim()
+  }};
+}})()"#
+    ))
+}
+
+fn build_locate_file_input_js(
+    ref_id: Option<&str>,
+    selector: Option<&str>,
+    file_count: usize,
+) -> Result<String, String> {
+    let ref_json = serde_json::to_string(&ref_id).map_err(|e| e.to_string())?;
+    let sel_json = serde_json::to_string(&selector).map_err(|e| e.to_string())?;
+    Ok(format!(
+        r#"(() => {{
+  const refId = {ref_json};
+  const selector = {sel_json};
+  const fileCount = {file_count};
+
+  const findDeep = (root, query, depth) => {{
+    if (!root || depth > 8) return null;
+    try {{
+      const direct = root.querySelector(query);
+      if (direct) return direct;
+      const all = root.querySelectorAll('*');
+      for (const n of all) {{
+        if (n.shadowRoot) {{
+          const hit = findDeep(n.shadowRoot, query, depth + 1);
+          if (hit) return hit;
+        }}
+        if (n.tagName === 'IFRAME' || n.tagName === 'FRAME') {{
+          try {{
+            if (n.contentDocument) {{
+              const hit = findDeep(n.contentDocument, query, depth + 1);
+              if (hit) return hit;
+            }}
+          }} catch (_) {{}}
+        }}
+      }}
+    }} catch (_) {{}}
+    return null;
+  }};
+
+  let el = null;
+  if (refId) {{
+    el = findDeep(document, `[data-orbit-ref="${{CSS.escape(refId)}}"]`, 0);
+  }}
+  if (!el && selector) {{
+    el = findDeep(document, selector, 0);
+  }}
+  if (!el) {{
+    throw new Error('Target <input type="file"> element not found');
+  }}
+  const tag = (el.tagName || '').toLowerCase();
+  const type = (el.getAttribute('type') || el.type || '').toLowerCase();
+  if (tag !== 'input' || type !== 'file') {{
+    throw new Error(`Target element is <${{tag}} type="${{type}}">, expected <input type="file">`);
+  }}
+  if (fileCount > 1 && !el.multiple) {{
+    throw new Error('Target file input does not accept multiple files');
+  }}
+  return el;
+}})()"#
+    ))
+}
+
+fn build_pick_element_js(
+    x: Option<f64>,
+    y: Option<f64>,
+    selector: Option<&str>,
+    ref_id: Option<&str>,
+    interactive: bool,
+    redact_sensitive: bool,
+) -> Result<String, String> {
+    let x_json = serde_json::to_string(&x).map_err(|e| e.to_string())?;
+    let y_json = serde_json::to_string(&y).map_err(|e| e.to_string())?;
+    let sel_json = serde_json::to_string(&selector).map_err(|e| e.to_string())?;
+    let ref_json = serde_json::to_string(&ref_id).map_err(|e| e.to_string())?;
+    let interactive_json = if interactive { "true" } else { "false" };
+    let redact_json = if redact_sensitive { "true" } else { "false" };
+    Ok(format!(
+        r#"(() => {{
+  const px = {x_json};
+  const py = {y_json};
+  const selector = {sel_json};
+  const refId = {ref_json};
+  const interactive = {interactive_json};
+  const redactSensitive = {redact_json};
+
+  const isSensitiveEl = (el) => {{
+    if (!redactSensitive || !el) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    const type = (el.getAttribute && (el.getAttribute('type') || el.type || '') || '').toLowerCase();
+    const ac = (el.getAttribute && el.getAttribute('autocomplete') || '').toLowerCase();
+    if (tag === 'input' && type === 'password') return true;
+    if (/(current-password|new-password|one-time-code|cc-number|cc-csc)/.test(ac)) return true;
+    return false;
+  }};
+
+  const buildUniqueSelector = (el) => {{
+    if (!el || el.nodeType !== 1) return '';
+    const tag = (el.tagName || 'div').toLowerCase();
+    if (el.id) {{
+      try {{
+        const idSel = `#${{CSS.escape(el.id)}}`;
+        if (document.querySelectorAll(idSel).length === 1) return `${{tag}}${{idSel}}`;
+      }} catch (_) {{}}
+    }}
+    const testId = el.getAttribute && (el.getAttribute('data-testid') || el.getAttribute('data-test-id'));
+    if (testId) {{
+      const attr = el.hasAttribute('data-testid') ? 'data-testid' : 'data-test-id';
+      const sel = `[${{attr}}="${{testId.replace(/"/g, '\\"')}}"]`;
+      try {{
+        if (document.querySelectorAll(sel).length === 1) return sel;
+      }} catch (_) {{}}
+    }}
+    const parts = [];
+    let cur = el;
+    let depth = 0;
+    while (cur && cur.nodeType === 1 && depth < 5) {{
+      depth += 1;
+      const t = (cur.tagName || '').toLowerCase();
+      if (!t || t === 'html') break;
+      if (cur.id) {{
+        try {{
+          const idSel = `#${{CSS.escape(cur.id)}}`;
+          if (document.querySelectorAll(idSel).length === 1) {{
+            parts.unshift(`${{t}}${{idSel}}`);
+            break;
+          }}
+        }} catch (_) {{}}
+      }}
+      let seg = t;
+      const clsList = Array.from(cur.classList || [])
+        .filter((c) => c && !c.startsWith('orbit-') && c.length <= 36)
+        .slice(0, 2);
+      if (clsList.length > 0) {{
+        seg += clsList.map((c) => `.${{CSS.escape(c)}}`).join('');
+      }}
+      if (cur.parentElement) {{
+        const siblings = Array.from(cur.parentElement.children).filter(
+          (s) => s.tagName === cur.tagName
+        );
+        if (siblings.length > 1) {{
+          const idx = siblings.indexOf(cur) + 1;
+          seg += `:nth-of-type(${{idx}})`;
+        }}
+      }}
+      parts.unshift(seg);
+      if (t === 'body') break;
+      cur = cur.parentElement;
+    }}
+    return parts.join(' > ') || tag;
+  }};
+
+  const extractElementInfo = (el) => {{
+    if (!el || el.nodeType !== 1) return {{ error: 'No DOM element found at target' }};
+    const tag = (el.tagName || '').toLowerCase();
+    const sensitive = isSensitiveEl(el);
+    const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+    const attrs = {{}};
+    if (el.attributes) {{
+      let count = 0;
+      for (const a of Array.from(el.attributes)) {{
+        if (count >= 20) break;
+        if (!a || !a.name || a.name === 'data-orbit-ref') continue;
+        const val = (sensitive && a.name.toLowerCase() === 'value')
+          ? '[redacted]'
+          : String(a.value || '').slice(0, 200);
+        attrs[a.name] = val;
+        count += 1;
+      }}
+    }}
+    const textPreview = sensitive
+      ? ''
+      : ((el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 240));
+    const outerHtml = sensitive
+      ? `<${{tag}} type="${{(el.getAttribute('type') || '')}}" [redacted]>`
+      : ((el.outerHTML || '').replace(/\s+/g, ' ').trim().slice(0, 600));
+    return {{
+      selector: buildUniqueSelector(el),
+      tag,
+      text_preview: textPreview,
+      attributes: attrs,
+      computed_box: rect
+        ? {{
+            x: Math.round(rect.left * 10) / 10,
+            y: Math.round(rect.top * 10) / 10,
+            width: Math.round(rect.width * 10) / 10,
+            height: Math.round(rect.height * 10) / 10
+          }}
+        : null,
+      outer_html_excerpt: outerHtml,
+      page_url: window.location.href || ''
+    }};
+  }};
+
+  const elementAtPointDeep = (x, y) => {{
+    let cur = document.elementFromPoint(x, y);
+    let depth = 0;
+    while (cur && depth < 12) {{
+      depth += 1;
+      if (cur.shadowRoot && cur.shadowRoot.elementFromPoint) {{
+        const inner = cur.shadowRoot.elementFromPoint(x, y);
+        if (inner && inner !== cur) {{
+          cur = inner;
+          continue;
+        }}
+      }}
+      break;
+    }}
+    return cur;
+  }};
+
+  const findDeep = (root, query, depth) => {{
+    if (!root || depth > 8) return null;
+    try {{
+      const direct = root.querySelector(query);
+      if (direct) return direct;
+      for (const n of root.querySelectorAll('*')) {{
+        if (n.shadowRoot) {{
+          const hit = findDeep(n.shadowRoot, query, depth + 1);
+          if (hit) return hit;
+        }}
+      }}
+    }} catch (_) {{}}
+    return null;
+  }};
+
+  if (px !== null && py !== null) {{
+    return extractElementInfo(elementAtPointDeep(px, py));
+  }}
+  if (refId) {{
+    const el = findDeep(document, `[data-orbit-ref="${{CSS.escape(refId)}}"]`, 0);
+    return extractElementInfo(el);
+  }}
+  if (selector) {{
+    try {{
+      const el = findDeep(document, selector, 0);
+      return extractElementInfo(el);
+    }} catch (err) {{
+      return {{ error: `Invalid CSS selector: ${{String(err)}}` }};
+    }}
+  }}
+  if (!interactive) {{
+    return {{ error: 'Missing PickElement target' }};
+  }}
+
+  return new Promise((resolve) => {{
+    const overlay = document.createElement('div');
+    overlay.setAttribute('data-orbit-picker-overlay', '1');
+    overlay.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483647;border:1.5px solid #2563EB;background:rgba(37,99,235,0.10);border-radius:4px;box-sizing:border-box;display:none;transition:transform 40ms ease-out;';
+    const badge = document.createElement('div');
+    badge.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483647;background:#14161D;color:#F1F2F7;font:500 11px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;padding:2px 6px;border-radius:4px;white-space:nowrap;max-width:320px;overflow:hidden;text-overflow:ellipsis;display:none;';
+    document.documentElement.appendChild(overlay);
+    document.documentElement.appendChild(badge);
+
+    let settled = false;
+    const cleanup = () => {{
+      window.removeEventListener('mousemove', onMove, true);
+      window.removeEventListener('click', onClick, true);
+      window.removeEventListener('keydown', onKey, true);
+      try {{ overlay.remove(); }} catch (_) {{}}
+      try {{ badge.remove(); }} catch (_) {{}}
+      clearTimeout(timer);
+    }};
+    const finish = (payload) => {{
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(payload);
+    }};
+    const onMove = (e) => {{
+      const el = elementAtPointDeep(e.clientX, e.clientY);
+      if (!el || el === overlay || el === badge) return;
+      const r = el.getBoundingClientRect();
+      overlay.style.display = 'block';
+      overlay.style.left = `${{r.left}}px`;
+      overlay.style.top = `${{r.top}}px`;
+      overlay.style.width = `${{r.width}}px`;
+      overlay.style.height = `${{r.height}}px`;
+      badge.textContent = buildUniqueSelector(el);
+      badge.style.display = 'block';
+      badge.style.left = `${{Math.max(4, Math.min(window.innerWidth - 200, r.left))}}px`;
+      badge.style.top = `${{Math.max(4, r.top > 24 ? r.top - 22 : r.bottom + 4)}}px`;
+    }};
+    const onClick = (e) => {{
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      const el = elementAtPointDeep(e.clientX, e.clientY);
+      finish(extractElementInfo(el));
+    }};
+    const onKey = (e) => {{
+      if (e.key === 'Escape') {{
+        e.preventDefault();
+        e.stopPropagation();
+        finish({{ cancelled: true }});
+      }}
+    }};
+    window.addEventListener('mousemove', onMove, true);
+    window.addEventListener('click', onClick, true);
+    window.addEventListener('keydown', onKey, true);
+    const timer = setTimeout(() => finish({{ cancelled: true }}), 12000);
+  }});
+}})()"#
+    ))
+}
+
+fn sanitize_picked_element(mut picked: PickedElementInfo) -> PickedElementInfo {
+    picked.selector = truncate_chars(picked.selector.trim(), 240);
+    picked.tag = truncate_chars(picked.tag.trim(), 48).to_ascii_lowercase();
+    picked.text_preview = truncate_chars(picked.text_preview.trim(), 240);
+    picked.outer_html_excerpt = truncate_chars(picked.outer_html_excerpt.trim(), 600);
+    picked.page_url = truncate_chars(picked.page_url.trim(), 512);
+    let mut clean_attrs = BTreeMap::new();
+    for (k, v) in picked.attributes.into_iter().take(20) {
+        let key = truncate_chars(k.trim(), 64);
+        if !key.is_empty() {
+            clean_attrs.insert(key, truncate_chars(&v, 200));
+        }
+    }
+    picked.attributes = clean_attrs;
+    picked.computed_box = picked.computed_box.filter(|b| {
+        b.x.is_finite() && b.y.is_finite() && b.width.is_finite() && b.height.is_finite()
+    });
+    picked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3426,6 +5197,55 @@ mod tests {
                                                                 }
                                                             })
                                                         }
+                                                    } else if expr.contains("HTMLSelectElement") {
+                                                        json!({
+                                                            "id": id,
+                                                            "result": {
+                                                                "result": {
+                                                                    "value": {
+                                                                        "ok": true,
+                                                                        "selectedIndex": 1,
+                                                                        "selectedValue": "pro",
+                                                                        "selectedLabel": "Pro Plan"
+                                                                    }
+                                                                }
+                                                            }
+                                                        })
+                                                    } else if expr.contains("Target <input type=\"file\">") {
+                                                        json!({
+                                                            "id": id,
+                                                            "result": {
+                                                                "result": {
+                                                                    "type": "object",
+                                                                    "objectId": "obj_file_input_1"
+                                                                }
+                                                            }
+                                                        })
+                                                    } else if expr.contains("buildUniqueSelector") {
+                                                        json!({
+                                                            "id": id,
+                                                            "result": {
+                                                                "result": {
+                                                                    "value": {
+                                                                        "selector": "button#submit-order",
+                                                                        "tag": "button",
+                                                                        "text_preview": "Submit Order",
+                                                                        "attributes": {
+                                                                            "id": "submit-order",
+                                                                            "data-testid": "submit-btn"
+                                                                        },
+                                                                        "computed_box": {
+                                                                            "x": 42.0,
+                                                                            "y": 108.5,
+                                                                            "width": 120.0,
+                                                                            "height": 36.0
+                                                                        },
+                                                                        "outer_html_excerpt": "<button id=\"submit-order\" data-testid=\"submit-btn\">Submit Order</button>",
+                                                                        "page_url": cur.url
+                                                                    }
+                                                                }
+                                                            }
+                                                        })
                                                     } else if expr.contains("document.elementFromPoint") {
                                                         let hit = cur.captcha_point.is_some_and(|(cx, cy)| {
                                                             expr.contains(&format!("elementFromPoint({cx}, {cy})"))
@@ -3458,6 +5278,16 @@ mod tests {
                                                             }
                                                         })
                                                     }
+                                                }
+                                                "DOM.describeNode" => {
+                                                    json!({
+                                                        "id": id,
+                                                        "result": {
+                                                            "node": {
+                                                                "backendNodeId": 4242
+                                                            }
+                                                        }
+                                                    })
                                                 }
                                                 _ => json!({ "id": id, "result": {} }),
                                             };
@@ -3688,6 +5518,7 @@ mod tests {
                     headless: Some(true),
                     viewport_width: Some(1280),
                     viewport_height: Some(800),
+                    workspace_root: None,
                 },
             )
             .await
@@ -4118,5 +5949,404 @@ mod tests {
         assert!(manager.list_snapshot().await.sessions.is_empty());
 
         let _ = std::fs::remove_dir_all(&tmp_home);
+    }
+
+    #[test]
+    fn parse_key_descriptor_special_keys_and_modifier_chords() {
+        let enter = parse_key_descriptor("Enter", &[]).expect("Enter");
+        assert_eq!(enter.key, "Enter");
+        assert_eq!(enter.code, "Enter");
+        assert_eq!(enter.windows_virtual_key_code, 13);
+        assert_eq!(enter.modifiers_mask, 0);
+        assert_eq!(enter.text.as_deref(), Some("\r"));
+        assert!(!enter.emits_printable_text());
+
+        let esc = parse_key_descriptor("Escape", &[]).expect("Escape");
+        assert_eq!(esc.key, "Escape");
+        assert_eq!(esc.windows_virtual_key_code, 27);
+        assert_eq!(esc.text, None);
+
+        let tab = parse_key_descriptor("Shift+Tab", &[]).expect("Shift+Tab");
+        assert_eq!(tab.key, "Tab");
+        assert_eq!(tab.windows_virtual_key_code, 9);
+        assert_eq!(tab.modifiers_mask, CDP_MODIFIER_SHIFT);
+
+        let bs = parse_key_descriptor("Backspace", &[]).expect("Backspace");
+        assert_eq!(bs.windows_virtual_key_code, 8);
+
+        let down = parse_key_descriptor("ArrowDown", &[]).expect("ArrowDown");
+        assert_eq!(down.code, "ArrowDown");
+        assert_eq!(down.windows_virtual_key_code, 40);
+
+        let space = parse_key_descriptor("Space", &[]).expect("Space");
+        assert_eq!(space.key, " ");
+        assert_eq!(space.code, "Space");
+        assert_eq!(space.windows_virtual_key_code, 32);
+        assert_eq!(space.text.as_deref(), Some(" "));
+        assert!(space.emits_printable_text());
+
+        let meta_a = parse_key_descriptor("Meta+A", &[]).expect("Meta+A");
+        assert_eq!(meta_a.code, "KeyA");
+        assert_eq!(meta_a.modifiers_mask, CDP_MODIFIER_META);
+        assert_eq!(meta_a.text, None);
+        assert_eq!(meta_a.commands, vec!["selectAll"]);
+
+        let ctrl_c = parse_key_descriptor("Control+C", &[]).expect("Control+C");
+        assert_eq!(ctrl_c.code, "KeyC");
+        assert_eq!(ctrl_c.modifiers_mask, CDP_MODIFIER_CTRL);
+        assert_eq!(ctrl_c.commands, vec!["copy"]);
+
+        let redo = parse_key_descriptor("Control+Shift+Z", &[]).expect("Control+Shift+Z");
+        assert_eq!(redo.modifiers_mask, CDP_MODIFIER_CTRL | CDP_MODIFIER_SHIFT);
+        assert_eq!(redo.commands, vec!["redo"]);
+
+        let plus_chord = parse_key_descriptor("Meta++", &[]).expect("Meta++");
+        assert_eq!(plus_chord.key, "+");
+        assert_eq!(plus_chord.code, "Equal");
+        assert_eq!(plus_chord.modifiers_mask, CDP_MODIFIER_META);
+
+        assert!(parse_key_descriptor("BogusMod+A", &[]).is_err());
+        assert!(parse_key_descriptor("", &[]).is_err());
+    }
+
+    #[test]
+    fn upload_file_path_confinement_blocks_escapes_symlinks_and_sensitive_dirs() {
+        let root = std::env::temp_dir().join(format!("orbit-upload-guard-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let orbit_home = root.join("orbit_home");
+        let outside = root.join("outside.txt");
+        let nested_orbit = workspace.join(".orbit");
+        let nested_ssh = workspace.join(".ssh");
+        std::fs::create_dir_all(workspace.join("fixtures")).expect("mkdir fixtures");
+        std::fs::create_dir_all(&orbit_home).expect("mkdir orbit_home");
+        std::fs::create_dir_all(&nested_orbit).expect("mkdir .orbit");
+        std::fs::create_dir_all(&nested_ssh).expect("mkdir .ssh");
+        std::fs::write(workspace.join("fixtures/sample.png"), b"PNGDATA").expect("write sample");
+        std::fs::write(&outside, b"TOP_SECRET").expect("write outside");
+        std::fs::write(orbit_home.join("mcp-token"), b"SECRET_TOKEN").expect("write token");
+        std::fs::write(nested_orbit.join("pairing.key"), b"PAIRING").expect("write pairing");
+        std::fs::write(nested_ssh.join("id_ed25519"), b"PRIVATE_KEY").expect("write ssh key");
+
+        // 1. Confined relative & absolute files inside workspace MUST pass.
+        let ok_rel = validate_upload_file_paths(
+            &["fixtures/sample.png".into()],
+            std::slice::from_ref(&workspace),
+            &orbit_home,
+        )
+        .expect("confined relative path must pass");
+        assert_eq!(ok_rel.len(), 1);
+        assert!(ok_rel[0].ends_with("fixtures/sample.png"));
+
+        let ok_abs = validate_upload_file_paths(
+            &[workspace
+                .join("fixtures/sample.png")
+                .to_string_lossy()
+                .to_string()],
+            std::slice::from_ref(&workspace),
+            &orbit_home,
+        )
+        .expect("confined absolute path must pass");
+        assert_eq!(ok_abs, ok_rel);
+
+        // 2. Empty allowed roots MUST fail closed.
+        assert!(
+            validate_upload_file_paths(&["fixtures/sample.png".into()], &[], &orbit_home).is_err()
+        );
+
+        // 3. Parent directory traversal `..` MUST be rejected.
+        let err_traversal = validate_upload_file_paths(
+            &["../outside.txt".into()],
+            std::slice::from_ref(&workspace),
+            &orbit_home,
+        )
+        .expect_err(".. traversal must be rejected");
+        assert!(err_traversal.contains("traversal"));
+
+        // 4. Absolute path outside workspace root MUST be rejected.
+        let err_outside = validate_upload_file_paths(
+            &[outside.to_string_lossy().to_string()],
+            std::slice::from_ref(&workspace),
+            &orbit_home,
+        )
+        .expect_err("outside path must be rejected");
+        assert!(err_outside.contains("escapes allowed workspace root"));
+
+        // 5. Symlink inside workspace pointing outside MUST be rejected after canonicalization!
+        #[cfg(unix)]
+        {
+            let escape_link = workspace.join("fixtures/evil-link.txt");
+            std::os::unix::fs::symlink(&outside, &escape_link).expect("create escaping symlink");
+            let err_sym = validate_upload_file_paths(
+                &["fixtures/evil-link.txt".into()],
+                std::slice::from_ref(&workspace),
+                &orbit_home,
+            )
+            .expect_err("escaping symlink must be rejected");
+            assert!(err_sym.contains("escapes allowed workspace root"));
+        }
+
+        // 6. Sensitive dot-directories (`.ssh`, `.orbit`) and `$ORBIT_HOME` MUST be rejected
+        //    even when inside an allowed root!
+        let err_ssh = validate_upload_file_paths(
+            &[".ssh/id_ed25519".into()],
+            std::slice::from_ref(&workspace),
+            &orbit_home,
+        )
+        .expect_err(".ssh upload must be rejected");
+        assert!(err_ssh.contains("sensitive"));
+
+        let err_dot_orbit = validate_upload_file_paths(
+            &[".orbit/pairing.key".into()],
+            std::slice::from_ref(&workspace),
+            &orbit_home,
+        )
+        .expect_err(".orbit upload must be rejected");
+        assert!(err_dot_orbit.contains("sensitive"));
+
+        let err_orbit_home = validate_upload_file_paths(
+            &[orbit_home.join("mcp-token").to_string_lossy().to_string()],
+            std::slice::from_ref(&root),
+            &orbit_home,
+        )
+        .expect_err("$ORBIT_HOME upload must be rejected");
+        assert!(err_orbit_home.contains("$ORBIT_HOME"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn mock_cdp_press_key_select_option_upload_file_and_pick_element() {
+        let root = std::env::temp_dir().join(format!("orbit-cdp-actions-{}", Uuid::new_v4()));
+        let tmp_home = root.join("orbit_home");
+        let workspace = root.join("workspace");
+        let outside = root.join("secret.txt");
+        std::fs::create_dir_all(workspace.join("assets")).expect("mkdir assets");
+        std::fs::create_dir_all(&tmp_home).expect("mkdir home");
+        std::fs::write(workspace.join("assets/logo.png"), b"PNG").expect("write logo");
+        std::fs::write(&outside, b"SECRET").expect("write secret");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, workspace.join("assets/escape.png"))
+            .expect("escape symlink");
+
+        let manager = BrowserManager::new(tmp_home.clone());
+        let server = MockCdpServer::start(MockCdpBehavior::default()).await;
+
+        let summary = manager
+            .create_session_from_cdp_ws_url(
+                &server.ws_url,
+                CreateBrowserSessionSpec {
+                    agent_id: Some("ag_actions".into()),
+                    initial_url: Some("http://127.0.0.1:5173/checkout".into()),
+                    headless: Some(true),
+                    viewport_width: Some(1280),
+                    viewport_height: Some(800),
+                    workspace_root: Some(workspace.clone()),
+                },
+            )
+            .await
+            .expect("create session");
+        manager
+            .execute_action(&summary.session_id, BrowserActionRequest::Snapshot)
+            .await
+            .expect("snapshot");
+
+        // 1. PressKey: Meta+A dispatches rawKeyDown + keyUp with selectAll command.
+        manager
+            .execute_action(
+                &summary.session_id,
+                BrowserActionRequest::PressKey {
+                    key: "Meta+A".into(),
+                    modifiers: vec![],
+                    ref_id: Some("e2".into()),
+                },
+            )
+            .await
+            .expect("press Meta+A");
+
+        // Printable key on password field (`e3`) MUST be blocked by sensitive input guard.
+        let pw_err = manager
+            .execute_action(
+                &summary.session_id,
+                BrowserActionRequest::PressKey {
+                    key: "a".into(),
+                    modifiers: vec![],
+                    ref_id: Some("e3".into()),
+                },
+            )
+            .await
+            .expect_err("printable press_key on password field must be blocked");
+        assert!(pw_err.contains("sensitive"));
+
+        // 2. SelectOption by value
+        let sel_out = manager
+            .execute_action(
+                &summary.session_id,
+                BrowserActionRequest::SelectOption {
+                    ref_id: None,
+                    selector: Some("select#plan".into()),
+                    value: Some("pro".into()),
+                    label: None,
+                    index: None,
+                },
+            )
+            .await
+            .expect("select option");
+        assert!(
+            sel_out
+                .text_excerpt
+                .as_deref()
+                .unwrap_or("")
+                .contains("Pro Plan")
+        );
+
+        // 3. UploadFile: confined file invokes DOM.setFileInputFiles; escaping symlink fails BEFORE CDP.
+        let up_out = manager
+            .execute_action(
+                &summary.session_id,
+                BrowserActionRequest::UploadFile {
+                    ref_id: None,
+                    selector: Some("input[type=file]".into()),
+                    files: vec!["assets/logo.png".into()],
+                },
+            )
+            .await
+            .expect("confined upload succeeds");
+        assert!(
+            up_out
+                .text_excerpt
+                .as_deref()
+                .unwrap_or("")
+                .contains("logo.png")
+        );
+
+        #[cfg(unix)]
+        {
+            let esc_err = manager
+                .execute_action(
+                    &summary.session_id,
+                    BrowserActionRequest::UploadFile {
+                        ref_id: None,
+                        selector: Some("input[type=file]".into()),
+                        files: vec!["assets/escape.png".into()],
+                    },
+                )
+                .await
+                .expect_err("escaping symlink upload must be rejected");
+            assert!(esc_err.contains("escapes allowed workspace root"));
+        }
+
+        // 4. PickElement returns structured PickedElementInfo
+        let pick_out = manager
+            .execute_action(
+                &summary.session_id,
+                BrowserActionRequest::PickElement {
+                    x: Some(50.0),
+                    y: Some(120.0),
+                    selector: None,
+                    ref_id: None,
+                    interactive: false,
+                },
+            )
+            .await
+            .expect("pick element");
+        let picked = pick_out
+            .picked_element
+            .expect("picked_element must be populated");
+        assert_eq!(picked.selector, "button#submit-order");
+        assert_eq!(picked.tag, "button");
+        assert_eq!(picked.text_preview, "Submit Order");
+        assert_eq!(
+            picked.attributes.get("data-testid").map(String::as_str),
+            Some("submit-btn")
+        );
+        assert!(picked.computed_box.is_some());
+        assert_eq!(picked.page_url, "http://127.0.0.1:5173/checkout");
+
+        // Verify CDP commands sent to mock server.
+        let cmds = server.received_commands.lock().await.clone();
+        assert!(cmds.iter().any(|(m, p)| {
+            m == "Input.dispatchKeyEvent"
+                && p.get("type").and_then(Value::as_str) == Some("rawKeyDown")
+                && p.get("code").and_then(Value::as_str) == Some("KeyA")
+                && p.get("modifiers").and_then(Value::as_u64) == Some(4)
+        }));
+        let set_files_calls: Vec<&Value> = cmds
+            .iter()
+            .filter(|(m, _)| m == "DOM.setFileInputFiles")
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(set_files_calls.len(), 1);
+        assert!(
+            !cmds.iter().any(|(m, _)| m == "DOM.describeNode"),
+            "redundant DOM.describeNode round trip must not be called"
+        );
+        assert_eq!(
+            set_files_calls[0].get("objectId").and_then(Value::as_str),
+            Some("obj_file_input_1")
+        );
+        assert!(set_files_calls[0].get("backendNodeId").is_none());
+
+        // Verify UploadFile staged a private 0700/0600 snapshot copy inside
+        // `$ORBIT_HOME/runtime/browser-uploads/<session_id>/` (zero TOCTOU symlink-swap window).
+        let staged_path_str = set_files_calls[0]
+            .get("files")
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.first())
+            .and_then(Value::as_str)
+            .expect("staged file path in DOM.setFileInputFiles");
+        let staged_path = PathBuf::from(staged_path_str);
+        let session_staging_dir = tmp_home
+            .join("runtime")
+            .join("browser-uploads")
+            .join(&summary.session_id);
+        assert!(
+            staged_path.starts_with(&session_staging_dir),
+            "staged file `{}` must live under `{}`",
+            staged_path.display(),
+            session_staging_dir.display()
+        );
+        assert_eq!(
+            staged_path.file_name().and_then(|n| n.to_str()),
+            Some("logo.png")
+        );
+        assert_eq!(
+            std::fs::read(&staged_path).expect("read staged file"),
+            b"PNG"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::symlink_metadata(&session_staging_dir)
+                .expect("stat staging dir")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700, "staging dir must be 0700");
+            let file_mode = std::fs::symlink_metadata(&staged_path)
+                .expect("stat staged file")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(file_mode, 0o600, "staged file must be 0600");
+        }
+        // Mutating/deleting workspace source AFTER staging must not corrupt the staged copy.
+        std::fs::write(workspace.join("assets/logo.png"), b"MUTATED").expect("mutate src");
+        assert_eq!(
+            std::fs::read(&staged_path).expect("staged copy remains immutable snapshot"),
+            b"PNG"
+        );
+
+        // Closing the browser session MUST delete `$ORBIT_HOME/runtime/browser-uploads/<session_id>/`.
+        manager
+            .close_session(&summary.session_id)
+            .await
+            .expect("close session");
+        assert!(
+            !session_staging_dir.exists(),
+            "session upload staging dir must be removed on session close"
+        );
+
+        manager.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

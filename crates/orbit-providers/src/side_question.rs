@@ -4,7 +4,7 @@
 //! snapshot of the active session context so users can ask clarifying questions without blocking
 //! an in-flight turn or polluting the primary conversation history.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -249,6 +249,279 @@ pub async fn run_ephemeral_text_prompt(
         .map_err(|_| format!("Ephemeral prompt timed out after {bounded_secs}s"))?;
     drain_task.abort();
     result
+}
+
+/// Hardened subprocess specification for Guardian Tier-2 LLM risk classification.
+///
+/// Security invariants:
+/// - Always runs inside a fresh, isolated **empty** temp directory (NEVER the user's workspace).
+/// - Prompt is delivered STRICTLY over stdin (NEVER via process `argv`).
+/// - All tools, slash commands, MCP servers, session persistence, and workspace settings are disabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HardenedGuardianCommandSpec {
+    pub provider: ProviderKind,
+    pub executable: PathBuf,
+    pub args: Vec<String>,
+    pub isolated_cwd: PathBuf,
+}
+
+/// Returns `true` iff the provider supports hardened zero-tool, isolated-cwd, stdin-only
+/// Guardian LLM classification (never passing untrusted prompt data in process `argv`).
+pub fn is_hardened_guardian_provider(provider: ProviderKind) -> bool {
+    matches!(provider, ProviderKind::ClaudeCode | ProviderKind::Codex)
+}
+
+/// Build the hardened subprocess command specification for Guardian Tier-2 LLM classification.
+///
+/// Explicitly rejects providers that only accept prompts via `argv` (such as Antigravity CLI).
+pub fn build_hardened_guardian_command_spec(
+    provider: ProviderKind,
+    executable: &Path,
+    isolated_cwd: &Path,
+    model: Option<&str>,
+) -> Result<HardenedGuardianCommandSpec, String> {
+    let trimmed_model = model.map(str::trim).filter(|s| !s.is_empty());
+    let args = match provider {
+        ProviderKind::ClaudeCode => {
+            let mut a = vec![
+                "--print".to_string(),
+                "--tools".to_string(),
+                String::new(),
+                "--disable-slash-commands".to_string(),
+                "--setting-sources".to_string(),
+                String::new(),
+                "--no-session-persistence".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+                "--include-partial-messages".to_string(),
+            ];
+            if let Some(m) = trimmed_model {
+                a.push("--model".to_string());
+                a.push(m.to_string());
+            }
+            a
+        }
+        ProviderKind::Codex => {
+            let mut a = vec![
+                "exec".to_string(),
+                "--ephemeral".to_string(),
+                "--skip-git-repo-check".to_string(),
+                "--sandbox".to_string(),
+                "read-only".to_string(),
+                "-c".to_string(),
+                "mcp_servers={}".to_string(),
+                "--json".to_string(),
+            ];
+            if let Some(m) = trimmed_model {
+                a.push("--model".to_string());
+                a.push(m.to_string());
+            }
+            a.push("-".to_string());
+            a
+        }
+        other => {
+            return Err(format!(
+                "Provider `{}` does not support hardened stdin-only isolated Guardian classification (argv prompt delivery is disallowed)",
+                other.display_name()
+            ));
+        }
+    };
+
+    Ok(HardenedGuardianCommandSpec {
+        provider,
+        executable: executable.to_path_buf(),
+        args,
+        isolated_cwd: isolated_cwd.to_path_buf(),
+    })
+}
+
+struct IsolatedGuardianTempDir {
+    path: PathBuf,
+}
+
+impl IsolatedGuardianTempDir {
+    fn create() -> Result<Self, String> {
+        let dir = std::env::temp_dir().join(format!(
+            "orbit-guardian-iso-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&dir)
+            .map_err(|e| format!("Failed to create isolated Guardian temp directory: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        Ok(Self { path: dir })
+    }
+}
+
+impl Drop for IsolatedGuardianTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Execute a hardened, zero-tool, isolated-temp-dir, stdin-only Guardian LLM classification turn.
+///
+/// Never runs inside the user's workspace, never passes prompts via `argv`, strips Orbit internal
+/// secret environment variables, and enforces a strict bounded timeout with `kill_on_drop(true)`.
+pub async fn run_hardened_guardian_prompt(
+    provider: ProviderKind,
+    model: Option<String>,
+    prompt: String,
+    timeout_ms: u64,
+) -> Result<String, String> {
+    if prompt.trim().is_empty() {
+        return Err("Guardian LLM prompt cannot be empty".to_string());
+    }
+    if !is_hardened_guardian_provider(provider) {
+        return Err(format!(
+            "Provider `{}` does not support hardened stdin-only isolated Guardian classification",
+            provider.display_name()
+        ));
+    }
+    if crate::is_provider_overridden(provider) {
+        return Err(format!(
+            "Provider `{}` is overridden in test mode and unavailable for live Guardian LLM calls",
+            provider.display_name()
+        ));
+    }
+    let executable = find_provider_executable(provider).ok_or_else(|| {
+        format!(
+            "{} binary (`{}`) not found on host PATH",
+            provider.display_name(),
+            provider.default_binary()
+        )
+    })?;
+
+    let iso_dir = IsolatedGuardianTempDir::create()?;
+    let spec = build_hardened_guardian_command_spec(
+        provider,
+        &executable,
+        &iso_dir.path,
+        model.as_deref(),
+    )?;
+    let bounded_ms = timeout_ms.clamp(1_000, 20_000);
+
+    let fut = run_hardened_guardian_spec(spec, prompt);
+    tokio::time::timeout(Duration::from_millis(bounded_ms), fut)
+        .await
+        .map_err(|_| format!("Hardened Guardian LLM prompt timed out after {bounded_ms}ms"))?
+}
+
+async fn run_hardened_guardian_spec(
+    spec: HardenedGuardianCommandSpec,
+    prompt: String,
+) -> Result<String, String> {
+    let mut cmd = Command::new(&spec.executable);
+    cmd.args(&spec.args)
+        .current_dir(&spec.isolated_cwd)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    crate::shell_snapshot::apply_cached_shell_env(&mut cmd);
+    // Strip Orbit internal credentials from the isolated classifier child process.
+    for key in [
+        "ORBIT_MCP_TOKEN",
+        "ORBIT_PAIRING_SECRET",
+        "ORBIT_RELAY_TOKEN",
+        "ORBIT_HOOK_ORIGIN_TOKEN",
+    ] {
+        cmd.env_remove(key);
+    }
+
+    let mut child = cmd.spawn().map_err(|e| {
+        format!(
+            "Failed to spawn hardened {} Guardian classifier: {e}",
+            spec.provider.display_name()
+        )
+    })?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(prompt.as_bytes()).await;
+        let _ = stdin.shutdown().await;
+    }
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Guardian classifier stdout pipe unavailable".to_string())?;
+    let stderr_task = spawn_bounded_stderr_reader(child.stderr.take());
+
+    let mut reader = BufReader::new(stdout).lines();
+    let mut accumulated = String::new();
+    let mut streamed_any = false;
+    let mut fallback_final: Option<String> = None;
+
+    while let Ok(Some(line)) = reader.next_line().await {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed = match spec.provider {
+            ProviderKind::ClaudeCode => parse_claude_side_line(trimmed),
+            ProviderKind::Codex => parse_codex_side_line(trimmed),
+            _ => ParsedSideEvent::Ignore,
+        };
+        match parsed {
+            ParsedSideEvent::Delta(chunk) => {
+                if !chunk.is_empty() {
+                    streamed_any = true;
+                    accumulated.push_str(&chunk);
+                }
+            }
+            ParsedSideEvent::Snapshot(full) => {
+                if !full.is_empty() {
+                    if spec.provider == ProviderKind::Codex && !streamed_any {
+                        if let Some(suffix) = full.strip_prefix(&accumulated) {
+                            accumulated.push_str(suffix);
+                        } else if accumulated.is_empty() {
+                            accumulated = full;
+                        } else {
+                            fallback_final = Some(full);
+                        }
+                    } else {
+                        fallback_final = Some(full);
+                    }
+                }
+            }
+            ParsedSideEvent::Error(msg) => {
+                let _ = child.kill().await;
+                return Err(msg);
+            }
+            ParsedSideEvent::PlainFallback(_) | ParsedSideEvent::Ignore => {}
+        }
+    }
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("Failed awaiting hardened Guardian classifier: {e}"))?;
+    let err_text = stderr_task.await.unwrap_or_default();
+
+    if (accumulated.trim().is_empty()
+        || (!streamed_any && spec.provider == ProviderKind::ClaudeCode))
+        && let Some(final_text) = fallback_final
+    {
+        accumulated = final_text;
+    }
+
+    if !status.success() {
+        return Err(if err_text.is_empty() {
+            format!(
+                "Hardened {} Guardian classifier exited with status {status}",
+                spec.provider.display_name()
+            )
+        } else {
+            err_text
+        });
+    }
+
+    Ok(accumulated)
 }
 
 async fn run_claude_side_question(
@@ -909,5 +1182,97 @@ mod tests {
         let prompt = build_side_question_prompt("Why?", &big);
         assert!(prompt.contains("earlier context truncated"));
         assert!(prompt.contains("<SIDE_QUESTION>\nWhy?\n</SIDE_QUESTION>"));
+    }
+
+    #[test]
+    fn hardened_guardian_command_spec_enforces_isolated_cwd_stdin_only_and_rejects_argv_providers()
+    {
+        let iso = PathBuf::from("/tmp/orbit-guardian-iso-test");
+        let exe = PathBuf::from("/usr/local/bin/mock-cli");
+
+        let claude = build_hardened_guardian_command_spec(
+            ProviderKind::ClaudeCode,
+            &exe,
+            &iso,
+            Some("claude-haiku-4-5"),
+        )
+        .expect("Claude hardened spec");
+        assert_eq!(claude.isolated_cwd, iso);
+        assert!(claude.args.contains(&"--print".to_string()));
+        assert!(
+            claude
+                .args
+                .contains(&"--disable-slash-commands".to_string())
+        );
+        assert!(
+            claude
+                .args
+                .contains(&"--no-session-persistence".to_string())
+        );
+        let tools_pos = claude
+            .args
+            .iter()
+            .position(|a| a == "--tools")
+            .expect("--tools flag");
+        assert_eq!(claude.args.get(tools_pos + 1).map(String::as_str), Some(""));
+        let settings_pos = claude
+            .args
+            .iter()
+            .position(|a| a == "--setting-sources")
+            .expect("--setting-sources flag");
+        assert_eq!(
+            claude.args.get(settings_pos + 1).map(String::as_str),
+            Some("")
+        );
+        let model_pos = claude
+            .args
+            .iter()
+            .position(|a| a == "--model")
+            .expect("--model flag");
+        assert_eq!(
+            claude.args.get(model_pos + 1).map(String::as_str),
+            Some("claude-haiku-4-5")
+        );
+
+        let codex = build_hardened_guardian_command_spec(
+            ProviderKind::Codex,
+            &exe,
+            &iso,
+            Some("gpt-5-mini"),
+        )
+        .expect("Codex hardened spec");
+        assert_eq!(codex.isolated_cwd, iso);
+        assert_eq!(codex.args.first().map(String::as_str), Some("exec"));
+        assert!(codex.args.contains(&"--ephemeral".to_string()));
+        assert!(codex.args.contains(&"--skip-git-repo-check".to_string()));
+        let sandbox_pos = codex
+            .args
+            .iter()
+            .position(|a| a == "--sandbox")
+            .expect("--sandbox flag");
+        assert_eq!(
+            codex.args.get(sandbox_pos + 1).map(String::as_str),
+            Some("read-only")
+        );
+        let cfg_pos = codex.args.iter().position(|a| a == "-c").expect("-c flag");
+        assert_eq!(
+            codex.args.get(cfg_pos + 1).map(String::as_str),
+            Some("mcp_servers={}")
+        );
+        assert!(codex.args.contains(&"--json".to_string()));
+        assert_eq!(
+            codex.args.last().map(String::as_str),
+            Some("-"),
+            "Codex hardened spec must read prompt strictly from stdin via `-`"
+        );
+
+        // Antigravity passes prompts on process argv (`--print <prompt>`) and MUST be rejected.
+        let agy_err =
+            build_hardened_guardian_command_spec(ProviderKind::Antigravity, &exe, &iso, None)
+                .expect_err("Antigravity must be rejected for hardened Guardian classification");
+        assert!(agy_err.contains("argv"));
+        assert!(!is_hardened_guardian_provider(ProviderKind::Antigravity));
+        assert!(is_hardened_guardian_provider(ProviderKind::ClaudeCode));
+        assert!(is_hardened_guardian_provider(ProviderKind::Codex));
     }
 }

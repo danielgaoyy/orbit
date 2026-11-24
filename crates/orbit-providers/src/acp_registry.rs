@@ -1555,7 +1555,7 @@ pub async fn probe_acp_agent(spec: &AcpAgentSpec, cwd: Option<&Path>) -> AcpProb
         "method": "initialize",
         "params": {
             "protocolVersion": 1,
-            "clientCapabilities": {},
+            "clientCapabilities": crate::acp_callbacks::acp_client_capabilities(),
             "clientInfo": {
                 "name": "orbit",
                 "version": env!("CARGO_PKG_VERSION")

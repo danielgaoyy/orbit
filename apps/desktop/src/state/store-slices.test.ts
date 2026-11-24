@@ -38,6 +38,7 @@ function createMinimalTestState(): OrbitUiState {
     slashCommands: [],
     composerDrafts: {},
     terminalTabs: [],
+    terminalSplits: [],
     activeTerminalTabKey: null,
     terminalFocused: false,
     sidebarOpen: true,

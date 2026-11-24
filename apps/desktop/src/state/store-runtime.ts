@@ -28,6 +28,7 @@ import type {
   SettingsSectionTarget,
   SimpleSyncGate,
   StagePullGate,
+  TerminalSplitDirection,
   TerminalStreamChannel,
   ThemeMode,
   ToastAction,
@@ -185,6 +186,13 @@ export interface OrbitCrossSliceActions {
   ): Promise<BrowserActionResponseView | null>;
   openTerminalTab(opts?: { spawnIfEmpty?: boolean }): void;
   toggleTerminalTab(openOverride?: boolean): void;
+  splitActiveTerminalPane(direction: TerminalSplitDirection): void;
+  setTerminalSplitRatios(splitId: string, ratios: number[]): void;
+  runCommandInTerminal(
+    command: string,
+    opts?: { execute?: boolean; hostId?: string; cwd?: string },
+  ): void;
+  onTerminalTabAttached(hostId: string, tabKey: string, terminalId: string): void;
   openBrowserTab(initialUrl?: string): void;
   openSideQuestionTab(opts?: { entryId?: string }): void;
   submitSideQuestion(

@@ -14,15 +14,19 @@ import {
   Check,
   ChevronRight,
   Copy,
+  Crosshair,
   FileCode2,
   FileDiff,
   FileImage,
   FileSymlink,
   FileText,
   Film,
+  Folder,
   GitBranch,
   GitCompareArrows,
   GitFork,
+  GitPullRequest,
+  Globe,
   Music,
   Quote,
   Sparkles,
@@ -94,6 +98,14 @@ function resolvePromptBadgeIcon(badge: PromptBadge): LucideIcon {
       return resolveSlashCommandIcon(normalizeDirectiveLabel(badge.label));
     case "skill":
       return Sparkles;
+    case "command":
+      return SquareTerminal;
+    case "folder":
+      return Folder;
+    case "pr":
+      return GitPullRequest;
+    case "web":
+      return Globe;
     case "file":
       return resolveSemanticFileIcon(badge.label);
     case "git_diff":
@@ -110,6 +122,8 @@ function resolvePromptBadgeIcon(badge: PromptBadge): LucideIcon {
       return Music;
     case "quote":
       return Quote;
+    case "element":
+      return Crosshair;
     case "paste": {
       const cleanName = badge.label.split("·")[0]?.trim() ?? "";
       return cleanName.includes(".") ? resolveSemanticFileIcon(cleanName) : FileText;
@@ -842,11 +856,16 @@ export const UserPromptBubble = memo(function UserPromptBubble({
                     badge.kind === "file" ||
                     badge.kind === "quote" ||
                     badge.kind === "skill" ||
+                    badge.kind === "command" ||
+                    badge.kind === "folder" ||
+                    badge.kind === "pr" ||
+                    badge.kind === "web" ||
                     mediaKind !== null;
                   const fileTarget = badge.path?.trim() || badge.label;
                   const isClickableMediaBadge = mediaKind !== null && fileTarget.trim().length > 0;
                   const isClickableFileBadge =
-                    badge.kind !== "skill" && isMono && fileTarget.trim().length > 0;
+                    (badge.kind === "file" || badge.kind === "quote") &&
+                    fileTarget.trim().length > 0;
                   if (isClickableMediaBadge && mediaKind) {
                     return (
                       <button

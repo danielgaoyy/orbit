@@ -14,19 +14,23 @@
 //!   metadata, `::ffff:`, NAT64, unspecified, multicast, broadcast) with `Policy::none()`
 //!   redirects and mask sensitive headers/env values in all snapshots.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
+use std::future::Future;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use orbit_protocol::{
     DEFAULT_HOOK_TIMEOUT_MS, HookAction, HookDecision, HookEventKind, HookExecutionRecord,
     HookScope, LifecycleHookRule, MAX_HOOK_EXECUTIONS, MAX_HOOK_OUTPUT_BYTES, MAX_HOOK_TIMEOUT_MS,
+    ToolCallDetail,
 };
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -34,7 +38,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, Semaphore, mpsc};
 use uuid::Uuid;
 
 use crate::mcp_servers::{
@@ -53,6 +57,55 @@ const MAX_HOOK_NAME_CHARS: usize = 120;
 const MAX_HOOK_ID_CHARS: usize = 96;
 const MAX_HOOK_DESC_CHARS: usize = 512;
 const MAX_HOOKS_PER_FILE: usize = 200;
+const MAX_CONCURRENT_HOOK_EXECUTIONS: usize = 8;
+const ASYNC_HOOK_QUEUE_CAPACITY: usize = 256;
+pub const HOOK_RECURSION_ENV_KEY: &str = "ORBIT_HOOK_EXECUTION";
+pub const HOOK_ORIGIN_RULE_ENV_KEY: &str = "ORBIT_HOOK_RULE_ID";
+pub const HOOK_ORIGIN_TOKEN_ENV_KEY: &str = "ORBIT_HOOK_ORIGIN_TOKEN";
+pub const HOOK_ORIGIN_HTTP_HEADER: &str = "x-orbit-hook-origin";
+pub const HOOK_ORIGIN_RULE_HTTP_HEADER: &str = "x-orbit-hook-rule-id";
+pub const HOOK_ORIGIN_TOKEN_HTTP_HEADER: &str = "x-orbit-hook-origin-token";
+
+/// Authenticated provenance attached to MCP requests originating from a lifecycle hook subprocess.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HookOriginContext {
+    pub from_hook: bool,
+    pub origin_rule_id: Option<String>,
+}
+
+/// RAII guard that removes a live hook invocation token as soon as the hook completes.
+pub struct ActiveHookInvocationGuard {
+    active_invocations: Arc<StdMutex<HashMap<String, String>>>,
+    token: String,
+}
+
+impl Drop for ActiveHookInvocationGuard {
+    fn drop(&mut self) {
+        let mut guard = self
+            .active_invocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.remove(&self.token);
+    }
+}
+
+type AsyncHookJob =
+    Box<dyn FnOnce(Arc<HooksEngine>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
+tokio::task_local! {
+    static IN_HOOK_DISPATCH: bool;
+}
+
+fn is_fail_closed_event(event: HookEventKind) -> bool {
+    matches!(event, HookEventKind::PreToolUse)
+}
+
+fn deserialize_explicit_option_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
 
 /// Snapshot returned to protocol callers (with secrets masked).
 #[derive(Debug, Clone)]
@@ -68,6 +121,7 @@ pub struct HookDispatchOutcome {
     pub decision: HookDecision,
     pub reason: Option<String>,
     pub updated_text: Option<String>,
+    pub updated_input: Option<Value>,
     pub blocking_hook_name: Option<String>,
     pub records: Vec<HookExecutionRecord>,
 }
@@ -78,6 +132,7 @@ impl Default for HookDispatchOutcome {
             decision: HookDecision::Allow,
             reason: None,
             updated_text: None,
+            updated_input: None,
             blocking_hook_name: None,
             records: Vec::new(),
         }
@@ -130,6 +185,22 @@ struct HookOutputDecisionPayload {
     reason: Option<String>,
     #[serde(default)]
     updated_text: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_explicit_option_value")]
+    updated_input: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HookOutputExtras {
+    updated_text: Option<String>,
+    updated_input: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedHookDecision {
+    decision: HookDecision,
+    reason: Option<String>,
+    updated_text: Option<String>,
+    updated_input: Option<Value>,
 }
 
 /// Pure-Rust deterministic lifecycle hooks engine owned by `DaemonRuntime`.
@@ -137,15 +208,95 @@ pub struct HooksEngine {
     home_dir: PathBuf,
     config_lock: AsyncMutex<()>,
     executions: RwLock<VecDeque<HookExecutionRecord>>,
+    exec_semaphore: Arc<Semaphore>,
+    async_worker_semaphore: Arc<Semaphore>,
+    async_tx: mpsc::Sender<AsyncHookJob>,
+    async_rx: StdMutex<Option<mpsc::Receiver<AsyncHookJob>>>,
+    pending_async_jobs: Arc<AtomicUsize>,
+    async_idle_notify: Arc<Notify>,
+    active_invocations: Arc<StdMutex<HashMap<String, String>>>,
 }
 
 impl HooksEngine {
     pub fn new(home_dir: PathBuf) -> Arc<Self> {
+        let (async_tx, async_rx) = mpsc::channel(ASYNC_HOOK_QUEUE_CAPACITY);
         Arc::new(Self {
             home_dir,
             config_lock: AsyncMutex::new(()),
             executions: RwLock::new(VecDeque::with_capacity(MAX_HOOK_EXECUTIONS)),
+            exec_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_HOOK_EXECUTIONS)),
+            async_worker_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_HOOK_EXECUTIONS)),
+            async_tx,
+            async_rx: StdMutex::new(Some(async_rx)),
+            pending_async_jobs: Arc::new(AtomicUsize::new(0)),
+            async_idle_notify: Arc::new(Notify::new()),
+            active_invocations: Arc::new(StdMutex::new(HashMap::new())),
         })
+    }
+
+    /// Register a short-lived, unguessable 256-bit provenance token for a currently running hook
+    /// rule so MCP callbacks from that subprocess can prove hook origin without allowing regular
+    /// agents to forge `x-orbit-hook-origin` headers.
+    pub fn register_active_invocation(&self, rule_id: &str) -> (String, ActiveHookInvocationGuard) {
+        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        {
+            let mut guard = self
+                .active_invocations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.insert(token.clone(), rule_id.to_string());
+        }
+        let drop_guard = ActiveHookInvocationGuard {
+            active_invocations: Arc::clone(&self.active_invocations),
+            token: token.clone(),
+        };
+        (token, drop_guard)
+    }
+
+    /// Verify a presented `x-orbit-hook-origin-token` header against live hook invocations.
+    pub fn verify_hook_origin_token(&self, token: &str) -> Option<HookOriginContext> {
+        let trimmed = token.trim();
+        if trimmed.len() < 32 {
+            return None;
+        }
+        let guard = self
+            .active_invocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.get(trimmed).map(|rule_id| HookOriginContext {
+            from_hook: true,
+            origin_rule_id: Some(rule_id.clone()),
+        })
+    }
+
+    fn ensure_async_worker_started(self: &Arc<Self>) {
+        let maybe_rx = self
+            .async_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(mut rx) = maybe_rx else {
+            return;
+        };
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            while let Some(job) = rx.recv().await {
+                let Ok(permit) = Arc::clone(&engine.async_worker_semaphore)
+                    .acquire_owned()
+                    .await
+                else {
+                    break;
+                };
+                let eng = Arc::clone(&engine);
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    job(Arc::clone(&eng)).await;
+                    if eng.pending_async_jobs.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        eng.async_idle_notify.notify_waiters();
+                    }
+                });
+            }
+        });
     }
 
     /// List all user-global hooks plus optional project hooks (with secret headers/env masked).
@@ -344,8 +495,16 @@ impl HooksEngine {
             "payload": sample_payload,
         });
 
-        let (record, _updated_text) =
-            execute_hook_rule(&rule, exec_cwd.as_deref(), target.as_deref(), &envelope).await;
+        let (invocation_token, _invocation_guard) = self.register_active_invocation(&rule.id);
+        let (record, _extras) = execute_hook_rule(
+            &rule,
+            &self.home_dir,
+            exec_cwd.as_deref(),
+            target.as_deref(),
+            &envelope,
+            Some(&invocation_token),
+        )
+        .await;
         self.push_execution(record.clone()).await;
         Ok(record)
     }
@@ -353,16 +512,60 @@ impl HooksEngine {
     /// Dispatch a live lifecycle event to all matching, enabled, trusted hooks.
     ///
     /// - Untrusted project hooks are strictly skipped (never executed).
+    /// - Re-entrant / recursive hook dispatches are blocked immediately.
     /// - If a hook returns `HookDecision::Block`, execution short-circuits immediately.
-    /// - If a hook returns `HookDecision::Modify` with `updated_text`, subsequent hooks receive
-    ///   the updated text in `payload["prompt"]` / `payload["updated_text"]`.
+    /// - For `PreToolUse`, execution/timeout/semaphore errors fail closed (`HookDecision::Block`).
+    /// - If a hook returns `HookDecision::Modify` with `updated_text` or `updated_input`,
+    ///   subsequent hooks receive the updated value in the payload.
     pub async fn dispatch_event(
         &self,
         event: HookEventKind,
         cwd: Option<&Path>,
         target: Option<&str>,
-        mut payload: Value,
+        payload: Value,
     ) -> HookDispatchOutcome {
+        let targets: Vec<String> = target
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| vec![t.to_string()])
+            .unwrap_or_default();
+        self.dispatch_event_with_targets(event, cwd, &targets, payload)
+            .await
+    }
+
+    /// Dispatch a live lifecycle event matching rules against one or more target aliases
+    /// (e.g. `["shell", "Bash", "Bash:git"]` or `["browser_open", "orbit_browser"]`).
+    pub async fn dispatch_event_with_targets(
+        &self,
+        event: HookEventKind,
+        cwd: Option<&Path>,
+        targets: &[String],
+        payload: Value,
+    ) -> HookDispatchOutcome {
+        self.dispatch_event_with_options(event, cwd, targets, payload, None)
+            .await
+    }
+
+    /// Dispatch a live lifecycle event, optionally skipping a specific originating `rule_id`
+    /// (used to break cross-MCP self-recursion without disabling unrelated `PreToolUse` policies).
+    pub async fn dispatch_event_with_options(
+        &self,
+        event: HookEventKind,
+        cwd: Option<&Path>,
+        targets: &[String],
+        mut payload: Value,
+        skip_rule_id: Option<&str>,
+    ) -> HookDispatchOutcome {
+        // Prevent recursive hook loops both in-process (task-local) and across child invocations.
+        let in_recursive_task = IN_HOOK_DISPATCH.try_with(|active| *active).unwrap_or(false);
+        if in_recursive_task || std::env::var_os(HOOK_RECURSION_ENV_KEY).is_some() {
+            tracing::debug!(
+                event = event.slug(),
+                "Skipping recursive lifecycle hook dispatch"
+            );
+            return HookDispatchOutcome::default();
+        }
+
         let (matching_rules, exec_cwd) = {
             let _guard = self.config_lock.lock().await;
             let Ok((all_rules, project_trusted, canonical_cwd)) =
@@ -371,13 +574,18 @@ impl HooksEngine {
                 return HookDispatchOutcome::default();
             };
 
-            let filtered: Vec<LifecycleHookRule> = all_rules
+            let filtered: Vec<(LifecycleHookRule, Option<String>)> = all_rules
                 .into_iter()
-                .filter(|rule| {
-                    rule.enabled
-                        && rule.event == event
-                        && (rule.scope == HookScope::UserGlobal || project_trusted)
-                        && matches_hook_pattern(rule.matcher.as_deref(), target)
+                .filter_map(|rule| {
+                    if !rule.enabled
+                        || rule.event != event
+                        || !(rule.scope == HookScope::UserGlobal || project_trusted)
+                        || skip_rule_id.is_some_and(|skip| rule.id == skip)
+                    {
+                        return None;
+                    }
+                    let matched = match_hook_targets(rule.matcher.as_deref(), targets)?;
+                    Some((rule, matched))
                 })
                 .collect();
             (filtered, canonical_cwd)
@@ -387,43 +595,179 @@ impl HooksEngine {
             return HookDispatchOutcome::default();
         }
 
-        let mut outcome = HookDispatchOutcome::default();
+        IN_HOOK_DISPATCH
+            .scope(true, async {
+                let mut outcome = HookDispatchOutcome::default();
 
-        for rule in matching_rules {
-            let (record, updated_text) =
-                execute_hook_rule(&rule, exec_cwd.as_deref(), target, &payload).await;
-            self.push_execution(record.clone()).await;
+                for (rule, matched_target) in matching_rules {
+                    let wait_ms = rule
+                        .timeout_ms
+                        .clamp(MIN_HOOK_TIMEOUT_MS, MAX_HOOK_TIMEOUT_MS);
+                    let Ok(Ok(_permit)) = tokio::time::timeout(
+                        Duration::from_millis(wait_ms),
+                        self.exec_semaphore.acquire(),
+                    )
+                    .await
+                    else {
+                        let reason =
+                            format!("Lifecycle hook concurrency limit timed out after {wait_ms}ms");
+                        if is_fail_closed_event(rule.event) {
+                            let record = HookExecutionRecord {
+                                id: format!("hx_{}", Uuid::new_v4().simple()),
+                                hook_id: rule.id.clone(),
+                                hook_name: rule.name.clone(),
+                                event: rule.event,
+                                matched_target: matched_target.clone(),
+                                decision: HookDecision::Block,
+                                reason: Some(format!("{reason} (fail-closed)")),
+                                exit_code: None,
+                                duration_ms: wait_ms,
+                                stdout_preview: String::new(),
+                                stderr_preview: reason.clone(),
+                                executed_at_ms: now_unix_ms(),
+                            };
+                            self.push_execution(record.clone()).await;
+                            outcome.decision = HookDecision::Block;
+                            outcome.reason = record.reason.clone();
+                            outcome.blocking_hook_name = Some(rule.name.clone());
+                            outcome.records.push(record);
+                            break;
+                        }
+                        tracing::warn!(
+                            hook_id = %rule.id,
+                            event = event.slug(),
+                            "{reason}; skipping non-blocking hook"
+                        );
+                        continue;
+                    };
 
-            match record.decision {
-                HookDecision::Block => {
-                    outcome.decision = HookDecision::Block;
-                    outcome.reason = record.reason.clone();
-                    outcome.blocking_hook_name = Some(rule.name.clone());
-                    outcome.records.push(record);
-                    break;
-                }
-                HookDecision::Modify => {
-                    if let Some(new_text) = updated_text {
-                        outcome.decision = HookDecision::Modify;
-                        outcome.updated_text = Some(new_text.clone());
-                        outcome.reason = record.reason.clone();
-                        if let Some(obj) = payload.as_object_mut() {
-                            if obj.contains_key("prompt") {
-                                obj.insert("prompt".to_string(), Value::String(new_text));
-                            } else {
-                                obj.insert("updated_text".to_string(), Value::String(new_text));
+                    let (invocation_token, _invocation_guard) =
+                        self.register_active_invocation(&rule.id);
+                    let (record, extras) = execute_hook_rule(
+                        &rule,
+                        &self.home_dir,
+                        exec_cwd.as_deref(),
+                        matched_target.as_deref(),
+                        &payload,
+                        Some(&invocation_token),
+                    )
+                    .await;
+                    self.push_execution(record.clone()).await;
+
+                    match record.decision {
+                        HookDecision::Block => {
+                            outcome.decision = HookDecision::Block;
+                            outcome.reason = record.reason.clone();
+                            outcome.blocking_hook_name = Some(rule.name.clone());
+                            outcome.records.push(record);
+                            break;
+                        }
+                        HookDecision::Modify => {
+                            let mut modified_any = false;
+                            if let Some(new_text) = extras.updated_text {
+                                modified_any = true;
+                                outcome.updated_text = Some(new_text.clone());
+                                if let Some(obj) = payload.as_object_mut() {
+                                    if obj.contains_key("prompt") {
+                                        obj.insert("prompt".to_string(), Value::String(new_text));
+                                    } else {
+                                        obj.insert(
+                                            "updated_text".to_string(),
+                                            Value::String(new_text),
+                                        );
+                                    }
+                                }
                             }
+                            if let Some(new_input) = extras.updated_input {
+                                modified_any = true;
+                                outcome.updated_input = Some(new_input.clone());
+                                if let Some(obj) = payload.as_object_mut() {
+                                    obj.insert("tool_input".to_string(), new_input);
+                                }
+                            }
+                            if modified_any {
+                                outcome.decision = HookDecision::Modify;
+                                outcome.reason = record.reason.clone();
+                            }
+                            outcome.records.push(record);
+                        }
+                        HookDecision::Allow => {
+                            if let Some(new_input) = extras.updated_input {
+                                outcome.updated_input = Some(new_input.clone());
+                                if let Some(obj) = payload.as_object_mut() {
+                                    obj.insert("tool_input".to_string(), new_input);
+                                }
+                            }
+                            if outcome.reason.is_none() && record.reason.is_some() {
+                                outcome.reason = record.reason.clone();
+                            }
+                            outcome.records.push(record);
                         }
                     }
-                    outcome.records.push(record);
                 }
-                HookDecision::Allow => {
-                    outcome.records.push(record);
+
+                outcome
+            })
+            .await
+    }
+
+    /// Enqueue a bounded asynchronous fire-and-forget lifecycle hook dispatch into the persistent
+    /// 256-slot mpsc queue drained by bounded worker concurrency (never dropping burst events
+    /// under normal load and never blocking stream rendering). Returns `true` iff enqueued.
+    pub fn dispatch_event_async_with_targets(
+        self: &Arc<Self>,
+        event: HookEventKind,
+        cwd: Option<PathBuf>,
+        targets: Vec<String>,
+        payload: Value,
+    ) -> bool {
+        self.spawn_bounded_async(event, move |engine| async move {
+            let _ = engine
+                .dispatch_event_with_targets(event, cwd.as_deref(), &targets, payload)
+                .await;
+        })
+    }
+
+    /// Enqueue a bounded asynchronous hook task onto the 256-slot mpsc dispatch queue.
+    /// Returns `true` iff the job was accepted into the queue.
+    pub fn spawn_bounded_async<F, Fut>(self: &Arc<Self>, event: HookEventKind, work: F) -> bool
+    where
+        F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.ensure_async_worker_started();
+        self.pending_async_jobs.fetch_add(1, Ordering::AcqRel);
+        let job: AsyncHookJob = Box::new(move |engine| Box::pin(work(engine)));
+        match self.async_tx.try_send(job) {
+            Ok(()) => true,
+            Err(_) => {
+                if self.pending_async_jobs.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    self.async_idle_notify.notify_waiters();
                 }
+                tracing::warn!(
+                    event = event.slug(),
+                    capacity = ASYNC_HOOK_QUEUE_CAPACITY,
+                    "Dropping async lifecycle hook dispatch: bounded mpsc queue saturated"
+                );
+                false
             }
         }
+    }
 
-        outcome
+    #[cfg(test)]
+    pub async fn wait_async_idle(&self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while self.pending_async_jobs.load(Ordering::Acquire) > 0 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let notified = self.async_idle_notify.notified();
+            if self.pending_async_jobs.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            let _ = tokio::time::timeout(remaining.min(Duration::from_millis(50)), notified).await;
+        }
     }
 
     async fn push_execution(&self, record: HookExecutionRecord) {
@@ -1193,6 +1537,173 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
+/// Match a rule's optional `matcher` against one or more candidate target aliases.
+/// Returns `Some(matched_target)` if any candidate matches (or matcher is empty/`*`), else `None`.
+fn match_hook_targets(matcher: Option<&str>, targets: &[String]) -> Option<Option<String>> {
+    let trimmed = matcher.map(str::trim).filter(|m| !m.is_empty());
+    if trimmed.is_none() || trimmed == Some("*") {
+        return Some(targets.first().cloned());
+    }
+    for cand in targets {
+        if matches_hook_pattern(trimmed, Some(cand.as_str())) {
+            return Some(Some(cand.clone()));
+        }
+    }
+    None
+}
+
+/// Public bounded UTF-8 preview helper for hook payloads (`output_preview`, `message`, etc.).
+pub fn truncate_hook_preview(text: &str, max_chars: usize) -> String {
+    truncate_preview(text, max_chars)
+}
+
+/// Extract all touched file paths from a `FileEdit` primary path and optional multi-file
+/// `unified_diff` (parsing `+++ b/...`, `--- a/...`, and `diff --git a/... b/...` headers,
+/// skipping `/dev/null`). Preserves insertion order and deduplicates.
+pub fn extract_paths_from_unified_diff(
+    primary_path: &str,
+    unified_diff: Option<&str>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push_clean = |raw: &str| {
+        let mut s = raw.trim();
+        if let Some((before_tab, _)) = s.split_once('\t') {
+            s = before_tab.trim();
+        }
+        s = s.trim_matches('"');
+        if s.is_empty() || s == "/dev/null" {
+            return;
+        }
+        if let Some(stripped) = s.strip_prefix("a/").or_else(|| s.strip_prefix("b/")) {
+            s = stripped;
+        }
+        if !s.is_empty() && s != "/dev/null" && !out.iter().any(|p| p == s) {
+            out.push(s.to_string());
+        }
+    };
+
+    push_clean(primary_path);
+    if let Some(diff) = unified_diff {
+        for line in diff.lines() {
+            if let Some(rest) = line.strip_prefix("+++ ") {
+                push_clean(rest);
+            } else if let Some(rest) = line.strip_prefix("--- ") {
+                push_clean(rest);
+            } else if let Some(rest) = line.strip_prefix("diff --git ") {
+                // Handle unquoted `a/<old> b/<new>` segments cleanly.
+                if let Some((lhs, rhs)) = rest.split_once(" b/") {
+                    push_clean(lhs);
+                    push_clean(rhs);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Build canonical `(primary_tool_name, matcher_target_aliases)` from a `ToolCallDetail` so
+/// `PreToolUse` and `PostToolUse` matchers work seamlessly with both normalized names (`shell`,
+/// `file_edit`) and provider-idiomatic names (`Bash`, `Bash:git`, `Edit`, `*.rs`), including all
+/// paths touched in multi-file diffs.
+pub fn tool_detail_hook_targets(detail: &ToolCallDetail, title: &str) -> (String, Vec<String>) {
+    let (primary, _) = crate::guardian::summarize_tool_request(detail, title);
+    let mut targets = Vec::new();
+    let mut push_unique = |val: String| {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() && !targets.iter().any(|t: &String| t == trimmed) {
+            targets.push(trimmed.to_string());
+        }
+    };
+
+    push_unique(primary.clone());
+    match detail {
+        ToolCallDetail::Shell { command, .. } => {
+            push_unique("Bash".to_string());
+            if let Some(first_tok) = command.split_whitespace().next() {
+                let prog = Path::new(first_tok)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(first_tok);
+                if !prog.is_empty() {
+                    push_unique(format!("shell:{prog}"));
+                    push_unique(format!("Bash:{prog}"));
+                }
+            }
+        }
+        ToolCallDetail::FileRead { path, .. } => {
+            push_unique("Read".to_string());
+            push_unique(path.clone());
+        }
+        ToolCallDetail::FileEdit { path, unified_diff } => {
+            push_unique("Edit".to_string());
+            push_unique("Write".to_string());
+            for touched in extract_paths_from_unified_diff(path, unified_diff.as_deref()) {
+                push_unique(touched);
+            }
+        }
+        ToolCallDetail::Search { scope, .. } => {
+            push_unique("Grep".to_string());
+            push_unique("Glob".to_string());
+            if let Some(sc) = scope {
+                push_unique(sc.clone());
+            }
+        }
+        ToolCallDetail::Subagent { role, .. } => {
+            push_unique("Agent".to_string());
+            push_unique(role.clone());
+        }
+        ToolCallDetail::Generic { tool_name, .. } => {
+            push_unique(tool_name.clone());
+        }
+    }
+    (primary, targets)
+}
+
+/// Extract a structured JSON `tool_input` representation from `ToolCallDetail`.
+pub fn tool_detail_input_value(detail: &ToolCallDetail) -> Value {
+    match detail {
+        ToolCallDetail::Shell { command, cwd, .. } => json!({
+            "command": command,
+            "cwd": cwd,
+        }),
+        ToolCallDetail::FileRead {
+            path,
+            start_line,
+            end_line,
+        } => json!({
+            "path": path,
+            "start_line": start_line,
+            "end_line": end_line,
+        }),
+        ToolCallDetail::FileEdit { path, unified_diff } => json!({
+            "path": path,
+            "unified_diff": unified_diff.as_deref().map(|d| truncate_preview(d, MAX_PREVIEW_CHARS)),
+        }),
+        ToolCallDetail::Search { query, scope } => json!({
+            "query": query,
+            "scope": scope,
+        }),
+        ToolCallDetail::Subagent {
+            child_agent_id,
+            role,
+            prompt_preview,
+        } => json!({
+            "child_agent_id": child_agent_id,
+            "role": role,
+            "prompt_preview": truncate_preview(prompt_preview, MAX_PREVIEW_CHARS),
+        }),
+        ToolCallDetail::Generic {
+            tool_name,
+            arguments_json,
+        } => serde_json::from_str::<Value>(arguments_json).unwrap_or_else(|_| {
+            json!({
+                "tool_name": tool_name,
+                "raw_arguments": truncate_preview(arguments_json, MAX_PREVIEW_CHARS),
+            })
+        }),
+    }
+}
+
 fn now_unix_ms() -> u64 {
     Utc::now().timestamp_millis().max(0) as u64
 }
@@ -1208,7 +1719,7 @@ fn truncate_preview(text: &str, max_chars: usize) -> String {
     }
 }
 
-fn parse_hook_json_decision(raw: &str) -> Option<(HookDecision, Option<String>, Option<String>)> {
+fn parse_hook_json_decision(raw: &str) -> Option<ParsedHookDecision> {
     let trimmed = raw.trim();
     if !trimmed.starts_with('{') {
         return None;
@@ -1225,19 +1736,36 @@ fn parse_hook_json_decision(raw: &str) -> Option<(HookDecision, Option<String>, 
         .reason
         .map(|r| r.trim().to_string())
         .filter(|r| !r.is_empty());
-    let updated_text = parsed.updated_text;
-    Some((decision, reason, updated_text))
+    Some(ParsedHookDecision {
+        decision,
+        reason,
+        updated_text: parsed.updated_text,
+        updated_input: parsed.updated_input,
+    })
 }
 
 async fn execute_hook_rule(
     rule: &LifecycleHookRule,
+    home_dir: &Path,
     cwd: Option<&Path>,
     target: Option<&str>,
     payload: &Value,
-) -> (HookExecutionRecord, Option<String>) {
+    invocation_token: Option<&str>,
+) -> (HookExecutionRecord, HookOutputExtras) {
     match &rule.action {
         HookAction::Command { command, args, env } => {
-            execute_command_hook(rule, command, args, env, cwd, target, payload).await
+            execute_command_hook(
+                rule,
+                command,
+                args,
+                env,
+                home_dir,
+                cwd,
+                target,
+                payload,
+                invocation_token,
+            )
+            .await
         }
         HookAction::HttpWebhook { url, headers } => {
             execute_webhook_hook(rule, url, headers, target, payload).await
@@ -1369,22 +1897,36 @@ async fn read_bounded_stream<R: AsyncRead + Unpin>(mut reader: R, limit: usize) 
     captured
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_command_hook(
     rule: &LifecycleHookRule,
     command: &str,
     args: &[String],
     hook_env: &BTreeMap<String, String>,
+    home_dir: &Path,
     cwd: Option<&Path>,
     target: Option<&str>,
     payload: &Value,
-) -> (HookExecutionRecord, Option<String>) {
+    invocation_token: Option<&str>,
+) -> (HookExecutionRecord, HookOutputExtras) {
     let started = Instant::now();
     let exec_id = format!("hx_{}", Uuid::new_v4().simple());
     let timeout_ms = rule
         .timeout_ms
         .clamp(MIN_HOOK_TIMEOUT_MS, MAX_HOOK_TIMEOUT_MS);
+    let fail_closed = is_fail_closed_event(rule.event);
+    let err_decision = if fail_closed {
+        HookDecision::Block
+    } else {
+        HookDecision::Allow
+    };
 
-    let fail_open = |reason: String, stderr: String, exit_code: Option<i32>| {
+    let on_error = |reason: String, stderr: String, exit_code: Option<i32>| {
+        let final_reason = if fail_closed && !reason.contains("fail-closed") {
+            format!("{reason} (fail-closed)")
+        } else {
+            reason
+        };
         (
             HookExecutionRecord {
                 id: exec_id.clone(),
@@ -1392,28 +1934,34 @@ async fn execute_command_hook(
                 hook_name: rule.name.clone(),
                 event: rule.event,
                 matched_target: target.map(ToOwned::to_owned),
-                decision: HookDecision::Allow,
-                reason: Some(reason),
+                decision: err_decision,
+                reason: Some(final_reason),
                 exit_code,
                 duration_ms: started.elapsed().as_millis() as u64,
                 stdout_preview: String::new(),
                 stderr_preview: truncate_preview(&stderr, MAX_PREVIEW_CHARS),
                 executed_at_ms: now_unix_ms(),
             },
-            None,
+            HookOutputExtras::default(),
         )
     };
 
+    // Security invariant: global (`UserGlobal`) hooks MUST resolve relative executables only
+    // against trusted `$ORBIT_HOME`, NEVER against a caller/workspace `cwd`. Project hooks
+    // resolve against their SHA-256-trusted canonical workspace `cwd`.
+    let exec_resolve_base = match rule.scope {
+        HookScope::UserGlobal => Some(home_dir.to_path_buf()),
+        HookScope::ProjectOrbit => cwd.map(Path::to_path_buf),
+    };
     let cmd_owned = command.to_string();
-    let cwd_owned = cwd.map(Path::to_path_buf);
     let resolved = tokio::task::spawn_blocking(move || {
-        resolve_executable_path(&cmd_owned, cwd_owned.as_deref())
+        resolve_executable_path(&cmd_owned, exec_resolve_base.as_deref())
     })
     .await
     .ok()
     .flatten();
     let Some(resolved) = resolved else {
-        return fail_open(
+        return on_error(
             format!("Executable `{command}` not found or not executable"),
             format!("Executable `{command}` not found or not executable"),
             None,
@@ -1427,9 +1975,10 @@ async fn execute_command_hook(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    if let Some(dir) = cwd
-        && dir.is_dir()
-    {
+    let effective_cmd_cwd = cwd
+        .filter(|d| d.is_dir())
+        .or_else(|| home_dir.is_dir().then_some(home_dir));
+    if let Some(dir) = effective_cmd_cwd {
         cmd.current_dir(dir);
     }
 
@@ -1450,13 +1999,20 @@ async fn execute_command_hook(
             cmd.env(k, v);
         }
     }
+    // Set non-secret recursion & provenance markers AFTER scrubbing all inherited `ORBIT_*`
+    // secrets so any child command calling back over MCP cannot trigger infinite hook loops.
+    cmd.env(HOOK_RECURSION_ENV_KEY, "1");
+    cmd.env(HOOK_ORIGIN_RULE_ENV_KEY, &rule.id);
+    if let Some(token) = invocation_token {
+        cmd.env(HOOK_ORIGIN_TOKEN_ENV_KEY, token);
+    }
 
     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return fail_open(
+            return on_error(
                 format!("Failed to spawn `{}`: {e}", resolved.display()),
                 e.to_string(),
                 None,
@@ -1499,7 +2055,7 @@ async fn execute_command_hook(
             stdin_task.abort();
             stdout_task.abort();
             stderr_task.abort();
-            return fail_open(format!("Hook process wait error: {e}"), e.to_string(), None);
+            return on_error(format!("Hook process wait error: {e}"), e.to_string(), None);
         }
         Err(_) => {
             kill_process_group_and_reap(&mut child, child_pid).await;
@@ -1510,6 +2066,11 @@ async fn execute_command_hook(
                 await_task_bounded(stderr_task, Duration::from_millis(200)).await;
             let stdout_str = String::from_utf8_lossy(&stdout_bytes).to_string();
             let stderr_str = String::from_utf8_lossy(&stderr_bytes).to_string();
+            let timeout_reason = if fail_closed {
+                format!("PreToolUse hook timed out after {timeout_ms}ms (fail-closed)")
+            } else {
+                format!("Hook timed out after {timeout_ms}ms")
+            };
             return (
                 HookExecutionRecord {
                     id: exec_id,
@@ -1517,15 +2078,15 @@ async fn execute_command_hook(
                     hook_name: rule.name.clone(),
                     event: rule.event,
                     matched_target: target.map(ToOwned::to_owned),
-                    decision: HookDecision::Allow,
-                    reason: Some(format!("Hook timed out after {timeout_ms}ms")),
+                    decision: err_decision,
+                    reason: Some(timeout_reason),
                     exit_code: None,
                     duration_ms: started.elapsed().as_millis() as u64,
                     stdout_preview: truncate_preview(&stdout_str, MAX_PREVIEW_CHARS),
                     stderr_preview: truncate_preview(&stderr_str, MAX_PREVIEW_CHARS),
                     executed_at_ms: now_unix_ms(),
                 },
-                None,
+                HookOutputExtras::default(),
             );
         }
     };
@@ -1545,9 +2106,9 @@ async fn execute_command_hook(
     let stderr_str = String::from_utf8_lossy(&stderr_bytes).to_string();
     let exit_code = exit_status.code();
 
-    let (decision, reason, updated_text) = match exit_code {
+    let (decision, reason, extras) = match exit_code {
         Some(2) => {
-            let parsed_reason = parse_hook_json_decision(&stdout_str).and_then(|(_, r, _)| r);
+            let parsed_reason = parse_hook_json_decision(&stdout_str).and_then(|d| d.reason);
             let reason = parsed_reason
                 .or_else(|| {
                     let s = stderr_str.trim();
@@ -1558,21 +2119,41 @@ async fn execute_command_hook(
                     (!s.is_empty()).then(|| truncate_preview(s, 300))
                 })
                 .or_else(|| Some("Blocked by hook (exit 2)".to_string()));
-            (HookDecision::Block, reason, None)
+            (HookDecision::Block, reason, HookOutputExtras::default())
         }
         Some(0) => {
-            if let Some((dec, r, updated)) = parse_hook_json_decision(&stdout_str) {
-                (dec, r, updated)
+            if let Some(parsed) = parse_hook_json_decision(&stdout_str) {
+                (
+                    parsed.decision,
+                    parsed.reason,
+                    HookOutputExtras {
+                        updated_text: parsed.updated_text,
+                        updated_input: parsed.updated_input,
+                    },
+                )
+            } else if fail_closed && stdout_str.trim().starts_with('{') {
+                (
+                    HookDecision::Block,
+                    Some(
+                        "PreToolUse hook returned invalid JSON decision (fail-closed)".to_string(),
+                    ),
+                    HookOutputExtras::default(),
+                )
             } else {
-                (HookDecision::Allow, None, None)
+                (HookDecision::Allow, None, HookOutputExtras::default())
             }
         }
         other => {
-            let msg = match other {
-                Some(code) => format!("Hook exited with code {code} (fail-open)"),
-                None => "Hook terminated by signal (fail-open)".to_string(),
+            let mode_tag = if fail_closed {
+                "fail-closed"
+            } else {
+                "fail-open"
             };
-            (HookDecision::Allow, Some(msg), None)
+            let msg = match other {
+                Some(code) => format!("Hook exited with code {code} ({mode_tag})"),
+                None => format!("Hook terminated by signal ({mode_tag})"),
+            };
+            (err_decision, Some(msg), HookOutputExtras::default())
         }
     };
 
@@ -1591,7 +2172,7 @@ async fn execute_command_hook(
             stderr_preview: truncate_preview(&stderr_str, MAX_PREVIEW_CHARS),
             executed_at_ms: now_unix_ms(),
         },
-        updated_text,
+        extras,
     )
 }
 
@@ -1601,14 +2182,25 @@ async fn execute_webhook_hook(
     headers: &BTreeMap<String, String>,
     target: Option<&str>,
     payload: &Value,
-) -> (HookExecutionRecord, Option<String>) {
+) -> (HookExecutionRecord, HookOutputExtras) {
     let started = Instant::now();
     let exec_id = format!("hx_{}", Uuid::new_v4().simple());
     let timeout_ms = rule
         .timeout_ms
         .clamp(MIN_HOOK_TIMEOUT_MS, MAX_HOOK_TIMEOUT_MS);
+    let fail_closed = is_fail_closed_event(rule.event);
+    let err_decision = if fail_closed {
+        HookDecision::Block
+    } else {
+        HookDecision::Allow
+    };
 
-    let fail_open = |reason: String, stderr: String| {
+    let on_error = |reason: String, stderr: String| {
+        let final_reason = if fail_closed && !reason.contains("fail-closed") {
+            format!("{reason} (fail-closed)")
+        } else {
+            reason
+        };
         (
             HookExecutionRecord {
                 id: exec_id.clone(),
@@ -1616,28 +2208,28 @@ async fn execute_webhook_hook(
                 hook_name: rule.name.clone(),
                 event: rule.event,
                 matched_target: target.map(ToOwned::to_owned),
-                decision: HookDecision::Allow,
-                reason: Some(reason),
+                decision: err_decision,
+                reason: Some(final_reason),
                 exit_code: None,
                 duration_ms: started.elapsed().as_millis() as u64,
                 stdout_preview: String::new(),
                 stderr_preview: truncate_preview(&stderr, MAX_PREVIEW_CHARS),
                 executed_at_ms: now_unix_ms(),
             },
-            None,
+            HookOutputExtras::default(),
         )
     };
 
     let parsed_url = match validate_webhook_url(url) {
         Ok(u) => u,
-        Err(e) => return fail_open(e.clone(), e),
+        Err(e) => return on_error(e.clone(), e),
     };
 
     // DNS-resolve upfront, validate EVERY IP against SSRF rules, pin those exact SocketAddrs
     // on reqwest, and disable redirects via `Policy::none()`.
     let (host_norm, pinned_addrs) = match resolve_and_validate_http_addrs(&parsed_url).await {
         Ok(res) => res,
-        Err(e) => return fail_open(e.clone(), e),
+        Err(e) => return on_error(e.clone(), e),
     };
 
     let mut builder = reqwest::Client::builder()
@@ -1648,7 +2240,7 @@ async fn execute_webhook_hook(
     }
     let client = match builder.build() {
         Ok(c) => c,
-        Err(e) => return fail_open(format!("HTTP client build failed: {e}"), e.to_string()),
+        Err(e) => return on_error(format!("HTTP client build failed: {e}"), e.to_string()),
     };
 
     let mut header_map = HeaderMap::new();
@@ -1674,7 +2266,7 @@ async fn execute_webhook_hook(
         .await
     {
         Ok(resp) => resp,
-        Err(e) => return fail_open(format!("Webhook request failed: {e}"), e.to_string()),
+        Err(e) => return on_error(format!("Webhook request failed: {e}"), e.to_string()),
     };
 
     let status = response.status();
@@ -1690,7 +2282,14 @@ async fn execute_webhook_hook(
     let body_str = String::from_utf8_lossy(&body_bytes).to_string();
 
     if status.is_redirection() {
-        let msg = format!("Webhook redirect blocked (HTTP {})", status.as_u16());
+        let msg = if fail_closed {
+            format!(
+                "Webhook redirect blocked (HTTP {}, fail-closed)",
+                status.as_u16()
+            )
+        } else {
+            format!("Webhook redirect blocked (HTTP {})", status.as_u16())
+        };
         return (
             HookExecutionRecord {
                 id: exec_id,
@@ -1698,7 +2297,7 @@ async fn execute_webhook_hook(
                 hook_name: rule.name.clone(),
                 event: rule.event,
                 matched_target: target.map(ToOwned::to_owned),
-                decision: HookDecision::Allow,
+                decision: err_decision,
                 reason: Some(msg.clone()),
                 exit_code: Some(i32::from(status.as_u16())),
                 duration_ms: started.elapsed().as_millis() as u64,
@@ -1706,12 +2305,17 @@ async fn execute_webhook_hook(
                 stderr_preview: msg,
                 executed_at_ms: now_unix_ms(),
             },
-            None,
+            HookOutputExtras::default(),
         );
     }
 
     if !status.is_success() {
-        let msg = format!("Webhook returned HTTP {} (fail-open)", status.as_u16());
+        let mode_tag = if fail_closed {
+            "fail-closed"
+        } else {
+            "fail-open"
+        };
+        let msg = format!("Webhook returned HTTP {} ({mode_tag})", status.as_u16());
         return (
             HookExecutionRecord {
                 id: exec_id,
@@ -1719,7 +2323,7 @@ async fn execute_webhook_hook(
                 hook_name: rule.name.clone(),
                 event: rule.event,
                 matched_target: target.map(ToOwned::to_owned),
-                decision: HookDecision::Allow,
+                decision: err_decision,
                 reason: Some(msg.clone()),
                 exit_code: Some(i32::from(status.as_u16())),
                 duration_ms: started.elapsed().as_millis() as u64,
@@ -1727,12 +2331,26 @@ async fn execute_webhook_hook(
                 stderr_preview: msg,
                 executed_at_ms: now_unix_ms(),
             },
-            None,
+            HookOutputExtras::default(),
         );
     }
 
-    let (decision, reason, updated_text) =
-        parse_hook_json_decision(&body_str).unwrap_or((HookDecision::Allow, None, None));
+    let (decision, reason, extras) = match parse_hook_json_decision(&body_str) {
+        Some(parsed) => (
+            parsed.decision,
+            parsed.reason,
+            HookOutputExtras {
+                updated_text: parsed.updated_text,
+                updated_input: parsed.updated_input,
+            },
+        ),
+        None if fail_closed && body_str.trim().starts_with('{') => (
+            HookDecision::Block,
+            Some("PreToolUse webhook returned invalid JSON decision (fail-closed)".to_string()),
+            HookOutputExtras::default(),
+        ),
+        None => (HookDecision::Allow, None, HookOutputExtras::default()),
+    };
 
     (
         HookExecutionRecord {
@@ -1749,7 +2367,7 @@ async fn execute_webhook_hook(
             stderr_preview: String::new(),
             executed_at_ms: now_unix_ms(),
         },
-        updated_text,
+        extras,
     )
 }
 
@@ -2229,6 +2847,7 @@ mod tests {
             "LD_PRELOAD",
             "DYLD_INSERT_LIBRARIES",
             "ORBIT_MCP_TOKEN",
+            "ORBIT_PAIRING_SECRET",
             "BASH_ENV",
             "BASH_FUNC_evil%%",
             "SHELLOPTS",
@@ -3049,5 +3668,582 @@ mod tests {
 
         let _ = fs::remove_dir_all(&home);
         let _ = fs::remove_dir_all(&workdir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hooks_prevent_in_process_recursion_and_propagate_updated_input() {
+        let home = temp_dir("recursion-updated-input");
+        let engine = HooksEngine::new(home.clone());
+
+        engine
+            .upsert_hook(
+                None,
+                LifecycleHookRule {
+                    id: "hk_mod_input".into(),
+                    name: "Rewrite Tool Input".into(),
+                    scope: HookScope::UserGlobal,
+                    event: HookEventKind::PreToolUse,
+                    matcher: Some("Bash|shell".into()),
+                    action: HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec![
+                            "-c".into(),
+                            r#"printf '{"decision":"modify","reason":"sandboxed args","updated_input":{"command":"cargo test --lib"}}'"#.into(),
+                        ],
+                        env: BTreeMap::new(),
+                    },
+                    timeout_ms: 5_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert modify input hook");
+
+        // Normal dispatch matches `Bash` alias and returns `updated_input`.
+        let out = engine
+            .dispatch_event_with_targets(
+                HookEventKind::PreToolUse,
+                None,
+                &["shell".into(), "Bash".into()],
+                json!({"event": "pre_tool_use", "tool_name": "shell"}),
+            )
+            .await;
+        assert_eq!(out.decision, HookDecision::Modify);
+        assert_eq!(
+            out.updated_input,
+            Some(json!({"command": "cargo test --lib"}))
+        );
+        assert_eq!(out.reason.as_deref(), Some("sandboxed args"));
+        assert_eq!(out.records.len(), 1);
+
+        // Re-entrant dispatch inside `IN_HOOK_DISPATCH` scope MUST short-circuit without running.
+        let nested = IN_HOOK_DISPATCH
+            .scope(true, async {
+                engine
+                    .dispatch_event_with_targets(
+                        HookEventKind::PreToolUse,
+                        None,
+                        &["Bash".into()],
+                        json!({"event": "pre_tool_use"}),
+                    )
+                    .await
+            })
+            .await;
+        assert_eq!(nested.decision, HookDecision::Allow);
+        assert!(nested.records.is_empty());
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_tool_use_fails_closed_on_timeout_error_missing_exec_webhook_500_and_semaphore_timeout()
+     {
+        use tokio::io::AsyncWriteExt as _;
+
+        let home = temp_dir("pre-tool-fail-closed");
+        let engine = HooksEngine::new(home.clone());
+
+        // 1. Command timeout -> PreToolUse Blocks (fail-closed); PostToolUse stays non-blocking (Allow).
+        engine
+            .upsert_hook(
+                None,
+                LifecycleHookRule {
+                    id: "hk_pre_timeout".into(),
+                    name: "Slow Pre".into(),
+                    scope: HookScope::UserGlobal,
+                    event: HookEventKind::PreToolUse,
+                    matcher: Some("timeout_target".into()),
+                    action: HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec!["-c".into(), "sleep 2".into()],
+                        env: BTreeMap::new(),
+                    },
+                    timeout_ms: 150,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert pre timeout");
+        engine
+            .upsert_hook(
+                None,
+                LifecycleHookRule {
+                    id: "hk_post_timeout".into(),
+                    name: "Slow Post".into(),
+                    scope: HookScope::UserGlobal,
+                    event: HookEventKind::PostToolUse,
+                    matcher: Some("timeout_target".into()),
+                    action: HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec!["-c".into(), "sleep 2".into()],
+                        env: BTreeMap::new(),
+                    },
+                    timeout_ms: 150,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert post timeout");
+
+        let pre_to = engine
+            .dispatch_event(
+                HookEventKind::PreToolUse,
+                None,
+                Some("timeout_target"),
+                json!({}),
+            )
+            .await;
+        assert_eq!(pre_to.decision, HookDecision::Block);
+        assert!(
+            pre_to
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("fail-closed")
+        );
+        let post_to = engine
+            .dispatch_event(
+                HookEventKind::PostToolUse,
+                None,
+                Some("timeout_target"),
+                json!({}),
+            )
+            .await;
+        assert_eq!(post_to.decision, HookDecision::Allow);
+
+        // 2. Unexpected non-zero exit (exit 1) -> PreToolUse Blocks; PostToolUse stays Allow.
+        engine
+            .upsert_hook(
+                None,
+                LifecycleHookRule {
+                    id: "hk_pre_exit1".into(),
+                    name: "Crash Pre".into(),
+                    scope: HookScope::UserGlobal,
+                    event: HookEventKind::PreToolUse,
+                    matcher: Some("exit1_target".into()),
+                    action: HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec!["-c".into(), "exit 1".into()],
+                        env: BTreeMap::new(),
+                    },
+                    timeout_ms: 2_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert exit1 pre");
+        engine
+            .upsert_hook(
+                None,
+                LifecycleHookRule {
+                    id: "hk_post_exit1".into(),
+                    name: "Crash Post".into(),
+                    scope: HookScope::UserGlobal,
+                    event: HookEventKind::PostToolUse,
+                    matcher: Some("exit1_target".into()),
+                    action: HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec!["-c".into(), "exit 1".into()],
+                        env: BTreeMap::new(),
+                    },
+                    timeout_ms: 2_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert exit1 post");
+
+        let pre_e1 = engine
+            .dispatch_event(
+                HookEventKind::PreToolUse,
+                None,
+                Some("exit1_target"),
+                json!({}),
+            )
+            .await;
+        assert_eq!(pre_e1.decision, HookDecision::Block);
+        assert!(
+            pre_e1
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("fail-closed")
+        );
+        let post_e1 = engine
+            .dispatch_event(
+                HookEventKind::PostToolUse,
+                None,
+                Some("exit1_target"),
+                json!({}),
+            )
+            .await;
+        assert_eq!(post_e1.decision, HookDecision::Allow);
+
+        // 3. Missing executable -> PreToolUse Blocks (fail-closed).
+        engine
+            .upsert_hook(
+                None,
+                LifecycleHookRule {
+                    id: "hk_pre_missing".into(),
+                    name: "Missing Bin".into(),
+                    scope: HookScope::UserGlobal,
+                    event: HookEventKind::PreToolUse,
+                    matcher: Some("missing_target".into()),
+                    action: HookAction::Command {
+                        command: "/nonexistent/orbit-hook-does-not-exist".into(),
+                        args: vec![],
+                        env: BTreeMap::new(),
+                    },
+                    timeout_ms: 2_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert missing");
+        let pre_missing = engine
+            .dispatch_event(
+                HookEventKind::PreToolUse,
+                None,
+                Some("missing_target"),
+                json!({}),
+            )
+            .await;
+        assert_eq!(pre_missing.decision, HookDecision::Block);
+        assert!(
+            pre_missing
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("fail-closed")
+        );
+
+        // 4. Webhook HTTP 500 -> PreToolUse Blocks (fail-closed); PostToolUse stays Allow.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local webhook server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = [0u8; 2048];
+                    let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\n\r\nboom",
+                        )
+                        .await;
+                }
+            }
+        });
+        let wh_url = format!("http://127.0.0.1:{}/hook", addr.port());
+        engine
+            .upsert_hook(
+                None,
+                LifecycleHookRule {
+                    id: "hk_pre_wh500".into(),
+                    name: "Webhook 500 Pre".into(),
+                    scope: HookScope::UserGlobal,
+                    event: HookEventKind::PreToolUse,
+                    matcher: Some("wh_target".into()),
+                    action: HookAction::HttpWebhook {
+                        url: wh_url.clone(),
+                        headers: BTreeMap::new(),
+                    },
+                    timeout_ms: 2_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert pre wh");
+        engine
+            .upsert_hook(
+                None,
+                LifecycleHookRule {
+                    id: "hk_post_wh500".into(),
+                    name: "Webhook 500 Post".into(),
+                    scope: HookScope::UserGlobal,
+                    event: HookEventKind::PostToolUse,
+                    matcher: Some("wh_target".into()),
+                    action: HookAction::HttpWebhook {
+                        url: wh_url,
+                        headers: BTreeMap::new(),
+                    },
+                    timeout_ms: 2_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert post wh");
+
+        let pre_wh = engine
+            .dispatch_event(
+                HookEventKind::PreToolUse,
+                None,
+                Some("wh_target"),
+                json!({}),
+            )
+            .await;
+        assert_eq!(pre_wh.decision, HookDecision::Block);
+        assert!(
+            pre_wh
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("fail-closed")
+        );
+        let post_wh = engine
+            .dispatch_event(
+                HookEventKind::PostToolUse,
+                None,
+                Some("wh_target"),
+                json!({}),
+            )
+            .await;
+        assert_eq!(post_wh.decision, HookDecision::Allow);
+        let _ = server.await;
+
+        // 5. Semaphore saturation -> PreToolUse Blocks (fail-closed) and records audit entry.
+        engine
+            .upsert_hook(
+                None,
+                LifecycleHookRule {
+                    id: "hk_pre_sem".into(),
+                    name: "Sem Pre".into(),
+                    scope: HookScope::UserGlobal,
+                    event: HookEventKind::PreToolUse,
+                    matcher: Some("sem_target".into()),
+                    action: HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec!["-c".into(), "exit 0".into()],
+                        env: BTreeMap::new(),
+                    },
+                    timeout_ms: 150,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert sem pre");
+        let _held_permits = engine
+            .exec_semaphore
+            .acquire_many(MAX_CONCURRENT_HOOK_EXECUTIONS as u32)
+            .await
+            .expect("saturate exec semaphore");
+        let pre_sem = engine
+            .dispatch_event(
+                HookEventKind::PreToolUse,
+                None,
+                Some("sem_target"),
+                json!({}),
+            )
+            .await;
+        assert_eq!(pre_sem.decision, HookDecision::Block);
+        assert!(
+            pre_sem
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("fail-closed")
+        );
+        assert_eq!(pre_sem.records.len(), 1);
+        drop(_held_permits);
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn user_global_hook_never_resolves_relative_executable_from_workspace_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = temp_dir("global-rel-home");
+        let untrusted_ws = temp_dir("global-rel-ws");
+        let pwn_marker = untrusted_ws.join("pwned.txt");
+        let evil_script = untrusted_ws.join("evil-hook.sh");
+        fs::write(
+            &evil_script,
+            format!(
+                "#!/bin/sh\necho PWNED > '{}'\nexit 0\n",
+                pwn_marker.display()
+            ),
+        )
+        .expect("write evil script");
+        fs::set_permissions(&evil_script, fs::Permissions::from_mode(0o755))
+            .expect("chmod evil script");
+
+        let engine = HooksEngine::new(home.clone());
+        engine
+            .upsert_hook(
+                None,
+                LifecycleHookRule {
+                    id: "hk_global_rel".into(),
+                    name: "Global Relative".into(),
+                    scope: HookScope::UserGlobal,
+                    event: HookEventKind::PreToolUse,
+                    matcher: Some("*".into()),
+                    action: HookAction::Command {
+                        command: "./evil-hook.sh".into(),
+                        args: vec![],
+                        env: BTreeMap::new(),
+                    },
+                    timeout_ms: 2_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert global rel hook");
+
+        // Must NEVER execute untrusted_ws/evil-hook.sh and must fail closed.
+        let out = engine
+            .dispatch_event(
+                HookEventKind::PreToolUse,
+                Some(&untrusted_ws),
+                Some("shell"),
+                json!({}),
+            )
+            .await;
+        assert_eq!(out.decision, HookDecision::Block);
+        assert!(
+            !pwn_marker.exists(),
+            "global hook must NEVER resolve relative executable against workspace cwd"
+        );
+
+        // Placing the relative executable inside trusted `$ORBIT_HOME` executes cleanly.
+        let trusted_marker = home.join("trusted-ran.txt");
+        let trusted_script = home.join("evil-hook.sh");
+        fs::write(
+            &trusted_script,
+            format!(
+                "#!/bin/sh\necho TRUSTED > '{}'\nexit 0\n",
+                trusted_marker.display()
+            ),
+        )
+        .expect("write trusted script");
+        fs::set_permissions(&trusted_script, fs::Permissions::from_mode(0o755))
+            .expect("chmod trusted script");
+
+        let out_ok = engine
+            .dispatch_event(
+                HookEventKind::PreToolUse,
+                Some(&untrusted_ws),
+                Some("shell"),
+                json!({}),
+            )
+            .await;
+        assert_eq!(out_ok.decision, HookDecision::Allow);
+        assert!(trusted_marker.exists());
+        assert!(!pwn_marker.exists());
+
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&untrusted_ws);
+    }
+
+    #[test]
+    fn extract_paths_from_unified_diff_captures_all_multi_file_targets() {
+        let diff = "\
+diff --git a/src/lib.rs b/src/lib.rs\n\
+--- a/src/lib.rs\n\
++++ b/src/lib.rs\n\
+@@ -1 +1 @@\n\
++pub fn a() {}\n\
+diff --git a/config/prod.env b/config/prod.env\n\
+--- a/config/prod.env\n\
++++ b/config/prod.env\n\
+@@ -1 +1 @@\n\
++SECRET=1\n\
+diff --git a/deploy/key.pem b/deploy/key.pem\n\
+--- /dev/null\n\
++++ b/deploy/key.pem\n\
+@@ -0,0 +1 @@\n\
++-----BEGIN KEY-----\n";
+
+        let paths = extract_paths_from_unified_diff("src/lib.rs", Some(diff));
+        assert_eq!(
+            paths,
+            vec![
+                "src/lib.rs".to_string(),
+                "config/prod.env".to_string(),
+                "deploy/key.pem".to_string()
+            ]
+        );
+
+        let detail = ToolCallDetail::FileEdit {
+            path: "src/lib.rs".into(),
+            unified_diff: Some(diff.into()),
+        };
+        let (_primary, targets) = tool_detail_hook_targets(&detail, "Edit files");
+        assert!(targets.contains(&"config/prod.env".to_string()));
+        assert!(targets.contains(&"deploy/key.pem".to_string()));
+        assert!(match_hook_targets(Some("*.env"), &targets).is_some());
+        assert!(match_hook_targets(Some("*.pem"), &targets).is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_hook_queue_drains_burst_of_fifty_events_without_drops() {
+        let home = temp_dir("burst-async-queue");
+        let log_file = home.join("burst.log");
+        let engine = HooksEngine::new(home.clone());
+
+        engine
+            .upsert_hook(
+                None,
+                LifecycleHookRule {
+                    id: "hk_burst_post".into(),
+                    name: "Burst Post".into(),
+                    scope: HookScope::UserGlobal,
+                    event: HookEventKind::PostToolUse,
+                    matcher: Some("*".into()),
+                    action: HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec!["-c".into(), format!("echo 1 >> '{}'", log_file.display())],
+                        env: BTreeMap::new(),
+                    },
+                    timeout_ms: 5_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert burst hook");
+
+        for i in 0..50 {
+            let enqueued = engine.dispatch_event_async_with_targets(
+                HookEventKind::PostToolUse,
+                None,
+                vec!["shell".into()],
+                json!({ "event": "post_tool_use", "seq": i }),
+            );
+            assert!(enqueued, "event {i} must enqueue cleanly without dropping");
+        }
+
+        engine.wait_async_idle().await;
+        let contents = fs::read_to_string(&log_file).expect("read burst log");
+        let count = contents.lines().filter(|l| !l.trim().is_empty()).count();
+        assert_eq!(count, 50, "all 50 burst PostToolUse events must execute");
+
+        let _ = fs::remove_dir_all(&home);
     }
 }

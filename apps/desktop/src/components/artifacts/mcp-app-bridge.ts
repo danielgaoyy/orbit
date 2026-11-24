@@ -18,7 +18,7 @@
 export type SandboxTheme = "light" | "dark";
 
 export const ARTIFACT_SANDBOX_CSP =
-  "default-src 'none'; base-uri 'none'; form-action 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:;";
+  "default-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:;";
 
 export const SEP_1865_PROTOCOL_VERSION = "2026-01-26";
 
@@ -65,6 +65,7 @@ export interface PendingToolCallRequest {
   name: string;
   arguments: Record<string, unknown>;
   argsPreview: string;
+  navigationEpoch: number;
 }
 
 export interface PendingOpenLinkRequest {
@@ -82,6 +83,28 @@ export interface PendingModelContextRequest {
   note: string;
 }
 
+export interface PendingReadResourceRequest {
+  id: string | number | null;
+  uri: string;
+  serverName: string;
+  navigationEpoch: number;
+}
+
+export interface McpResourceReadResult {
+  uri: string;
+  mimeType?: string | null;
+  text?: string | null;
+  blob?: string | null;
+}
+
+export interface McpToolCallBridgeOutcome {
+  ok: boolean;
+  isError?: boolean;
+  content?: unknown[];
+  structuredContent?: unknown;
+  error?: string | null;
+}
+
 export interface PostMessageTargetLike {
   postMessage: (message: unknown, targetOrigin: string) => void;
 }
@@ -95,6 +118,7 @@ export interface MessageEventLike {
 export interface McpAppBridgeCallbacks {
   getExpectedSource: () => PostMessageTargetLike | null;
   getTheme: () => SandboxTheme;
+  getOwningMcpServerName?: () => string | null;
   now?: () => number;
   maxRequestsPerSecond?: number;
   onInitialized?: () => void;
@@ -103,6 +127,7 @@ export interface McpAppBridgeCallbacks {
   onMessageRequest?: (req: PendingMessageRequest) => void;
   onUpdateModelContextRequest?: (req: PendingModelContextRequest) => void;
   onToolCallRequest?: (req: PendingToolCallRequest) => void;
+  onReadResourceRequest?: (req: PendingReadResourceRequest) => void;
 }
 
 const utf8Encoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
@@ -169,6 +194,34 @@ export function validateExternalHttpsUrl(rawUrl: unknown): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Validate that a URI requested by SEP-1865 `resources/read` is strictly `ui://...`
+ * with NO control characters, NO whitespace, and a non-empty authority/path.
+ */
+export function validateUiResourceUri(rawUri: unknown): string | null {
+  if (typeof rawUri !== "string") return null;
+  if (rawUri.length === 0 || rawUri.length > 2048) return null;
+  if (/[\u0000-\u0020\u007F]|\s/.test(rawUri)) return null;
+  if (!rawUri.startsWith("ui://")) return null;
+  const rest = rawUri.slice("ui://".length);
+  if (!rest || rest.startsWith("/")) return null;
+  return rawUri;
+}
+
+/**
+ * Extract an optional explicit server override attempted by an iframe payload so the bridge
+ * can strictly reject cross-server calls.
+ */
+function extractAttemptedServerOverride(params: Record<string, unknown>): string | null {
+  for (const key of ["server", "serverName", "server_name", "mcpServerName", "mcp_server_name"]) {
+    const val = params[key];
+    if (typeof val === "string" && val.trim().length > 0) {
+      return val.trim();
+    }
+  }
+  return null;
 }
 
 /**
@@ -534,6 +587,7 @@ export function createMcpAppHostBridge(callbacks: McpAppBridgeCallbacks) {
   let activeConfirmation: ActiveConfirmation | null = null;
   let lastEmittedHeight: number | null = null;
   let lastSizeChangedAtMs = -Infinity;
+  let navigationEpoch = 0;
 
   function postToIframe(payload: JsonRpcResponse | JsonRpcNotification): boolean {
     const target = callbacks.getExpectedSource();
@@ -599,8 +653,8 @@ export function createMcpAppHostBridge(callbacks: McpAppBridgeCallbacks) {
         ? (msg.params as Record<string, unknown>)
         : {};
 
-    // Coalesce `ui/notifications/size-changed` separately so ResizeObserver bursts never starve RPC quota
-    if (msg.method === "ui/notifications/size-changed") {
+    // Coalesce `ui/notifications/size-changed` and `ui/size-change` separately so ResizeObserver bursts never starve RPC quota
+    if (msg.method === "ui/notifications/size-changed" || msg.method === "ui/size-change") {
       const clamped = clampSandboxHeight(params.height);
       if (clamped !== null) {
         const now = nowFn();
@@ -636,6 +690,7 @@ export function createMcpAppHostBridge(callbacks: McpAppBridgeCallbacks) {
                 message: {},
                 updateModelContext: {},
                 serverTools: {},
+                serverResources: {},
               },
               hostContext: {
                 theme,
@@ -736,10 +791,65 @@ export function createMcpAppHostBridge(callbacks: McpAppBridgeCallbacks) {
         return true;
       }
 
+      case "resources/read": {
+        const safeUri = validateUiResourceUri(params.uri);
+        if (!safeUri) {
+          postError(
+            id,
+            JSON_RPC_ERR_INVALID_PARAMS,
+            "resources/read only permits valid `ui://` resource URIs",
+          );
+          return true;
+        }
+        const owningServer = callbacks.getOwningMcpServerName?.()?.trim() || null;
+        if (!owningServer) {
+          postError(
+            id,
+            JSON_RPC_ERR_USER_DENIED,
+            "Artifact is not bound to an owning MCP server for resources/read",
+          );
+          return true;
+        }
+        const attemptedServer = extractAttemptedServerOverride(params);
+        if (attemptedServer && attemptedServer !== owningServer) {
+          postError(
+            id,
+            JSON_RPC_ERR_USER_DENIED,
+            "Cross-server resources/read requests are forbidden",
+          );
+          return true;
+        }
+        if (!callbacks.onReadResourceRequest) {
+          postError(
+            id,
+            JSON_RPC_ERR_METHOD_NOT_FOUND,
+            "resources/read is not enabled for this host frame",
+          );
+          return true;
+        }
+        callbacks.onReadResourceRequest({
+          id: id ?? null,
+          uri: safeUri,
+          serverName: owningServer,
+          navigationEpoch,
+        });
+        return true;
+      }
+
       case "tools/call": {
         const rawName = typeof params.name === "string" ? params.name.trim() : "";
-        if (!rawName || rawName.length > 128) {
+        if (!rawName || rawName.length > 128 || /[\u0000-\u0020\u007F]|\s/.test(rawName)) {
           postError(id, JSON_RPC_ERR_INVALID_PARAMS, "tools/call requires a valid tool `name`");
+          return true;
+        }
+        const owningServer = callbacks.getOwningMcpServerName?.()?.trim() || null;
+        const attemptedServer = extractAttemptedServerOverride(params);
+        if (attemptedServer && (!owningServer || attemptedServer !== owningServer)) {
+          postError(
+            id,
+            JSON_RPC_ERR_USER_DENIED,
+            "Cross-server tools/call requests are forbidden",
+          );
           return true;
         }
         const toolArgs =
@@ -775,6 +885,7 @@ export function createMcpAppHostBridge(callbacks: McpAppBridgeCallbacks) {
           name: rawName,
           arguments: toolArgs,
           argsPreview: safeFormatToolArgsPreview(toolArgs, 600),
+          navigationEpoch,
         });
         return true;
       }
@@ -790,9 +901,87 @@ export function createMcpAppHostBridge(callbacks: McpAppBridgeCallbacks) {
     return postToIframe(buildHostContextChangedNotification(theme));
   }
 
-  function resolveToolCall(id: string | number | null, approved: boolean, detail?: string): boolean {
+  function resolveToolCall(
+    id: string | number | null,
+    approved: boolean,
+    detail?: string,
+    expectedEpoch?: number,
+  ): boolean {
+    if (expectedEpoch !== undefined && expectedEpoch !== navigationEpoch) {
+      return false;
+    }
     clearConfirmation("tool_call", id);
     return postToIframe(buildToolCallResolutionResponse(id, approved, detail));
+  }
+
+  function resolveToolCallResult(
+    id: string | number | null,
+    outcome: McpToolCallBridgeOutcome,
+    expectedEpoch?: number,
+  ): boolean {
+    if (expectedEpoch !== undefined && expectedEpoch !== navigationEpoch) {
+      return false;
+    }
+    clearConfirmation("tool_call", id);
+    if (id === null) return true;
+    const content = Array.isArray(outcome.content) ? outcome.content : [];
+    if (!outcome.ok && content.length === 0) {
+      return postToIframe({
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: JSON_RPC_ERR_USER_DENIED,
+          message: outcome.error ?? "MCP tool execution failed",
+        },
+      });
+    }
+    const resultObj: Record<string, unknown> = {
+      content,
+      isError: Boolean(outcome.isError ?? !outcome.ok),
+    };
+    if (outcome.structuredContent !== undefined && outcome.structuredContent !== null) {
+      resultObj.structuredContent = outcome.structuredContent;
+    }
+    return postToIframe({
+      jsonrpc: "2.0",
+      id,
+      result: resultObj,
+    });
+  }
+
+  function resolveResourceRead(
+    id: string | number | null,
+    resource: McpResourceReadResult | null,
+    errorMessage?: string,
+    expectedEpoch?: number,
+  ): boolean {
+    if (expectedEpoch !== undefined && expectedEpoch !== navigationEpoch) {
+      return false;
+    }
+    if (id === null) return true;
+    if (!resource) {
+      return postToIframe({
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: JSON_RPC_ERR_USER_DENIED,
+          message: errorMessage ?? "Unable to read MCP resource",
+        },
+      });
+    }
+    const entry: Record<string, unknown> = {
+      uri: resource.uri,
+    };
+    if (resource.mimeType) entry.mimeType = resource.mimeType;
+    if (resource.text !== undefined && resource.text !== null) entry.text = resource.text;
+    if (resource.blob !== undefined && resource.blob !== null) entry.blob = resource.blob;
+    return postToIframe({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        contents: [entry],
+      },
+    });
   }
 
   function resolveOpenLink(id: string | number | null, approved: boolean, detail?: string): boolean {
@@ -854,13 +1043,31 @@ export function createMcpAppHostBridge(callbacks: McpAppBridgeCallbacks) {
     activeConfirmation = null;
   }
 
+  /**
+   * Increment the active iframe navigation epoch and cancel any pending confirmation so
+   * in-flight async replies from a previous document can NEVER be delivered after navigation.
+   */
+  function invalidateNavigation(): number {
+    navigationEpoch += 1;
+    activeConfirmation = null;
+    return navigationEpoch;
+  }
+
+  function getNavigationEpoch(): number {
+    return navigationEpoch;
+  }
+
   return {
     handleMessageEvent,
     pushThemeChange,
     resolveToolCall,
+    resolveToolCallResult,
+    resolveResourceRead,
     resolveOpenLink,
     resolveMessage,
     resolveModelContext,
     resetConfirmations,
+    invalidateNavigation,
+    getNavigationEpoch,
   };
 }

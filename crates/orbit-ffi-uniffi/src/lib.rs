@@ -2143,6 +2143,7 @@ impl From<FfiUpsertArtifactRequest> for UpsertArtifactRequest {
             language: v.language,
             mime_type: v.mime_type,
             resource_uri: v.resource_uri,
+            mcp_server_name: None,
             content: v.content,
             summary_note: v.summary_note,
         }
@@ -2300,6 +2301,7 @@ pub enum FfiRichBlock {
         ordered: bool,
         index: u32,
         checked: Option<bool>,
+        depth: u8,
         spans: Vec<FfiInlineSpan>,
     },
     BlockQuote {
@@ -2340,11 +2342,13 @@ impl From<RichBlockView> for FfiRichBlock {
                 ordered,
                 index,
                 checked,
+                depth,
                 spans,
             } => Self::ListItem {
                 ordered,
                 index,
                 checked,
+                depth,
                 spans: spans.into_iter().map(Into::into).collect(),
             },
             RichBlockView::BlockQuote { spans } => Self::BlockQuote {

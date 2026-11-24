@@ -1,8 +1,11 @@
 import { useEffect, useRef } from "react";
 import {
   hasOpenSettingsBlockingOverlay,
+  isFocusInsideCodeEditor,
   isFocusInsideFileViewerPane,
+  isFocusInsideSidebar,
   isFocusInsideSidePanel,
+  resolveGlobalFindAction,
   shouldCloseSettingsOnEscape,
   SIDE_PANEL_SELECTOR,
 } from "@/lib/file-viewer-shortcuts";
@@ -45,23 +48,26 @@ export function useGlobalErgonomicKeybindings(): void {
         return;
       }
 
-      // 1. Command Palette (`⌘K` / `Ctrl+K`) — yield to terminal clear/kill-line when terminal is focused
+      // 1. Command Palette (`⌘K` / `Ctrl+K`) — yield to terminal clear/kill-line and inline CodeMirror AI Edit
       if (mod && !e.shiftKey && !e.altKey && keyLower === "k" && !snap.terminalFocused) {
+        if (!snap.commandPaletteOpen && isFocusInsideCodeEditor(e.target, document.activeElement)) {
+          return;
+        }
         e.preventDefault();
         if (e.repeat) return;
         orbitActions.setCommandPaletteOpen(!snap.commandPaletteOpen);
         return;
       }
 
-      // 1a. Filter Sidebar Conversations (`⌘F` / `Ctrl+F`) — yield to terminal search, Side Panel / File Viewer, & modal overlays
-      if (mod && !e.shiftKey && !e.altKey && keyLower === "f" && !snap.terminalFocused) {
+      // 1a. Focus-aware Find (`⌘F` / `Ctrl+F`) and Sidebar Filter (`⌘⇧F` / `Ctrl+Shift+F`)
+      //     Yields cleanly to Terminal search, Right Side Panel / File Viewer, & modal overlays;
+      //     focuses Sidebar filter when inside Sidebar (or on `⌘⇧F`); otherwise opens in-session `StageFindBar`.
+      if (mod && !e.altKey && keyLower === "f") {
         const sidePanelEl = document.querySelector<HTMLElement>(SIDE_PANEL_SELECTOR);
         const focusInsideSidePanelOrFileViewer =
           isFocusInsideSidePanel(e.target, document.activeElement) ||
           isFocusInsideFileViewerPane(sidePanelEl, e.target, document.activeElement);
-        if (focusInsideSidePanelOrFileViewer) {
-          return;
-        }
+        const focusInsideSidebar = isFocusInsideSidebar(e.target, document.activeElement);
         const isOverlayOpen =
           snap.activeView === "settings" ||
           snap.commandPaletteOpen ||
@@ -78,7 +84,27 @@ export function useGlobalErgonomicKeybindings(): void {
               '[data-slot="dialog-content"], [role="dialog"], [role="alertdialog"]',
             ),
           );
-        if (!isOverlayOpen) {
+        const hasOpenConversation = Boolean(
+          snap.selectedHostId && snap.selectedAgentId && !snap.isDraftNewSession,
+        );
+        const findAction = resolveGlobalFindAction({
+          mod,
+          shiftKey: e.shiftKey,
+          altKey: e.altKey,
+          keyLower,
+          terminalFocused: snap.terminalFocused,
+          focusInsideSidePanel: focusInsideSidePanelOrFileViewer,
+          focusInsideSidebar,
+          isOverlayOpen,
+          hasOpenConversation,
+        });
+        if (findAction === "stage_find") {
+          e.preventDefault();
+          if (e.repeat) return;
+          orbitActions.openStageFind();
+          return;
+        }
+        if (findAction === "sidebar_filter") {
           e.preventDefault();
           if (e.repeat) return;
           orbitActions.focusSidebarFilter();
@@ -201,8 +227,11 @@ export function useGlobalErgonomicKeybindings(): void {
         return;
       }
 
-      // 6. Toggle Diff Review Tab (`⌘D` / `Ctrl+D`)
+      // 6. Toggle Diff Review Tab (`⌘D` / `Ctrl+D`) — yield to CodeMirror multi-cursor `selectNextOccurrence`
       if (mod && !e.shiftKey && !e.altKey && keyLower === "d") {
+        if (isFocusInsideCodeEditor(e.target, document.activeElement)) {
+          return;
+        }
         e.preventDefault();
         if (e.repeat) return;
         orbitActions.toggleReviewTab();
@@ -361,6 +390,7 @@ export function useGlobalErgonomicKeybindings(): void {
       // 11. Double-Escape to Interrupt Active Agent Turn safely
       if (
         e.key === "Escape" &&
+        !e.defaultPrevented &&
         !snap.commandPaletteOpen &&
         !snap.pairDialogOpen &&
         !snap.relayDialogOpen &&

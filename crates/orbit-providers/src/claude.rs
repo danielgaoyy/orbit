@@ -584,6 +584,7 @@ struct PendingClaudePerm {
     permission_suggestions: Value,
     is_question: bool,
     question_texts: Vec<String>,
+    original_plan_markdown: String,
 }
 
 fn hydrate_reattached_claude_bg_tasks(
@@ -863,6 +864,9 @@ async fn run_claude_actor(
     let mut confirmed_fast_mode: bool = cfg.fast_mode;
     let mut active_fast_mode: bool = cfg.fast_mode;
     let mut pending_fast_mode_reqs: HashMap<String, bool> = HashMap::new();
+    let mut current_mode: SessionMode = cfg.mode.clone();
+    let mut last_plan_file_path: Option<String> = None;
+    let mut last_assistant_text: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -1132,6 +1136,7 @@ async fn run_claude_actor(
                         }
                     }
                     DriverCommand::SetMode { mode } => {
+                        current_mode = mode.clone();
                         let rid = format!("ctrl_{ctrl_seq}");
                         ctrl_seq += 1;
                         let req = json!({
@@ -1240,6 +1245,66 @@ async fn run_claude_actor(
                                     }))
                                     .await;
                             }
+                        }
+                    }
+                    DriverCommand::ResolvePlanApproval {
+                        request_id,
+                        action,
+                        edited_plan_markdown,
+                        feedback,
+                        target_mode,
+                    } => {
+                        if matches!(action, orbit_protocol::PlanApprovalAction::ApproveAndBuild) {
+                            current_mode = target_mode.clone();
+                        }
+                        if let Some(p) = pending_perms.remove(&request_id) {
+                            if matches!(action, orbit_protocol::PlanApprovalAction::ApproveAndBuild)
+                            {
+                                let mode_rid = format!("ctrl_{ctrl_seq}");
+                                ctrl_seq += 1;
+                                let mode_req = json!({
+                                    "request_id": mode_rid,
+                                    "type": "control_request",
+                                    "request": {
+                                        "subtype": "set_permission_mode",
+                                        "mode": claude_mode_flag(&target_mode)
+                                    }
+                                });
+                                let _ = shim.write_stdin_line(mode_req.to_string()).await;
+                            }
+                            let resp = crate::plan_approval::build_claude_plan_control_response(
+                                &p.control_request_id,
+                                &p.tool_use_id,
+                                &p.original_input,
+                                &p.original_plan_markdown,
+                                claude_mode_flag(&target_mode),
+                                action,
+                                edited_plan_markdown.as_deref(),
+                                feedback.as_deref(),
+                            );
+                            let _ = shim.write_stdin_line(resp.to_string()).await;
+                            if let Some(ref tid) = active_turn_id {
+                                let _ = evt_tx
+                                    .send(DriverEvent::StatusChanged(AgentStatus::Running {
+                                        turn_id: tid.clone(),
+                                    }))
+                                    .await;
+                            }
+                        } else if matches!(
+                            action,
+                            orbit_protocol::PlanApprovalAction::ApproveAndBuild
+                        ) {
+                            let mode_rid = format!("ctrl_{ctrl_seq}");
+                            ctrl_seq += 1;
+                            let mode_req = json!({
+                                "request_id": mode_rid,
+                                "type": "control_request",
+                                "request": {
+                                    "subtype": "set_permission_mode",
+                                    "mode": claude_mode_flag(&target_mode)
+                                }
+                            });
+                            let _ = shim.write_stdin_line(mode_req.to_string()).await;
                         }
                     }
                     DriverCommand::AnswerQuestion { request_id, answers } => {
@@ -1666,6 +1731,7 @@ async fn run_claude_actor(
                                             && btype == "text"
                                             && !full_txt.is_empty()
                                         {
+                                            last_assistant_text = Some(full_txt.clone());
                                             let _ = evt_tx
                                                 .send(DriverEvent::AssistantText {
                                                     item_id: format!("{active_msg_id}_{idx}"),
@@ -1744,6 +1810,14 @@ async fn run_claude_actor(
                                                 managed_dispatches.insert(call_id.clone());
                                             }
                                             let detail = map_claude_tool_detail(name, input, None);
+                                            if matches!(name, "Write" | "Edit" | "MultiEdit")
+                                                && let Some(fp) = input
+                                                    .get("file_path")
+                                                    .and_then(|v| v.as_str())
+                                                && orbit_protocol::looks_like_plan_file_path(fp)
+                                            {
+                                                last_plan_file_path = Some(fp.to_string());
+                                            }
                                             let bg_info = if name == "Bash"
                                                 && input
                                                     .get("run_in_background")
@@ -1780,6 +1854,7 @@ async fn run_claude_actor(
                                             && !txt.is_empty()
                                         {
                                             emitted_text_in_turn = true;
+                                            last_assistant_text = Some(txt.to_string());
                                             let _ = evt_tx
                                                 .send(DriverEvent::AssistantText {
                                                     item_id: format!("{mid}_{i}"),
@@ -1865,6 +1940,10 @@ async fn run_claude_actor(
                             "control_request" => {
                                 handle_claude_control_request(
                                     &val,
+                                    &current_mode,
+                                    &cfg.cwd,
+                                    last_plan_file_path.as_deref(),
+                                    last_assistant_text.as_deref(),
                                     &active_turn_id,
                                     &mut pending_perms,
                                     &evt_tx,
@@ -2239,8 +2318,13 @@ fn claude_mode_flag(mode: &SessionMode) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_claude_control_request(
     val: &Value,
+    current_mode: &SessionMode,
+    workspace_cwd: &Path,
+    last_plan_file_path: Option<&str>,
+    last_assistant_text: Option<&str>,
     active_turn_id: &Option<String>,
     pending_perms: &mut HashMap<String, PendingClaudePerm>,
     evt_tx: &mpsc::Sender<DriverEvent>,
@@ -2320,6 +2404,7 @@ async fn handle_claude_control_request(
                 permission_suggestions: suggestions,
                 is_question: true,
                 question_texts: q_texts,
+                original_plan_markdown: String::new(),
             },
         );
         let _ = evt_tx
@@ -2340,13 +2425,41 @@ async fn handle_claude_control_request(
     }
 
     let req_id = format!("clp_{}", Uuid::new_v4().simple());
-    let title = req
+    let raw_title = req
         .get("title")
         .or_else(|| req.get("description"))
         .and_then(|v| v.as_str())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("Claude wants to use {tool_name}"));
+        .map(ToOwned::to_owned);
+
+    let mut plan_approval = orbit_protocol::extract_plan_approval_from_tool_input(
+        tool_name,
+        &input,
+        raw_title.as_deref(),
+        matches!(current_mode, SessionMode::Plan),
+        Some("exit_plan_mode"),
+    );
+    if let Some(ref mut plan) = plan_approval {
+        crate::plan_approval::enrich_plan_payload(
+            plan,
+            workspace_cwd,
+            last_plan_file_path,
+            last_assistant_text,
+        );
+    }
+
+    let title = if let Some(ref plan) = plan_approval {
+        plan.plan_title
+            .clone()
+            .unwrap_or_else(|| "Review implementation plan".to_string())
+    } else {
+        raw_title.unwrap_or_else(|| format!("Claude wants to use {tool_name}"))
+    };
     let detail = map_claude_tool_detail(tool_name, &input, None);
+    let allowed_decisions = if plan_approval.is_some() {
+        vec!["allow".into(), "deny".into()]
+    } else {
+        vec!["allow".into(), "allow_always".into(), "deny".into()]
+    };
 
     pending_perms.insert(
         req_id.clone(),
@@ -2357,6 +2470,10 @@ async fn handle_claude_control_request(
             permission_suggestions: suggestions,
             is_question: false,
             question_texts: Vec::new(),
+            original_plan_markdown: plan_approval
+                .as_ref()
+                .map(|p| p.plan_markdown.clone())
+                .unwrap_or_default(),
         },
     );
 
@@ -2365,7 +2482,8 @@ async fn handle_claude_control_request(
             request_id: req_id.clone(),
             title,
             detail,
-            allowed_decisions: vec!["allow".into(), "allow_always".into(), "deny".into()],
+            allowed_decisions,
+            plan_approval,
         })
         .await;
     let _ = evt_tx

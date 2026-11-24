@@ -2183,16 +2183,22 @@ fn is_zsh_program(program: &str) -> bool {
 }
 
 /// Build the environment variables applied to a spawned PTY shell.
-/// Defaults (`TERM`, `TERM_PROGRAM`, and `PROMPT_EOL_MARK=""` for `zsh` to prevent the reverse-video
-/// `%` partial-line artifact on fresh PTY launch) are injected before `spec_env` so explicit caller
-/// overrides always win.
+/// Defaults (`TERM`, `COLORTERM`, `TERM_PROGRAM`, `ORBIT_SHELL_INTEGRATION`, and `PROMPT_EOL_MARK=""`
+/// for `zsh` to prevent the reverse-video `%` partial-line artifact on fresh PTY launch) are injected
+/// before `spec_env` so explicit caller overrides always win and user prompts stay untouched.
 fn build_pty_env_pairs(program: &str, spec_env: &HashMap<String, String>) -> Vec<(String, String)> {
-    let mut env = Vec::with_capacity(spec_env.len() + 3);
+    let mut env = Vec::with_capacity(spec_env.len() + 5);
     if !spec_env.contains_key("TERM") {
         env.push(("TERM".to_string(), "xterm-256color".to_string()));
     }
+    if !spec_env.contains_key("COLORTERM") {
+        env.push(("COLORTERM".to_string(), "truecolor".to_string()));
+    }
     if !spec_env.contains_key("TERM_PROGRAM") {
         env.push(("TERM_PROGRAM".to_string(), "Orbit".to_string()));
+    }
+    if !spec_env.contains_key("ORBIT_SHELL_INTEGRATION") {
+        env.push(("ORBIT_SHELL_INTEGRATION".to_string(), "1".to_string()));
     }
     if is_zsh_program(program) && !spec_env.contains_key("PROMPT_EOL_MARK") {
         env.push(("PROMPT_EOL_MARK".to_string(), String::new()));
@@ -3778,6 +3784,11 @@ mod tests {
             assert_eq!(env.get("PROMPT_EOL_MARK").map(String::as_str), Some(""));
             assert_eq!(env.get("TERM_PROGRAM").map(String::as_str), Some("Orbit"));
             assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
+            assert_eq!(env.get("COLORTERM").map(String::as_str), Some("truecolor"));
+            assert_eq!(
+                env.get("ORBIT_SHELL_INTEGRATION").map(String::as_str),
+                Some("1")
+            );
         }
 
         // 2. Non-zsh shells must NOT receive `PROMPT_EOL_MARK`

@@ -16222,6 +16222,7 @@ sealed class FfiRichBlock {
         val `ordered`: kotlin.Boolean, 
         val `index`: kotlin.UInt, 
         val `checked`: kotlin.Boolean?, 
+        val `depth`: kotlin.UByte, 
         val `spans`: List<uniffi.orbit_ffi_uniffi.FfiInlineSpan>) : FfiRichBlock()
         
     {
@@ -16295,6 +16296,7 @@ public object FfiConverterTypeFfiRichBlock : FfiConverterRustBuffer<FfiRichBlock
                 FfiConverterBoolean.read(buf),
                 FfiConverterUInt.read(buf),
                 FfiConverterOptionalBoolean.read(buf),
+                FfiConverterUByte.read(buf),
                 FfiConverterSequenceTypeFfiInlineSpan.read(buf),
                 )
             5 -> FfiRichBlock.BlockQuote(
@@ -16346,6 +16348,7 @@ public object FfiConverterTypeFfiRichBlock : FfiConverterRustBuffer<FfiRichBlock
                 + FfiConverterBoolean.allocationSize(value.`ordered`)
                 + FfiConverterUInt.allocationSize(value.`index`)
                 + FfiConverterOptionalBoolean.allocationSize(value.`checked`)
+                + FfiConverterUByte.allocationSize(value.`depth`)
                 + FfiConverterSequenceTypeFfiInlineSpan.allocationSize(value.`spans`)
             )
         }
@@ -16406,6 +16409,7 @@ public object FfiConverterTypeFfiRichBlock : FfiConverterRustBuffer<FfiRichBlock
                 FfiConverterBoolean.write(value.`ordered`, buf)
                 FfiConverterUInt.write(value.`index`, buf)
                 FfiConverterOptionalBoolean.write(value.`checked`, buf)
+                FfiConverterUByte.write(value.`depth`, buf)
                 FfiConverterSequenceTypeFfiInlineSpan.write(value.`spans`, buf)
                 Unit
             }

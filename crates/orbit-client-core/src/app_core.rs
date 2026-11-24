@@ -19,22 +19,27 @@ use orbit_protocol::{
     ArtifactDetail, ArtifactSummary, AttentionState, BackgroundTaskInfo, BrowserPolicyConfig,
     BrowserSessionSummary, ConditionalTimerRecord, ConditionalTimerState, ConnectedHostSummary,
     ContextOccupancyBreakdown, DirectoryEntry, DiscoveredProject, EventTriggerDelivery,
-    ExternalMcpServerRecord, GitCommitResult, GitCreatePrResult, GitMutationOutcome, GitPushResult,
-    GitStatusSnapshot, GoalRunRecord, GuardianAssessment, GuardianAuditEntry, GuardianPolicyConfig,
-    HookExecutionRecord, HookScope, HostProjectEntry, HostSyncState, ImChannelRecord, ImPlatform,
-    ImThreadBinding, KeepAwakeStatus, LifecycleHookRule, LspDiagnostic, LspLocation,
-    LspServerStatus, LspSymbolInfo, ManagedSkillRecord, McpProbeResult, ModelOption,
+    ExternalMcpServerRecord, GitCollabQueryResult, GitCommitResult, GitConflictListResult,
+    GitConflictResolution, GitCreatePrResult, GitGeneratedCommitMessage, GitMutationOutcome,
+    GitPrStatus, GitPushResult, GitRebaseActionResult, GitRebaseStatus, GitResolveConflictResult,
+    GitStashListResult, GitStashMutationResult, GitStatusSnapshot, GoalRunRecord,
+    GuardianAssessment, GuardianAuditEntry, GuardianPolicyConfig, HookExecutionRecord, HookScope,
+    HostProjectEntry, HostSyncState, ImChannelRecord, ImPlatform, ImThreadBinding, KeepAwakeStatus,
+    LifecycleHookRule, LspCodeAction, LspCompletionItem, LspDiagnostic, LspHoverInfo, LspLocation,
+    LspReferenceLocation, LspServerStatus, LspSymbolInfo, LspWorkspaceEdit, LspWorkspaceEditResult,
+    ManagedSkillRecord, McpProbeResult, McpResourceContent, McpToolCallOutcome, ModelOption,
     MonitorWatchRecord, OrchestrationConfig, OrchestrationSkillInfo, PathScopedRule,
-    PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
-    ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
-    PushDeviceRecord, PushPlatform, PushPreferences, QuestionItem, QueuedPromptView,
-    ReasoningEffort, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode,
-    SkillWriteScope, TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelineOutlinePrompt,
-    TimelinePayload, TimerCondition, ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot,
-    WireMessage, WorkflowRunRecord, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion,
-    WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent,
-    WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome,
-    WorktreeHandoffPreview,
+    PendingPermissionSummary, PermissionCheckpointRef, PermissionRuleRecord, PlanApprovalAction,
+    PlanApprovalPayload, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot,
+    ProviderSubagentDescriptor, ProviderSubagentEvent, PushDeviceRecord, PushPlatform,
+    PushPreferences, QuestionItem, QueuedPromptView, ReasoningEffort, RemoteMessageSearchHit,
+    ResolvePermissionsBatchResult, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec,
+    ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame, TerminalSummary,
+    TimelineEvent, TimelineOutlinePrompt, TimelinePayload, TimerCondition, ToolCallDetail,
+    ToolCallStatus, UpsertPermissionRuleInput, UsageInsightsSnapshot, WireMessage,
+    WorkflowRunRecord, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind,
+    WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo,
+    WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -60,8 +65,9 @@ pub use crate::contract::{
     ForkAgentRequest, ForkAgentResultView, InstructionFileContentView, InstructionFileSavedView,
     InstructionFilesSnapshotView, LifecycleHooksSnapshotView, ListInstructionFilesRequest,
     MatchPathRulesRequest, MatchedPathRulesView, PathRulesSnapshotView,
-    PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RenameWorkspaceEntryRequest,
-    SaveInstructionFileRequest, SelectBestOfNWinnerRequest, StartBatchFanoutRequest,
+    PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RemotePreviewTunnelView,
+    RenameWorkspaceEntryRequest, SaveInstructionFileRequest, SearchMessagesRequest,
+    SearchMessagesResponse, SelectBestOfNWinnerRequest, StartBatchFanoutRequest,
     StartBestOfNRequest, StartDagWorkflowRequest, StartGoalRunRequest, StartMonitorWatchRequest,
     StopMonitorWatchRequest, UpsertArtifactRequest, UpsertEventTriggerRequest,
     UpsertExternalMcpServerRequest, UpsertPathRuleRequest, WorkspaceEntryMutationResultView,
@@ -665,6 +671,8 @@ pub enum TimelineItemView {
         resolved_decision: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         guardian_assessment: Option<GuardianAssessment>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_approval: Option<PlanApprovalPayload>,
         #[serde(default)]
         timestamp_ms: Option<i64>,
     },
@@ -743,11 +751,17 @@ pub struct UpsertImChannelRequest {
     pub platform: ImPlatform,
     pub enabled: bool,
     #[serde(default)]
+    pub transport_mode: orbit_protocol::ImTransportMode,
+    #[serde(default)]
     pub app_id: Option<String>,
     #[serde(default)]
     pub primary_secret: Option<String>,
     #[serde(default)]
     pub signing_secret: Option<String>,
+    #[serde(default)]
+    pub app_token: Option<String>,
+    #[serde(default)]
+    pub public_key: Option<String>,
     #[serde(default = "default_keep_existing_secrets")]
     pub keep_existing_secrets: bool,
     #[serde(default)]
@@ -772,6 +786,7 @@ impl std::fmt::Debug for UpsertImChannelRequest {
             .field("name", &self.name)
             .field("platform", &self.platform)
             .field("enabled", &self.enabled)
+            .field("transport_mode", &self.transport_mode)
             .field("app_id", &self.app_id)
             .field(
                 "primary_secret",
@@ -781,6 +796,8 @@ impl std::fmt::Debug for UpsertImChannelRequest {
                 "signing_secret",
                 &self.signing_secret.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("app_token", &self.app_token.as_ref().map(|_| "[REDACTED]"))
+            .field("public_key", &self.public_key)
             .field("keep_existing_secrets", &self.keep_existing_secrets)
             .field("allowed_chat_ids", &self.allowed_chat_ids)
             .field("allowed_user_ids", &self.allowed_user_ids)
@@ -989,6 +1006,7 @@ struct CachedAgentStage {
     turn_item_starts: Vec<usize>,
     pending_permissions: Vec<TimelineItemView>,
     pending_questions: Vec<TimelineItemView>,
+    pending_plan_approval: Option<crate::stage::PendingPlanApprovalView>,
     session_turn_diffs: Vec<DiffFileView>,
     insights: SessionInsightsView,
     stage_revision: u64,
@@ -1012,8 +1030,119 @@ type PendingManagedSkillsListEntry = (
 type PendingSymbolSearchTx =
     tokio::sync::oneshot::Sender<Result<(Vec<orbit_protocol::WorkspaceSymbolEntry>, bool), String>>;
 
+type PendingMessageSearchTx =
+    tokio::sync::oneshot::Sender<Result<Vec<RemoteMessageSearchHit>, String>>;
+
+const MAX_PREVIEW_TUNNEL_QUEUED_FRAMES: usize = 64;
+const MAX_PREVIEW_TUNNEL_QUEUED_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PREVIEW_TUNNEL_INBOUND_FRAME_BYTES: usize = 512 * 1024;
+const PREVIEW_TUNNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct AbortPreviewTaskOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortPreviewTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct ClientQueuedPreviewBytes {
+    data: Vec<u8>,
+    len: usize,
+    queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for ClientQueuedPreviewBytes {
+    fn drop(&mut self) {
+        let mut cur = self.queued_bytes.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            let next = cur.saturating_sub(self.len);
+            match self.queued_bytes.compare_exchange_weak(
+                cur,
+                next,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
+struct PreviewTunnelSink {
+    tx: tokio::sync::mpsc::Sender<ClientQueuedPreviewBytes>,
+    queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    cancel_tx: tokio::sync::watch::Sender<bool>,
+}
+
+struct TrackedPreviewConnection {
+    request_id: Uuid,
+    abort_handle: tokio::task::AbortHandle,
+}
+
+#[derive(Default)]
+struct PreviewListenerConnections {
+    closed: bool,
+    conns: HashMap<Uuid, TrackedPreviewConnection>,
+}
+
+struct ActivePreviewListener {
+    session_gen: u64,
+    target_port: u16,
+    proxy_host: Option<String>,
+    local_port: u16,
+    local_url: String,
+    session: HostSessionHandle,
+    runtime: tokio::runtime::Handle,
+    connections: Arc<std::sync::Mutex<PreviewListenerConnections>>,
+    task: tokio::task::AbortHandle,
+}
+
+impl ActivePreviewListener {
+    fn shutdown_connections(&self) -> Vec<(Uuid, Uuid)> {
+        self.task.abort();
+        let mut closed = Vec::new();
+        if let Ok(mut guard) = self.connections.lock() {
+            guard.closed = true;
+            for (tunnel_id, entry) in guard.conns.drain() {
+                entry.abort_handle.abort();
+                closed.push((entry.request_id, tunnel_id));
+            }
+        }
+        closed
+    }
+
+    fn notify_remote_close(&self, tunnel_ids: Vec<Uuid>, reason: &'static str) {
+        if tunnel_ids.is_empty() {
+            return;
+        }
+        let session = self.session.clone();
+        self.runtime.spawn(async move {
+            for tunnel_id in tunnel_ids {
+                let _ = session
+                    .send_wire(WireMessage::PreviewTunnelClose {
+                        tunnel_id,
+                        reason: Some(reason.to_string()),
+                    })
+                    .await;
+            }
+        });
+    }
+}
+
+impl Drop for ActivePreviewListener {
+    fn drop(&mut self) {
+        let closed = self.shutdown_connections();
+        let tunnel_ids: Vec<Uuid> = closed.into_iter().map(|(_, tid)| tid).collect();
+        self.notify_remote_close(tunnel_ids, "listener_closed");
+    }
+}
+
 type PendingGitMutationTx =
     tokio::sync::oneshot::Sender<Result<(GitMutationOutcome, bool), String>>;
+
+type PendingGitCollabQueryTx = tokio::sync::oneshot::Sender<Result<GitCollabQueryResult, String>>;
 
 struct HostMemoryState {
     profile: SavedHostProfile,
@@ -1041,6 +1170,7 @@ struct HostMemoryState {
     pending_file_reads:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<RawFileReadResponse, String>>>,
     pending_symbol_searches: HashMap<Uuid, PendingSymbolSearchTx>,
+    pending_message_searches: HashMap<Uuid, PendingMessageSearchTx>,
     pending_file_writes:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<WorkspaceFileWriteResultView, String>>>,
     pending_file_mutations: HashMap<
@@ -1063,10 +1193,12 @@ struct HostMemoryState {
     pending_handoff_executes:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<WorktreeHandoffOutcome, String>>>,
     pending_daemon_upgrades: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<(), String>>>,
+    pending_plan_approval_acks: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<(), String>>>,
     pending_upgrade_terminals: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<String, String>>>,
     pending_git_repo_inspections:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GitReposInspectionView, String>>>,
     pending_git_mutations: HashMap<Uuid, PendingGitMutationTx>,
+    pending_git_collab_queries: HashMap<Uuid, PendingGitCollabQueryTx>,
     pending_acp_probes: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<AcpProbeResult, String>>>,
     pending_acp_snapshots: HashMap<
         Uuid,
@@ -1082,6 +1214,10 @@ struct HostMemoryState {
     pending_artifact_upserts:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ArtifactSummary, String>>>,
     pending_artifact_deletes: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<String, String>>>,
+    pending_mcp_resource_reads:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<McpResourceContent, String>>>,
+    pending_artifact_mcp_tool_calls:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<McpToolCallOutcome, String>>>,
     pending_managed_skills_lists: HashMap<Uuid, PendingManagedSkillsListEntry>,
     background_managed_skills_reqs: HashSet<Uuid>,
     active_managed_skills_cwd: Option<String>,
@@ -1100,6 +1236,16 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<LspDiagnostic>, String>>>,
     pending_lsp_locations:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<LspLocation>, String>>>,
+    pending_lsp_hover:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Option<LspHoverInfo>, String>>>,
+    pending_lsp_references:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<LspReferenceLocation>, String>>>,
+    pending_lsp_completions:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<LspCompletionItem>, String>>>,
+    pending_lsp_code_actions:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<LspCodeAction>, String>>>,
+    pending_lsp_workspace_edits:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<LspWorkspaceEditResult, String>>>,
     pending_usage_insights:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<UsageInsightsSnapshot, String>>>,
     pending_context_occupancy:
@@ -1117,6 +1263,14 @@ struct HostMemoryState {
     background_timer_list_reqs: HashSet<Uuid>,
     pending_guardian_configs:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GuardianConfigSnapshotView, String>>>,
+    pending_permission_rule_lists:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<PermissionRuleRecord>, String>>>,
+    pending_permission_rule_updates:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<PermissionRuleRecord, String>>>,
+    pending_permission_rule_deletes:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<bool, String>>>,
+    pending_permission_batch_resolves:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ResolvePermissionsBatchResult, String>>>,
     pending_goal_updates:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GoalRunRecord, String>>>,
     pending_goal_lists:
@@ -1135,6 +1289,9 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<BrowserSessionSummary, String>>>,
     pending_browser_actions:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<BrowserActionResponseView, String>>>,
+    pending_preview_tunnels: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<u16, String>>>,
+    active_preview_tunnels: HashMap<Uuid, PreviewTunnelSink>,
+    active_preview_listeners: HashMap<(u16, Option<String>), ActivePreviewListener>,
     pending_workflow_updates:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<WorkflowRunRecord, String>>>,
     pending_workflow_lists:
@@ -1264,6 +1421,7 @@ impl HostMemoryState {
             pending_attachment_acks: HashMap::new(),
             pending_file_reads: HashMap::new(),
             pending_symbol_searches: HashMap::new(),
+            pending_message_searches: HashMap::new(),
             pending_file_writes: HashMap::new(),
             pending_file_mutations: HashMap::new(),
             pending_instruction_lists: HashMap::new(),
@@ -1275,9 +1433,11 @@ impl HostMemoryState {
             pending_handoff_previews: HashMap::new(),
             pending_handoff_executes: HashMap::new(),
             pending_daemon_upgrades: HashMap::new(),
+            pending_plan_approval_acks: HashMap::new(),
             pending_upgrade_terminals: HashMap::new(),
             pending_git_repo_inspections: HashMap::new(),
             pending_git_mutations: HashMap::new(),
+            pending_git_collab_queries: HashMap::new(),
             pending_acp_probes: HashMap::new(),
             pending_acp_snapshots: HashMap::new(),
             pending_mcp_snapshots: HashMap::new(),
@@ -1287,6 +1447,8 @@ impl HostMemoryState {
             pending_artifact_reads: HashMap::new(),
             pending_artifact_upserts: HashMap::new(),
             pending_artifact_deletes: HashMap::new(),
+            pending_mcp_resource_reads: HashMap::new(),
+            pending_artifact_mcp_tool_calls: HashMap::new(),
             pending_managed_skills_lists: HashMap::new(),
             background_managed_skills_reqs: HashSet::new(),
             active_managed_skills_cwd: None,
@@ -1298,6 +1460,11 @@ impl HostMemoryState {
             pending_lsp_symbols: HashMap::new(),
             pending_lsp_diagnostics: HashMap::new(),
             pending_lsp_locations: HashMap::new(),
+            pending_lsp_hover: HashMap::new(),
+            pending_lsp_references: HashMap::new(),
+            pending_lsp_completions: HashMap::new(),
+            pending_lsp_code_actions: HashMap::new(),
+            pending_lsp_workspace_edits: HashMap::new(),
             pending_usage_insights: HashMap::new(),
             pending_context_occupancy: HashMap::new(),
             pending_lifecycle_hooks: HashMap::new(),
@@ -1307,6 +1474,10 @@ impl HostMemoryState {
             pending_timer_updates: HashMap::new(),
             background_timer_list_reqs: HashSet::new(),
             pending_guardian_configs: HashMap::new(),
+            pending_permission_rule_lists: HashMap::new(),
+            pending_permission_rule_updates: HashMap::new(),
+            pending_permission_rule_deletes: HashMap::new(),
+            pending_permission_batch_resolves: HashMap::new(),
             pending_goal_updates: HashMap::new(),
             pending_goal_lists: HashMap::new(),
             pending_monitor_updates: HashMap::new(),
@@ -1316,6 +1487,9 @@ impl HostMemoryState {
             pending_browser_snapshots: HashMap::new(),
             pending_browser_sessions: HashMap::new(),
             pending_browser_actions: HashMap::new(),
+            pending_preview_tunnels: HashMap::new(),
+            active_preview_tunnels: HashMap::new(),
+            active_preview_listeners: HashMap::new(),
             pending_workflow_updates: HashMap::new(),
             pending_workflow_lists: HashMap::new(),
             pending_im_channels: HashMap::new(),
@@ -2397,14 +2571,19 @@ impl OrbitAppCore {
                     .get(agent_id)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
-                let (pending_permissions, pending_questions, session_turn_diffs, mut insights) =
-                    stage::collect_stage_auxiliary_state(
-                        &items,
-                        cwd,
-                        current_agent_card.as_ref(),
-                        &host_agent_cards,
-                        provider_subagents,
-                    );
+                let (
+                    pending_permissions,
+                    pending_questions,
+                    pending_plan_approval,
+                    session_turn_diffs,
+                    mut insights,
+                ) = stage::collect_stage_auxiliary_state(
+                    &items,
+                    cwd,
+                    current_agent_card.as_ref(),
+                    &host_agent_cards,
+                    provider_subagents,
+                );
 
                 insights.merge_outline(full_outline);
                 host_state.stage_cache.insert(
@@ -2417,6 +2596,7 @@ impl OrbitAppCore {
                         turn_item_starts: sliced.turn_item_starts,
                         pending_permissions,
                         pending_questions,
+                        pending_plan_approval,
                         session_turn_diffs,
                         insights,
                         stage_revision: next_rev,
@@ -2491,17 +2671,23 @@ impl OrbitAppCore {
                         .get(agent_id)
                         .map(Vec::as_slice)
                         .unwrap_or(&[]);
-                    let (pending_permissions, pending_questions, session_turn_diffs, mut insights) =
-                        stage::collect_stage_auxiliary_state(
-                            &cached.items,
-                            cwd,
-                            current_agent_card.as_ref(),
-                            &host_agent_cards,
-                            provider_subagents,
-                        );
+                    let (
+                        pending_permissions,
+                        pending_questions,
+                        pending_plan_approval,
+                        session_turn_diffs,
+                        mut insights,
+                    ) = stage::collect_stage_auxiliary_state(
+                        &cached.items,
+                        cwd,
+                        current_agent_card.as_ref(),
+                        &host_agent_cards,
+                        provider_subagents,
+                    );
                     insights.merge_outline(full_outline);
                     cached.pending_permissions = pending_permissions;
                     cached.pending_questions = pending_questions;
+                    cached.pending_plan_approval = pending_plan_approval;
                     cached.session_turn_diffs = session_turn_diffs;
                     cached.insights = insights;
                     cached.aux_revision = cached.aux_revision.saturating_add(1);
@@ -2554,6 +2740,7 @@ impl OrbitAppCore {
                 turns: c.turns.clone(),
                 pending_permissions: c.pending_permissions.clone(),
                 pending_questions: c.pending_questions.clone(),
+                pending_plan_approval: c.pending_plan_approval.clone(),
                 session_turn_diffs: c.session_turn_diffs.clone(),
                 insights: c.insights.clone(),
                 latest_seq: c.latest_seq,
@@ -2565,6 +2752,7 @@ impl OrbitAppCore {
                 turns: Vec::new(),
                 pending_permissions: Vec::new(),
                 pending_questions: Vec::new(),
+                pending_plan_approval: None,
                 session_turn_diffs: Vec::new(),
                 insights: crate::stage::SessionInsightsView::default(),
                 latest_seq: agent.map(|a| a.latest_seq).unwrap_or(0),
@@ -2617,6 +2805,7 @@ impl OrbitAppCore {
                     total_turn_count: 0,
                     pending_permissions: Vec::new(),
                     pending_questions: Vec::new(),
+                    pending_plan_approval: None,
                     session_turn_diffs: Vec::new(),
                     insights: crate::stage::SessionInsightsView::default(),
                     latest_seq: agent.map(|a| a.latest_seq).unwrap_or(0),
@@ -2650,6 +2839,11 @@ impl OrbitAppCore {
                         Vec::new()
                     } else {
                         c.pending_questions.clone()
+                    },
+                    pending_plan_approval: if aux_unchanged {
+                        None
+                    } else {
+                        c.pending_plan_approval.clone()
                     },
                     session_turn_diffs: if aux_unchanged {
                         Vec::new()
@@ -2715,6 +2909,11 @@ impl OrbitAppCore {
                 } else {
                     c.pending_questions.clone()
                 },
+                pending_plan_approval: if aux_unchanged {
+                    None
+                } else {
+                    c.pending_plan_approval.clone()
+                },
                 session_turn_diffs: if aux_unchanged {
                     Vec::new()
                 } else {
@@ -2772,6 +2971,7 @@ impl OrbitAppCore {
                         total_turn_count: 0,
                         pending_permissions: Vec::new(),
                         pending_questions: Vec::new(),
+                        pending_plan_approval: None,
                         session_turn_diffs: Vec::new(),
                         insights: crate::stage::SessionInsightsView::default(),
                         latest_seq: agent.map(|a| a.latest_seq).unwrap_or(0),
@@ -2814,6 +3014,11 @@ impl OrbitAppCore {
                             Vec::new()
                         } else {
                             c.pending_questions.clone()
+                        },
+                        pending_plan_approval: if aux_unchanged {
+                            None
+                        } else {
+                            c.pending_plan_approval.clone()
                         },
                         session_turn_diffs: if aux_unchanged {
                             Vec::new()
@@ -2897,6 +3102,11 @@ impl OrbitAppCore {
                         Vec::new()
                     } else {
                         c.pending_questions.clone()
+                    },
+                    pending_plan_approval: if aux_unchanged {
+                        None
+                    } else {
+                        c.pending_plan_approval.clone()
                     },
                     session_turn_diffs: if aux_unchanged {
                         Vec::new()
@@ -3526,21 +3736,275 @@ impl OrbitAppCore {
             return Vec::new();
         }
 
+        let candidates: Vec<CandidateSearchHit> = raw_hits
+            .into_iter()
+            .map(CandidateSearchHit::from_local)
+            .collect();
+        self.enrich_search_candidates(candidates, max_hits)
+    }
+
+    /// Hybrid local-replica + concurrent remote-daemon full-history SQLite FTS5 search.
+    ///
+    /// - Queries local `client_timeline_fts` immediately so offline/slow hosts never drop local hits.
+    /// - Fans out `WireMessage::SearchMessages` concurrently to every relevant online host with a
+    ///   tight `2500ms` timeout per host.
+    /// - Merges and deduplicates by `(host_id, agent_id, seq)`, ranks by BM25 + recency, and tags
+    ///   `is_remote` / `is_unloaded` so clicking an un-replicated historical turn auto-paginates
+    ///   directly to that `seq`.
+    pub async fn search_messages_remote(
+        self: &Arc<Self>,
+        req: SearchMessagesRequest,
+    ) -> SearchMessagesResponse {
+        const REMOTE_SEARCH_TIMEOUT: Duration = Duration::from_millis(2500);
+
+        let q = req.query.trim().to_string();
+        if q.is_empty() {
+            return SearchMessagesResponse::default();
+        }
+        if matches!(req.limit, Some(0)) {
+            return SearchMessagesResponse::default();
+        }
+        let host_filter = req
+            .host_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let agent_filter = req
+            .agent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let max_hits = match req.limit {
+            Some(n) => (n as usize).clamp(1, 100),
+            None => {
+                if agent_filter.is_some() {
+                    100
+                } else {
+                    20
+                }
+            }
+        };
+
+        // 1. Local SQLite replica search (fast, local-first)
+        let local_raw = if let Some(ref aid) = agent_filter {
+            self.store
+                .search_replica_messages_for_agent(&q, host_filter.as_deref(), aid, max_hits)
+        } else {
+            self.store
+                .search_replica_messages_for_host(&q, host_filter.as_deref(), max_hits)
+        };
+        let local_candidates: Vec<CandidateSearchHit> = match local_raw {
+            Ok(hits) => hits
+                .into_iter()
+                .map(CandidateSearchHit::from_local)
+                .collect(),
+            Err(err) => {
+                tracing::warn!(query = %q, error = %err, "local replica FTS5 search failed");
+                Vec::new()
+            }
+        };
+
+        // 2. Identify online target hosts to fan out `WireMessage::SearchMessages`
+        let targets: Vec<(String, HostSessionHandle)> = match self.hosts.read() {
+            Ok(guard) => {
+                if let Some(ref hid) = host_filter {
+                    guard
+                        .get(hid)
+                        .and_then(|h| h.session.clone().map(|s| (hid.clone(), s)))
+                        .into_iter()
+                        .collect()
+                } else if let Some(ref aid) = agent_filter {
+                    let exact: Vec<(String, HostSessionHandle)> = guard
+                        .iter()
+                        .filter_map(|(hid, h)| {
+                            if h.agents.contains_key(aid) {
+                                h.session.clone().map(|s| (hid.clone(), s))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if !exact.is_empty() {
+                        exact
+                    } else {
+                        guard
+                            .iter()
+                            .filter_map(|(hid, h)| h.session.clone().map(|s| (hid.clone(), s)))
+                            .collect()
+                    }
+                } else {
+                    guard
+                        .iter()
+                        .filter_map(|(hid, h)| h.session.clone().map(|s| (hid.clone(), s)))
+                        .collect()
+                }
+            }
+            Err(_) => Vec::new(),
+        };
+
+        // 3. Fan out concurrently onto `self.runtime` with a tight 2500ms timeout per host
+        let (remote_candidates, remote_hosts_queried, remote_hosts_failed) = if targets.is_empty() {
+            (Vec::new(), 0u32, 0u32)
+        } else {
+            let core = Arc::clone(self);
+            let q_owned = q.clone();
+            let agent_owned = agent_filter.clone();
+            let limit_u32 = max_hits as u32;
+            let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+            self.runtime.spawn(async move {
+                let futs = targets.into_iter().map(|(target_host_id, session)| {
+                    let core = Arc::clone(&core);
+                    let query = q_owned.clone();
+                    let agent_id = agent_owned.clone();
+                    async move {
+                        let req_id = Uuid::new_v4();
+                        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+                        let registered = match core.hosts.write() {
+                            Ok(mut guard) => match guard.get_mut(&target_host_id) {
+                                Some(h) if h.session.is_some() => {
+                                    h.pending_message_searches.insert(req_id, ack_tx);
+                                    true
+                                }
+                                _ => false,
+                            },
+                            Err(_) => false,
+                        };
+                        if !registered {
+                            return (target_host_id, Err("host disconnected".to_string()));
+                        }
+
+                        let send_res = session
+                            .send_wire(WireMessage::SearchMessages {
+                                request_id: req_id,
+                                query,
+                                agent_id,
+                                limit: Some(limit_u32),
+                            })
+                            .await;
+                        if let Err(err) = send_res {
+                            if let Ok(mut guard) = core.hosts.write()
+                                && let Some(h) = guard.get_mut(&target_host_id)
+                            {
+                                h.pending_message_searches.remove(&req_id);
+                            }
+                            return (target_host_id, Err(format!("send failed: {err}")));
+                        }
+
+                        match tokio::time::timeout(REMOTE_SEARCH_TIMEOUT, ack_rx).await {
+                            Ok(Ok(Ok(hits))) => (target_host_id, Ok(hits)),
+                            Ok(Ok(Err(rpc_err))) => (target_host_id, Err(rpc_err)),
+                            Ok(Err(_)) => (target_host_id, Err("host disconnected".to_string())),
+                            Err(_) => {
+                                if let Ok(mut guard) = core.hosts.write()
+                                    && let Some(h) = guard.get_mut(&target_host_id)
+                                {
+                                    h.pending_message_searches.remove(&req_id);
+                                }
+                                (target_host_id, Err("timed out".to_string()))
+                            }
+                        }
+                    }
+                });
+
+                let outcomes = futures_util::future::join_all(futs).await;
+                let mut merged_remote = Vec::new();
+                let mut queried = 0u32;
+                let mut failed = 0u32;
+                for (hid, outcome) in outcomes {
+                    match outcome {
+                        Ok(hits) => {
+                            queried += 1;
+                            for h in hits {
+                                merged_remote.push(CandidateSearchHit::from_remote(hid.clone(), h));
+                            }
+                        }
+                        Err(err) => {
+                            failed += 1;
+                            tracing::debug!(
+                                host_id = %hid,
+                                error = %err,
+                                "remote FTS5 SearchMessages skipped for host"
+                            );
+                        }
+                    }
+                }
+                let _ = res_tx.send((merged_remote, queried, failed));
+            });
+
+            res_rx.await.unwrap_or_else(|_| (Vec::new(), 0, 0))
+        };
+
+        // 4. Resolve empty host_id on local candidates before deduping against remote hits
+        let resolved_local = self.resolve_local_candidate_host_ids(local_candidates);
+
+        // 5. Merge, deduplicate by `(host_id, agent_id, seq)`, rank by BM25 + recency, and enrich
+        let merged =
+            merge_and_rank_search_candidates(resolved_local, remote_candidates, Utc::now());
+        let hits = self.enrich_search_candidates(merged, max_hits);
+
+        SearchMessagesResponse {
+            hits,
+            remote_hosts_queried,
+            remote_hosts_failed,
+        }
+    }
+
+    pub fn search_messages_remote_blocking(
+        self: &Arc<Self>,
+        req: SearchMessagesRequest,
+    ) -> SearchMessagesResponse {
+        self.runtime.block_on(self.search_messages_remote(req))
+    }
+
+    fn resolve_local_candidate_host_ids(
+        &self,
+        candidates: Vec<CandidateSearchHit>,
+    ) -> Vec<CandidateSearchHit> {
+        let Ok(hosts_guard) = self.hosts.read() else {
+            return candidates;
+        };
+        candidates
+            .into_iter()
+            .map(|mut c| {
+                if c.host_id.is_empty()
+                    && let Some((hid, _)) = hosts_guard
+                        .iter()
+                        .find(|(_, mem)| mem.agents.contains_key(&c.agent_id))
+                {
+                    c.host_id = hid.clone();
+                }
+                c
+            })
+            .collect()
+    }
+
+    fn enrich_search_candidates(
+        &self,
+        candidates: Vec<CandidateSearchHit>,
+        max_hits: usize,
+    ) -> Vec<ConversationSearchHit> {
+        if candidates.is_empty() || max_hits == 0 {
+            return Vec::new();
+        }
         let Ok(hosts_guard) = self.hosts.read() else {
             return Vec::new();
         };
         let projects_guard = self.projects.read().ok();
-        let mut results = Vec::with_capacity(raw_hits.len());
+        let mut results = Vec::with_capacity(candidates.len().min(max_hits));
 
-        for hit in raw_hits {
-            let matched_pair = if !hit.host_id.is_empty() {
+        for cand in candidates {
+            let matched_pair = if !cand.host_id.is_empty() {
                 hosts_guard
-                    .get(&hit.host_id)
-                    .map(|mem| (hit.host_id.as_str(), mem))
+                    .get(&cand.host_id)
+                    .map(|mem| (cand.host_id.as_str(), mem))
             } else {
                 hosts_guard
                     .iter()
-                    .find(|(_, mem)| mem.agents.contains_key(&hit.agent_id))
+                    .find(|(_, mem)| mem.agents.contains_key(&cand.agent_id))
                     .map(|(hid, mem)| (hid.as_str(), mem))
             };
 
@@ -3550,63 +4014,108 @@ impl OrbitAppCore {
             if hid.is_empty() {
                 continue;
             }
-            let Some(ag) = mem.agents.get(&hit.agent_id) else {
+
+            let mem_agent = mem.agents.get(&cand.agent_id);
+            // Local-only orphan FTS rows whose agent no longer exists on the host must never surface.
+            if mem_agent.is_none() && !cand.from_remote {
                 continue;
-            };
+            }
 
             let resolved_host_id = hid.to_string();
             let mut host_name = mem.profile.effective_display_name();
             if host_name.is_empty() {
                 host_name = resolved_host_id.clone();
             }
-            let title = if ag.title.trim().is_empty() {
-                "Conversation".to_string()
+
+            let title = if let Some(ag) = mem_agent {
+                if ag.title.trim().is_empty() {
+                    cand.agent_title
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("Conversation")
+                        .to_string()
+                } else {
+                    ag.title.clone()
+                }
             } else {
-                ag.title.clone()
+                cand.agent_title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Conversation")
+                    .to_string()
             };
-            let mut updated_at_rfc3339 = hit.timestamp_rfc3339.clone().unwrap_or_default();
-            if updated_at_rfc3339.is_empty() {
+
+            let mut updated_at_rfc3339 = cand.timestamp_rfc3339.clone().unwrap_or_default();
+            if updated_at_rfc3339.is_empty()
+                && let Some(ag) = mem_agent
+            {
                 updated_at_rfc3339 = ag.last_activity_at.unwrap_or(ag.updated_at).to_rfc3339();
             }
-            let effective_cwd = mem
-                .workspaces
-                .iter()
-                .find(|w| w.workspace_id == ag.workspace_id)
-                .and_then(|w| {
-                    w.project_root
-                        .as_deref()
-                        .or(w.source_cwd.as_deref())
-                        .or(Some(w.cwd.as_str()))
+
+            let fallback_cwd = cand.cwd.as_deref().unwrap_or("");
+            let ag_cwd = mem_agent.map(|ag| ag.cwd.as_str()).unwrap_or(fallback_cwd);
+            let effective_cwd = mem_agent
+                .and_then(|ag| {
+                    mem.workspaces
+                        .iter()
+                        .find(|w| w.workspace_id == ag.workspace_id)
+                        .and_then(|w| {
+                            w.project_root
+                                .as_deref()
+                                .or(w.source_cwd.as_deref())
+                                .or(Some(w.cwd.as_str()))
+                        })
                 })
-                .unwrap_or(ag.cwd.as_str());
+                .unwrap_or(ag_cwd);
 
             let mut project_name = String::new();
             if let Some(ref projects) = projects_guard
                 && let Some(proj) = projects.values().find(|p| {
                     p.host_id == resolved_host_id
                         && p.directories.iter().any(|dir| {
-                            cwd_paths_equivalent(effective_cwd, dir)
-                                || cwd_paths_equivalent(&ag.cwd, dir)
+                            (!effective_cwd.is_empty() && cwd_paths_equivalent(effective_cwd, dir))
+                                || (!ag_cwd.is_empty() && cwd_paths_equivalent(ag_cwd, dir))
                         })
                 })
             {
                 project_name = proj.name.clone();
             }
-            if project_name.is_empty() {
+            if project_name.is_empty() && !effective_cwd.is_empty() {
                 project_name = crate::sidebar::basename_of_project_path(effective_cwd);
             }
+
+            let is_unloaded = match mem.timelines.get(&cand.agent_id) {
+                Some(evs) if !evs.is_empty() => {
+                    let oldest_loaded_seq = evs
+                        .iter()
+                        .filter(|e| e.seq > 0)
+                        .map(|e| e.seq)
+                        .min()
+                        .unwrap_or(0);
+                    oldest_loaded_seq > 0 && cand.seq < oldest_loaded_seq
+                }
+                _ => !cand.from_local,
+            };
 
             results.push(ConversationSearchHit {
                 host_id: resolved_host_id,
                 host_name,
-                agent_id: hit.agent_id,
-                seq: hit.seq,
-                role: hit.role,
+                agent_id: cand.agent_id,
+                seq: cand.seq,
+                turn_id: cand.turn_id,
+                role: cand.role,
                 title,
                 project_name,
-                snippet: hit.snippet,
+                snippet: cand.snippet,
                 updated_at_rfc3339,
+                is_remote: cand.from_remote && !cand.from_local,
+                is_unloaded,
             });
+            if results.len() >= max_hits {
+                break;
+            }
         }
         results
     }
@@ -5308,6 +5817,7 @@ impl OrbitAppCore {
         let mut host_sync_to_apply: Option<(HostSyncState, bool)> = None;
         let mut flush_terminal_frames: Option<(HostSessionHandle, VecDeque<TerminalBinaryFrame>)> =
             None;
+        let mut preview_tunnels_to_close: Vec<(HostSessionHandle, Uuid, &'static str)> = Vec::new();
         let mut migrated_opt_pref: Option<(String, String)> = None;
         let mut rewound_seen_reset: Option<(String, u64)> = None;
         let mut adopted_daemon_relay = false;
@@ -5382,6 +5892,16 @@ impl OrbitAppCore {
                     state.workspaces.insert(0, workspace);
                     notify_fleet = true;
                     notify_host = true;
+                }
+                WireMessage::WorkspaceFilesChanged {
+                    cwd,
+                    skills_or_rules_changed,
+                    ..
+                } => {
+                    notify_git_cwd = Some(cwd);
+                    if skills_or_rules_changed {
+                        notify_host = true;
+                    }
                 }
                 WireMessage::WorkspaceSetupProgress { .. } => {
                     notify_host = true;
@@ -5863,6 +6383,24 @@ impl OrbitAppCore {
                         let _ = tx.send(Ok(artifact_id));
                     }
                     notify_host = true;
+                }
+                WireMessage::McpResourceResponse {
+                    request_id,
+                    content,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_mcp_resource_reads.remove(&request_id) {
+                        let _ = tx.send(Ok(content));
+                    }
+                }
+                WireMessage::ArtifactMcpToolResponse {
+                    request_id,
+                    outcome,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_artifact_mcp_tool_calls.remove(&request_id) {
+                        let _ = tx.send(Ok(outcome));
+                    }
                 }
                 WireMessage::SchedulesSnapshot { schedules, .. } => {
                     state.schedules = schedules;
@@ -6540,6 +7078,15 @@ impl OrbitAppCore {
                         let _ = tx.send(Ok((result, status_refreshed)));
                     }
                 }
+                WireMessage::GitCollabResponse {
+                    request_id,
+                    payload,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_git_collab_queries.remove(&request_id) {
+                        let _ = tx.send(Ok(payload));
+                    }
+                }
                 WireMessage::WorkspaceFilesResponse { cwd, files, .. } => {
                     state.workspace_files.insert(cwd.clone(), files);
                     notify_git_cwd = Some(cwd);
@@ -6552,6 +7099,11 @@ impl OrbitAppCore {
                 } => {
                     if let Some(tx) = state.pending_symbol_searches.remove(&request_id) {
                         let _ = tx.send(Ok((symbols, truncated)));
+                    }
+                }
+                WireMessage::SearchMessagesResult { request_id, hits } => {
+                    if let Some(tx) = state.pending_message_searches.remove(&request_id) {
+                        let _ = tx.send(Ok(hits));
                     }
                 }
                 WireMessage::WorkspaceFileContentResponse {
@@ -6753,6 +7305,45 @@ impl OrbitAppCore {
                         let _ = tx.send(Ok(locations));
                     }
                 }
+                WireMessage::LspHoverResponse {
+                    request_id, hover, ..
+                } => {
+                    if let Some(tx) = state.pending_lsp_hover.remove(&request_id) {
+                        let _ = tx.send(Ok(hover));
+                    }
+                }
+                WireMessage::LspReferencesResponse {
+                    request_id,
+                    references,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_lsp_references.remove(&request_id) {
+                        let _ = tx.send(Ok(references));
+                    }
+                }
+                WireMessage::LspCompletionResponse {
+                    request_id, items, ..
+                } => {
+                    if let Some(tx) = state.pending_lsp_completions.remove(&request_id) {
+                        let _ = tx.send(Ok(items));
+                    }
+                }
+                WireMessage::LspCodeActionResponse {
+                    request_id,
+                    actions,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_lsp_code_actions.remove(&request_id) {
+                        let _ = tx.send(Ok(actions));
+                    }
+                }
+                WireMessage::LspWorkspaceEditResponse {
+                    request_id, result, ..
+                } => {
+                    if let Some(tx) = state.pending_lsp_workspace_edits.remove(&request_id) {
+                        let _ = tx.send(Ok(result));
+                    }
+                }
                 WireMessage::UsageInsightsResponse {
                     request_id,
                     snapshot,
@@ -6846,6 +7437,39 @@ impl OrbitAppCore {
                         let _ = tx.send(Ok(GuardianConfigSnapshotView {
                             config,
                             recent_audits,
+                        }));
+                    }
+                }
+                WireMessage::PermissionRulesSnapshot { request_id, rules } => {
+                    if let Some(tx) = state.pending_permission_rule_lists.remove(&request_id) {
+                        let _ = tx.send(Ok(rules));
+                    }
+                }
+                WireMessage::PermissionRuleUpdated { request_id, rule } => {
+                    if let Some(tx) = state.pending_permission_rule_updates.remove(&request_id) {
+                        let _ = tx.send(Ok(rule));
+                    }
+                }
+                WireMessage::PermissionRuleDeleted {
+                    request_id,
+                    deleted,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_permission_rule_deletes.remove(&request_id) {
+                        let _ = tx.send(Ok(deleted));
+                    }
+                }
+                WireMessage::PermissionsBatchResolved {
+                    request_id,
+                    resolved_count,
+                    skipped_count,
+                    skipped_reasons,
+                } => {
+                    if let Some(tx) = state.pending_permission_batch_resolves.remove(&request_id) {
+                        let _ = tx.send(Ok(ResolvePermissionsBatchResult {
+                            resolved_count,
+                            skipped_count,
+                            skipped_reasons,
                         }));
                     }
                 }
@@ -6995,6 +7619,7 @@ impl OrbitAppCore {
                     screenshot_base64,
                     text_excerpt,
                     captcha_detected,
+                    picked_element,
                 } => {
                     if let Some(tx) = state.pending_browser_actions.remove(&request_id) {
                         let _ = tx.send(Ok(BrowserActionResponseView {
@@ -7004,8 +7629,34 @@ impl OrbitAppCore {
                             screenshot_base64,
                             text_excerpt,
                             captcha_detected,
+                            picked_element,
                         }));
                     }
+                }
+                WireMessage::PreviewTunnelOpened {
+                    request_id,
+                    target_port,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_preview_tunnels.remove(&request_id) {
+                        let _ = tx.send(Ok(target_port));
+                    }
+                }
+                WireMessage::PreviewTunnelData {
+                    tunnel_id,
+                    payload_b64,
+                } => {
+                    if let Err(reason) = enqueue_client_preview_tunnel_data(
+                        &mut state.active_preview_tunnels,
+                        tunnel_id,
+                        &payload_b64,
+                    ) && let Some(handle) = state.session.clone()
+                    {
+                        preview_tunnels_to_close.push((handle, tunnel_id, reason));
+                    }
+                }
+                WireMessage::PreviewTunnelClose { tunnel_id, .. } => {
+                    state.active_preview_tunnels.remove(&tunnel_id);
                 }
                 WireMessage::WorkflowRunsSnapshot { request_id, runs } => {
                     if let Some(tx) = state.pending_workflow_lists.remove(&request_id) {
@@ -7123,6 +7774,9 @@ impl OrbitAppCore {
                     if let Some(tx) = state.pending_daemon_upgrades.remove(&request_id) {
                         let _ = tx.send(Ok(()));
                     }
+                    if let Some(tx) = state.pending_plan_approval_acks.remove(&request_id) {
+                        let _ = tx.send(Ok(()));
+                    }
                 }
                 WireMessage::AttachmentStaged {
                     request_id,
@@ -7162,6 +7816,10 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_symbol_searches.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_message_searches.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -7205,6 +7863,10 @@ impl OrbitAppCore {
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_plan_approval_acks.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_upgrade_terminals.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
@@ -7214,6 +7876,10 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_git_mutations.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_git_collab_queries.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -7257,6 +7923,14 @@ impl OrbitAppCore {
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_mcp_resource_reads.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_artifact_mcp_tool_calls.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
                         && let Some((_, tx)) = state.pending_managed_skills_lists.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
@@ -7278,6 +7952,26 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_lsp_locations.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_lsp_hover.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_lsp_references.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_lsp_completions.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_lsp_code_actions.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_lsp_workspace_edits.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -7326,6 +8020,22 @@ impl OrbitAppCore {
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_permission_rule_lists.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_permission_rule_updates.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_permission_rule_deletes.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_permission_batch_resolves.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_goal_updates.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
@@ -7351,6 +8061,10 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_browser_actions.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_preview_tunnels.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -7692,6 +8406,18 @@ impl OrbitAppCore {
             self.runtime.spawn(async move {
                 for frame in pending_frames {
                     let _ = handle.send_terminal(frame).await;
+                }
+            });
+        }
+        if !preview_tunnels_to_close.is_empty() {
+            self.runtime.spawn(async move {
+                for (handle, tunnel_id, reason) in preview_tunnels_to_close {
+                    let _ = handle
+                        .send_wire(WireMessage::PreviewTunnelClose {
+                            tunnel_id,
+                            reason: Some(reason.to_string()),
+                        })
+                        .await;
                 }
             });
         }
@@ -10235,6 +10961,7 @@ impl OrbitAppCore {
                     language: req.language,
                     mime_type: req.mime_type,
                     resource_uri: req.resource_uri,
+                    mcp_server_name: req.mcp_server_name,
                     content: req.content,
                     summary_note: req.summary_note,
                 })
@@ -10276,6 +11003,180 @@ impl OrbitAppCore {
         let core = Arc::clone(self);
         self.runtime
             .block_on(async move { core.upsert_artifact_async(req).await })
+    }
+
+    /// Read a SEP-1865 `ui://` resource strictly bound to `artifact_id` (and optional `artifact_version`)
+    /// resolved inside that artifact's persisted workspace on `host_id`.
+    pub async fn read_mcp_resource_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        artifact_id: &str,
+        artifact_version: Option<u32>,
+        uri: &str,
+    ) -> Result<McpResourceContent, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let owned_artifact = artifact_id.to_string();
+        let owned_uri = uri.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_mcp_resource_reads.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ReadMcpResource {
+                    request_id: req_id,
+                    artifact_id: owned_artifact,
+                    artifact_version,
+                    uri: owned_uri,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_mcp_resource_reads.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ReadMcpResource: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(content))) => Ok(content),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while reading MCP resource".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_mcp_resource_reads.remove(&req_id);
+                    }
+                    Err("Timed out waiting for MCP resource".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "read_mcp_resource task cancelled".to_string())?
+    }
+
+    /// Invoke a tool strictly scoped to the owning external MCP server and persisted workspace of
+    /// `artifact_id` (and optional `artifact_version`).
+    pub async fn call_artifact_mcp_tool_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        artifact_id: &str,
+        artifact_version: Option<u32>,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<McpToolCallOutcome, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let owned_artifact = artifact_id.to_string();
+        let owned_tool = tool_name.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_artifact_mcp_tool_calls.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::CallArtifactMcpTool {
+                    request_id: req_id,
+                    artifact_id: owned_artifact,
+                    artifact_version,
+                    tool_name: owned_tool,
+                    arguments,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_artifact_mcp_tool_calls.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send CallArtifactMcpTool: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(Ok(result))) => Ok(result),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while calling MCP tool".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_artifact_mcp_tool_calls.remove(&req_id);
+                    }
+                    Err("Timed out waiting for MCP tool response".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "call_artifact_mcp_tool task cancelled".to_string())?
     }
 
     pub async fn delete_artifact_async(
@@ -11898,8 +12799,106 @@ impl OrbitAppCore {
                 agent_id: agent_id.to_string(),
                 permission_request_id: permission_request_id.to_string(),
                 decision: decision.to_string(),
+                agent_originated: false,
             },
         );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_plan_approval_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        permission_request_id: &str,
+        action: PlanApprovalAction,
+        edited_plan_markdown: Option<String>,
+        feedback: Option<String>,
+        target_mode: Option<SessionMode>,
+    ) -> Result<(), String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to resolve plan approval".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.to_string();
+        let owned_agent_id = agent_id.to_string();
+        let owned_perm_id = permission_request_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_plan_approval_acks.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before resolving plan approval".to_string()),
+                    None => Some(format!("host `{owned_host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            core.record_agent_request(&owned_host_id, req_id, &owned_agent_id);
+            if let Err(e) = session
+                .send_wire(WireMessage::ResolvePlanApproval {
+                    request_id: req_id,
+                    agent_id: owned_agent_id,
+                    permission_request_id: owned_perm_id,
+                    action,
+                    edited_plan_markdown,
+                    feedback,
+                    target_mode,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_plan_approval_acks.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send plan approval response: {e}")));
+                return;
+            }
+
+            let outcome = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while resolving plan approval".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_plan_approval_acks.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon to resolve plan approval (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "Plan approval task canceled".to_string())?
     }
 
     pub fn answer_question(
@@ -12277,6 +13276,489 @@ impl OrbitAppCore {
         match outcome {
             GitMutationOutcome::PrCreated(res) => Ok(res),
             other => Err(format!("Unexpected git create PR outcome: {other:?}")),
+        }
+    }
+
+    async fn dispatch_git_collab_query_on_host(
+        self: &Arc<Self>,
+        host_id: String,
+        timeout_secs: u64,
+        op_label: &'static str,
+        build_wire: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+    ) -> Result<GitCollabQueryResult, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+
+        let Some(session) = session else {
+            return Err(format!("Host is disconnected; reconnect to {op_label}"));
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.clone();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        struct PendingGitCollabQueryGuard {
+            core: Arc<OrbitAppCore>,
+            host_id: String,
+            req_id: Uuid,
+            armed: bool,
+        }
+
+        impl PendingGitCollabQueryGuard {
+            fn disarm(&mut self) {
+                self.armed = false;
+            }
+        }
+
+        impl Drop for PendingGitCollabQueryGuard {
+            fn drop(&mut self) {
+                if self.armed
+                    && let Ok(mut guard) = self.core.hosts.write()
+                    && let Some(h) = guard.get_mut(&self.host_id)
+                {
+                    h.pending_git_collab_queries.remove(&self.req_id);
+                }
+            }
+        }
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_git_collab_queries.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some(format!("Host disconnected before {op_label}")),
+                        None => Some(format!("host `{owned_host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            let mut cleanup = PendingGitCollabQueryGuard {
+                core: Arc::clone(&core),
+                host_id: owned_host_id,
+                req_id,
+                armed: true,
+            };
+
+            let out = match tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+                session
+                    .send_wire(build_wire(req_id))
+                    .await
+                    .map_err(|e| format!("failed to {op_label}: {e}"))?;
+                match ack_rx.await {
+                    Ok(res) => {
+                        cleanup.disarm();
+                        res
+                    }
+                    Err(_) => Err(format!("Host disconnected while trying to {op_label}")),
+                }
+            })
+            .await
+            {
+                Ok(res) => res,
+                Err(_) => Err(format!(
+                    "Timed out waiting for daemon to {op_label} (ensure orbit daemon is up to date)"
+                )),
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    pub async fn git_stash_list_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+    ) -> Result<GitStashListResult, String> {
+        let cwd_wire = cwd.to_string();
+        let res = self
+            .dispatch_git_collab_query_on_host(
+                host_id.to_string(),
+                25,
+                "list git stashes",
+                move |request_id| WireMessage::GitStashList {
+                    request_id,
+                    cwd: cwd_wire,
+                },
+            )
+            .await?;
+        match res {
+            GitCollabQueryResult::StashList(list) => Ok(list),
+            other => Err(format!("Unexpected git stash list outcome: {other:?}")),
+        }
+    }
+
+    pub async fn git_stash_push_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        message: Option<String>,
+        include_untracked: bool,
+    ) -> Result<GitStashMutationResult, String> {
+        let cwd_owned = cwd.to_string();
+        let cwd_wire = cwd_owned.clone();
+        let outcome = self
+            .dispatch_git_mutation_on_host(
+                host_id.to_string(),
+                cwd_owned,
+                30,
+                "push git stash",
+                move |request_id| WireMessage::GitStashPush {
+                    request_id,
+                    cwd: cwd_wire,
+                    message,
+                    include_untracked,
+                },
+            )
+            .await?;
+        match outcome {
+            GitMutationOutcome::StashMutated(res) => Ok(res),
+            other => Err(format!("Unexpected git stash push outcome: {other:?}")),
+        }
+    }
+
+    pub async fn git_stash_apply_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        stash_ref: String,
+        expected_oid: Option<String>,
+    ) -> Result<GitStashMutationResult, String> {
+        let cwd_owned = cwd.to_string();
+        let cwd_wire = cwd_owned.clone();
+        let outcome = self
+            .dispatch_git_mutation_on_host(
+                host_id.to_string(),
+                cwd_owned,
+                30,
+                "apply git stash",
+                move |request_id| WireMessage::GitStashApply {
+                    request_id,
+                    cwd: cwd_wire,
+                    stash_ref,
+                    expected_oid,
+                },
+            )
+            .await?;
+        match outcome {
+            GitMutationOutcome::StashMutated(res) => Ok(res),
+            other => Err(format!("Unexpected git stash apply outcome: {other:?}")),
+        }
+    }
+
+    pub async fn git_stash_pop_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        stash_ref: String,
+        expected_oid: Option<String>,
+    ) -> Result<GitStashMutationResult, String> {
+        let cwd_owned = cwd.to_string();
+        let cwd_wire = cwd_owned.clone();
+        let outcome = self
+            .dispatch_git_mutation_on_host(
+                host_id.to_string(),
+                cwd_owned,
+                30,
+                "pop git stash",
+                move |request_id| WireMessage::GitStashPop {
+                    request_id,
+                    cwd: cwd_wire,
+                    stash_ref,
+                    expected_oid,
+                },
+            )
+            .await?;
+        match outcome {
+            GitMutationOutcome::StashMutated(res) => Ok(res),
+            other => Err(format!("Unexpected git stash pop outcome: {other:?}")),
+        }
+    }
+
+    pub async fn git_stash_drop_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        stash_ref: String,
+        expected_oid: Option<String>,
+    ) -> Result<GitStashMutationResult, String> {
+        let cwd_owned = cwd.to_string();
+        let cwd_wire = cwd_owned.clone();
+        let outcome = self
+            .dispatch_git_mutation_on_host(
+                host_id.to_string(),
+                cwd_owned,
+                25,
+                "drop git stash",
+                move |request_id| WireMessage::GitStashDrop {
+                    request_id,
+                    cwd: cwd_wire,
+                    stash_ref,
+                    expected_oid,
+                },
+            )
+            .await?;
+        match outcome {
+            GitMutationOutcome::StashMutated(res) => Ok(res),
+            other => Err(format!("Unexpected git stash drop outcome: {other:?}")),
+        }
+    }
+
+    pub async fn git_rebase_status_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+    ) -> Result<GitRebaseStatus, String> {
+        let cwd_wire = cwd.to_string();
+        let res = self
+            .dispatch_git_collab_query_on_host(
+                host_id.to_string(),
+                25,
+                "inspect git rebase status",
+                move |request_id| WireMessage::GitRebaseStatus {
+                    request_id,
+                    cwd: cwd_wire,
+                },
+            )
+            .await?;
+        match res {
+            GitCollabQueryResult::RebaseStatus(status) => Ok(status),
+            other => Err(format!("Unexpected git rebase status outcome: {other:?}")),
+        }
+    }
+
+    pub async fn git_rebase_start_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        onto_ref: String,
+    ) -> Result<GitRebaseActionResult, String> {
+        let cwd_owned = cwd.to_string();
+        let cwd_wire = cwd_owned.clone();
+        let outcome = self
+            .dispatch_git_mutation_on_host(
+                host_id.to_string(),
+                cwd_owned,
+                30,
+                "start git rebase",
+                move |request_id| WireMessage::GitRebaseStart {
+                    request_id,
+                    cwd: cwd_wire,
+                    onto_ref,
+                },
+            )
+            .await?;
+        match outcome {
+            GitMutationOutcome::RebaseAction(res) => Ok(res),
+            other => Err(format!("Unexpected git rebase start outcome: {other:?}")),
+        }
+    }
+
+    pub async fn git_rebase_continue_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+    ) -> Result<GitRebaseActionResult, String> {
+        let cwd_owned = cwd.to_string();
+        let cwd_wire = cwd_owned.clone();
+        let outcome = self
+            .dispatch_git_mutation_on_host(
+                host_id.to_string(),
+                cwd_owned,
+                30,
+                "continue git rebase",
+                move |request_id| WireMessage::GitRebaseContinue {
+                    request_id,
+                    cwd: cwd_wire,
+                },
+            )
+            .await?;
+        match outcome {
+            GitMutationOutcome::RebaseAction(res) => Ok(res),
+            other => Err(format!("Unexpected git rebase continue outcome: {other:?}")),
+        }
+    }
+
+    pub async fn git_rebase_abort_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+    ) -> Result<GitRebaseActionResult, String> {
+        let cwd_owned = cwd.to_string();
+        let cwd_wire = cwd_owned.clone();
+        let outcome = self
+            .dispatch_git_mutation_on_host(
+                host_id.to_string(),
+                cwd_owned,
+                30,
+                "abort git rebase",
+                move |request_id| WireMessage::GitRebaseAbort {
+                    request_id,
+                    cwd: cwd_wire,
+                },
+            )
+            .await?;
+        match outcome {
+            GitMutationOutcome::RebaseAction(res) => Ok(res),
+            other => Err(format!("Unexpected git rebase abort outcome: {other:?}")),
+        }
+    }
+
+    pub async fn git_rebase_skip_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        expected_step: Option<u32>,
+    ) -> Result<GitRebaseActionResult, String> {
+        let cwd_owned = cwd.to_string();
+        let cwd_wire = cwd_owned.clone();
+        let outcome = self
+            .dispatch_git_mutation_on_host(
+                host_id.to_string(),
+                cwd_owned,
+                30,
+                "skip git rebase commit",
+                move |request_id| WireMessage::GitRebaseSkip {
+                    request_id,
+                    cwd: cwd_wire,
+                    expected_step,
+                },
+            )
+            .await?;
+        match outcome {
+            GitMutationOutcome::RebaseAction(res) => Ok(res),
+            other => Err(format!("Unexpected git rebase skip outcome: {other:?}")),
+        }
+    }
+
+    pub async fn git_list_conflicts_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+    ) -> Result<GitConflictListResult, String> {
+        let cwd_wire = cwd.to_string();
+        let res = self
+            .dispatch_git_collab_query_on_host(
+                host_id.to_string(),
+                25,
+                "list git conflicts",
+                move |request_id| WireMessage::GitListConflicts {
+                    request_id,
+                    cwd: cwd_wire,
+                },
+            )
+            .await?;
+        match res {
+            GitCollabQueryResult::ConflictList(list) => Ok(list),
+            other => Err(format!("Unexpected git conflict list outcome: {other:?}")),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn git_resolve_conflict_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: String,
+        block_index: Option<u32>,
+        resolution: GitConflictResolution,
+        auto_stage: bool,
+        expected_sha256: Option<String>,
+    ) -> Result<GitResolveConflictResult, String> {
+        let cwd_owned = cwd.to_string();
+        let cwd_wire = cwd_owned.clone();
+        let outcome = self
+            .dispatch_git_mutation_on_host(
+                host_id.to_string(),
+                cwd_owned,
+                30,
+                "resolve git conflict",
+                move |request_id| WireMessage::GitResolveConflict {
+                    request_id,
+                    cwd: cwd_wire,
+                    path,
+                    block_index,
+                    resolution,
+                    auto_stage,
+                    expected_sha256,
+                },
+            )
+            .await?;
+        match outcome {
+            GitMutationOutcome::ConflictResolved(res) => Ok(res),
+            other => Err(format!(
+                "Unexpected git conflict resolution outcome: {other:?}"
+            )),
+        }
+    }
+
+    pub async fn git_pr_status_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+    ) -> Result<GitPrStatus, String> {
+        let cwd_wire = cwd.to_string();
+        let res = self
+            .dispatch_git_collab_query_on_host(
+                host_id.to_string(),
+                30,
+                "fetch pull request status",
+                move |request_id| WireMessage::GitPrStatus {
+                    request_id,
+                    cwd: cwd_wire,
+                },
+            )
+            .await?;
+        match res {
+            GitCollabQueryResult::PrStatus(status) => Ok(status),
+            other => Err(format!("Unexpected git PR status outcome: {other:?}")),
+        }
+    }
+
+    pub async fn git_generate_commit_message_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+    ) -> Result<GitGeneratedCommitMessage, String> {
+        let cwd_wire = cwd.to_string();
+        let res = self
+            .dispatch_git_collab_query_on_host(
+                host_id.to_string(),
+                20,
+                "generate commit message",
+                move |request_id| WireMessage::GitGenerateCommitMessage {
+                    request_id,
+                    cwd: cwd_wire,
+                },
+            )
+            .await?;
+        match res {
+            GitCollabQueryResult::CommitMessage(msg) => Ok(msg),
+            other => Err(format!(
+                "Unexpected git commit message generation outcome: {other:?}"
+            )),
         }
     }
 
@@ -15202,6 +16684,308 @@ impl OrbitAppCore {
             .map_err(|_| format!("{op_label} task cancelled"))?
     }
 
+    /// List persistent permission rules configured on a connected host (optionally filtered to a project).
+    pub async fn list_permission_rules_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        project_cwd: Option<String>,
+    ) -> Result<Vec<PermissionRuleRecord>, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to list permission rules".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_permission_rule_lists.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before listing permission rules".into()),
+                    None => Some(format!("host `{owned_host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".into()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ListPermissionRules {
+                    request_id: req_id,
+                    project_cwd,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_permission_rule_lists.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to list permission rules: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while listing permission rules".into()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_permission_rule_lists.remove(&req_id);
+                    }
+                    Err("Timed out waiting for daemon to list permission rules".into())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "list permission rules task cancelled".to_string())?
+    }
+
+    /// Create or update a persistent permission rule on a connected host.
+    pub async fn upsert_permission_rule_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        rule: UpsertPermissionRuleInput,
+    ) -> Result<PermissionRuleRecord, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to save permission rule".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_permission_rule_updates.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before saving permission rule".into()),
+                    None => Some(format!("host `{owned_host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".into()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::UpsertPermissionRule {
+                    request_id: req_id,
+                    rule,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_permission_rule_updates.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to save permission rule: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while saving permission rule".into()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_permission_rule_updates.remove(&req_id);
+                    }
+                    Err("Timed out waiting for daemon to save permission rule".into())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "upsert permission rule task cancelled".to_string())?
+    }
+
+    /// Delete/revoke a persistent permission rule on a connected host.
+    pub async fn delete_permission_rule_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        rule_id: String,
+    ) -> Result<bool, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to revoke permission rule".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_permission_rule_deletes.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before revoking permission rule".into()),
+                    None => Some(format!("host `{owned_host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".into()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::DeletePermissionRule {
+                    request_id: req_id,
+                    rule_id,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_permission_rule_deletes.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to revoke permission rule: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while revoking permission rule".into()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_permission_rule_deletes.remove(&req_id);
+                    }
+                    Err("Timed out waiting for daemon to revoke permission rule".into())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "delete permission rule task cancelled".to_string())?
+    }
+
+    /// Server-verified safe batch permission resolution on a connected host.
+    pub async fn resolve_permissions_batch_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        items: Vec<(String, String)>,
+        decision: String,
+    ) -> Result<ResolvePermissionsBatchResult, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to resolve permissions".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_permission_batch_resolves.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before batch permission approval".into()),
+                    None => Some(format!("host `{owned_host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".into()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ResolvePermissionsBatch {
+                    request_id: req_id,
+                    items,
+                    decision,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_permission_batch_resolves.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to batch resolve permissions: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while batch resolving permissions".into()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_permission_batch_resolves.remove(&req_id);
+                    }
+                    Err("Timed out waiting for daemon to batch resolve permissions".into())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "resolve permissions batch task cancelled".to_string())?
+    }
+
     /// List configured bidirectional IM channels and active thread bindings on any connected host.
     pub async fn list_im_channels_on_host(
         self: &Arc<Self>,
@@ -15641,9 +17425,12 @@ impl OrbitAppCore {
                 name: req.name,
                 platform: req.platform,
                 enabled: req.enabled,
+                transport_mode: req.transport_mode,
                 app_id: req.app_id,
                 primary_secret: req.primary_secret,
                 signing_secret: req.signing_secret,
+                app_token: req.app_token,
+                public_key: req.public_key,
                 keep_existing_secrets: req.keep_existing_secrets,
                 allowed_chat_ids: req.allowed_chat_ids,
                 allowed_user_ids: req.allowed_user_ids,
@@ -16434,6 +18221,528 @@ impl OrbitAppCore {
             .map_err(|_| "LSP goto-definition task cancelled".to_string())?
     }
 
+    /// Resolve `textDocument/hover` documentation at a 1-based `(line, col)` on any connected host.
+    pub async fn lsp_hover_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: &str,
+        line: u32,
+        col: u32,
+        content: Option<String>,
+    ) -> Result<Option<LspHoverInfo>, String> {
+        let host_id = host_id.to_string();
+        let cwd = cwd.to_string();
+        let path = path.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to inspect hover info".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_lsp_hover.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before hover query".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::LspHover {
+                    request_id: req_id,
+                    cwd,
+                    path,
+                    line,
+                    col,
+                    content,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lsp_hover.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send LSP hover request: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(12), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected during hover query".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lsp_hover.remove(&req_id);
+                    }
+                    Err("Timed out waiting for LSP hover".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "LSP hover task cancelled".to_string())?
+    }
+
+    /// Resolve workspace-confined `textDocument/references` locations on any connected host.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn lsp_references_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: &str,
+        line: u32,
+        col: u32,
+        include_declaration: bool,
+        content: Option<String>,
+    ) -> Result<Vec<LspReferenceLocation>, String> {
+        let host_id = host_id.to_string();
+        let cwd = cwd.to_string();
+        let path = path.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to find references".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_lsp_references.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before references query".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::LspReferences {
+                    request_id: req_id,
+                    cwd,
+                    path,
+                    line,
+                    col,
+                    include_declaration,
+                    content,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lsp_references.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send LSP references request: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while finding references".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lsp_references.remove(&req_id);
+                    }
+                    Err("Timed out waiting for LSP references".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "LSP references task cancelled".to_string())?
+    }
+
+    /// Resolve `textDocument/completion` candidates on any connected host.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn lsp_completion_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: &str,
+        line: u32,
+        col: u32,
+        trigger_character: Option<String>,
+        content: Option<String>,
+    ) -> Result<Vec<LspCompletionItem>, String> {
+        let host_id = host_id.to_string();
+        let cwd = cwd.to_string();
+        let path = path.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to fetch completions".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_lsp_completions.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before completion query".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::LspCompletion {
+                    request_id: req_id,
+                    cwd,
+                    path,
+                    line,
+                    col,
+                    trigger_character,
+                    content,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lsp_completions.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send LSP completion request: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(12), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while fetching completions".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lsp_completions.remove(&req_id);
+                    }
+                    Err("Timed out waiting for LSP completions".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "LSP completion task cancelled".to_string())?
+    }
+
+    /// Resolve `textDocument/codeAction` quick fixes and refactors on any connected host.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn lsp_code_action_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: &str,
+        line: u32,
+        col: u32,
+        end_line: u32,
+        end_col: u32,
+        diagnostics: Vec<LspDiagnostic>,
+        content: Option<String>,
+    ) -> Result<Vec<LspCodeAction>, String> {
+        let host_id = host_id.to_string();
+        let cwd = cwd.to_string();
+        let path = path.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to fetch code actions".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_lsp_code_actions.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before codeAction query".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::LspCodeActionRequest {
+                    request_id: req_id,
+                    cwd,
+                    path,
+                    line,
+                    col,
+                    end_line,
+                    end_col,
+                    diagnostics,
+                    content,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lsp_code_actions.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send LSP codeAction request: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while fetching code actions".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lsp_code_actions.remove(&req_id);
+                    }
+                    Err("Timed out waiting for LSP code actions".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "LSP codeAction task cancelled".to_string())?
+    }
+
+    /// Execute `textDocument/rename` atomically inside the workspace on any connected host.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn lsp_rename_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: &str,
+        line: u32,
+        col: u32,
+        new_name: &str,
+        content: Option<String>,
+    ) -> Result<LspWorkspaceEditResult, String> {
+        let host_id = host_id.to_string();
+        let cwd = cwd.to_string();
+        let path = path.to_string();
+        let new_name = new_name.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to rename symbols".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_lsp_workspace_edits.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before rename".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::LspRename {
+                    request_id: req_id,
+                    cwd,
+                    path,
+                    line,
+                    col,
+                    new_name,
+                    content,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lsp_workspace_edits.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send LSP rename request: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected during symbol rename".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lsp_workspace_edits.remove(&req_id);
+                    }
+                    Err("Timed out waiting for LSP rename".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "LSP rename task cancelled".to_string())?
+    }
+
+    /// Apply a workspace-confined `LspWorkspaceEdit` atomically on any connected host.
+    pub async fn lsp_apply_workspace_edit_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        edit: LspWorkspaceEdit,
+    ) -> Result<LspWorkspaceEditResult, String> {
+        let host_id = host_id.to_string();
+        let cwd = cwd.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to apply workspace edit".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_lsp_workspace_edits.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before applying workspace edit".to_string()),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::LspApplyWorkspaceEdit {
+                    request_id: req_id,
+                    cwd,
+                    edit,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_lsp_workspace_edits.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!(
+                    "failed to send LSP apply-workspace-edit request: {e}"
+                )));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while applying workspace edit".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_lsp_workspace_edits.remove(&req_id);
+                    }
+                    Err("Timed out waiting for LSP workspace edit".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "LSP workspace edit task cancelled".to_string())?
+    }
+
     /// Fetch host-wide cost/token usage insights and quota depletion forecasts for any connected host.
     pub async fn get_usage_insights_on_host(
         self: &Arc<Self>,
@@ -17100,6 +19409,7 @@ impl OrbitAppCore {
                     headless: req.headless,
                     viewport_width: req.viewport_width,
                     viewport_height: req.viewport_height,
+                    workspace_root: req.workspace_root,
                 })
                 .await
             {
@@ -17314,6 +19624,325 @@ impl OrbitAppCore {
         res_rx
             .await
             .map_err(|_| "UpdateBrowserPolicy task cancelled".to_string())?
+    }
+
+    /// Open (or reuse) an automatic local loopback preview forwarder for a running workspace
+    /// service on a remote connected Orbit host over the existing Noise_NK E2EE session.
+    ///
+    /// Local hosts return their direct local URL (`is_tunneled = false`). Remote hosts validate
+    /// the strict workspace-service allowlist on the daemon before binding `127.0.0.1:0`.
+    pub async fn open_remote_preview_tunnel(
+        self: &Arc<Self>,
+        host_id: &str,
+        target_port: u16,
+        proxy_host: Option<String>,
+    ) -> Result<RemotePreviewTunnelView, String> {
+        let host_id_owned = host_id.to_string();
+        let norm_proxy_host = proxy_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split(':').next().unwrap_or(s).trim().to_ascii_lowercase());
+
+        // 1. Check local host fast-path and existing active listener cache.
+        let (session, session_gen) = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id_owned)
+                .ok_or_else(|| format!("host `{host_id_owned}` not found"))?;
+            if h.is_local {
+                let matched_proxy = h
+                    .workspace_scripts
+                    .values()
+                    .flatten()
+                    .find(|s| {
+                        s.port == Some(target_port)
+                            || (norm_proxy_host.is_some()
+                                && s.proxy_url.as_deref().is_some_and(|u| {
+                                    norm_proxy_host.as_deref().is_some_and(|ph| u.contains(ph))
+                                }))
+                    })
+                    .and_then(|s| s.proxy_url.clone());
+                let local_url =
+                    matched_proxy.unwrap_or_else(|| format!("http://127.0.0.1:{target_port}"));
+                return Ok(RemotePreviewTunnelView {
+                    host_id: host_id_owned,
+                    target_port,
+                    proxy_host: norm_proxy_host,
+                    local_port: target_port,
+                    local_url,
+                    is_tunneled: false,
+                });
+            }
+            let key = (target_port, norm_proxy_host.clone());
+            if let Some(existing) = h.active_preview_listeners.get(&key)
+                && existing.session_gen == h.session_gen
+                && !existing.task.is_finished()
+            {
+                return Ok(RemotePreviewTunnelView {
+                    host_id: host_id_owned,
+                    target_port: existing.target_port,
+                    proxy_host: existing.proxy_host.clone(),
+                    local_port: existing.local_port,
+                    local_url: existing.local_url.clone(),
+                    is_tunneled: true,
+                });
+            }
+            let sess = h
+                .session
+                .clone()
+                .ok_or_else(|| format!("host `{host_id_owned}` is currently offline"))?;
+            (sess, h.session_gen)
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            // 2. Preflight-verify allowlist on remote daemon via PreviewTunnelOpen + immediate close.
+            let probe_req_id = Uuid::new_v4();
+            let probe_tunnel_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id_owned) {
+                    Some(h) if h.session.is_some() && h.session_gen == session_gen => {
+                        h.pending_preview_tunnels.insert(probe_req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before opening preview tunnel".to_string()),
+                    None => Some(format!("host `{host_id_owned}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::PreviewTunnelOpen {
+                    request_id: probe_req_id,
+                    tunnel_id: probe_tunnel_id,
+                    target_port,
+                    proxy_host: norm_proxy_host.clone(),
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id_owned)
+                {
+                    h.pending_preview_tunnels.remove(&probe_req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send PreviewTunnelOpen: {e}")));
+                return;
+            }
+            let resolved_port = match await_preview_tunnel_open_ack(
+                &core,
+                &host_id_owned,
+                &session,
+                probe_req_id,
+                probe_tunnel_id,
+                ack_rx,
+                PREVIEW_TUNNEL_OPEN_TIMEOUT,
+            )
+            .await
+            {
+                Ok(port) => {
+                    let _ = session
+                        .send_wire(WireMessage::PreviewTunnelClose {
+                            tunnel_id: probe_tunnel_id,
+                            reason: Some("preflight".to_string()),
+                        })
+                        .await;
+                    port
+                }
+                Err(err) => {
+                    let _ = res_tx.send(Err(err));
+                    return;
+                }
+            };
+
+            // 3. Bind ephemeral loopback-only listener and spawn E2EE stream multiplexer.
+            let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = res_tx.send(Err(format!(
+                        "failed to bind local loopback preview listener: {e}"
+                    )));
+                    return;
+                }
+            };
+            let local_port = match listener.local_addr() {
+                Ok(addr) => addr.port(),
+                Err(e) => {
+                    let _ = res_tx.send(Err(format!(
+                        "failed to read local preview listener port: {e}"
+                    )));
+                    return;
+                }
+            };
+            let local_url = format!("http://127.0.0.1:{local_port}");
+
+            let connections =
+                Arc::new(std::sync::Mutex::new(PreviewListenerConnections::default()));
+            let accept_core = Arc::clone(&core);
+            let accept_host_id = host_id_owned.clone();
+            let accept_session = session.clone();
+            let accept_proxy_host = norm_proxy_host.clone();
+            let accept_connections = Arc::clone(&connections);
+            let accept_task = tokio::spawn(async move {
+                loop {
+                    let (stream, _) = match listener.accept().await {
+                        Ok(pair) => pair,
+                        Err(_) => break,
+                    };
+                    let _ = stream.set_nodelay(true);
+                    let request_id = Uuid::new_v4();
+                    let tunnel_id = Uuid::new_v4();
+
+                    let conn_core = Arc::clone(&accept_core);
+                    let conn_host_id = accept_host_id.clone();
+                    let conn_session = accept_session.clone();
+                    let conn_proxy_host = accept_proxy_host.clone();
+                    let conn_tracker = Arc::clone(&accept_connections);
+                    let conn_handle = tokio::spawn(async move {
+                        pump_remote_preview_connection(
+                            conn_core,
+                            conn_host_id,
+                            session_gen,
+                            conn_session,
+                            request_id,
+                            tunnel_id,
+                            resolved_port,
+                            conn_proxy_host,
+                            conn_tracker,
+                            stream,
+                        )
+                        .await;
+                    });
+                    let abort_handle = conn_handle.abort_handle();
+                    let closed_now = match accept_connections.lock() {
+                        Ok(mut guard) => {
+                            if guard.closed {
+                                true
+                            } else {
+                                guard.conns.insert(
+                                    tunnel_id,
+                                    TrackedPreviewConnection {
+                                        request_id,
+                                        abort_handle: abort_handle.clone(),
+                                    },
+                                );
+                                false
+                            }
+                        }
+                        Err(_) => true,
+                    };
+                    if closed_now {
+                        abort_handle.abort();
+                        break;
+                    }
+                }
+            });
+
+            let view = RemotePreviewTunnelView {
+                host_id: host_id_owned.clone(),
+                target_port: resolved_port,
+                proxy_host: norm_proxy_host.clone(),
+                local_port,
+                local_url: local_url.clone(),
+                is_tunneled: true,
+            };
+
+            let runtime_handle = core.runtime.handle().clone();
+            if let Ok(mut guard) = core.hosts.write() {
+                if let Some(h) = guard.get_mut(&host_id_owned)
+                    && h.session_gen == session_gen
+                {
+                    let key = (target_port, norm_proxy_host.clone());
+                    let new_listener = ActivePreviewListener {
+                        session_gen,
+                        target_port: resolved_port,
+                        proxy_host: norm_proxy_host,
+                        local_port,
+                        local_url,
+                        session: session.clone(),
+                        runtime: runtime_handle,
+                        connections,
+                        task: accept_task.abort_handle(),
+                    };
+                    if let Some(prev) = h.active_preview_listeners.insert(key, new_listener) {
+                        let closed = prev.shutdown_connections();
+                        let mut closed_tids = Vec::with_capacity(closed.len());
+                        for (req_id, tid) in closed {
+                            h.pending_preview_tunnels.remove(&req_id);
+                            h.active_preview_tunnels.remove(&tid);
+                            closed_tids.push(tid);
+                        }
+                        prev.notify_remote_close(closed_tids, "listener_replaced");
+                    }
+                    let _ = res_tx.send(Ok(view));
+                } else {
+                    accept_task.abort();
+                    if let Ok(mut cg) = connections.lock() {
+                        cg.closed = true;
+                        for (_, entry) in cg.conns.drain() {
+                            entry.abort_handle.abort();
+                        }
+                    }
+                    let _ = res_tx.send(Err(
+                        "Host session changed before preview tunnel became active".to_string(),
+                    ));
+                }
+            } else {
+                accept_task.abort();
+                if let Ok(mut cg) = connections.lock() {
+                    cg.closed = true;
+                    for (_, entry) in cg.conns.drain() {
+                        entry.abort_handle.abort();
+                    }
+                }
+                let _ = res_tx.send(Err("host state lock poisoned".to_string()));
+            }
+        });
+        res_rx
+            .await
+            .map_err(|_| "open_remote_preview_tunnel task cancelled".to_string())?
+    }
+
+    /// Close an active remote preview loopback listener for `(host_id, target_port, proxy_host)`.
+    pub fn close_remote_preview_tunnel(
+        &self,
+        host_id: &str,
+        target_port: u16,
+        proxy_host: Option<String>,
+    ) -> Result<bool, String> {
+        let norm_proxy_host = proxy_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split(':').next().unwrap_or(s).trim().to_ascii_lowercase());
+        let mut guard = self
+            .hosts
+            .write()
+            .map_err(|_| "host state lock poisoned".to_string())?;
+        let Some(h) = guard.get_mut(host_id) else {
+            return Ok(false);
+        };
+        let key = (target_port, norm_proxy_host);
+        if let Some(removed) = h.active_preview_listeners.remove(&key) {
+            let closed = removed.shutdown_connections();
+            let mut closed_tids = Vec::with_capacity(closed.len());
+            for (req_id, tid) in closed {
+                h.pending_preview_tunnels.remove(&req_id);
+                h.active_preview_tunnels.remove(&tid);
+                closed_tids.push(tid);
+            }
+            removed.notify_remote_close(closed_tids, "listener_closed");
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     async fn dispatch_workflow_update_rpc(
@@ -19378,6 +22007,145 @@ fn collect_provider_subagent_resubscriptions(h: &HostMemoryState) -> Vec<(String
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct CandidateSearchHit {
+    host_id: String,
+    agent_id: String,
+    seq: u64,
+    turn_id: Option<String>,
+    role: String,
+    snippet: String,
+    timestamp_rfc3339: Option<String>,
+    bm25_score: f64,
+    agent_title: Option<String>,
+    cwd: Option<String>,
+    from_local: bool,
+    from_remote: bool,
+}
+
+impl CandidateSearchHit {
+    fn from_local(hit: orbit_store::MessageSearchHit) -> Self {
+        Self {
+            host_id: hit.host_id,
+            agent_id: hit.agent_id,
+            seq: hit.seq,
+            turn_id: hit.turn_id,
+            role: hit.role,
+            snippet: hit.snippet,
+            timestamp_rfc3339: hit.timestamp_rfc3339,
+            bm25_score: if hit.rank.is_finite() { hit.rank } else { 0.0 },
+            agent_title: None,
+            cwd: None,
+            from_local: true,
+            from_remote: false,
+        }
+    }
+
+    fn from_remote(host_id: String, hit: RemoteMessageSearchHit) -> Self {
+        Self {
+            host_id,
+            agent_id: hit.agent_id,
+            seq: hit.seq,
+            turn_id: hit.turn_id,
+            role: hit.role,
+            snippet: hit.snippet,
+            timestamp_rfc3339: hit.timestamp,
+            bm25_score: if hit.bm25_score.is_finite() {
+                hit.bm25_score
+            } else {
+                0.0
+            },
+            agent_title: (!hit.agent_title.trim().is_empty()).then_some(hit.agent_title),
+            cwd: (!hit.cwd.trim().is_empty()).then_some(hit.cwd),
+            from_local: false,
+            from_remote: true,
+        }
+    }
+}
+
+/// Lower score = better rank, preserving SQLite FTS5 BM25 convention (more negative is stronger)
+/// while adding a gentle bounded recency bonus (`[-0.35, 0.0]`) so near-ties favor fresh hits.
+fn combined_search_rank_score(
+    bm25_score: f64,
+    timestamp_rfc3339: Option<&str>,
+    now: chrono::DateTime<Utc>,
+) -> f64 {
+    let base = if bm25_score.is_finite() {
+        bm25_score
+    } else {
+        0.0
+    };
+    let recency_bonus = timestamp_rfc3339
+        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        .map(|dt| {
+            let age_secs = (now - dt.with_timezone(&Utc)).num_seconds().max(0) as f64;
+            let age_days = age_secs / 86_400.0;
+            -0.35 / (1.0 + age_days / 7.0)
+        })
+        .unwrap_or(0.0);
+    base + recency_bonus
+}
+
+/// Merge local replica and remote daemon hits, deduplicating by `(host_id, agent_id, seq)` and
+/// ranking deterministically by BM25 + recency.
+fn merge_and_rank_search_candidates(
+    local: Vec<CandidateSearchHit>,
+    remote: Vec<CandidateSearchHit>,
+    now: chrono::DateTime<Utc>,
+) -> Vec<CandidateSearchHit> {
+    let mut by_key: HashMap<(String, String, u64), CandidateSearchHit> =
+        HashMap::with_capacity(local.len() + remote.len());
+
+    for cand in local {
+        let key = (cand.host_id.clone(), cand.agent_id.clone(), cand.seq);
+        by_key.entry(key).or_insert(cand);
+    }
+
+    for cand in remote {
+        let key = (cand.host_id.clone(), cand.agent_id.clone(), cand.seq);
+        if let Some(existing) = by_key.get_mut(&key) {
+            existing.from_remote = true;
+            if cand.bm25_score.is_finite() && cand.bm25_score < existing.bm25_score {
+                existing.bm25_score = cand.bm25_score;
+            }
+            if existing.turn_id.is_none() && cand.turn_id.is_some() {
+                existing.turn_id = cand.turn_id;
+            }
+            if existing
+                .timestamp_rfc3339
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+                && cand.timestamp_rfc3339.is_some()
+            {
+                existing.timestamp_rfc3339 = cand.timestamp_rfc3339;
+            }
+            if existing.snippet.trim().is_empty() && !cand.snippet.trim().is_empty() {
+                existing.snippet = cand.snippet;
+            }
+            if existing.agent_title.is_none() && cand.agent_title.is_some() {
+                existing.agent_title = cand.agent_title;
+            }
+            if existing.cwd.is_none() && cand.cwd.is_some() {
+                existing.cwd = cand.cwd;
+            }
+        } else {
+            by_key.insert(key, cand);
+        }
+    }
+
+    let mut merged: Vec<CandidateSearchHit> = by_key.into_values().collect();
+    merged.sort_by(|a, b| {
+        let sa = combined_search_rank_score(a.bm25_score, a.timestamp_rfc3339.as_deref(), now);
+        let sb = combined_search_rank_score(b.bm25_score, b.timestamp_rfc3339.as_deref(), now);
+        sa.total_cmp(&sb)
+            .then_with(|| b.seq.cmp(&a.seq))
+            .then_with(|| a.host_id.cmp(&b.host_id))
+            .then_with(|| a.agent_id.cmp(&b.agent_id))
+    });
+    merged
+}
+
 fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     for (_, tx) in h.pending_attachment_acks.drain() {
         let _ = tx.send(Err(reason.to_string()));
@@ -19386,6 +22154,9 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_symbol_searches.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_message_searches.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_file_writes.drain() {
@@ -19421,6 +22192,9 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     for (_, tx) in h.pending_git_mutations.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
+    for (_, tx) in h.pending_git_collab_queries.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
     for (_, tx) in h.pending_acp_probes.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
@@ -19444,6 +22218,12 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_artifact_deletes.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_mcp_resource_reads.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_artifact_mcp_tool_calls.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, (_, tx)) in h.pending_managed_skills_lists.drain() {
@@ -19472,6 +22252,21 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     for (_, tx) in h.pending_lsp_locations.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
+    for (_, tx) in h.pending_lsp_hover.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_lsp_references.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_lsp_completions.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_lsp_code_actions.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_lsp_workspace_edits.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
     for (_, tx) in h.pending_usage_insights.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
@@ -19495,6 +22290,18 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     }
     h.background_timer_list_reqs.clear();
     for (_, tx) in h.pending_guardian_configs.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_permission_rule_lists.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_permission_rule_updates.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_permission_rule_deletes.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_permission_batch_resolves.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_goal_updates.drain() {
@@ -19523,6 +22330,13 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     }
     for (_, tx) in h.pending_browser_actions.drain() {
         let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_preview_tunnels.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    h.active_preview_tunnels.clear();
+    for (_, listener) in h.active_preview_listeners.drain() {
+        let _ = listener.shutdown_connections();
     }
     for (_, tx) in h.pending_workflow_updates.drain() {
         let _ = tx.send(Err(reason.to_string()));
@@ -19564,8 +22378,320 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     // Dropping pending daemon-upgrade ack senders lets `upgrade_host_daemon_over_wire` observe
     // `RecvError` immediately when the remote daemon disconnects to hot-restart.
     h.pending_daemon_upgrades.clear();
+    for (_, tx) in h.pending_plan_approval_acks.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
     for (_, tx) in h.pending_upgrade_terminals.drain() {
         let _ = tx.send(Err(reason.to_string()));
+    }
+}
+
+fn enqueue_client_preview_tunnel_data(
+    active_tunnels: &mut HashMap<Uuid, PreviewTunnelSink>,
+    tunnel_id: Uuid,
+    payload_b64: &str,
+) -> Result<(), &'static str> {
+    use base64::Engine as _;
+
+    if !active_tunnels.contains_key(&tunnel_id) {
+        return Ok(());
+    }
+    let fail = |tunnels: &mut HashMap<Uuid, PreviewTunnelSink>, reason: &'static str| {
+        if let Some(removed) = tunnels.remove(&tunnel_id) {
+            let _ = removed.cancel_tx.send(true);
+        }
+        Err(reason)
+    };
+
+    if payload_b64.is_empty() {
+        return fail(active_tunnels, "empty preview tunnel frame");
+    }
+    if payload_b64.len() > (MAX_PREVIEW_TUNNEL_INBOUND_FRAME_BYTES / 3 + 2) * 4 {
+        return fail(active_tunnels, "preview tunnel frame exceeds size limit");
+    }
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload_b64) else {
+        return fail(active_tunnels, "invalid preview tunnel base64 payload");
+    };
+    let len = bytes.len();
+    if len == 0 {
+        return fail(active_tunnels, "empty preview tunnel frame");
+    }
+    if len > MAX_PREVIEW_TUNNEL_INBOUND_FRAME_BYTES {
+        return fail(active_tunnels, "preview tunnel frame exceeds size limit");
+    }
+
+    let send_err = {
+        let Some(sink) = active_tunnels.get(&tunnel_id) else {
+            return Ok(());
+        };
+        let reserved = {
+            let mut cur = sink.queued_bytes.load(std::sync::atomic::Ordering::Acquire);
+            loop {
+                let Some(next) = cur
+                    .checked_add(len)
+                    .filter(|n| *n <= MAX_PREVIEW_TUNNEL_QUEUED_BYTES)
+                else {
+                    break false;
+                };
+                match sink.queued_bytes.compare_exchange_weak(
+                    cur,
+                    next,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                ) {
+                    Ok(_) => break true,
+                    Err(actual) => cur = actual,
+                }
+            }
+        };
+        if !reserved {
+            Some("preview tunnel byte buffer overflow")
+        } else {
+            let chunk = ClientQueuedPreviewBytes {
+                data: bytes,
+                len,
+                queued_bytes: Arc::clone(&sink.queued_bytes),
+            };
+            match sink.tx.try_send(chunk) {
+                Ok(()) => None,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    Some("preview tunnel frame queue overflow")
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    Some("preview tunnel closed")
+                }
+            }
+        }
+    };
+
+    if let Some(reason) = send_err {
+        return fail(active_tunnels, reason);
+    }
+    Ok(())
+}
+
+fn cleanup_failed_preview_tunnel_open(
+    core: &Arc<OrbitAppCore>,
+    host_id: &str,
+    request_id: Uuid,
+    tunnel_id: Uuid,
+) {
+    if let Ok(mut guard) = core.hosts.write()
+        && let Some(h) = guard.get_mut(host_id)
+    {
+        h.pending_preview_tunnels.remove(&request_id);
+        h.active_preview_tunnels.remove(&tunnel_id);
+    }
+}
+
+async fn await_preview_tunnel_open_ack(
+    core: &Arc<OrbitAppCore>,
+    host_id: &str,
+    session: &HostSessionHandle,
+    request_id: Uuid,
+    tunnel_id: Uuid,
+    ack_rx: tokio::sync::oneshot::Receiver<Result<u16, String>>,
+    timeout: Duration,
+) -> Result<u16, String> {
+    match tokio::time::timeout(timeout, ack_rx).await {
+        Ok(Ok(Ok(port))) => Ok(port),
+        Ok(Ok(Err(err))) => {
+            cleanup_failed_preview_tunnel_open(core, host_id, request_id, tunnel_id);
+            Err(err)
+        }
+        Ok(Err(_)) => {
+            cleanup_failed_preview_tunnel_open(core, host_id, request_id, tunnel_id);
+            let _ = session
+                .send_wire(WireMessage::PreviewTunnelClose {
+                    tunnel_id,
+                    reason: Some("open_abandoned".to_string()),
+                })
+                .await;
+            Err("Host disconnected while opening remote preview service tunnel".to_string())
+        }
+        Err(_) => {
+            cleanup_failed_preview_tunnel_open(core, host_id, request_id, tunnel_id);
+            let _ = session
+                .send_wire(WireMessage::PreviewTunnelClose {
+                    tunnel_id,
+                    reason: Some("open_timeout".to_string()),
+                })
+                .await;
+            Err("Timed out verifying remote preview service tunnel".to_string())
+        }
+    }
+}
+
+async fn wait_client_tunnel_cancelled(cancel_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    if *cancel_rx.borrow() {
+        return;
+    }
+    while cancel_rx.changed().await.is_ok() {
+        if *cancel_rx.borrow() {
+            return;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pump_remote_preview_connection(
+    core: Arc<OrbitAppCore>,
+    host_id: String,
+    session_gen: u64,
+    session: HostSessionHandle,
+    request_id: Uuid,
+    tunnel_id: Uuid,
+    target_port: u16,
+    proxy_host: Option<String>,
+    connections: Arc<std::sync::Mutex<PreviewListenerConnections>>,
+    stream: tokio::net::TcpStream,
+) {
+    use base64::Engine as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    let (down_tx, mut down_rx) =
+        tokio::sync::mpsc::channel::<ClientQueuedPreviewBytes>(MAX_PREVIEW_TUNNEL_QUEUED_FRAMES);
+    let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+
+    let registered = match core.hosts.write() {
+        Ok(mut guard) => match guard.get_mut(&host_id) {
+            Some(h) if h.session.is_some() && h.session_gen == session_gen => {
+                h.pending_preview_tunnels.insert(request_id, ack_tx);
+                h.active_preview_tunnels.insert(
+                    tunnel_id,
+                    PreviewTunnelSink {
+                        tx: down_tx,
+                        queued_bytes: Arc::clone(&queued_bytes),
+                        cancel_tx,
+                    },
+                );
+                true
+            }
+            _ => false,
+        },
+        Err(_) => false,
+    };
+    if !registered {
+        if let Ok(mut guard) = connections.lock() {
+            guard.conns.remove(&tunnel_id);
+        }
+        return;
+    }
+
+    if session
+        .send_wire(WireMessage::PreviewTunnelOpen {
+            request_id,
+            tunnel_id,
+            target_port,
+            proxy_host,
+        })
+        .await
+        .is_err()
+    {
+        cleanup_failed_preview_tunnel_open(&core, &host_id, request_id, tunnel_id);
+        if let Ok(mut guard) = connections.lock() {
+            guard.conns.remove(&tunnel_id);
+        }
+        return;
+    }
+
+    if await_preview_tunnel_open_ack(
+        &core,
+        &host_id,
+        &session,
+        request_id,
+        tunnel_id,
+        ack_rx,
+        PREVIEW_TUNNEL_OPEN_TIMEOUT,
+    )
+    .await
+    .is_err()
+    {
+        if let Ok(mut guard) = connections.lock() {
+            guard.conns.remove(&tunnel_id);
+        }
+        return;
+    }
+
+    let (mut tcp_reader, mut tcp_writer) = stream.into_split();
+
+    let mut write_task = tokio::spawn(async move {
+        while let Some(chunk) = down_rx.recv().await {
+            if tcp_writer.write_all(&chunk.data).await.is_err() {
+                return Err(());
+            }
+            drop(chunk);
+        }
+        let _ = tcp_writer.shutdown().await;
+        Ok::<(), ()>(())
+    });
+    let _write_guard = AbortPreviewTaskOnDrop(write_task.abort_handle());
+
+    let read_session = session.clone();
+    let mut read_task = tokio::spawn(async move {
+        let mut read_buf = vec![0u8; 32 * 1024];
+        loop {
+            match tcp_reader.read(&mut read_buf).await {
+                Ok(0) => return Ok::<(), ()>(()),
+                Ok(n) => {
+                    let payload_b64 =
+                        base64::engine::general_purpose::STANDARD.encode(&read_buf[..n]);
+                    if read_session
+                        .send_wire(WireMessage::PreviewTunnelData {
+                            tunnel_id,
+                            payload_b64,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Err(());
+                    }
+                }
+                Err(_) => return Err(()),
+            }
+        }
+    });
+    let _read_guard = AbortPreviewTaskOnDrop(read_task.abort_handle());
+
+    let mut read_done = false;
+    let cancelled_by_overflow = loop {
+        tokio::select! {
+            write_res = &mut write_task => {
+                let _ = write_res;
+                break false;
+            }
+            read_res = &mut read_task, if !read_done => {
+                read_done = true;
+                if !matches!(read_res, Ok(Ok(()))) {
+                    break false;
+                }
+            }
+            _ = wait_client_tunnel_cancelled(&mut cancel_rx) => {
+                break true;
+            }
+        }
+    };
+
+    drop(_write_guard);
+    drop(_read_guard);
+
+    if let Ok(mut guard) = core.hosts.write()
+        && let Some(h) = guard.get_mut(&host_id)
+    {
+        h.active_preview_tunnels.remove(&tunnel_id);
+    }
+    if let Ok(mut guard) = connections.lock() {
+        guard.conns.remove(&tunnel_id);
+    }
+    if !cancelled_by_overflow {
+        let _ = session
+            .send_wire(WireMessage::PreviewTunnelClose {
+                tunnel_id,
+                reason: None,
+            })
+            .await;
     }
 }
 
@@ -20747,6 +23873,7 @@ fn render_timeline_event_view(
             detail,
             allowed_decisions,
             guardian_assessment,
+            plan_approval,
         } => Some(TimelineItemView::PermissionRequest {
             seq: ev.seq,
             request_id: request_id.clone(),
@@ -20755,6 +23882,7 @@ fn render_timeline_event_view(
             allowed_decisions: allowed_decisions.clone(),
             resolved_decision: all_resolved_perms.get(request_id).cloned(),
             guardian_assessment: guardian_assessment.clone(),
+            plan_approval: plan_approval.clone(),
             timestamp_ms: ts_ms,
         }),
         TimelinePayload::QuestionRequest {
@@ -22788,6 +25916,7 @@ mod tests {
                             },
                             allowed_decisions: vec!["allow_once".into()],
                             guardian_assessment: None,
+                            plan_approval: None,
                         },
                     },
                     TimelineEvent {
@@ -25634,6 +28763,323 @@ mod tests {
     }
 
     #[test]
+    fn merge_and_rank_search_candidates_dedupes_and_ranks_by_bm25_and_recency() {
+        let now = Utc::now();
+        let old_ts = (now - chrono::Duration::days(60)).to_rfc3339();
+        let fresh_ts = (now - chrono::Duration::minutes(5)).to_rfc3339();
+
+        let local = vec![
+            CandidateSearchHit {
+                host_id: "host_a".into(),
+                agent_id: "ag_1".into(),
+                seq: 50,
+                turn_id: None,
+                role: "assistant".into(),
+                snippet: "local snippet".into(),
+                timestamp_rfc3339: Some(fresh_ts.clone()),
+                bm25_score: -2.0,
+                agent_title: None,
+                cwd: None,
+                from_local: true,
+                from_remote: false,
+            },
+            CandidateSearchHit {
+                host_id: "host_a".into(),
+                agent_id: "ag_2".into(),
+                seq: 10,
+                turn_id: Some("t_old".into()),
+                role: "user".into(),
+                snippet: "older tie".into(),
+                timestamp_rfc3339: Some(old_ts.clone()),
+                bm25_score: -2.0,
+                agent_title: None,
+                cwd: None,
+                from_local: true,
+                from_remote: false,
+            },
+        ];
+
+        let remote = vec![
+            // Duplicate of (host_a, ag_1, 50) carrying richer turn_id & better BM25
+            CandidateSearchHit {
+                host_id: "host_a".into(),
+                agent_id: "ag_1".into(),
+                seq: 50,
+                turn_id: Some("turn_50".into()),
+                role: "assistant".into(),
+                snippet: "remote snippet".into(),
+                timestamp_rfc3339: Some(fresh_ts),
+                bm25_score: -2.5,
+                agent_title: Some("Alpha Thread".into()),
+                cwd: Some("/repo/alpha".into()),
+                from_local: false,
+                from_remote: true,
+            },
+            // Unloaded deep historical remote hit with strongest BM25
+            CandidateSearchHit {
+                host_id: "host_a".into(),
+                agent_id: "ag_1".into(),
+                seq: 3,
+                turn_id: Some("turn_1".into()),
+                role: "user".into(),
+                snippet: "historical <mark>match</mark>".into(),
+                timestamp_rfc3339: Some(old_ts),
+                bm25_score: -6.5,
+                agent_title: Some("Alpha Thread".into()),
+                cwd: Some("/repo/alpha".into()),
+                from_local: false,
+                from_remote: true,
+            },
+        ];
+
+        let merged = merge_and_rank_search_candidates(local, remote, now);
+        assert_eq!(
+            merged.len(),
+            3,
+            "duplicate (host_a, ag_1, 50) must collapse"
+        );
+
+        // Strongest BM25 (-6.5) ranks first even though older
+        assert_eq!(merged[0].seq, 3);
+        assert!(!merged[0].from_local && merged[0].from_remote);
+
+        // Deduped hit (seq 50) merges remote turn_id & improved score (-2.5) and ranks second
+        assert_eq!(merged[1].seq, 50);
+        assert!(merged[1].from_local && merged[1].from_remote);
+        assert_eq!(merged[1].turn_id.as_deref(), Some("turn_50"));
+
+        // Older weaker hit ranks third
+        assert_eq!(merged[2].agent_id, "ag_2");
+        assert_eq!(merged[2].seq, 10);
+    }
+
+    #[test]
+    fn search_messages_remote_merges_unloaded_remote_hits_and_handles_offline_hosts() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let now = Utc::now();
+
+        let make_host = |id: &str, name: &str, state: HostConnectionState| SavedHostProfile {
+            host_id: id.into(),
+            hostname: format!("{id}.internal"),
+            custom_name: Some(name.into()),
+            ssh_alias: None,
+            route_mode: HostRouteMode::Auto,
+            remote_daemon_port: 6868,
+            custom_direct_endpoint: None,
+            daemon_pubkey_b64: format!("pk_{id}"),
+            direct_endpoints: vec![],
+            relay_url: None,
+            pairing_secret: String::new(),
+            pairing_secret_updated_at_ms: 0,
+            state,
+        };
+
+        let make_agent = |id: &str, title: &str, cwd: &str| AgentSummary {
+            agent_id: id.into(),
+            workspace_id: "ws_1".into(),
+            cwd: cwd.into(),
+            title: title.into(),
+            provider: ProviderKind::ClaudeCode,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::Default,
+            status: AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 120,
+            timeline_epoch: 1,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
+        };
+
+        // 1. Register an offline host (session: None) with a locally replicated tail event at seq 20
+        //    and an online host wired to a synthetic outbound wire receiver.
+        let (online_session, mut wire_rx) = crate::HostSessionHandle::new_test_channel();
+        let ag_online = make_agent("ag_big", "Large Paginated Thread", "/workspace/orbit");
+        let ag_offline = make_agent("ag_off", "Offline Mac", "/workspace/offline");
+
+        let tail_ev_online = TimelineEvent {
+            seq: 110,
+            epoch: 1,
+            agent_id: "ag_big".into(),
+            turn_id: Some("turn_110".into()),
+            timestamp: now,
+            payload: TimelinePayload::AssistantMessage {
+                item_id: "tail_110".into(),
+                text: "Tail replica mentions orbit_deep_token once".into(),
+                streaming: false,
+            },
+        };
+        let tail_ev_offline = TimelineEvent {
+            seq: 20,
+            epoch: 1,
+            agent_id: "ag_off".into(),
+            turn_id: Some("turn_20".into()),
+            timestamp: now,
+            payload: TimelinePayload::UserPrompt {
+                message_id: "off_20".into(),
+                text: "Offline host still finds orbit_deep_token locally".into(),
+                badges: Vec::new(),
+            },
+        };
+
+        core.store
+            .upsert_replica_agents("host_online", std::slice::from_ref(&ag_online))
+            .expect("rep online");
+        core.store
+            .upsert_replica_agents("host_offline", std::slice::from_ref(&ag_offline))
+            .expect("rep offline");
+        core.store
+            .upsert_replica_timeline_event_for_host("host_online", &tail_ev_online)
+            .expect("rep ev online");
+        core.store
+            .upsert_replica_timeline_event_for_host("host_offline", &tail_ev_offline)
+            .expect("rep ev offline");
+
+        {
+            let mut guard = core.hosts.write().expect("hosts write");
+            let mut online_state = HostMemoryState::new(make_host(
+                "host_online",
+                "Devbox",
+                HostConnectionState::OnlineDirect,
+            ));
+            online_state.session = Some(online_session);
+            online_state
+                .agents
+                .insert("ag_big".into(), ag_online.clone());
+            // Loaded timeline window starts at seq 110 -> seq 5 is unloaded!
+            online_state
+                .timelines
+                .insert("ag_big".into(), vec![tail_ev_online.clone()]);
+            online_state
+                .timeline_has_older
+                .insert("ag_big".into(), true);
+            guard.insert("host_online".into(), online_state);
+
+            let mut offline_state = HostMemoryState::new(make_host(
+                "host_offline",
+                "Laptop",
+                HostConnectionState::Disconnected,
+            ));
+            offline_state
+                .agents
+                .insert("ag_off".into(), ag_offline.clone());
+            offline_state
+                .timelines
+                .insert("ag_off".into(), vec![tail_ev_offline.clone()]);
+            guard.insert("host_offline".into(), offline_state);
+        }
+
+        // Spawn simulated daemon responder for `host_online`
+        let core_responder = Arc::clone(&core);
+        let responder_ts = now.to_rfc3339();
+        core.runtime.spawn(async move {
+            if let Some(crate::OutboundPayload::Wire(WireMessage::SearchMessages {
+                request_id,
+                query,
+                agent_id,
+                ..
+            })) = wire_rx.recv().await
+            {
+                assert_eq!(query, "orbit_deep_token");
+                assert_eq!(agent_id, None);
+                core_responder.handle_inbound_wire(
+                    "host_online",
+                    WireMessage::SearchMessagesResult {
+                        request_id,
+                        hits: vec![
+                            // Duplicate of tail seq 110
+                            RemoteMessageSearchHit {
+                                agent_id: "ag_big".into(),
+                                seq: 110,
+                                turn_id: Some("turn_110".into()),
+                                role: "assistant".into(),
+                                snippet: "Tail replica mentions <mark>orbit_deep_token</mark> once"
+                                    .into(),
+                                timestamp: Some(responder_ts.clone()),
+                                bm25_score: -1.5,
+                                agent_title: "Large Paginated Thread".into(),
+                                cwd: "/workspace/orbit".into(),
+                            },
+                            // Unloaded historical seq 5 not present in client replica!
+                            RemoteMessageSearchHit {
+                                agent_id: "ag_big".into(),
+                                seq: 5,
+                                turn_id: Some("turn_1".into()),
+                                role: "user".into(),
+                                snippet: "Early turn <mark>orbit_deep_token</mark> origin".into(),
+                                timestamp: Some(responder_ts),
+                                bm25_score: -5.2,
+                                agent_title: "Large Paginated Thread".into(),
+                                cwd: "/workspace/orbit".into(),
+                            },
+                        ],
+                    },
+                );
+            }
+        });
+
+        let resp = core.search_messages_remote_blocking(SearchMessagesRequest {
+            query: "orbit_deep_token".into(),
+            host_id: None,
+            agent_id: None,
+            limit: Some(20),
+        });
+        assert_eq!(resp.remote_hosts_queried, 1);
+        assert_eq!(resp.remote_hosts_failed, 0);
+        assert_eq!(
+            resp.hits.len(),
+            3,
+            "unloaded seq 5 + deduped seq 110 + offline seq 20"
+        );
+
+        let unloaded_hit = resp
+            .hits
+            .iter()
+            .find(|h| h.host_id == "host_online" && h.agent_id == "ag_big" && h.seq == 5)
+            .expect("unloaded remote hit");
+        assert!(unloaded_hit.is_remote);
+        assert!(unloaded_hit.is_unloaded);
+        assert_eq!(unloaded_hit.turn_id.as_deref(), Some("turn_1"));
+        assert_eq!(unloaded_hit.host_name, "Devbox");
+        assert_eq!(unloaded_hit.project_name, "orbit");
+
+        let loaded_hit = resp
+            .hits
+            .iter()
+            .find(|h| h.host_id == "host_online" && h.agent_id == "ag_big" && h.seq == 110)
+            .expect("deduped tail hit");
+        assert!(!loaded_hit.is_remote);
+        assert!(!loaded_hit.is_unloaded);
+
+        let offline_hit = resp
+            .hits
+            .iter()
+            .find(|h| h.host_id == "host_offline" && h.agent_id == "ag_off" && h.seq == 20)
+            .expect("offline local hit preserved");
+        assert!(!offline_hit.is_remote);
+        assert!(!offline_hit.is_unloaded);
+    }
+
+    #[test]
     fn agent_forked_updates_host_state_and_projects_provenance_card() {
         let core = OrbitAppCore::open_in_memory().expect("open core");
         let now = Utc::now();
@@ -25899,6 +29345,7 @@ mod tests {
             language: Some("html".into()),
             mime_type: Some("text/html".into()),
             resource_uri: None,
+            mcp_server_name: None,
             version: 5,
             byte_len: 100,
             created_at: now,
@@ -25913,6 +29360,7 @@ mod tests {
             language: None,
             mime_type: Some("text/markdown".into()),
             resource_uri: None,
+            mcp_server_name: None,
             version: 1,
             byte_len: 50,
             created_at: now,
@@ -27906,5 +31354,283 @@ mod tests {
             }
             other => panic!("unexpected outbound payload: {other:?}"),
         }
+    }
+
+    #[test]
+    fn client_preview_tunnel_bounded_queue_rejects_empty_and_overflow_and_refunds_bytes() {
+        use base64::Engine as _;
+
+        // 1. Empty frame rejected + cancels tunnel.
+        {
+            let tid = Uuid::new_v4();
+            let (tx, _rx) = tokio::sync::mpsc::channel(MAX_PREVIEW_TUNNEL_QUEUED_FRAMES);
+            let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let mut active = HashMap::new();
+            active.insert(
+                tid,
+                PreviewTunnelSink {
+                    tx,
+                    queued_bytes,
+                    cancel_tx,
+                },
+            );
+            let err = enqueue_client_preview_tunnel_data(&mut active, tid, "")
+                .expect_err("empty frame must fail");
+            assert!(err.contains("empty"));
+            assert!(!active.contains_key(&tid));
+            assert!(*cancel_rx.borrow());
+        }
+
+        // 2. Frame count cap (64 frames) rejects 65th frame non-blockingly and refunds bytes on drop.
+        {
+            let tid = Uuid::new_v4();
+            let (tx, rx) = tokio::sync::mpsc::channel(MAX_PREVIEW_TUNNEL_QUEUED_FRAMES);
+            let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let mut active = HashMap::new();
+            active.insert(
+                tid,
+                PreviewTunnelSink {
+                    tx,
+                    queued_bytes: Arc::clone(&queued_bytes),
+                    cancel_tx,
+                },
+            );
+            let b64 = base64::engine::general_purpose::STANDARD.encode(b"01234567");
+            for _ in 0..MAX_PREVIEW_TUNNEL_QUEUED_FRAMES {
+                enqueue_client_preview_tunnel_data(&mut active, tid, &b64)
+                    .expect("within frame cap");
+            }
+            assert_eq!(
+                queued_bytes.load(std::sync::atomic::Ordering::Acquire),
+                MAX_PREVIEW_TUNNEL_QUEUED_FRAMES * 8
+            );
+            let err = enqueue_client_preview_tunnel_data(&mut active, tid, &b64)
+                .expect_err("65th frame must overflow");
+            assert!(err.contains("frame queue overflow"));
+            assert!(!active.contains_key(&tid));
+            assert!(*cancel_rx.borrow());
+            drop(rx);
+            assert_eq!(queued_bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+        }
+
+        // 3. Byte cap (4 MiB) rejects overflow before hitting frame cap.
+        {
+            let tid = Uuid::new_v4();
+            let (tx, rx) = tokio::sync::mpsc::channel(MAX_PREVIEW_TUNNEL_QUEUED_FRAMES);
+            let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let mut active = HashMap::new();
+            active.insert(
+                tid,
+                PreviewTunnelSink {
+                    tx,
+                    queued_bytes: Arc::clone(&queued_bytes),
+                    cancel_tx,
+                },
+            );
+            let b64 = base64::engine::general_purpose::STANDARD
+                .encode(vec![0xCDu8; MAX_PREVIEW_TUNNEL_INBOUND_FRAME_BYTES]);
+            let max_chunks =
+                MAX_PREVIEW_TUNNEL_QUEUED_BYTES / MAX_PREVIEW_TUNNEL_INBOUND_FRAME_BYTES;
+            for _ in 0..max_chunks {
+                enqueue_client_preview_tunnel_data(&mut active, tid, &b64)
+                    .expect("within byte cap");
+            }
+            let err = enqueue_client_preview_tunnel_data(&mut active, tid, &b64)
+                .expect_err("exceeding 4 MiB byte cap must overflow");
+            assert!(err.contains("byte buffer overflow"));
+            assert!(!active.contains_key(&tid));
+            assert!(*cancel_rx.borrow());
+            drop(rx);
+            assert_eq!(queued_bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn client_preview_tunnel_open_timeout_and_listener_close_send_remote_close() {
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("open core");
+        let (session_handle, mut out_rx) = crate::HostSessionHandle::new_test_channel();
+        let host_id = "h_preview_cleanup";
+        {
+            let mut hosts = core.hosts.write().expect("write hosts");
+            let mut h = HostMemoryState::new(SavedHostProfile {
+                host_id: host_id.to_string(),
+                hostname: "remote-devbox".to_string(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 6868,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk_preview".to_string(),
+                direct_endpoints: vec![],
+                relay_url: Some("wss://relay.example".to_string()),
+                pairing_secret: "secret".to_string(),
+                pairing_secret_updated_at_ms: 0,
+                state: HostConnectionState::OnlineRelay,
+            });
+            h.session = Some(session_handle.clone());
+            hosts.insert(host_id.to_string(), h);
+        }
+
+        // 1. Open timeout MUST clean up maps AND send PreviewTunnelClose { reason: "open_timeout" }.
+        let timeout_req_id = Uuid::new_v4();
+        let timeout_tid = Uuid::new_v4();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let (down_tx, _down_rx) = tokio::sync::mpsc::channel(4);
+        let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
+        {
+            let mut hosts = core.hosts.write().expect("write hosts");
+            let h = hosts.get_mut(host_id).expect("host");
+            h.pending_preview_tunnels.insert(timeout_req_id, ack_tx);
+            h.active_preview_tunnels.insert(
+                timeout_tid,
+                PreviewTunnelSink {
+                    tx: down_tx,
+                    queued_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    cancel_tx,
+                },
+            );
+        }
+
+        let err = core
+            .runtime
+            .block_on(await_preview_tunnel_open_ack(
+                &core,
+                host_id,
+                &session_handle,
+                timeout_req_id,
+                timeout_tid,
+                ack_rx,
+                Duration::from_millis(25),
+            ))
+            .expect_err("timed-out open must return Err");
+        assert!(err.contains("Timed out"));
+        {
+            let hosts = core.hosts.read().expect("read hosts");
+            let h = hosts.get(host_id).expect("host");
+            assert!(!h.pending_preview_tunnels.contains_key(&timeout_req_id));
+            assert!(!h.active_preview_tunnels.contains_key(&timeout_tid));
+        }
+        let close_msg = core.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+                .await
+                .expect("PreviewTunnelClose sent on timeout")
+                .expect("channel open")
+        });
+        assert!(
+            matches!(
+                close_msg,
+                crate::OutboundPayload::Wire(WireMessage::PreviewTunnelClose {
+                    tunnel_id,
+                    reason: Some(ref r),
+                }) if tunnel_id == timeout_tid && r == "open_timeout"
+            ),
+            "unexpected open-timeout wire frame: {close_msg:?}"
+        );
+
+        // 2. Closing a listener MUST abort all tracked active connections AND send
+        //    PreviewTunnelClose for every active tunnel_id!
+        let req1 = Uuid::new_v4();
+        let tid1 = Uuid::new_v4();
+        let req2 = Uuid::new_v4();
+        let tid2 = Uuid::new_v4();
+        let (accept_handle, conn1_handle, conn2_handle) = core.runtime.block_on(async {
+            let accept = tokio::spawn(std::future::pending::<()>()).abort_handle();
+            let c1 = tokio::spawn(std::future::pending::<()>()).abort_handle();
+            let c2 = tokio::spawn(std::future::pending::<()>()).abort_handle();
+            (accept, c1, c2)
+        });
+        let connections = Arc::new(std::sync::Mutex::new(PreviewListenerConnections {
+            closed: false,
+            conns: HashMap::from([
+                (
+                    tid1,
+                    TrackedPreviewConnection {
+                        request_id: req1,
+                        abort_handle: conn1_handle.clone(),
+                    },
+                ),
+                (
+                    tid2,
+                    TrackedPreviewConnection {
+                        request_id: req2,
+                        abort_handle: conn2_handle.clone(),
+                    },
+                ),
+            ]),
+        }));
+        {
+            let mut hosts = core.hosts.write().expect("write hosts");
+            let h = hosts.get_mut(host_id).expect("host");
+            for tid in [tid1, tid2] {
+                let (dtx, _drx) = tokio::sync::mpsc::channel(4);
+                let (ctx, _crx) = tokio::sync::watch::channel(false);
+                h.active_preview_tunnels.insert(
+                    tid,
+                    PreviewTunnelSink {
+                        tx: dtx,
+                        queued_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                        cancel_tx: ctx,
+                    },
+                );
+            }
+            h.active_preview_listeners.insert(
+                (5173, Some("web--app.localhost".to_string())),
+                ActivePreviewListener {
+                    session_gen: h.session_gen,
+                    target_port: 5173,
+                    proxy_host: Some("web--app.localhost".to_string()),
+                    local_port: 54321,
+                    local_url: "http://127.0.0.1:54321".to_string(),
+                    session: session_handle.clone(),
+                    runtime: core.runtime.handle().clone(),
+                    connections,
+                    task: accept_handle.clone(),
+                },
+            );
+        }
+
+        let closed = core
+            .close_remote_preview_tunnel(host_id, 5173, Some("web--app.localhost".to_string()))
+            .expect("close listener");
+        assert!(closed);
+
+        let mut closed_tids = std::collections::HashSet::new();
+        core.runtime.block_on(async {
+            for _ in 0..2 {
+                let msg = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+                    .await
+                    .expect("listener close frame")
+                    .expect("channel open");
+                match msg {
+                    crate::OutboundPayload::Wire(WireMessage::PreviewTunnelClose {
+                        tunnel_id,
+                        reason: Some(ref r),
+                    }) if r == "listener_closed" => {
+                        closed_tids.insert(tunnel_id);
+                    }
+                    other => panic!("unexpected listener close payload: {other:?}"),
+                }
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while !(accept_handle.is_finished()
+                && conn1_handle.is_finished()
+                && conn2_handle.is_finished())
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        assert!(closed_tids.contains(&tid1));
+        assert!(closed_tids.contains(&tid2));
+        assert!(accept_handle.is_finished());
+        assert!(conn1_handle.is_finished());
+        assert!(conn2_handle.is_finished());
+        let hosts = core.hosts.read().expect("read hosts");
+        let h = hosts.get(host_id).expect("host");
+        assert!(!h.active_preview_tunnels.contains_key(&tid1));
+        assert!(!h.active_preview_tunnels.contains_key(&tid2));
     }
 }

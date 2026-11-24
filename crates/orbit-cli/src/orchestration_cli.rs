@@ -1990,6 +1990,7 @@ pub async fn cmd_permit(
                     agent_id: agent_id.clone(),
                     permission_request_id: perm_id.clone(),
                     decision: decision.clone(),
+                    agent_originated: false,
                 },
                 15,
             )
@@ -2013,6 +2014,7 @@ pub async fn cmd_permit(
                     agent_id: agent_id.clone(),
                     permission_request_id: perm_id.clone(),
                     decision: "deny".into(),
+                    agent_originated: false,
                 },
                 15,
             )

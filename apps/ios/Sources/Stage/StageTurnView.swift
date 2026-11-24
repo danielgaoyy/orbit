@@ -608,7 +608,7 @@ struct StageTurnView: View, Equatable {
             switch block {
             case let .heading(_, spans),
                  let .paragraph(spans),
-                 let .listItem(_, _, _, spans),
+                 let .listItem(_, _, _, _, spans),
                  let .blockQuote(spans):
                 let joined = spans.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines)
                 if !joined.isEmpty {

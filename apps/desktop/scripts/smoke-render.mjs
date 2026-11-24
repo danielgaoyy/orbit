@@ -126,13 +126,42 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
         case "list_ssh_hosts":
         case "get_fallback_provider_catalogs":
         case "get_slash_commands":
+        case "list_managed_skills":
         case "list_provider_subagents":
         case "list_conditional_timers":
         case "list_goal_runs":
         case "list_monitor_watches":
         case "list_artifacts":
         case "get_workspace_files":
+        case "list_lsp_servers":
+        case "lsp_query_symbols":
+        case "lsp_get_diagnostics":
+        case "lsp_goto_definition":
+        case "lsp_references":
+        case "lsp_completion":
+        case "lsp_code_action":
+        case "restart_lsp_server":
           return [];
+        case "read_mcp_resource":
+          return {
+            uri: typeof args?.uri === "string" ? args.uri : "ui://smoke/app",
+            mime_type: "text/html;profile=mcp-app",
+            text: "<div>Smoke MCP App</div>",
+            blob_base64: null,
+          };
+        case "call_artifact_mcp_tool":
+          return {
+            ok: true,
+            is_error: false,
+            content: [{ type: "text", text: "ok" }],
+            structured_content: null,
+            error: null,
+          };
+        case "lsp_hover":
+          return null;
+        case "lsp_rename":
+        case "lsp_apply_workspace_edit":
+          return { applied: false, modified_files: [], total_edits: 0 };
         case "get_cloud_sync_status":
           return null;
         case "get_fleet_overview":
@@ -180,6 +209,7 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
             turns: [],
             pending_permissions: [],
             pending_questions: [],
+            pending_plan_approval: null,
             session_turn_diffs: [],
             insights: emptyInsights,
             latest_seq: 0,
@@ -199,6 +229,7 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
             oldest_loaded_seq: 0,
             pending_permissions: [],
             pending_questions: [],
+            pending_plan_approval: null,
             session_turn_diffs: [],
             insights: emptyInsights,
             latest_seq: 0,
@@ -208,6 +239,30 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
           };
         case "get_agent_stage_turns_slice":
           return [];
+        case "resolve_plan_approval":
+          return null;
+        case "list_permission_rules":
+          return [];
+        case "upsert_permission_rule":
+          return {
+            id: args.rule?.id ?? "pr_smoke_1",
+            scope_kind: args.rule?.scope_kind ?? "project",
+            project_cwd: args.rule?.project_cwd ?? "/tmp/smoke",
+            provider: args.rule?.provider ?? null,
+            tool_kind: args.rule?.tool_kind ?? "shell",
+            pattern_kind: args.rule?.pattern_kind ?? "command_prefix",
+            pattern: args.rule?.pattern ?? "cargo test",
+            decision: args.rule?.decision ?? "allow",
+            source: args.rule?.source ?? "manual",
+            note: args.rule?.note ?? null,
+            created_at: "2026-11-24T00:00:00Z",
+            last_matched_at: null,
+            match_count: 0,
+          };
+        case "delete_permission_rule":
+          return true;
+        case "resolve_permissions_batch":
+          return { resolved_count: 0, skipped_count: 0, skipped_reasons: [] };
         case "load_older_agent_timeline":
           return true;
         case "get_local_machine_info":
@@ -226,6 +281,72 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
             raw_diff: "",
             diff_files: [],
           };
+        case "git_stash_list":
+          return { entries: [] };
+        case "git_stash_push":
+        case "git_stash_apply":
+        case "git_stash_pop":
+        case "git_stash_drop":
+          return {
+            action: cmd.replace("git_stash_", ""),
+            stash_ref: args.stashRef ?? "stash@{0}",
+            summary: "ok",
+            had_conflicts: false,
+          };
+        case "git_rebase_status":
+          return {
+            in_progress: false,
+            kind: "none",
+            conflicted_files: [],
+            merge_in_progress: false,
+            cherry_pick_in_progress: false,
+          };
+        case "git_rebase_start":
+        case "git_rebase_continue":
+        case "git_rebase_abort":
+        case "git_rebase_skip":
+          return {
+            action: cmd.replace("git_rebase_", ""),
+            status: {
+              in_progress: false,
+              kind: "none",
+              conflicted_files: [],
+              merge_in_progress: false,
+              cherry_pick_in_progress: false,
+            },
+            summary: "ok",
+          };
+        case "git_list_conflicts":
+          return { files: [] };
+        case "git_resolve_conflict":
+          return {
+            path: args.path ?? "",
+            remaining_blocks: 0,
+            staged: true,
+            summary: "ok",
+          };
+        case "git_pr_status":
+          return {
+            availability: "no_pull_request",
+            is_draft: false,
+            checks: [],
+            passing_checks: 0,
+            failing_checks: 0,
+            pending_checks: 0,
+            review_comments: [],
+            unresolved_comment_count: 0,
+          };
+        case "git_generate_commit_message":
+          return {
+            message: "chore: update workspace",
+            subject: "chore: update workspace",
+            body: null,
+            commit_type: "chore",
+            scope: null,
+            diff_source: "staged",
+            files_analyzed: 1,
+            generator: "deterministic",
+          };
         case "list_path_rules":
           return {
             host_id: args.hostId ?? "host_smoke_1",
@@ -234,6 +355,10 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
             total_always_tokens: 0,
             token_budget_warning: false,
           };
+        case "search_messages":
+          return [];
+        case "search_messages_remote":
+          return { hits: [], remote_hosts_queried: 0, remote_hosts_failed: 0 };
         case "get_context_occupancy":
           return {
             agent_id: args.agentId ?? "ag_smoke_1",
@@ -243,6 +368,68 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
             occupancy_pct: 0,
             segments: [],
           };
+        case "get_guardian_config":
+        case "update_guardian_config":
+          return {
+            config: args.config ?? {
+              enabled: true,
+              auto_approve_max_risk: "low",
+              use_ai_classifier_for_medium: true,
+              classifier_timeout_ms: 4000,
+              allow_read_only_tools: true,
+              allow_workspace_tests: true,
+              blocked_command_patterns: [],
+              trusted_command_prefixes: [],
+              llm_tier2_enabled: true,
+              llm_provider: null,
+              llm_model: null,
+              llm_timeout_ms: 8000,
+            },
+            recent_audits: [],
+          };
+        case "list_lifecycle_hooks":
+        case "upsert_lifecycle_hook":
+        case "delete_lifecycle_hook":
+        case "set_project_hooks_trust":
+          return {
+            hooks: [],
+            recent_executions: [],
+            project_hooks_trusted: false,
+          };
+        case "list_im_channels":
+        case "upsert_im_channel":
+        case "delete_im_channel":
+          return {
+            channels: [],
+            bindings: [],
+            base_webhook_url: "http://127.0.0.1:6868",
+          };
+        case "list_browser_sessions":
+          return {
+            host_id: args.hostId ?? "host_smoke_1",
+            sessions: [],
+            policy: {
+              enabled: true,
+              headless: true,
+              allow_localhost: true,
+              allowed_domains: [],
+              blocked_domains: [],
+              block_password_inputs: true,
+              max_sessions: 4,
+            },
+            chrome_binary: null,
+          };
+        case "open_remote_preview_tunnel":
+          return {
+            host_id: args.hostId ?? "host_smoke_1",
+            target_port: args.targetPort ?? 5173,
+            proxy_host: args.proxyHost ?? null,
+            local_port: args.targetPort ?? 5173,
+            local_url: "http://127.0.0.1:" + (args.targetPort ?? 5173),
+            is_tunneled: false,
+          };
+        case "close_remote_preview_tunnel":
+          return true;
         default:
           return null;
       }
@@ -406,6 +593,7 @@ const MOCK_TAURI_PAGINATED_INIT_SCRIPT = (() => {
         oldest_loaded_seq: 350,
         pending_permissions: [],
         pending_questions: [],
+        pending_plan_approval: null,
         session_turn_diffs: [],
         insights: {
           touched_files: [],

@@ -23,8 +23,8 @@ use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use orbit_protocol::{
-    ExternalMcpServerRecord, McpProbeResult, McpServerScope, McpToolSummary, McpTransportKind,
-    McpWriteScope,
+    ExternalMcpServerRecord, McpProbeResult, McpResourceContent, McpServerScope,
+    McpToolCallOutcome, McpToolSummary, McpTransportKind, McpWriteScope,
 };
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
@@ -36,9 +36,13 @@ use crate::workspace_files::canonicalize_workspace_root;
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 pub const MCP_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+pub const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_MCP_PROBE_TOOLS: usize = 200;
 pub const MAX_MCP_PROBE_CACHE_ENTRIES: usize = 128;
 pub const MAX_HTTP_PROBE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_MCP_RESOURCE_URI_LEN: usize = 2048;
+const MAX_MCP_TOOL_NAME_LEN: usize = 128;
+const MAX_MCP_TOOL_ARGS_BYTES: usize = 128 * 1024;
 const MAX_STDIO_PROBE_STDOUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STDIO_PROBE_STDERR_BYTES: usize = 8 * 1024;
 const MAX_TOOL_DESC_CHARS: usize = 500;
@@ -350,7 +354,7 @@ pub fn validate_mcp_http_url(raw: &str) -> Result<reqwest::Url, String> {
     if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err("URL contains invalid whitespace or control characters".to_string());
     }
-    let parsed =
+    let mut parsed =
         reqwest::Url::parse(trimmed).map_err(|e| format!("Invalid Streamable HTTP URL: {e}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(format!(
@@ -365,8 +369,20 @@ pub fn validate_mcp_http_url(raw: &str) -> Result<reqwest::Url, String> {
     }
     let host_raw = parsed
         .host_str()
-        .ok_or_else(|| "Streamable HTTP URL is missing a host".to_string())?;
-    let host_norm = normalize_url_host(host_raw);
+        .ok_or_else(|| "Streamable HTTP URL is missing a host".to_string())?
+        .to_string();
+    let host_norm = normalize_url_host(&host_raw);
+    if host_norm.is_empty() {
+        return Err("Streamable HTTP URL host cannot be empty".to_string());
+    }
+    // Strip trailing DNS dot directly on the request URL itself BEFORE validation and DNS pinning
+    // so `reqwest`'s exact-hostname `resolve_to_addrs` override always matches and never falls
+    // back to unpinned DNS resolution.
+    if host_raw.ends_with('.') {
+        parsed
+            .set_host(Some(&host_norm))
+            .map_err(|e| format!("Invalid Streamable HTTP host after normalization: {e}"))?;
+    }
 
     if matches!(
         host_norm.as_str(),
@@ -2588,6 +2604,704 @@ async fn probe_http_mcp(
     }
 }
 
+/// Strictly validate a SEP-1865 `ui://` resource URI before contacting an external MCP server.
+pub fn validate_ui_resource_uri(raw_uri: &str) -> Result<String, String> {
+    let trimmed = raw_uri.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_MCP_RESOURCE_URI_LEN {
+        return Err(format!(
+            "SEP-1865 resource URI must be 1..={MAX_MCP_RESOURCE_URI_LEN} bytes"
+        ));
+    }
+    if trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(
+            "SEP-1865 resource URI must not contain whitespace or control characters".to_string(),
+        );
+    }
+    let Some(rest) = trimmed.strip_prefix("ui://") else {
+        return Err("Only `ui://` resource URIs are permitted for MCP App resources/read".into());
+    };
+    if rest.is_empty() || rest.starts_with('/') {
+        return Err("SEP-1865 `ui://` URI requires a non-empty authority/resource path".into());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn scope_resolution_priority(scope: McpServerScope) -> u8 {
+    match scope {
+        McpServerScope::ProjectDotMcp => 0,
+        McpServerScope::OrbitUser => 1,
+        McpServerScope::ClaudeUser => 2,
+        McpServerScope::CodexUser => 3,
+        McpServerScope::AntigravityUser => 4,
+    }
+}
+
+fn resolve_enabled_external_server(
+    orbit_home: &Path,
+    user_home: Option<&Path>,
+    server_name: &str,
+    cwd: Option<&Path>,
+) -> Result<ResolvedExternalMcpServer, String> {
+    let needle = server_name.trim();
+    if needle.is_empty() || needle.len() > 128 || needle.chars().any(char::is_control) {
+        return Err("Invalid MCP server name".to_string());
+    }
+    let mut servers = discover_all_resolved(orbit_home, user_home, cwd);
+    servers.sort_by_key(|s| scope_resolution_priority(s.scope));
+
+    // Prefer exact server ID match first, then exact server name match (project overrides user).
+    let matched = servers
+        .iter()
+        .find(|s| s.id == needle)
+        .or_else(|| servers.iter().find(|s| s.name == needle))
+        .cloned();
+
+    let Some(server) = matched else {
+        return Err(format!(
+            "External MCP server `{needle}` not found on this host"
+        ));
+    };
+    if !server.enabled {
+        return Err(format!("External MCP server `{needle}` is disabled"));
+    }
+    Ok(server)
+}
+
+/// Resolve the canonical enabled host/user-configured external MCP server name for passive
+/// SEP-1865 auto-extraction.
+///
+/// SECURITY: NEVER selects repo/workspace `.mcp.json` (`McpServerScope::ProjectDotMcp`) servers
+/// for passive background extraction so untrusted repositories cannot auto-launch stdio commands.
+pub(crate) fn find_matching_enabled_server_for_auto_extract(
+    orbit_home: &Path,
+    server_name: &str,
+) -> Option<String> {
+    let user_home = resolve_user_home_dir();
+    find_matching_enabled_server_for_auto_extract_with_homes(
+        orbit_home,
+        user_home.as_deref(),
+        server_name,
+    )
+}
+
+pub(crate) fn find_matching_enabled_server_for_auto_extract_with_homes(
+    orbit_home: &Path,
+    user_home: Option<&Path>,
+    server_name: &str,
+) -> Option<String> {
+    let cand = server_name.trim();
+    if cand.is_empty() || cand.len() > 128 || cand.chars().any(char::is_control) {
+        return None;
+    }
+    // Pass `cwd = None` so project `.mcp.json` entries are excluded from passive auto-extraction.
+    let mut servers = discover_all_resolved(orbit_home, user_home, None);
+    servers.retain(|s| s.enabled && s.scope != McpServerScope::ProjectDotMcp);
+    if servers.is_empty() {
+        return None;
+    }
+    servers.sort_by_key(|s| scope_resolution_priority(s.scope));
+
+    servers
+        .iter()
+        .find(|s| s.id == cand || s.name == cand || s.name.eq_ignore_ascii_case(cand))
+        .map(|s| s.name.clone())
+}
+
+/// Passive SEP-1865 `resources/read` strictly restricted to host/user-configured enabled MCP
+/// servers (NEVER auto-launching repo/workspace `.mcp.json` stdio commands).
+pub(crate) async fn read_mcp_resource_for_auto_extract(
+    orbit_home: &Path,
+    server_name: &str,
+    uri: &str,
+    cwd: Option<&Path>,
+) -> Result<McpResourceContent, String> {
+    let user_home = resolve_user_home_dir();
+    read_mcp_resource_for_auto_extract_with_homes(
+        orbit_home,
+        user_home.as_deref(),
+        server_name,
+        uri,
+        cwd,
+    )
+    .await
+}
+
+pub(crate) async fn read_mcp_resource_for_auto_extract_with_homes(
+    orbit_home: &Path,
+    user_home: Option<&Path>,
+    server_name: &str,
+    uri: &str,
+    cwd: Option<&Path>,
+) -> Result<McpResourceContent, String> {
+    let clean_uri = validate_ui_resource_uri(uri)?;
+    // Discover WITHOUT project `.mcp.json` (`cwd = None`) so passive auto-extraction can ONLY
+    // contact host/global user-configured enabled MCP servers and never repo-defined stdio cmds.
+    let server = resolve_enabled_external_server(orbit_home, user_home, server_name, None)?;
+    if server.scope == McpServerScope::ProjectDotMcp {
+        return Err(
+            "Refusing passive auto-read against project-scoped `.mcp.json` server".to_string(),
+        );
+    }
+
+    let result = invoke_external_mcp_method(
+        &server,
+        "resources/read",
+        json!({ "uri": clean_uri }),
+        cwd,
+        MCP_CALL_TIMEOUT,
+    )
+    .await?;
+
+    parse_mcp_resource_read_result(&server.name, &clean_uri, &result)
+}
+
+async fn exchange_stdio_mcp_method(
+    mut stdin: tokio::process::ChildStdin,
+    stdout: tokio::process::ChildStdout,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let bounded_stdout = stdout.take((MAX_STDIO_PROBE_STDOUT_BYTES + 1) as u64);
+    let mut reader = BufReader::new(bounded_stdout);
+    let mut total_read = 0usize;
+
+    let init_req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {
+                "name": "orbit",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        }
+    });
+    let init_line = format!("{init_req}\n");
+    stdin
+        .write_all(init_line.as_bytes())
+        .await
+        .map_err(|e| format!("Failed writing initialize request: {e}"))?;
+    let _ = stdin.flush().await;
+
+    let init_resp = read_stdio_jsonrpc_response(&mut reader, 1, &mut total_read).await?;
+    if let Some((_, msg)) = jsonrpc_error_message(&init_resp) {
+        return Err(format!("initialize failed: {msg}"));
+    }
+
+    let notif = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+    });
+    let _ = stdin.write_all(format!("{notif}\n").as_bytes()).await;
+
+    let call_req = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": method,
+        "params": params
+    });
+    stdin
+        .write_all(format!("{call_req}\n").as_bytes())
+        .await
+        .map_err(|e| format!("Failed writing {method} request: {e}"))?;
+    let _ = stdin.flush().await;
+
+    let call_resp = read_stdio_jsonrpc_response(&mut reader, 2, &mut total_read).await?;
+    drop(stdin);
+    if let Some((_, msg)) = jsonrpc_error_message(&call_resp) {
+        return Err(format!("{method} failed: {msg}"));
+    }
+    Ok(call_resp.get("result").cloned().unwrap_or(Value::Null))
+}
+
+async fn invoke_stdio_mcp_method(
+    command: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+    method: &str,
+    params: Value,
+    timeout_dur: Duration,
+) -> Result<Value, String> {
+    if command.trim().is_empty() || command.chars().any(|c| c == '\0' || c.is_control()) {
+        return Err("Invalid stdio command".to_string());
+    }
+
+    let cmd_owned = command.to_string();
+    let resolved = tokio::task::spawn_blocking(move || resolve_executable_path(&cmd_owned))
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(|| format!("Executable `{command}` not found on PATH"))?;
+
+    let mut cmd = Command::new(&resolved);
+    cmd.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    crate::platform::configure_isolated_process_group(&mut cmd);
+
+    for (k_os, _) in std::env::vars_os() {
+        if let Some(k_str) = k_os.to_str()
+            && is_blocked_mcp_env_key(k_str)
+        {
+            cmd.env_remove(&k_os);
+        }
+    }
+    cmd.env("NO_COLOR", "1");
+
+    for (k, v) in sanitize_stdio_env(env) {
+        cmd.env(k, v);
+    }
+    if let Some(dir) = cwd
+        && dir.is_dir()
+    {
+        cmd.current_dir(dir);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn `{}`: {e}", resolved.display()))?;
+
+    let Some(stdin) = child.stdin.take() else {
+        kill_process_group_and_reap(&mut child).await;
+        return Err("Failed to capture MCP child stdin".to_string());
+    };
+    let Some(stdout) = child.stdout.take() else {
+        kill_process_group_and_reap(&mut child).await;
+        return Err("Failed to capture MCP child stdout".to_string());
+    };
+    let stderr_task = child.stderr.take().map(|stderr| {
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stderr
+                .take(MAX_STDIO_PROBE_STDERR_BYTES as u64)
+                .read_to_end(&mut buf)
+                .await;
+            buf
+        })
+    });
+
+    let exchange_res = tokio::time::timeout(
+        timeout_dur,
+        exchange_stdio_mcp_method(stdin, stdout, method, params),
+    )
+    .await;
+
+    kill_process_group_and_reap(&mut child).await;
+
+    match exchange_res {
+        Ok(Ok(val)) => {
+            if let Some(task) = stderr_task {
+                task.abort();
+            }
+            Ok(val)
+        }
+        Ok(Err(err)) => {
+            let stderr_note = collect_stderr_note(stderr_task).await;
+            if let Some(ref note) = stderr_note {
+                tracing::warn!(
+                    method = %method,
+                    error = %err,
+                    stderr = %note,
+                    "External MCP stdio request failed"
+                );
+            }
+            // Never return raw child stderr over RPC where untrusted iframe JS could read it.
+            Err(err)
+        }
+        Err(_) => {
+            if let Some(task) = stderr_task {
+                task.abort();
+            }
+            Err(format!(
+                "MCP {method} timed out after {}s",
+                timeout_dur.as_secs()
+            ))
+        }
+    }
+}
+
+async fn invoke_http_mcp_method(
+    url: &str,
+    headers: &BTreeMap<String, String>,
+    method: &str,
+    params: Value,
+    timeout_dur: Duration,
+) -> Result<Value, String> {
+    let parsed_url = validate_mcp_http_url(url)?;
+    let (host_norm, pinned_addrs) = resolve_and_validate_http_addrs(&parsed_url).await?;
+
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout_dur)
+        .redirect(reqwest::redirect::Policy::none());
+    if host_norm.parse::<IpAddr>().is_err() {
+        builder = builder.resolve_to_addrs(&host_norm, &pinned_addrs);
+    }
+    let client = builder
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+
+    let mut base_headers = HeaderMap::new();
+    base_headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/json, text/event-stream"),
+    );
+    base_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Ok(ver_val) = HeaderValue::from_str(MCP_PROTOCOL_VERSION) {
+        base_headers.insert(HeaderName::from_static("mcp-protocol-version"), ver_val);
+    }
+    for (k, v) in headers {
+        let key_trimmed = k.trim();
+        if key_trimmed.is_empty() || is_forbidden_http_header_name(key_trimmed) {
+            continue;
+        }
+        if v.chars().any(|c| c == '\r' || c == '\n' || c == '\0') {
+            return Err(format!(
+                "HTTP header `{key_trimmed}` contains invalid control characters"
+            ));
+        }
+        let hn = HeaderName::from_bytes(key_trimmed.as_bytes())
+            .map_err(|_| format!("Invalid HTTP header name `{key_trimmed}`"))?;
+        let hv = HeaderValue::from_str(v)
+            .map_err(|_| format!("Invalid HTTP header value for `{key_trimmed}`"))?;
+        base_headers.insert(hn, hv);
+    }
+
+    // 1. initialize
+    let init_http = client
+        .post(parsed_url.clone())
+        .headers(base_headers.clone())
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "orbit",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("HTTP initialize request failed: {e}"))?;
+
+    let init_status = init_http.status();
+    let session_id = init_http
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    let init_ct = init_http
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+
+    if !init_status.is_success() {
+        let err_bytes = read_bounded_http_body(init_http).await.unwrap_or_default();
+        let snippet = truncate_chars(&String::from_utf8_lossy(&err_bytes), 200);
+        return Err(if snippet.is_empty() {
+            format!("HTTP {init_status} during initialize")
+        } else {
+            format!("HTTP {init_status} during initialize: {snippet}")
+        });
+    }
+
+    let init_json = read_http_jsonrpc_response(init_http, &init_ct, 1).await?;
+    if let Some((_, msg)) = jsonrpc_error_message(&init_json) {
+        return Err(format!("initialize failed: {msg}"));
+    }
+
+    if let Some(sid) = session_id.as_deref()
+        && let Ok(val) = HeaderValue::from_str(sid)
+    {
+        base_headers.insert(HeaderName::from_static("mcp-session-id"), val);
+    }
+
+    // 2. notifications/initialized (best-effort)
+    let _ = client
+        .post(parsed_url.clone())
+        .headers(base_headers.clone())
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .send()
+        .await;
+
+    // 3. Invoke target JSON-RPC method
+    let call_http = client
+        .post(parsed_url)
+        .headers(base_headers)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": method,
+            "params": params
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("HTTP {method} failed: {e}"))?;
+
+    let call_status = call_http.status();
+    let call_ct = call_http
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+
+    if !call_status.is_success() {
+        let err_bytes = read_bounded_http_body(call_http).await.unwrap_or_default();
+        let snippet = truncate_chars(&String::from_utf8_lossy(&err_bytes), 200);
+        return Err(if snippet.is_empty() {
+            format!("HTTP {call_status} during {method}")
+        } else {
+            format!("HTTP {call_status} during {method}: {snippet}")
+        });
+    }
+
+    let call_json = read_http_jsonrpc_response(call_http, &call_ct, 2).await?;
+    if let Some((_, msg)) = jsonrpc_error_message(&call_json) {
+        return Err(format!("{method} failed: {msg}"));
+    }
+    Ok(call_json.get("result").cloned().unwrap_or(Value::Null))
+}
+
+async fn invoke_external_mcp_method(
+    server: &ResolvedExternalMcpServer,
+    method: &str,
+    params: Value,
+    cwd: Option<&Path>,
+    timeout_dur: Duration,
+) -> Result<Value, String> {
+    match &server.transport {
+        ResolvedTransport::Stdio { command, args } => {
+            invoke_stdio_mcp_method(command, args, &server.env, cwd, method, params, timeout_dur)
+                .await
+        }
+        ResolvedTransport::StreamableHttp { url } => tokio::time::timeout(
+            timeout_dur,
+            invoke_http_mcp_method(url, &server.headers, method, params, timeout_dur),
+        )
+        .await
+        .map_err(|_| format!("MCP {method} timed out after {}s", timeout_dur.as_secs()))?,
+    }
+}
+
+/// Invoke JSON-RPC `resources/read` on an enabled external MCP server for a strictly validated
+/// SEP-1865 `ui://` URI, enforcing the 2 MiB payload safety cap.
+pub async fn read_mcp_resource(
+    orbit_home: &Path,
+    server_name: &str,
+    uri: &str,
+    cwd: Option<&Path>,
+) -> Result<McpResourceContent, String> {
+    let user_home = resolve_user_home_dir();
+    read_mcp_resource_with_homes(orbit_home, user_home.as_deref(), server_name, uri, cwd).await
+}
+
+pub(crate) async fn read_mcp_resource_with_homes(
+    orbit_home: &Path,
+    user_home: Option<&Path>,
+    server_name: &str,
+    uri: &str,
+    cwd: Option<&Path>,
+) -> Result<McpResourceContent, String> {
+    let clean_uri = validate_ui_resource_uri(uri)?;
+    let server = resolve_enabled_external_server(orbit_home, user_home, server_name, cwd)?;
+
+    let result = invoke_external_mcp_method(
+        &server,
+        "resources/read",
+        json!({ "uri": clean_uri }),
+        cwd,
+        MCP_CALL_TIMEOUT,
+    )
+    .await?;
+
+    parse_mcp_resource_read_result(&server.name, &clean_uri, &result)
+}
+
+fn parse_mcp_resource_read_result(
+    server_name: &str,
+    clean_uri: &str,
+    result: &Value,
+) -> Result<McpResourceContent, String> {
+    let contents = result
+        .get("contents")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "MCP resources/read response missing `contents` array".to_string())?;
+    if contents.is_empty() {
+        return Err(format!(
+            "MCP server `{server_name}` returned empty contents for `{clean_uri}`"
+        ));
+    }
+
+    let entry = contents
+        .iter()
+        .find(|item| item.get("uri").and_then(Value::as_str).map(str::trim) == Some(clean_uri))
+        .unwrap_or(&contents[0]);
+
+    let entry_uri = entry
+        .get("uri")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(clean_uri)
+        .to_string();
+    let mime_type = entry
+        .get("mimeType")
+        .or_else(|| entry.get("mime_type"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    let text = entry
+        .get("text")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let blob_base64 = entry
+        .get("blob")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    let payload_len =
+        text.as_deref().map_or(0, str::len) + blob_base64.as_deref().map_or(0, str::len);
+    if payload_len == 0 {
+        return Err(format!(
+            "MCP resource `{clean_uri}` returned neither `text` nor `blob`"
+        ));
+    }
+    if payload_len > orbit_store::MAX_ARTIFACT_CONTENT_BYTES {
+        return Err(format!(
+            "MCP resource `{clean_uri}` ({payload_len} bytes) exceeds 2 MiB safety limit"
+        ));
+    }
+
+    Ok(McpResourceContent {
+        uri: entry_uri,
+        mime_type,
+        text,
+        blob_base64,
+    })
+}
+
+/// Invoke JSON-RPC `tools/call` strictly scoped to the owning enabled external MCP server
+/// (`server_name`), enforcing strict tool name and payload bounds.
+pub async fn call_mcp_tool(
+    orbit_home: &Path,
+    server_name: &str,
+    tool_name: &str,
+    arguments: Value,
+    cwd: Option<&Path>,
+) -> Result<McpToolCallOutcome, String> {
+    let user_home = resolve_user_home_dir();
+    call_mcp_tool_with_homes(
+        orbit_home,
+        user_home.as_deref(),
+        server_name,
+        tool_name,
+        arguments,
+        cwd,
+    )
+    .await
+}
+
+pub(crate) async fn call_mcp_tool_with_homes(
+    orbit_home: &Path,
+    user_home: Option<&Path>,
+    server_name: &str,
+    tool_name: &str,
+    arguments: Value,
+    cwd: Option<&Path>,
+) -> Result<McpToolCallOutcome, String> {
+    let clean_tool = tool_name.trim();
+    if clean_tool.is_empty()
+        || clean_tool.len() > MAX_MCP_TOOL_NAME_LEN
+        || clean_tool
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(format!(
+            "Invalid MCP tool name (must be 1..={MAX_MCP_TOOL_NAME_LEN} non-whitespace characters)"
+        ));
+    }
+
+    let args_val = match arguments {
+        Value::Null => json!({}),
+        Value::Object(map) => Value::Object(map),
+        _ => {
+            return Err("MCP tools/call `arguments` must be a JSON object".to_string());
+        }
+    };
+    let args_serialized = serde_json::to_string(&args_val)
+        .map_err(|e| format!("Failed to serialize MCP tool arguments: {e}"))?;
+    if args_serialized.len() > MAX_MCP_TOOL_ARGS_BYTES {
+        return Err(format!(
+            "MCP tools/call arguments exceed maximum size of {MAX_MCP_TOOL_ARGS_BYTES} bytes"
+        ));
+    }
+
+    let server = resolve_enabled_external_server(orbit_home, user_home, server_name, cwd)?;
+
+    let result = invoke_external_mcp_method(
+        &server,
+        "tools/call",
+        json!({
+            "name": clean_tool,
+            "arguments": args_val
+        }),
+        cwd,
+        MCP_CALL_TIMEOUT,
+    )
+    .await?;
+
+    let is_error = result
+        .get("isError")
+        .or_else(|| result.get("is_error"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let content = result
+        .get("content")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let structured_content = result
+        .get("structuredContent")
+        .or_else(|| result.get("structured_content"))
+        .cloned();
+    let error = if is_error {
+        content
+            .iter()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .map(|s| truncate_chars(s, 400))
+            .or_else(|| Some(format!("Tool `{clean_tool}` returned an error")))
+    } else {
+        None
+    };
+
+    Ok(McpToolCallOutcome {
+        ok: !is_error,
+        is_error,
+        content,
+        structured_content,
+        error,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3569,5 +4283,301 @@ done
 
         server_task.abort();
         let _ = fs::remove_dir_all(&orbit_home);
+    }
+
+    #[tokio::test]
+    async fn read_mcp_resource_and_call_mcp_tool_enforce_ui_scheme_and_server_scoping() {
+        let orbit_home = make_temp_dir("sep1865-http");
+
+        async fn sep1865_handler(axum::Json(payload): axum::Json<Value>) -> Response {
+            let id = payload.get("id").cloned().unwrap_or(json!(1));
+            let method = payload.get("method").and_then(Value::as_str).unwrap_or("");
+            match method {
+                "initialize" => (
+                    StatusCode::OK,
+                    [("mcp-session-id", "sess-sep1865")],
+                    axum::Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": "2025-03-26",
+                            "serverInfo": { "name": "analytics", "version": "1.0.0" },
+                            "capabilities": { "resources": {}, "tools": {} }
+                        }
+                    })),
+                )
+                    .into_response(),
+                "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
+                "resources/read" => {
+                    let uri = payload
+                        .pointer("/params/uri")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    axum::Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "contents": [{
+                                "uri": uri,
+                                "mimeType": "text/html;profile=mcp-app",
+                                "text": "<main><h1>Live SEP-1865 Widget</h1></main>"
+                            }]
+                        }
+                    }))
+                    .into_response()
+                }
+                "tools/call" => {
+                    let tool_name = payload
+                        .pointer("/params/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let window = payload
+                        .pointer("/params/arguments/window")
+                        .and_then(Value::as_str)
+                        .unwrap_or("none");
+                    axum::Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "isError": false,
+                            "content": [{ "type": "text", "text": format!("{tool_name}:{window}") }],
+                            "structuredContent": { "rows": 7 }
+                        }
+                    }))
+                    .into_response()
+                }
+                _ => StatusCode::BAD_REQUEST.into_response(),
+            }
+        }
+
+        let app = Router::new().route("/mcp", post(sep1865_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        upsert_external_mcp_server_with_homes(
+            &orbit_home,
+            None,
+            UpsertExternalMcpInput {
+                scope: McpWriteScope::User,
+                cwd: None,
+                name: "analytics".into(),
+                transport: McpTransportKind::StreamableHttp {
+                    url: format!("http://{addr}/mcp"),
+                    header_keys: Vec::new(),
+                },
+                env: BTreeMap::new(),
+                headers: BTreeMap::new(),
+                keep_existing_secrets: false,
+                enabled: true,
+            },
+            &HashMap::new(),
+        )
+        .expect("save enabled server");
+
+        upsert_external_mcp_server_with_homes(
+            &orbit_home,
+            None,
+            UpsertExternalMcpInput {
+                scope: McpWriteScope::User,
+                cwd: None,
+                name: "disabled-srv".into(),
+                transport: McpTransportKind::StreamableHttp {
+                    url: format!("http://{addr}/mcp"),
+                    header_keys: Vec::new(),
+                },
+                env: BTreeMap::new(),
+                headers: BTreeMap::new(),
+                keep_existing_secrets: false,
+                enabled: false,
+            },
+            &HashMap::new(),
+        )
+        .expect("save disabled server");
+
+        // Non-ui:// schemes rejected before touching any server
+        for bad_uri in [
+            "https://example.com/widget",
+            "file:///etc/passwd",
+            "ui://",
+            "ui:///empty-host",
+            "ui://analytics/bad space",
+        ] {
+            assert!(
+                read_mcp_resource_with_homes(&orbit_home, None, "analytics", bad_uri, None)
+                    .await
+                    .is_err(),
+                "expected rejection for {bad_uri}"
+            );
+        }
+
+        // Disabled & unknown servers rejected for both resources/read and tools/call
+        assert!(
+            read_mcp_resource_with_homes(
+                &orbit_home,
+                None,
+                "disabled-srv",
+                "ui://analytics/dashboard",
+                None,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            call_mcp_tool_with_homes(
+                &orbit_home,
+                None,
+                "disabled-srv",
+                "refresh",
+                json!({}),
+                None,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            call_mcp_tool_with_homes(&orbit_home, None, "unknown-srv", "refresh", json!({}), None)
+                .await
+                .is_err()
+        );
+
+        // Valid ui:// resources/read succeeds
+        let res = read_mcp_resource_with_homes(
+            &orbit_home,
+            None,
+            "analytics",
+            "ui://analytics/dashboard",
+            None,
+        )
+        .await
+        .expect("read ui:// resource");
+        assert_eq!(res.uri, "ui://analytics/dashboard");
+        assert_eq!(res.mime_type.as_deref(), Some("text/html;profile=mcp-app"));
+        assert_eq!(
+            res.text.as_deref(),
+            Some("<main><h1>Live SEP-1865 Widget</h1></main>")
+        );
+
+        // Valid server-scoped tools/call succeeds
+        let tool_out = call_mcp_tool_with_homes(
+            &orbit_home,
+            None,
+            "analytics",
+            "refresh_metrics",
+            json!({ "window": "24h" }),
+            None,
+        )
+        .await
+        .expect("call mcp tool");
+        assert!(tool_out.ok);
+        assert!(!tool_out.is_error);
+        assert_eq!(tool_out.content[0]["text"], "refresh_metrics:24h");
+        assert_eq!(tool_out.structured_content, Some(json!({ "rows": 7 })));
+
+        server_task.abort();
+        let _ = fs::remove_dir_all(&orbit_home);
+    }
+
+    #[test]
+    fn validate_mcp_http_url_strips_trailing_dns_dot_before_pinning() {
+        let normalized = validate_mcp_http_url("https://mcp.example.com.:8443/v1/mcp")
+            .expect("valid url with trailing dot");
+        assert_eq!(normalized.host_str(), Some("mcp.example.com"));
+        assert_eq!(normalized.as_str(), "https://mcp.example.com:8443/v1/mcp");
+
+        // Cloud metadata with trailing dot MUST still be blocked after normalization
+        assert!(
+            validate_mcp_http_url("http://metadata.google.internal./computeMetadata/v1").is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn passive_auto_extract_refuses_project_dot_mcp_stdio_and_never_leaks_child_stderr() {
+        let orbit_home = make_temp_dir("sep1865-sec");
+        let project_dir = make_temp_dir("sep1865-repo");
+        let marker_file = project_dir.join("pwned-marker.txt");
+
+        // Malicious repo `.mcp.json` with a stdio command that would write `marker_file` if run
+        let dot_mcp = json!({
+            "mcpServers": {
+                "repo-evil": {
+                    "command": "/bin/sh",
+                    "args": ["-c", format!("echo pwned > {}", marker_file.display())]
+                }
+            }
+        });
+        fs::write(project_dir.join(".mcp.json"), dot_mcp.to_string()).expect("write .mcp.json");
+
+        assert!(
+            find_matching_enabled_server_for_auto_extract_with_homes(
+                &orbit_home,
+                None,
+                "repo-evil"
+            )
+            .is_none(),
+            "project .mcp.json servers must NEVER be matched for passive auto-extraction"
+        );
+        let auto_err = read_mcp_resource_for_auto_extract_with_homes(
+            &orbit_home,
+            None,
+            "repo-evil",
+            "ui://repo-evil/app",
+            Some(&project_dir),
+        )
+        .await
+        .expect_err("passive auto-read must refuse repo .mcp.json stdio server");
+        assert!(!auto_err.is_empty());
+        assert!(
+            !marker_file.exists(),
+            "repo .mcp.json stdio command must NEVER be spawned during passive auto-extract!"
+        );
+
+        // Stdio error must NEVER leak raw child stderr over RPC
+        #[cfg(unix)]
+        {
+            upsert_external_mcp_server_with_homes(
+                &orbit_home,
+                None,
+                UpsertExternalMcpInput {
+                    scope: McpWriteScope::User,
+                    cwd: None,
+                    name: "leaky-stdio".into(),
+                    transport: McpTransportKind::Stdio {
+                        command: "/bin/sh".into(),
+                        args: vec![
+                            "-c".into(),
+                            "echo TOP_SECRET_HOST_STDERR_LEAK >&2; exit 1".into(),
+                        ],
+                    },
+                    env: BTreeMap::new(),
+                    headers: BTreeMap::new(),
+                    keep_existing_secrets: false,
+                    enabled: true,
+                },
+                &HashMap::new(),
+            )
+            .expect("save leaky-stdio");
+
+            let rpc_err = read_mcp_resource_with_homes(
+                &orbit_home,
+                None,
+                "leaky-stdio",
+                "ui://leaky-stdio/view",
+                None,
+            )
+            .await
+            .expect_err("expected failure");
+            assert!(
+                !rpc_err.contains("TOP_SECRET_HOST_STDERR_LEAK"),
+                "RPC error must NEVER leak raw child stderr: {rpc_err}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&orbit_home);
+        let _ = fs::remove_dir_all(&project_dir);
     }
 }

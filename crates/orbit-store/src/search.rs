@@ -39,11 +39,30 @@ pub struct MessageSearchHit {
     pub host_id: String,
     pub agent_id: String,
     pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
     pub role: String,
     pub snippet: String,
     pub rank: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_rfc3339: Option<String>,
+}
+
+/// Rich daemon-side full-text search match joined with `timeline_events` (`turn_id`, `timestamp`)
+/// and `agents` (`title`, `cwd`) for `WireMessage::SearchMessagesResult`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonMessageSearchHit {
+    pub agent_id: String,
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub role: String,
+    pub snippet: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    pub bm25_score: f64,
+    pub agent_title: String,
+    pub cwd: String,
 }
 
 /// Incremental progress returned by batched FTS5 backfill calls.
@@ -1315,6 +1334,7 @@ impl OrbitStore {
                     ) AS resolved_host_id,
                     client_timeline_fts.agent_id AS agent_id,
                     client_timeline_fts.seq AS seq,
+                    e.turn_id AS turn_id,
                     client_timeline_fts.role AS role,
                     snippet(client_timeline_fts, 4, ?2, ?3, '…', 20) AS raw_snippet,
                     client_timeline_fts.body AS body,
@@ -1334,6 +1354,7 @@ impl OrbitStore {
                     resolved_host_id,
                     agent_id,
                     seq,
+                    turn_id,
                     role,
                     raw_snippet,
                     body,
@@ -1345,7 +1366,7 @@ impl OrbitStore {
                     ) AS rn
                 FROM matched
              )
-             SELECT resolved_host_id, agent_id, seq, role, raw_snippet, body, rank, timestamp
+             SELECT resolved_host_id, agent_id, seq, turn_id, role, raw_snippet, body, rank, timestamp
              FROM ranked
              WHERE rn = 1
              ORDER BY rank ASC, seq DESC
@@ -1365,23 +1386,120 @@ impl OrbitStore {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?.max(0) as u64,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, f64>(6)?,
-                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, f64>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             },
         )?;
 
         let mut hits = Vec::with_capacity(effective_limit);
         for row in rows {
-            let (host_id, agent_id, seq, role, raw_snippet, body, rank, timestamp_rfc3339) = row?;
+            let (host_id, agent_id, seq, turn_id, role, raw_snippet, body, rank, timestamp_rfc3339) =
+                row?;
             let snippet = finalize_snippet(&raw_snippet, &body, query);
             hits.push(MessageSearchHit {
                 host_id,
                 agent_id,
                 seq,
+                turn_id,
+                role,
+                snippet,
+                rank,
+                timestamp_rfc3339,
+            });
+        }
+        Ok(hits)
+    }
+
+    /// Session-scoped full-text search across locally replicated events for a single `agent_id`,
+    /// returning every matching event up to `limit` (capped at 100) without collapsing to one hit
+    /// per conversation.
+    pub fn search_replica_messages_for_agent(
+        &self,
+        query: &str,
+        host_id: Option<&str>,
+        agent_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageSearchHit>, StoreError> {
+        let agent_filter = agent_id.trim();
+        if limit == 0 || agent_filter.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(fts_query) = build_fts5_match_query(query) else {
+            return Ok(Vec::new());
+        };
+        let host_filter = host_id.map(str::trim).filter(|s| !s.is_empty());
+        let effective_limit = limit.min(100);
+        let mark_start = SNIPPET_MARK_START.to_string();
+        let mark_end = SNIPPET_MARK_END.to_string();
+
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT
+                COALESCE(
+                    NULLIF(client_timeline_fts.host_id, ''),
+                    (SELECT cra.host_id FROM client_replica_agents cra WHERE cra.agent_id = client_timeline_fts.agent_id LIMIT 1),
+                    ''
+                ) AS resolved_host_id,
+                client_timeline_fts.agent_id AS agent_id,
+                client_timeline_fts.seq AS seq,
+                e.turn_id AS turn_id,
+                client_timeline_fts.role AS role,
+                snippet(client_timeline_fts, 4, ?2, ?3, '…', 20) AS raw_snippet,
+                client_timeline_fts.body AS body,
+                bm25(client_timeline_fts, 0.0, 0.0, 0.0, 0.0, 1.0, 0.5) AS rank,
+                e.timestamp AS timestamp
+             FROM client_timeline_fts
+             LEFT JOIN client_replica_events e ON e.rowid = client_timeline_fts.rowid
+             WHERE client_timeline_fts MATCH ?1
+               AND client_timeline_fts.agent_id = ?6
+               AND (?5 IS NULL OR COALESCE(
+                    NULLIF(client_timeline_fts.host_id, ''),
+                    (SELECT cra.host_id FROM client_replica_agents cra WHERE cra.agent_id = client_timeline_fts.agent_id LIMIT 1),
+                    ''
+               ) = ?5)
+             ORDER BY rank ASC, client_timeline_fts.seq DESC
+             LIMIT ?4",
+        )?;
+
+        let rows = stmt.query_map(
+            params![
+                fts_query,
+                mark_start,
+                mark_end,
+                effective_limit as i64,
+                host_filter,
+                agent_filter
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, f64>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )?;
+
+        let mut hits = Vec::with_capacity(effective_limit);
+        for row in rows {
+            let (host_id, agent_id, seq, turn_id, role, raw_snippet, body, rank, timestamp_rfc3339) =
+                row?;
+            let snippet = finalize_snippet(&raw_snippet, &body, query);
+            hits.push(MessageSearchHit {
+                host_id,
+                agent_id,
+                seq,
+                turn_id,
                 role,
                 snippet,
                 rank,
@@ -1398,82 +1516,207 @@ impl OrbitStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<MessageSearchHit>, StoreError> {
+        let hits = self.search_daemon_messages_scoped(query, None, limit)?;
+        Ok(hits
+            .into_iter()
+            .map(|h| MessageSearchHit {
+                host_id: String::new(),
+                agent_id: h.agent_id,
+                seq: h.seq,
+                turn_id: h.turn_id,
+                role: h.role,
+                snippet: h.snippet,
+                rank: h.bm25_score,
+                timestamp_rfc3339: h.timestamp,
+            })
+            .collect())
+    }
+
+    /// Full-text search across daemon-side `timeline_events_fts` joined with `timeline_events`
+    /// (`turn_id`, `timestamp`) and `agents` (`title`, `cwd`).
+    ///
+    /// - When `agent_id` is `Some(non_empty)`, returns individual matching events in that session
+    ///   (up to `limit`, capped at 100) so in-session `Cmd+F` covers unloaded historical turns.
+    /// - When `agent_id` is `None`, deduplicates to the highest-ranked match per `agent_id`
+    ///   across the entire daemon store.
+    pub fn search_daemon_messages_scoped(
+        &self,
+        query: &str,
+        agent_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DaemonMessageSearchHit>, StoreError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let Some(fts_query) = build_fts5_match_query(query) else {
             return Ok(Vec::new());
         };
-        let effective_limit = limit.min(200);
+        let agent_filter = agent_id.map(str::trim).filter(|s| !s.is_empty());
+        let effective_limit = limit.min(100);
         let mark_start = SNIPPET_MARK_START.to_string();
         let mark_end = SNIPPET_MARK_END.to_string();
 
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let mut stmt = conn.prepare_cached(
-            "WITH matched AS (
-                SELECT
+        let mut hits = Vec::with_capacity(effective_limit);
+
+        if let Some(target_agent_id) = agent_filter {
+            let mut stmt = conn.prepare_cached(
+                "SELECT
                     timeline_events_fts.agent_id AS agent_id,
                     timeline_events_fts.seq AS seq,
+                    e.turn_id AS turn_id,
                     timeline_events_fts.role AS role,
                     snippet(timeline_events_fts, 3, ?2, ?3, '…', 20) AS raw_snippet,
                     timeline_events_fts.body AS body,
                     bm25(timeline_events_fts, 0.0, 0.0, 0.0, 1.0, 0.5) AS rank,
-                    e.timestamp AS timestamp
-                FROM timeline_events_fts
-                LEFT JOIN timeline_events e ON e.seq = timeline_events_fts.rowid
-                WHERE timeline_events_fts MATCH ?1
-             ),
-             ranked AS (
-                SELECT
+                    e.timestamp AS timestamp,
+                    a.title AS agent_title,
+                    a.cwd AS cwd
+                 FROM timeline_events_fts
+                 INNER JOIN agents a ON a.agent_id = timeline_events_fts.agent_id
+                 LEFT JOIN timeline_events e ON e.seq = timeline_events_fts.rowid
+                 WHERE timeline_events_fts MATCH ?1
+                   AND timeline_events_fts.agent_id = ?5
+                 ORDER BY rank ASC, timeline_events_fts.seq DESC
+                 LIMIT ?4",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    fts_query,
+                    mark_start,
+                    mark_end,
+                    effective_limit as i64,
+                    target_agent_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?.max(0) as u64,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, f64>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (
                     agent_id,
                     seq,
+                    turn_id,
                     role,
                     raw_snippet,
                     body,
-                    rank,
+                    bm25_score,
                     timestamp,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY agent_id
-                        ORDER BY rank ASC, seq DESC
-                    ) AS rn
-                FROM matched
-             )
-             SELECT agent_id, seq, role, raw_snippet, body, rank, timestamp
-             FROM ranked
-             WHERE rn = 1
-             ORDER BY rank ASC, seq DESC
-             LIMIT ?4",
-        )?;
-
-        let rows = stmt.query_map(
-            params![fts_query, mark_start, mark_end, effective_limit as i64],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?.max(0) as u64,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, f64>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                ))
-            },
-        )?;
-
-        let mut hits = Vec::with_capacity(effective_limit);
-        for row in rows {
-            let (agent_id, seq, role, raw_snippet, body, rank, timestamp_rfc3339) = row?;
-            let snippet = finalize_snippet(&raw_snippet, &body, query);
-            hits.push(MessageSearchHit {
-                host_id: String::new(),
-                agent_id,
-                seq,
-                role,
-                snippet,
-                rank,
-                timestamp_rfc3339,
-            });
+                    agent_title,
+                    cwd,
+                ) = row?;
+                let snippet = finalize_snippet(&raw_snippet, &body, query);
+                hits.push(DaemonMessageSearchHit {
+                    agent_id,
+                    seq,
+                    turn_id,
+                    role,
+                    snippet,
+                    timestamp,
+                    bm25_score,
+                    agent_title,
+                    cwd,
+                });
+            }
+        } else {
+            let mut stmt = conn.prepare_cached(
+                "WITH matched AS (
+                    SELECT
+                        timeline_events_fts.agent_id AS agent_id,
+                        timeline_events_fts.seq AS seq,
+                        e.turn_id AS turn_id,
+                        timeline_events_fts.role AS role,
+                        snippet(timeline_events_fts, 3, ?2, ?3, '…', 20) AS raw_snippet,
+                        timeline_events_fts.body AS body,
+                        bm25(timeline_events_fts, 0.0, 0.0, 0.0, 1.0, 0.5) AS rank,
+                        e.timestamp AS timestamp,
+                        a.title AS agent_title,
+                        a.cwd AS cwd
+                    FROM timeline_events_fts
+                    INNER JOIN agents a ON a.agent_id = timeline_events_fts.agent_id
+                    LEFT JOIN timeline_events e ON e.seq = timeline_events_fts.rowid
+                    WHERE timeline_events_fts MATCH ?1
+                 ),
+                 ranked AS (
+                    SELECT
+                        agent_id,
+                        seq,
+                        turn_id,
+                        role,
+                        raw_snippet,
+                        body,
+                        rank,
+                        timestamp,
+                        agent_title,
+                        cwd,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY agent_id
+                            ORDER BY rank ASC, seq DESC
+                        ) AS rn
+                    FROM matched
+                 )
+                 SELECT agent_id, seq, turn_id, role, raw_snippet, body, rank, timestamp, agent_title, cwd
+                 FROM ranked
+                 WHERE rn = 1
+                 ORDER BY rank ASC, seq DESC
+                 LIMIT ?4",
+            )?;
+            let rows = stmt.query_map(
+                params![fts_query, mark_start, mark_end, effective_limit as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?.max(0) as u64,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, f64>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (
+                    agent_id,
+                    seq,
+                    turn_id,
+                    role,
+                    raw_snippet,
+                    body,
+                    bm25_score,
+                    timestamp,
+                    agent_title,
+                    cwd,
+                ) = row?;
+                let snippet = finalize_snippet(&raw_snippet, &body, query);
+                hits.push(DaemonMessageSearchHit {
+                    agent_id,
+                    seq,
+                    turn_id,
+                    role,
+                    snippet,
+                    timestamp,
+                    bm25_score,
+                    agent_title,
+                    cwd,
+                });
+            }
         }
+
         Ok(hits)
     }
 }
@@ -2739,6 +2982,157 @@ mod tests {
                 .expect("kept agent intact")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn daemon_scoped_fts5_search_supports_session_multi_hit_cjk_and_global_dedup() {
+        let store = OrbitStore::open_in_memory().expect("open store");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_remote".into(),
+                title: "Orbit Core".into(),
+                cwd: "/workspace/orbit-core".into(),
+                git_branch: Some("main".into()),
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::default(),
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+        let mut ag1 = mk_agent("ag_alpha", "ws_remote", "Pagination Audit");
+        ag1.cwd = "/workspace/orbit-core".into();
+        let mut ag2 = mk_agent("ag_beta", "ws_remote", "数据库迁移");
+        ag2.cwd = "/workspace/orbit-db".into();
+        store.upsert_agent(&ag1, None).expect("ag1");
+        store.upsert_agent(&ag2, None).expect("ag2");
+
+        let e1 = store
+            .append_timeline_event(
+                "ag_alpha",
+                1,
+                Some("turn_1"),
+                TimelinePayload::UserPrompt {
+                    message_id: "m1".into(),
+                    text: "Check nebula_beacon early turn pagination".into(),
+                    badges: Vec::new(),
+                },
+            )
+            .expect("e1");
+        let e2 = store
+            .append_timeline_event(
+                "ag_alpha",
+                1,
+                Some("turn_2"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "a1".into(),
+                    text: "Verified nebula_beacon in SQLite FTS5 layer and nebula_beacon ranking"
+                        .into(),
+                    streaming: false,
+                },
+            )
+            .expect("e2");
+        let e3 = store
+            .append_timeline_event(
+                "ag_beta",
+                1,
+                Some("turn_cjk"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "a2".into(),
+                    text: "已完成 nebula_beacon 远程全文检索与中文分词索引优化".into(),
+                    streaming: false,
+                },
+            )
+            .expect("e3");
+
+        // 1. Global search (`agent_id: None`) deduplicates to 1 best match per conversation and
+        //    enriches turn_id, agent_title, cwd, timestamp, and <mark> snippet.
+        let global_hits = store
+            .search_daemon_messages_scoped("nebula_beacon", None, 20)
+            .expect("global scoped search");
+        assert_eq!(global_hits.len(), 2);
+        let alpha_hit = global_hits
+            .iter()
+            .find(|h| h.agent_id == "ag_alpha")
+            .expect("alpha hit");
+        assert_eq!(alpha_hit.agent_title, "Pagination Audit");
+        assert_eq!(alpha_hit.cwd, "/workspace/orbit-core");
+        assert!(alpha_hit.snippet.contains("<mark>nebula_beacon</mark>"));
+        assert!(alpha_hit.timestamp.is_some());
+
+        // 2. Session-scoped search (`agent_id: Some("ag_alpha")`) returns BOTH distinct events
+        //    in ag_alpha and excludes ag_beta completely.
+        let session_hits = store
+            .search_daemon_messages_scoped("nebula_beacon", Some("ag_alpha"), 50)
+            .expect("session scoped search");
+        assert_eq!(session_hits.len(), 2);
+        assert!(session_hits.iter().all(|h| h.agent_id == "ag_alpha"));
+        let seqs: Vec<u64> = session_hits.iter().map(|h| h.seq).collect();
+        assert!(seqs.contains(&e1.seq));
+        assert!(seqs.contains(&e2.seq));
+        assert!(!seqs.contains(&e3.seq));
+        let e1_hit = session_hits.iter().find(|h| h.seq == e1.seq).expect("e1");
+        assert_eq!(e1_hit.turn_id.as_deref(), Some("turn_1"));
+        assert_eq!(e1_hit.role, "user");
+        let e2_hit = session_hits.iter().find(|h| h.seq == e2.seq).expect("e2");
+        assert_eq!(e2_hit.turn_id.as_deref(), Some("turn_2"));
+        assert_eq!(e2_hit.role, "assistant");
+
+        // 3. CJK scoped search matches Chinese phrase and extracts highlighted snippet.
+        let cjk_hits = store
+            .search_daemon_messages_scoped("全文检索", Some("ag_beta"), 20)
+            .expect("cjk scoped search");
+        assert_eq!(cjk_hits.len(), 1);
+        assert_eq!(cjk_hits[0].seq, e3.seq);
+        assert_eq!(cjk_hits[0].agent_title, "数据库迁移");
+        assert_eq!(cjk_hits[0].cwd, "/workspace/orbit-db");
+        assert!(cjk_hits[0].snippet.contains("<mark>全文检索</mark>"));
+
+        // 4. Limit = 0 and blank/punctuation queries return empty cleanly.
+        assert!(
+            store
+                .search_daemon_messages_scoped("nebula_beacon", None, 0)
+                .expect("zero limit")
+                .is_empty()
+        );
+        assert!(
+            store
+                .search_daemon_messages_scoped("   --- /// ", Some("ag_alpha"), 10)
+                .expect("punctuation only")
+                .is_empty()
+        );
+
+        // 5. Local replica session-scoped search returns all matching events in that session.
+        store
+            .upsert_replica_agents("host_local", &[ag1])
+            .expect("rep agent");
+        store
+            .upsert_replica_timeline_events_batch_for_host("host_local", &[e1.clone(), e2.clone()])
+            .expect("rep events");
+        let rep_session = store
+            .search_replica_messages_for_agent("nebula_beacon", Some("host_local"), "ag_alpha", 20)
+            .expect("replica session search");
+        assert_eq!(rep_session.len(), 2);
+        assert!(
+            rep_session
+                .iter()
+                .any(|h| h.seq == e1.seq && h.turn_id.as_deref() == Some("turn_1"))
+        );
+        assert!(
+            rep_session
+                .iter()
+                .any(|h| h.seq == e2.seq && h.turn_id.as_deref() == Some("turn_2"))
         );
     }
 }

@@ -17,6 +17,7 @@ import {
   GitFork,
   Globe,
   Hash,
+  History,
   LayoutList,
   MessageCircleQuestion,
   MessageSquare,
@@ -47,6 +48,7 @@ import {
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
 import { useWorkspaceScripts } from "@/components/side-panel/scripts-panel";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog-tabs";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { Kbd, ShortcutKbd } from "@/components/ui/overlays";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -78,6 +80,7 @@ interface PaletteItem {
   snippet?: string;
   snippetRole?: string;
   metaBadge?: string;
+  isUnloadedHistory?: boolean;
   gitStatus?: string;
   relativeTime?: string;
   shortcut?: string;
@@ -297,6 +300,7 @@ function CommandPaletteDialog() {
     hits: ConversationSearchHit[];
   }>({ query: "", hits: [] });
   const [isSearchingMessages, setIsSearchingMessages] = useState(false);
+  const [isSearchingRemoteMessages, setIsSearchingRemoteMessages] = useState(false);
 
   const inputRef = useRef<HTMLInputElement | null>(null);
   const itemRefs = useRef<Map<number, HTMLButtonElement>>(new Map());
@@ -332,7 +336,7 @@ function CommandPaletteDialog() {
     }
   }, [mode, selectedHostId, activeCwd, selectedWorkspaceCwd]);
 
-  // Debounced (80ms) SQLite FTS5 cross-conversation search in `all` & `@` modes
+  // Debounced (80ms) local-first + concurrent remote full-history SQLite FTS5 search in `all` & `@` modes
   useEffect(() => {
     if (isComposing) return;
     const reqId = searchReqIdRef.current + 1;
@@ -341,23 +345,46 @@ function CommandPaletteDialog() {
     if ((mode !== "all" && mode !== "threads") || !meetsFtsQueryThreshold(term)) {
       setMessageResult({ query: "", hits: [] });
       setIsSearchingMessages(false);
+      setIsSearchingRemoteMessages(false);
       return;
     }
 
     let cancelled = false;
+    let remoteResolved = false;
     setIsSearchingMessages(true);
+    setIsSearchingRemoteMessages(true);
     const timer = window.setTimeout(() => {
+      // 1. Fast local replica FTS5 (sub-2ms) so instant matches appear with zero network latency
       void orbitIpc
         .searchMessages(term, FTS_RESULT_LIMIT)
-        .then((hits) => {
+        .then((localHits) => {
           if (cancelled || searchReqIdRef.current !== reqId) return;
-          setMessageResult({ query: term, hits });
+          if (!remoteResolved) {
+            setMessageResult({ query: term, hits: localHits });
+          }
           setIsSearchingMessages(false);
         })
         .catch(() => {
           if (cancelled || searchReqIdRef.current !== reqId) return;
-          setMessageResult({ query: "", hits: [] });
+          if (!remoteResolved) {
+            setMessageResult({ query: term, hits: [] });
+          }
           setIsSearchingMessages(false);
+        });
+
+      // 2. Concurrent remote daemon full-history FTS5 fan-out (merged & BM25-ranked in Rust core)
+      void orbitIpc
+        .searchMessagesRemote({ query: term, limit: FTS_RESULT_LIMIT })
+        .then((remoteRes) => {
+          if (cancelled || searchReqIdRef.current !== reqId) return;
+          remoteResolved = true;
+          setMessageResult({ query: term, hits: remoteRes.hits ?? [] });
+          setIsSearchingMessages(false);
+          setIsSearchingRemoteMessages(false);
+        })
+        .catch(() => {
+          if (cancelled || searchReqIdRef.current !== reqId) return;
+          setIsSearchingRemoteMessages(false);
         });
     }, FTS_DEBOUNCE_MS);
 
@@ -463,6 +490,18 @@ function CommandPaletteDialog() {
       },
       ...(selectedHostId && selectedAgentId && !isDraftNewSession
         ? [
+            {
+              id: "act-find-in-conversation",
+              kind: "command" as const,
+              sectionKey: "palette.sectionActions" as const,
+              section: actionsSection,
+              title: t("palette.findInConversation"),
+              subtitle: t("palette.findInConversationSub"),
+              keywords: "find search transcript history messages cmd+f",
+              shortcut: `${mod}F`,
+              icon: <Search className="size-3.5" />,
+              run: () => orbitActions.openStageFind(),
+            },
             {
               id: "act-fork-thread",
               kind: "command" as const,
@@ -1138,6 +1177,7 @@ function CommandPaletteDialog() {
         snippet: hit.snippet,
         snippetRole: hit.role,
         metaBadge,
+        isUnloadedHistory: Boolean(hit.is_unloaded || hit.is_remote),
         relativeTime: formatCompactRelativeTime(hit.updated_at_rfc3339, t) ?? item.relativeTime,
         run: () => orbitActions.selectAgent(hit.host_id, hit.agent_id, hit.seq),
       };
@@ -1162,6 +1202,7 @@ function CommandPaletteDialog() {
         snippet: hit.snippet,
         snippetRole: hit.role,
         metaBadge: buildMetaBadge(hit, isMultiHost),
+        isUnloadedHistory: Boolean(hit.is_unloaded || hit.is_remote),
         relativeTime: formatCompactRelativeTime(hit.updated_at_rfc3339, t),
         threadKey: tKey,
         icon:
@@ -1270,6 +1311,7 @@ function CommandPaletteDialog() {
           ? t("palette.placeholderFiles")
           : t("palette.placeholder");
 
+  const isAnyMessageSearchPending = isSearchingMessages || isSearchingRemoteMessages;
   const emptyMessage =
     mode === "files"
       ? workspaceFiles.length === 0
@@ -1278,10 +1320,10 @@ function CommandPaletteDialog() {
       : mode === "commands"
         ? t("palette.noMatchingCommands")
         : mode === "threads"
-          ? isSearchingMessages
+          ? isAnyMessageSearchPending
             ? t("palette.searchingMessages")
             : t("palette.noMatchingThreads")
-          : isSearchingMessages
+          : isAnyMessageSearchPending
             ? t("palette.searchingMessages")
             : t("palette.noMatches");
 
@@ -1337,6 +1379,16 @@ function CommandPaletteDialog() {
         {mode === "files" && parsedFile.line != null && (
           <span className="bg-signal-info/12 text-signal-info shrink-0 rounded px-1.5 py-0.5 font-mono text-[11px] font-medium">
             L{parsedFile.line}
+          </span>
+        )}
+
+        {isSearchingRemoteMessages && (mode === "all" || mode === "threads") && meetsFtsQueryThreshold(term) && (
+          <span
+            title={t("palette.searchingRemoteHistory")}
+            className="text-ink-muted inline-flex shrink-0 items-center gap-1.5 text-[11px] select-none"
+          >
+            <OrbitSpinner size={11} />
+            <span className="hidden sm:inline">{t("palette.searchingRemoteHistory")}</span>
           </span>
         )}
 
@@ -1397,6 +1449,15 @@ function CommandPaletteDialog() {
                         {item.metaBadge && (
                           <span className="text-muted-foreground/80 bg-foreground/[0.045] dark:bg-foreground/[0.07] max-w-[160px] shrink-0 truncate rounded px-1.5 py-0.5 text-[11px] leading-none font-normal">
                             {item.metaBadge}
+                          </span>
+                        )}
+                        {item.isUnloadedHistory && (
+                          <span
+                            title={t("stage.findIncludesEarlierHistory")}
+                            className="text-ink-muted bg-foreground/[0.04] dark:bg-foreground/[0.065] inline-flex shrink-0 items-center gap-0.5 rounded px-1.5 py-0.5 text-[11px] leading-none font-normal"
+                          >
+                            <History className="size-[10px] opacity-80" aria-hidden="true" />
+                            <span>{t("palette.remoteHistoryBadge")}</span>
                           </span>
                         )}
                       </div>

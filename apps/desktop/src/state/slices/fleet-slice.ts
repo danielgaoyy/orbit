@@ -420,6 +420,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
             ? {
                 composerDrafts: omitRecordKeys(s.composerDrafts, remotelyArchivedDraftKeys),
                 slashDirectives: omitRecordKeys(s.slashDirectives, remotelyArchivedDraftKeys),
+                inlineMentions: omitRecordKeys(s.inlineMentions, remotelyArchivedDraftKeys),
                 pastedAttachments: omitRecordKeys(s.pastedAttachments, remotelyArchivedDraftKeys),
                 diffQuotes: omitRecordKeys(s.diffQuotes, remotelyArchivedDraftKeys),
                 sideQuestionDrafts: omitRecordKeys(s.sideQuestionDrafts, remotelyArchivedDraftKeys),
@@ -616,6 +617,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
       let viewedAgentLatestSeq: number | null = null;
       let viewedAgentIdToMark: string | null = null;
       let viewedAgentWasUnread = false;
+      let newlyAttachedTerminal: { tabKey: string; terminalId: string } | null = null;
 
       for (const ag of detail.agents) {
         if (ag.is_unread) {
@@ -720,6 +722,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
             } else {
               nextTabs = [...nextTabs, entry];
               nextActiveTab = tabKey;
+              newlyAttachedTerminal = { tabKey, terminalId: detail.active_terminal_id };
             }
           }
         }
@@ -760,6 +763,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
             ? {
                 composerDrafts: omitRecordKeys(s.composerDrafts, remotelyArchivedDraftKeys),
                 slashDirectives: omitRecordKeys(s.slashDirectives, remotelyArchivedDraftKeys),
+                inlineMentions: omitRecordKeys(s.inlineMentions, remotelyArchivedDraftKeys),
                 pastedAttachments: omitRecordKeys(s.pastedAttachments, remotelyArchivedDraftKeys),
                 diffQuotes: omitRecordKeys(s.diffQuotes, remotelyArchivedDraftKeys),
                 sideQuestionDrafts: omitRecordKeys(s.sideQuestionDrafts, remotelyArchivedDraftKeys),
@@ -767,6 +771,11 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
             : {}),
         };
       });
+
+      if (newlyAttachedTerminal !== null) {
+        const attached = newlyAttachedTerminal as { tabKey: string; terminalId: string };
+        ctx.actions.onTerminalTabAttached(hostId, attached.tabKey, attached.terminalId);
+      }
 
       if (viewedAgentIdToMark !== null && viewedAgentLatestSeq !== null) {
         markThreadSeenInCore(

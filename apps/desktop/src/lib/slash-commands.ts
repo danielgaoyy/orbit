@@ -34,6 +34,7 @@ export type SlashCommandGroupId =
   | "session"
   | "tools"
   | "orchestration"
+  | "commands"
   | "skills";
 
 export const SLASH_GROUP_ORDER: readonly SlashCommandGroupId[] = [
@@ -41,6 +42,7 @@ export const SLASH_GROUP_ORDER: readonly SlashCommandGroupId[] = [
   "session",
   "tools",
   "orchestration",
+  "commands",
   "skills",
 ];
 
@@ -77,10 +79,12 @@ export const SLASH_GROUP_LABEL_KEY: Readonly<Record<SlashCommandGroupId, Message
   session: "composer.slashGroupSession",
   tools: "composer.slashGroupTools",
   orchestration: "composer.slashGroupOrchestration",
+  commands: "composer.slashGroupCommands",
   skills: "composer.slashGroupSkills",
 };
 
 export function resolveSlashCommandGroup(cmd: SlashCommandView): SlashCommandGroupId {
+  if (cmd.icon_key === "command" || cmd.id.startsWith("cmd:")) return "commands";
   if (cmd.icon_key === "skill" || cmd.id.startsWith("skill:")) return "skills";
   switch (cmd.id) {
     case "plan":

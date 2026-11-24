@@ -141,6 +141,29 @@ export type InlineMentionTarget =
       signature?: string | null;
       container?: string | null;
       language: string;
+    }
+  | {
+      token: string;
+      kind: "folder";
+      path: string;
+      fileCount: number;
+    }
+  | {
+      token: string;
+      kind: "pr";
+      number: number;
+      title: string;
+      url?: string | null;
+      state?: string | null;
+      headRef?: string | null;
+      baseRef?: string | null;
+      summary?: string | null;
+    }
+  | {
+      token: string;
+      kind: "web";
+      url: string;
+      label: string;
     };
 
 export interface QueuedPromptItem {
@@ -231,7 +254,41 @@ export type ContextMentionItem =
       computedBox?: { x: number; y: number; width: number; height: number } | null;
       outerHtmlExcerpt: string;
       pageUrl: string;
+    }
+  | {
+      id: string;
+      kind: "folder";
+      path: string;
+      fileCount: number;
+      treeSummary?: string | null;
+    }
+  | {
+      id: string;
+      kind: "pr";
+      number: number;
+      title: string;
+      url?: string | null;
+      state?: string | null;
+      headRef?: string | null;
+      baseRef?: string | null;
+      summary?: string | null;
+    }
+  | {
+      id: string;
+      kind: "web";
+      url: string;
+      label: string;
     };
+
+export type TerminalSplitDirection = "horizontal" | "vertical";
+
+export interface TerminalSplitGroup {
+  id: string;
+  hostId: string;
+  direction: TerminalSplitDirection;
+  paneKeys: string[];
+  ratios: number[];
+}
 
 export interface TerminalTabSession {
   key: string;
@@ -490,6 +547,7 @@ export interface OrbitUiState {
 
   // Persistent Multi-Slot PTY Sessions (rendered inside Side Panel Terminal tab)
   terminalTabs: TerminalTabSession[];
+  terminalSplits: TerminalSplitGroup[];
   activeTerminalTabKey: string | null;
   terminalFocused: boolean;
 

@@ -528,6 +528,7 @@ export function createDefaultInitialState(
   initialDrafts: {
     composerDrafts: OrbitUiState["composerDrafts"];
     slashDirectives: OrbitUiState["slashDirectives"];
+    inlineMentions: OrbitUiState["inlineMentions"];
     contextItems: OrbitUiState["contextItems"];
     pastedAttachments: OrbitUiState["pastedAttachments"];
     diffQuotes: OrbitUiState["diffQuotes"];
@@ -576,7 +577,7 @@ export function createDefaultInitialState(
 
     composerDrafts: initialDrafts.composerDrafts,
     slashDirectives: initialDrafts.slashDirectives,
-    inlineMentions: {},
+    inlineMentions: initialDrafts.inlineMentions,
     contextItems: initialDrafts.contextItems,
     pastedAttachments: initialDrafts.pastedAttachments,
     diffQuotes: initialDrafts.diffQuotes,
@@ -661,6 +662,7 @@ export function createDefaultInitialState(
     stageFindFocusNonce: 0,
 
     terminalTabs: [],
+    terminalSplits: [],
     activeTerminalTabKey: null,
     terminalFocused: false,
 

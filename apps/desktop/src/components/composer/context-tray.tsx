@@ -6,7 +6,10 @@ import {
   FileDiff,
   FileText,
   Film,
+  Folder,
   GitCompareArrows,
+  GitPullRequest,
+  Globe,
   Image as ImageIcon,
   Music,
   Quote,
@@ -32,6 +35,7 @@ import { symbolKindGlyph } from "@/lib/symbol-mentions";
 import {
   type ContextMentionItem,
   type DiffQuoteSnippet,
+  type InlineMentionTarget,
   type PastedAttachment,
   orbitActions,
   useOrbitSelector,
@@ -39,8 +43,10 @@ import {
 
 interface ContextTrayProps {
   contexts: readonly ContextMentionItem[];
+  inlineMentions?: readonly InlineMentionTarget[];
   quotes: readonly DiffQuoteSnippet[];
   pastes: readonly PastedAttachment[];
+  onRemoveInlineMention?: (token: string) => void;
 }
 
 interface ImagePreviewState {
@@ -175,8 +181,10 @@ function splitPathDisplay(rawPath: string): { basename: string; dirHint: string 
 
 export const ContextTray = memo(function ContextTray({
   contexts,
+  inlineMentions = [],
   quotes,
   pastes,
+  onRemoveInlineMention,
 }: ContextTrayProps) {
   const { t } = useI18n();
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
@@ -185,7 +193,12 @@ export const ContextTray = memo(function ContextTray({
   const [previewPaste, setPreviewPaste] = useState<PastePreviewState | null>(null);
   const [copiedPaste, setCopiedPaste] = useState(false);
 
-  if (contexts.length === 0 && quotes.length === 0 && pastes.length === 0) {
+  if (
+    contexts.length === 0 &&
+    inlineMentions.length === 0 &&
+    quotes.length === 0 &&
+    pastes.length === 0
+  ) {
     return null;
   }
 
@@ -452,7 +465,259 @@ export const ContextTray = memo(function ContextTray({
             );
           }
 
+          if (item.kind === "folder") {
+            return (
+              <span
+                key={item.id}
+                title={`${item.path}/ (${item.fileCount})`}
+                className="orbit-pill-enter border-border-subtle bg-surface-recessed/80 text-ink-primary inline-flex max-w-68 items-center gap-1.5 rounded-md border py-0.5 pr-1 pl-2 text-[12px]"
+              >
+                <Folder className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
+                <span className="truncate font-mono font-medium">{item.path}/</span>
+                {item.fileCount > 0 && (
+                  <span className="text-ink-muted shrink-0 font-mono text-[11px] tabular-nums">
+                    {item.fileCount}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  aria-label={t("composer.removeAttachmentAria", { name: `${item.path}/` })}
+                  onClick={() => orbitActions.removeContextMention(item.id)}
+                  className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-[5px] transition-colors"
+                >
+                  <X className="size-3" />
+                </button>
+              </span>
+            );
+          }
+
+          if (item.kind === "pr") {
+            return (
+              <span
+                key={item.id}
+                title={`PR #${item.number}: ${item.title}${item.headRef ? ` (${item.headRef})` : ""}`}
+                className="orbit-pill-enter border-border-subtle bg-surface-recessed/80 text-ink-primary inline-flex max-w-72 items-center gap-1.5 rounded-md border py-0.5 pr-1 pl-2 text-[12px]"
+              >
+                <GitPullRequest className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
+                <span className="shrink-0 font-mono font-medium tabular-nums">
+                  #{item.number}
+                </span>
+                <span className="text-ink-secondary truncate text-[12px]">{item.title}</span>
+                <button
+                  type="button"
+                  aria-label={t("composer.removeAttachmentAria", { name: `PR #${item.number}` })}
+                  onClick={() => orbitActions.removeContextMention(item.id)}
+                  className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-[5px] transition-colors"
+                >
+                  <X className="size-3" />
+                </button>
+              </span>
+            );
+          }
+
+          if (item.kind === "web") {
+            return (
+              <span
+                key={item.id}
+                title={item.url}
+                className="orbit-pill-enter border-border-subtle bg-surface-recessed/80 text-ink-primary inline-flex max-w-72 items-center gap-1.5 rounded-md border py-0.5 pr-1 pl-2 text-[12px]"
+              >
+                <Globe className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
+                <span className="truncate font-mono font-medium">{item.label}</span>
+                <button
+                  type="button"
+                  aria-label={t("composer.removeAttachmentAria", { name: item.label })}
+                  onClick={() => orbitActions.removeContextMention(item.id)}
+                  className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-[5px] transition-colors"
+                >
+                  <X className="size-3" />
+                </button>
+              </span>
+            );
+          }
+
           return null;
+        })}
+
+        {/* 2b. Atomic Inline `@` Mention Chips (monochrome hairline, 1-click removal synced with draft) */}
+        {inlineMentions.map((m) => {
+          const handleRemove = () => {
+            if (onRemoveInlineMention) {
+              onRemoveInlineMention(m.token);
+            } else {
+              orbitActions.removeInlineMention(m.token);
+            }
+          };
+
+          if (m.kind === "file") {
+            const { basename, dirHint } = splitPathDisplay(m.path);
+            const FileIcon = resolveSemanticFileIcon(basename);
+            return (
+              <span
+                key={`inl:${m.token}`}
+                data-inline-mention-chip={m.token}
+                title={m.path}
+                className="orbit-pill-enter border-border-subtle bg-surface-recessed/70 text-ink-primary inline-flex max-w-68 items-center gap-1.5 rounded-md border py-0.5 pr-1 pl-2 text-[12px]"
+              >
+                <FileIcon className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
+                <span className="truncate font-mono font-medium">{basename}</span>
+                {dirHint && (
+                  <span className="text-ink-muted hidden truncate font-mono text-[11px] sm:inline">
+                    {dirHint}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  aria-label={t("composer.removeAttachmentAria", { name: m.token })}
+                  onClick={handleRemove}
+                  className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-4.5 shrink-0 cursor-pointer items-center justify-center rounded-[4px] transition-colors"
+                >
+                  <X className="size-3" />
+                </button>
+              </span>
+            );
+          }
+
+          if (m.kind === "folder") {
+            return (
+              <span
+                key={`inl:${m.token}`}
+                data-inline-mention-chip={m.token}
+                title={`${m.path}/ (${m.fileCount})`}
+                className="orbit-pill-enter border-border-subtle bg-surface-recessed/70 text-ink-primary inline-flex max-w-68 items-center gap-1.5 rounded-md border py-0.5 pr-1 pl-2 text-[12px]"
+              >
+                <Folder className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
+                <span className="truncate font-mono font-medium">{m.path}/</span>
+                {m.fileCount > 0 && (
+                  <span className="text-ink-muted shrink-0 font-mono text-[11px] tabular-nums">
+                    {m.fileCount}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  aria-label={t("composer.removeAttachmentAria", { name: m.token })}
+                  onClick={handleRemove}
+                  className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-4.5 shrink-0 cursor-pointer items-center justify-center rounded-[4px] transition-colors"
+                >
+                  <X className="size-3" />
+                </button>
+              </span>
+            );
+          }
+
+          if (m.kind === "pr") {
+            return (
+              <span
+                key={`inl:${m.token}`}
+                data-inline-mention-chip={m.token}
+                title={`PR #${m.number}: ${m.title}${m.headRef ? ` (${m.headRef})` : ""}`}
+                className="orbit-pill-enter border-border-subtle bg-surface-recessed/70 text-ink-primary inline-flex max-w-72 items-center gap-1.5 rounded-md border py-0.5 pr-1 pl-2 text-[12px]"
+              >
+                <GitPullRequest className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
+                <span className="shrink-0 font-mono font-medium tabular-nums">#{m.number}</span>
+                <span className="text-ink-secondary truncate">{m.title}</span>
+                <button
+                  type="button"
+                  aria-label={t("composer.removeAttachmentAria", { name: m.token })}
+                  onClick={handleRemove}
+                  className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-4.5 shrink-0 cursor-pointer items-center justify-center rounded-[4px] transition-colors"
+                >
+                  <X className="size-3" />
+                </button>
+              </span>
+            );
+          }
+
+          if (m.kind === "web") {
+            return (
+              <span
+                key={`inl:${m.token}`}
+                data-inline-mention-chip={m.token}
+                title={m.url}
+                className="orbit-pill-enter border-border-subtle bg-surface-recessed/70 text-ink-primary inline-flex max-w-72 items-center gap-1.5 rounded-md border py-0.5 pr-1 pl-2 text-[12px]"
+              >
+                <Globe className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
+                <span className="truncate font-mono font-medium">{m.label}</span>
+                <button
+                  type="button"
+                  aria-label={t("composer.removeAttachmentAria", { name: m.token })}
+                  onClick={handleRemove}
+                  className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-4.5 shrink-0 cursor-pointer items-center justify-center rounded-[4px] transition-colors"
+                >
+                  <X className="size-3" />
+                </button>
+              </span>
+            );
+          }
+
+          if (m.kind === "code_symbol") {
+            const glyphMeta = symbolKindGlyph(m.symbolKind);
+            return (
+              <span
+                key={`inl:${m.token}`}
+                data-inline-mention-chip={m.token}
+                title={m.signature || `${m.symbolName} (${m.path}:L${m.startLine})`}
+                className="orbit-pill-enter border-border-subtle bg-surface-recessed/70 text-ink-primary inline-flex max-w-68 items-center gap-1.5 rounded-md border py-0.5 pr-1 pl-1.5 text-[12px]"
+              >
+                <span className="bg-surface-base text-ink-muted inline-flex size-4 shrink-0 items-center justify-center rounded font-mono text-[11px] font-semibold">
+                  {glyphMeta.glyph}
+                </span>
+                <span className="truncate font-mono font-medium">{m.symbolName}</span>
+                <span className="text-ink-muted shrink-0 font-mono text-[11px] tabular-nums">
+                  :L{m.startLine}
+                </span>
+                <button
+                  type="button"
+                  aria-label={t("composer.removeAttachmentAria", { name: m.token })}
+                  onClick={handleRemove}
+                  className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-4.5 shrink-0 cursor-pointer items-center justify-center rounded-[4px] transition-colors"
+                >
+                  <X className="size-3" />
+                </button>
+              </span>
+            );
+          }
+
+          if (m.kind === "git_diff") {
+            const DiffIcon = m.staged ? GitCompareArrows : FileDiff;
+            return (
+              <span
+                key={`inl:${m.token}`}
+                data-inline-mention-chip={m.token}
+                className="orbit-pill-enter border-border-subtle bg-surface-recessed/70 text-ink-primary inline-flex items-center gap-1.5 rounded-md border py-0.5 pr-1 pl-2 text-[12px]"
+              >
+                <DiffIcon className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
+                <span className="font-mono font-medium">{m.token}</span>
+                <button
+                  type="button"
+                  aria-label={t("composer.removeAttachmentAria", { name: m.token })}
+                  onClick={handleRemove}
+                  className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-4.5 shrink-0 cursor-pointer items-center justify-center rounded-[4px] transition-colors"
+                >
+                  <X className="size-3" />
+                </button>
+              </span>
+            );
+          }
+
+          return (
+            <span
+              key={`inl:${m.token}`}
+              data-inline-mention-chip={m.token}
+              className="orbit-pill-enter border-border-subtle bg-surface-recessed/70 text-ink-primary inline-flex items-center gap-1.5 rounded-md border py-0.5 pr-1 pl-2 text-[12px]"
+            >
+              <SquareTerminal className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
+              <span className="font-mono font-medium">{m.label}</span>
+              <button
+                type="button"
+                aria-label={t("composer.removeAttachmentAria", { name: m.token })}
+                onClick={handleRemove}
+                className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-4.5 shrink-0 cursor-pointer items-center justify-center rounded-[4px] transition-colors"
+              >
+                <X className="size-3" />
+              </button>
+            </span>
+          );
         })}
 
         {/* 3. Diff Line Quotes */}

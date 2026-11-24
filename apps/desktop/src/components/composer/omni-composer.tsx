@@ -71,6 +71,15 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import {
+  buildFolderTreeSummary,
+  findInlineMentionSpans,
+  isValidHttpsReferenceUrl,
+  resolveAtomicMentionBackspace,
+  resolveAtomicMentionDelete,
+  shortWebUrlLabel,
+} from "@/lib/inline-mentions";
+import {
+  containsInlineMentionToken,
   mergeMentionCandidates,
   parseSymbolMentionQuery,
   resolveDisambiguatedSymbolToken,
@@ -226,16 +235,32 @@ export const OmniComposer = memo(function OmniComposer({
       if (!skill.enabled) continue;
       const cmd = `/${skill.slug}`;
       if (existingCommands.has(cmd.toLowerCase())) continue;
-      skillEntries.push({
-        id: `skill:${skill.slug}`,
-        command: cmd,
-        label: skill.name,
-        description: skill.description || `Invoke ${skill.name} skill`,
-        shortcut_key: null,
-        icon_key: "skill",
-        keywords: ["skills", "skill", skill.slug, skill.name, ...skill.triggers],
-        desktop_only: false,
-      });
+      existingCommands.add(cmd.toLowerCase());
+      if (skill.is_command) {
+        skillEntries.push({
+          id: `cmd:${skill.id}`,
+          command: cmd,
+          label: skill.name,
+          description: skill.description || `Run ${cmd} command`,
+          shortcut_key: null,
+          icon_key: "command",
+          keywords: ["command", "claude", skill.slug, skill.name, ...skill.triggers],
+          desktop_only: false,
+          argument_hint: skill.argument_hint ?? null,
+          skill_id: skill.id,
+        });
+      } else {
+        skillEntries.push({
+          id: `skill:${skill.slug}`,
+          command: cmd,
+          label: skill.name,
+          description: skill.description || `Invoke ${skill.name} skill`,
+          shortcut_key: null,
+          icon_key: "skill",
+          keywords: ["skills", "skill", skill.slug, skill.name, ...skill.triggers],
+          desktop_only: false,
+        });
+      }
     }
     return skillEntries.length > 0 ? [...visibleBuiltins, ...skillEntries] : visibleBuiltins;
   }, [slashCommands, managedSkills]);
@@ -818,6 +843,19 @@ export const OmniComposer = memo(function OmniComposer({
         orbitActions.openSettings();
         return;
       default:
+        if (cmd.id.startsWith("cmd:")) {
+          const nextText = stripped ? `${cmd.command} ${stripped}` : `${cmd.command} `;
+          orbitActions.setComposerDraft(nextText);
+          setCursorOffset(nextText.length, nextText);
+          requestAnimationFrame(() => {
+            const el = textareaRef.current;
+            if (el) {
+              el.focus();
+              el.setSelectionRange(nextText.length, nextText.length);
+            }
+          });
+          return;
+        }
         if (cmd.id.startsWith("skill:")) {
           const slug = cmd.id.slice("skill:".length);
           orbitActions.addContextMention({
@@ -847,10 +885,10 @@ export const OmniComposer = memo(function OmniComposer({
     const beforeAt = draftText.slice(0, mentionTrigger.atIndex);
     const afterToken = draftText.slice(mentionTrigger.endIndex);
 
-    const insertInlineToken = (token: string) => {
+    const insertInlineToken = (token: string, appendTrailingSpace = true) => {
       const needsLeadingSpace = beforeAt.length > 0 && !/\s$/.test(beforeAt);
-      const inserted = `${needsLeadingSpace ? " " : ""}${token} `;
-      const trimmedAfter = afterToken.replace(/^[ \t]+/, "");
+      const inserted = `${needsLeadingSpace ? " " : ""}${token}${appendTrailingSpace ? " " : ""}`;
+      const trimmedAfter = appendTrailingSpace ? afterToken.replace(/^[ \t]+/, "") : afterToken;
       const nextDraft = `${beforeAt}${inserted}${trimmedAfter}`;
       const nextPos = beforeAt.length + inserted.length;
       orbitActions.setComposerDraft(nextDraft);
@@ -917,6 +955,104 @@ export const OmniComposer = memo(function OmniComposer({
     } else if (candidate.kind === "path_rule") {
       const token = candidate.token_label || candidate.title;
       insertInlineToken(token);
+    } else if (candidate.kind === "folder_hint") {
+      insertInlineToken("@folder:", false);
+      if (selectedHostId && selectedCwd && selectedCwd !== "~") {
+        void orbitActions.ensureWorkspaceFiles(selectedHostId, selectedCwd);
+      }
+    } else if (candidate.kind === "folder") {
+      const folderPath = candidate.file_path.replace(/\/+$/, "");
+      const token = candidate.token_label || `@folder:${folderPath}`;
+      const cachedFiles =
+        selectedHostId && selectedCwd
+          ? (orbitActions.getSnapshot().workspaceFilesCache[`${selectedHostId}::${selectedCwd}`] ??
+            [])
+          : [];
+      const { fileCount } = buildFolderTreeSummary(folderPath, cachedFiles);
+      orbitActions.registerInlineMention({
+        token,
+        kind: "folder",
+        path: folderPath,
+        fileCount,
+      });
+      insertInlineToken(token);
+    } else if (candidate.kind === "web_hint") {
+      insertInlineToken("@web:https://", false);
+    } else if (candidate.kind === "web") {
+      const cleanUrl = (candidate.file_path || candidate.subtitle).trim();
+      if (isValidHttpsReferenceUrl(cleanUrl)) {
+        const token = candidate.token_label || `@web:${cleanUrl}`;
+        orbitActions.registerInlineMention({
+          token,
+          kind: "web",
+          url: cleanUrl,
+          label: shortWebUrlLabel(cleanUrl),
+        });
+        insertInlineToken(token);
+      } else {
+        orbitActions.showToast(t("composer.mentionInvalidHttpsUrl"));
+      }
+    } else if (candidate.kind === "pr") {
+      const joined = collapseStrippedToken(beforeAt, afterToken);
+      orbitActions.setComposerDraft(joined.text);
+      setCursorOffset(joined.cursor, joined.text);
+      const hostId = selectedHostId;
+      const cwd = selectedCwd;
+      if (!hostId || !cwd || cwd === "~") {
+        orbitActions.showToast(t("composer.mentionPrUnavailable"));
+      } else {
+        void orbitIpc
+          .gitPrStatus({ hostId, cwd })
+          .then((pr) => {
+            if (pr.availability !== "available" || !pr.number) {
+              orbitActions.showToast(pr.reason || t("composer.mentionPrNotFound"));
+              return;
+            }
+            const token = `@pr#${pr.number}`;
+            const title = pr.title?.trim() || `Pull Request #${pr.number}`;
+            const summaryParts: string[] = [];
+            if (pr.head_ref && pr.base_ref) {
+              summaryParts.push(`Branch: ${pr.head_ref} -> ${pr.base_ref}`);
+            }
+            if (pr.state) {
+              summaryParts.push(`State: ${pr.state}${pr.is_draft ? " (Draft)" : ""}`);
+            }
+            if (pr.checks.length > 0) {
+              summaryParts.push(
+                `CI checks: ${pr.passing_checks} passing, ${pr.failing_checks} failing, ${pr.pending_checks} pending`,
+              );
+            }
+            if (pr.unresolved_comment_count > 0) {
+              summaryParts.push(`Unresolved review comments: ${pr.unresolved_comment_count}`);
+            }
+            orbitActions.registerInlineMention({
+              token,
+              kind: "pr",
+              number: pr.number,
+              title,
+              url: pr.url ?? null,
+              state: pr.state ?? null,
+              headRef: pr.head_ref ?? null,
+              baseRef: pr.base_ref ?? null,
+              summary: summaryParts.join("\n") || null,
+            });
+            const latest = draftTextRef.current;
+            const sep = latest.length > 0 && !/\s$/.test(latest) ? " " : "";
+            const next = `${latest}${sep}${token} `;
+            orbitActions.setComposerDraft(next);
+            setCursorOffset(next.length, next);
+            requestAnimationFrame(() => {
+              const el = textareaRef.current;
+              if (el) {
+                el.focus();
+                el.setSelectionRange(next.length, next.length);
+              }
+            });
+          })
+          .catch(() => {
+            orbitActions.showToast(t("composer.mentionPrUnavailable"));
+          });
+      }
     } else if (candidate.kind === "terminal" || candidate.kind === "terminal_output") {
       const snap = orbitActions.captureActiveTerminalTail();
       if (snap) {
@@ -1145,6 +1281,72 @@ export const OmniComposer = memo(function OmniComposer({
 
     if (
       e.key === "Backspace" &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      !e.altKey &&
+      !slashTrigger &&
+      !mentionTrigger &&
+      inlineMentions.length > 0 &&
+      textareaRef.current
+    ) {
+      const atomicBack = resolveAtomicMentionBackspace(
+        draftText,
+        textareaRef.current.selectionStart,
+        textareaRef.current.selectionEnd,
+        inlineMentions,
+      );
+      if (atomicBack) {
+        e.preventDefault();
+        orbitActions.setComposerDraft(atomicBack.nextText);
+        if (!containsInlineMentionToken(atomicBack.nextText, atomicBack.removedToken)) {
+          orbitActions.unregisterInlineMention(atomicBack.removedToken);
+        }
+        setCursorOffset(atomicBack.nextCursor, atomicBack.nextText);
+        requestAnimationFrame(() => {
+          const el = textareaRef.current;
+          if (el) {
+            el.setSelectionRange(atomicBack.nextCursor, atomicBack.nextCursor);
+          }
+        });
+        return;
+      }
+    }
+
+    if (
+      e.key === "Delete" &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      !e.altKey &&
+      !slashTrigger &&
+      !mentionTrigger &&
+      inlineMentions.length > 0 &&
+      textareaRef.current
+    ) {
+      const atomicDel = resolveAtomicMentionDelete(
+        draftText,
+        textareaRef.current.selectionStart,
+        textareaRef.current.selectionEnd,
+        inlineMentions,
+      );
+      if (atomicDel) {
+        e.preventDefault();
+        orbitActions.setComposerDraft(atomicDel.nextText);
+        if (!containsInlineMentionToken(atomicDel.nextText, atomicDel.removedToken)) {
+          orbitActions.unregisterInlineMention(atomicDel.removedToken);
+        }
+        setCursorOffset(atomicDel.nextCursor, atomicDel.nextText);
+        requestAnimationFrame(() => {
+          const el = textareaRef.current;
+          if (el) {
+            el.setSelectionRange(atomicDel.nextCursor, atomicDel.nextCursor);
+          }
+        });
+        return;
+      }
+    }
+
+    if (
+      e.key === "Backspace" &&
       slashDirective &&
       textareaRef.current?.selectionStart === 0 &&
       textareaRef.current?.selectionEnd === 0
@@ -1249,6 +1451,40 @@ export const OmniComposer = memo(function OmniComposer({
   }, []);
   const handleSelectModeSilent = useCallback((mode: SessionMode) => handleSelectMode(mode, false), [handleSelectMode]);
   const handleSubmitClick = useCallback(() => triggerSubmit(false), [triggerSubmit]);
+  const handleRemoveInlineMention = useCallback((token: string) => {
+    orbitActions.removeInlineMention(token);
+    requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+    });
+  }, []);
+
+  const activeInlineMentionSpans = useMemo(
+    () => findInlineMentionSpans(draftText, inlineMentions),
+    [draftText, inlineMentions],
+  );
+
+  const activeInlineMentions = useMemo(() => {
+    if (inlineMentions.length === 0 || !draftText) return EMPTY_INLINE_MENTIONS;
+    const matched = inlineMentions.filter((m) => containsInlineMentionToken(draftText, m.token));
+    return matched.length > 0 ? matched : EMPTY_INLINE_MENTIONS;
+  }, [draftText, inlineMentions]);
+
+  const inlineBackdropSegments = useMemo(() => {
+    if (activeInlineMentionSpans.length === 0) return null;
+    const segs: Array<{ text: string; isMention: boolean }> = [];
+    let cursorPos = 0;
+    for (const span of activeInlineMentionSpans) {
+      if (span.start > cursorPos) {
+        segs.push({ text: draftText.slice(cursorPos, span.start), isMention: false });
+      }
+      segs.push({ text: draftText.slice(span.start, span.end), isMention: true });
+      cursorPos = span.end;
+    }
+    if (cursorPos < draftText.length) {
+      segs.push({ text: draftText.slice(cursorPos), isMention: false });
+    }
+    return segs;
+  }, [draftText, activeInlineMentionSpans]);
 
   if (!selectedHostId) return null;
 
@@ -1398,10 +1634,16 @@ export const OmniComposer = memo(function OmniComposer({
               {t("composer.dropToAttach")}
             </div>
 
-            {/* Unified Context Tray — strictly for uploaded files/images, diff quotes & large pastes */}
-            <ContextTray contexts={contexts} quotes={quotes} pastes={pastes} />
+            {/* Unified Context Tray — attachments, active atomic `@` mention chips, diff quotes & large pastes */}
+            <ContextTray
+              contexts={contexts}
+              inlineMentions={activeInlineMentions}
+              quotes={quotes}
+              pastes={pastes}
+              onRemoveInlineMention={handleRemoveInlineMention}
+            />
 
-            {/* Shared Native Scroll Container (`max-h-[200px]`): inline directive token + full-height textarea scroll as one compositor layer */}
+            {/* Shared Native Scroll Container (`max-h-[200px]`): inline directive token + inline mention pill backdrop + full-height textarea scroll as one compositor layer */}
             <div
               ref={scrollContainerRef}
               className="orbit-native-scroll relative max-h-[200px] overflow-x-hidden overflow-y-auto rounded-t-[20px]"
@@ -1422,6 +1664,28 @@ export const OmniComposer = memo(function OmniComposer({
                   className="text-ink-faint pointer-events-none absolute top-[12px] right-[14px] truncate text-[15px] leading-[22px] select-none"
                 >
                   {dynamicPlaceholder}
+                </div>
+              )}
+
+              {/* Pixel-aligned monochrome hairline pill backdrop behind bound `@` mention spans */}
+              {inlineBackdropSegments && (
+                <div
+                  aria-hidden="true"
+                  style={inputInset}
+                  className="pointer-events-none absolute top-0 right-0 left-0 z-0 block w-full px-[14px] pt-[12px] pb-[6px] text-[15px] leading-[22px] whitespace-pre-wrap break-words text-transparent select-none"
+                >
+                  {inlineBackdropSegments.map((seg, idx) =>
+                    seg.isMention ? (
+                      <mark
+                        key={idx}
+                        className="bg-foreground/[0.065] ring-border-default/80 rounded-[5px] text-transparent ring-1 ring-inset"
+                      >
+                        {seg.text}
+                      </mark>
+                    ) : (
+                      <span key={idx}>{seg.text}</span>
+                    ),
+                  )}
                 </div>
               )}
 
@@ -1459,7 +1723,7 @@ export const OmniComposer = memo(function OmniComposer({
                 {...ime.compositionProps}
                 onKeyDown={handleKeyDown}
                 rows={1}
-                className="text-ink-primary block min-h-[40px] w-full resize-none overflow-y-hidden bg-transparent px-[14px] pt-[12px] pb-[6px] text-[15px] leading-[22px] transition-none outline-none"
+                className="text-ink-primary relative z-[1] block min-h-[40px] w-full resize-none overflow-y-hidden bg-transparent px-[14px] pt-[12px] pb-[6px] text-[15px] leading-[22px] transition-none outline-none"
               />
             </div>
 

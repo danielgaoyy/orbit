@@ -138,6 +138,7 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
 
   // terminal
   terminalTabs: "terminal",
+  terminalSplits: "terminal",
   activeTerminalTabKey: "terminal",
   terminalFocused: "terminal",
 

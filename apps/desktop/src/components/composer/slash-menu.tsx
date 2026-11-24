@@ -57,6 +57,9 @@ export function slashOptionId(index: number): string {
 }
 
 export function resolveSlashCommandIcon(id: string, iconKey = ""): LucideIcon {
+  if (iconKey === "command" || id.startsWith("cmd:")) {
+    return Terminal;
+  }
   if (iconKey === "skill" || id.startsWith("skill:")) {
     return Sparkles;
   }
@@ -229,6 +232,11 @@ export function SlashCommandMenu({
                     <span className="text-ink-primary shrink-0 font-mono text-[13px] font-medium">
                       {cmd.command}
                     </span>
+                    {cmd.argument_hint && (
+                      <span className="text-ink-faint shrink-0 font-mono text-[11px]">
+                        {cmd.argument_hint}
+                      </span>
+                    )}
                     <span className="text-ink-muted truncate text-[11px]">
                       {localizedDesc}
                     </span>
@@ -247,6 +255,10 @@ export function SlashCommandMenu({
                   )}
                   {shortcut ? (
                     <ShortcutKbd keys={shortcut} className="shrink-0" />
+                  ) : cmd.icon_key === "command" ? (
+                    <span className="bg-surface-recessed text-ink-muted shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium">
+                      {t("composer.slashBadgeCommand")}
+                    </span>
                   ) : cmd.icon_key === "skill" ? (
                     <span className="bg-surface-recessed text-ink-muted shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium">
                       {t("composer.slashBadgeSkill")}

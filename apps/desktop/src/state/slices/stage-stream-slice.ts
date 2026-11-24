@@ -8,6 +8,12 @@ import {
   hasNonEmptyScopeDraft,
 } from "@/lib/draft-persistence";
 import {
+  buildFolderTreeSummary,
+  expandClaudeCommandArguments,
+  isValidHttpsReferenceUrl,
+  removeInlineMentionFromDraft,
+} from "@/lib/inline-mentions";
+import {
   defaultMimeForMedia,
   detectRichMediaKind,
   estimatePdfPageCount,
@@ -949,7 +955,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
     addContextMention(item: ContextMentionItem): void {
       const key = composerScopeKey(getState());
       const existing = getState().contextItems[key] ?? [];
-      // Prevent duplicate file, git_diff, or skill mentions
+      // Prevent duplicate file, git_diff, skill, folder, pr, or web mentions
       const duplicate = existing.some((x) => {
         if (x.kind === "file" && item.kind === "file") {
           return x.path.length > 0 && x.path === item.path;
@@ -961,6 +967,9 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         if (x.kind === "dom_element" && item.kind === "dom_element") {
           return x.selector === item.selector && x.pageUrl === item.pageUrl;
         }
+        if (x.kind === "folder" && item.kind === "folder") return x.path === item.path;
+        if (x.kind === "pr" && item.kind === "pr") return x.number === item.number;
+        if (x.kind === "web" && item.kind === "web") return x.url === item.url;
         return false;
       });
       if (duplicate) return;
@@ -1001,6 +1010,48 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
           inlineMentions: {
             ...s.inlineMentions,
             [key]: [...filtered, target],
+          },
+        };
+      });
+    },
+
+
+    unregisterInlineMention(token: string): void {
+      const key = composerScopeKey(getState());
+      setState((s) => {
+        const prev = s.inlineMentions[key] ?? [];
+        const next = prev.filter((m) => m.token !== token);
+        if (next.length === prev.length) return s;
+        return {
+          ...s,
+          inlineMentions: {
+            ...s.inlineMentions,
+            [key]: next,
+          },
+        };
+      });
+    },
+
+
+    removeInlineMention(token: string): void {
+      const key = composerScopeKey(getState());
+      setState((s) => {
+        const curDraft = s.composerDrafts[key] ?? "";
+        const nextDraft = removeInlineMentionFromDraft(curDraft, token);
+        const prevMentions = s.inlineMentions[key] ?? [];
+        const nextMentions = prevMentions.filter((m) => m.token !== token);
+        if (nextDraft === curDraft && nextMentions.length === prevMentions.length) {
+          return s;
+        }
+        return {
+          ...s,
+          composerDrafts: {
+            ...s.composerDrafts,
+            [key]: nextDraft,
+          },
+          inlineMentions: {
+            ...s.inlineMentions,
+            [key]: nextMentions,
           },
         };
       });
@@ -1460,6 +1511,9 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       const existingContexts = getState().contextItems[submitTarget.scopeKey] ?? [];
 
       // Resolve any inline `@tokens` still present in `rawDraft` without showing attachment boxes
+      const cwd = submitTarget.workspaceCwd;
+      const cachedWorkspaceFiles =
+        getState().workspaceFilesCache[`${submitTarget.hostId}::${cwd}`] ?? [];
       const resolvedInlineContexts: ContextMentionItem[] = [];
       for (const m of registeredInline) {
         if (!containsInlineMentionToken(rawDraft, m.token)) continue;
@@ -1493,6 +1547,34 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
             container: m.container ?? null,
             language: m.language,
           });
+        } else if (m.kind === "folder") {
+          const { fileCount, treeSummary } = buildFolderTreeSummary(m.path, cachedWorkspaceFiles);
+          resolvedInlineContexts.push({
+            id: `inl_dir_${m.path}`,
+            kind: "folder",
+            path: m.path,
+            fileCount: fileCount || m.fileCount,
+            treeSummary,
+          });
+        } else if (m.kind === "pr") {
+          resolvedInlineContexts.push({
+            id: `inl_pr_${m.number}`,
+            kind: "pr",
+            number: m.number,
+            title: m.title,
+            url: m.url ?? null,
+            state: m.state ?? null,
+            headRef: m.headRef ?? null,
+            baseRef: m.baseRef ?? null,
+            summary: m.summary ?? null,
+          });
+        } else if (m.kind === "web" && isValidHttpsReferenceUrl(m.url)) {
+          resolvedInlineContexts.push({
+            id: `inl_web_${m.url}`,
+            kind: "web",
+            url: m.url,
+            label: m.label,
+          });
         }
       }
 
@@ -1509,12 +1591,13 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
               x.startLine === rc.startLine
             );
           }
+          if (x.kind === "folder" && rc.kind === "folder") return x.path === rc.path;
+          if (x.kind === "pr" && rc.kind === "pr") return x.number === rc.number;
+          if (x.kind === "web" && rc.kind === "web") return x.url === rc.url;
           return false;
         });
         if (!dup) mergedContexts.push(rc);
       }
-
-      const cwd = submitTarget.workspaceCwd;
 
       // Resolve line-numbered code snippets for any cited `@symbol` mentions (bounded & file-deduplicated)
       const symbolContexts = mergedContexts.filter(
@@ -1554,8 +1637,42 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
 
       let workingDiffText: string | null = null;
       let stagedDiffText: string | null = null;
+      let customCommandBadge: PromptBadge | null = null;
+      let customCommandDisplayText: string | null = null;
       let composed: Awaited<ReturnType<typeof orbitIpc.composePrompt>>;
       try {
+        // Expand `.claude/commands/**/*.md` custom slash command with `$ARGUMENTS` substitution
+        let effectiveRawText = rawDraft;
+        if (!storedDirective && rawDraft.startsWith("/")) {
+          const cmdMatch = /^\/([a-z0-9][a-z0-9_:-]{0,63})(?:\s+([\s\S]*))?$/i.exec(rawDraft);
+          if (cmdMatch) {
+            const cmdSlugLower = cmdMatch[1].toLowerCase();
+            const cmdArgs = (cmdMatch[2] ?? "").trim();
+            const hostSkills = getState().hostDetails[submitTarget.hostId]?.managed_skills ?? [];
+            const matchedCmd = hostSkills.find(
+              (s) => s.is_command && s.enabled && s.slug.toLowerCase() === cmdSlugLower,
+            );
+            if (matchedCmd) {
+              const scopedCwd = cwd && cwd !== "~" ? cwd : null;
+              const cmdContent = await orbitIpc.readManagedSkill(
+                submitTarget.hostId,
+                matchedCmd.id,
+                scopedCwd,
+              );
+              const expanded = expandClaudeCommandArguments(cmdContent.content, cmdArgs);
+              if (expanded) {
+                effectiveRawText = expanded;
+                customCommandBadge = {
+                  kind: "command",
+                  label: `/${matchedCmd.slug}`,
+                  path: null,
+                };
+                customCommandDisplayText = cmdArgs;
+              }
+            }
+          }
+        }
+
         if (needsWorkingDiff) {
           await orbitIpc.fetchGitDiff(submitTarget.hostId, cwd, null, false);
           const gr = await orbitIpc.getGitReview(submitTarget.hostId, cwd, null);
@@ -1571,45 +1688,50 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
 
         const nonSkillContexts = mergedContexts.filter((c) => c.kind !== "skill");
 
-        const contextInputs: ComposerContextInput[] = nonSkillContexts.map((ctx) => {
+        const contextInputs: ComposerContextInput[] = [];
+        for (const ctx of nonSkillContexts) {
           switch (ctx.kind) {
             case "image":
-              return { kind: "image", path: ctx.path, filename: ctx.filename };
+              contextInputs.push({ kind: "image", path: ctx.path, filename: ctx.filename });
+              break;
             case "file": {
               if (ctx.stagedHostId) {
                 const fname = ctx.filename || ctx.path;
                 if (ctx.mediaKind === "pdf") {
-                  return { kind: "pdf", path: ctx.path, filename: fname };
+                  contextInputs.push({ kind: "pdf", path: ctx.path, filename: fname });
+                } else if (ctx.mediaKind === "audio") {
+                  contextInputs.push({ kind: "audio", path: ctx.path, filename: fname });
+                } else if (ctx.mediaKind === "video") {
+                  contextInputs.push({ kind: "video", path: ctx.path, filename: fname });
+                } else {
+                  contextInputs.push({
+                    kind: "staged_file",
+                    path: ctx.path,
+                    filename: fname,
+                  });
                 }
-                if (ctx.mediaKind === "audio") {
-                  return { kind: "audio", path: ctx.path, filename: fname };
-                }
-                if (ctx.mediaKind === "video") {
-                  return { kind: "video", path: ctx.path, filename: fname };
-                }
-                return {
-                  kind: "staged_file",
-                  path: ctx.path,
-                  filename: fname,
-                };
+              } else {
+                contextInputs.push({ kind: "workspace_file", path: ctx.path });
               }
-              return { kind: "workspace_file", path: ctx.path };
+              break;
             }
             case "git_diff":
-              return {
+              contextInputs.push({
                 kind: "git_diff",
                 staged: ctx.staged,
                 label: ctx.label,
                 diff_text: ctx.staged ? stagedDiffText : workingDiffText,
-              };
+              });
+              break;
             case "terminal_output":
-              return {
+              contextInputs.push({
                 kind: "terminal_output",
                 label: ctx.label,
                 content: ctx.content,
-              };
+              });
+              break;
             case "code_symbol":
-              return {
+              contextInputs.push({
                 kind: "code_symbol",
                 name: ctx.symbolName,
                 symbol_kind: ctx.symbolKind,
@@ -1620,9 +1742,10 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
                 container: ctx.container ?? null,
                 language: ctx.language,
                 snippet: ctx.snippet ?? resolvedSymbolSnippets.get(ctx.id) ?? null,
-              };
+              });
+              break;
             case "dom_element":
-              return {
+              contextInputs.push({
                 kind: "dom_element",
                 selector: ctx.selector,
                 tag: ctx.tag,
@@ -1631,13 +1754,47 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
                 computed_box: ctx.computedBox ?? null,
                 outer_html_excerpt: ctx.outerHtmlExcerpt,
                 page_url: ctx.pageUrl,
-              };
+              });
+              break;
+            case "folder": {
+              const fallbackTree =
+                ctx.treeSummary ??
+                buildFolderTreeSummary(ctx.path, cachedWorkspaceFiles).treeSummary;
+              contextInputs.push({
+                kind: "workspace_folder",
+                path: ctx.path,
+                file_count: ctx.fileCount,
+                tree_summary: fallbackTree || null,
+              });
+              break;
+            }
+            case "pr":
+              contextInputs.push({
+                kind: "pull_request",
+                number: ctx.number,
+                title: ctx.title,
+                url: ctx.url ?? null,
+                state: ctx.state ?? null,
+                head_ref: ctx.headRef ?? null,
+                base_ref: ctx.baseRef ?? null,
+                summary: ctx.summary ?? null,
+              });
+              break;
+            case "web":
+              if (isValidHttpsReferenceUrl(ctx.url)) {
+                contextInputs.push({
+                  kind: "web_url",
+                  url: ctx.url,
+                  label: ctx.label,
+                });
+              }
+              break;
           }
-        });
+        }
 
         composed = await orbitIpc.composePrompt({
           provider: providerForCompose,
-          raw_text: rawDraft,
+          raw_text: effectiveRawText,
           explicit_directive: storedDirective,
           host_id: submitTarget.hostId,
           cwd,
@@ -1792,7 +1949,8 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       }
 
       const effectiveDirective = composed.effective_directive;
-      const cleanUserText = composed.display_prompt;
+      const cleanUserText =
+        customCommandDisplayText !== null ? customCommandDisplayText : composed.display_prompt;
       const imagePathQueueByLabel = new Map<string, string[]>();
       const filePathQueueByLabel = new Map<string, string[]>();
       const sentImages: SentImagePreviewMeta[] = [];
@@ -1838,6 +1996,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         path: null,
       }));
       const badges: PromptBadge[] = [
+        ...(customCommandBadge ? [customCommandBadge] : []),
         ...composed.badges.map((b) => {
           if (b.path) return b;
           if (b.kind === "image") {

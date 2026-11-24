@@ -1030,6 +1030,8 @@ export interface ManagedSkillRecord {
   has_references: boolean;
   approx_tokens: number;
   updated_at_ms: number;
+  argument_hint?: string | null;
+  is_command?: boolean;
 }
 
 export interface ManagedSkillContentView {
@@ -1783,6 +1785,7 @@ export type RichBlockView =
       ordered: boolean;
       index: number;
       checked: boolean | null;
+      depth?: number;
       spans: InlineSpanView[];
     }
   | { kind: "block_quote"; spans: InlineSpanView[] }
@@ -2804,6 +2807,8 @@ export interface SlashCommandView {
   icon_key: string;
   keywords: string[];
   desktop_only: boolean;
+  argument_hint?: string | null;
+  skill_id?: string;
 }
 
 export type ComposerContextInput =
@@ -2838,6 +2843,27 @@ export type ComposerContextInput =
       computed_box?: PickedElementBox | null;
       outer_html_excerpt: string;
       page_url: string;
+    }
+  | {
+      kind: "workspace_folder";
+      path: string;
+      file_count: number;
+      tree_summary?: string | null;
+    }
+  | {
+      kind: "pull_request";
+      number: number;
+      title: string;
+      url?: string | null;
+      state?: string | null;
+      head_ref?: string | null;
+      base_ref?: string | null;
+      summary?: string | null;
+    }
+  | {
+      kind: "web_url";
+      url: string;
+      label?: string | null;
     };
 
 export interface ComposerQuoteInput {

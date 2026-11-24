@@ -2300,6 +2300,7 @@ pub enum FfiRichBlock {
         ordered: bool,
         index: u32,
         checked: Option<bool>,
+        depth: u8,
         spans: Vec<FfiInlineSpan>,
     },
     BlockQuote {
@@ -2340,11 +2341,13 @@ impl From<RichBlockView> for FfiRichBlock {
                 ordered,
                 index,
                 checked,
+                depth,
                 spans,
             } => Self::ListItem {
                 ordered,
                 index,
                 checked,
+                depth,
                 spans: spans.into_iter().map(Into::into).collect(),
             },
             RichBlockView::BlockQuote { spans } => Self::BlockQuote {

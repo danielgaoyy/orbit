@@ -126,6 +126,7 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
         case "list_ssh_hosts":
         case "get_fallback_provider_catalogs":
         case "get_slash_commands":
+        case "list_managed_skills":
         case "list_provider_subagents":
         case "list_conditional_timers":
         case "list_goal_runs":

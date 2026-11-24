@@ -136,6 +136,8 @@ export type {
   SidebarThreadFilter,
   SlashDirective,
   TerminalCursorStyle,
+  TerminalSplitDirection,
+  TerminalSplitGroup,
   TerminalTabSession,
   TerminalThemeMode,
   ThemeMode,
@@ -273,6 +275,7 @@ function syncDraftMutations(prev: OrbitUiState, next: OrbitUiState): void {
     prev.pastedAttachments === next.pastedAttachments &&
     prev.diffQuotes === next.diffQuotes &&
     prev.contextItems === next.contextItems &&
+    prev.inlineMentions === next.inlineMentions &&
     prev.slashDirectives === next.slashDirectives &&
     prev.sideQuestionDrafts === next.sideQuestionDrafts
   ) {
@@ -284,6 +287,7 @@ function syncDraftMutations(prev: OrbitUiState, next: OrbitUiState): void {
   collectChangedRecordKeys(prev.pastedAttachments, next.pastedAttachments, changedKeys);
   collectChangedRecordKeys(prev.diffQuotes, next.diffQuotes, changedKeys);
   collectChangedRecordKeys(prev.contextItems, next.contextItems, changedKeys);
+  collectChangedRecordKeys(prev.inlineMentions, next.inlineMentions, changedKeys);
   collectChangedRecordKeys(prev.slashDirectives, next.slashDirectives, changedKeys);
   collectChangedRecordKeys(prev.sideQuestionDrafts, next.sideQuestionDrafts, changedKeys);
 

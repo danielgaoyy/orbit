@@ -769,9 +769,13 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cancel_workflow_run(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_export_device_link_uri(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_generate_passphrase(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_get_preferences_json(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_import_device_link_uri(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_login_with_token(
     ): Int
@@ -784,6 +788,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_auto_sync(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_github_client_id(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_manual_passphrase_mode(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_start_github_device_flow(
     ): Int
@@ -1159,9 +1165,13 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cancel_workflow_run(`ptr`: Long,`hostId`: RustBuffer.ByValue,`runId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_export_device_link_uri(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_generate_passphrase(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_get_preferences_json(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_import_device_link_uri(`ptr`: Long,`uri`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_login_with_token(`ptr`: Long,`token`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1174,6 +1184,8 @@ internal object UniffiLib {
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_set_auto_sync(`ptr`: Long,`enabled`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_set_github_client_id(`ptr`: Long,`clientId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_set_manual_passphrase_mode(`ptr`: Long,`requireManual`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_start_github_device_flow(`ptr`: Long,`clientIdOverride`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1687,10 +1699,16 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cancel_workflow_run() and 0xFFFF) != 30638) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_export_device_link_uri() and 0xFFFF) != 50707) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_generate_passphrase() and 0xFFFF) != 49340) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_get_preferences_json() and 0xFFFF) != 11716) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_import_device_link_uri() and 0xFFFF) != 18979) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_login_with_token() and 0xFFFF) != 37302) {
@@ -1709,6 +1727,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_github_client_id() and 0xFFFF) != 62078) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_manual_passphrase_mode() and 0xFFFF) != 55160) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_start_github_device_flow() and 0xFFFF) != 41593) {
@@ -3084,9 +3105,13 @@ public interface OrbitMobileCoreInterface {
     
     fun `cancelWorkflowRun`(`hostId`: kotlin.String, `runId`: kotlin.String): FfiWorkflowRunRecord
     
+    fun `cloudSyncExportDeviceLinkUri`(): kotlin.String
+    
     fun `cloudSyncGeneratePassphrase`(): kotlin.String
     
     fun `cloudSyncGetPreferencesJson`(): kotlin.String
+    
+    fun `cloudSyncImportDeviceLinkUri`(`uri`: kotlin.String): FfiCloudSyncResult
     
     fun `cloudSyncLoginWithToken`(`token`: kotlin.String): FfiCloudSyncStatus
     
@@ -3099,6 +3124,8 @@ public interface OrbitMobileCoreInterface {
     fun `cloudSyncSetAutoSync`(`enabled`: kotlin.Boolean): FfiCloudSyncStatus
     
     fun `cloudSyncSetGithubClientId`(`clientId`: kotlin.String?): FfiCloudSyncStatus
+    
+    fun `cloudSyncSetManualPassphraseMode`(`requireManual`: kotlin.Boolean): FfiCloudSyncStatus
     
     fun `cloudSyncStartGithubDeviceFlow`(`clientIdOverride`: kotlin.String?): FfiGitHubDeviceFlowStart
     
@@ -3743,6 +3770,20 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     }
     
 
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncExportDeviceLinkUri`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_export_device_link_uri(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
     override fun `cloudSyncGeneratePassphrase`(): kotlin.String {
             return FfiConverterString.lift(
     callWithHandle {
@@ -3763,6 +3804,21 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_get_preferences_json(
         it,
         _status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncImportDeviceLinkUri`(`uri`: kotlin.String): FfiCloudSyncResult {
+            return FfiConverterTypeFfiCloudSyncResult.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_import_device_link_uri(
+        it,
+        
+        FfiConverterString.lower(`uri`),_status)
 }
     }
     )
@@ -3853,6 +3909,21 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
         it,
         
         FfiConverterOptionalString.lower(`clientId`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncSetManualPassphraseMode`(`requireManual`: kotlin.Boolean): FfiCloudSyncStatus {
+            return FfiConverterTypeFfiCloudSyncStatus.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_set_manual_passphrase_mode(
+        it,
+        
+        FfiConverterBoolean.lower(`requireManual`),_status)
 }
     }
     )
@@ -7751,6 +7822,8 @@ data class FfiCloudSyncStatus (
     , 
     var `autoSyncEnabled`: kotlin.Boolean
     , 
+    var `instantUnlockEnabled`: kotlin.Boolean
+    , 
     var `lastSyncedAtMs`: kotlin.Long?
     , 
     var `lastVaultRevision`: kotlin.ULong
@@ -7787,6 +7860,7 @@ public object FfiConverterTypeFfiCloudSyncStatus: FfiConverterRustBuffer<FfiClou
             FfiConverterOptionalString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
             FfiConverterOptionalLong.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterUInt.read(buf),
@@ -7807,6 +7881,7 @@ public object FfiConverterTypeFfiCloudSyncStatus: FfiConverterRustBuffer<FfiClou
             FfiConverterOptionalString.allocationSize(value.`gistHtmlUrl`) +
             FfiConverterBoolean.allocationSize(value.`remoteVaultExists`) +
             FfiConverterBoolean.allocationSize(value.`autoSyncEnabled`) +
+            FfiConverterBoolean.allocationSize(value.`instantUnlockEnabled`) +
             FfiConverterOptionalLong.allocationSize(value.`lastSyncedAtMs`) +
             FfiConverterULong.allocationSize(value.`lastVaultRevision`) +
             FfiConverterUInt.allocationSize(value.`syncedHostCount`) +
@@ -7826,6 +7901,7 @@ public object FfiConverterTypeFfiCloudSyncStatus: FfiConverterRustBuffer<FfiClou
             FfiConverterOptionalString.write(value.`gistHtmlUrl`, buf)
             FfiConverterBoolean.write(value.`remoteVaultExists`, buf)
             FfiConverterBoolean.write(value.`autoSyncEnabled`, buf)
+            FfiConverterBoolean.write(value.`instantUnlockEnabled`, buf)
             FfiConverterOptionalLong.write(value.`lastSyncedAtMs`, buf)
             FfiConverterULong.write(value.`lastVaultRevision`, buf)
             FfiConverterUInt.write(value.`syncedHostCount`, buf)

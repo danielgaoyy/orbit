@@ -1,14 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   AlertCircle,
   Check,
+  ChevronRight,
   Cloud,
   Copy,
   ExternalLink,
   Globe,
   KeyRound,
+  Link2,
   Lock,
   LogOut,
+  QrCode,
   RefreshCw,
   ShieldCheck,
   Sparkles,
@@ -24,7 +27,19 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog-tabs";
 import { Input } from "@/components/ui/input";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { useI18n } from "@/lib/i18n";
@@ -33,7 +48,7 @@ import { orbitIpc } from "@/lib/orbit-ipc";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
-type LoginMethodTab = "device" | "token";
+type LoginMethodTab = "device" | "token" | "link";
 
 function formatRelativeSyncTime(tsMs: number | null): string {
   if (!tsMs) return "Never synced yet";
@@ -59,13 +74,19 @@ export function CloudSyncSection() {
   const [loginTab, setLoginTab] = useState<LoginMethodTab>("device");
   const [clientIdInput, setClientIdInput] = useState("");
   const [tokenInput, setTokenInput] = useState("");
+  const [deviceLinkInput, setDeviceLinkInput] = useState("");
   const [passphraseInput, setPassphraseInput] = useState("");
   const [confirmPassphraseInput, setConfirmPassphraseInput] = useState("");
   const [generatedKey, setGeneratedKey] = useState<string | null>(null);
-  const [copiedFlag, setCopiedFlag] = useState<"code" | "key" | "cli" | null>(null);
+  const [copiedFlag, setCopiedFlag] = useState<"code" | "key" | "cli" | "link" | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const [clearHostsOnLogout, setClearHostsOnLogout] = useState(false);
   const [confirmSignOutOpen, setConfirmSignOutOpen] = useState(false);
+  const [linkQrOpen, setLinkQrOpen] = useState(false);
+  const [linkQrUri, setLinkQrUri] = useState<string | null>(null);
+  const [linkQrSvg, setLinkQrSvg] = useState<string | null>(null);
+  const [linkQrLoading, setLinkQrLoading] = useState(false);
+  const [advancedSecOpen, setAdvancedSecOpen] = useState(false);
 
   const ime = useImeCompositionGuard();
 
@@ -80,10 +101,41 @@ export function CloudSyncSection() {
   }, [status?.github_client_id_override, clientIdInput]);
 
   useEffect(() => {
-    if (status && !status.github_oauth_configured && !deviceFlow) {
+    if (status && !status.github_oauth_configured && !deviceFlow && loginTab === "device") {
       setLoginTab("token");
     }
-  }, [status, deviceFlow]);
+  }, [status, deviceFlow, loginTab]);
+
+  useEffect(() => {
+    if (!linkQrOpen) return;
+    let active = true;
+    setLinkQrLoading(true);
+    setLocalError(null);
+    void (async () => {
+      try {
+        const uri = await orbitIpc.cloudSyncExportDeviceLinkUri();
+        const svg = await orbitIpc.renderQrSvg(uri);
+        if (!active) return;
+        setLinkQrUri(uri);
+        setLinkQrSvg(svg);
+      } catch (err) {
+        if (!active) return;
+        setLinkQrUri(null);
+        setLinkQrSvg(null);
+        setLocalError(String(err));
+      } finally {
+        if (active) setLinkQrLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [linkQrOpen]);
+
+  const linkQrDataUri = useMemo(() => {
+    if (!linkQrSvg) return null;
+    return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(linkQrSvg)}`;
+  }, [linkQrSvg]);
 
   const effectiveState = status?.state ?? "signed_out";
   const displayError = localError ?? storeError ?? status?.last_error ?? null;
@@ -97,7 +149,7 @@ export function CloudSyncSection() {
   const allRemoteHostsLackReachability =
     hosts.length > 1 && hostsWithReachableFabric.length === 0;
 
-  const markCopied = (which: "code" | "key" | "cli", text: string) => {
+  const markCopied = (which: "code" | "key" | "cli" | "link", text: string) => {
     if (typeof navigator !== "undefined" && navigator.clipboard) {
       void navigator.clipboard.writeText(text).catch(() => undefined);
     }
@@ -128,6 +180,18 @@ export function CloudSyncSection() {
     const ok = await orbitActions.loginCloudSyncWithToken(tokenInput);
     if (ok) {
       setTokenInput("");
+    }
+  };
+
+  const handleDeviceLinkLogin = async () => {
+    setLocalError(null);
+    if (!deviceLinkInput.trim()) {
+      setLocalError("Paste an `orbit://sync-login?...` Device Link URI.");
+      return;
+    }
+    const ok = await orbitActions.importCloudSyncDeviceLinkUri(deviceLinkInput);
+    if (ok) {
+      setDeviceLinkInput("");
     }
   };
 
@@ -176,16 +240,9 @@ export function CloudSyncSection() {
         <ShieldCheck className="text-signal-success mt-0.5 h-[17px] w-[17px] shrink-0" />
         <div className="text-muted-foreground space-y-1 text-[12.5px] leading-relaxed">
           <div className="text-foreground text-[13px] font-medium">
-            Zero-Server · Zero-Knowledge (BYOS)
+            Zero-Server · End-to-End Encrypted (GitHub Secret Gist)
           </div>
-          <p>
-            Orbit encrypts your fleet &amp; preferences locally with{" "}
-            <span className="text-foreground/85 font-mono text-[12px]">Argon2id + AES-256-GCM</span>{" "}
-            and stores only opaque ciphertext in a private{" "}
-            <span className="text-foreground/85 font-medium">GitHub Secret Gist</span> (
-            <code className="bg-muted rounded px-1 py-0.5 font-mono text-[11.5px]">gist</code>{" "}
-            scope only — never touches your code repositories).
-          </p>
+          <p>{t("settings.cloudSyncInstantSummary")}</p>
         </div>
       </div>
 
@@ -267,7 +324,7 @@ export function CloudSyncSection() {
               <SettingCard>
                 <div className="space-y-4 p-4">
                   {/* Method Toggle */}
-                  <div className="bg-muted/60 grid grid-cols-2 gap-1 rounded-[10px] p-1">
+                  <div className="bg-muted/60 grid grid-cols-3 gap-1 rounded-[10px] p-1">
                     <button
                       type="button"
                       onClick={() => {
@@ -275,7 +332,7 @@ export function CloudSyncSection() {
                         setLocalError(null);
                       }}
                       className={cn(
-                        "h-[30px] cursor-pointer rounded-[7px] text-[12.5px] font-medium transition-colors",
+                        "h-[30px] cursor-pointer rounded-[7px] px-2 text-[12px] font-medium transition-colors",
                         loginTab === "device"
                           ? "bg-background text-foreground shadow-xs"
                           : "text-muted-foreground hover:text-foreground",
@@ -290,13 +347,28 @@ export function CloudSyncSection() {
                         setLocalError(null);
                       }}
                       className={cn(
-                        "h-[30px] cursor-pointer rounded-[7px] text-[12.5px] font-medium transition-colors",
+                        "h-[30px] cursor-pointer rounded-[7px] px-2 text-[12px] font-medium transition-colors",
                         loginTab === "token"
                           ? "bg-background text-foreground shadow-xs"
                           : "text-muted-foreground hover:text-foreground",
                       )}
                     >
                       {t("settings.personalAccessToken")}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setLoginTab("link");
+                        setLocalError(null);
+                      }}
+                      className={cn(
+                        "h-[30px] cursor-pointer rounded-[7px] px-2 text-[12px] font-medium transition-colors",
+                        loginTab === "link"
+                          ? "bg-background text-foreground shadow-xs"
+                          : "text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      {t("settings.deviceLinkTab")}
                     </button>
                   </div>
 
@@ -351,7 +423,7 @@ export function CloudSyncSection() {
                         <span>Sign in with GitHub</span>
                       </Button>
                     </div>
-                  ) : (
+                  ) : loginTab === "token" ? (
                     <div className="space-y-3">
                       <div className="text-muted-foreground text-[12px] leading-relaxed">
                         Create a classic token with only the{" "}
@@ -397,6 +469,39 @@ export function CloudSyncSection() {
                             <KeyRound className="size-3.5" />
                           )}
                           <span>Continue</span>
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      <div className="text-muted-foreground text-[12px] leading-relaxed">
+                        {t("settings.deviceLinkTabDesc")}
+                      </div>
+                      <div className="flex gap-2">
+                        <Input
+                          type="password"
+                          value={deviceLinkInput}
+                          onChange={(e) => setDeviceLinkInput(e.target.value)}
+                          {...ime.compositionProps}
+                          onKeyDown={(e) => {
+                            if (ime.shouldIgnoreKeyDown(e)) return;
+                            if (e.key === "Enter") void handleDeviceLinkLogin();
+                          }}
+                          placeholder={t("settings.deviceLinkPlaceholder")}
+                          className="h-[34px] flex-1 px-3 font-mono"
+                        />
+                        <Button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => void handleDeviceLinkLogin()}
+                          className="h-[34px] shrink-0 gap-1.5 px-3.5"
+                        >
+                          {busy ? (
+                            <OrbitSpinner size={14} className="size-3.5" />
+                          ) : (
+                            <Link2 className="size-3.5" />
+                          )}
+                          <span>{t("settings.deviceLinkConnect")}</span>
                         </Button>
                       </div>
                     </div>
@@ -617,16 +722,28 @@ export function CloudSyncSection() {
                     </div>
                   </div>
 
-                  <Button
-                    type="button"
-                    size="sm"
-                    disabled={busy}
-                    onClick={() => void orbitActions.syncCloudNow()}
-                    className="h-[32px] shrink-0 text-[12.5px]"
-                  >
-                    <RefreshCw className={cn("size-3.5", busy && "animate-spin")} />
-                    <span>{busy ? "Syncing…" : "Sync Now"}</span>
-                  </Button>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setLinkQrOpen(true)}
+                      className="h-[32px] gap-1.5 text-[12.5px]"
+                    >
+                      <QrCode className="size-3.5" />
+                      <span>{t("settings.linkDeviceQr")}</span>
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      disabled={busy}
+                      onClick={() => void orbitActions.syncCloudNow()}
+                      className="h-[32px] shrink-0 text-[12.5px]"
+                    >
+                      <RefreshCw className={cn("size-3.5", busy && "animate-spin")} />
+                      <span>{busy ? "Syncing…" : "Sync Now"}</span>
+                    </Button>
+                  </div>
                 </div>
 
                 {lastResult && (
@@ -714,6 +831,43 @@ export function CloudSyncSection() {
                 </SettingRow>
               </SettingCard>
             </div>
+
+            {/* Optional Manual Passphrase / Dual-Gist Security Toggle */}
+            <Collapsible
+              open={advancedSecOpen}
+              onOpenChange={setAdvancedSecOpen}
+              className="border-border bg-background/60 rounded-[13px] border px-4 py-3"
+            >
+              <CollapsibleTrigger className="group/sec flex w-full cursor-pointer items-center justify-between gap-2 text-left outline-none">
+                <span className="flex min-w-0 items-center gap-2">
+                  <ChevronRight className="text-muted-foreground size-3.5 shrink-0 transition-transform duration-150 group-data-[panel-open]/sec:rotate-90" />
+                  <span className="text-foreground text-[12.5px] font-medium">
+                    {t("settings.cloudSyncAdvancedTitle")}
+                  </span>
+                </span>
+                <span className="bg-muted text-muted-foreground shrink-0 rounded-md px-2 py-0.5 text-[11px] font-medium">
+                  {status.instant_unlock_enabled
+                    ? t("settings.cloudSyncInstantBadge")
+                    : t("settings.cloudSyncManualBadge")}
+                </span>
+              </CollapsibleTrigger>
+
+              <CollapsibleContent className="pt-3">
+                <SettingCard>
+                  <SettingRow
+                    title={t("settings.cloudSyncRequireManualTitle")}
+                    description={t("settings.cloudSyncRequireManualDesc")}
+                  >
+                    <ToggleSwitch
+                      checked={!status.instant_unlock_enabled}
+                      onChange={(requireManual) =>
+                        void orbitActions.setCloudSyncManualPassphraseMode(requireManual)
+                      }
+                    />
+                  </SettingRow>
+                </SettingCard>
+              </CollapsibleContent>
+            </Collapsible>
 
             {/* Auto-register remote Linux/macOS servers tip */}
             <div className="space-y-2">
@@ -814,6 +968,63 @@ export function CloudSyncSection() {
         tone={clearHostsOnLogout ? "danger" : "default"}
         onConfirm={() => orbitActions.logoutCloudSync(clearHostsOnLogout)}
       />
+
+      <Dialog open={linkQrOpen} onOpenChange={setLinkQrOpen}>
+        <DialogContent className="max-w-[380px] gap-5 p-5">
+          <DialogHeader className="gap-1 pr-6">
+            <DialogTitle className="flex items-center gap-2 text-[15px]">
+              <QrCode className="text-muted-foreground h-[16px] w-[16px] stroke-[1.75]" />
+              <span>{t("settings.deviceLinkQrTitle")}</span>
+            </DialogTitle>
+            <DialogDescription className="text-[12.5px] leading-relaxed">
+              {t("settings.deviceLinkQrDesc")}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="flex flex-col items-center gap-3.5">
+            <div className="flex size-[208px] items-center justify-center rounded-[14px] border border-black/[0.08] bg-white p-3 shadow-2xs dark:border-white/[0.14]">
+              {linkQrLoading ? (
+                <OrbitSpinner size={20} className="size-5 text-zinc-500" />
+              ) : linkQrDataUri ? (
+                <img
+                  src={linkQrDataUri}
+                  alt={t("settings.deviceLinkQrTitle")}
+                  draggable={false}
+                  className="size-full object-contain select-none [image-rendering:pixelated]"
+                />
+              ) : (
+                <AlertCircle className="size-5 text-rose-500" />
+              )}
+            </div>
+
+            <div className="text-muted-foreground flex items-center gap-1.5 text-center text-[11.5px]">
+              <ShieldCheck className="h-[13px] w-[13px] shrink-0 opacity-75" />
+              <span>{t("settings.deviceLinkQrHint")}</span>
+            </div>
+
+            {linkQrUri && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => markCopied("link", linkQrUri)}
+                className="gap-1.5"
+              >
+                {copiedFlag === "link" ? (
+                  <Check className="text-signal-success size-3.5" />
+                ) : (
+                  <Copy className="text-muted-foreground size-3.5" />
+                )}
+                <span>
+                  {copiedFlag === "link"
+                    ? t("common.copied")
+                    : t("settings.copyDeviceLinkUri")}
+                </span>
+              </Button>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

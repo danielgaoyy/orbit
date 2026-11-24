@@ -1636,6 +1636,7 @@ mod tests {
                 daemon_version: "0.2.0".into(),
                 available_providers: vec![],
                 relay_url: None,
+                direct_endpoints: vec![],
             };
             let listen_port = Arc::new(RwLock::new(6868));
             let orch_cfg = Arc::new(RwLock::new(orbit_protocol::OrchestrationConfig::default()));

@@ -1649,6 +1649,788 @@ impl OhosCoreFacade {
         let snap = self.inner.list_push_devices_blocking(host_id)?;
         serde_json::to_string(&snap).map_err(|e| e.to_string())
     }
+    pub fn parse_markdown_preview_json(
+        &self,
+        markdown: &str,
+        streaming: bool,
+    ) -> Result<String, String> {
+        serde_json::to_string(&orbit_client_core::render::parse_markdown_blocks(
+            markdown, streaming,
+        ))
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn detach_agent(&self, host_id: String, agent_id: String) {
+        self.inner.detach_agent(&host_id, &agent_id);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_agent_identity(
+        &self,
+        host_id: String,
+        agent_id: String,
+        handle: Option<String>,
+        title: Option<String>,
+        task_summary: Option<String>,
+        lock_handle: bool,
+        lock_title: bool,
+    ) {
+        self.inner.update_agent_identity(
+            &host_id,
+            &agent_id,
+            handle,
+            title,
+            task_summary,
+            lock_handle,
+            lock_title,
+        );
+    }
+
+    pub fn summarize_agent(&self, host_id: String, agent_id: String) {
+        self.inner.summarize_agent(&host_id, &agent_id);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_mission_workspace(
+        &self,
+        host_id: String,
+        source_cwd: String,
+        title: String,
+        mission_goal: Option<String>,
+        use_worktree: bool,
+        worktree_branch: Option<String>,
+        base_ref: Option<String>,
+    ) {
+        let isolation = if use_worktree {
+            orbit_protocol::WorkspaceIsolation::Worktree
+        } else {
+            orbit_protocol::WorkspaceIsolation::Local
+        };
+        self.inner.create_mission_workspace(
+            &host_id,
+            &source_cwd,
+            title,
+            mission_goal,
+            isolation,
+            worktree_branch,
+            base_ref,
+        );
+    }
+
+    pub fn rename_workspace(&self, host_id: String, workspace_id: String, title: String) {
+        self.inner.rename_workspace(&host_id, &workspace_id, &title);
+    }
+
+    pub fn update_workspace_goal(&self, host_id: String, workspace_id: String, goal: String) {
+        self.inner
+            .update_workspace_goal(&host_id, &workspace_id, goal);
+    }
+
+    pub fn archive_workspace(
+        &self,
+        host_id: String,
+        workspace_id: String,
+        keep_agents_unclassified: bool,
+    ) {
+        self.inner
+            .archive_workspace_v2(&host_id, &workspace_id, keep_agents_unclassified);
+    }
+
+    pub fn move_agent_to_workspace_v2(
+        &self,
+        host_id: String,
+        agent_id: String,
+        target_workspace_id: Option<String>,
+        new_workspace_title: Option<String>,
+        make_unclassified: bool,
+    ) {
+        self.inner.move_agent_to_workspace_v2(
+            &host_id,
+            &agent_id,
+            target_workspace_id,
+            new_workspace_title,
+            make_unclassified,
+        );
+    }
+
+    pub fn organize_project_workspaces(
+        &self,
+        host_id: String,
+        project_root: String,
+        agent_ids: Vec<String>,
+        auto_apply: bool,
+    ) {
+        self.inner
+            .organize_project_workspaces(&host_id, &project_root, agent_ids, auto_apply);
+    }
+
+    pub fn request_git_repos_inspection(
+        &self,
+        host_id: String,
+        path: String,
+        extra_dirs: Vec<String>,
+    ) {
+        self.inner
+            .request_git_repos_inspection(&host_id, &path, extra_dirs);
+    }
+
+    pub fn list_provider_subagents(&self, host_id: String, parent_agent_id: String) {
+        self.inner
+            .list_provider_subagents(&host_id, &parent_agent_id);
+    }
+
+    pub fn open_provider_subagent_timeline(
+        &self,
+        host_id: String,
+        parent_agent_id: String,
+        subagent_id: String,
+    ) {
+        self.inner
+            .open_provider_subagent_timeline(&host_id, &parent_agent_id, &subagent_id);
+    }
+
+    pub fn send_terminal_bytes(&self, host_id: String, slot: u8, bytes: Vec<u8>) {
+        self.inner.send_terminal_input_slot(&host_id, slot, bytes);
+    }
+
+    pub fn get_tool_call_diff_json(
+        &self,
+        host_id: String,
+        agent_id: String,
+        seq: u64,
+    ) -> Result<String, String> {
+        serde_json::to_string(&self.inner.get_tool_call_diff(&host_id, &agent_id, seq))
+            .map_err(|e| e.to_string())
+    }
+    pub fn git_repos_inspection_json(
+        &self,
+        host_id: String,
+        path: String,
+    ) -> Result<String, String> {
+        serde_json::to_string(&self.inner.git_repos_inspection(&host_id, &path))
+            .map_err(|e| e.to_string())
+    }
+    pub fn provider_subagent_timeline_json(
+        &self,
+        host_id: String,
+        parent_agent_id: String,
+        subagent_id: String,
+    ) -> Result<String, String> {
+        serde_json::to_string(&self.inner.provider_subagent_timeline(
+            &host_id,
+            &parent_agent_id,
+            &subagent_id,
+        ))
+        .map_err(|e| e.to_string())
+    }
+    pub fn upgrade_host_daemon_over_wire(
+        &self,
+        host_id: String,
+        target_version: Option<String>,
+    ) -> Result<String, String> {
+        self.inner
+            .upgrade_host_daemon_over_wire_blocking(&host_id, target_version)
+    }
+    pub fn register_push_token_json(
+        &self,
+        platform: String,
+        token: String,
+    ) -> Result<String, String> {
+        serde_json::to_string(&self.inner.register_push_token(platform, token)?)
+            .map_err(|e| e.to_string())
+    }
+    pub fn unregister_push_token(&self, platform: String) -> Result<(), String> {
+        self.inner.unregister_push_token(platform)
+    }
+    pub fn push_registration_status_json(&self) -> Result<String, String> {
+        serde_json::to_string(&self.inner.push_registration_status()).map_err(|e| e.to_string())
+    }
+    pub fn rewind_agent_request_json(&self, req_json: String) -> Result<String, String> {
+        let r: orbit_client_core::contract::RewindAgentRequest =
+            serde_json::from_str(&req_json).map_err(|e| e.to_string())?;
+        self.rewind_agent_json(&r.host_id, &r.agent_id, r.to_before_seq, r.restore_files)
+    }
+    pub fn read_workspace_file_request_json(&self, req_json: String) -> Result<String, String> {
+        let r: orbit_client_core::contract::ReadWorkspaceFileRequest =
+            serde_json::from_str(&req_json).map_err(|e| e.to_string())?;
+        self.read_workspace_file_json(&r.host_id, &r.cwd, &r.path)
+    }
+
+    pub fn get_guardian_config_json(&self, host_id: String) -> Result<String, String> {
+        serde_json::to_string(
+            &self
+                .inner
+                .run_mobile_rpc(self.inner.get_guardian_config_on_host(&host_id))?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn update_guardian_config_json(
+        &self,
+        host_id: String,
+        config_json: String,
+    ) -> Result<String, String> {
+        serde_json::to_string(&self.inner.run_mobile_rpc(
+            self.inner.update_guardian_config_on_host(
+                &host_id,
+                serde_json::from_str(&config_json).map_err(|e| e.to_string())?,
+            ),
+        )?)
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn list_permission_rules_json(
+        &self,
+        host_id: String,
+        project_cwd: Option<String>,
+    ) -> Result<String, String> {
+        serde_json::to_string(
+            &self.inner.run_mobile_rpc(
+                self.inner
+                    .list_permission_rules_on_host(&host_id, project_cwd),
+            )?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn upsert_permission_rule_json(
+        &self,
+        host_id: String,
+        rule_json: String,
+    ) -> Result<String, String> {
+        serde_json::to_string(&self.inner.run_mobile_rpc(
+            self.inner.upsert_permission_rule_on_host(
+                &host_id,
+                serde_json::from_str(&rule_json).map_err(|e| e.to_string())?,
+            ),
+        )?)
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn delete_permission_rule_json(
+        &self,
+        host_id: String,
+        rule_id: String,
+    ) -> Result<String, String> {
+        serde_json::to_string(
+            &self
+                .inner
+                .run_mobile_rpc(self.inner.delete_permission_rule_on_host(&host_id, rule_id))?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn resolve_permissions_batch_json(
+        &self,
+        host_id: String,
+        items_json: String,
+        decision: String,
+    ) -> Result<String, String> {
+        serde_json::to_string(
+            &self.inner.run_mobile_rpc(
+                self.inner.resolve_permissions_batch_on_host(
+                    &host_id,
+                    serde_json::from_str::<Vec<orbit_client_core::contract::PermissionRequestId>>(
+                        &items_json,
+                    )
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+                    decision,
+                ),
+            )?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_plan_approval_json(
+        &self,
+        host_id: String,
+        agent_id: String,
+        permission_request_id: String,
+        action_json: String,
+        edited_plan_markdown: Option<String>,
+        feedback: Option<String>,
+        target_mode_json: String,
+    ) -> Result<(), String> {
+        self.inner
+            .run_mobile_rpc(self.inner.resolve_plan_approval_on_host(
+                &host_id,
+                &agent_id,
+                &permission_request_id,
+                serde_json::from_str(&action_json).map_err(|e| e.to_string())?,
+                edited_plan_markdown,
+                feedback,
+                serde_json::from_str(&target_mode_json).map_err(|e| e.to_string())?,
+            ))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn git_commit_json(
+        &self,
+        host_id: String,
+        cwd: String,
+        message: String,
+        amend: bool,
+    ) -> Result<String, String> {
+        serde_json::to_string(
+            &self.inner.run_mobile_rpc(
+                self.inner
+                    .git_commit_on_host(&host_id, &cwd, message, amend),
+            )?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn git_generate_commit_message_json(
+        &self,
+        host_id: String,
+        cwd: String,
+    ) -> Result<String, String> {
+        serde_json::to_string(
+            &self.inner.run_mobile_rpc(
+                self.inner
+                    .git_generate_commit_message_on_host(&host_id, &cwd),
+            )?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn git_stash_list_json(&self, host_id: String, cwd: String) -> Result<String, String> {
+        serde_json::to_string(
+            &self
+                .inner
+                .run_mobile_rpc(self.inner.git_stash_list_on_host(&host_id, &cwd))?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn git_stash_apply_json(
+        &self,
+        host_id: String,
+        cwd: String,
+        stash_ref: String,
+        expected_oid: Option<String>,
+    ) -> Result<String, String> {
+        serde_json::to_string(
+            &self
+                .inner
+                .run_mobile_rpc(self.inner.git_stash_apply_on_host(
+                    &host_id,
+                    &cwd,
+                    stash_ref,
+                    expected_oid,
+                ))?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn git_stash_drop_json(
+        &self,
+        host_id: String,
+        cwd: String,
+        stash_ref: String,
+        expected_oid: Option<String>,
+    ) -> Result<String, String> {
+        serde_json::to_string(
+            &self
+                .inner
+                .run_mobile_rpc(self.inner.git_stash_drop_on_host(
+                    &host_id,
+                    &cwd,
+                    stash_ref,
+                    expected_oid,
+                ))?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn git_stash_pop_json(
+        &self,
+        host_id: String,
+        cwd: String,
+        stash_ref: String,
+        expected_oid: Option<String>,
+    ) -> Result<String, String> {
+        serde_json::to_string(&self.inner.run_mobile_rpc(self.inner.git_stash_pop_on_host(
+            &host_id,
+            &cwd,
+            stash_ref,
+            expected_oid,
+        ))?)
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn git_create_pr_json(
+        &self,
+        host_id: String,
+        cwd: String,
+        title: String,
+        body: String,
+        base: Option<String>,
+        draft: bool,
+    ) -> Result<String, String> {
+        serde_json::to_string(
+            &self.inner.run_mobile_rpc(
+                self.inner
+                    .git_create_pr_on_host(&host_id, &cwd, title, body, base, draft),
+            )?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn git_pr_status_json(&self, host_id: String, cwd: String) -> Result<String, String> {
+        serde_json::to_string(
+            &self
+                .inner
+                .run_mobile_rpc(self.inner.git_pr_status_on_host(&host_id, &cwd))?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn git_resolve_conflict_json(
+        &self,
+        host_id: String,
+        cwd: String,
+        path: String,
+        block_index: Option<u32>,
+        resolution_json: String,
+        auto_stage: bool,
+        expected_sha256: Option<String>,
+    ) -> Result<String, String> {
+        serde_json::to_string(&self.inner.run_mobile_rpc(
+            self.inner.git_resolve_conflict_on_host(
+                &host_id,
+                &cwd,
+                path,
+                block_index,
+                serde_json::from_str(&resolution_json).map_err(|e| e.to_string())?,
+                auto_stage,
+                expected_sha256,
+            ),
+        )?)
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn git_rebase_status_json(&self, host_id: String, cwd: String) -> Result<String, String> {
+        serde_json::to_string(
+            &self
+                .inner
+                .run_mobile_rpc(self.inner.git_rebase_status_on_host(&host_id, &cwd))?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn git_rebase_start_json(
+        &self,
+        host_id: String,
+        cwd: String,
+        onto_ref: String,
+    ) -> Result<String, String> {
+        serde_json::to_string(
+            &self.inner.run_mobile_rpc(
+                self.inner
+                    .git_rebase_start_on_host(&host_id, &cwd, onto_ref),
+            )?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn git_rebase_continue_json(&self, host_id: String, cwd: String) -> Result<String, String> {
+        serde_json::to_string(
+            &self
+                .inner
+                .run_mobile_rpc(self.inner.git_rebase_continue_on_host(&host_id, &cwd))?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn git_rebase_abort_json(&self, host_id: String, cwd: String) -> Result<String, String> {
+        serde_json::to_string(
+            &self
+                .inner
+                .run_mobile_rpc(self.inner.git_rebase_abort_on_host(&host_id, &cwd))?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn git_rebase_skip_json(
+        &self,
+        host_id: String,
+        cwd: String,
+        expected_step: Option<u32>,
+    ) -> Result<String, String> {
+        serde_json::to_string(
+            &self
+                .inner
+                .run_mobile_rpc(self.inner.git_rebase_skip_on_host(
+                    &host_id,
+                    &cwd,
+                    expected_step,
+                ))?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn update_push_preferences_json(
+        &self,
+        host_id: String,
+        req_json: String,
+    ) -> Result<String, String> {
+        serde_json::to_string(&self.inner.run_mobile_rpc(
+            self.inner.update_push_preferences_on_host(
+                &host_id,
+                serde_json::from_str(&req_json).map_err(|e| e.to_string())?,
+            ),
+        )?)
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn test_push_notification_json(
+        &self,
+        host_id: String,
+        device_id: Option<String>,
+    ) -> Result<String, String> {
+        serde_json::to_string(
+            &self.inner.run_mobile_rpc(
+                self.inner
+                    .test_push_notification_on_host(&host_id, device_id),
+            )?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn git_stage_paths_json(
+        &self,
+        host_id: String,
+        cwd: String,
+        paths: Vec<String>,
+        all: bool,
+    ) -> Result<String, String> {
+        serde_json::to_string(
+            &self.inner.run_mobile_rpc(
+                self.inner
+                    .git_stage_files_on_host(&host_id, &cwd, paths, all),
+            )?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn git_unstage_paths_json(
+        &self,
+        host_id: String,
+        cwd: String,
+        paths: Vec<String>,
+        all: bool,
+    ) -> Result<String, String> {
+        serde_json::to_string(
+            &self.inner.run_mobile_rpc(
+                self.inner
+                    .git_unstage_files_on_host(&host_id, &cwd, paths, all),
+            )?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn git_stash_save_json(
+        &self,
+        host_id: String,
+        cwd: String,
+        message: Option<String>,
+        include_untracked: bool,
+    ) -> Result<String, String> {
+        serde_json::to_string(
+            &self
+                .inner
+                .run_mobile_rpc(self.inner.git_stash_push_on_host(
+                    &host_id,
+                    &cwd,
+                    message,
+                    include_untracked,
+                ))?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn git_conflicts_json(&self, host_id: String, cwd: String) -> Result<String, String> {
+        serde_json::to_string(
+            &self
+                .inner
+                .run_mobile_rpc(self.inner.git_list_conflicts_on_host(&host_id, &cwd))?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn start_goal_json(&self, req_json: String) -> Result<String, String> {
+        serde_json::to_string(&self.inner.run_mobile_rpc(
+            self.inner.start_goal_run_on_host(
+                serde_json::from_str(&req_json).map_err(|e| e.to_string())?,
+            ),
+        )?)
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn create_monitor_json(&self, req_json: String) -> Result<String, String> {
+        serde_json::to_string(&self.inner.run_mobile_rpc(
+            self.inner.start_monitor_watch_on_host(
+                serde_json::from_str(&req_json).map_err(|e| e.to_string())?,
+            ),
+        )?)
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn create_timer_json(
+        &self,
+        host_id: String,
+        agent_id: String,
+        duration_seconds: u64,
+        prompt: String,
+        condition_json: String,
+    ) -> Result<String, String> {
+        serde_json::to_string(&self.inner.run_mobile_rpc(
+            self.inner.create_conditional_timer_on_host(
+                &host_id,
+                &agent_id,
+                duration_seconds,
+                prompt,
+                serde_json::from_str(&condition_json).map_err(|e| e.to_string())?,
+            ),
+        )?)
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn cancel_timer_json(&self, host_id: String, timer_id: String) -> Result<String, String> {
+        serde_json::to_string(
+            &self.inner.run_mobile_rpc(
+                self.inner
+                    .cancel_conditional_timer_on_host(&host_id, &timer_id),
+            )?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn start_workflow_json(&self, req_json: String) -> Result<String, String> {
+        serde_json::to_string(
+            &self
+                .inner
+                .run_mobile_rpc(self.inner.start_dag_workflow_on_host(
+                    serde_json::from_str(&req_json).map_err(|e| e.to_string())?,
+                ))?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn get_router_config_json(&self, host_id: String) -> Result<String, String> {
+        serde_json::to_string(
+            &self
+                .inner
+                .run_mobile_rpc(self.inner.get_personal_router_status_on_host(&host_id))?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn update_router_config_json(
+        &self,
+        host_id: String,
+        config_json: String,
+        external_webhook_secret: Option<String>,
+        activate: bool,
+    ) -> Result<String, String> {
+        serde_json::to_string(&self.inner.run_mobile_rpc(
+            self.inner.configure_personal_router_on_host(
+                &host_id,
+                serde_json::from_str(&config_json).map_err(|e| e.to_string())?,
+                external_webhook_secret,
+                activate,
+            ),
+        )?)
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn update_mesh_peer_json(
+        &self,
+        host_id: String,
+        registration_id: String,
+        label: Option<String>,
+        enabled: Option<bool>,
+    ) -> Result<(), String> {
+        self.inner
+            .update_connected_host(&host_id, &registration_id, label, enabled);
+        Ok(())
+    }
+
+    pub fn search_messages_remote_json(&self, req_json: String) -> Result<String, String> {
+        serde_json::to_string(&self.inner.search_messages_remote_blocking(
+            serde_json::from_str(&req_json).map_err(|e| e.to_string())?,
+        ))
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn discover_fleet_router_hosts_json(&self) -> Result<String, String> {
+        serde_json::to_string(
+            &self
+                .inner
+                .run_mobile_rpc(self.inner.discover_fleet_router_hosts())?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn get_fleet_mesh_snapshot_json(&self) -> Result<String, String> {
+        serde_json::to_string(&self.inner.get_fleet_mesh_snapshot()?).map_err(|e| e.to_string())
+    }
+
+    pub fn get_session_usage_json(
+        &self,
+        host_id: String,
+        agent_id: String,
+    ) -> Result<String, String> {
+        serde_json::to_string(
+            &self
+                .inner
+                .run_mobile_rpc(self.inner.get_session_usage(&host_id, &agent_id))?,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn register_live_activity_token_json(
+        &self,
+        host_id: String,
+        device_id: String,
+        live_activity_token: Option<String>,
+    ) -> Result<String, String> {
+        serde_json::to_string(
+            &self
+                .inner
+                .run_mobile_rpc(self.inner.register_live_activity_token(
+                    &host_id,
+                    device_id,
+                    live_activity_token,
+                ))?,
+        )
+        .map_err(|e| e.to_string())
+    }
+    pub fn new_with_master_key(db_path: String, master_key_b64: String) -> Result<Self, String> {
+        use base64::Engine as _;
+        let master_key_b64 = zeroize::Zeroizing::new(master_key_b64);
+        let bytes = zeroize::Zeroizing::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(master_key_b64.as_str())
+                .map_err(|_| "invalid master key base64")?,
+        );
+        let key: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "expected a 32-byte master key")?;
+        let key = zeroize::Zeroizing::new(key);
+        Ok(Self {
+            inner: OrbitAppCore::open_with_master_key(db_path, Some(*key))
+                .map_err(|e| e.to_string())?,
+        })
+    }
 }
 
 #[cfg(target_env = "ohos")]
@@ -1666,6 +2448,13 @@ mod ohos_napi {
         facade: OhosCoreFacade,
     }
 
+    // Both public class names refer to the same JS constructor and prototype.
+    #[napi(module_exports)]
+    fn export_mobile_core_alias(mut exports: Object) -> Result<()> {
+        let constructor: Unknown = exports.get_named_property("OrbitHarmonyCore")?;
+        exports.set_named_property("OhosOrbitCore", constructor)
+    }
+
     pub struct StageAttachmentTask {
         facade: OhosCoreFacade,
         host_id: String,
@@ -1674,6 +2463,30 @@ mod ohos_napi {
         bytes: Vec<u8>,
     }
 
+    type RpcJob<T> = Box<dyn FnOnce() -> std::result::Result<T, String> + Send>;
+    pub struct MobileRpcTask<T>(Option<RpcJob<T>>);
+    fn run_mobile_job<T: Send + TypeName + ToNapiValue + 'static>(
+        facade: &OhosCoreFacade,
+        job: impl FnOnce(OhosCoreFacade) -> std::result::Result<T, String> + Send + 'static,
+    ) -> AsyncTask<MobileRpcTask<T>> {
+        let facade = facade.clone();
+        AsyncTask::new(MobileRpcTask(Some(Box::new(move || job(facade)))))
+    }
+
+    impl<T: Send + TypeName + ToNapiValue + 'static> Task for MobileRpcTask<T> {
+        type Output = T;
+        type JsValue = T;
+        fn compute(&mut self) -> Result<T> {
+            let job = self
+                .0
+                .take()
+                .ok_or_else(|| Error::from_reason("mobile RPC already completed"))?;
+            job().map_err(Error::from_reason)
+        }
+        fn resolve(&mut self, _env: Env, output: T) -> Result<T> {
+            Ok(output)
+        }
+    }
     pub struct RegisterPushDeviceTask {
         facade: OhosCoreFacade,
         host_id: String,
@@ -3741,6 +4554,854 @@ mod ohos_napi {
                 host_id,
             })
         }
+        #[napi]
+        pub fn parse_markdown_preview_json(
+            &self,
+            markdown: String,
+            streaming: bool,
+        ) -> Result<String> {
+            self.facade
+                .parse_markdown_preview_json(&markdown, streaming)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn archive_workspace(
+            &self,
+            host_id: String,
+            workspace_id: String,
+            keep_agents_unclassified: bool,
+        ) {
+            self.facade
+                .archive_workspace(host_id, workspace_id, keep_agents_unclassified)
+        }
+
+        #[napi]
+        pub fn cancel_timer_json(
+            &self,
+            host_id: String,
+            timer_id: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.cancel_timer_json(host_id, timer_id)
+            })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        #[napi]
+        pub fn create_mission_workspace(
+            &self,
+            host_id: String,
+            source_cwd: String,
+            title: String,
+            mission_goal: Option<String>,
+            use_worktree: bool,
+            worktree_branch: Option<String>,
+            base_ref: Option<String>,
+        ) {
+            self.facade.create_mission_workspace(
+                host_id,
+                source_cwd,
+                title,
+                mission_goal,
+                use_worktree,
+                worktree_branch,
+                base_ref,
+            )
+        }
+
+        #[napi]
+        pub fn create_monitor_json(&self, req_json: String) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.create_monitor_json(req_json)
+            })
+        }
+
+        #[napi]
+        pub fn create_timer_json(
+            &self,
+            host_id: String,
+            agent_id: String,
+            duration_seconds: i64,
+            prompt: String,
+            condition_json: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.create_timer_json(
+                    host_id,
+                    agent_id,
+                    duration_seconds.max(0) as u64,
+                    prompt,
+                    condition_json,
+                )
+            })
+        }
+
+        #[napi]
+        pub fn delete_custom_acp_agent_json(
+            &self,
+            host_id: String,
+            agent_id: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.delete_custom_acp_agent_json(&host_id, &agent_id)
+            })
+        }
+
+        #[napi]
+        pub fn delete_permission_rule_json(
+            &self,
+            host_id: String,
+            rule_id: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.delete_permission_rule_json(host_id, rule_id)
+            })
+        }
+
+        #[napi]
+        pub fn detach_agent(&self, host_id: String, agent_id: String) {
+            self.facade.detach_agent(host_id, agent_id)
+        }
+
+        #[napi]
+        pub fn discover_fleet_router_hosts_json(&self) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.discover_fleet_router_hosts_json()
+            })
+        }
+
+        #[napi]
+        pub fn dismiss_cluster_suggestion(&self, host_id: String, agent_id: String) {
+            self.facade.dismiss_cluster_suggestion(&host_id, &agent_id)
+        }
+
+        #[napi]
+        pub fn get_fleet_mesh_snapshot_json(&self) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.get_fleet_mesh_snapshot_json()
+            })
+        }
+
+        #[napi]
+        pub fn get_guardian_config_json(
+            &self,
+            host_id: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.get_guardian_config_json(host_id)
+            })
+        }
+
+        #[napi]
+        pub fn get_router_config_json(&self, host_id: String) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.get_router_config_json(host_id)
+            })
+        }
+
+        #[napi]
+        pub fn get_session_usage_json(
+            &self,
+            host_id: String,
+            agent_id: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.get_session_usage_json(host_id, agent_id)
+            })
+        }
+
+        #[napi]
+        pub fn get_tool_call_diff_json(
+            &self,
+            host_id: String,
+            agent_id: String,
+            seq: i64,
+        ) -> Result<String> {
+            self.facade
+                .get_tool_call_diff_json(host_id, agent_id, seq.max(0) as u64)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn git_commit_json(
+            &self,
+            host_id: String,
+            cwd: String,
+            message: String,
+            amend: bool,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.git_commit_json(host_id, cwd, message, amend)
+            })
+        }
+
+        #[napi]
+        pub fn git_conflicts_json(
+            &self,
+            host_id: String,
+            cwd: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.git_conflicts_json(host_id, cwd)
+            })
+        }
+
+        #[napi]
+        pub fn git_create_pr_json(
+            &self,
+            host_id: String,
+            cwd: String,
+            title: String,
+            body: String,
+            base: Option<String>,
+            draft: bool,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.git_create_pr_json(host_id, cwd, title, body, base, draft)
+            })
+        }
+
+        #[napi]
+        pub fn git_generate_commit_message_json(
+            &self,
+            host_id: String,
+            cwd: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.git_generate_commit_message_json(host_id, cwd)
+            })
+        }
+
+        #[napi]
+        pub fn git_pr_status_json(
+            &self,
+            host_id: String,
+            cwd: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.git_pr_status_json(host_id, cwd)
+            })
+        }
+
+        #[napi]
+        pub fn git_rebase_abort_json(
+            &self,
+            host_id: String,
+            cwd: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.git_rebase_abort_json(host_id, cwd)
+            })
+        }
+
+        #[napi]
+        pub fn git_rebase_continue_json(
+            &self,
+            host_id: String,
+            cwd: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.git_rebase_continue_json(host_id, cwd)
+            })
+        }
+
+        #[napi]
+        pub fn git_rebase_skip_json(
+            &self,
+            host_id: String,
+            cwd: String,
+            expected_step: Option<u32>,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.git_rebase_skip_json(host_id, cwd, expected_step)
+            })
+        }
+
+        #[napi]
+        pub fn git_rebase_start_json(
+            &self,
+            host_id: String,
+            cwd: String,
+            onto_ref: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.git_rebase_start_json(host_id, cwd, onto_ref)
+            })
+        }
+
+        #[napi]
+        pub fn git_rebase_status_json(
+            &self,
+            host_id: String,
+            cwd: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.git_rebase_status_json(host_id, cwd)
+            })
+        }
+
+        #[napi]
+        pub fn git_repos_inspection_json(&self, host_id: String, path: String) -> Result<String> {
+            self.facade
+                .git_repos_inspection_json(host_id, path)
+                .map_err(Error::from_reason)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        #[napi]
+        pub fn git_resolve_conflict_json(
+            &self,
+            host_id: String,
+            cwd: String,
+            path: String,
+            block_index: Option<u32>,
+            resolution_json: String,
+            auto_stage: bool,
+            expected_sha256: Option<String>,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.git_resolve_conflict_json(
+                    host_id,
+                    cwd,
+                    path,
+                    block_index,
+                    resolution_json,
+                    auto_stage,
+                    expected_sha256,
+                )
+            })
+        }
+
+        #[napi]
+        pub fn git_stage_paths_json(
+            &self,
+            host_id: String,
+            cwd: String,
+            paths: Vec<String>,
+            all: bool,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.git_stage_paths_json(host_id, cwd, paths, all)
+            })
+        }
+
+        #[napi]
+        pub fn git_stash_apply_json(
+            &self,
+            host_id: String,
+            cwd: String,
+            stash_ref: String,
+            expected_oid: Option<String>,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.git_stash_apply_json(host_id, cwd, stash_ref, expected_oid)
+            })
+        }
+
+        #[napi]
+        pub fn git_stash_drop_json(
+            &self,
+            host_id: String,
+            cwd: String,
+            stash_ref: String,
+            expected_oid: Option<String>,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.git_stash_drop_json(host_id, cwd, stash_ref, expected_oid)
+            })
+        }
+
+        #[napi]
+        pub fn git_stash_list_json(
+            &self,
+            host_id: String,
+            cwd: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.git_stash_list_json(host_id, cwd)
+            })
+        }
+
+        #[napi]
+        pub fn git_stash_pop_json(
+            &self,
+            host_id: String,
+            cwd: String,
+            stash_ref: String,
+            expected_oid: Option<String>,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.git_stash_pop_json(host_id, cwd, stash_ref, expected_oid)
+            })
+        }
+
+        #[napi]
+        pub fn git_stash_save_json(
+            &self,
+            host_id: String,
+            cwd: String,
+            message: Option<String>,
+            include_untracked: bool,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.git_stash_save_json(host_id, cwd, message, include_untracked)
+            })
+        }
+
+        #[napi]
+        pub fn git_unstage_paths_json(
+            &self,
+            host_id: String,
+            cwd: String,
+            paths: Vec<String>,
+            all: bool,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.git_unstage_paths_json(host_id, cwd, paths, all)
+            })
+        }
+
+        #[napi]
+        pub fn list_acp_agents_json(&self, host_id: String) -> Result<String> {
+            self.facade
+                .list_acp_agents_json(&host_id)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn list_permission_rules_json(
+            &self,
+            host_id: String,
+            project_cwd: Option<String>,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.list_permission_rules_json(host_id, project_cwd)
+            })
+        }
+
+        #[napi]
+        pub fn list_provider_subagents(&self, host_id: String, parent_agent_id: String) {
+            self.facade
+                .list_provider_subagents(host_id, parent_agent_id)
+        }
+
+        #[napi]
+        pub fn merge_workspaces(
+            &self,
+            host_id: String,
+            source_workspace_id: String,
+            target_workspace_id: String,
+        ) {
+            self.facade
+                .merge_workspaces(&host_id, &source_workspace_id, &target_workspace_id)
+        }
+
+        #[napi]
+        pub fn move_agent_to_workspace(
+            &self,
+            host_id: String,
+            agent_id: String,
+            target_workspace_id: Option<String>,
+        ) {
+            self.facade
+                .move_agent_to_workspace(&host_id, &agent_id, target_workspace_id)
+        }
+
+        #[napi]
+        pub fn move_agent_to_workspace_v2(
+            &self,
+            host_id: String,
+            agent_id: String,
+            target_workspace_id: Option<String>,
+            new_workspace_title: Option<String>,
+            make_unclassified: bool,
+        ) {
+            self.facade.move_agent_to_workspace_v2(
+                host_id,
+                agent_id,
+                target_workspace_id,
+                new_workspace_title,
+                make_unclassified,
+            )
+        }
+
+        #[napi]
+        pub fn open_provider_subagent_timeline(
+            &self,
+            host_id: String,
+            parent_agent_id: String,
+            subagent_id: String,
+        ) {
+            self.facade
+                .open_provider_subagent_timeline(host_id, parent_agent_id, subagent_id)
+        }
+
+        #[napi]
+        pub fn organize_project_workspaces(
+            &self,
+            host_id: String,
+            project_root: String,
+            agent_ids: Vec<String>,
+            auto_apply: bool,
+        ) {
+            self.facade
+                .organize_project_workspaces(host_id, project_root, agent_ids, auto_apply)
+        }
+
+        #[napi]
+        pub fn project_order_json(&self) -> Result<String> {
+            self.facade.project_order_json().map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn provider_subagent_timeline_json(
+            &self,
+            host_id: String,
+            parent_agent_id: String,
+            subagent_id: String,
+        ) -> Result<String> {
+            self.facade
+                .provider_subagent_timeline_json(host_id, parent_agent_id, subagent_id)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn push_registration_status_json(&self) -> Result<String> {
+            self.facade
+                .push_registration_status_json()
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn read_workspace_file_request_json(
+            &self,
+            req_json: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.read_workspace_file_request_json(req_json)
+            })
+        }
+
+        #[napi]
+        pub fn refresh_acp_agents(&self, host_id: String) {
+            self.facade.refresh_acp_agents(&host_id)
+        }
+
+        #[napi]
+        pub fn refresh_acp_registry_json(
+            &self,
+            host_id: String,
+            registry_url: Option<String>,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.refresh_acp_registry_json(&host_id, registry_url)
+            })
+        }
+
+        #[napi]
+        pub fn register_live_activity_token_json(
+            &self,
+            host_id: String,
+            device_id: String,
+            live_activity_token: Option<String>,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.register_live_activity_token_json(host_id, device_id, live_activity_token)
+            })
+        }
+
+        #[napi]
+        pub fn register_push_token_json(&self, platform: String, token: String) -> Result<String> {
+            self.facade
+                .register_push_token_json(platform, token)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn rename_workspace(&self, host_id: String, workspace_id: String, title: String) {
+            self.facade.rename_workspace(host_id, workspace_id, title)
+        }
+
+        #[napi]
+        pub fn reorder_projects_json(&self, ordered_keys_json: String) -> Result<String> {
+            self.facade
+                .reorder_projects_json(&ordered_keys_json)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn request_git_repos_inspection(
+            &self,
+            host_id: String,
+            path: String,
+            extra_dirs: Vec<String>,
+        ) {
+            self.facade
+                .request_git_repos_inspection(host_id, path, extra_dirs)
+        }
+
+        #[napi]
+        pub fn resolve_permissions_batch_json(
+            &self,
+            host_id: String,
+            items_json: String,
+            decision: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.resolve_permissions_batch_json(host_id, items_json, decision)
+            })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        #[napi]
+        pub fn resolve_plan_approval_json(
+            &self,
+            host_id: String,
+            agent_id: String,
+            permission_request_id: String,
+            action_json: String,
+            edited_plan_markdown: Option<String>,
+            feedback: Option<String>,
+            target_mode_json: String,
+        ) -> AsyncTask<MobileRpcTask<()>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.resolve_plan_approval_json(
+                    host_id,
+                    agent_id,
+                    permission_request_id,
+                    action_json,
+                    edited_plan_markdown,
+                    feedback,
+                    target_mode_json,
+                )
+            })
+        }
+
+        #[napi]
+        pub fn rewind_agent_request_json(
+            &self,
+            req_json: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.rewind_agent_request_json(req_json)
+            })
+        }
+
+        #[napi]
+        pub fn search_messages_remote_json(
+            &self,
+            req_json: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.search_messages_remote_json(req_json)
+            })
+        }
+
+        #[napi]
+        pub fn send_terminal_bytes(&self, host_id: String, slot: u32, bytes: Uint8Array) {
+            self.facade
+                .send_terminal_bytes(host_id, slot.clamp(1, 255) as u8, bytes.to_vec())
+        }
+
+        #[napi]
+        pub fn start_goal_json(&self, req_json: String) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| facade.start_goal_json(req_json))
+        }
+
+        #[napi]
+        pub fn start_workflow_json(&self, req_json: String) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.start_workflow_json(req_json)
+            })
+        }
+
+        #[napi]
+        pub fn summarize_agent(&self, host_id: String, agent_id: String) {
+            self.facade.summarize_agent(host_id, agent_id)
+        }
+
+        #[napi]
+        pub fn test_acp_agent_json(
+            &self,
+            host_id: String,
+            agent_id: String,
+            cwd: Option<String>,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.test_acp_agent_json(&host_id, &agent_id, cwd)
+            })
+        }
+
+        #[napi]
+        pub fn test_push_notification_json(
+            &self,
+            host_id: String,
+            device_id: Option<String>,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.test_push_notification_json(host_id, device_id)
+            })
+        }
+
+        #[napi]
+        pub fn unregister_push_token(&self, platform: String) -> Result<()> {
+            self.facade
+                .unregister_push_token(platform)
+                .map_err(Error::from_reason)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        #[napi]
+        pub fn update_agent_identity(
+            &self,
+            host_id: String,
+            agent_id: String,
+            handle: Option<String>,
+            title: Option<String>,
+            task_summary: Option<String>,
+            lock_handle: bool,
+            lock_title: bool,
+        ) {
+            self.facade.update_agent_identity(
+                host_id,
+                agent_id,
+                handle,
+                title,
+                task_summary,
+                lock_handle,
+                lock_title,
+            )
+        }
+
+        #[napi]
+        pub fn update_guardian_config_json(
+            &self,
+            host_id: String,
+            config_json: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.update_guardian_config_json(host_id, config_json)
+            })
+        }
+
+        #[napi]
+        pub fn update_mesh_peer_json(
+            &self,
+            host_id: String,
+            registration_id: String,
+            label: Option<String>,
+            enabled: Option<bool>,
+        ) -> AsyncTask<MobileRpcTask<()>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.update_mesh_peer_json(host_id, registration_id, label, enabled)
+            })
+        }
+
+        #[napi]
+        pub fn update_push_preferences_json(
+            &self,
+            host_id: String,
+            req_json: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.update_push_preferences_json(host_id, req_json)
+            })
+        }
+
+        #[napi]
+        pub fn update_router_config_json(
+            &self,
+            host_id: String,
+            config_json: String,
+            external_webhook_secret: Option<String>,
+            activate: bool,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.update_router_config_json(
+                    host_id,
+                    config_json,
+                    external_webhook_secret,
+                    activate,
+                )
+            })
+        }
+
+        #[napi]
+        pub fn update_workspace_goal(&self, host_id: String, workspace_id: String, goal: String) {
+            self.facade
+                .update_workspace_goal(host_id, workspace_id, goal)
+        }
+
+        #[napi]
+        pub fn upgrade_host_daemon_over_wire(
+            &self,
+            host_id: String,
+            target_version: Option<String>,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.upgrade_host_daemon_over_wire(host_id, target_version)
+            })
+        }
+
+        #[napi]
+        pub fn upsert_custom_acp_agent_json(
+            &self,
+            host_id: String,
+            spec_json: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.upsert_custom_acp_agent_json(&host_id, &spec_json)
+            })
+        }
+
+        #[napi]
+        pub fn upsert_permission_rule_json(
+            &self,
+            host_id: String,
+            rule_json: String,
+        ) -> AsyncTask<MobileRpcTask<String>> {
+            run_mobile_job(&self.facade, move |facade| {
+                facade.upsert_permission_rule_json(host_id, rule_json)
+            })
+        }
+
+        #[napi(factory)]
+        pub fn new_with_master_key(db_path: String, master_key_b64: String) -> Result<Self> {
+            Ok(Self {
+                facade: OhosCoreFacade::new_with_master_key(db_path, master_key_b64)
+                    .map_err(Error::from_reason)?,
+            })
+        }
+        #[napi(factory)]
+        pub fn open(db_path: String) -> Result<Self> {
+            Ok(Self {
+                facade: OhosCoreFacade::open(&db_path).map_err(Error::from_reason)?,
+            })
+        }
+        #[napi(factory)]
+        pub fn open_in_memory() -> Result<Self> {
+            Ok(Self {
+                facade: OhosCoreFacade::open_in_memory().map_err(Error::from_reason)?,
+            })
+        }
+        #[napi]
+        pub fn subscribe(&self, callback: ThreadsafeFunction<String, ()>) {
+            self.facade.subscribe(move |event| {
+                let _ = callback.call(Ok(event), ThreadsafeFunctionCallMode::NonBlocking);
+            });
+        }
+        #[napi]
+        pub fn subscribe_coalesced(
+            &self,
+            min_interval_ms: u32,
+            callback: ThreadsafeFunction<String, ()>,
+        ) {
+            self.facade
+                .subscribe_coalesced(min_interval_ms.into(), move |event| {
+                    let _ = callback.call(Ok(event), ThreadsafeFunctionCallMode::NonBlocking);
+                });
+        }
     }
 }
 
@@ -3748,6 +5409,31 @@ mod ohos_napi {
 mod tests {
     use super::*;
 
+    #[test]
+    fn mobile_contract_rejects_bad_keys_and_preserves_host_scope() {
+        let path = std::env::temp_dir().join(format!("orbit-ohos-key-{}.db", std::process::id()));
+        let path = path.to_str().expect("path").to_owned();
+        assert!(OhosCoreFacade::new_with_master_key(path.clone(), "%%%".into()).is_err());
+        assert!(OhosCoreFacade::new_with_master_key(path.clone(), "AQI=".into()).is_err());
+        use base64::Engine as _;
+        let core = OhosCoreFacade::new_with_master_key(
+            path.clone(),
+            base64::engine::general_purpose::STANDARD.encode([7; 32]),
+        )
+        .expect("key");
+        assert_eq!(core.get_fleet_mesh_snapshot_json().expect("mesh"), "{}");
+        assert!(
+            core.get_session_usage_json("unknown".into(), "agent".into())
+                .is_err()
+        );
+        assert!(
+            core.git_stage_paths_json("unknown".into(), "/repo".into(), vec![], true)
+                .is_err()
+        );
+        drop(core);
+        assert!(OhosCoreFacade::open(&path).is_err());
+        std::fs::remove_file(path).expect("cleanup");
+    }
     #[test]
     fn ohos_facade_exports_valid_fleet_json() {
         let facade = OhosCoreFacade::open_in_memory().expect("open");

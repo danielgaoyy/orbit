@@ -800,13 +800,22 @@ impl OrbitStore {
 
     pub fn get_client_kv(&self, key: &str) -> Result<Option<String>, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        conn.query_row(
-            "SELECT value_json FROM client_kv WHERE key = ?1",
-            params![key],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(Into::into)
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT value_json FROM client_kv WHERE key = ?1",
+                [key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if key == crate::secrets::CLOUD_CONFIG {
+            return raw
+                .map(|raw| {
+                    self.secrets
+                        .cloud_fields(&raw, crate::secrets::SecretEnvelope::open)
+                })
+                .transpose();
+        }
+        Ok(raw)
     }
 
     pub fn set_client_kv(
@@ -816,6 +825,15 @@ impl OrbitStore {
         updated_at_ms: i64,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let sealed;
+        let value_json = if key == crate::secrets::CLOUD_CONFIG && self.secrets.0.is_some() {
+            sealed = self
+                .secrets
+                .cloud_fields(value_json, crate::secrets::SecretEnvelope::seal)?;
+            &sealed
+        } else {
+            value_json
+        };
         conn.execute(
             "INSERT INTO client_kv (key, value_json, updated_at_ms)
              VALUES (?1, ?2, ?3)

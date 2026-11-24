@@ -30,6 +30,8 @@ jobs:
         run: |
           bash -n scripts/check-docs-index.sh
           bash scripts/check-docs-index.sh
+      - name: Verify HarmonyOS native declarations
+        run: bash scripts/check-ohos-dts-sync.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

@@ -39,11 +39,40 @@ pub enum ClientInboundEvent {
     Disconnected,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutboxSendError {
+    EncodeFailed,
+    TransportFailed,
+}
+
+#[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum OutboundPayload {
     Wire(WireMessage),
     Terminal(TerminalBinaryFrame),
+    ConfirmedWire(
+        WireMessage,
+        tokio::sync::oneshot::Sender<Result<(), OutboxSendError>>,
+    ),
+}
+
+type WireReceipt = Option<tokio::sync::oneshot::Sender<Result<(), OutboxSendError>>>;
+type CiphertextWrite = (Vec<u8>, WireReceipt);
+
+#[allow(clippy::large_enum_variant)]
+enum OutboundFrame {
+    Wire(WireMessage),
+    Terminal(TerminalBinaryFrame),
+}
+
+impl OutboundPayload {
+    fn into_parts(self) -> (OutboundFrame, WireReceipt) {
+        match self {
+            Self::Wire(w) => (OutboundFrame::Wire(w), None),
+            Self::Terminal(t) => (OutboundFrame::Terminal(t), None),
+            Self::ConfirmedWire(w, receipt) => (OutboundFrame::Wire(w), Some(receipt)),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -137,6 +166,18 @@ impl HostSessionHandle {
             .send(OutboundPayload::Wire(msg))
             .await
             .map_err(|_| ClientCoreError::ChannelClosed)
+    }
+
+    pub(crate) async fn send_wire_confirmed(&self, msg: WireMessage) -> Result<(), OutboxSendError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.out_tx
+            .send(OutboundPayload::ConfirmedWire(msg, tx))
+            .await
+            .map_err(|_| OutboxSendError::TransportFailed)?;
+        match rx.await {
+            Ok(res) => res,
+            Err(_) => Err(OutboxSendError::TransportFailed),
+        }
     }
 
     pub async fn send_terminal(&self, frame: TerminalBinaryFrame) -> Result<(), ClientCoreError> {
@@ -450,24 +491,38 @@ async fn connect_direct_with_host_id(
         }
     });
 
+    let write_events = events_tx.clone();
     let tunnel_keep_writer = ssh_tunnel.clone();
     tokio::spawn(async move {
         let _hold = tunnel_keep_writer;
         while let Some(item) = out_rx.recv().await {
-            let ws_msg = match item {
-                OutboundPayload::Wire(w) => match w.encode_zstd(3) {
+            let (data, receipt) = item.into_parts();
+            let ws_msg = match data {
+                OutboundFrame::Wire(w) => match w.encode_zstd(3) {
                     Ok(z) => {
                         let mut framed = Vec::with_capacity(1 + z.len());
                         framed.push(DIRECT_BIN_ZSTD_WIRE);
                         framed.extend_from_slice(&z);
                         Message::Binary(framed.into())
                     }
-                    Err(_) => continue,
+                    Err(_) => {
+                        if let Some(receipt) = receipt {
+                            let _ = receipt.send(Err(OutboxSendError::EncodeFailed));
+                        }
+                        continue;
+                    }
                 },
-                OutboundPayload::Terminal(t) => Message::Binary(t.encode().into()),
+                OutboundFrame::Terminal(t) => Message::Binary(t.encode().into()),
             };
             if sink.send(ws_msg).await.is_err() {
+                if let Some(receipt) = receipt {
+                    let _ = receipt.send(Err(OutboxSendError::TransportFailed));
+                }
+                let _ = write_events.send(ClientInboundEvent::Disconnected);
                 break;
+            }
+            if let Some(receipt) = receipt {
+                let _ = receipt.send(Ok(()));
             }
         }
     });
@@ -625,27 +680,43 @@ async fn connect_via_relay_with_host_id(
         other => ClientCoreError::Crypto(other),
     })?;
 
-    let (ct_out_tx, mut ct_out_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (ct_out_tx, mut ct_out_rx) = mpsc::channel::<CiphertextWrite>(256);
     let (ct_in_tx, ct_in_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
 
     tokio::spawn(async move {
-        while let Some(ct) = ct_out_rx.recv().await {
+        let mut close_tx = Some(close_tx);
+        while let Some((ct, receipt)) = ct_out_rx.recv().await {
             if sink.send(Message::Binary(ct.into())).await.is_err() {
+                if let Some(receipt) = receipt {
+                    let _ = receipt.send(Err(OutboxSendError::TransportFailed));
+                }
+                if let Some(tx) = close_tx.take() {
+                    let _ = tx.send(());
+                }
                 break;
+            }
+            if let Some(receipt) = receipt {
+                let _ = receipt.send(Ok(()));
             }
         }
     });
 
     tokio::spawn(async move {
-        while let Some(Ok(msg)) = stream.next().await {
-            match msg {
-                Message::Binary(ct) => {
-                    if ct_in_tx.send(ct.to_vec()).await.is_err() {
-                        break;
+        loop {
+            tokio::select! {
+                _ = &mut close_rx => break,
+                maybe_msg = stream.next() => {
+                    match maybe_msg {
+                        Some(Ok(Message::Binary(ct))) => {
+                            if ct_in_tx.send(ct.to_vec()).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                        Some(Ok(_)) => {}
                     }
                 }
-                Message::Close(_) => break,
-                _ => {}
             }
         }
     });
@@ -775,21 +846,31 @@ pub async fn connect_via_peer_bridge(
         other => ClientCoreError::Crypto(other),
     })?;
 
-    let (ct_out_tx, mut ct_out_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (ct_out_tx, mut ct_out_rx) = mpsc::channel::<CiphertextWrite>(256);
     let (ct_in_tx, ct_in_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
 
     let writer_bridge = bridge_session.clone();
     tokio::spawn(async move {
-        while let Some(ct) = ct_out_rx.recv().await {
-            if writer_bridge
-                .send_wire(WireMessage::PeerBridgeData {
+        let mut close_tx = Some(close_tx);
+        while let Some((ct, receipt)) = ct_out_rx.recv().await {
+            if let Err(err) = writer_bridge
+                .send_wire_confirmed(WireMessage::PeerBridgeData {
                     bridge_id,
                     payload_b64: STANDARD.encode(&ct),
                 })
                 .await
-                .is_err()
             {
+                if let Some(receipt) = receipt {
+                    let _ = receipt.send(Err(err));
+                }
+                if let Some(tx) = close_tx.take() {
+                    let _ = tx.send(());
+                }
                 break;
+            }
+            if let Some(receipt) = receipt {
+                let _ = receipt.send(Ok(()));
             }
         }
         let _ = writer_bridge
@@ -802,25 +883,30 @@ pub async fn connect_via_peer_bridge(
 
     tokio::spawn(async move {
         loop {
-            match bridge_events.recv().await {
-                Ok(ClientInboundEvent::Wire(WireMessage::PeerBridgeData {
-                    bridge_id: b,
-                    payload_b64,
-                })) if b == bridge_id => {
-                    if let Ok(bytes) = STANDARD.decode(&payload_b64)
-                        && ct_in_tx.send(bytes).await.is_err()
-                    {
-                        break;
+            tokio::select! {
+                _ = &mut close_rx => break,
+                ev = bridge_events.recv() => {
+                    match ev {
+                        Ok(ClientInboundEvent::Wire(WireMessage::PeerBridgeData {
+                            bridge_id: b,
+                            payload_b64,
+                        })) if b == bridge_id => {
+                            if let Ok(bytes) = STANDARD.decode(&payload_b64)
+                                && ct_in_tx.send(bytes).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(ClientInboundEvent::Wire(WireMessage::PeerBridgeClosed {
+                            bridge_id: b,
+                            ..
+                        })) if b == bridge_id => break,
+                        Ok(ClientInboundEvent::Disconnected)
+                        | Err(tokio::sync::broadcast::error::RecvError::Closed)
+                        | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
+                        Ok(_) => {}
                     }
                 }
-                Ok(ClientInboundEvent::Wire(WireMessage::PeerBridgeClosed {
-                    bridge_id: b,
-                    ..
-                })) if b == bridge_id => break,
-                Ok(ClientInboundEvent::Disconnected)
-                | Err(tokio::sync::broadcast::error::RecvError::Closed)
-                | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
-                Ok(_) => {}
             }
         }
     });
@@ -839,7 +925,7 @@ pub async fn connect_via_peer_bridge(
 async fn complete_e2ee_session_tasks(
     host_id: &str,
     write_chan: SecureChannel,
-    ct_out_tx: mpsc::Sender<Vec<u8>>,
+    ct_out_tx: mpsc::Sender<CiphertextWrite>,
     mut ct_in_rx: mpsc::Receiver<Vec<u8>>,
     replica: Option<Arc<OrbitStore>>,
     hold_bridge_session: Option<HostSessionHandle>,
@@ -856,7 +942,7 @@ async fn complete_e2ee_session_tasks(
         let plain = hello.encode_e2ee(true)?;
         let ct = shared_chan.lock().await.seal_record(&plain)?;
         ct_out_tx
-            .send(ct)
+            .send((ct, None))
             .await
             .map_err(|_| ClientCoreError::ChannelClosed)?;
     }
@@ -887,16 +973,23 @@ async fn complete_e2ee_session_tasks(
         }
     });
 
+    let write_events = events_tx.clone();
     let chan_writer = shared_chan.clone();
     tokio::spawn(async move {
         let _keep_bridge = hold_bridge_session;
         while let Some(item) = out_rx.recv().await {
-            let plain = match item {
-                OutboundPayload::Wire(w) => match w.encode_e2ee(true) {
+            let (data, receipt) = item.into_parts();
+            let plain = match data {
+                OutboundFrame::Wire(w) => match w.encode_e2ee(true) {
                     Ok(frame) => frame,
-                    Err(_) => continue,
+                    Err(_) => {
+                        if let Some(receipt) = receipt {
+                            let _ = receipt.send(Err(OutboxSendError::EncodeFailed));
+                        }
+                        continue;
+                    }
                 },
-                OutboundPayload::Terminal(t) => {
+                OutboundFrame::Terminal(t) => {
                     let enc = t.encode();
                     let mut p = Vec::with_capacity(1 + enc.len());
                     p.push(E2EE_FRAME_TERMINAL);
@@ -905,9 +998,14 @@ async fn complete_e2ee_session_tasks(
                 }
             };
             let Ok(ct) = chan_writer.lock().await.seal_record(&plain) else {
+                if let Some(receipt) = receipt {
+                    let _ = receipt.send(Err(OutboxSendError::TransportFailed));
+                }
+                let _ = write_events.send(ClientInboundEvent::Disconnected);
                 break;
             };
-            if ct_out_tx.send(ct).await.is_err() {
+            if ct_out_tx.send((ct, receipt)).await.is_err() {
+                let _ = write_events.send(ClientInboundEvent::Disconnected);
                 break;
             }
         }

@@ -77,3 +77,5 @@ In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight
 
 **硬性禁止**在未同步更新 GitHub Branch Ruleset 的情况下修改或删除 `ci.yml` 中的任何必填 Check 名称！
 若需增删或重命名 `rust-quality-and-unit`、`e2e-regression-matrix` 标签或 `desktop-frontend-build`，**必须在同一 PR 合入前后同步调整 GitHub Ruleset `protect-main-and-master`（ID `27444583`）的 `required_status_checks`**，否则所有 PR 将被永久挂起。
+
+The Rust quality job runs `bash scripts/check-ohos-dts-sync.sh` to verify every N-API method against the checked-in ArkTS declarations, including factories, optional arguments and promise results. After changing the Rust exports, run the script with `--write` to regenerate `index.d.ts`.

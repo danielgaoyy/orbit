@@ -33,3 +33,5 @@ pub use viewmodel::{HostConnectionState, HostRouteMode, SavedHostProfile};
 mod native;
 #[cfg(feature = "native")]
 pub use native::*;
+#[cfg(feature = "native")]
+pub(crate) use native::OutboxSendError;

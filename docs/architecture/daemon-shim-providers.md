@@ -121,3 +121,16 @@ Set the backend and the corresponding model ID together. Each catalog entry pins
 Local recognition falls back to a configured OpenAI-compatible audio endpoint and finally to client STT. Selecting `open_ai_compatible` starts at the endpoint. Selecting `system_client_fallback` hands capture directly back to the client. Local synthesis tries the configured endpoint and then the host's WAV writer. Native output uses macOS `say`, Windows PowerShell SAPI or Linux `espeak-ng` / `espeak`. The result contains WAV bytes for playback on the requesting device. A host with only a playback-only synthesizer delegates playback to the client. Speech text is reduced to at most 2,000 characters after Markdown cleanup.
 
 The endpoint accepts a base such as `http://127.0.0.1:8000/v1`. Orbit posts multipart WAV to `audio/transcriptions` and requests WAV from `audio/speech`. With a local model ID the remote defaults are `whisper-1` and `tts-1`. With the OpenAI-compatible backend the model ID may name a model served by the endpoint. Credential binding is documented in [SECURITY.md](../../SECURITY.md).
+
+## Direct mobile push
+
+Place provider settings in a private `$ORBIT_HOME/push.json` file or set the corresponding uppercase `ORBIT_` environment variables. Environment values override the file. Each platform with configured direct credentials uses its vendor endpoint. Other platforms can use the existing push gateway. Provider keys belong to the daemon operator.
+
+| Platform | Configuration fields | Delivery |
+| --- | --- | --- |
+| APNs | `apns_key_path`, `apns_key_id`, `apns_team_id`, `apns_bundle_id`, `apns_sandbox` | HTTP/2, ES256 provider token refreshed after 50 minutes. The device token receives alerts. An additional ActivityKit token receives updates under the Live Activity topic. |
+| FCM | `fcm_service_account_path` | Firebase Messaging scope, RS256 assertion, OAuth token exchange and HTTP v1 project endpoint. |
+| HarmonyOS NEXT | `hms_service_account_path` | Huawei service-account PS256 JWT, v3 notification endpoint with `push-type: 0` and the `WORK` category. |
+| Huawei client credentials | `hms_client_id`, `hms_client_secret`, `hms_project_id` | OAuth client-credentials exchange for deployments accepting that bearer. NEXT requires service-account JWT authentication. |
+
+Register or rotate an ActivityKit token using the host and device IDs. Passing null to the dedicated token-update RPC clears it. The ActivityKit `content-state` uses the `PushDispatchPayload` fields. Provider acceptance is reported per device. The notification privacy preference controls optional previews. [Huawei authentication](https://developer.huawei.com/consumer/en/doc/harmonyos-guides/push-jwt-token/) · [Apple ActivityKit updates](https://developer.apple.com/documentation/activitykit/starting-and-updating-live-activities-with-activitykit-push-notifications)

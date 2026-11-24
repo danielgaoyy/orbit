@@ -767,12 +767,13 @@ impl DaemonRuntime {
         let im_channels =
             ImChannelBridge::new(store.clone(), orchestrator.clone(), listen_port.clone());
         let host_display_name = hostname_string();
-        let push = PushManager::new(
+        let push = PushManager::from_home(
             store.clone(),
             orchestrator.clone(),
             host_id.clone(),
             host_display_name.clone(),
-        );
+            home_dir,
+        )?;
 
         let home_for_probe = home_dir.to_path_buf();
         let available_providers = tokio::task::spawn_blocking(move || {
@@ -9146,6 +9147,25 @@ async fn handle_wire_rpc(
                 Err(e) => rpc_err(request_id, "diagnostics", e),
             })
         }
+        WireMessage::GetSessionUsage {
+            request_id,
+            agent_id,
+        } => {
+            let store = Arc::clone(&runtime.store);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply =
+                    match tokio::task::spawn_blocking(move || store.session_usage(&agent_id)).await
+                    {
+                        Ok(Ok(usage)) => WireMessage::SessionUsageResponse { request_id, usage },
+                        Ok(Err(e)) => rpc_err(request_id, "session_usage_failed", e),
+                        Err(e) => rpc_err(request_id, "session_usage_failed", e),
+                    };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
         WireMessage::GetUsageInsights { request_id, days } => {
             let store = Arc::clone(&runtime.store);
             let tx = out_tx.clone();
@@ -9475,6 +9495,7 @@ async fn handle_wire_rpc(
             platform,
             device_name,
             device_token,
+            live_activity_token,
             sandbox,
         } => {
             let tx = out_tx.clone();
@@ -9482,7 +9503,14 @@ async fn handle_wire_rpc(
             let push = Arc::clone(&runtime.push);
             tokio::spawn(async move {
                 let reply = match tokio::task::spawn_blocking(move || {
-                    push.register_device(device_id, platform, device_name, device_token, sandbox)
+                    push.register_device(
+                        device_id,
+                        platform,
+                        device_name,
+                        device_token,
+                        sandbox,
+                        live_activity_token,
+                    )
                 })
                 .await
                 {
@@ -9493,6 +9521,32 @@ async fn handle_wire_rpc(
                     },
                     Ok(Err(e)) => rpc_err(request_id, "register_push_device_failed", e),
                     Err(e) => rpc_err(request_id, "register_push_device_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::RegisterLiveActivityToken {
+            request_id,
+            device_id,
+            live_activity_token,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let push = Arc::clone(&runtime.push);
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    push.register_live_activity_token(&device_id, live_activity_token.as_deref())
+                })
+                .await
+                {
+                    Ok(Ok(snap)) => WireMessage::PushDevicesSnapshot {
+                        request_id,
+                        devices: snap.devices,
+                        preferences: snap.preferences,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "register_live_activity_failed", e),
+                    Err(e) => rpc_err(request_id, "register_live_activity_failed", e),
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });

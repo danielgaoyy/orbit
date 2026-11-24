@@ -14,9 +14,11 @@ crate-type = ["lib", "cdylib", "staticlib"]
 [dependencies]
 orbit-client-core.workspace = true
 orbit-protocol.workspace = true
+chrono.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uniffi.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 orbit-crypto.workspace = true

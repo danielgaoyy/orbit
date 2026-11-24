@@ -1333,6 +1333,7 @@ mod tests {
             },
             is_running,
             has_background_tasks: false,
+            has_armed_timers: false,
             has_running_subagents: false,
             is_awaiting_permission,
             parent_agent_id: None,

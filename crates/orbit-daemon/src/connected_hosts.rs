@@ -6,6 +6,7 @@
 //! `AgentUpdated` / `TimelineLive` events for cross-host Finish Subscriptions.
 
 use std::collections::HashMap;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ use orbit_protocol::{
     AgentSummary, ConnectedHostStatus, ConnectedHostSummary, HostInfo, PROTOCOL_VERSION,
     TimelineEvent, WireMessage,
 };
-use orbit_relay_transport::RelayConnector;
+use orbit_relay_transport::{RelayConnector, RelayWsStream};
 use orbit_store::{OrbitStore, StoredConnectedHost};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use tokio::task::AbortHandle;
@@ -111,11 +112,25 @@ impl ConnectedHostsManager {
         label: Option<String>,
         pairing_uri: &str,
     ) -> anyhow::Result<ConnectedHostSummary> {
+        self.add_from_pairing_uri_with_transport(label, pairing_uri, None, None)
+            .await
+    }
+
+    pub async fn add_from_pairing_uri_with_transport(
+        self: &Arc<Self>,
+        label: Option<String>,
+        pairing_uri: &str,
+        ssh_alias: Option<String>,
+        remote_daemon_port: Option<u16>,
+    ) -> anyhow::Result<ConnectedHostSummary> {
         let offer = PairingOffer::from_qr_uri(pairing_uri)
             .map_err(|e| anyhow::anyhow!("invalid pairing URI: {e}"))?;
         if offer.host_id == self.self_host_id {
             anyhow::bail!("cannot register this daemon as its own connected host");
         }
+        let clean_ssh_alias = ssh_alias
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         // Check if already registered for the same pubkey/host_id -> update endpoints idempotently
         let existing = self.store.list_connected_hosts()?.into_iter().find(|h| {
             h.daemon_pubkey_b64 == offer.daemon_pubkey_b64
@@ -130,6 +145,12 @@ impl ConnectedHostsManager {
             ex.direct_endpoints = offer.direct_endpoints;
             ex.relay_url = offer.relay_url;
             ex.pairing_secret = offer.pairing_secret;
+            if clean_ssh_alias.is_some() {
+                ex.ssh_alias = clean_ssh_alias;
+            }
+            if remote_daemon_port.is_some() {
+                ex.remote_daemon_port = remote_daemon_port;
+            }
             ex.enabled = true;
             ex.updated_at = now;
             ex
@@ -144,6 +165,8 @@ impl ConnectedHostsManager {
                 direct_endpoints: offer.direct_endpoints,
                 relay_url: offer.relay_url,
                 pairing_secret: offer.pairing_secret,
+                ssh_alias: clean_ssh_alias,
+                remote_daemon_port,
                 enabled: true,
                 created_at: now,
                 updated_at: now,
@@ -606,7 +629,8 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::ImChannelsSnapshot { request_id, .. }
         | WireMessage::ImChannelTestResponse { request_id, .. }
         | WireMessage::PushDevicesSnapshot { request_id, .. }
-        | WireMessage::PushTestResponse { request_id, .. } => Some(*request_id),
+        | WireMessage::PushTestResponse { request_id, .. }
+        | WireMessage::PeerBridgeOpened { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }
         | WireMessage::ArtifactDeleted { request_id, .. }
@@ -615,7 +639,148 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
     }
 }
 
-/// Connect to a remote peer Orbit Daemon via direct endpoints first, falling back to Noise NK Relay.
+pub(crate) struct SshForwardGuard {
+    _child: tokio::process::Child,
+}
+
+pub(crate) async fn open_ssh_forward_tunnel(
+    ssh_alias: &str,
+    remote_port: u16,
+) -> anyhow::Result<(u16, SshForwardGuard)> {
+    let alias = ssh_alias.trim();
+    if alias.is_empty() || alias.starts_with('-') || alias.chars().any(char::is_whitespace) {
+        anyhow::bail!("invalid SSH alias for peer bridge tunnel");
+    }
+    let port = if remote_port == 0 { 6868 } else { remote_port };
+    let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let local_port = probe.local_addr()?.port();
+    drop(probe);
+
+    let forward_arg = format!("127.0.0.1:{local_port}:127.0.0.1:{port}");
+    let mut child = tokio::process::Command::new("ssh")
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "ServerAliveInterval=20",
+            "-N",
+            "-L",
+            &forward_arg,
+            "--",
+            alias,
+        ])
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to launch ssh tunnel for `{alias}`: {e}"))?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("ssh forward tunnel for `{alias}` exited early ({status})");
+        }
+        if tokio::net::TcpStream::connect(("127.0.0.1", local_port))
+            .await
+            .is_ok()
+        {
+            return Ok((local_port, SshForwardGuard { _child: child }));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let _ = child.kill().await;
+            anyhow::bail!("timed out waiting for SSH local tunnel to `{alias}`");
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+}
+
+fn direct_ws_to_e2ee_url(ep: &str) -> String {
+    let trimmed = ep.trim().trim_end_matches('/');
+    if let Some(prefix) = trimmed.strip_suffix("/ws") {
+        format!("{prefix}/ws/e2ee")
+    } else if trimmed.ends_with("/ws/e2ee") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/ws/e2ee")
+    }
+}
+
+/// Dial an upstream peer's raw Noise_NK E2EE WebSocket stream (used by Peer-Bridged tunneling)
+/// via LAN direct endpoints (`/ws/e2ee`), intranet/configured Relay, or ephemeral SSH tunnel.
+pub(crate) async fn connect_peer_e2ee_ws(
+    row: &StoredConnectedHost,
+) -> anyhow::Result<(RelayWsStream, Option<SshForwardGuard>)> {
+    let mut last_err = anyhow::anyhow!("no reachable endpoints for peer E2EE bridge");
+    let mut ws_cfg = WebSocketConfig::default();
+    ws_cfg.max_frame_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
+    ws_cfg.max_message_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
+
+    // 1. Direct LAN / intranet `/ws/e2ee`
+    for ep in &row.direct_endpoints {
+        let e2ee_url = direct_ws_to_e2ee_url(ep);
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            connect_async_with_config(&e2ee_url, Some(ws_cfg), false),
+        )
+        .await
+        {
+            Ok(Ok((ws, _))) => return Ok((RelayWsStream::Direct(Box::new(ws)), None)),
+            Ok(Err(e)) => last_err = e.into(),
+            Err(_) => last_err = anyhow::anyhow!("timeout connecting to peer {e2ee_url}"),
+        }
+    }
+
+    // 2. Relay endpoint reachable by this bridge host
+    if let Some(ref relay_url) = row.relay_url {
+        match RelayConnector::connect(relay_url).await {
+            Ok(connector) => {
+                let path = format!("/v1/client/{}", row.daemon_pubkey_b64);
+                match connector.open_ws(&path).await {
+                    Ok(ws) => return Ok((ws, None)),
+                    Err(e) => last_err = e.into(),
+                }
+            }
+            Err(e) => last_err = e.into(),
+        }
+    }
+
+    // 3. SSH local forward fallback (e.g. jump/bastion host or LAN SSH reachable from bridge)
+    if let Some(alias) = row
+        .ssh_alias
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        match open_ssh_forward_tunnel(alias, row.remote_daemon_port.unwrap_or(6868)).await {
+            Ok((local_port, guard)) => {
+                let url = format!("ws://127.0.0.1:{local_port}/ws/e2ee");
+                match tokio::time::timeout(
+                    Duration::from_secs(3),
+                    connect_async_with_config(&url, Some(ws_cfg), false),
+                )
+                .await
+                {
+                    Ok(Ok((ws, _))) => {
+                        return Ok((RelayWsStream::Direct(Box::new(ws)), Some(guard)));
+                    }
+                    Ok(Err(e)) => last_err = e.into(),
+                    Err(_) => last_err = anyhow::anyhow!("timeout dialing SSH-tunneled /ws/e2ee"),
+                }
+            }
+            Err(e) => last_err = e,
+        }
+    }
+
+    Err(last_err)
+}
+
+/// Connect to a remote peer Orbit Daemon via direct endpoints first, falling back to Noise NK Relay
+/// and then SSH local forwarding if configured.
 async fn connect_to_peer_daemon(
     row: &StoredConnectedHost,
     self_host_id: &str,
@@ -628,7 +793,7 @@ async fn connect_to_peer_daemon(
 
     // 1. Direct WebSocket endpoints (only explicitly registered endpoints with stored Bearer secret)
     for ep in &row.direct_endpoints {
-        match connect_direct_peer(ep, &row.pairing_secret, self_host_id).await {
+        match connect_direct_peer(ep, &row.pairing_secret, self_host_id, None).await {
             Ok((info, tx, rx)) => {
                 if let Some(ref pinned) = row.host_id
                     && pinned != &info.host_id
@@ -660,6 +825,27 @@ async fn connect_to_peer_daemon(
         }
     }
 
+    // 3. SSH local forward fallback when no direct/relay route succeeded
+    if let Some(alias) = row
+        .ssh_alias
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        match open_ssh_forward_tunnel(alias, row.remote_daemon_port.unwrap_or(6868)).await {
+            Ok((local_port, guard)) => {
+                let url = format!("ws://127.0.0.1:{local_port}/ws");
+                match connect_direct_peer(&url, &row.pairing_secret, self_host_id, Some(guard))
+                    .await
+                {
+                    Ok((info, tx, rx)) => return Ok((info, tx, rx)),
+                    Err(e) => last_err = e,
+                }
+            }
+            Err(e) => last_err = e,
+        }
+    }
+
     Err(last_err)
 }
 
@@ -667,6 +853,7 @@ async fn connect_direct_peer(
     ws_url: &str,
     pairing_secret: &str,
     self_host_id: &str,
+    ssh_guard: Option<SshForwardGuard>,
 ) -> anyhow::Result<(
     HostInfo,
     mpsc::Sender<WireMessage>,
@@ -723,6 +910,7 @@ async fn connect_direct_peer(
     let (in_tx, in_rx) = mpsc::channel::<WireMessage>(512);
 
     tokio::spawn(async move {
+        let _keep_ssh = ssh_guard;
         while let Some(msg) = out_rx.recv().await {
             if let Ok(z) = msg.encode_zstd(3) {
                 let mut frame = Vec::with_capacity(1 + z.len());

@@ -1562,7 +1562,8 @@ public final class OrbitIosStore: ObservableObject {
             workspaceCount: 1,
             agentCount: 1,
             pendingApprovalCount: 0,
-            supportsServerQueue: true
+            supportsServerQueue: true,
+            isLocal: false
         )
         let demoCard = FfiAgentCard(
             agentId: demoAgentId,
@@ -1578,6 +1579,7 @@ public final class OrbitIosStore: ObservableObject {
             statusLabel: "Working",
             isRunning: true,
             hasBackgroundTasks: false,
+            hasArmedTimers: false,
             isAwaitingPermission: false,
             parentAgentId: nil,
             parentHostId: nil,
@@ -4957,7 +4959,7 @@ public final class OrbitIosStore: ObservableObject {
     // MARK: - Fleet Daemon Version & One-Click Over-the-Wire Update
 
     public var appShortVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.10.1"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.10.2"
     }
 
     public func isHostProtocolBehind(_ host: FfiHostCard) -> Bool {

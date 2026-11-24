@@ -29,7 +29,7 @@ This document describes the unified cross-platform architecture of Orbit across 
 
 ```mermaid
 flowchart TD
-  Hosts["Remote / Local Orbit Daemons"] -->|"Noise_NK_25519_ChaChaPoly_SHA256 + Direct / Relay"| Core["orbit-client-core (OrbitClientCore)"]
+  Hosts["Remote / Local Orbit Daemons"] -->|"Noise_NK_25519_ChaChaPoly_SHA256 + Direct / Relay / Peer-Bridge"| Core["orbit-client-core (OrbitClientCore)"]
   Core <-->|"Replica, Host Profiles, Projects, client_thread_prefs"| Store["orbit-store (SQLite)"]
   Core -->|"Coalesced CoreNotification (Fleet / Host / Stage / Git / Files / Terminal)"| Tauri["Tauri IPC + Channel (Desktop)"]
   Core -->|"MobileCoreListener (iOS / Android)"| UniFFI["orbit-ffi-uniffi (Swift / Kotlin)"]
@@ -75,6 +75,8 @@ All Contract v2 request/response DTOs are canonically defined in `crates/orbit-c
 | Side questions (`/btw`) | `build_side_question_context`, `ask_side_question` | `build_side_question_context`, `ask_side_question` | `build_side_question_context`, `ask_side_question` | `buildSideQuestionContext`, `askSideQuestion` |
 | Session creation & prompting | `CreateSessionRequest`, `SendPromptRequest` | `create_agent`, `send_prompt` | `create_session`, `send_prompt_request` | `createSessionJson`, `sendPromptJson` |
 | Lifecycle & connectivity | `on_app_foreground`, `on_app_background`, `on_network_changed` | `on_app_foreground`, `on_app_background`, `on_network_changed` | `on_app_foreground`, `on_app_background`, `on_network_changed` | `onAppForeground`, `onAppBackground`, `onNetworkChanged` |
+| Host & Agent identity flags | `HostCardView.is_local`, `AgentCardView.has_armed_timers` | Same JSON fields + `isAgentTimerWaiting` | `FfiHostCard.isLocal`, `FfiAgentCard.hasArmedTimers` | Same DTO fields via N-API |
+| Global Personal Agent routing | `discover_fleet_router_hosts`, `primary_router_selection` (APP-level) | `App -> Personal Agent` (host-independent) | `OrbitIosStore` | ArkTS settings store |
 
 ---
 

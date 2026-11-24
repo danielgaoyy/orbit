@@ -29,7 +29,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio_tungstenite::tungstenite::{Error as WsError, Message, protocol::WebSocketConfig};
+use tokio_tungstenite::tungstenite::{
+    Error as WsError, Message, client::IntoClientRequest, protocol::WebSocketConfig,
+};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, client_async_with_config, connect_async_with_config,
 };
@@ -94,7 +96,7 @@ impl From<WsError> for RelayTransportError {
     }
 }
 
-/// Parsed `ssh+relay://<user>@<ssh_host>:<ssh_port>/<relay_port>?key=<seed_b64>[&fp=<fps>]` specification.
+/// Parsed `ssh+relay://<user>@<ssh_host>:<ssh_port>/<relay_port>?key=<seed_b64>[&fp=<fps>][&ft=<token>]` specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshRelaySpec {
     pub user: String,
@@ -103,6 +105,8 @@ pub struct SshRelaySpec {
     pub relay_port: u16,
     pub key_seed_b64: String,
     pub host_key_fps_b64: Vec<String>,
+    /// Optional shared fleet admission token (`&ft=...`). Never logged or displayed verbatim.
+    pub fleet_token: Option<String>,
 }
 
 impl SshRelaySpec {
@@ -152,6 +156,7 @@ impl SshRelaySpec {
 
         let mut key_seed_b64: Option<String> = None;
         let mut host_key_fps_b64: Vec<String> = Vec::new();
+        let mut fleet_token: Option<String> = None;
 
         if let Some(query) = query_opt {
             for pair in query.split('&').filter(|s| !s.is_empty()) {
@@ -175,6 +180,15 @@ impl SshRelaySpec {
                             }
                         }
                     }
+                    "ft" | "token" => {
+                        let tok = v.trim();
+                        if tok.is_empty() || tok.chars().any(char::is_whitespace) {
+                            return Err(RelayTransportError::InvalidUrl(
+                                "invalid `ft` fleet token parameter in ssh+relay:// URL".into(),
+                            ));
+                        }
+                        fleet_token = Some(tok.to_string());
+                    }
                     _ => {}
                 }
             }
@@ -191,6 +205,7 @@ impl SshRelaySpec {
             relay_port,
             key_seed_b64,
             host_key_fps_b64,
+            fleet_token,
         })
     }
 
@@ -205,10 +220,19 @@ impl SshRelaySpec {
             uri.push_str("&fp=");
             uri.push_str(&self.host_key_fps_b64.join(","));
         }
+        if let Some(ft) = self
+            .fleet_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            uri.push_str("&ft=");
+            uri.push_str(ft);
+        }
         uri
     }
 
-    /// Redacted human-readable representation that never exposes `?key=`.
+    /// Redacted human-readable representation that never exposes `?key=` or `&ft=`.
     pub fn redacted_display(&self) -> String {
         let host_fmt = format_host_for_uri(&self.ssh_host);
         format!(
@@ -237,6 +261,31 @@ pub enum RelayEndpoint {
     SshTunnel(SshRelaySpec),
 }
 
+/// Split a normalized or raw direct `ws://`/`wss://` Relay URL into `(base_url, fleet_token)`.
+pub fn split_direct_relay_url(raw: &str) -> Result<(String, Option<String>), RelayTransportError> {
+    let normalized = normalize_relay_url(raw)?;
+    if is_ssh_relay_url(&normalized) {
+        return Err(RelayTransportError::InvalidUrl(
+            "expected direct ws(s):// relay URL, got ssh+relay://".into(),
+        ));
+    }
+    Ok(match normalized.split_once('?') {
+        Some((base, query)) => {
+            let mut token = None;
+            for pair in query.split('&').filter(|s| !s.is_empty()) {
+                if let Some((k, v)) = pair.split_once('=')
+                    && matches!(k, "ft" | "token")
+                    && !v.trim().is_empty()
+                {
+                    token = Some(v.trim().to_string());
+                }
+            }
+            (base.to_string(), token)
+        }
+        None => (normalized, None),
+    })
+}
+
 /// Check whether a raw Relay URL uses the `ssh+relay://` transport scheme.
 pub fn is_ssh_relay_url(raw: &str) -> bool {
     strip_scheme_ci(raw.trim(), "ssh+relay://").is_some()
@@ -253,6 +302,7 @@ pub fn parse_relay_endpoint(raw: &str) -> Result<RelayEndpoint, RelayTransportEr
 }
 
 /// Normalize a Relay URL (`ssh+relay://...`, `ws://...`, `wss://...`, `http(s)://...`, or `host:port`).
+/// Preserves optional `?ft=<fleet_token>` admission tokens on direct WebSocket URLs.
 pub fn normalize_relay_url(raw: &str) -> Result<String, RelayTransportError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -265,18 +315,39 @@ pub fn normalize_relay_url(raw: &str) -> Result<String, RelayTransportError> {
         return Ok(SshRelaySpec::parse(trimmed)?.to_uri());
     }
 
-    let trimmed = trimmed.trim_end_matches('/');
-    let had_scheme = trimmed.contains("://");
-    let with_scheme = if let Some(rest) = strip_scheme_ci(trimmed, "http://") {
+    let (before_query_raw, query_opt) = match trimmed.split_once('?') {
+        Some((left, q)) => (left, Some(q)),
+        None => (trimmed, None),
+    };
+    let mut fleet_token: Option<String> = None;
+    if let Some(query) = query_opt {
+        for pair in query.split('&').filter(|s| !s.is_empty()) {
+            if let Some((k, v)) = pair.split_once('=')
+                && matches!(k, "ft" | "token")
+            {
+                let tok = v.trim();
+                if tok.is_empty() || tok.chars().any(char::is_whitespace) {
+                    return Err(RelayTransportError::InvalidUrl(
+                        "invalid fleet token query parameter in relay URL".into(),
+                    ));
+                }
+                fleet_token = Some(tok.to_string());
+            }
+        }
+    }
+
+    let before_query = before_query_raw.trim_end_matches('/');
+    let had_scheme = before_query.contains("://");
+    let with_scheme = if let Some(rest) = strip_scheme_ci(before_query, "http://") {
         format!("ws://{rest}")
-    } else if let Some(rest) = strip_scheme_ci(trimmed, "https://") {
+    } else if let Some(rest) = strip_scheme_ci(before_query, "https://") {
         format!("wss://{rest}")
-    } else if let Some(rest) = strip_scheme_ci(trimmed, "ws://") {
+    } else if let Some(rest) = strip_scheme_ci(before_query, "ws://") {
         format!("ws://{rest}")
-    } else if let Some(rest) = strip_scheme_ci(trimmed, "wss://") {
+    } else if let Some(rest) = strip_scheme_ci(before_query, "wss://") {
         format!("wss://{rest}")
     } else {
-        format!("ws://{trimmed}")
+        format!("ws://{before_query}")
     };
 
     let (scheme, after_scheme) = with_scheme
@@ -303,16 +374,30 @@ pub fn normalize_relay_url(raw: &str) -> Result<String, RelayTransportError> {
         authority.to_string()
     };
 
-    Ok(format!("{scheme}://{final_authority}"))
+    let mut out = format!("{scheme}://{final_authority}");
+    if let Some(ft) = fleet_token {
+        out.push_str("?ft=");
+        out.push_str(&ft);
+    }
+    Ok(out)
 }
 
-/// Return a log/UI-safe Relay URL string that masks any `ssh+relay://` tunnel secret.
+/// Return a log/UI-safe Relay URL string that masks any `ssh+relay://` tunnel secret or `?ft=` token.
 pub fn redact_relay_url(raw: &str) -> String {
     let trimmed = raw.trim();
     if is_ssh_relay_url(trimmed) {
         match SshRelaySpec::parse(trimmed) {
             Ok(spec) => spec.redacted_display(),
             Err(_) => "ssh+relay://<redacted>".to_string(),
+        }
+    } else if let Some((base, query)) = trimmed.split_once('?') {
+        if query
+            .split('&')
+            .any(|p| p.starts_with("ft=") || p.starts_with("token="))
+        {
+            format!("{base}?ft=<redacted>")
+        } else {
+            trimmed.to_string()
         }
     } else {
         trimmed.to_string()
@@ -915,9 +1000,11 @@ impl Sink<Message> for RelayWsStream {
 pub enum RelayConnector {
     Direct {
         base_url: String,
+        fleet_token: Option<String>,
     },
     Ssh {
         relay_port: u16,
+        fleet_token: Option<String>,
         session: Arc<SshRelaySession>,
     },
 }
@@ -926,11 +1013,18 @@ impl RelayConnector {
     /// Establish a reusable Relay connector for `relay_base` (`ws://`, `wss://`, or `ssh+relay://`).
     pub async fn connect(relay_base: &str) -> Result<Self, RelayTransportError> {
         match parse_relay_endpoint(relay_base)? {
-            RelayEndpoint::DirectWs(base_url) => Ok(Self::Direct { base_url }),
+            RelayEndpoint::DirectWs(raw_base) => {
+                let (base_url, fleet_token) = split_direct_relay_url(&raw_base)?;
+                Ok(Self::Direct {
+                    base_url,
+                    fleet_token,
+                })
+            }
             RelayEndpoint::SshTunnel(spec) => {
                 let session = SshRelaySession::connect(&spec).await?;
                 Ok(Self::Ssh {
                     relay_port: spec.relay_port,
+                    fleet_token: spec.fleet_token,
                     session,
                 })
             }
@@ -960,18 +1054,36 @@ impl RelayConnector {
         let ws_cfg = relay_ws_config(max_frame_bytes);
 
         match self {
-            Self::Direct { base_url } => {
+            Self::Direct {
+                base_url,
+                fleet_token,
+            } => {
                 let url = format!("{}{}", base_url.trim_end_matches('/'), suffix);
-                let (ws, _) = connect_async_with_config(&url, Some(ws_cfg), false).await?;
+                let mut req = url.as_str().into_client_request()?;
+                if let Some(tok) = fleet_token.as_deref() {
+                    let hdr = format!("Bearer {tok}").parse().map_err(|_| {
+                        RelayTransportError::InvalidUrl("invalid fleet token header".into())
+                    })?;
+                    req.headers_mut().insert("Authorization", hdr);
+                }
+                let (ws, _) = connect_async_with_config(req, Some(ws_cfg), false).await?;
                 Ok(RelayWsStream::Direct(Box::new(ws)))
             }
             Self::Ssh {
                 relay_port,
+                fleet_token,
                 session,
             } => {
                 let guard = session.open_channel().await?;
                 let ws_url = format!("ws://127.0.0.1:{relay_port}{suffix}");
-                let (ws, _) = client_async_with_config(&ws_url, guard, Some(ws_cfg)).await?;
+                let mut req = ws_url.as_str().into_client_request()?;
+                if let Some(tok) = fleet_token.as_deref() {
+                    let hdr = format!("Bearer {tok}").parse().map_err(|_| {
+                        RelayTransportError::InvalidUrl("invalid fleet token header".into())
+                    })?;
+                    req.headers_mut().insert("Authorization", hdr);
+                }
+                let (ws, _) = client_async_with_config(req, guard, Some(ws_cfg)).await?;
                 Ok(RelayWsStream::Ssh(Box::new(ws)))
             }
         }
@@ -1018,8 +1130,13 @@ pub async fn http_get_over_ssh_relay(
     };
     let session = SshRelaySession::connect(spec).await?;
     let mut channel = session.open_channel().await?;
+    let auth_header = spec
+        .fleet_token
+        .as_deref()
+        .map(|tok| format!("Authorization: Bearer {tok}\r\n"))
+        .unwrap_or_default();
     let req = format!(
-        "GET {suffix} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        "GET {suffix} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{auth_header}Connection: close\r\n\r\n",
         spec.relay_port
     );
     channel.write_all(req.as_bytes()).await.map_err(|e| {
@@ -1912,5 +2029,30 @@ mod tests {
         assert!(rev_err.to_string().contains("@revoked"));
 
         let _ = std::fs::remove_file(&kh_path);
+    }
+
+    #[test]
+    fn fleet_token_preserved_across_normalization_and_redacted_in_display() {
+        let key = generate_ssh_tunnel_key().expect("key");
+        let secret = "fleet_tok_secret_value_123456";
+        let ssh_uri = format!(
+            "ssh+relay://ec2-user@10.0.0.1:22/7878?key={}&ft={secret}",
+            key.seed_b64
+        );
+        let parsed = SshRelaySpec::parse(&ssh_uri).expect("parse ssh");
+        assert_eq!(parsed.fleet_token.as_deref(), Some(secret));
+        assert_eq!(parsed.to_uri(), ssh_uri);
+        assert!(!parsed.redacted_display().contains(secret));
+        assert!(!redact_relay_url(&ssh_uri).contains(secret));
+
+        let direct = format!("wss://relay.example.com/?ft={secret}");
+        let normalized = normalize_relay_url(&direct).expect("normalize direct");
+        assert_eq!(normalized, format!("wss://relay.example.com?ft={secret}"));
+        let (clean, tok) = split_direct_relay_url(&normalized).expect("split direct");
+        assert_eq!(clean, "wss://relay.example.com");
+        assert_eq!(tok.as_deref(), Some(secret));
+        let redacted = redact_relay_url(&normalized);
+        assert!(!redacted.contains(secret));
+        assert!(redacted.contains("ft=<redacted>"));
     }
 }

@@ -68,6 +68,7 @@ export interface HostCardDto {
   agent_count: number;
   pending_approval_count: number;
   supports_server_queue?: boolean;
+  is_local?: boolean;
 }
 
 export interface FleetOverviewDto {
@@ -112,6 +113,7 @@ export interface AgentCardDto {
   status_label: string;
   is_running: boolean;
   has_background_tasks?: boolean;
+  has_armed_timers?: boolean;
   is_awaiting_permission: boolean;
   parent_agent_id: string | null;
   archived_at_rfc3339?: string | null;

@@ -1540,6 +1540,7 @@ async fn pitfall_04_off_lan_relay_propagation_and_fleet_configure_host_relay() {
         let _ = run_relay(RelayConfig {
             listen_addr: relay_addr,
             allowed_pubkeys: Arc::new(allowed),
+            fleet_token: None,
         })
         .await;
     });

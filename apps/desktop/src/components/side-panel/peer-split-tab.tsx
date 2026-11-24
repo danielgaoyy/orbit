@@ -8,7 +8,7 @@ import {
   Square,
 } from "lucide-react";
 import { useImeCompositionGuard } from "@/lib/ime";
-import { orbitIpc, semanticAgentTabLabel } from "@/lib/orbit-ipc";
+import { isAgentForegroundRunning, orbitIpc, semanticAgentTabLabel } from "@/lib/orbit-ipc";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
 import { ProviderIcon } from "@/components/ui/provider-icons";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -31,6 +31,7 @@ export const PeerSplitTab = memo(function PeerSplitTab({ tab }: { tab: SidePanel
   const workspace = agent
     ? hostDetail?.workspaces.find((w) => w.workspace_id === agent.workspace_id) ?? null
     : null;
+  const peerForegroundRunning = isAgentForegroundRunning(agent);
 
   const [reply, setReply] = useState("");
   const [sending, setSending] = useState(false);
@@ -57,7 +58,7 @@ export const PeerSplitTab = memo(function PeerSplitTab({ tab }: { tab: SidePanel
     try {
       await orbitIpc.sendPrompt(hostId, peerAgentId, text, {
         displayPrompt: text,
-        activeTurnBehavior: agent?.is_running ? "steer" : "queue",
+        activeTurnBehavior: peerForegroundRunning ? "steer" : "queue",
       });
     } finally {
       setSending(false);
@@ -71,7 +72,7 @@ export const PeerSplitTab = memo(function PeerSplitTab({ tab }: { tab: SidePanel
       {/* Split Header */}
       <div className="border-border/70 flex items-center justify-between gap-2 border-b px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
-          {agent?.is_running ? (
+          {peerForegroundRunning ? (
             <Loader2 className="h-[13.5px] w-[13.5px] shrink-0 animate-spin text-sky-500" />
           ) : agent ? (
             <ProviderIcon
@@ -129,7 +130,7 @@ export const PeerSplitTab = memo(function PeerSplitTab({ tab }: { tab: SidePanel
       <ScrollArea className="min-h-0 flex-1" viewportClassName="p-3.5 space-y-4 select-text">
         {turns.length === 0 ? (
           <div className="text-muted-foreground py-8 text-center text-[12.5px]">
-            {agent?.is_running ? "Peer is working…" : "No turns yet."}
+            {peerForegroundRunning ? "Peer is working…" : "No turns yet."}
           </div>
         ) : (
           turns.map((turn) => {
@@ -204,7 +205,7 @@ export const PeerSplitTab = memo(function PeerSplitTab({ tab }: { tab: SidePanel
             placeholder={`Message ${handleLabel}…`}
             className="text-foreground placeholder:text-muted-foreground/60 min-w-0 flex-1 bg-transparent text-[12.5px] outline-none"
           />
-          {agent?.is_running && !reply.trim() ? (
+          {peerForegroundRunning && !reply.trim() ? (
             <button
               type="button"
               title="Stop peer"

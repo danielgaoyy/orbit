@@ -168,7 +168,10 @@ impl HostSessionHandle {
             .map_err(|_| ClientCoreError::ChannelClosed)
     }
 
-    pub(crate) async fn send_wire_confirmed(&self, msg: WireMessage) -> Result<(), OutboxSendError> {
+    pub(crate) async fn send_wire_confirmed(
+        &self,
+        msg: WireMessage,
+    ) -> Result<(), OutboxSendError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.out_tx
             .send(OutboundPayload::ConfirmedWire(msg, tx))

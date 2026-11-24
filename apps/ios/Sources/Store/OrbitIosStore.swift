@@ -1684,7 +1684,8 @@ public final class OrbitIosStore: ObservableObject {
                 .assistantMessage(key: "demo-am-1", item: replyItem1)
             ],
             turnDiffs: [], hasError: false, hasUnrecoveredError: false, hasActiveItem: false,
-            startedAtMs: startMs, completedAtMs: nowMs
+            startedAtMs: startMs, completedAtMs: nowMs,
+            latestActivityMs: nowMs, latestVisibleProgressMs: nowMs
         )
         agentStage = FfiAgentStage(
             revision: 1, hostId: demoHostId, agent: demoCard, turns: [turn1],

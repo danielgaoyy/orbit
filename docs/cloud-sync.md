@@ -41,3 +41,9 @@ orbit sync --mesh
 
 ### 2. Sync on Desktop / iOS / Android
 Open **Settings → Cloud Sync**, sign in with the same GitHub account, and enter your **Sync Passphrase** (or generated **Recovery Key**) once. All paired hosts, pinned projects, manual order, and preferences appear automatically — no pairing codes required.
+
+## Mobile replica storage
+
+Keyed opens authenticate the master key and atomically migrate plaintext `client_hosts.pairing_secret`, the GitHub access token and cached vault key in `client_kv.cloud_sync_config_v1`, and pending outbox payloads. The AES-256-GCM envelope uses a fresh nonce and authenticates the field and owner. Its stored representation is `enc:v1:<base64(nonce || ciphertext)>`. The existing Orbit vault codec compresses the plaintext before encryption. A database enrolled with a key requires that same key on subsequent opens. Unkeyed desktop databases keep their existing format.
+
+Local host, project and thread preference writes update `cloud_sync_dirty` in the same SQLite transaction. A successful sync clears the revision it captured. Concurrent edits keep a newer dirty revision. Reconnection and foreground resume retry pending syncs when auto-sync is enabled and the account is unlocked. Thread preferences travel in the encrypted vault as per-host, per-agent preference entries and use their edit timestamps for merging.

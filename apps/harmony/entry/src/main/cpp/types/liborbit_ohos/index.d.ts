@@ -1,3 +1,4 @@
+// Generated from orbit-ffi-ohos. Run scripts/check-ohos-dts-sync.sh --write.
 export class OrbitHarmonyCore {
   constructor(dbPath: string, autoDiscoverLocal?: boolean | null);
   static openWithOptions(dbPath: string, autoDiscoverLocal: boolean): OrbitHarmonyCore;
@@ -5,6 +6,9 @@ export class OrbitHarmonyCore {
   discoverLocalDaemonUri(): string | null;
   fleetOverviewJson(): string;
   bridgeInfoJson(): string;
+  searchMessagesJson(query: string, limit?: number | null): string;
+  exportAgentTranscriptJson(hostId: string, agentId: string, optionsJson: string): string;
+  listAgentCodeBlocksJson(hostId: string, agentId: string): string;
   fleetSidebarByRequestJson(reqJson: string): string;
   agentStageDeltaByRequestJson(reqJson: string): string;
   createSessionJson(reqJson: string): string;
@@ -17,14 +21,7 @@ export class OrbitHarmonyCore {
   hostDetailJson(hostId: string): string;
   agentStageJson(hostId: string, agentId: string): string;
   agentStageDeltaJson(hostId: string, agentId: string, sinceRevision: number): string;
-  fleetSidebarJson(
-    sort?: string | null,
-    filter?: string | null,
-    query?: string | null,
-    activeHostId?: string | null,
-    activeAgentId?: string | null,
-    activeCwd?: string | null
-  ): string;
+  fleetSidebarJson(sort?: string | null, filter?: string | null, query?: string | null, activeHostId?: string | null, activeAgentId?: string | null, activeCwd?: string | null): string;
   markAgentSeen(hostId: string, agentId: string, seq: number): void;
   markAgentUnread(hostId: string, agentId: string): void;
   setAgentPinned(hostId: string, agentId: string, pinned: boolean): void;
@@ -35,11 +32,7 @@ export class OrbitHarmonyCore {
   formatCatalogModelLabel(catalogJson: string, rawModelId?: string | null): string;
   formatEffortLabel(effort: string): string;
   defaultEffortDescription(effort: string): string;
-  resolveSupportedEffortForModel(
-    specJson?: string | null,
-    desired?: string | null,
-    catalogDefault?: string | null
-  ): string | null;
+  resolveSupportedEffortForModel(specJson?: string | null, desired?: string | null, catalogDefault?: string | null): string | null;
   agentTimelineJson(hostId: string, agentId: string): string;
   agentTimelineDeltaJson(hostId: string, agentId: string, sinceSeq: number): string;
   describeToolItemJson(itemJson: string, cwd?: string | null): string | null;
@@ -49,22 +42,9 @@ export class OrbitHarmonyCore {
   pairHostJson(pairingUri: string): string;
   removeHost(hostId: string): void;
   updateHostRelay(hostId: string, relayUrl?: string | null): void;
-  updateHostConfigJson(
-    hostId: string,
-    customName?: string | null,
-    routeMode?: string | null,
-    sshAlias?: string | null,
-    remoteDaemonPort?: number | null,
-    customDirectEndpoint?: string | null,
-    relayUrl?: string | null,
-    reconnect?: boolean | null
-  ): string;
-  upsertProjectJson(
-    projectId: string | null | undefined,
-    hostId: string,
-    name: string,
-    directoriesJson: string
-  ): string;
+  applyRelayToFleet(rawRelayUrl: string): number;
+  updateHostConfigJson(hostId: string, customName?: string | null, routeMode?: string | null, sshAlias?: string | null, remoteDaemonPort?: number | null, customDirectEndpoint?: string | null, relayUrl?: string | null, reconnect?: boolean | null): string;
+  upsertProjectJson(projectId: string | null | undefined, hostId: string, name: string, directoriesJson: string): string;
   removeProject(projectId: string): void;
   listDirectory(hostId: string, path?: string | null): void;
   connectAllHosts(): void;
@@ -72,90 +52,32 @@ export class OrbitHarmonyCore {
   refreshHost(hostId: string): void;
   refreshQuotas(hostId: string): void;
   refreshProviderModels(hostId: string, forceRefresh: boolean): void;
-  createAgent(
-    hostId: string,
-    cwd: string,
-    provider: string,
-    mode: string,
-    initialPrompt: string,
-    worktreeBranch?: string | null
-  ): void;
-  createAgentFull(
-    hostId: string,
-    cwd: string,
-    extraDirsJson: string | null | undefined,
-    provider: string,
-    acpAgentId: string | null | undefined,
-    model: string | null | undefined,
-    effort: string | null | undefined,
-    mode: string,
-    initialPrompt: string,
-    initialDisplayPrompt?: string | null,
-    initialBadgesJson?: string | null,
-    worktreeBranch?: string | null
-  ): string;
+  createAgent(hostId: string, cwd: string, provider: string, mode: string, initialPrompt: string, worktreeBranch?: string | null): void;
+  createAgentFull(hostId: string, cwd: string, extraDirsJson: string | null | undefined, provider: string, acpAgentId: string | null | undefined, model: string | null | undefined, effort: string | null | undefined, mode: string, initialPrompt: string, initialDisplayPrompt?: string | null, initialBadgesJson?: string | null, worktreeBranch?: string | null): string;
   openAgentTimeline(hostId: string, agentId: string): void;
+  loadOlderAgentTimeline(hostId: string, agentId: string, limitEvents: number): boolean;
   sendPrompt(hostId: string, agentId: string, prompt: string): void;
-  sendPromptWithMeta(
-    hostId: string,
-    agentId: string,
-    prompt: string,
-    displayPrompt?: string | null,
-    badgesJson?: string | null
-  ): void;
-  enqueuePrompt(
-    hostId: string,
-    agentId: string,
-    prompt: string,
-    displayPrompt?: string | null,
-    badgesJson?: string | null,
-    queueId?: string | null
-  ): string;
+  sendPromptWithMeta(hostId: string, agentId: string, prompt: string, displayPrompt?: string | null, badgesJson?: string | null): void;
+  enqueuePrompt(hostId: string, agentId: string, prompt: string, displayPrompt?: string | null, badgesJson?: string | null, queueId?: string | null): string;
   removeQueuedPrompt(hostId: string, agentId: string, queueId: string): void;
   flushQueuedPromptNow(hostId: string, agentId: string, queueId: string): void;
   reorderQueuedPrompts(hostId: string, agentId: string, queueIdsJson: string): void;
   interruptAgent(hostId: string, agentId: string): void;
+  interruptAgentAndContinue(hostId: string, agentId: string): void;
   setSessionMode(hostId: string, agentId: string, mode: string): void;
-  setAgentConfig(
-    hostId: string,
-    agentId: string,
-    model?: string | null,
-    effort?: string | null
-  ): void;
+  setAgentConfig(hostId: string, agentId: string, model?: string | null, effort?: string | null): void;
   setAgentFastMode(hostId: string, agentId: string, fastMode: boolean): void;
-  switchAgentProvider(
-    hostId: string,
-    agentId: string,
-    provider: string,
-    model?: string | null,
-    effort?: string | null,
-    acpAgentId?: string | null
-  ): void;
+  switchAgentProvider(hostId: string, agentId: string, provider: string, model?: string | null, effort?: string | null, acpAgentId?: string | null): void;
   archiveAgent(hostId: string, agentId: string): void;
   unarchiveAgent(hostId: string, agentId: string): void;
   deleteAgent(hostId: string, agentId: string): void;
-  resolvePermission(
-    hostId: string,
-    agentId: string,
-    permissionRequestId: string,
-    decision: string
-  ): void;
-  answerQuestion(
-    hostId: string,
-    agentId: string,
-    questionRequestId: string,
-    answersJson: string
-  ): void;
+  resolvePermission(hostId: string, agentId: string, permissionRequestId: string, decision: string): void;
+  answerQuestion(hostId: string, agentId: string, questionRequestId: string, answersJson: string): void;
   fetchGitStatus(hostId: string, cwd: string): void;
   fetchGitDiff(hostId: string, cwd: string, path: string | null | undefined, staged: boolean): void;
   fetchWorkspaceFiles(hostId: string, cwd: string): void;
   workspaceFilesJson(hostId: string, cwd: string): string;
-  stageAttachmentJson(
-    hostId: string,
-    filename: string,
-    mimeType: string | null | undefined,
-    bytes: Uint8Array
-  ): Promise<string>;
+  stageAttachmentJson(hostId: string, filename: string, mimeType: string | null | undefined, bytes: Uint8Array): Promise<string>;
   startTerminal(hostId: string, cwd: string, cols: number, rows: number): void;
   attachTerminal(hostId: string, terminalId: string, slot: number): void;
   killTerminal(hostId: string, terminalId: string): void;
@@ -163,33 +85,22 @@ export class OrbitHarmonyCore {
   sendTerminalKeysSlot(hostId: string, slot: number, keys: string): void;
   resizeTerminal(hostId: string, cols: number, rows: number): void;
   resizeTerminalSlot(hostId: string, slot: number, cols: number, rows: number): void;
-  rewindAgentJson(
-    hostId: string,
-    agentId: string,
-    toBeforeSeq: number,
-    restoreFiles: boolean
-  ): Promise<string>;
-  readWorkspaceFileJson(hostId: string, cwd: string, path: string): Promise<string>;
-  buildSideQuestionContext(hostId: string, agentId: string, maxChars?: number | null): string;
-  askSideQuestion(
-    reqJson: string,
-    callback: (err: Error | null, payloadJson: string) => void
-  ): string;
-  detectDiagramKind(language: string, source: string): string | null;
-  renderDiagramJson(reqJson: string): Promise<string>;
-  onAppForeground(): void;
-  onAppBackground(): void;
-  onNetworkChanged(): void;
-  searchMessagesJson(query: string, limit?: number | null): string;
-  exportAgentTranscriptJson(hostId: string, agentId: string, optionsJson: string): string;
-  listAgentCodeBlocksJson(hostId: string, agentId: string): string;
+  rewindAgentJson(hostId: string, agentId: string, toBeforeSeq: number, restoreFiles: boolean): Promise<string>;
   forkAgentJson(reqJson: string): Promise<string>;
   previewWorktreeHandoffJson(reqJson: string): Promise<string>;
   executeWorktreeHandoffJson(reqJson: string): Promise<string>;
+  readWorkspaceFileJson(hostId: string, cwd: string, path: string): Promise<string>;
   writeWorkspaceFileJson(reqJson: string): Promise<string>;
   createWorkspaceEntryJson(reqJson: string): Promise<string>;
   renameWorkspaceEntryJson(reqJson: string): Promise<string>;
   deleteWorkspaceEntryJson(reqJson: string): Promise<string>;
+  buildSideQuestionContext(hostId: string, agentId: string, maxChars?: number | null): string;
+  askSideQuestion(reqJson: string, callback: (err: Error | null, payloadJson: string) => void): string;
+  onAppForeground(): void;
+  onAppBackground(): void;
+  onNetworkChanged(): void;
+  detectDiagramKind(language: string, source: string): string | null;
+  renderDiagramJson(reqJson: string): Promise<string>;
   cloudSyncStatusJson(): string;
   cloudSyncGeneratePassphrase(): string;
   cloudSyncSetGithubClientIdJson(clientId?: string | null): string;
@@ -208,13 +119,7 @@ export class OrbitHarmonyCore {
   deleteArtifact(hostId: string, artifactId: string): Promise<string>;
   fetchWorkspaceBoard(hostId: string, workspaceId: string): void;
   workspaceBoardJson(hostId: string, workspaceId: string): string;
-  updateWorkspaceBoard(
-    hostId: string,
-    workspaceId: string,
-    content: string,
-    section?: string | null,
-    updatedBy?: string | null
-  ): void;
+  updateWorkspaceBoard(hostId: string, workspaceId: string, content: string, section?: string | null, updatedBy?: string | null): void;
   fetchWorkspaceEvents(hostId: string, workspaceId: string, limit?: number | null): void;
   workspaceEventsJson(hostId: string, workspaceId: string): string;
   spawnWorkspacePeerJson(reqJson: string): string;
@@ -226,11 +131,7 @@ export class OrbitHarmonyCore {
   deleteSchedule(hostId: string, scheduleId: string): void;
   fetchScheduleRuns(hostId: string, scheduleId: string, limit?: number | null): void;
   scheduleRunsJson(hostId: string, scheduleId: string): string;
-  listConditionalTimersJson(
-    hostId: string,
-    agentId: string | null | undefined,
-    includeResolved: boolean
-  ): Promise<string>;
+  listConditionalTimersJson(hostId: string, agentId: string | null | undefined, includeResolved: boolean): Promise<string>;
   cancelConditionalTimerJson(hostId: string, timerId: string): Promise<string>;
   fireConditionalTimerNowJson(hostId: string, timerId: string): Promise<string>;
   listGoalRunsJson(hostId: string, agentId?: string | null): Promise<string>;
@@ -242,4 +143,84 @@ export class OrbitHarmonyCore {
   registerPushDeviceJson(hostId: string, reqJson: string): Promise<string>;
   unregisterPushDeviceJson(hostId: string, deviceId: string): Promise<string>;
   listPushDevicesJson(hostId: string): Promise<string>;
+  parseMarkdownPreviewJson(markdown: string, streaming: boolean): string;
+  archiveWorkspace(hostId: string, workspaceId: string, keepAgentsUnclassified: boolean): void;
+  cancelTimerJson(hostId: string, timerId: string): Promise<string>;
+  createMissionWorkspace(hostId: string, sourceCwd: string, title: string, missionGoal: string | null | undefined, useWorktree: boolean, worktreeBranch?: string | null, baseRef?: string | null): void;
+  createMonitorJson(reqJson: string): Promise<string>;
+  createTimerJson(hostId: string, agentId: string, durationSeconds: number, prompt: string, conditionJson: string): Promise<string>;
+  deleteCustomAcpAgentJson(hostId: string, agentId: string): Promise<string>;
+  deletePermissionRuleJson(hostId: string, ruleId: string): Promise<string>;
+  detachAgent(hostId: string, agentId: string): void;
+  discoverFleetRouterHostsJson(): Promise<string>;
+  dismissClusterSuggestion(hostId: string, agentId: string): void;
+  getFleetMeshSnapshotJson(): Promise<string>;
+  getGuardianConfigJson(hostId: string): Promise<string>;
+  getRouterConfigJson(hostId: string): Promise<string>;
+  getSessionUsageJson(hostId: string, agentId: string): Promise<string>;
+  getToolCallDiffJson(hostId: string, agentId: string, seq: number): string;
+  gitCommitJson(hostId: string, cwd: string, message: string, amend: boolean): Promise<string>;
+  gitConflictsJson(hostId: string, cwd: string): Promise<string>;
+  gitCreatePrJson(hostId: string, cwd: string, title: string, body: string, base: string | null | undefined, draft: boolean): Promise<string>;
+  gitGenerateCommitMessageJson(hostId: string, cwd: string): Promise<string>;
+  gitPrStatusJson(hostId: string, cwd: string): Promise<string>;
+  gitRebaseAbortJson(hostId: string, cwd: string): Promise<string>;
+  gitRebaseContinueJson(hostId: string, cwd: string): Promise<string>;
+  gitRebaseSkipJson(hostId: string, cwd: string, expectedStep?: number | null): Promise<string>;
+  gitRebaseStartJson(hostId: string, cwd: string, ontoRef: string): Promise<string>;
+  gitRebaseStatusJson(hostId: string, cwd: string): Promise<string>;
+  gitReposInspectionJson(hostId: string, path: string): string;
+  gitResolveConflictJson(hostId: string, cwd: string, path: string, blockIndex: number | null | undefined, resolutionJson: string, autoStage: boolean, expectedSha256?: string | null): Promise<string>;
+  gitStagePathsJson(hostId: string, cwd: string, paths: Array<string>, all: boolean): Promise<string>;
+  gitStashApplyJson(hostId: string, cwd: string, stashRef: string, expectedOid?: string | null): Promise<string>;
+  gitStashDropJson(hostId: string, cwd: string, stashRef: string, expectedOid?: string | null): Promise<string>;
+  gitStashListJson(hostId: string, cwd: string): Promise<string>;
+  gitStashPopJson(hostId: string, cwd: string, stashRef: string, expectedOid?: string | null): Promise<string>;
+  gitStashSaveJson(hostId: string, cwd: string, message: string | null | undefined, includeUntracked: boolean): Promise<string>;
+  gitUnstagePathsJson(hostId: string, cwd: string, paths: Array<string>, all: boolean): Promise<string>;
+  listAcpAgentsJson(hostId: string): string;
+  listPermissionRulesJson(hostId: string, projectCwd?: string | null): Promise<string>;
+  listProviderSubagents(hostId: string, parentAgentId: string): void;
+  mergeWorkspaces(hostId: string, sourceWorkspaceId: string, targetWorkspaceId: string): void;
+  moveAgentToWorkspace(hostId: string, agentId: string, targetWorkspaceId?: string | null): void;
+  moveAgentToWorkspaceV2(hostId: string, agentId: string, targetWorkspaceId: string | null | undefined, newWorkspaceTitle: string | null | undefined, makeUnclassified: boolean): void;
+  openProviderSubagentTimeline(hostId: string, parentAgentId: string, subagentId: string): void;
+  organizeProjectWorkspaces(hostId: string, projectRoot: string, agentIds: Array<string>, autoApply: boolean): void;
+  projectOrderJson(): string;
+  providerSubagentTimelineJson(hostId: string, parentAgentId: string, subagentId: string): string;
+  pushRegistrationStatusJson(): string;
+  readWorkspaceFileRequestJson(reqJson: string): Promise<string>;
+  refreshAcpAgents(hostId: string): void;
+  refreshAcpRegistryJson(hostId: string, registryUrl?: string | null): Promise<string>;
+  registerLiveActivityTokenJson(hostId: string, deviceId: string, liveActivityToken?: string | null): Promise<string>;
+  registerPushTokenJson(platform: string, token: string): string;
+  renameWorkspace(hostId: string, workspaceId: string, title: string): void;
+  reorderProjectsJson(orderedKeysJson: string): string;
+  requestGitReposInspection(hostId: string, path: string, extraDirs: Array<string>): void;
+  resolvePermissionsBatchJson(hostId: string, itemsJson: string, decision: string): Promise<string>;
+  resolvePlanApprovalJson(hostId: string, agentId: string, permissionRequestId: string, actionJson: string, editedPlanMarkdown: string | null | undefined, feedback: string | null | undefined, targetModeJson: string): Promise<void>;
+  rewindAgentRequestJson(reqJson: string): Promise<string>;
+  searchMessagesRemoteJson(reqJson: string): Promise<string>;
+  sendTerminalBytes(hostId: string, slot: number, bytes: Uint8Array): void;
+  startGoalJson(reqJson: string): Promise<string>;
+  startWorkflowJson(reqJson: string): Promise<string>;
+  summarizeAgent(hostId: string, agentId: string): void;
+  testAcpAgentJson(hostId: string, agentId: string, cwd?: string | null): Promise<string>;
+  testPushNotificationJson(hostId: string, deviceId?: string | null): Promise<string>;
+  unregisterPushToken(platform: string): void;
+  updateAgentIdentity(hostId: string, agentId: string, handle: string | null | undefined, title: string | null | undefined, taskSummary: string | null | undefined, lockHandle: boolean, lockTitle: boolean): void;
+  updateGuardianConfigJson(hostId: string, configJson: string): Promise<string>;
+  updateMeshPeerJson(hostId: string, registrationId: string, label?: string | null, enabled?: boolean | null): Promise<void>;
+  updatePushPreferencesJson(hostId: string, reqJson: string): Promise<string>;
+  updateRouterConfigJson(hostId: string, configJson: string, externalWebhookSecret: string | null | undefined, activate: boolean): Promise<string>;
+  updateWorkspaceGoal(hostId: string, workspaceId: string, goal: string): void;
+  upgradeHostDaemonOverWire(hostId: string, targetVersion?: string | null): Promise<string>;
+  upsertCustomAcpAgentJson(hostId: string, specJson: string): Promise<string>;
+  upsertPermissionRuleJson(hostId: string, ruleJson: string): Promise<string>;
+  static newWithMasterKey(dbPath: string, masterKeyB64: string): OrbitHarmonyCore;
+  static open(dbPath: string): OrbitHarmonyCore;
+  static openInMemory(): OrbitHarmonyCore;
+  subscribe(callback: (err: Error | null, payloadJson: string) => void): void;
+  subscribeCoalesced(minIntervalMs: number, callback: (err: Error | null, payloadJson: string) => void): void;
 }
+export { OrbitHarmonyCore as OhosOrbitCore };

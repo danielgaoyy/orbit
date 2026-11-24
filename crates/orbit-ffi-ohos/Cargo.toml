@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 orbit-client-core.workspace = true
 orbit-protocol.workspace = true
 serde.workspace = true
+base64.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

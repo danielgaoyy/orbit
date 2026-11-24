@@ -10,6 +10,7 @@ pub mod orchestration;
 pub mod permission_rules;
 pub mod push;
 pub mod search;
+mod secrets;
 pub mod timers;
 pub mod triggers;
 pub mod usage;
@@ -177,8 +178,146 @@ impl StoreError {
     }
 }
 
+#[derive(Debug)]
+pub struct PendingOutboxEntry {
+    pub id: i64,
+    pub host_id: String,
+    pub payload_json: String,
+    pub created_at_ms: i64,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+}
+
+impl OrbitStore {
+    pub fn enqueue_pending_outbox(
+        &self,
+        host_id: &str,
+        payload_json: &str,
+    ) -> Result<i64, StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM client_pending_outbox WHERE host_id=?1",
+            [host_id],
+            |row| row.get(0),
+        )?;
+        if count >= 100 {
+            return Err(StoreError::InvalidArgument(
+                "host outbox is full (100 pending messages)".into(),
+            ));
+        }
+        let stored = self
+            .secrets
+            .seal(&format!("outbox/{host_id}"), payload_json)?;
+        tx.execute("INSERT INTO client_pending_outbox(host_id,payload_json,created_at_ms) VALUES(?1,?2,?3)",params![host_id,stored,Utc::now().timestamp_millis()])?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn has_pending_outbox(&self, host_id: &str) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM client_pending_outbox WHERE host_id=?1)",
+            [host_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn list_pending_outbox(
+        &self,
+        host_id: &str,
+    ) -> Result<Vec<PendingOutboxEntry>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn.prepare("SELECT id,payload_json,created_at_ms,attempts,last_error FROM client_pending_outbox WHERE host_id=?1 ORDER BY id")?;
+        let mut rows = stmt.query([host_id])?;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next()? {
+            entries.push(PendingOutboxEntry {
+                id: row.get(0)?,
+                host_id: host_id.to_owned(),
+                payload_json: self
+                    .secrets
+                    .open(&format!("outbox/{host_id}"), &row.get::<_, String>(1)?)?,
+                created_at_ms: row.get(2)?,
+                attempts: row.get(3)?,
+                last_error: row.get(4)?,
+            });
+        }
+        Ok(entries)
+    }
+
+    pub fn remove_pending_outbox(&self, id: i64) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute("DELETE FROM client_pending_outbox WHERE id=?1", [id])?;
+        Ok(())
+    }
+
+    pub fn mark_outbox_attempt(&self, id: i64, err: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "UPDATE client_pending_outbox SET attempts=attempts+1,last_error=?2 WHERE id=?1",
+            params![id, err],
+        )?;
+        Ok(())
+    }
+
+    pub fn prune_stale_outbox(&self, max_age_ms: i64) -> Result<usize, StoreError> {
+        if max_age_ms < 0 {
+            return Err(StoreError::InvalidArgument(
+                "negative outbox retention".into(),
+            ));
+        }
+        let cutoff = Utc::now().timestamp_millis().saturating_sub(max_age_ms);
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        Ok(conn.execute(
+            "DELETE FROM client_pending_outbox WHERE created_at_ms < ?1",
+            [cutoff],
+        )?)
+    }
+
+    pub fn cloud_dirty_revision(&self) -> Result<Option<i64>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        Ok(conn.query_row("SELECT updated_at_ms FROM client_kv WHERE key='cloud_sync_dirty' AND value_json='true'", [], |r|r.get(0)).optional()?)
+    }
+
+    /// Clear only the exact generation that was included in a successful sync.
+    pub fn clear_cloud_dirty_revision(&self, revision: i64) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute("UPDATE client_kv SET value_json='false' WHERE key='cloud_sync_dirty' AND updated_at_ms=?1",[revision])?;
+        Ok(())
+    }
+}
+
+fn install_cloud_dirty_triggers(conn: &Connection) -> Result<(), StoreError> {
+    for table in [
+        "client_hosts",
+        "client_thread_prefs",
+        "client_projects",
+        "client_kv",
+    ] {
+        for event in ["INSERT", "UPDATE", "DELETE"] {
+            let row = if event == "DELETE" { "OLD" } else { "NEW" };
+            let filter = if table == "client_kv" {
+                format!(
+                    "WHEN {row}.key IN ('cloud_sync_prefs_v1','project_order','primary_router_selection','cloud_sync_fleet_network_v1')"
+                )
+            } else {
+                String::new()
+            };
+            conn.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS dirty_{table}_{event}
+                AFTER {event} ON {table} {filter} BEGIN
+                INSERT INTO client_kv(key,value_json,updated_at_ms) VALUES('cloud_sync_dirty','true',CAST(strftime('%s','now') AS INTEGER)*1000)
+                ON CONFLICT(key) DO UPDATE SET value_json='true', updated_at_ms=MAX(updated_at_ms+1,excluded.updated_at_ms);
+                END;"))?;
+        }
+    }
+    Ok(())
+}
+
 pub struct OrbitStore {
     conn: Mutex<Connection>,
+    secrets: secrets::SecretEnvelope,
 }
 
 #[cfg(unix)]
@@ -244,11 +383,18 @@ fn harden_sqlite_db_and_sidecars(path: &Path) -> std::io::Result<()> {
 
 impl OrbitStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_with_master_key(path, None)
+    }
+
+    pub fn open_with_master_key(
+        path: impl AsRef<Path>,
+        key: Option<[u8; 32]>,
+    ) -> Result<Self, StoreError> {
         let path = path.as_ref();
         #[cfg(unix)]
         harden_sqlite_parent_and_precreate(path)?;
         let conn = Connection::open(path)?;
-        let store = Self::init_connection(conn)?;
+        let store = Self::init_connection(conn, key)?;
         #[cfg(unix)]
         harden_sqlite_db_and_sidecars(path)?;
         Ok(store)
@@ -256,21 +402,31 @@ impl OrbitStore {
 
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
-        Self::init_connection(conn)
+        Self::init_connection(conn, None)
     }
 
-    fn init_connection(mut conn: Connection) -> Result<Self, StoreError> {
+    fn init_connection(mut conn: Connection, key: Option<[u8; 32]>) -> Result<Self, StoreError> {
         conn.busy_timeout(std::time::Duration::from_millis(4000))?;
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
+            PRAGMA secure_delete = ON;
             PRAGMA foreign_keys = ON;
             PRAGMA wal_autocheckpoint = 1000;
             PRAGMA journal_size_limit = 16777216;
             PRAGMA cache_size = -16000;
             PRAGMA temp_store = MEMORY;
 
+            CREATE TABLE IF NOT EXISTS client_pending_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                host_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_outbox_host_id ON client_pending_outbox(host_id,id);
             CREATE TABLE IF NOT EXISTS workspaces (
                 workspace_id TEXT PRIMARY KEY,
                 title        TEXT NOT NULL,
@@ -553,7 +709,11 @@ impl OrbitStore {
         workflows::migrate_workflows_schema(&conn)?;
         im_channels::migrate_im_channels_schema(&conn)?;
         push::migrate_push_schema(&conn)?;
+        install_cloud_dirty_triggers(&conn)?;
+        let secrets = secrets::SecretEnvelope(key.map(zeroize::Zeroizing::new));
+        secrets.initialize(&mut conn)?;
         Ok(Self {
+            secrets,
             conn: Mutex::new(conn),
         })
     }
@@ -2995,7 +3155,7 @@ impl OrbitStore {
                 host.daemon_pubkey_b64,
                 endpoints_json,
                 host.relay_url,
-                host.pairing_secret,
+                self.secrets.seal(&format!("pairing_secret/{}", host.host_id), &host.pairing_secret)?,
                 meta_json,
                 Utc::now().to_rfc3339(),
             ],
@@ -3028,12 +3188,24 @@ impl OrbitStore {
                 meta,
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        rows.map(|row| {
+            let mut host = row?;
+            host.pairing_secret = self.secrets.open(
+                &format!("pairing_secret/{}", host.host_id),
+                &host.pairing_secret,
+            )?;
+            Ok(host)
+        })
+        .collect()
     }
 
     pub fn delete_client_host(&self, host_id: &str) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM client_pending_outbox WHERE host_id=?1",
+            [host_id],
+        )?;
         search::delete_replica_fts_and_events_for_host(&tx, host_id)?;
         tx.execute(
             "DELETE FROM client_hosts WHERE host_id = ?1",

@@ -57,3 +57,16 @@
 - **跨主机 Relay 配置传播**：
   - 通过 `WireMessage::ConfigureHostRelay` 与 `apply_relay_to_fleet` 同步各主机的 Relay 地址并写入云端加密 Vault，使脱离局域网的移动端无需回到 Mac 旁也能与已配置机群重建连接。
   - **必跑验证**：改动连接池、Relay 配置分发或移动网络切换逻辑必跑 `pitfall_04`。
+
+## Direct mobile push
+
+Place provider settings in a private `$ORBIT_HOME/push.json` file or set the corresponding uppercase `ORBIT_` environment variables. Environment values override the file. Each platform with configured direct credentials uses its vendor endpoint. Other platforms can use the existing push gateway. Provider keys belong to the daemon operator.
+
+| Platform | Configuration fields | Delivery |
+| --- | --- | --- |
+| APNs | `apns_key_path`, `apns_key_id`, `apns_team_id`, `apns_bundle_id`, `apns_sandbox` | HTTP/2, ES256 provider token refreshed after 50 minutes. The device token receives alerts. An additional ActivityKit token receives updates under the Live Activity topic. |
+| FCM | `fcm_service_account_path` | Firebase Messaging scope, RS256 assertion, OAuth token exchange and HTTP v1 project endpoint. |
+| HarmonyOS NEXT | `hms_service_account_path` | Huawei service-account PS256 JWT, v3 notification endpoint with `push-type: 0` and the `WORK` category. |
+| Huawei client credentials | `hms_client_id`, `hms_client_secret`, `hms_project_id` | OAuth client-credentials exchange for deployments accepting that bearer. NEXT requires service-account JWT authentication. |
+
+Register or rotate an ActivityKit token using the host and device IDs. Passing null to the dedicated token-update RPC clears it. The ActivityKit `content-state` uses the `PushDispatchPayload` fields. Provider acceptance is reported per device. The notification privacy preference controls optional previews. [Huawei authentication](https://developer.huawei.com/consumer/en/doc/harmonyos-guides/push-jwt-token/) · [Apple ActivityKit updates](https://developer.apple.com/documentation/activitykit/starting-and-updating-live-activities-with-activitykit-push-notifications)

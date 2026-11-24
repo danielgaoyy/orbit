@@ -105,3 +105,16 @@ pub struct UsageInsightsSnapshot {
     #[serde(default)]
     pub forecasts: Vec<QuotaDepletionForecast>,
 }
+
+/// Totals for one session across all retained turn-level ledger entries.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionUsage {
+    pub agent_id: String,
+    pub turns: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub estimated_cost_usd: f64,
+    pub cache_savings_usd: f64,
+}

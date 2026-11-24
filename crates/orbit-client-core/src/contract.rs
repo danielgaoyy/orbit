@@ -331,6 +331,18 @@ pub struct SearchMessagesResponse {
     pub remote_hosts_failed: u32,
 }
 
+/// Host-scoped agent and request identifiers for a server-verified permission batch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionRequestId {
+    pub agent_id: String,
+    pub permission_request_id: String,
+}
+impl From<PermissionRequestId> for (String, String) {
+    fn from(item: PermissionRequestId) -> Self {
+        (item.agent_id, item.permission_request_id)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnWorkspacePeerRequest {
     pub host_id: String,

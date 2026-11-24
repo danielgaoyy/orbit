@@ -16,6 +16,7 @@ pub struct StoredPushDevice {
     pub platform: PushPlatform,
     pub device_name: String,
     pub device_token: String,
+    pub live_activity_token: Option<String>,
     pub sandbox: bool,
     pub enabled: bool,
     pub last_delivered_at_ms: Option<u64>,
@@ -130,11 +131,12 @@ pub(crate) fn migrate_push_schema(conn: &Connection) -> Result<(), StoreError> {
         );
         ",
     )?;
+    crate::ensure_table_column(conn, "push_devices", "live_activity_token", "TEXT")?;
     Ok(())
 }
 
 const PUSH_DEVICE_SELECT_COLS: &str = "device_id, platform, device_name, device_token, sandbox, \
-    enabled, last_delivered_at_ms, last_error, registered_at_ms, updated_at_ms";
+    enabled, last_delivered_at_ms, last_error, registered_at_ms, updated_at_ms, live_activity_token";
 
 fn map_push_device_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPushDevice> {
     let device_id: String = row.get(0)?;
@@ -163,6 +165,7 @@ fn map_push_device_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPushDe
         platform,
         device_name,
         device_token,
+        live_activity_token: row.get(10)?,
         sandbox: sandbox_raw != 0,
         enabled: enabled_raw != 0,
         last_delivered_at_ms: last_delivered_raw.and_then(|v| u64::try_from(v).ok()),
@@ -196,6 +199,22 @@ impl OrbitStore {
             .map_err(Into::into)
     }
 
+    pub fn set_live_activity_token(
+        &self,
+        device_id: &str,
+        token: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        if conn.execute(
+            "UPDATE push_devices SET live_activity_token=?2 WHERE device_id=?1 AND platform='apns'",
+            params![device_id, token],
+        )? != 1
+        {
+            return Err(StoreError::InvalidArgument("unknown APNs device".into()));
+        }
+        Ok(())
+    }
+
     pub fn count_push_devices(&self) -> Result<usize, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let count: i64 =
@@ -214,12 +233,13 @@ impl OrbitStore {
             "
             INSERT INTO push_devices (
                 device_id, platform, device_name, device_token, sandbox, enabled,
-                last_delivered_at_ms, last_error, registered_at_ms, updated_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                last_delivered_at_ms, last_error, registered_at_ms, updated_at_ms, live_activity_token
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             ON CONFLICT(device_id) DO UPDATE SET
                 platform = excluded.platform,
                 device_name = excluded.device_name,
                 device_token = excluded.device_token,
+                live_activity_token = CASE WHEN push_devices.platform = excluded.platform THEN COALESCE(excluded.live_activity_token,push_devices.live_activity_token) ELSE excluded.live_activity_token END,
                 sandbox = excluded.sandbox,
                 enabled = excluded.enabled,
                 last_delivered_at_ms = COALESCE(excluded.last_delivered_at_ms, push_devices.last_delivered_at_ms),
@@ -236,7 +256,7 @@ impl OrbitStore {
                 last_delivered_i64,
                 dev.last_error,
                 registered_i64,
-                updated_i64,
+                updated_i64,dev.live_activity_token,
             ],
         )?;
         Ok(())
@@ -292,6 +312,36 @@ impl OrbitStore {
             ",
             params![device_id, error, updated_i64],
         )?;
+        Ok(())
+    }
+    pub fn disable_push_token_with_error(
+        &self,
+        device_id: &str,
+        device_token: &str,
+        error: &str,
+        updated_at_ms: u64,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let updated_i64 = i64::try_from(updated_at_ms).unwrap_or(i64::MAX);
+        conn.execute(
+            "
+            UPDATE push_devices
+            SET enabled = 0,
+                last_error = ?2,
+                updated_at_ms = ?3
+            WHERE device_id = ?1 AND device_token=?4
+            ",
+            params![device_id, error, updated_i64, device_token],
+        )?;
+        Ok(())
+    }
+    pub fn clear_stale_activity_token(
+        &self,
+        device_id: &str,
+        token: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute("UPDATE push_devices SET live_activity_token=NULL WHERE device_id=?1 AND live_activity_token=?2",params![device_id,token])?;
         Ok(())
     }
 
@@ -429,6 +479,7 @@ mod tests {
 
         // Register & mask device token.
         let dev = StoredPushDevice {
+            live_activity_token: None,
             device_id: "ios_iphone_16".into(),
             platform: PushPlatform::Apns,
             device_name: "Jess iPhone 16 Pro".into(),

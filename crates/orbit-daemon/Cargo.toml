@@ -34,5 +34,7 @@ ed25519-dalek.workspace = true
 rand.workspace = true
 zeroize.workspace = true
 vt100.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["http2"] }
+p256 = { version = "0.14", features = ["ecdsa", "pem"] }
+rsa = { version = "0.10", features = ["pkcs1v15"] }
 notify.workspace = true

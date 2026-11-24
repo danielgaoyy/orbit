@@ -2,9 +2,11 @@
 //! - iOS 16.4+ (`Swift` + `SwiftUI`)
 //! - Android `minSdk 29` / `targetSdk 36` (`Kotlin 2` + `Jetpack Compose`)
 
+mod mobile;
+
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 
@@ -1908,6 +1910,16 @@ pub struct FfiPushRegistrationStatus {
     pub token_preview: Option<String>,
     pub relay_sync_supported: bool,
 }
+impl From<orbit_client_core::app_core::LocalPushRegistration> for FfiPushRegistrationStatus {
+    fn from(v: orbit_client_core::app_core::LocalPushRegistration) -> Self {
+        Self {
+            platform: v.platform,
+            token_registered: v.token_registered,
+            token_preview: v.token_preview,
+            relay_sync_supported: v.relay_sync_supported,
+        }
+    }
+}
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiHostDetail {
@@ -3454,17 +3466,48 @@ impl From<SessionSubagentEntryView> for FfiSessionSubagentEntry {
     }
 }
 
+use orbit_client_core::stage::SessionPlanStepStatus;
+#[uniffi::remote(Enum)]
+pub enum SessionPlanStepStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Skipped,
+    Failed,
+}
+use orbit_client_core::stage::SessionPlanStepView;
+#[uniffi::remote(Record)]
+pub struct SessionPlanStepView {
+    pub id: String,
+    pub title: String,
+    pub status: SessionPlanStepStatus,
+
+    pub active_form: Option<String>,
+    pub updated_seq: u64,
+}
+use orbit_client_core::stage::SessionOutlinePromptView;
+#[uniffi::remote(Record)]
+pub struct SessionOutlinePromptView {
+    pub seq: u64,
+    pub preview: String,
+}
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiSessionInsights {
     pub touched_files: Vec<FfiSessionTouchedFile>,
     pub background_tasks: Vec<FfiSessionBackgroundTask>,
     pub subagents: Vec<FfiSessionSubagentEntry>,
     pub detected_local_urls: Vec<String>,
+    #[uniffi(default = [])]
+    pub plan_steps: Vec<SessionPlanStepView>,
+    #[uniffi(default = [])]
+    pub outline_prompts: Vec<SessionOutlinePromptView>,
 }
 
 impl From<SessionInsightsView> for FfiSessionInsights {
     fn from(v: SessionInsightsView) -> Self {
         Self {
+            plan_steps: v.plan_steps,
+            outline_prompts: v.outline_prompts,
             touched_files: v.touched_files.into_iter().map(Into::into).collect(),
             background_tasks: v.background_tasks.into_iter().map(Into::into).collect(),
             subagents: v.subagents.into_iter().map(Into::into).collect(),
@@ -5177,33 +5220,37 @@ fn block_on_oneshot_future<F: Future>(fut: F) -> F::Output {
     }
 }
 
-fn mask_push_token(token: &str) -> String {
-    let chars: Vec<char> = token.trim().chars().collect();
-    if chars.len() <= 12 {
-        return "••••".to_string();
-    }
-    let prefix: String = chars.iter().take(6).collect();
-    let suffix: String = chars[chars.len().saturating_sub(4)..].iter().collect();
-    format!("{prefix}…{suffix}")
-}
-
 #[derive(uniffi::Object)]
 pub struct OrbitMobileCore {
     inner: Arc<OrbitAppCore>,
-    push_registration: Mutex<Option<(String, String)>>,
 }
 
 #[uniffi::export]
 impl OrbitMobileCore {
     #[uniffi::constructor]
+    pub fn new_with_master_key(
+        db_path: String,
+        master_key_bytes: Vec<u8>,
+    ) -> Result<Arc<Self>, FfiOrbitError> {
+        let key = master_key_bytes
+            .try_into()
+            .map_err(|_| FfiOrbitError::Core {
+                detail: "expected a 32-byte master key".into(),
+            })?;
+        let inner = OrbitAppCore::open_with_master_key(db_path, Some(key)).map_err(|e| {
+            FfiOrbitError::Core {
+                detail: e.to_string(),
+            }
+        })?;
+        Ok(Arc::new(Self { inner }))
+    }
+
+    #[uniffi::constructor]
     pub fn open(db_path: String) -> Result<Arc<Self>, FfiOrbitError> {
         let inner = OrbitAppCore::open(&db_path, false).map_err(|e| FfiOrbitError::Core {
             detail: e.to_string(),
         })?;
-        Ok(Arc::new(Self {
-            inner,
-            push_registration: Mutex::new(None),
-        }))
+        Ok(Arc::new(Self { inner }))
     }
 
     #[uniffi::constructor]
@@ -5215,10 +5262,7 @@ impl OrbitMobileCore {
             OrbitAppCore::open(&db_path, auto_discover_local).map_err(|e| FfiOrbitError::Core {
                 detail: e.to_string(),
             })?;
-        Ok(Arc::new(Self {
-            inner,
-            push_registration: Mutex::new(None),
-        }))
+        Ok(Arc::new(Self { inner }))
     }
 
     #[uniffi::constructor]
@@ -5226,10 +5270,7 @@ impl OrbitMobileCore {
         let inner = OrbitAppCore::open_in_memory().map_err(|e| FfiOrbitError::Core {
             detail: e.to_string(),
         })?;
-        Ok(Arc::new(Self {
-            inner,
-            push_registration: Mutex::new(None),
-        }))
+        Ok(Arc::new(Self { inner }))
     }
 
     pub fn subscribe(&self, listener: Arc<dyn MobileCoreListener>) {
@@ -6816,74 +6857,20 @@ impl OrbitMobileCore {
         platform: String,
         token: String,
     ) -> Result<FfiPushRegistrationStatus, FfiOrbitError> {
-        let clean_platform = platform.trim().to_ascii_lowercase();
-        let clean_token = token.trim().to_string();
-        if clean_platform.is_empty() {
-            return Err(FfiOrbitError::Core {
-                detail: "push platform cannot be empty".to_string(),
-            });
-        }
-        if clean_token.is_empty() {
-            return Err(FfiOrbitError::Core {
-                detail: "push token cannot be empty".to_string(),
-            });
-        }
-        let preview = mask_push_token(&clean_token);
-        let mut guard = self
-            .push_registration
-            .lock()
-            .map_err(|_| FfiOrbitError::Core {
-                detail: "push registration lock poisoned".to_string(),
-            })?;
-        *guard = Some((clean_platform.clone(), clean_token));
-        Ok(FfiPushRegistrationStatus {
-            platform: clean_platform,
-            token_registered: true,
-            token_preview: Some(preview),
-            relay_sync_supported: false,
-        })
+        self.inner
+            .register_push_token(platform, token)
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
     }
 
     pub fn unregister_push_token(&self, platform: String) -> Result<(), FfiOrbitError> {
-        let clean_platform = platform.trim().to_ascii_lowercase();
-        let mut guard = self
-            .push_registration
-            .lock()
-            .map_err(|_| FfiOrbitError::Core {
-                detail: "push registration lock poisoned".to_string(),
-            })?;
-        if guard
-            .as_ref()
-            .is_some_and(|(existing, _)| clean_platform.is_empty() || existing == &clean_platform)
-        {
-            *guard = None;
-        }
-        Ok(())
+        self.inner
+            .unregister_push_token(platform)
+            .map_err(|detail| FfiOrbitError::Core { detail })
     }
 
     pub fn push_registration_status(&self) -> FfiPushRegistrationStatus {
-        match self.push_registration.lock() {
-            Ok(guard) => match guard.as_ref() {
-                Some((platform, token)) => FfiPushRegistrationStatus {
-                    platform: platform.clone(),
-                    token_registered: true,
-                    token_preview: Some(mask_push_token(token)),
-                    relay_sync_supported: false,
-                },
-                None => FfiPushRegistrationStatus {
-                    platform: String::new(),
-                    token_registered: false,
-                    token_preview: None,
-                    relay_sync_supported: false,
-                },
-            },
-            Err(_) => FfiPushRegistrationStatus {
-                platform: String::new(),
-                token_registered: false,
-                token_preview: None,
-                relay_sync_supported: false,
-            },
-        }
+        self.inner.push_registration_status().into()
     }
 }
 
@@ -6921,6 +6908,8 @@ pub struct FfiRegisterPushDeviceRequest {
     pub device_name: String,
     pub device_token: String,
     pub sandbox: bool,
+    #[uniffi(default = None)]
+    pub live_activity_token: Option<String>,
 }
 
 impl From<FfiRegisterPushDeviceRequest> for RegisterPushDeviceRequest {
@@ -6930,6 +6919,7 @@ impl From<FfiRegisterPushDeviceRequest> for RegisterPushDeviceRequest {
             platform: v.platform.into(),
             device_name: v.device_name,
             device_token: v.device_token,
+            live_activity_token: v.live_activity_token,
             sandbox: v.sandbox,
         }
     }
@@ -7457,12 +7447,15 @@ mod tests {
         assert_eq!(registered.token_preview.as_deref(), Some("fcm_to…cdef"));
 
         // Short ASCII and short multi-byte UTF-8 tokens must never leak plaintext.
-        assert_eq!(mask_push_token("short_tok"), "••••");
-        assert_eq!(mask_push_token("🔑令牌测试"), "••••");
-        assert_eq!(
-            mask_push_token("🔑令牌测试数据1234567890"),
-            "🔑令牌测试数…7890"
-        );
+        let preview = |token: &str| {
+            core.register_push_token("android_fcm".into(), token.into())
+                .expect("register")
+                .token_preview
+                .unwrap_or_default()
+        };
+        assert_eq!(preview("short_tok"), "••••");
+        assert_eq!(preview("🔑令牌测试"), "••••");
+        assert_eq!(preview("🔑令牌测试数据1234567890"), "🔑令牌测试数…7890");
 
         core.unregister_push_token("android_fcm".into())
             .expect("unregister push token");

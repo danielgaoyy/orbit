@@ -2736,16 +2736,16 @@ struct AgentMessageCardView: View {
         guard let status = deliveryStatus else { return nil }
         switch status {
         case .queued:
-            return ("Queued", palette.warning)
+            return (OrbitL10n.tr("Queued"), palette.warning)
         case .dispatched:
-            return ("Processing", palette.primary)
+            return (OrbitL10n.tr("Processing"), palette.primary)
         case .settled:
             if let q = queuedAtMs, let d = dispatchedAtMs, d - q >= 2000 {
-                return ("Delivered", palette.fgMuted)
+                return (OrbitL10n.tr("Delivered"), palette.fgMuted)
             }
             return nil
         case .dropped:
-            return ("Canceled", palette.danger)
+            return (OrbitL10n.tr("Canceled"), palette.danger)
         }
     }
 

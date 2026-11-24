@@ -271,6 +271,19 @@ pub fn is_hardened_guardian_provider(provider: ProviderKind) -> bool {
     matches!(provider, ProviderKind::ClaudeCode | ProviderKind::Codex)
 }
 
+/// Trim and validate an explicit model name against CLI flag injection and control characters.
+pub fn validate_cli_model_name(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 256
+        || trimmed.starts_with('-')
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("Invalid model name".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Build the hardened subprocess command specification for Guardian Tier-2 LLM classification.
 ///
 /// Explicitly rejects providers that only accept prompts via `argv` (such as Antigravity CLI).
@@ -280,7 +293,7 @@ pub fn build_hardened_guardian_command_spec(
     isolated_cwd: &Path,
     model: Option<&str>,
 ) -> Result<HardenedGuardianCommandSpec, String> {
-    let trimmed_model = model.map(str::trim).filter(|s| !s.is_empty());
+    let trimmed_model = model.map(validate_cli_model_name).transpose()?;
     let args = match provider {
         ProviderKind::ClaudeCode => {
             let mut a = vec![
@@ -298,7 +311,7 @@ pub fn build_hardened_guardian_command_spec(
             ];
             if let Some(m) = trimmed_model {
                 a.push("--model".to_string());
-                a.push(m.to_string());
+                a.push(m);
             }
             a
         }
@@ -315,7 +328,7 @@ pub fn build_hardened_guardian_command_spec(
             ];
             if let Some(m) = trimmed_model {
                 a.push("--model".to_string());
-                a.push(m.to_string());
+                a.push(m);
             }
             a.push("-".to_string());
             a
@@ -1303,5 +1316,47 @@ mod tests {
         assert!(!is_hardened_guardian_provider(ProviderKind::Antigravity));
         assert!(is_hardened_guardian_provider(ProviderKind::ClaudeCode));
         assert!(is_hardened_guardian_provider(ProviderKind::Codex));
+    }
+
+    #[test]
+    fn hardened_guardian_command_spec_rejects_model_argument_injection() {
+        let iso = PathBuf::from("/tmp/orbit-guardian-iso-test");
+        let exe = PathBuf::from("/usr/local/bin/mock-cli");
+
+        for bad in [
+            " --mcp-config",
+            "\t--mcp-config",
+            "-flag",
+            "--strict",
+            "",
+            "   ",
+            "claude-haiku --mcp-config",
+            "claude-haiku\n--mcp-config",
+            "claude\0haiku",
+        ] {
+            for provider in [ProviderKind::ClaudeCode, ProviderKind::Codex] {
+                assert!(
+                    build_hardened_guardian_command_spec(provider, &exe, &iso, Some(bad)).is_err(),
+                    "expected `{bad:?}` to be rejected for {provider:?}"
+                );
+            }
+        }
+
+        let trimmed = build_hardened_guardian_command_spec(
+            ProviderKind::ClaudeCode,
+            &exe,
+            &iso,
+            Some("  claude-haiku-4-5  "),
+        )
+        .expect("trimmed valid model should succeed");
+        let pos = trimmed
+            .args
+            .iter()
+            .position(|a| a == "--model")
+            .expect("--model flag");
+        assert_eq!(
+            trimmed.args.get(pos + 1).map(String::as_str),
+            Some("claude-haiku-4-5")
+        );
     }
 }

@@ -145,6 +145,73 @@ struct Token<'a> {
     parent: Option<usize>,
 }
 
+fn split_top_level_commas(input: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut start = 0usize;
+    for (idx, ch) in input.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&input[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&input[start..]);
+    parts
+}
+
+fn is_test_cfg_expr(expr: &str) -> bool {
+    if expr == "test" {
+        return true;
+    }
+    if let Some(inner) = expr.strip_prefix("all(").and_then(|s| s.strip_suffix(')')) {
+        return split_top_level_commas(inner)
+            .into_iter()
+            .any(is_test_cfg_expr);
+    }
+    if let Some(inner) = expr.strip_prefix("any(").and_then(|s| s.strip_suffix(')')) {
+        return split_top_level_commas(inner)
+            .into_iter()
+            .any(is_test_cfg_expr);
+    }
+    false
+}
+
+fn is_test_attribute(attr: &str) -> bool {
+    if attr == "test" || attr.ends_with("::test") {
+        return true;
+    }
+    if let Some((path, rest)) = attr.split_once('(') {
+        let Some(inner) = rest.strip_suffix(')') else {
+            return false;
+        };
+        if path == "test" || path.ends_with("::test") {
+            return true;
+        }
+        if path == "cfg" {
+            return is_test_cfg_expr(inner);
+        }
+    }
+    false
+}
+
 pub(super) fn rust_context(source: &str, mut deny: bool, file: &mut File) {
     use rustc_lexer::TokenKind;
     let (mut line, mut pos) = (1, 0);
@@ -199,7 +266,7 @@ pub(super) fn rust_context(source: &str, mut deny: bool, file: &mut File) {
         if inner && matches!(attr.as_str(), "deny(unsafe_code)" | "forbid(unsafe_code)") {
             deny = true;
         }
-        if attr == "cfg(test)" || attr == "test" || attr.ends_with("::test") {
+        if is_test_attribute(&attr) {
             let end_line = if inner {
                 Some(
                     t.parent
@@ -221,7 +288,17 @@ pub(super) fn rust_context(source: &str, mut deny: bool, file: &mut File) {
         }
     }
     for (i, t) in tokens.iter().enumerate() {
-        if deny && t.text == "unsafe" && at(i + 1) == Some("{") {
+        let is_unsafe_attr = at(i + 1) == Some("(")
+            && ((i >= 2 && at(i - 1) == Some("[") && at(i - 2) == Some("#"))
+                || (i >= 3
+                    && at(i - 1) == Some("[")
+                    && at(i - 2) == Some("!")
+                    && at(i - 3) == Some("#")));
+        if deny
+            && t.text == "unsafe"
+            && (matches!(at(i + 1), Some("{" | "fn" | "impl" | "trait" | "extern"))
+                || is_unsafe_attr)
+        {
             file.rust_signals.insert((t.line, Rule::Unsafe));
         }
         if i > 0
@@ -247,4 +324,81 @@ pub(super) fn is_test(path: &str, file: &File, start: u32, end: u32) -> bool {
             .test_ranges
             .get(file.test_ranges.partition_point(|r| *r.end() < start))
             .is_some_and(|r| *r.start() <= end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn rust_context_detects_all_unsafe_forms_without_false_positives() {
+        let source = "\
+fn a() { unsafe { raw(); } }
+pub unsafe fn b() {}
+unsafe impl Send for Foo {}
+pub unsafe trait Bar {}
+unsafe extern \"C\" { fn c_fn(); }
+#[unsafe(no_mangle)]
+pub extern \"C\" fn d() {}
+fn safe_fn() { let s = \"unsafe fn fake() {}\"; let unsafe_name = 1; }
+";
+        let mut file = File::default();
+        rust_context(source, true, &mut file);
+        let unsafe_lines: BTreeSet<u32> = file
+            .rust_signals
+            .iter()
+            .filter_map(|(line, rule)| (*rule == Rule::Unsafe).then_some(*line))
+            .collect();
+        assert_eq!(unsafe_lines, BTreeSet::from([1, 2, 3, 4, 5, 6]));
+    }
+
+    #[test]
+    fn rust_context_accurately_detects_parameterized_and_boolean_test_attributes() {
+        let source = "\
+#[test]
+fn plain_test() { v.unwrap(); }
+#[tokio::test]
+async fn tokio_plain() { v.unwrap(); }
+#[tokio::test(flavor = \"multi_thread\", worker_threads = 2)]
+async fn tokio_param() { v.unwrap(); }
+#[cfg(test)]
+mod unit_tests { fn helper() { v.unwrap(); } }
+#[cfg(all(test, unix))]
+fn unix_test_helper() { v.unwrap(); }
+#[cfg(all(unix, test))]
+fn reordered_all_helper() { v.unwrap(); }
+#[cfg(any(test, feature = \"bench\"))]
+fn any_test_helper() { v.unwrap(); }
+#[cfg(not(test))]
+fn prod_only() { v.unwrap(); }
+#[cfg(feature = \"test\")]
+fn feature_not_test() { v.unwrap(); }
+#[cfg_attr(test, derive(Debug))]
+fn cfg_attr_prod() { v.unwrap(); }
+";
+        let mut file = File::default();
+        rust_context(source, true, &mut file);
+
+        // Lines 2, 4, 6, 8, 10, 12, 14 are inside test contexts.
+        for test_line in [2u32, 4, 6, 8, 10, 12, 14] {
+            assert!(
+                is_test("src/lib.rs", &file, test_line, test_line),
+                "expected line {test_line} to be classified as test code"
+            );
+        }
+
+        // Lines 16 (`#[cfg(not(test))]`), 18 (`#[cfg(feature = "test")]`),
+        // and 20 (`#[cfg_attr(test, ...)]`) are production code and MUST NOT be skipped!
+        for prod_line in [16u32, 18, 20] {
+            assert!(
+                !is_test("src/lib.rs", &file, prod_line, prod_line),
+                "expected line {prod_line} to remain production code"
+            );
+            assert!(
+                file.rust_signals.contains(&(prod_line, Rule::Panic)),
+                "expected panic signal on production line {prod_line}"
+            );
+        }
+    }
 }

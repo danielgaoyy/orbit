@@ -382,7 +382,7 @@ pub use shell_snapshot::{
 pub use side_question::{
     HardenedGuardianCommandSpec, SideQuestionSpec, build_hardened_guardian_command_spec,
     is_hardened_guardian_provider, run_ephemeral_text_prompt, run_hardened_guardian_prompt,
-    run_side_question, run_tool_free_prompt,
+    run_side_question, run_tool_free_prompt, validate_cli_model_name,
 };
 
 static PROVIDER_EXECUTABLE_OVERRIDES: OnceLock<RwLock<HashMap<ProviderKind, PathBuf>>> =

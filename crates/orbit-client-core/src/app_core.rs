@@ -1262,6 +1262,10 @@ struct HostMemoryState {
     pending_timer_updates:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ConditionalTimerRecord, String>>>,
     background_timer_list_reqs: HashSet<Uuid>,
+    pending_fim_configs: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<FimConfig, String>>>,
+    pending_inline_edits:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<InlineEditResult, String>>>,
+    pending_pr_patrols: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<PrPatrolReport, String>>>,
     pending_guardian_configs:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GuardianConfigSnapshotView, String>>>,
     pending_permission_rule_lists:
@@ -1474,6 +1478,9 @@ impl HostMemoryState {
             pending_timer_lists: HashMap::new(),
             pending_timer_updates: HashMap::new(),
             background_timer_list_reqs: HashSet::new(),
+            pending_fim_configs: HashMap::new(),
+            pending_inline_edits: HashMap::new(),
+            pending_pr_patrols: HashMap::new(),
             pending_guardian_configs: HashMap::new(),
             pending_permission_rule_lists: HashMap::new(),
             pending_permission_rule_updates: HashMap::new(),
@@ -7429,6 +7436,31 @@ impl OrbitAppCore {
                     upsert_conditional_timer_record(&mut state.conditional_timers, timer);
                     notify_host = true;
                 }
+                WireMessage::FimConfigState { request_id, config } => {
+                    if let Some(tx) = state.pending_fim_configs.remove(&request_id) {
+                        let _ = tx.send(Ok(config));
+                    }
+                }
+                WireMessage::InlineEditPrediction {
+                    request_id,
+                    completion,
+                    latency_ms,
+                    source,
+                } => {
+                    if let Some(tx) = state.pending_inline_edits.remove(&request_id) {
+                        let _ = tx.send(Ok(InlineEditResult {
+                            request_id,
+                            completion,
+                            latency_ms,
+                            source,
+                        }));
+                    }
+                }
+                WireMessage::PrPatrolCompleted { request_id, report } => {
+                    if let Some(tx) = state.pending_pr_patrols.remove(&request_id) {
+                        let _ = tx.send(Ok(report));
+                    }
+                }
                 WireMessage::GuardianConfigSnapshot {
                     request_id,
                     config,
@@ -8016,6 +8048,18 @@ impl OrbitAppCore {
                         && state.background_timer_list_reqs.remove(&req_id)
                     {
                         // Ignore unsupported/transient background timer list errors on older daemons.
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_fim_configs.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_inline_edits.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_pr_patrols.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_guardian_configs.remove(&req_id)
                     {
@@ -16588,50 +16632,112 @@ impl OrbitAppCore {
     }
 
     /// Fetch the policy for this host, allowing concurrent config reads and writes.
-    pub async fn get_fim_config(&self, host_id: &str) -> Result<FimConfig, String> {
+    pub async fn get_fim_config(self: &Arc<Self>, host_id: &str) -> Result<FimConfig, String> {
         self.fim_config_rpc(host_id, None).await
     }
+
     pub async fn update_fim_config(
-        &self,
+        self: &Arc<Self>,
         host_id: &str,
         config: FimConfig,
     ) -> Result<FimConfig, String> {
         self.fim_config_rpc(host_id, Some(config)).await
     }
+
+    async fn dispatch_pending_rpc<T, SelectMap>(
+        self: &Arc<Self>,
+        host_id: String,
+        select_map: SelectMap,
+        build_wire: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        op_label: &'static str,
+        timeout: Duration,
+    ) -> Result<T, String>
+    where
+        T: Send + 'static,
+        SelectMap: Fn(
+                &mut HostMemoryState,
+            ) -> &mut HashMap<Uuid, tokio::sync::oneshot::Sender<Result<T, String>>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let session = self.require_online_session(&host_id)?;
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        select_map(h).insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some(format!("Host disconnected before {op_label}")),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session.send_wire(build_wire(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    select_map(h).remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to {op_label}: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(timeout, ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected while trying to {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        select_map(h).remove(&req_id);
+                    }
+                    Err(format!("Timed out waiting for daemon to {op_label}"))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
     async fn fim_config_rpc(
-        &self,
+        self: &Arc<Self>,
         host_id: &str,
         config: Option<FimConfig>,
     ) -> Result<FimConfig, String> {
-        let id = Uuid::new_v4();
-        let msg = match config {
-            Some(config) => WireMessage::UpdateFimConfig {
-                request_id: id,
-                config,
-            },
-            None => WireMessage::GetFimConfig { request_id: id },
+        let op_label = if config.is_some() {
+            "update FIM configuration"
+        } else {
+            "load FIM configuration"
         };
-        match self
-            .require_online_session(host_id)?
-            .request_for(
-                msg,
-                Duration::from_secs(10),
-                Some(id),
-                |w| matches!(w,WireMessage::FimConfigState{request_id,..} if *request_id==id),
-            )
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            WireMessage::FimConfigState { config, .. } => Ok(config),
-            _ => Err("Unexpected FIM configuration response".into()),
-        }
+        self.dispatch_pending_rpc(
+            host_id.to_string(),
+            |h| &mut h.pending_fim_configs,
+            move |request_id| match config {
+                Some(config) => WireMessage::UpdateFimConfig { request_id, config },
+                None => WireMessage::GetFimConfig { request_id },
+            },
+            op_label,
+            Duration::from_secs(10),
+        )
+        .await
     }
+
     pub async fn predict_inline_edit(
-        &self,
+        self: &Arc<Self>,
         host_id: &str,
         input: InlineEditInput,
     ) -> Result<InlineEditResult, String> {
-        let id = Uuid::new_v4();
         let InlineEditInput {
             cwd,
             file_path,
@@ -16641,43 +16747,27 @@ impl OrbitAppCore {
             cursor_line,
             cursor_col,
         } = input;
-        let msg = WireMessage::PredictInlineEdit {
-            request_id: id,
-            cwd,
-            file_path,
-            language,
-            prefix,
-            suffix,
-            cursor_line,
-            cursor_col,
-        };
-        match self
-            .require_online_session(host_id)?
-            .request_for(
-                msg,
-                Duration::from_secs(7),
-                Some(id),
-                |w| matches!(w,WireMessage::InlineEditPrediction{request_id,..} if *request_id==id),
-            )
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            WireMessage::InlineEditPrediction {
+        self.dispatch_pending_rpc(
+            host_id.to_string(),
+            |h| &mut h.pending_inline_edits,
+            move |request_id| WireMessage::PredictInlineEdit {
                 request_id,
-                completion,
-                latency_ms,
-                source,
-            } => Ok(InlineEditResult {
-                request_id,
-                completion,
-                latency_ms,
-                source,
-            }),
-            _ => Err("Unexpected FIM prediction response".into()),
-        }
+                cwd,
+                file_path,
+                language,
+                prefix,
+                suffix,
+                cursor_line,
+                cursor_col,
+            },
+            "predict inline edit",
+            Duration::from_secs(7),
+        )
+        .await
     }
+
     pub async fn run_pr_patrol(
-        &self,
+        self: &Arc<Self>,
         host_id: &str,
         cwd: String,
         base_ref: Option<String>,
@@ -16685,29 +16775,21 @@ impl OrbitAppCore {
         pr_number: Option<u64>,
         post_github_comments: bool,
     ) -> Result<PrPatrolReport, String> {
-        let id = Uuid::new_v4();
-        let msg = WireMessage::RunPrPatrol {
-            request_id: id,
-            cwd,
-            base_ref,
-            head_ref,
-            pr_number,
-            post_github_comments,
-        };
-        match self
-            .require_online_session(host_id)?
-            .request_for(
-                msg,
-                Duration::from_secs(130),
-                Some(id),
-                |w| matches!(w,WireMessage::PrPatrolCompleted{request_id,..} if *request_id==id),
-            )
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            WireMessage::PrPatrolCompleted { report, .. } => Ok(report),
-            _ => Err("Unexpected PR Patrol response".into()),
-        }
+        self.dispatch_pending_rpc(
+            host_id.to_string(),
+            |h| &mut h.pending_pr_patrols,
+            move |request_id| WireMessage::RunPrPatrol {
+                request_id,
+                cwd,
+                base_ref,
+                head_ref,
+                pr_number,
+                post_github_comments,
+            },
+            "run PR Patrol",
+            Duration::from_secs(130),
+        )
+        .await
     }
 
     /// Fetch Guardian auto-approval policy and recent audit entries from any connected host.
@@ -22413,6 +22495,15 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     h.background_timer_list_reqs.clear();
+    for (_, tx) in h.pending_fim_configs.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_inline_edits.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_pr_patrols.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
     for (_, tx) in h.pending_guardian_configs.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
@@ -31756,5 +31847,118 @@ mod tests {
         let h = hosts.get(host_id).expect("host");
         assert!(!h.active_preview_tunnels.contains_key(&tid1));
         assert!(!h.active_preview_tunnels.contains_key(&tid2));
+    }
+
+    #[test]
+    fn fim_and_pr_patrol_rpcs_use_pending_oneshot_maps_and_fail_on_disconnect() {
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("open core");
+        let (session_handle, mut out_rx) = crate::HostSessionHandle::new_test_channel();
+        let host_id = "h_fim_patrol";
+        {
+            let mut hosts = core.hosts.write().expect("write hosts");
+            let mut h = HostMemoryState::new(SavedHostProfile {
+                host_id: host_id.to_string(),
+                hostname: "patrol-box".to_string(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 6868,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk_patrol".to_string(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                pairing_secret: "secret".to_string(),
+                pairing_secret_updated_at_ms: 0,
+                state: HostConnectionState::OnlineDirect,
+            });
+            h.session = Some(session_handle.clone());
+            hosts.insert(host_id.to_string(), h);
+        }
+
+        // 1. Correlated success reply via handle_inbound_wire resolves get_fim_config.
+        let core_reply = Arc::clone(&core);
+        let cfg = core.runtime.block_on(async {
+            let rpc = core.get_fim_config(host_id);
+            let responder = async {
+                let Some(crate::OutboundPayload::Wire(WireMessage::GetFimConfig { request_id })) =
+                    out_rx.recv().await
+                else {
+                    panic!("expected GetFimConfig wire frame");
+                };
+                core_reply.handle_inbound_wire(
+                    host_id,
+                    WireMessage::FimConfigState {
+                        request_id,
+                        config: FimConfig {
+                            model: Some("qwen2.5-coder:7b".into()),
+                            ..FimConfig::default()
+                        },
+                    },
+                );
+            };
+            let (res, ()) = tokio::join!(rpc, responder);
+            res.expect("fim config response")
+        });
+        assert_eq!(cfg.model.as_deref(), Some("qwen2.5-coder:7b"));
+
+        // 2. Correlated RpcError resolves predict_inline_edit with an error immediately.
+        let core_err = Arc::clone(&core);
+        let pred_err = core.runtime.block_on(async {
+            let rpc = core.predict_inline_edit(
+                host_id,
+                InlineEditInput {
+                    cwd: "/repo".into(),
+                    file_path: "src/lib.rs".into(),
+                    language: Some("rust".into()),
+                    prefix: "let x = ".into(),
+                    suffix: ";".into(),
+                    cursor_line: 1,
+                    cursor_col: 8,
+                },
+            );
+            let responder = async {
+                let Some(crate::OutboundPayload::Wire(WireMessage::PredictInlineEdit {
+                    request_id,
+                    ..
+                })) = out_rx.recv().await
+                else {
+                    panic!("expected PredictInlineEdit wire frame");
+                };
+                core_err.handle_inbound_wire(
+                    host_id,
+                    WireMessage::RpcError {
+                        request_id: Some(request_id),
+                        code: "fim_busy".into(),
+                        message: "Too many pending predictions".into(),
+                    },
+                );
+            };
+            let (res, ()) = tokio::join!(rpc, responder);
+            res.expect_err("expected rpc error")
+        });
+        assert!(pred_err.contains("fim_busy"));
+
+        // 3. Unexpected disconnect drains pending_pr_patrols promptly (never waits 130s).
+        let core_disc = Arc::clone(&core);
+        let start = std::time::Instant::now();
+        let patrol_err = core.runtime.block_on(async {
+            let rpc = core.run_pr_patrol(host_id, "/repo".into(), None, None, None, false);
+            let disconnector = async {
+                let Some(crate::OutboundPayload::Wire(WireMessage::RunPrPatrol { .. })) =
+                    out_rx.recv().await
+                else {
+                    panic!("expected RunPrPatrol wire frame");
+                };
+                core_disc.handle_unexpected_disconnect(host_id, None);
+            };
+            let (res, ()) = tokio::join!(rpc, disconnector);
+            res.expect_err("expected disconnect error")
+        });
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(
+            patrol_err.to_ascii_lowercase().contains("disconnect")
+                || patrol_err.to_ascii_lowercase().contains("lost")
+                || !patrol_err.is_empty()
+        );
     }
 }

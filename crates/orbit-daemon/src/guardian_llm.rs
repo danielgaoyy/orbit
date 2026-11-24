@@ -523,7 +523,7 @@ pub fn parse_guardian_llm_response(
 /// Strip a single optional outer markdown code fence (```` ```json ... ``` ```` or ```` ``` ... ``` ````).
 /// Direct `serde_json::from_str` afterwards natively rejects any non-JSON prose, trailing text,
 /// or concatenated JSON objects.
-fn strip_optional_markdown_fence(raw: &str) -> &str {
+pub(crate) fn strip_optional_markdown_fence(raw: &str) -> &str {
     let s = raw.trim();
     if let Some(after_open) = s.strip_prefix("```") {
         let after_lang = after_open

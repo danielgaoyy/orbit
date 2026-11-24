@@ -1,7 +1,9 @@
 //! Two-stage review of a pinned merge-base diff. The reviewed tree is never executed.
 mod repository;
 mod scanner;
-use crate::guardian_llm::{GuardianLlmBackend, LlmBackendCall, ToolFreeLlmBackend};
+use crate::guardian_llm::{
+    GuardianLlmBackend, LlmBackendCall, ToolFreeLlmBackend, strip_optional_markdown_fence,
+};
 use anyhow::{Context, Result, ensure};
 use orbit_protocol::{PrPatrolCategory, PrPatrolFinding, PrPatrolReport, PrPatrolSeverity};
 use repository::{ContextData, PullRequest, append_bounded, command};
@@ -65,7 +67,7 @@ impl Reviewer<'_> {
         if raw.len() > 64 * 1024 {
             return None;
         }
-        serde_json::from_str(raw.trim()).ok()
+        serde_json::from_str(strip_optional_markdown_fence(&raw)).ok()
     }
 }
 
@@ -249,9 +251,20 @@ async fn review(
     Ok((count, verified, status))
 }
 
+const MAX_GITHUB_REVIEW_COMMENTS: usize = 50;
+const EXISTING_MARKERS_JQ: &str = r#"(.[].body // "") | split("\n")[] | gsub("^\\s+|\\s+$"; "") | select(startswith("<!-- orbit-patrol:"))"#;
+
 fn marker(f: &PrPatrolFinding) -> String {
     format!("<!-- orbit-patrol:{} -->", f.id)
 }
+
+fn parse_existing_markers(raw: &str) -> BTreeSet<&str> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("<!-- orbit-patrol:"))
+        .collect()
+}
+
 fn new_comments(findings: &[PrPatrolFinding], existing: &BTreeSet<&str>) -> Vec<Value> {
     findings.iter().filter_map(|f|{
         let marker=marker(f);
@@ -259,6 +272,30 @@ fn new_comments(findings: &[PrPatrolFinding], existing: &BTreeSet<&str>) -> Vec<
         let plain=|s:&str| s.replace('&',"&amp;").replace('<',"&lt;").replace('>',"&gt;").replace('@',"@\u{200b}");
         Some(json!({"path":f.file_path,"line":f.start_line,"side":"RIGHT","body":format!("[{:?}] {}\n\n{}\n\n{}\n\n{marker}",f.severity,plain(&f.title),plain(&f.summary),plain(&f.suggested_fix))}))
     }).collect()
+}
+
+fn review_payloads(head_ref_oid: &str, comments: &[Value]) -> Vec<Value> {
+    if comments.is_empty() {
+        return Vec::new();
+    }
+    let total_batches = comments.len().div_ceil(MAX_GITHUB_REVIEW_COMMENTS);
+    comments
+        .chunks(MAX_GITHUB_REVIEW_COMMENTS)
+        .enumerate()
+        .map(|(idx, batch)| {
+            let body = if total_batches == 1 {
+                "Orbit Patrol review".to_string()
+            } else {
+                format!("Orbit Patrol review ({}/{})", idx + 1, total_batches)
+            };
+            json!({
+                "commit_id": head_ref_oid,
+                "event": "COMMENT",
+                "body": body,
+                "comments": batch,
+            })
+        })
+        .collect()
 }
 
 async fn post(
@@ -287,36 +324,33 @@ async fn post(
             "--paginate",
             &format!("{endpoint}/comments?per_page=100"),
             "--jq",
-            r#".[].body | split("\n")[] | select(startswith("<!-- orbit-patrol:"))"#,
+            EXISTING_MARKERS_JQ,
         ],
         None,
         1024 * 1024,
     )
     .await?;
-    let existing = std::str::from_utf8(&bytes)?.lines().collect();
+    let existing = parse_existing_markers(std::str::from_utf8(&bytes)?);
     let comments = new_comments(findings, &existing);
-    if comments.is_empty() {
-        return Ok(());
+    for payload in review_payloads(&pr.head_ref_oid, &comments) {
+        let body = serde_json::to_vec(&payload)?;
+        command(
+            root,
+            "gh",
+            &[
+                "api",
+                "--method",
+                "POST",
+                &format!("{endpoint}/reviews"),
+                "--input",
+                "-",
+                "--silent",
+            ],
+            Some(&body),
+            1024,
+        )
+        .await?;
     }
-    let body = serde_json::to_vec(
-        &json!({"commit_id":pr.head_ref_oid,"event":"COMMENT","body":"Orbit Patrol review","comments":comments}),
-    )?;
-    command(
-        root,
-        "gh",
-        &[
-            "api",
-            "--method",
-            "POST",
-            &format!("{endpoint}/reviews"),
-            "--input",
-            "-",
-            "--silent",
-        ],
-        Some(&body),
-        1024,
-    )
-    .await?;
     Ok(())
 }
 
@@ -359,47 +393,54 @@ async fn run_inner(
     } else {
         None
     };
-    let dir = store.as_ref().map_or(root.as_path(), |t| t.path());
-    let base = match base.or_else(|| pr.as_ref().map(|p| p.base_ref_oid.as_str())) {
-        Some(r) => repository::oid(dir, r).await?,
-        None => repository::default_base(dir).await?,
-    };
-    let head = repository::oid(
-        dir,
-        head.or_else(|| pr.as_ref().map(|p| p.head_ref_oid.as_str()))
-            .unwrap_or("HEAD"),
-    )
-    .await?;
-    if post_github_comments && let Some(pr) = &pr {
-        ensure!(
-            base == pr.base_ref_oid && head == pr.head_ref_oid,
-            "Posting requires the exact PR base and head"
-        );
+    let result = async {
+        let dir = store.as_ref().map_or(root.as_path(), |t| t.path());
+        let base = match base.or_else(|| pr.as_ref().map(|p| p.base_ref_oid.as_str())) {
+            Some(r) => repository::oid(dir, r).await?,
+            None => repository::default_base(dir).await?,
+        };
+        let head = repository::oid(
+            dir,
+            head.or_else(|| pr.as_ref().map(|p| p.head_ref_oid.as_str()))
+                .unwrap_or("HEAD"),
+        )
+        .await?;
+        if post_github_comments && let Some(pr) = &pr {
+            ensure!(
+                base == pr.base_ref_oid && head == pr.head_ref_oid,
+                "Posting requires the exact PR base and head"
+            );
+        }
+        let data = repository::assemble(dir, &base, &head).await?;
+        let backend = ToolFreeLlmBackend::authenticated().await;
+        let reviewer = backend.as_ref().map(|backend| Reviewer { backend });
+        let (count, findings, status) = review(&data, reviewer.as_ref()).await?;
+        if post_github_comments && let (Some(n), Some(p)) = (pr_number, pr.as_ref()) {
+            post(&root, n, p, &findings).await?;
+        }
+        Ok(PrPatrolReport {
+            repo_root: root.display().to_string(),
+            base_ref: base,
+            head_ref: head,
+            pr_number,
+            files_reviewed: data.files.len() as u32,
+            candidates_found: count as u32,
+            dropped_false_positives: count.saturating_sub(findings.len()) as u32,
+            summary: format!(
+                "{status}. {} verified findings in {} reviewed files. {} files skipped.",
+                findings.len(),
+                data.files.len(),
+                data.skipped
+            ),
+            findings,
+            duration_ms: start.elapsed().as_millis() as u64,
+        })
     }
-    let data = repository::assemble(dir, &base, &head).await?;
-    let backend = ToolFreeLlmBackend::authenticated().await;
-    let reviewer = backend.as_ref().map(|backend| Reviewer { backend });
-    let (count, findings, status) = review(&data, reviewer.as_ref()).await?;
-    if post_github_comments && let (Some(n), Some(p)) = (pr_number, pr.as_ref()) {
-        post(&root, n, p, &findings).await?;
+    .await;
+    if let Some(store) = store {
+        store.close().await;
     }
-    Ok(PrPatrolReport {
-        repo_root: root.display().to_string(),
-        base_ref: base,
-        head_ref: head,
-        pr_number,
-        files_reviewed: data.files.len() as u32,
-        candidates_found: count as u32,
-        dropped_false_positives: (count - findings.len()) as u32,
-        summary: format!(
-            "{status}. {} verified findings in {} reviewed files. {} files skipped.",
-            findings.len(),
-            data.files.len(),
-            data.skipped
-        ),
-        findings,
-        duration_ms: start.elapsed().as_millis() as u64,
-    })
+    result
 }
 
 #[cfg(test)]
@@ -590,6 +631,114 @@ fn ordinary() { println!("unsafe {{ value.unwrap() }}"); }
         let rerun = new_comments(&[make(7)?, make(10)?], &existing);
         assert_eq!(rerun.len(), 1);
         assert_eq!(rerun[0]["line"], 10);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reviewer_parses_markdown_fenced_json_responses() -> Result<()> {
+        let fenced_proposals = format!(
+            "```json\n{}\n```",
+            json!([claim("src/lib.rs", 4, "return 1;")])
+        );
+        let fenced_indices = "```\n[0]\n```".to_string();
+        let model = MockModel {
+            replies: Mutex::new([fenced_proposals, fenced_indices].into()),
+            calls: Mutex::new(vec![]),
+        };
+        let reviewer = Reviewer { backend: &model };
+        let proposals: Vec<Proposal> = reviewer
+            .ask("Discover", "diff")
+            .await
+            .context("expected fenced Proposal array to parse")?;
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].file_path, "src/lib.rs");
+        assert_eq!(proposals[0].start_line, 4);
+
+        let indices: BTreeSet<usize> = reviewer
+            .ask("Verify", "claims")
+            .await
+            .context("expected fenced index set to parse")?;
+        assert_eq!(indices, BTreeSet::from([0]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn github_marker_jq_handles_null_bodies_and_chunks_reviews_at_50() -> Result<()> {
+        assert!(EXISTING_MARKERS_JQ.contains("(.[].body // \"\")"));
+
+        // Verify marker line trimming handles CRLF, whitespace, and non-marker noise.
+        let markers = parse_existing_markers(
+            "  <!-- orbit-patrol:aaa111 -->  \r\nignored line\n<!-- orbit-patrol:bbb222 -->\r\n",
+        );
+        assert_eq!(
+            markers,
+            BTreeSet::from([
+                "<!-- orbit-patrol:aaa111 -->",
+                "<!-- orbit-patrol:bbb222 -->",
+            ])
+        );
+
+        // If `jq` is available on the host, execute EXISTING_MARKERS_JQ directly on a null-body payload.
+        let sample_api_json =
+            br#"[{"body":null},{},{"body":"note\r\n  <!-- orbit-patrol:nullsafe123 -->  \r\n"}]"#;
+        let tmp = tempfile::tempdir()?;
+        match command(
+            tmp.path(),
+            "jq",
+            &["-r", EXISTING_MARKERS_JQ],
+            Some(sample_api_json),
+            4096,
+        )
+        .await
+        {
+            Ok(out) => {
+                let text = std::str::from_utf8(&out)?;
+                assert_eq!(
+                    parse_existing_markers(text),
+                    BTreeSet::from(["<!-- orbit-patrol:nullsafe123 -->"])
+                );
+            }
+            Err(err) => {
+                // Only skip the live jq subprocess check when `jq` is not installed in PATH.
+                let not_found = err.chain().any(|cause| {
+                    cause.to_string().contains("No such file or directory")
+                        || cause.to_string().contains("program not found")
+                });
+                assert!(not_found, "jq failed on null-body payload: {err:?}");
+            }
+        }
+
+        // Chunking: 0 -> 0 batches, 50 -> 1 batch, 51 -> [50, 1], 125 -> [50, 50, 25].
+        let make_comments = |n: usize| -> Vec<Value> {
+            (1..=n)
+                .map(
+                    |i| json!({"path":"src/lib.rs","line":i,"side":"RIGHT","body":format!("c{i}")}),
+                )
+                .collect()
+        };
+        let head_oid = "0123456789abcdef0123456789abcdef01234567";
+        assert!(review_payloads(head_oid, &[]).is_empty());
+
+        let exact_50 = review_payloads(head_oid, &make_comments(50));
+        assert_eq!(exact_50.len(), 1);
+        assert_eq!(exact_50[0]["body"], "Orbit Patrol review");
+        assert_eq!(exact_50[0]["comments"].as_array().map(Vec::len), Some(50));
+
+        let batch_125 = review_payloads(head_oid, &make_comments(125));
+        assert_eq!(batch_125.len(), 3);
+        let sizes: Vec<usize> = batch_125
+            .iter()
+            .filter_map(|p| p["comments"].as_array().map(Vec::len))
+            .collect();
+        assert_eq!(sizes, vec![50, 50, 25]);
+        assert!(sizes.iter().all(|&s| s <= MAX_GITHUB_REVIEW_COMMENTS));
+        assert_eq!(batch_125[0]["body"], "Orbit Patrol review (1/3)");
+        assert_eq!(batch_125[2]["body"], "Orbit Patrol review (3/3)");
+        assert!(
+            batch_125
+                .iter()
+                .all(|p| p["commit_id"] == head_oid && p["event"] == "COMMENT")
+        );
         Ok(())
     }
 }

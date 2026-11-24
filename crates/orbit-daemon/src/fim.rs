@@ -14,6 +14,7 @@ use crate::{
 };
 
 const FILE: &str = "fim-config.json";
+const API_KEY_ENV_PREFIX: &str = "ORBIT_FIM_";
 const STOPS: [&str; 3] = ["<|endoftext|>", "<|fim_pad|>", "<|file_sep|>"];
 
 pub(crate) async fn config(home: &Path) -> Result<FimConfig, String> {
@@ -35,32 +36,70 @@ fn endpoint(raw: &str) -> Result<reqwest::Url, String> {
     Ok(url)
 }
 
-pub(crate) async fn update(home: &Path, mut config: FimConfig) -> Result<FimConfig, String> {
-    if let Some(raw) = &config.endpoint_url {
-        endpoint(raw)?;
-    }
-    if let Some(name) = &config.api_key_env
-        && (name.is_empty()
-            || name.len() > 128
-            || matches!(
-                name.as_str(),
-                "ORBIT_MCP_TOKEN"
-                    | "ORBIT_PAIRING_SECRET"
-                    | "ORBIT_RELAY_TOKEN"
-                    | "ORBIT_HOOK_ORIGIN_TOKEN"
-            )
-            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+fn validate_api_key_env(name: &str) -> Result<&str, String> {
+    if name.len() <= API_KEY_ENV_PREFIX.len()
+        || name.len() > 128
+        || !name.starts_with(API_KEY_ENV_PREFIX)
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
     {
-        return Err("Invalid API key environment variable name".into());
+        return Err(
+            "FIM API key environment variable must start with ORBIT_FIM_ and contain only [A-Z0-9_] (<= 128 chars)"
+                .into(),
+        );
     }
-    if config.model.as_ref().is_some_and(|m| {
-        m.trim().is_empty()
-            || m.len() > 256
-            || m.starts_with('-')
-            || m.chars().any(char::is_control)
-    }) {
-        return Err("Invalid FIM model name".into());
+    Ok(name)
+}
+
+fn is_explicit_loopback_host(url: &reqwest::Url) -> bool {
+    let Some(raw) = url.host_str() else {
+        return false;
+    };
+    let host = raw
+        .trim_end_matches('.')
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(raw.trim_end_matches('.'));
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+fn validate_bearer_transport(
+    url: &reqwest::Url,
+    resolved_addrs: Option<&[std::net::SocketAddr]>,
+) -> Result<(), String> {
+    if url.scheme() == "https" {
+        return Ok(());
     }
+    let explicit_loopback = is_explicit_loopback_host(url);
+    let resolved_loopback = resolved_addrs.is_none_or(|addrs| {
+        !addrs.is_empty()
+            && addrs
+                .iter()
+                .all(|addr| addr.ip().to_canonical().is_loopback())
+    });
+    if explicit_loopback && resolved_loopback {
+        return Ok(());
+    }
+    Err(
+        "FIM API keys require an https:// endpoint or explicit loopback host (127.0.0.1, ::1, localhost)"
+            .into(),
+    )
+}
+
+fn validate_model(raw: &str) -> Result<String, String> {
+    orbit_providers::validate_cli_model_name(raw).map_err(|_| "Invalid FIM model name".into())
+}
+
+pub(crate) async fn update(home: &Path, mut config: FimConfig) -> Result<FimConfig, String> {
+    let parsed_endpoint = config.endpoint_url.as_deref().map(endpoint).transpose()?;
+    if let Some(name) = &config.api_key_env {
+        validate_api_key_env(name)?;
+        if let Some(url) = &parsed_endpoint {
+            validate_bearer_transport(url, None)?;
+        }
+    }
+    config.model = config.model.as_deref().map(validate_model).transpose()?;
     config.timeout_ms = config.timeout_ms.clamp(200, 5000);
     config.max_tokens = config.max_tokens.clamp(1, 2048);
     let path = home.join(FILE);
@@ -93,9 +132,27 @@ async fn generate(
     prefix: &str,
     suffix: &str,
 ) -> Result<(String, &'static str), String> {
+    generate_with_env(config, prefix, suffix, |name| std::env::var(name).ok()).await
+}
+
+async fn generate_with_env<F>(
+    config: &FimConfig,
+    prefix: &str,
+    suffix: &str,
+    lookup_env: F,
+) -> Result<(String, &'static str), String>
+where
+    F: FnOnce(&str) -> Option<String>,
+{
     if config.mode == FimMode::Off {
         return Ok((String::new(), "off"));
     }
+    let validated_model = config.model.as_deref().map(validate_model).transpose()?;
+    let validated_api_key_env = config
+        .api_key_env
+        .as_deref()
+        .map(validate_api_key_env)
+        .transpose()?;
     let Some(raw) = &config.endpoint_url else {
         if !config.allow_fast_cli_fallback {
             return Ok((String::new(), "unconfigured"));
@@ -112,7 +169,7 @@ async fn generate(
             .complete(LlmBackendCall {
                 requested_provider: None,
                 agent_provider: None,
-                requested_model: config.model.clone(),
+                requested_model: validated_model,
                 prompt,
                 timeout_ms: config.timeout_ms,
             })
@@ -121,6 +178,9 @@ async fn generate(
         return Ok((text, "fast_cli"));
     };
     let url = endpoint(raw)?;
+    if validated_api_key_env.is_some() {
+        validate_bearer_transport(&url, None)?;
+    }
     let (host, addrs) = resolve_and_validate_http_addrs(&url).await?;
     if addrs
         .iter()
@@ -146,15 +206,16 @@ async fn generate(
     } else {
         json!({"prompt":prefix, "suffix":suffix, "max_tokens":tokens, "temperature":0.0,"stream":false,"stop":STOPS})
     };
-    if let Some(model) = &config.model {
+    if let Some(model) = validated_model {
         payload["model"] = json!(model);
     } else if ollama {
         return Err("Select an installed Ollama FIM model".into());
     }
-    let mut request = client.post(url).json(&payload);
-    if let Some(name) = &config.api_key_env {
+    let mut request = client.post(url.clone()).json(&payload);
+    if let Some(name) = validated_api_key_env {
+        validate_bearer_transport(&url, Some(&addrs))?;
         let key =
-            std::env::var(name).map_err(|_| "FIM API key variable is unavailable".to_string())?;
+            lookup_env(name).ok_or_else(|| "FIM API key variable is unavailable".to_string())?;
         request = request.bearer_auth(key);
     }
     let response = request
@@ -395,6 +456,200 @@ mod tests {
                 .is_err_and(|e| e.contains("307"))
         );
         server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn api_key_env_enforces_orbit_fim_prefix_and_secure_transport() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let overlong = format!("ORBIT_FIM_{}", "A".repeat(119));
+
+        // Non-ORBIT_FIM_ or malformed env names must be rejected in BOTH update() and generate().
+        for bad_env in [
+            "AWS_SECRET_ACCESS_KEY",
+            "GITHUB_TOKEN",
+            "OPENAI_API_KEY",
+            "ORBIT_FIM_",
+            "ORBIT_FIM_lower",
+            "ORBIT_FIM_BAD-NAME",
+            " ORBIT_FIM_API_KEY",
+            overlong.as_str(),
+        ] {
+            let cfg = FimConfig {
+                mode: FimMode::Subtle,
+                endpoint_url: Some("https://api.example.com/v1/completions".into()),
+                api_key_env: Some(bad_env.into()),
+                ..Default::default()
+            };
+            assert!(
+                update(tmp.path(), cfg.clone()).await.is_err(),
+                "update() should reject api_key_env={bad_env:?}"
+            );
+            let mut env_read = false;
+            assert!(
+                generate_with_env(&cfg, "let a = ", ";", |_| {
+                    env_read = true;
+                    Some("leaked".into())
+                })
+                .await
+                .is_err(),
+                "generate() should reject api_key_env={bad_env:?}"
+            );
+            assert!(
+                !env_read,
+                "lookup_env must not be invoked for rejected api_key_env={bad_env:?}"
+            );
+        }
+
+        // Plaintext remote HTTP endpoints must be rejected whenever api_key_env is set.
+        for remote_http in [
+            "http://example.com/v1/completions",
+            "http://192.168.1.50:11434/api/generate",
+        ] {
+            let cfg = FimConfig {
+                mode: FimMode::Subtle,
+                endpoint_url: Some(remote_http.into()),
+                api_key_env: Some("ORBIT_FIM_API_KEY".into()),
+                model: Some("fixture".into()),
+                ..Default::default()
+            };
+            assert!(
+                update(tmp.path(), cfg.clone()).await.is_err(),
+                "update() should reject Bearer over plaintext {remote_http}"
+            );
+            let mut env_read = false;
+            assert!(
+                generate_with_env(&cfg, "let a = ", ";", |_| {
+                    env_read = true;
+                    Some("secret".into())
+                })
+                .await
+                .is_err(),
+                "generate() should reject Bearer over plaintext {remote_http}"
+            );
+            assert!(!env_read);
+        }
+
+        // HTTPS and explicit loopback endpoints (127.0.0.1, ::1, localhost) are allowed.
+        for allowed in [
+            "https://api.example.com/v1/completions",
+            "http://127.0.0.1:11434/v1/completions",
+            "http://[::1]:11434/v1/completions",
+            "http://localhost:11434/v1/completions",
+        ] {
+            let saved = update(
+                tmp.path(),
+                FimConfig {
+                    mode: FimMode::Subtle,
+                    endpoint_url: Some(allowed.into()),
+                    api_key_env: Some("ORBIT_FIM_API_KEY".into()),
+                    model: Some("fixture".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+            assert_eq!(saved.api_key_env.as_deref(), Some("ORBIT_FIM_API_KEY"));
+            let parsed = endpoint(allowed).map_err(anyhow::Error::msg)?;
+            assert!(validate_bearer_transport(&parsed, None).is_ok());
+        }
+
+        // Verify live loopback request attaches Authorization: Bearer when ORBIT_FIM_API_KEY is set.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let addr = listener.local_addr()?;
+        let (auth_tx, mut auth_rx) = mpsc::channel::<Option<String>>(1);
+        let app = Router::new().route(
+            "/v1/completions",
+            post(
+                move |headers: axum::http::HeaderMap, Json(_req): Json<Value>| {
+                    let auth_tx = auth_tx.clone();
+                    async move {
+                        let header = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        let _ = auth_tx.send(header).await;
+                        Json(json!({"choices":[{"text":"42"}]}))
+                    }
+                },
+            ),
+        );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let cfg = FimConfig {
+            mode: FimMode::Subtle,
+            endpoint_url: Some(format!("http://{addr}/v1/completions")),
+            api_key_env: Some("ORBIT_FIM_API_KEY".into()),
+            model: Some("fixture".into()),
+            ..Default::default()
+        };
+        let (text, source) = generate_with_env(&cfg, "let x = ", ";", |name| {
+            (name == "ORBIT_FIM_API_KEY").then(|| "fim-secret-token".to_string())
+        })
+        .await
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(text, "42");
+        assert_eq!(source, "openai");
+        assert_eq!(
+            auth_rx.recv().await.flatten().as_deref(),
+            Some("Bearer fim-secret-token")
+        );
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn model_validation_rejects_leading_whitespace_flag_injection() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        for bad_model in [
+            " --mcp-config",
+            "\t--mcp-config",
+            "-flag",
+            "--strict",
+            "",
+            "   ",
+            "fixture --mcp-config",
+            "fixture\n--flag",
+        ] {
+            let http_cfg = FimConfig {
+                mode: FimMode::Subtle,
+                endpoint_url: Some("http://127.0.0.1:11434/v1/completions".into()),
+                model: Some(bad_model.into()),
+                ..Default::default()
+            };
+            assert!(
+                update(tmp.path(), http_cfg.clone()).await.is_err(),
+                "update() should reject model={bad_model:?}"
+            );
+            assert!(
+                generate(&http_cfg, "let x = ", ";").await.is_err(),
+                "generate() HTTP path should reject model={bad_model:?}"
+            );
+            let cli_cfg = FimConfig {
+                mode: FimMode::Subtle,
+                endpoint_url: None,
+                allow_fast_cli_fallback: true,
+                model: Some(bad_model.into()),
+                ..Default::default()
+            };
+            assert!(
+                generate(&cli_cfg, "let x = ", ";").await.is_err(),
+                "generate() fast_cli path should reject model={bad_model:?}"
+            );
+        }
+
+        let saved = update(
+            tmp.path(),
+            FimConfig {
+                mode: FimMode::Subtle,
+                model: Some("  qwen2.5-coder:7b  ".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(saved.model.as_deref(), Some("qwen2.5-coder:7b"));
         Ok(())
     }
 }

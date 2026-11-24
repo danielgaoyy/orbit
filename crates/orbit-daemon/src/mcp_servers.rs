@@ -604,7 +604,11 @@ impl Drop for TempFileGuard {
     }
 }
 
-fn write_json_atomic(path: &Path, value: &Value, private_mode: bool) -> Result<(), String> {
+fn write_json_atomic(
+    path: &Path,
+    value: &Value,
+    #[cfg_attr(not(unix), allow(unused_variables))] private_mode: bool,
+) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("Invalid config path `{}`", path.display()))?;

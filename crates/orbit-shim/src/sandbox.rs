@@ -409,6 +409,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn native_backend_enforces_read_and_write_rules() -> io::Result<()> {
+        let _guard = crate::tests::SHIM_TEST_LOCK.lock().await;
         if !probe_sandbox_support().kernel_enforced {
             return Ok(());
         }

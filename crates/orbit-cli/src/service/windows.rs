@@ -89,7 +89,7 @@ pub(super) mod native {
             ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
             ServiceType,
         },
-        service_control_handler::{self, ServiceControlHandlerResult},
+        service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle},
         service_dispatcher,
     };
     static START: OnceLock<(ServiceRole, PathBuf)> = OnceLock::new();
@@ -142,9 +142,13 @@ pub(super) mod native {
     }
     fn task_name(sid: &str, home: &Path) -> String {
         use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
         let norm = home.to_string_lossy().to_ascii_lowercase();
         let digest = Sha256::digest(norm.as_bytes());
-        let short = hex::encode(&digest[..8]);
+        let mut short = String::with_capacity(16);
+        for b in &digest[..8] {
+            let _ = write!(short, "{b:02x}");
+        }
         format!("Orbit-Daemon-{sid}-{short}")
     }
     fn marker(home: &Path, role: ServiceRole) -> PathBuf {
@@ -271,6 +275,26 @@ pub(super) mod native {
     fn service_main(_: Vec<OsString>) {
         let _ = worker();
     }
+    fn report_status(
+        handler: ServiceStatusHandle,
+        state: ServiceState,
+        code: u32,
+        wait_hint: Duration,
+    ) -> windows_service::Result<()> {
+        handler.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            controls_accepted: if state == ServiceState::Running {
+                ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
+            } else {
+                ServiceControlAccept::empty()
+            },
+            exit_code: ServiceExitCode::Win32(code),
+            checkpoint: 0,
+            wait_hint,
+            process_id: None,
+        })
+    }
     fn worker() -> anyhow::Result<()> {
         let (role, home) = START
             .get()
@@ -287,26 +311,11 @@ pub(super) mod native {
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
         })?;
-        let report = |state, code, wait_hint| {
-            handler.set_service_status(ServiceStatus {
-                service_type: ServiceType::OWN_PROCESS,
-                current_state: state,
-                controls_accepted: if state == ServiceState::Running {
-                    ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
-                } else {
-                    ServiceControlAccept::empty()
-                },
-                exit_code: ServiceExitCode::Win32(code),
-                checkpoint: 0,
-                wait_hint,
-                process_id: None,
-            })
-        };
         let rt = tokio::runtime::Builder::new_multi_thread()
             .thread_stack_size(8 * 1024 * 1024)
             .enable_all()
             .build()?;
-        report(ServiceState::Running, 0, Duration::ZERO)?;
+        report_status(handler, ServiceState::Running, 0, Duration::ZERO)?;
         let result = rt.block_on(async {
             let exporter = crate::setup_logging(home, *role == ServiceRole::Daemon)?;
             match role {
@@ -319,9 +328,14 @@ pub(super) mod native {
                             .unwrap_or_else(super::super::default_daemon_listen),
                         relay_url: persisted.relay_url,
                     };
-                    orbit_daemon::run_daemon_until(config, exporter, async {
+                    orbit_daemon::run_daemon_until(config, exporter, async move {
                         let _ = rx.await;
-                        let _ = report(ServiceState::StopPending, 0, Duration::from_secs(15));
+                        let _ = report_status(
+                            handler,
+                            ServiceState::StopPending,
+                            0,
+                            Duration::from_secs(15),
+                        );
                     })
                     .await
                 }
@@ -337,14 +351,20 @@ pub(super) mod native {
                     tokio::select! {
                         result = orbit_relay::run_relay(config) => result,
                         _ = rx => {
-                            let _ = report(ServiceState::StopPending, 0, Duration::from_secs(15));
+                            let _ = report_status(
+                                handler,
+                                ServiceState::StopPending,
+                                0,
+                                Duration::from_secs(15),
+                            );
                             Ok(())
                         }
                     }
                 }
             }
         });
-        report(
+        report_status(
+            handler,
             ServiceState::Stopped,
             u32::from(result.is_err()),
             Duration::ZERO,

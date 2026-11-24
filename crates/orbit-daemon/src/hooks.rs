@@ -1079,7 +1079,7 @@ impl Drop for TempFileGuard {
 fn write_json_atomic<T: Serialize>(
     path: &Path,
     value: &T,
-    private_mode: bool,
+    #[cfg_attr(not(unix), allow(unused_variables))] private_mode: bool,
 ) -> Result<String, String> {
     let parent = path
         .parent()

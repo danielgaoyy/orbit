@@ -2771,10 +2771,11 @@ fn spawn_optional_parent_watchdog(spec: &ShimSpawnSpec, kill_tx: mpsc::Sender<()
 mod tests {
     use super::*;
 
-    // On macOS, `UnixListener::bind` lacks atomic `SOCK_CLOEXEC`, so concurrent `fork()` calls
-    // from sibling tests in the same binary can momentarily inherit a test listener FD before
-    // `fcntl(FD_CLOEXEC)` runs. Serialize fork-spawning / socket-cleanup tests cleanly.
-    static SHIM_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // Serialize fork-spawning / socket-cleanup tests cleanly across Unix platforms:
+    // on macOS `UnixListener::bind` lacks atomic `SOCK_CLOEXEC`, and on Linux a concurrent
+    // sibling test's `fork()` holds a transient reference to a newly dropped listener FD until
+    // `execve()` closes `SOCK_CLOEXEC` descriptors.
+    pub(crate) static SHIM_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[cfg(unix)]
     #[tokio::test]

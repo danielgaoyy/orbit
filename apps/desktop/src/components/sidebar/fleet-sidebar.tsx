@@ -488,7 +488,10 @@ export const FleetSidebar = memo(function FleetSidebar() {
   };
 
   return (
-    <aside className="bg-surface-base flex h-full w-full flex-col select-none">
+    <aside
+      data-orbit-sidebar="true"
+      className="bg-surface-base flex h-full w-full flex-col select-none"
+    >
       {/* 1. Native Window Titlebar Drag Strip (`40px`; `[◫]` lives left in shell, symmetric `[🔍]` lives right) */}
       <div className="flex h-[40px] shrink-0 items-center pr-2">
         <div data-tauri-drag-region className="h-full flex-1" />
@@ -496,7 +499,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
           size="md"
           active={showFilterBar}
           tooltip={t("sidebar.filterThreadsAria")}
-          shortcut={`${mod}F`}
+          shortcut={`${mod}⇧F`}
           indicatorTone={isFilteringThreads ? "info" : "none"}
           onMouseDown={(e) => {
             if (showFilterBar && !isFilteringThreads) {

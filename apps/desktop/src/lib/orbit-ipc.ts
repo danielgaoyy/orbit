@@ -666,11 +666,27 @@ export interface ConversationSearchHit {
   host_name: string;
   agent_id: string;
   seq: number;
+  turn_id?: string | null;
   role: string;
   title: string;
   project_name: string;
   snippet: string;
   updated_at_rfc3339: string;
+  is_remote?: boolean;
+  is_unloaded?: boolean;
+}
+
+export interface SearchMessagesRemoteRequest {
+  query: string;
+  hostId?: string | null;
+  agentId?: string | null;
+  limit?: number;
+}
+
+export interface SearchMessagesRemoteResponse {
+  hits: ConversationSearchHit[];
+  remote_hosts_queried: number;
+  remote_hosts_failed: number;
 }
 
 export type ExportFormat = "markdown" | "json" | "html";
@@ -5752,6 +5768,24 @@ export const orbitIpc = {
     return invoke<ConversationSearchHit[]>("search_messages", {
       query: trimmed,
       limit,
+    });
+  },
+
+  searchMessagesRemote: async (
+    req: SearchMessagesRemoteRequest,
+  ): Promise<SearchMessagesRemoteResponse> => {
+    if (!isTauriRuntime()) {
+      return { hits: [], remote_hosts_queried: 0, remote_hosts_failed: 0 };
+    }
+    const trimmed = req.query.trim();
+    if (!trimmed) {
+      return { hits: [], remote_hosts_queried: 0, remote_hosts_failed: 0 };
+    }
+    return invoke<SearchMessagesRemoteResponse>("search_messages_remote", {
+      query: trimmed,
+      hostId: req.hostId ?? null,
+      agentId: req.agentId ?? null,
+      limit: req.limit ?? null,
     });
   },
 

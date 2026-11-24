@@ -658,6 +658,7 @@ export function createDefaultInitialState(
     sidebarProjectSort: initialPrefs.sidebarProjectSort ?? "recent",
     sidebarThreadFilter: initialPrefs.sidebarThreadFilter ?? "all",
     sidebarFilterFocusNonce: 0,
+    stageFindFocusNonce: 0,
 
     terminalTabs: [],
     activeTerminalTabKey: null,

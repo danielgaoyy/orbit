@@ -247,6 +247,10 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
             total_always_tokens: 0,
             token_budget_warning: false,
           };
+        case "search_messages":
+          return [];
+        case "search_messages_remote":
+          return { hits: [], remote_hosts_queried: 0, remote_hosts_failed: 0 };
         case "get_context_occupancy":
           return {
             agent_id: args.agentId ?? "ag_smoke_1",

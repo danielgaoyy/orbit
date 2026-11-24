@@ -3,7 +3,9 @@ import {
   hasOpenSettingsBlockingOverlay,
   isFocusInsideCodeEditor,
   isFocusInsideFileViewerPane,
+  isFocusInsideSidebar,
   isFocusInsideSidePanel,
+  resolveGlobalFindAction,
   shouldCloseSettingsOnEscape,
   SIDE_PANEL_SELECTOR,
 } from "@/lib/file-viewer-shortcuts";
@@ -57,15 +59,15 @@ export function useGlobalErgonomicKeybindings(): void {
         return;
       }
 
-      // 1a. Filter Sidebar Conversations (`⌘F` / `Ctrl+F`) — yield to terminal search, Side Panel / File Viewer, & modal overlays
-      if (mod && !e.shiftKey && !e.altKey && keyLower === "f" && !snap.terminalFocused) {
+      // 1a. Focus-aware Find (`⌘F` / `Ctrl+F`) and Sidebar Filter (`⌘⇧F` / `Ctrl+Shift+F`)
+      //     Yields cleanly to Terminal search, Right Side Panel / File Viewer, & modal overlays;
+      //     focuses Sidebar filter when inside Sidebar (or on `⌘⇧F`); otherwise opens in-session `StageFindBar`.
+      if (mod && !e.altKey && keyLower === "f") {
         const sidePanelEl = document.querySelector<HTMLElement>(SIDE_PANEL_SELECTOR);
         const focusInsideSidePanelOrFileViewer =
           isFocusInsideSidePanel(e.target, document.activeElement) ||
           isFocusInsideFileViewerPane(sidePanelEl, e.target, document.activeElement);
-        if (focusInsideSidePanelOrFileViewer) {
-          return;
-        }
+        const focusInsideSidebar = isFocusInsideSidebar(e.target, document.activeElement);
         const isOverlayOpen =
           snap.activeView === "settings" ||
           snap.commandPaletteOpen ||
@@ -82,7 +84,27 @@ export function useGlobalErgonomicKeybindings(): void {
               '[data-slot="dialog-content"], [role="dialog"], [role="alertdialog"]',
             ),
           );
-        if (!isOverlayOpen) {
+        const hasOpenConversation = Boolean(
+          snap.selectedHostId && snap.selectedAgentId && !snap.isDraftNewSession,
+        );
+        const findAction = resolveGlobalFindAction({
+          mod,
+          shiftKey: e.shiftKey,
+          altKey: e.altKey,
+          keyLower,
+          terminalFocused: snap.terminalFocused,
+          focusInsideSidePanel: focusInsideSidePanelOrFileViewer,
+          focusInsideSidebar,
+          isOverlayOpen,
+          hasOpenConversation,
+        });
+        if (findAction === "stage_find") {
+          e.preventDefault();
+          if (e.repeat) return;
+          orbitActions.openStageFind();
+          return;
+        }
+        if (findAction === "sidebar_filter") {
           e.preventDefault();
           if (e.repeat) return;
           orbitActions.focusSidebarFilter();

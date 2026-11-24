@@ -475,6 +475,7 @@ export interface OrbitUiState {
   sidebarProjectSort: SidebarProjectSort;
   sidebarThreadFilter: SidebarThreadFilter;
   sidebarFilterFocusNonce: number;
+  stageFindFocusNonce: number;
 
   // Persistent Multi-Slot PTY Sessions (rendered inside Side Panel Terminal tab)
   terminalTabs: TerminalTabSession[];

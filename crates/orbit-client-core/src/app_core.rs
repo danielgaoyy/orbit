@@ -29,13 +29,13 @@ use orbit_protocol::{
     PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
     PushDeviceRecord, PushPlatform, PushPreferences, QuestionItem, QueuedPromptView,
-    ReasoningEffort, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode,
-    SkillWriteScope, TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelineOutlinePrompt,
-    TimelinePayload, TimerCondition, ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot,
-    WireMessage, WorkflowRunRecord, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion,
-    WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent,
-    WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome,
-    WorktreeHandoffPreview,
+    ReasoningEffort, RemoteMessageSearchHit, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec,
+    ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame, TerminalSummary,
+    TimelineEvent, TimelineOutlinePrompt, TimelinePayload, TimerCondition, ToolCallDetail,
+    ToolCallStatus, UsageInsightsSnapshot, WireMessage, WorkflowRunRecord, WorkspaceBoardSnapshot,
+    WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
+    WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode,
+    WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -62,8 +62,9 @@ pub use crate::contract::{
     InstructionFilesSnapshotView, LifecycleHooksSnapshotView, ListInstructionFilesRequest,
     MatchPathRulesRequest, MatchedPathRulesView, PathRulesSnapshotView,
     PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RenameWorkspaceEntryRequest,
-    SaveInstructionFileRequest, SelectBestOfNWinnerRequest, StartBatchFanoutRequest,
-    StartBestOfNRequest, StartDagWorkflowRequest, StartGoalRunRequest, StartMonitorWatchRequest,
+    SaveInstructionFileRequest, SearchMessagesRequest, SearchMessagesResponse,
+    SelectBestOfNWinnerRequest, StartBatchFanoutRequest, StartBestOfNRequest,
+    StartDagWorkflowRequest, StartGoalRunRequest, StartMonitorWatchRequest,
     StopMonitorWatchRequest, UpsertArtifactRequest, UpsertEventTriggerRequest,
     UpsertExternalMcpServerRequest, UpsertPathRuleRequest, WorkspaceEntryMutationResultView,
     WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
@@ -1013,6 +1014,9 @@ type PendingManagedSkillsListEntry = (
 type PendingSymbolSearchTx =
     tokio::sync::oneshot::Sender<Result<(Vec<orbit_protocol::WorkspaceSymbolEntry>, bool), String>>;
 
+type PendingMessageSearchTx =
+    tokio::sync::oneshot::Sender<Result<Vec<RemoteMessageSearchHit>, String>>;
+
 type PendingGitMutationTx =
     tokio::sync::oneshot::Sender<Result<(GitMutationOutcome, bool), String>>;
 
@@ -1042,6 +1046,7 @@ struct HostMemoryState {
     pending_file_reads:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<RawFileReadResponse, String>>>,
     pending_symbol_searches: HashMap<Uuid, PendingSymbolSearchTx>,
+    pending_message_searches: HashMap<Uuid, PendingMessageSearchTx>,
     pending_file_writes:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<WorkspaceFileWriteResultView, String>>>,
     pending_file_mutations: HashMap<
@@ -1275,6 +1280,7 @@ impl HostMemoryState {
             pending_attachment_acks: HashMap::new(),
             pending_file_reads: HashMap::new(),
             pending_symbol_searches: HashMap::new(),
+            pending_message_searches: HashMap::new(),
             pending_file_writes: HashMap::new(),
             pending_file_mutations: HashMap::new(),
             pending_instruction_lists: HashMap::new(),
@@ -3542,21 +3548,275 @@ impl OrbitAppCore {
             return Vec::new();
         }
 
+        let candidates: Vec<CandidateSearchHit> = raw_hits
+            .into_iter()
+            .map(CandidateSearchHit::from_local)
+            .collect();
+        self.enrich_search_candidates(candidates, max_hits)
+    }
+
+    /// Hybrid local-replica + concurrent remote-daemon full-history SQLite FTS5 search.
+    ///
+    /// - Queries local `client_timeline_fts` immediately so offline/slow hosts never drop local hits.
+    /// - Fans out `WireMessage::SearchMessages` concurrently to every relevant online host with a
+    ///   tight `2500ms` timeout per host.
+    /// - Merges and deduplicates by `(host_id, agent_id, seq)`, ranks by BM25 + recency, and tags
+    ///   `is_remote` / `is_unloaded` so clicking an un-replicated historical turn auto-paginates
+    ///   directly to that `seq`.
+    pub async fn search_messages_remote(
+        self: &Arc<Self>,
+        req: SearchMessagesRequest,
+    ) -> SearchMessagesResponse {
+        const REMOTE_SEARCH_TIMEOUT: Duration = Duration::from_millis(2500);
+
+        let q = req.query.trim().to_string();
+        if q.is_empty() {
+            return SearchMessagesResponse::default();
+        }
+        if matches!(req.limit, Some(0)) {
+            return SearchMessagesResponse::default();
+        }
+        let host_filter = req
+            .host_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let agent_filter = req
+            .agent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let max_hits = match req.limit {
+            Some(n) => (n as usize).clamp(1, 100),
+            None => {
+                if agent_filter.is_some() {
+                    100
+                } else {
+                    20
+                }
+            }
+        };
+
+        // 1. Local SQLite replica search (fast, local-first)
+        let local_raw = if let Some(ref aid) = agent_filter {
+            self.store
+                .search_replica_messages_for_agent(&q, host_filter.as_deref(), aid, max_hits)
+        } else {
+            self.store
+                .search_replica_messages_for_host(&q, host_filter.as_deref(), max_hits)
+        };
+        let local_candidates: Vec<CandidateSearchHit> = match local_raw {
+            Ok(hits) => hits
+                .into_iter()
+                .map(CandidateSearchHit::from_local)
+                .collect(),
+            Err(err) => {
+                tracing::warn!(query = %q, error = %err, "local replica FTS5 search failed");
+                Vec::new()
+            }
+        };
+
+        // 2. Identify online target hosts to fan out `WireMessage::SearchMessages`
+        let targets: Vec<(String, HostSessionHandle)> = match self.hosts.read() {
+            Ok(guard) => {
+                if let Some(ref hid) = host_filter {
+                    guard
+                        .get(hid)
+                        .and_then(|h| h.session.clone().map(|s| (hid.clone(), s)))
+                        .into_iter()
+                        .collect()
+                } else if let Some(ref aid) = agent_filter {
+                    let exact: Vec<(String, HostSessionHandle)> = guard
+                        .iter()
+                        .filter_map(|(hid, h)| {
+                            if h.agents.contains_key(aid) {
+                                h.session.clone().map(|s| (hid.clone(), s))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if !exact.is_empty() {
+                        exact
+                    } else {
+                        guard
+                            .iter()
+                            .filter_map(|(hid, h)| h.session.clone().map(|s| (hid.clone(), s)))
+                            .collect()
+                    }
+                } else {
+                    guard
+                        .iter()
+                        .filter_map(|(hid, h)| h.session.clone().map(|s| (hid.clone(), s)))
+                        .collect()
+                }
+            }
+            Err(_) => Vec::new(),
+        };
+
+        // 3. Fan out concurrently onto `self.runtime` with a tight 2500ms timeout per host
+        let (remote_candidates, remote_hosts_queried, remote_hosts_failed) = if targets.is_empty() {
+            (Vec::new(), 0u32, 0u32)
+        } else {
+            let core = Arc::clone(self);
+            let q_owned = q.clone();
+            let agent_owned = agent_filter.clone();
+            let limit_u32 = max_hits as u32;
+            let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+            self.runtime.spawn(async move {
+                let futs = targets.into_iter().map(|(target_host_id, session)| {
+                    let core = Arc::clone(&core);
+                    let query = q_owned.clone();
+                    let agent_id = agent_owned.clone();
+                    async move {
+                        let req_id = Uuid::new_v4();
+                        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+                        let registered = match core.hosts.write() {
+                            Ok(mut guard) => match guard.get_mut(&target_host_id) {
+                                Some(h) if h.session.is_some() => {
+                                    h.pending_message_searches.insert(req_id, ack_tx);
+                                    true
+                                }
+                                _ => false,
+                            },
+                            Err(_) => false,
+                        };
+                        if !registered {
+                            return (target_host_id, Err("host disconnected".to_string()));
+                        }
+
+                        let send_res = session
+                            .send_wire(WireMessage::SearchMessages {
+                                request_id: req_id,
+                                query,
+                                agent_id,
+                                limit: Some(limit_u32),
+                            })
+                            .await;
+                        if let Err(err) = send_res {
+                            if let Ok(mut guard) = core.hosts.write()
+                                && let Some(h) = guard.get_mut(&target_host_id)
+                            {
+                                h.pending_message_searches.remove(&req_id);
+                            }
+                            return (target_host_id, Err(format!("send failed: {err}")));
+                        }
+
+                        match tokio::time::timeout(REMOTE_SEARCH_TIMEOUT, ack_rx).await {
+                            Ok(Ok(Ok(hits))) => (target_host_id, Ok(hits)),
+                            Ok(Ok(Err(rpc_err))) => (target_host_id, Err(rpc_err)),
+                            Ok(Err(_)) => (target_host_id, Err("host disconnected".to_string())),
+                            Err(_) => {
+                                if let Ok(mut guard) = core.hosts.write()
+                                    && let Some(h) = guard.get_mut(&target_host_id)
+                                {
+                                    h.pending_message_searches.remove(&req_id);
+                                }
+                                (target_host_id, Err("timed out".to_string()))
+                            }
+                        }
+                    }
+                });
+
+                let outcomes = futures_util::future::join_all(futs).await;
+                let mut merged_remote = Vec::new();
+                let mut queried = 0u32;
+                let mut failed = 0u32;
+                for (hid, outcome) in outcomes {
+                    match outcome {
+                        Ok(hits) => {
+                            queried += 1;
+                            for h in hits {
+                                merged_remote.push(CandidateSearchHit::from_remote(hid.clone(), h));
+                            }
+                        }
+                        Err(err) => {
+                            failed += 1;
+                            tracing::debug!(
+                                host_id = %hid,
+                                error = %err,
+                                "remote FTS5 SearchMessages skipped for host"
+                            );
+                        }
+                    }
+                }
+                let _ = res_tx.send((merged_remote, queried, failed));
+            });
+
+            res_rx.await.unwrap_or_else(|_| (Vec::new(), 0, 0))
+        };
+
+        // 4. Resolve empty host_id on local candidates before deduping against remote hits
+        let resolved_local = self.resolve_local_candidate_host_ids(local_candidates);
+
+        // 5. Merge, deduplicate by `(host_id, agent_id, seq)`, rank by BM25 + recency, and enrich
+        let merged =
+            merge_and_rank_search_candidates(resolved_local, remote_candidates, Utc::now());
+        let hits = self.enrich_search_candidates(merged, max_hits);
+
+        SearchMessagesResponse {
+            hits,
+            remote_hosts_queried,
+            remote_hosts_failed,
+        }
+    }
+
+    pub fn search_messages_remote_blocking(
+        self: &Arc<Self>,
+        req: SearchMessagesRequest,
+    ) -> SearchMessagesResponse {
+        self.runtime.block_on(self.search_messages_remote(req))
+    }
+
+    fn resolve_local_candidate_host_ids(
+        &self,
+        candidates: Vec<CandidateSearchHit>,
+    ) -> Vec<CandidateSearchHit> {
+        let Ok(hosts_guard) = self.hosts.read() else {
+            return candidates;
+        };
+        candidates
+            .into_iter()
+            .map(|mut c| {
+                if c.host_id.is_empty()
+                    && let Some((hid, _)) = hosts_guard
+                        .iter()
+                        .find(|(_, mem)| mem.agents.contains_key(&c.agent_id))
+                {
+                    c.host_id = hid.clone();
+                }
+                c
+            })
+            .collect()
+    }
+
+    fn enrich_search_candidates(
+        &self,
+        candidates: Vec<CandidateSearchHit>,
+        max_hits: usize,
+    ) -> Vec<ConversationSearchHit> {
+        if candidates.is_empty() || max_hits == 0 {
+            return Vec::new();
+        }
         let Ok(hosts_guard) = self.hosts.read() else {
             return Vec::new();
         };
         let projects_guard = self.projects.read().ok();
-        let mut results = Vec::with_capacity(raw_hits.len());
+        let mut results = Vec::with_capacity(candidates.len().min(max_hits));
 
-        for hit in raw_hits {
-            let matched_pair = if !hit.host_id.is_empty() {
+        for cand in candidates {
+            let matched_pair = if !cand.host_id.is_empty() {
                 hosts_guard
-                    .get(&hit.host_id)
-                    .map(|mem| (hit.host_id.as_str(), mem))
+                    .get(&cand.host_id)
+                    .map(|mem| (cand.host_id.as_str(), mem))
             } else {
                 hosts_guard
                     .iter()
-                    .find(|(_, mem)| mem.agents.contains_key(&hit.agent_id))
+                    .find(|(_, mem)| mem.agents.contains_key(&cand.agent_id))
                     .map(|(hid, mem)| (hid.as_str(), mem))
             };
 
@@ -3566,63 +3826,108 @@ impl OrbitAppCore {
             if hid.is_empty() {
                 continue;
             }
-            let Some(ag) = mem.agents.get(&hit.agent_id) else {
+
+            let mem_agent = mem.agents.get(&cand.agent_id);
+            // Local-only orphan FTS rows whose agent no longer exists on the host must never surface.
+            if mem_agent.is_none() && !cand.from_remote {
                 continue;
-            };
+            }
 
             let resolved_host_id = hid.to_string();
             let mut host_name = mem.profile.effective_display_name();
             if host_name.is_empty() {
                 host_name = resolved_host_id.clone();
             }
-            let title = if ag.title.trim().is_empty() {
-                "Conversation".to_string()
+
+            let title = if let Some(ag) = mem_agent {
+                if ag.title.trim().is_empty() {
+                    cand.agent_title
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("Conversation")
+                        .to_string()
+                } else {
+                    ag.title.clone()
+                }
             } else {
-                ag.title.clone()
+                cand.agent_title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Conversation")
+                    .to_string()
             };
-            let mut updated_at_rfc3339 = hit.timestamp_rfc3339.clone().unwrap_or_default();
-            if updated_at_rfc3339.is_empty() {
+
+            let mut updated_at_rfc3339 = cand.timestamp_rfc3339.clone().unwrap_or_default();
+            if updated_at_rfc3339.is_empty()
+                && let Some(ag) = mem_agent
+            {
                 updated_at_rfc3339 = ag.last_activity_at.unwrap_or(ag.updated_at).to_rfc3339();
             }
-            let effective_cwd = mem
-                .workspaces
-                .iter()
-                .find(|w| w.workspace_id == ag.workspace_id)
-                .and_then(|w| {
-                    w.project_root
-                        .as_deref()
-                        .or(w.source_cwd.as_deref())
-                        .or(Some(w.cwd.as_str()))
+
+            let fallback_cwd = cand.cwd.as_deref().unwrap_or("");
+            let ag_cwd = mem_agent.map(|ag| ag.cwd.as_str()).unwrap_or(fallback_cwd);
+            let effective_cwd = mem_agent
+                .and_then(|ag| {
+                    mem.workspaces
+                        .iter()
+                        .find(|w| w.workspace_id == ag.workspace_id)
+                        .and_then(|w| {
+                            w.project_root
+                                .as_deref()
+                                .or(w.source_cwd.as_deref())
+                                .or(Some(w.cwd.as_str()))
+                        })
                 })
-                .unwrap_or(ag.cwd.as_str());
+                .unwrap_or(ag_cwd);
 
             let mut project_name = String::new();
             if let Some(ref projects) = projects_guard
                 && let Some(proj) = projects.values().find(|p| {
                     p.host_id == resolved_host_id
                         && p.directories.iter().any(|dir| {
-                            cwd_paths_equivalent(effective_cwd, dir)
-                                || cwd_paths_equivalent(&ag.cwd, dir)
+                            (!effective_cwd.is_empty() && cwd_paths_equivalent(effective_cwd, dir))
+                                || (!ag_cwd.is_empty() && cwd_paths_equivalent(ag_cwd, dir))
                         })
                 })
             {
                 project_name = proj.name.clone();
             }
-            if project_name.is_empty() {
+            if project_name.is_empty() && !effective_cwd.is_empty() {
                 project_name = crate::sidebar::basename_of_project_path(effective_cwd);
             }
+
+            let is_unloaded = match mem.timelines.get(&cand.agent_id) {
+                Some(evs) if !evs.is_empty() => {
+                    let oldest_loaded_seq = evs
+                        .iter()
+                        .filter(|e| e.seq > 0)
+                        .map(|e| e.seq)
+                        .min()
+                        .unwrap_or(0);
+                    oldest_loaded_seq > 0 && cand.seq < oldest_loaded_seq
+                }
+                _ => !cand.from_local,
+            };
 
             results.push(ConversationSearchHit {
                 host_id: resolved_host_id,
                 host_name,
-                agent_id: hit.agent_id,
-                seq: hit.seq,
-                role: hit.role,
+                agent_id: cand.agent_id,
+                seq: cand.seq,
+                turn_id: cand.turn_id,
+                role: cand.role,
                 title,
                 project_name,
-                snippet: hit.snippet,
+                snippet: cand.snippet,
                 updated_at_rfc3339,
+                is_remote: cand.from_remote && !cand.from_local,
+                is_unloaded,
             });
+            if results.len() >= max_hits {
+                break;
+            }
         }
         results
     }
@@ -6570,6 +6875,11 @@ impl OrbitAppCore {
                         let _ = tx.send(Ok((symbols, truncated)));
                     }
                 }
+                WireMessage::SearchMessagesResult { request_id, hits } => {
+                    if let Some(tx) = state.pending_message_searches.remove(&request_id) {
+                        let _ = tx.send(Ok(hits));
+                    }
+                }
                 WireMessage::WorkspaceFileContentResponse {
                     request_id,
                     resolved_path,
@@ -7217,6 +7527,10 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_symbol_searches.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_message_searches.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -19975,6 +20289,145 @@ fn collect_provider_subagent_resubscriptions(h: &HostMemoryState) -> Vec<(String
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct CandidateSearchHit {
+    host_id: String,
+    agent_id: String,
+    seq: u64,
+    turn_id: Option<String>,
+    role: String,
+    snippet: String,
+    timestamp_rfc3339: Option<String>,
+    bm25_score: f64,
+    agent_title: Option<String>,
+    cwd: Option<String>,
+    from_local: bool,
+    from_remote: bool,
+}
+
+impl CandidateSearchHit {
+    fn from_local(hit: orbit_store::MessageSearchHit) -> Self {
+        Self {
+            host_id: hit.host_id,
+            agent_id: hit.agent_id,
+            seq: hit.seq,
+            turn_id: hit.turn_id,
+            role: hit.role,
+            snippet: hit.snippet,
+            timestamp_rfc3339: hit.timestamp_rfc3339,
+            bm25_score: if hit.rank.is_finite() { hit.rank } else { 0.0 },
+            agent_title: None,
+            cwd: None,
+            from_local: true,
+            from_remote: false,
+        }
+    }
+
+    fn from_remote(host_id: String, hit: RemoteMessageSearchHit) -> Self {
+        Self {
+            host_id,
+            agent_id: hit.agent_id,
+            seq: hit.seq,
+            turn_id: hit.turn_id,
+            role: hit.role,
+            snippet: hit.snippet,
+            timestamp_rfc3339: hit.timestamp,
+            bm25_score: if hit.bm25_score.is_finite() {
+                hit.bm25_score
+            } else {
+                0.0
+            },
+            agent_title: (!hit.agent_title.trim().is_empty()).then_some(hit.agent_title),
+            cwd: (!hit.cwd.trim().is_empty()).then_some(hit.cwd),
+            from_local: false,
+            from_remote: true,
+        }
+    }
+}
+
+/// Lower score = better rank, preserving SQLite FTS5 BM25 convention (more negative is stronger)
+/// while adding a gentle bounded recency bonus (`[-0.35, 0.0]`) so near-ties favor fresh hits.
+fn combined_search_rank_score(
+    bm25_score: f64,
+    timestamp_rfc3339: Option<&str>,
+    now: chrono::DateTime<Utc>,
+) -> f64 {
+    let base = if bm25_score.is_finite() {
+        bm25_score
+    } else {
+        0.0
+    };
+    let recency_bonus = timestamp_rfc3339
+        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        .map(|dt| {
+            let age_secs = (now - dt.with_timezone(&Utc)).num_seconds().max(0) as f64;
+            let age_days = age_secs / 86_400.0;
+            -0.35 / (1.0 + age_days / 7.0)
+        })
+        .unwrap_or(0.0);
+    base + recency_bonus
+}
+
+/// Merge local replica and remote daemon hits, deduplicating by `(host_id, agent_id, seq)` and
+/// ranking deterministically by BM25 + recency.
+fn merge_and_rank_search_candidates(
+    local: Vec<CandidateSearchHit>,
+    remote: Vec<CandidateSearchHit>,
+    now: chrono::DateTime<Utc>,
+) -> Vec<CandidateSearchHit> {
+    let mut by_key: HashMap<(String, String, u64), CandidateSearchHit> =
+        HashMap::with_capacity(local.len() + remote.len());
+
+    for cand in local {
+        let key = (cand.host_id.clone(), cand.agent_id.clone(), cand.seq);
+        by_key.entry(key).or_insert(cand);
+    }
+
+    for cand in remote {
+        let key = (cand.host_id.clone(), cand.agent_id.clone(), cand.seq);
+        if let Some(existing) = by_key.get_mut(&key) {
+            existing.from_remote = true;
+            if cand.bm25_score.is_finite() && cand.bm25_score < existing.bm25_score {
+                existing.bm25_score = cand.bm25_score;
+            }
+            if existing.turn_id.is_none() && cand.turn_id.is_some() {
+                existing.turn_id = cand.turn_id;
+            }
+            if existing
+                .timestamp_rfc3339
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+                && cand.timestamp_rfc3339.is_some()
+            {
+                existing.timestamp_rfc3339 = cand.timestamp_rfc3339;
+            }
+            if existing.snippet.trim().is_empty() && !cand.snippet.trim().is_empty() {
+                existing.snippet = cand.snippet;
+            }
+            if existing.agent_title.is_none() && cand.agent_title.is_some() {
+                existing.agent_title = cand.agent_title;
+            }
+            if existing.cwd.is_none() && cand.cwd.is_some() {
+                existing.cwd = cand.cwd;
+            }
+        } else {
+            by_key.insert(key, cand);
+        }
+    }
+
+    let mut merged: Vec<CandidateSearchHit> = by_key.into_values().collect();
+    merged.sort_by(|a, b| {
+        let sa = combined_search_rank_score(a.bm25_score, a.timestamp_rfc3339.as_deref(), now);
+        let sb = combined_search_rank_score(b.bm25_score, b.timestamp_rfc3339.as_deref(), now);
+        sa.total_cmp(&sb)
+            .then_with(|| b.seq.cmp(&a.seq))
+            .then_with(|| a.host_id.cmp(&b.host_id))
+            .then_with(|| a.agent_id.cmp(&b.agent_id))
+    });
+    merged
+}
+
 fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     for (_, tx) in h.pending_attachment_acks.drain() {
         let _ = tx.send(Err(reason.to_string()));
@@ -19983,6 +20436,9 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_symbol_searches.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_message_searches.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_file_writes.drain() {
@@ -26243,6 +26699,323 @@ mod tests {
                 .is_empty(),
             "orphaned host/agent FTS rows must never surface in search_messages"
         );
+    }
+
+    #[test]
+    fn merge_and_rank_search_candidates_dedupes_and_ranks_by_bm25_and_recency() {
+        let now = Utc::now();
+        let old_ts = (now - chrono::Duration::days(60)).to_rfc3339();
+        let fresh_ts = (now - chrono::Duration::minutes(5)).to_rfc3339();
+
+        let local = vec![
+            CandidateSearchHit {
+                host_id: "host_a".into(),
+                agent_id: "ag_1".into(),
+                seq: 50,
+                turn_id: None,
+                role: "assistant".into(),
+                snippet: "local snippet".into(),
+                timestamp_rfc3339: Some(fresh_ts.clone()),
+                bm25_score: -2.0,
+                agent_title: None,
+                cwd: None,
+                from_local: true,
+                from_remote: false,
+            },
+            CandidateSearchHit {
+                host_id: "host_a".into(),
+                agent_id: "ag_2".into(),
+                seq: 10,
+                turn_id: Some("t_old".into()),
+                role: "user".into(),
+                snippet: "older tie".into(),
+                timestamp_rfc3339: Some(old_ts.clone()),
+                bm25_score: -2.0,
+                agent_title: None,
+                cwd: None,
+                from_local: true,
+                from_remote: false,
+            },
+        ];
+
+        let remote = vec![
+            // Duplicate of (host_a, ag_1, 50) carrying richer turn_id & better BM25
+            CandidateSearchHit {
+                host_id: "host_a".into(),
+                agent_id: "ag_1".into(),
+                seq: 50,
+                turn_id: Some("turn_50".into()),
+                role: "assistant".into(),
+                snippet: "remote snippet".into(),
+                timestamp_rfc3339: Some(fresh_ts),
+                bm25_score: -2.5,
+                agent_title: Some("Alpha Thread".into()),
+                cwd: Some("/repo/alpha".into()),
+                from_local: false,
+                from_remote: true,
+            },
+            // Unloaded deep historical remote hit with strongest BM25
+            CandidateSearchHit {
+                host_id: "host_a".into(),
+                agent_id: "ag_1".into(),
+                seq: 3,
+                turn_id: Some("turn_1".into()),
+                role: "user".into(),
+                snippet: "historical <mark>match</mark>".into(),
+                timestamp_rfc3339: Some(old_ts),
+                bm25_score: -6.5,
+                agent_title: Some("Alpha Thread".into()),
+                cwd: Some("/repo/alpha".into()),
+                from_local: false,
+                from_remote: true,
+            },
+        ];
+
+        let merged = merge_and_rank_search_candidates(local, remote, now);
+        assert_eq!(
+            merged.len(),
+            3,
+            "duplicate (host_a, ag_1, 50) must collapse"
+        );
+
+        // Strongest BM25 (-6.5) ranks first even though older
+        assert_eq!(merged[0].seq, 3);
+        assert!(!merged[0].from_local && merged[0].from_remote);
+
+        // Deduped hit (seq 50) merges remote turn_id & improved score (-2.5) and ranks second
+        assert_eq!(merged[1].seq, 50);
+        assert!(merged[1].from_local && merged[1].from_remote);
+        assert_eq!(merged[1].turn_id.as_deref(), Some("turn_50"));
+
+        // Older weaker hit ranks third
+        assert_eq!(merged[2].agent_id, "ag_2");
+        assert_eq!(merged[2].seq, 10);
+    }
+
+    #[test]
+    fn search_messages_remote_merges_unloaded_remote_hits_and_handles_offline_hosts() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let now = Utc::now();
+
+        let make_host = |id: &str, name: &str, state: HostConnectionState| SavedHostProfile {
+            host_id: id.into(),
+            hostname: format!("{id}.internal"),
+            custom_name: Some(name.into()),
+            ssh_alias: None,
+            route_mode: HostRouteMode::Auto,
+            remote_daemon_port: 6868,
+            custom_direct_endpoint: None,
+            daemon_pubkey_b64: format!("pk_{id}"),
+            direct_endpoints: vec![],
+            relay_url: None,
+            pairing_secret: String::new(),
+            pairing_secret_updated_at_ms: 0,
+            state,
+        };
+
+        let make_agent = |id: &str, title: &str, cwd: &str| AgentSummary {
+            agent_id: id.into(),
+            workspace_id: "ws_1".into(),
+            cwd: cwd.into(),
+            title: title.into(),
+            provider: ProviderKind::ClaudeCode,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::Default,
+            status: AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 120,
+            timeline_epoch: 1,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
+        };
+
+        // 1. Register an offline host (session: None) with a locally replicated tail event at seq 20
+        //    and an online host wired to a synthetic outbound wire receiver.
+        let (online_session, mut wire_rx) = crate::HostSessionHandle::new_test_channel();
+        let ag_online = make_agent("ag_big", "Large Paginated Thread", "/workspace/orbit");
+        let ag_offline = make_agent("ag_off", "Offline Mac", "/workspace/offline");
+
+        let tail_ev_online = TimelineEvent {
+            seq: 110,
+            epoch: 1,
+            agent_id: "ag_big".into(),
+            turn_id: Some("turn_110".into()),
+            timestamp: now,
+            payload: TimelinePayload::AssistantMessage {
+                item_id: "tail_110".into(),
+                text: "Tail replica mentions orbit_deep_token once".into(),
+                streaming: false,
+            },
+        };
+        let tail_ev_offline = TimelineEvent {
+            seq: 20,
+            epoch: 1,
+            agent_id: "ag_off".into(),
+            turn_id: Some("turn_20".into()),
+            timestamp: now,
+            payload: TimelinePayload::UserPrompt {
+                message_id: "off_20".into(),
+                text: "Offline host still finds orbit_deep_token locally".into(),
+                badges: Vec::new(),
+            },
+        };
+
+        core.store
+            .upsert_replica_agents("host_online", std::slice::from_ref(&ag_online))
+            .expect("rep online");
+        core.store
+            .upsert_replica_agents("host_offline", std::slice::from_ref(&ag_offline))
+            .expect("rep offline");
+        core.store
+            .upsert_replica_timeline_event_for_host("host_online", &tail_ev_online)
+            .expect("rep ev online");
+        core.store
+            .upsert_replica_timeline_event_for_host("host_offline", &tail_ev_offline)
+            .expect("rep ev offline");
+
+        {
+            let mut guard = core.hosts.write().expect("hosts write");
+            let mut online_state = HostMemoryState::new(make_host(
+                "host_online",
+                "Devbox",
+                HostConnectionState::OnlineDirect,
+            ));
+            online_state.session = Some(online_session);
+            online_state
+                .agents
+                .insert("ag_big".into(), ag_online.clone());
+            // Loaded timeline window starts at seq 110 -> seq 5 is unloaded!
+            online_state
+                .timelines
+                .insert("ag_big".into(), vec![tail_ev_online.clone()]);
+            online_state
+                .timeline_has_older
+                .insert("ag_big".into(), true);
+            guard.insert("host_online".into(), online_state);
+
+            let mut offline_state = HostMemoryState::new(make_host(
+                "host_offline",
+                "Laptop",
+                HostConnectionState::Disconnected,
+            ));
+            offline_state
+                .agents
+                .insert("ag_off".into(), ag_offline.clone());
+            offline_state
+                .timelines
+                .insert("ag_off".into(), vec![tail_ev_offline.clone()]);
+            guard.insert("host_offline".into(), offline_state);
+        }
+
+        // Spawn simulated daemon responder for `host_online`
+        let core_responder = Arc::clone(&core);
+        let responder_ts = now.to_rfc3339();
+        core.runtime.spawn(async move {
+            if let Some(crate::OutboundPayload::Wire(WireMessage::SearchMessages {
+                request_id,
+                query,
+                agent_id,
+                ..
+            })) = wire_rx.recv().await
+            {
+                assert_eq!(query, "orbit_deep_token");
+                assert_eq!(agent_id, None);
+                core_responder.handle_inbound_wire(
+                    "host_online",
+                    WireMessage::SearchMessagesResult {
+                        request_id,
+                        hits: vec![
+                            // Duplicate of tail seq 110
+                            RemoteMessageSearchHit {
+                                agent_id: "ag_big".into(),
+                                seq: 110,
+                                turn_id: Some("turn_110".into()),
+                                role: "assistant".into(),
+                                snippet: "Tail replica mentions <mark>orbit_deep_token</mark> once"
+                                    .into(),
+                                timestamp: Some(responder_ts.clone()),
+                                bm25_score: -1.5,
+                                agent_title: "Large Paginated Thread".into(),
+                                cwd: "/workspace/orbit".into(),
+                            },
+                            // Unloaded historical seq 5 not present in client replica!
+                            RemoteMessageSearchHit {
+                                agent_id: "ag_big".into(),
+                                seq: 5,
+                                turn_id: Some("turn_1".into()),
+                                role: "user".into(),
+                                snippet: "Early turn <mark>orbit_deep_token</mark> origin".into(),
+                                timestamp: Some(responder_ts),
+                                bm25_score: -5.2,
+                                agent_title: "Large Paginated Thread".into(),
+                                cwd: "/workspace/orbit".into(),
+                            },
+                        ],
+                    },
+                );
+            }
+        });
+
+        let resp = core.search_messages_remote_blocking(SearchMessagesRequest {
+            query: "orbit_deep_token".into(),
+            host_id: None,
+            agent_id: None,
+            limit: Some(20),
+        });
+        assert_eq!(resp.remote_hosts_queried, 1);
+        assert_eq!(resp.remote_hosts_failed, 0);
+        assert_eq!(
+            resp.hits.len(),
+            3,
+            "unloaded seq 5 + deduped seq 110 + offline seq 20"
+        );
+
+        let unloaded_hit = resp
+            .hits
+            .iter()
+            .find(|h| h.host_id == "host_online" && h.agent_id == "ag_big" && h.seq == 5)
+            .expect("unloaded remote hit");
+        assert!(unloaded_hit.is_remote);
+        assert!(unloaded_hit.is_unloaded);
+        assert_eq!(unloaded_hit.turn_id.as_deref(), Some("turn_1"));
+        assert_eq!(unloaded_hit.host_name, "Devbox");
+        assert_eq!(unloaded_hit.project_name, "orbit");
+
+        let loaded_hit = resp
+            .hits
+            .iter()
+            .find(|h| h.host_id == "host_online" && h.agent_id == "ag_big" && h.seq == 110)
+            .expect("deduped tail hit");
+        assert!(!loaded_hit.is_remote);
+        assert!(!loaded_hit.is_unloaded);
+
+        let offline_hit = resp
+            .hits
+            .iter()
+            .find(|h| h.host_id == "host_offline" && h.agent_id == "ag_off" && h.seq == 20)
+            .expect("offline local hit preserved");
+        assert!(!offline_hit.is_remote);
+        assert!(!offline_hit.is_unloaded);
     }
 
     #[test]

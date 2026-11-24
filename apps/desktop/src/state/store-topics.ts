@@ -66,6 +66,7 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   rewoundSessions: "stage",
   sessionScrollNonce: "stage",
   pendingJumpTarget: "stage",
+  stageFindFocusNonce: "stage",
   slashCommands: "stage",
 
   // composer

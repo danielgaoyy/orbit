@@ -294,11 +294,41 @@ pub struct ConversationSearchHit {
     pub host_name: String,
     pub agent_id: String,
     pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
     pub role: String,
     pub title: String,
     pub project_name: String,
     pub snippet: String,
     pub updated_at_rfc3339: String,
+    /// `true` when this match was discovered from a remote daemon's full-history FTS5 index
+    /// rather than already being matched in the local client replica.
+    #[serde(default)]
+    pub is_remote: bool,
+    /// `true` when this event `seq` precedes the client's locally loaded timeline window,
+    /// signalling that jumping to it should auto-paginate older history.
+    #[serde(default)]
+    pub is_unloaded: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SearchMessagesRequest {
+    pub query: String,
+    #[serde(default)]
+    pub host_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchMessagesResponse {
+    pub hits: Vec<ConversationSearchHit>,
+    #[serde(default)]
+    pub remote_hosts_queried: u32,
+    #[serde(default)]
+    pub remote_hosts_failed: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

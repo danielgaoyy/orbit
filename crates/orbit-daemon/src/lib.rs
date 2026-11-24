@@ -718,6 +718,58 @@ impl DaemonRuntime {
         drop(self.lsp.spawn_idle_reaper());
         drop(self.browser.spawn_idle_reaper());
 
+        // 4b. Incrementally backfill legacy daemon `timeline_events` into `timeline_events_fts`
+        //     without blocking startup so full-history remote search covers pre-v6 histories.
+        if !self.store.is_daemon_fts_backfill_done() {
+            let store_bg = Arc::clone(&self.store);
+            tokio::spawn(async move {
+                const BACKFILL_BATCH_SIZE: usize = 200;
+                const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+                let mut consecutive_errors: u32 = 0;
+                loop {
+                    let store_step = Arc::clone(&store_bg);
+                    let step = tokio::task::spawn_blocking(move || {
+                        store_step.backfill_daemon_fts_batch(BACKFILL_BATCH_SIZE)
+                    })
+                    .await;
+                    match step {
+                        Ok(Ok(progress)) => {
+                            consecutive_errors = 0;
+                            if progress.done {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                        }
+                        Ok(Err(err)) => {
+                            consecutive_errors += 1;
+                            warn!(
+                                error = %err,
+                                attempt = consecutive_errors,
+                                "daemon FTS5 backfill batch failed"
+                            );
+                            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                                warn!(
+                                    "aborting daemon FTS5 background backfill after repeated errors"
+                                );
+                                break;
+                            }
+                            let backoff_ms = 50u64
+                                .saturating_mul(1u64 << (consecutive_errors - 1).min(4))
+                                .min(1000);
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        }
+                        Err(join_err) => {
+                            warn!(
+                                error = %join_err,
+                                "daemon FTS5 backfill worker task aborted"
+                            );
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
         // 5. Warm login-shell environment snapshot & provider model catalogs in background (non-blocking)
         orbit_providers::set_snapshot_orbit_home(&self.home_dir);
         let rt_warm = Arc::clone(self);
@@ -3394,6 +3446,71 @@ async fn handle_wire_rpc(
                         }
                     }
                     Err(e) => rpc_err(request_id, "search_symbols_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::SearchMessages {
+            request_id,
+            query,
+            agent_id,
+            limit,
+        } => {
+            let trimmed_query = query.trim().to_string();
+            let scoped_agent_id = agent_id
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let effective_limit = match limit {
+                Some(0) => 0usize,
+                Some(n) => (n as usize).min(100),
+                None => {
+                    if scoped_agent_id.is_some() {
+                        100
+                    } else {
+                        20
+                    }
+                }
+            };
+            if trimmed_query.is_empty() || effective_limit == 0 {
+                return Some(WireMessage::SearchMessagesResult {
+                    request_id,
+                    hits: Vec::new(),
+                });
+            }
+
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let outcome = tokio::task::spawn_blocking(move || {
+                    store.search_daemon_messages_scoped(
+                        &trimmed_query,
+                        scoped_agent_id.as_deref(),
+                        effective_limit,
+                    )
+                })
+                .await;
+                let reply = match outcome {
+                    Ok(Ok(rows)) => WireMessage::SearchMessagesResult {
+                        request_id,
+                        hits: rows
+                            .into_iter()
+                            .map(|h| orbit_protocol::RemoteMessageSearchHit {
+                                agent_id: h.agent_id,
+                                seq: h.seq,
+                                turn_id: h.turn_id,
+                                role: h.role,
+                                snippet: h.snippet,
+                                timestamp: h.timestamp,
+                                bm25_score: h.bm25_score,
+                                agent_title: h.agent_title,
+                                cwd: h.cwd,
+                            })
+                            .collect(),
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "search_messages_failed", e),
+                    Err(e) => rpc_err(request_id, "search_messages_failed", e),
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });
@@ -9680,5 +9797,261 @@ mod self_upgrade_tests {
                 .expect("valid encrypted Hello must succeed");
             assert!(matches!(decoded, WireMessage::Hello { client_id, .. } if client_id == "c1"));
         }
+    }
+
+    #[tokio::test]
+    async fn search_messages_rpc_queries_daemon_fts5_with_ascii_cjk_and_agent_scoping() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{
+            connect_async,
+            tungstenite::{
+                Message as TungMsg,
+                client::IntoClientRequest,
+                http::{HeaderValue, header::AUTHORIZATION},
+            },
+        };
+
+        let home = std::env::temp_dir().join(format!("orbit_ws_search_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let (addr, runtime) = spawn_embedded_daemon(home.clone(), None)
+            .await
+            .expect("spawn daemon");
+
+        let now = chrono::Utc::now();
+        runtime
+            .store
+            .upsert_workspace(&orbit_protocol::WorkspaceSummary {
+                workspace_id: "ws_search_rpc".into(),
+                title: "Orbit Search RPC".into(),
+                cwd: "/workspace/orbit-rpc".into(),
+                git_branch: Some("main".into()),
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert workspace");
+
+        let make_agent = |id: &str, title: &str, cwd: &str| orbit_protocol::AgentSummary {
+            agent_id: id.into(),
+            workspace_id: "ws_search_rpc".into(),
+            cwd: cwd.into(),
+            title: title.into(),
+            provider: orbit_protocol::ProviderKind::ClaudeCode,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: orbit_protocol::SessionMode::Default,
+            status: orbit_protocol::AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 1,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: orbit_protocol::AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
+        };
+
+        runtime
+            .store
+            .upsert_agent(
+                &make_agent("ag_s1", "RPC Engine", "/workspace/orbit-rpc"),
+                None,
+            )
+            .expect("ag_s1");
+        runtime
+            .store
+            .upsert_agent(
+                &make_agent("ag_s2", "中文检索测试", "/workspace/orbit-cjk"),
+                None,
+            )
+            .expect("ag_s2");
+
+        let ev1 = runtime
+            .store
+            .append_timeline_event(
+                "ag_s1",
+                1,
+                Some("t_early"),
+                orbit_protocol::TimelinePayload::UserPrompt {
+                    message_id: "u1".into(),
+                    text: "Investigate quasar_rpc_needle on historical turn 1".into(),
+                    badges: Vec::new(),
+                },
+            )
+            .expect("ev1");
+        let ev2 = runtime
+            .store
+            .append_timeline_event(
+                "ag_s1",
+                1,
+                Some("t_late"),
+                orbit_protocol::TimelinePayload::AssistantMessage {
+                    item_id: "a1".into(),
+                    text: "Resolved quasar_rpc_needle with FTS5 remote search".into(),
+                    streaming: false,
+                },
+            )
+            .expect("ev2");
+        let ev3 = runtime
+            .store
+            .append_timeline_event(
+                "ag_s2",
+                1,
+                Some("t_cjk"),
+                orbit_protocol::TimelinePayload::AssistantMessage {
+                    item_id: "a2".into(),
+                    text: "确认 quasar_rpc_needle 在远程历史全文搜索中生效".into(),
+                    streaming: false,
+                },
+            )
+            .expect("ev3");
+
+        let ws_url = format!("ws://{addr}/ws");
+        let mut req = ws_url.as_str().into_client_request().expect("ws req");
+        req.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", runtime.pairing_secret)).expect("hdr"),
+        );
+        let (mut ws, _) = connect_async(req).await.expect("connect ws");
+
+        // Complete Hello handshake
+        let hello = WireMessage::Hello {
+            client_id: "search-test-client".into(),
+            client_name: "Test".into(),
+            protocol_version: orbit_protocol::PROTOCOL_VERSION,
+            supports_zstd: false,
+        };
+        ws.send(TungMsg::Text(
+            serde_json::to_string(&hello).expect("ser hello").into(),
+        ))
+        .await
+        .expect("send hello");
+        let _welcome = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .expect("welcome timeout")
+            .expect("welcome frame")
+            .expect("welcome ok");
+
+        async fn rpc_search(
+            ws: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            query: &str,
+            agent_id: Option<&str>,
+            limit: Option<u32>,
+        ) -> Vec<orbit_protocol::RemoteMessageSearchHit> {
+            let req_id = Uuid::new_v4();
+            let msg = WireMessage::SearchMessages {
+                request_id: req_id,
+                query: query.to_string(),
+                agent_id: agent_id.map(str::to_string),
+                limit,
+            };
+            ws.send(TungMsg::Text(
+                serde_json::to_string(&msg).expect("ser").into(),
+            ))
+            .await
+            .expect("send search");
+            loop {
+                let frame = tokio::time::timeout(Duration::from_secs(3), ws.next())
+                    .await
+                    .expect("resp timeout")
+                    .expect("resp stream")
+                    .expect("resp ok");
+                let text = match frame {
+                    TungMsg::Text(t) => t.to_string(),
+                    TungMsg::Binary(b) => {
+                        match WireMessage::decode_zstd(&b).expect("decode zstd") {
+                            WireMessage::SearchMessagesResult { request_id, hits }
+                                if request_id == req_id =>
+                            {
+                                return hits;
+                            }
+                            _ => continue,
+                        }
+                    }
+                    _ => continue,
+                };
+                if let Ok(WireMessage::SearchMessagesResult { request_id, hits }) =
+                    serde_json::from_str::<WireMessage>(&text)
+                    && request_id == req_id
+                {
+                    return hits;
+                }
+            }
+        }
+
+        // 1. Global search returns 1 best match per conversation (2 total)
+        let global_hits = rpc_search(&mut ws, "quasar_rpc_needle", None, Some(20)).await;
+        assert_eq!(global_hits.len(), 2);
+        assert!(global_hits.iter().any(|h| h.agent_id == "ag_s1"
+            && h.agent_title == "RPC Engine"
+            && h.cwd == "/workspace/orbit-rpc"));
+        assert!(global_hits.iter().any(|h| h.agent_id == "ag_s2"
+            && h.agent_title == "中文检索测试"
+            && h.cwd == "/workspace/orbit-cjk"));
+
+        // 2. Agent-scoped search returns BOTH events in ag_s1 and none from ag_s2
+        let scoped_hits = rpc_search(&mut ws, "quasar_rpc_needle", Some("ag_s1"), Some(50)).await;
+        assert_eq!(scoped_hits.len(), 2);
+        assert!(scoped_hits.iter().all(|h| h.agent_id == "ag_s1"));
+        assert!(
+            scoped_hits
+                .iter()
+                .any(|h| h.seq == ev1.seq && h.turn_id.as_deref() == Some("t_early"))
+        );
+        assert!(
+            scoped_hits
+                .iter()
+                .any(|h| h.seq == ev2.seq && h.turn_id.as_deref() == Some("t_late"))
+        );
+
+        // 3. CJK query matches ag_s2 with highlighted <mark> snippet
+        let cjk_hits = rpc_search(&mut ws, "远程历史全文搜索", None, Some(20)).await;
+        assert_eq!(cjk_hits.len(), 1);
+        assert_eq!(cjk_hits[0].agent_id, "ag_s2");
+        assert_eq!(cjk_hits[0].seq, ev3.seq);
+        assert!(
+            cjk_hits[0]
+                .snippet
+                .contains("<mark>远程历史全文搜索</mark>")
+        );
+
+        // 4. Empty query & limit=0 return empty cleanly
+        assert!(rpc_search(&mut ws, "   ", None, Some(10)).await.is_empty());
+        assert!(
+            rpc_search(&mut ws, "quasar_rpc_needle", None, Some(0))
+                .await
+                .is_empty()
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

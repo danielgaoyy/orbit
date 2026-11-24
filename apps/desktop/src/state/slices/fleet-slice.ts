@@ -2111,6 +2111,17 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
     },
 
 
+    openStageFind(): void {
+      setState(
+        (s) => ({
+          ...s,
+          stageFindFocusNonce: s.stageFindFocusNonce + 1,
+        }),
+        false,
+      );
+    },
+
+
     updateViewportWidth(viewportWidth: number): void {
       const nextCompact = getState().isCompactViewport
         ? viewportWidth < COMPACT_VIEWPORT_EXPAND_PX

@@ -54,11 +54,11 @@ use orbit_client_core::contract::{
     InstructionFilesSnapshotView, ListInstructionFilesRequest, MatchPathRulesRequest,
     MatchedPathRulesView, MentionRankRequest, ModelSelectionRequest, PathRulesSnapshotView,
     PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RenameWorkspaceEntryRequest,
-    RenderDiagramRequest, RenderDiagramView, SaveInstructionFileRequest,
-    SearchWorkspaceSymbolsRequest, SpawnWorkspacePeerRequest, UpsertArtifactRequest,
-    UpsertEventTriggerRequest, UpsertExternalMcpServerRequest, UpsertPathRuleRequest,
-    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WorkspaceSymbolsView,
-    WriteWorkspaceFileRequest,
+    RenderDiagramRequest, RenderDiagramView, SaveInstructionFileRequest, SearchMessagesRequest,
+    SearchMessagesResponse, SearchWorkspaceSymbolsRequest, SpawnWorkspacePeerRequest,
+    UpsertArtifactRequest, UpsertEventTriggerRequest, UpsertExternalMcpServerRequest,
+    UpsertPathRuleRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
+    WorkspaceSymbolsView, WriteWorkspaceFileRequest,
 };
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, LocalMachineInfo, SshHostItem, StagedAttachmentInfo,
@@ -287,6 +287,25 @@ async fn search_messages(
     tauri::async_runtime::spawn_blocking(move || core.search_messages(&query, max_hits))
         .await
         .map_err(|e| format!("search messages task error: {e}"))
+}
+
+#[tauri::command]
+async fn search_messages_remote(
+    state: State<'_, DesktopAppState>,
+    query: String,
+    host_id: Option<String>,
+    agent_id: Option<String>,
+    limit: Option<u32>,
+) -> Result<SearchMessagesResponse, String> {
+    let core = Arc::clone(&state.core);
+    Ok(core
+        .search_messages_remote(SearchMessagesRequest {
+            query,
+            host_id,
+            agent_id,
+            limit,
+        })
+        .await)
 }
 
 #[tauri::command]
@@ -4186,6 +4205,7 @@ pub fn run() {
             get_bridge_info,
             get_fleet_overview,
             search_messages,
+            search_messages_remote,
             get_fleet_sidebar,
             get_host_detail,
             get_agent_stage,

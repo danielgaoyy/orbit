@@ -73,6 +73,7 @@ All Contract v2 request/response DTOs are canonically defined in `crates/orbit-c
 | Capability | Rust Core (`orbit-client-core`) | Desktop Tauri (`src-tauri`) | UniFFI (`orbit-ffi-uniffi`) | HarmonyOS N-API (`orbit-ffi-ohos`) |
 | --- | --- | --- | --- | --- |
 | Bridge version & caps | `BridgeInfoView` | `get_bridge_info` | `bridge_info()` | `bridgeInfoJson()` |
+| Full-history FTS5 search | `search_messages` / `search_messages_remote` (`WireMessage::SearchMessages`) | `search_messages` / `search_messages_remote` | `search_messages` | `searchMessagesJson` |
 | Sidebar tree + search + prefs | `fleet_sidebar` / `FleetSidebarRequest` | `get_fleet_sidebar` | `fleet_sidebar_request` / `fleet_sidebar` | `fleetSidebarByRequestJson` / `fleetSidebarJson` |
 | Incremental stage projection | `agent_stage_delta` / `AgentStageDeltaRequest` | `get_agent_stage` / `get_agent_stage_delta` | `agent_stage_delta_request` / `agent_stage_delta` | `agentStageDeltaByRequestJson` / `agentStageDeltaJson` |
 | Delivery lifecycle & stall observability | `AgentMessageDeliveryUpdated` in-place fold, `StageTurnView.latest_activity_ms` / `latest_visible_progress_ms`, `interrupt_agent_and_continue` | `interrupt_agent_and_continue` | `FfiAgentMessageDeliveryStatus`, `interrupt_agent_and_continue` | `interruptAgentAndContinue` |

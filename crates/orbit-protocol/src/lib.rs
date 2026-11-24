@@ -1107,6 +1107,25 @@ pub struct WorkspaceSymbolEntry {
     pub language: String,
 }
 
+/// Full-text search match returned by a Daemon's authoritative SQLite FTS5 index
+/// (`timeline_events_fts`), covering full conversation history independent of client pagination.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteMessageSearchHit {
+    pub agent_id: String,
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub role: String,
+    pub snippet: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    pub bm25_score: f64,
+    #[serde(default)]
+    pub agent_title: String,
+    #[serde(default)]
+    pub cwd: String,
+}
+
 /// Client-to-Daemon and Daemon-to-Client RPC envelope over WebSocket / E2EE Relay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -1366,6 +1385,22 @@ pub enum WireMessage {
         symbols: Vec<WorkspaceSymbolEntry>,
         #[serde(default)]
         truncated: bool,
+    },
+    /// Query the daemon's authoritative full-history SQLite FTS5 index (`timeline_events_fts`).
+    /// When `agent_id` is `Some`, returns individual matching events within that session
+    /// (for in-session `Cmd+F` across unloaded historical turns); when `None`, returns the
+    /// highest-ranked match per conversation across all sessions on this host.
+    SearchMessages {
+        request_id: Uuid,
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    SearchMessagesResult {
+        request_id: Uuid,
+        hits: Vec<RemoteMessageSearchHit>,
     },
     ReadWorkspaceFile {
         request_id: Uuid,
@@ -3731,6 +3766,78 @@ mod tests {
                 );
                 assert_eq!(symbols[0].start_line, 42);
                 assert_eq!(symbols[0].end_line, 78);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_messages_rpc_wire_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let scoped_req = WireMessage::SearchMessages {
+            request_id: req_id,
+            query: "数据库连接 timeout".into(),
+            agent_id: Some("ag_42".into()),
+            limit: Some(50),
+        };
+        let encoded = scoped_req.encode_zstd(3).expect("encode search messages");
+        match WireMessage::decode_zstd(&encoded).expect("decode search messages") {
+            WireMessage::SearchMessages {
+                request_id,
+                query,
+                agent_id,
+                limit,
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(query, "数据库连接 timeout");
+                assert_eq!(agent_id.as_deref(), Some("ag_42"));
+                assert_eq!(limit, Some(50));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // Minimal request omitting optional agent_id / limit
+        let minimal_req = serde_json::json!({
+            "op": "search_messages",
+            "request_id": req_id,
+            "query": "rust fts5"
+        });
+        match serde_json::from_value::<WireMessage>(minimal_req).expect("decode minimal search") {
+            WireMessage::SearchMessages {
+                agent_id, limit, ..
+            } => {
+                assert_eq!(agent_id, None);
+                assert_eq!(limit, None);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let resp = WireMessage::SearchMessagesResult {
+            request_id: req_id,
+            hits: vec![RemoteMessageSearchHit {
+                agent_id: "ag_42".into(),
+                seq: 17,
+                turn_id: Some("turn_3".into()),
+                role: "assistant".into(),
+                snippet: "Fixed <mark>数据库连接</mark> <mark>timeout</mark>".into(),
+                timestamp: Some("2026-11-24T12:00:00Z".into()),
+                bm25_score: -4.25,
+                agent_title: "DB Pool Hardening".into(),
+                cwd: "/workspace/orbit".into(),
+            }],
+        };
+        let z_resp = resp.encode_zstd(3).expect("encode search result");
+        match WireMessage::decode_zstd(&z_resp).expect("decode search result") {
+            WireMessage::SearchMessagesResult { request_id, hits } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].agent_id, "ag_42");
+                assert_eq!(hits[0].seq, 17);
+                assert_eq!(hits[0].turn_id.as_deref(), Some("turn_3"));
+                assert_eq!(hits[0].role, "assistant");
+                assert!((hits[0].bm25_score - (-4.25)).abs() < 1e-6);
+                assert_eq!(hits[0].agent_title, "DB Pool Hardening");
+                assert_eq!(hits[0].cwd, "/workspace/orbit");
             }
             other => panic!("unexpected variant: {other:?}"),
         }

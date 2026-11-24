@@ -21,7 +21,9 @@ pub use artifacts::{
 pub use im_channels::StoredImChannel;
 pub use orchestration::*;
 pub use push::{StoredPushDevice, StoredPushPreferences};
-pub use search::{FtsBackfillProgress, MessageSearchHit, build_fts5_match_query};
+pub use search::{
+    DaemonMessageSearchHit, FtsBackfillProgress, MessageSearchHit, build_fts5_match_query,
+};
 pub use triggers::{
     DEFAULT_RECENT_DELIVERIES_LIMIT, StoredEventTrigger, UpsertEventTriggerParams,
     mask_trigger_secret,

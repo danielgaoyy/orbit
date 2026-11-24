@@ -46,6 +46,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -430,11 +431,18 @@ fun PairQrSheet(
 }
 
 @Composable
-private fun ZxingCameraPreview(
+internal fun ZxingCameraPreview(
+    accepts: (String) -> Boolean = { raw ->
+        val action = dev.orbit.android.notifications.OrbitPushRouter.parseDeepLink(raw)
+        action is dev.orbit.android.notifications.OrbitDeepLinkAction.PairHost ||
+            action is dev.orbit.android.notifications.OrbitDeepLinkAction.ImportDeviceLink
+    },
     onQrDecoded: (String) -> Unit,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val currentAccepts by rememberUpdatedState(accepts)
+    val currentOnQrDecoded by rememberUpdatedState(onQrDecoded)
     val decodedOnce = remember { AtomicBoolean(false) }
     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
 
@@ -448,9 +456,15 @@ private fun ZxingCameraPreview(
     DisposableEffect(lifecycleOwner) {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         val mainExecutor = ContextCompat.getMainExecutor(context)
+        val disposed = AtomicBoolean(false)
 
         val listener = Runnable {
+            if (disposed.get()) return@Runnable
             val provider = runCatching { cameraProviderFuture.get() }.getOrNull() ?: return@Runnable
+            if (disposed.get()) {
+                runCatching { provider.unbindAll() }
+                return@Runnable
+            }
             val preview = Preview.Builder().build().also {
                 it.surfaceProvider = previewView.surfaceProvider
             }
@@ -467,11 +481,13 @@ private fun ZxingCameraPreview(
                 .also { imageAnalysis ->
                     imageAnalysis.setAnalyzer(analysisExecutor) { imageProxy ->
                         try {
-                            if (!decodedOnce.get()) {
+                            if (!disposed.get() && !decodedOnce.get()) {
                                 val resultText = decodeOrbitQrFromImageProxy(imageProxy, reader, hints)
-                                if (resultText != null && decodedOnce.compareAndSet(false, true)) {
+                                if (resultText != null && currentAccepts(resultText) && decodedOnce.compareAndSet(false, true)) {
                                     mainExecutor.execute {
-                                        onQrDecoded(resultText)
+                                        if (!disposed.get()) {
+                                            currentOnQrDecoded(resultText)
+                                        }
                                     }
                                 }
                             }
@@ -483,18 +499,21 @@ private fun ZxingCameraPreview(
 
             runCatching {
                 provider.unbindAll()
-                provider.bindToLifecycle(
-                    lifecycleOwner,
-                    CameraSelector.DEFAULT_BACK_CAMERA,
-                    preview,
-                    analysis,
-                )
+                if (!disposed.get()) {
+                    provider.bindToLifecycle(
+                        lifecycleOwner,
+                        CameraSelector.DEFAULT_BACK_CAMERA,
+                        preview,
+                        analysis,
+                    )
+                }
             }
         }
 
         cameraProviderFuture.addListener(listener, mainExecutor)
 
         onDispose {
+            disposed.set(true)
             runCatching {
                 if (cameraProviderFuture.isDone) {
                     cameraProviderFuture.get().unbindAll()

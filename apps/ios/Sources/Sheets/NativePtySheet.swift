@@ -1,11 +1,27 @@
 import SwiftUI
 import UIKit
 
+private enum OrbitPtyInputMode: String, CaseIterable, Identifiable {
+    case raw
+    case line
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .raw: return OrbitL10n.tr("Raw")
+        case .line: return OrbitL10n.tr("Line")
+        }
+    }
+}
+
 struct NativePtySheet: View {
     @ObservedObject var store: OrbitIosStore
     @Environment(\.dismiss) private var dismiss
     @Environment(\.orbitPalette) private var palette
 
+    @State private var inputMode: OrbitPtyInputMode = .raw
+    @State private var isRawKeyboardFocused = false
     @State private var commandBuffer = ""
     @State private var isCtrlArmed = false
     @State private var isAltArmed = false
@@ -13,8 +29,8 @@ struct NativePtySheet: View {
     @State private var copiedSnapshot = false
     @FocusState private var isInputFocused: Bool
 
-    private let terminalSurfaceBg = Color(hex: "#0A0B0E")
-    private let terminalDefaultFg = Color(hex: "#E6E8EE")
+    private let terminalSurfaceBg = Color(hex: "#121318")
+    private let terminalDefaultFg = Color(hex: "#F1F2F7")
 
     private var terminals: [FfiTerminalSummary] {
         store.currentHostDetail?.terminals ?? []
@@ -37,11 +53,38 @@ struct NativePtySheet: View {
                 terminalViewport
                 OrbitHairline()
                 developerAccessoryKeybar(isCompactHeight: isCompactHeight)
-                commandInputBar(isCompactHeight: isCompactHeight)
+                if inputMode == .raw {
+                    rawModeStatusBar(isCompactHeight: isCompactHeight)
+                } else {
+                    commandInputBar(isCompactHeight: isCompactHeight)
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(alignment: .bottom) {
+                if inputMode == .raw {
+                    RawPtyInputView(
+                        isFirstResponder: $isRawKeyboardFocused,
+                        isCtrlArmed: $isCtrlArmed,
+                        isAltArmed: $isAltArmed,
+                        onSendBytes: { bytes in
+                            store.sendTerminalBytes(bytes)
+                        }
+                    )
+                    .frame(width: 1, height: 1)
+                    .allowsHitTesting(false)
+                }
+            }
         }
         .background(palette.canvas.ignoresSafeArea())
+        .onChange(of: inputMode) { nextMode in
+            if nextMode == .raw {
+                isInputFocused = false
+                isRawKeyboardFocused = true
+            } else {
+                isRawKeyboardFocused = false
+                isInputFocused = true
+            }
+        }
     }
 
     // MARK: - Header
@@ -62,6 +105,30 @@ struct NativePtySheet: View {
                     .clipShape(Capsule())
                     .fixedSize(horizontal: true, vertical: false)
             }
+
+            // Crisp Raw / Line mode toggle
+            HStack(spacing: 2) {
+                ForEach(OrbitPtyInputMode.allCases) { mode in
+                    let selected = inputMode == mode
+                    Button {
+                        store.hapticLight()
+                        withAnimation(OrbitMotion.ui) {
+                            inputMode = mode
+                        }
+                    } label: {
+                        Text(mode.label)
+                            .font(OrbitTypography.meta(selected ? .semibold : .medium))
+                            .foregroundStyle(selected ? palette.fgPrimary : palette.fgMuted)
+                            .padding(.horizontal, 8)
+                            .frame(height: 24)
+                            .background(selected ? palette.elevated : Color.clear, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(2)
+            .background(palette.subtleFill, in: Capsule())
+            .overlay(Capsule().strokeBorder(palette.hairline, lineWidth: 0.5))
 
             if isCompactHeight && !terminals.isEmpty {
                 inlineCompactTabsStrip
@@ -273,7 +340,11 @@ struct NativePtySheet: View {
             .background(terminalSurfaceBg)
             .contentShape(Rectangle())
             .onTapGesture {
-                isInputFocused = true
+                if inputMode == .raw {
+                    isRawKeyboardFocused = true
+                } else {
+                    isInputFocused = true
+                }
             }
             .onAppear {
                 let grid = computeGridSize(width: availW, height: availH)
@@ -463,7 +534,51 @@ struct NativePtySheet: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: - Command & Keystroke Input Bar
+    // MARK: - Raw Mode Keyboard Bar & Line Mode Command Input Bar
+
+    private func rawModeStatusBar(isCompactHeight: Bool) -> some View {
+        HStack(spacing: OrbitSpacing.sm) {
+            Button {
+                store.hapticLight()
+                isRawKeyboardFocused.toggle()
+            } label: {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(isRawKeyboardFocused ? palette.direct : palette.fgMuted)
+                        .frame(width: 6, height: 6)
+                    Text(
+                        isCtrlArmed
+                            ? "CTRL+…"
+                            : (isAltArmed
+                                ? "ALT+…"
+                                : OrbitL10n.tr("Raw keyboard active — tap terminal to type"))
+                    )
+                    .font(OrbitTypography.meta(.medium))
+                    .foregroundStyle(isRawKeyboardFocused ? palette.fgPrimary : palette.fgSecondary)
+                    .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                store.hapticLight()
+                isRawKeyboardFocused.toggle()
+            } label: {
+                Image(systemName: isRawKeyboardFocused ? "keyboard.chevron.compact.down" : "keyboard")
+                    .font(OrbitTypography.iconSmall)
+                    .foregroundStyle(palette.fgPrimary)
+                    .frame(width: 36, height: 34)
+                    .background(palette.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isRawKeyboardFocused ? "Hide Keyboard" : "Show Keyboard")
+        }
+        .padding(.horizontal, OrbitSpacing.md)
+        .padding(.vertical, isCompactHeight ? 2 : OrbitSpacing.xs)
+        .background(palette.elevated)
+    }
 
     private func commandInputBar(isCompactHeight: Bool) -> some View {
         HStack(spacing: OrbitSpacing.xs) {
@@ -554,19 +669,21 @@ struct NativePtySheet: View {
     private func sendRawKey(_ seq: String) {
         store.hapticLight()
         if isAltArmed {
-            store.sendTerminalKeys("\u{001B}" + seq)
+            store.sendTerminalBytes(Data(("\u{001B}" + seq).utf8))
             isAltArmed = false
         } else {
-            store.sendTerminalKeys(seq)
+            store.sendTerminalBytes(Data(seq.utf8))
         }
     }
 
     private func insertOrSendSymbol(_ sym: String) {
         store.hapticLight()
-        if isInputFocused {
+        if inputMode == .line && isInputFocused {
             commandBuffer.append(sym)
         } else {
-            store.sendTerminalKeys(sym)
+            store.sendTerminalBytes(OrbitPtyInputLogic.encodeText(sym, ctrl: isCtrlArmed, alt: isAltArmed))
+            isCtrlArmed = false
+            isAltArmed = false
         }
     }
 

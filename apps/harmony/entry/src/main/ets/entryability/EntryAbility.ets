@@ -5,18 +5,28 @@ import { OrbitHarmonyStore } from '../model/OrbitHarmonyStore';
 import { orbitLogError, orbitLogInfo, orbitLogWarn } from '../model/OrbitLogger';
 import { ORBIT_DEFAULT_THEME } from '../theme/OrbitTokens';
 
-interface EdgeInsetsPx {
+interface OrbitEdgeInsetsPx {
   top: number;
   bottom: number;
   left: number;
   right: number;
 }
 
-function zeroInsets(): EdgeInsetsPx {
+interface OrbitPushExtraPayload {
+  deep_link?: string;
+  orbit_open_uri?: string;
+  host_id?: string;
+  orbit_host_id?: string;
+  agent_id?: string;
+  orbit_agent_id?: string;
+  event_kind?: string;
+}
+
+function zeroInsets(): OrbitEdgeInsetsPx {
   return { top: 0, bottom: 0, left: 0, right: 0 };
 }
 
-function mergeInsets(a: EdgeInsetsPx, b: EdgeInsetsPx): EdgeInsetsPx {
+function mergeInsets(a: OrbitEdgeInsetsPx, b: OrbitEdgeInsetsPx): OrbitEdgeInsetsPx {
   return {
     top: Math.max(a.top, b.top),
     bottom: Math.max(a.bottom, b.bottom),
@@ -25,31 +35,70 @@ function mergeInsets(a: EdgeInsetsPx, b: EdgeInsetsPx): EdgeInsetsPx {
   };
 }
 
-function extractAvoidInsetsPx(area: window.AvoidArea, screenWidthPx: number, screenHeightPx: number): EdgeInsetsPx {
+function extractAvoidInsetsPx(
+  area: window.AvoidArea,
+  screenWidthPx: number,
+  screenHeightPx: number
+): OrbitEdgeInsetsPx {
   return {
     top: area.topRect.height > 0 ? area.topRect.top + area.topRect.height : 0,
     bottom: area.bottomRect.height > 0
-      ? (screenHeightPx > 0 ? Math.max(area.bottomRect.height, screenHeightPx - area.bottomRect.top) : area.bottomRect.height)
+      ? (screenHeightPx > 0
+        ? Math.max(area.bottomRect.height, screenHeightPx - area.bottomRect.top)
+        : area.bottomRect.height)
       : 0,
     left: area.leftRect.width > 0 ? area.leftRect.left + area.leftRect.width : 0,
     right: area.rightRect.width > 0
-      ? (screenWidthPx > 0 ? Math.max(area.rightRect.width, screenWidthPx - area.rightRect.left) : area.rightRect.width)
+      ? (screenWidthPx > 0
+        ? Math.max(area.rightRect.width, screenWidthPx - area.rightRect.left)
+        : area.rightRect.width)
       : 0
   };
+}
+
+function mapFoldStatusToSlug(status: display.FoldStatus): string {
+  if (
+    status === display.FoldStatus.FOLD_STATUS_EXPANDED ||
+    status === display.FoldStatus.FOLD_STATUS_EXPANDED_WITH_SECOND_EXPANDED
+  ) {
+    return 'expanded';
+  }
+  if (
+    status === display.FoldStatus.FOLD_STATUS_HALF_FOLDED ||
+    status === display.FoldStatus.FOLD_STATUS_EXPANDED_WITH_SECOND_HALF_FOLDED
+  ) {
+    return 'half_folded';
+  }
+  if (status === display.FoldStatus.FOLD_STATUS_FOLDED) {
+    return 'folded';
+  }
+  return 'unknown';
+}
+
+function readParamString(params: Record<string, Object> | undefined, key: string): string {
+  if (params === undefined) {
+    return '';
+  }
+  const raw = params[key];
+  if (typeof raw === 'string') {
+    return raw.trim();
+  }
+  return '';
 }
 
 export default class EntryAbility extends UIAbility {
   private netConn: connection.NetConnection | null = null;
   private mainWin: window.Window | null = null;
   private lastBearerSig: string = '';
-  private systemInsets: EdgeInsetsPx = zeroInsets();
-  private navIndicatorInsets: EdgeInsetsPx = zeroInsets();
-  private cutoutInsets: EdgeInsetsPx = zeroInsets();
-  private floatNavInsets: EdgeInsetsPx = zeroInsets();
+  private systemInsets: OrbitEdgeInsetsPx = zeroInsets();
+  private navIndicatorInsets: OrbitEdgeInsetsPx = zeroInsets();
+  private cutoutInsets: OrbitEdgeInsetsPx = zeroInsets();
+  private floatNavInsets: OrbitEdgeInsetsPx = zeroInsets();
   private keyboardVp: number = 0;
 
   private avoidAreaHandler: ((opts: window.AvoidAreaOptions) => void) | null = null;
   private windowSizeHandler: ((size: window.Size) => void) | null = null;
+  private foldStatusHandler: ((status: display.FoldStatus) => void) | null = null;
 
   onCreate(want: Want, _launchParam: AbilityConstant.LaunchParam): void {
     const store = OrbitHarmonyStore.getInstance();
@@ -67,11 +116,15 @@ export default class EntryAbility extends UIAbility {
     }
 
     const dbPath = `${this.context.databaseDir}/orbit_harmony_v2.sqlite`;
-    store.initialize(dbPath);
-    orbitLogInfo('OrbitEntry', `OrbitHarmonyCore initialized at ${dbPath}`);
+    store.initializeWithHuksAsync(this.context, dbPath).then(() => {
+      orbitLogInfo('OrbitEntry', `OrbitHarmonyCore ready at ${dbPath}`);
+    }).catch((err: Object) => {
+      orbitLogError('OrbitEntry', 'OrbitHarmonyCore HUKS init failed', err);
+    });
 
     this.applyLaunchWant(want);
     this.registerNetworkObserver();
+    this.registerFoldableObserver();
     store.registerPushTokenSilently();
   }
 
@@ -81,33 +134,73 @@ export default class EntryAbility extends UIAbility {
 
   private applyLaunchWant(want: Want): void {
     const store = OrbitHarmonyStore.getInstance();
-    if (want.uri !== undefined && want.uri.length > 0) {
-      store.handleDeepLinkUri(want.uri);
+    const params = want.parameters;
+    let eventKind = readParamString(params, 'event_kind');
+    let deepLink = want.uri !== undefined ? want.uri.trim() : '';
+    let hostId = readParamString(params, 'orbit_host_id');
+    if (hostId.length === 0) {
+      hostId = readParamString(params, 'host_id');
+    }
+    let agentId = readParamString(params, 'orbit_agent_id');
+    if (agentId.length === 0) {
+      agentId = readParamString(params, 'agent_id');
+    }
+
+    if (deepLink.length === 0) {
+      deepLink = readParamString(params, 'deep_link');
+    }
+    if (deepLink.length === 0) {
+      deepLink = readParamString(params, 'orbit_open_uri');
+    }
+    if (deepLink.length === 0) {
+      deepLink = readParamString(params, 'orbit_pair_uri');
+    }
+
+    // Parse HarmonyOS Push Kit nested extraData JSON when present
+    const extraRaw = readParamString(params, 'extraData');
+    if (extraRaw.length > 0 && extraRaw.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(extraRaw) as OrbitPushExtraPayload;
+        if (eventKind.length === 0 && typeof parsed.event_kind === 'string') {
+          eventKind = parsed.event_kind.trim();
+        }
+        if (deepLink.length === 0 && typeof parsed.deep_link === 'string') {
+          deepLink = parsed.deep_link.trim();
+        }
+        if (deepLink.length === 0 && typeof parsed.orbit_open_uri === 'string') {
+          deepLink = parsed.orbit_open_uri.trim();
+        }
+        if (hostId.length === 0 && typeof parsed.host_id === 'string') {
+          hostId = parsed.host_id.trim();
+        }
+        if (hostId.length === 0 && typeof parsed.orbit_host_id === 'string') {
+          hostId = parsed.orbit_host_id.trim();
+        }
+        if (agentId.length === 0 && typeof parsed.agent_id === 'string') {
+          agentId = parsed.agent_id.trim();
+        }
+        if (agentId.length === 0 && typeof parsed.orbit_agent_id === 'string') {
+          agentId = parsed.orbit_agent_id.trim();
+        }
+      } catch (err) {
+        orbitLogWarn('OrbitEntry', 'Failed to parse push extraData JSON', err as Object);
+      }
+    }
+
+    if (hostId.length > 0) {
+      store.openSessionFromDeepLink(hostId, agentId, eventKind);
       return;
     }
-    const openUri = want.parameters?.['orbit_open_uri'];
-    if (typeof openUri === 'string' && openUri.length > 0) {
-      store.handleDeepLinkUri(openUri);
-      return;
-    }
-    const hostParam = want.parameters?.['orbit_host_id'];
-    const agentParam = want.parameters?.['orbit_agent_id'];
-    if (typeof hostParam === 'string' && hostParam.length > 0) {
-      const agentId = typeof agentParam === 'string' ? agentParam : '';
-      store.openSessionFromDeepLink(hostParam, agentId);
-      return;
-    }
-    const paramUri = want.parameters?.['orbit_pair_uri'];
-    if (typeof paramUri === 'string' && paramUri.length > 0) {
-      store.handleDeepLinkUri(paramUri);
+    if (deepLink.length > 0) {
+      store.handleDeepLinkUri(deepLink, eventKind);
     }
   }
 
   onConfigurationUpdate(newConfig: Configuration): void {
     if (newConfig.colorMode !== undefined) {
-      OrbitHarmonyStore.getInstance().setSystemDark(
-        newConfig.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK
-      );
+      const store = OrbitHarmonyStore.getInstance();
+      store.setSystemDark(newConfig.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK);
+      this.applySystemBarTheme();
     }
   }
 
@@ -120,8 +213,10 @@ export default class EntryAbility extends UIAbility {
   }
 
   onMemoryLevel(level: AbilityConstant.MemoryLevel): void {
-    if (level === AbilityConstant.MemoryLevel.MEMORY_LEVEL_CRITICAL ||
-      level === AbilityConstant.MemoryLevel.MEMORY_LEVEL_LOW) {
+    if (
+      level === AbilityConstant.MemoryLevel.MEMORY_LEVEL_CRITICAL ||
+      level === AbilityConstant.MemoryLevel.MEMORY_LEVEL_LOW
+    ) {
       orbitLogWarn('OrbitEntry', `Memory pressure level ${level}, trimming caches`);
       OrbitHarmonyStore.getInstance().onMemoryPressure();
     }
@@ -139,6 +234,14 @@ export default class EntryAbility extends UIAbility {
         orbitLogWarn('OrbitEntry', 'Network unregister failed', err as Object);
       }
       this.netConn = null;
+    }
+    if (this.foldStatusHandler !== null) {
+      try {
+        display.off('foldStatusChange', this.foldStatusHandler);
+      } catch (err) {
+        orbitLogWarn('OrbitEntry', 'foldStatusChange unregister failed', err as Object);
+      }
+      this.foldStatusHandler = null;
     }
     OrbitHarmonyStore.getInstance().dispose();
   }
@@ -177,6 +280,57 @@ export default class EntryAbility extends UIAbility {
       this.avoidAreaHandler = null;
       this.windowSizeHandler = null;
       this.mainWin = null;
+    }
+  }
+
+  private registerFoldableObserver(): void {
+    if (!canIUse('SystemCapability.Window.SessionManager')) {
+      return;
+    }
+    try {
+      const foldable = display.isFoldable();
+      const initialStatus = foldable
+        ? mapFoldStatusToSlug(display.getFoldStatus())
+        : 'unknown';
+      OrbitHarmonyStore.getInstance().updateFoldPosture(foldable, initialStatus);
+
+      if (foldable) {
+        this.foldStatusHandler = (nextStatus: display.FoldStatus): void => {
+          const slug = mapFoldStatusToSlug(nextStatus);
+          OrbitHarmonyStore.getInstance().updateFoldPosture(true, slug);
+          if (this.mainWin !== null) {
+            try {
+              const uiCtx = this.mainWin.getUIContext();
+              this.queryAndPublishAllAvoidAreas(this.mainWin, uiCtx);
+            } catch (err) {
+              orbitLogWarn('OrbitEntry', 'Avoid area refresh on foldStatusChange failed', err as Object);
+            }
+          }
+        };
+        display.on('foldStatusChange', this.foldStatusHandler);
+      }
+    } catch (err) {
+      orbitLogWarn('OrbitEntry', 'Foldable display observer unavailable', err as Object);
+    }
+  }
+
+  private applySystemBarTheme(): void {
+    if (this.mainWin === null) {
+      return;
+    }
+    try {
+      const palette = OrbitHarmonyStore.getInstance().palette;
+      const barProps: window.SystemBarProperties = {
+        statusBarColor: '#00000000',
+        navigationBarColor: '#00000000',
+        statusBarContentColor: palette.statusBarContentHex,
+        navigationBarContentColor: palette.statusBarContentHex
+      };
+      this.mainWin.setWindowSystemBarProperties(barProps).catch((err: Object) => {
+        orbitLogWarn('OrbitEntry', 'setWindowSystemBarProperties failed', err);
+      });
+    } catch (err) {
+      orbitLogWarn('OrbitEntry', 'System bar theme sync unavailable', err as Object);
     }
   }
 
@@ -279,8 +433,10 @@ export default class EntryAbility extends UIAbility {
       try {
         await mainWin.setWindowLayoutFullScreen(true);
       } catch (err) {
-        orbitLogWarn('OrbitEntry', 'setWindowLayoutFullScreen not applied (e.g. freeform window)', err as Object);
+        orbitLogWarn('OrbitEntry', 'setWindowLayoutFullScreen not applied', err as Object);
       }
+
+      this.applySystemBarTheme();
 
       try {
         await mainWin.setFloatNavigationAvoidAreaEnabled(true);
@@ -337,7 +493,6 @@ export default class EntryAbility extends UIAbility {
       };
       mainWin.on('avoidAreaChange', this.avoidAreaHandler);
 
-      // Re-query all avoid areas atomically on rotation/fold to prevent intermediate-state jumps
       this.windowSizeHandler = (size: window.Size): void => {
         try {
           OrbitHarmonyStore.getInstance().updateWindowSize(

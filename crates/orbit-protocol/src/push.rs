@@ -57,6 +57,39 @@ impl PushPlatform {
     }
 }
 
+/// Device registration sent to a single paired daemon. Both raw tokens are private.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RegisterPushDeviceRequest {
+    pub device_id: String,
+    pub platform: PushPlatform,
+    pub device_name: String,
+    pub device_token: String,
+    #[serde(default)]
+    pub live_activity_token: Option<String>,
+    #[serde(default)]
+    pub sandbox: bool,
+}
+
+impl std::fmt::Debug for RegisterPushDeviceRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisterPushDeviceRequest")
+            .field("device_id", &self.device_id)
+            .field("platform", &self.platform)
+            .field("device_name", &self.device_name)
+            .field("device_token", &"[REDACTED]")
+            .field("sandbox", &self.sandbox)
+            .finish()
+    }
+}
+
+/// APNs routes alert and ActivityKit updates to independent tokens and topics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PushDeliveryKind {
+    Alert,
+    LiveActivity,
+}
+
 /// Categories of Orbit daemon events eligible for native background push delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

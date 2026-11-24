@@ -31,11 +31,11 @@ use orbit_protocol::{
     MonitorWatchRecord, OrchestrationConfig, OrchestrationSkillInfo, PathScopedRule,
     PendingPermissionSummary, PermissionRuleRecord, PlanApprovalAction, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
-    PushDeviceRecord, PushPlatform, PushPreferences, QueuedPromptView, ReasoningEffort,
-    RemoteMessageSearchHit, ResolvePermissionsBatchResult, RuleTriggerMode, ScheduleRunRecord,
-    ScheduleSpec, ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame,
-    TerminalSummary, TimelineEvent, TimelineOutlinePrompt, TimelinePayload, TimerCondition,
-    ToolCallDetail, ToolCallStatus, UpsertPermissionRuleInput, UsageInsightsSnapshot, WireMessage,
+    PushDeviceRecord, PushPreferences, QueuedPromptView, ReasoningEffort, RemoteMessageSearchHit,
+    ResolvePermissionsBatchResult, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec,
+    ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame, TerminalSummary,
+    TimelineEvent, TimelineOutlinePrompt, TimelinePayload, TimerCondition, ToolCallDetail,
+    ToolCallStatus, UpsertPermissionRuleInput, UsageInsightsSnapshot, WireMessage,
     WorkflowRunRecord, WorkspaceBoardSnapshot, WorkspaceEventKind, WorkspaceEventRecord,
     WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary,
     WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
@@ -549,27 +549,7 @@ pub struct PushTestResultView {
     pub detail: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct RegisterPushDeviceRequest {
-    pub device_id: String,
-    pub platform: PushPlatform,
-    pub device_name: String,
-    pub device_token: String,
-    #[serde(default)]
-    pub sandbox: bool,
-}
-
-impl std::fmt::Debug for RegisterPushDeviceRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RegisterPushDeviceRequest")
-            .field("device_id", &self.device_id)
-            .field("platform", &self.platform)
-            .field("device_name", &self.device_name)
-            .field("device_token", &"[REDACTED]")
-            .field("sandbox", &self.sandbox)
-            .finish()
-    }
-}
+pub use orbit_protocol::RegisterPushDeviceRequest;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct UpdatePushPreferencesRequest {
@@ -859,7 +839,8 @@ struct HostMemoryState {
     session_gen: u64,
     available_providers: Vec<ProviderKind>,
     session: Option<HostSessionHandle>,
-    pending_outbox: Vec<WireMessage>,
+    transient_requests: Vec<WireMessage>,
+    outbox_writer: Arc<tokio::sync::Mutex<()>>,
     pending_queue_adds: HashMap<String, Vec<(Uuid, QueuedPromptView)>>,
     pending_queue_removals: HashMap<String, Vec<(Uuid, String)>>,
     pending_queue_reorders: HashMap<String, (Uuid, Vec<String>)>,
@@ -1116,7 +1097,8 @@ impl HostMemoryState {
                 ProviderKind::ClaudeCode,
             ],
             session: None,
-            pending_outbox: Vec::new(),
+            transient_requests: Vec::new(),
+            outbox_writer: Arc::default(),
             pending_queue_adds: HashMap::new(),
             pending_queue_removals: HashMap::new(),
             pending_queue_reorders: HashMap::new(),
@@ -1633,11 +1615,41 @@ impl HostMemoryState {
     }
 }
 
+const THREAD_SYNC_PREFIX: &str = "orbit.thread_pref.v1/";
+fn thread_sync_key(pref: &ClientThreadPref) -> String {
+    // A length prefix keeps arbitrary host and agent identifiers unambiguous.
+    format!(
+        "{THREAD_SYNC_PREFIX}{}:{}{}",
+        pref.host_id.len(),
+        pref.host_id,
+        pref.agent_id
+    )
+}
+
+fn mask_push_token(token: &str) -> String {
+    let chars: Vec<char> = token.trim().chars().collect();
+    if chars.len() <= 12 {
+        return "••••".to_string();
+    }
+    let prefix: String = chars.iter().take(6).collect();
+    let suffix: String = chars[chars.len().saturating_sub(4)..].iter().collect();
+    format!("{prefix}…{suffix}")
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LocalPushRegistration {
+    pub platform: String,
+    pub token_registered: bool,
+    pub token_preview: Option<String>,
+    pub relay_sync_supported: bool,
+}
+
 /// Thread-safe, self-contained Rust Application Core with its own background Tokio runtime.
 pub struct OrbitAppCore {
     runtime: tokio::runtime::Runtime,
     store: Arc<OrbitStore>,
     is_ephemeral_memory: bool,
+    push_registration: Mutex<Option<(String, String)>>,
     hosts: Arc<RwLock<HashMap<String, HostMemoryState>>>,
     projects: Arc<RwLock<HashMap<String, ClientProjectView>>>,
     project_order: Arc<RwLock<Vec<String>>>,
@@ -1657,11 +1669,92 @@ pub struct OrbitAppCore {
 }
 
 impl OrbitAppCore {
+    pub fn register_push_token(
+        &self,
+        platform: String,
+        token: String,
+    ) -> Result<LocalPushRegistration, String> {
+        let clean_platform = platform.trim().to_ascii_lowercase();
+        let clean_token = token.trim().to_string();
+        if clean_platform.is_empty() {
+            return Err("push platform cannot be empty".to_string());
+        }
+        if clean_token.is_empty() {
+            return Err("push token cannot be empty".to_string());
+        }
+        let preview = mask_push_token(&clean_token);
+        let mut guard = self
+            .push_registration
+            .lock()
+            .map_err(|_| "push registration lock poisoned".to_string())?;
+        *guard = Some((clean_platform.clone(), preview.clone()));
+        Ok(LocalPushRegistration {
+            platform: clean_platform,
+            token_registered: true,
+            token_preview: Some(preview),
+            relay_sync_supported: false,
+        })
+    }
+    pub fn unregister_push_token(&self, platform: String) -> Result<(), String> {
+        let clean_platform = platform.trim().to_ascii_lowercase();
+        let mut guard = self
+            .push_registration
+            .lock()
+            .map_err(|_| "push registration lock poisoned".to_string())?;
+        if guard
+            .as_ref()
+            .is_some_and(|(existing, _)| clean_platform.is_empty() || existing == &clean_platform)
+        {
+            *guard = None;
+        }
+        Ok(())
+    }
+    pub fn push_registration_status(&self) -> LocalPushRegistration {
+        match self.push_registration.lock() {
+            Ok(guard) => match guard.as_ref() {
+                Some((platform, token)) => LocalPushRegistration {
+                    platform: platform.clone(),
+                    token_registered: true,
+                    token_preview: Some(token.clone()),
+                    relay_sync_supported: false,
+                },
+                None => LocalPushRegistration {
+                    platform: String::new(),
+                    token_registered: false,
+                    token_preview: None,
+                    relay_sync_supported: false,
+                },
+            },
+            Err(_) => LocalPushRegistration {
+                platform: String::new(),
+                token_registered: false,
+                token_preview: None,
+                relay_sync_supported: false,
+            },
+        }
+    }
+
     pub fn open(
         local_db_path: impl AsRef<Path>,
         auto_discover_local_daemon: bool,
     ) -> Result<Arc<Self>, ClientCoreError> {
-        let store = Arc::new(OrbitStore::open(local_db_path)?);
+        Self::open_with_options_and_key(local_db_path, auto_discover_local_daemon, None)
+    }
+
+    /// Open a mobile database with a 32-byte master key supplied by the platform.
+    pub fn open_with_master_key(
+        local_db_path: impl AsRef<Path>,
+        master_key: Option<[u8; 32]>,
+    ) -> Result<Arc<Self>, ClientCoreError> {
+        Self::open_with_options_and_key(local_db_path, false, master_key)
+    }
+
+    fn open_with_options_and_key(
+        local_db_path: impl AsRef<Path>,
+        auto_discover_local_daemon: bool,
+        master_key: Option<[u8; 32]>,
+    ) -> Result<Arc<Self>, ClientCoreError> {
+        let store = Arc::new(OrbitStore::open_with_master_key(local_db_path, master_key)?);
         if let Ok(purged) = store.purge_legacy_client_timeline_events()
             && purged > 0
         {
@@ -1848,6 +1941,7 @@ impl OrbitAppCore {
             runtime,
             store,
             is_ephemeral_memory,
+            push_registration: Mutex::default(),
             hosts: Arc::new(RwLock::new(initial_hosts)),
             projects: Arc::new(RwLock::new(initial_projects)),
             project_order: Arc::new(RwLock::new(initial_project_order)),
@@ -1915,7 +2009,11 @@ impl OrbitAppCore {
             });
         }
         if !core.is_ephemeral_memory {
+            let _ = core.store.prune_stale_outbox(7 * 24 * 60 * 60 * 1000);
             core.spawn_cloud_sync_etag_poller();
+            if core.store.cloud_dirty_revision().ok().flatten().is_some() {
+                core.schedule_cloud_auto_sync(false);
+            }
         }
         Ok(core)
     }
@@ -4760,7 +4858,7 @@ impl OrbitAppCore {
     }
 
     pub fn remove_host(&self, host_id: &str) -> Result<(), ClientCoreError> {
-        let _ = self.store.delete_client_host(host_id);
+        self.store.delete_client_host(host_id)?;
         let now_ms = now_unix_ms();
         self.record_cloud_meta_mutation(|meta| meta.record_host_deleted(host_id, now_ms));
         {
@@ -5021,7 +5119,12 @@ impl OrbitAppCore {
             h.slot_attach_dispatched_gen.clear();
             h.slot_confirmed_gen.clear();
             h.silent_attach_req_ids.clear();
-            if h.pending_outbox.is_empty() {
+            if h.transient_requests.is_empty()
+                && self
+                    .store
+                    .has_pending_outbox(host_id)
+                    .is_ok_and(|pending| !pending)
+            {
                 h.agent_req_by_req_id.clear();
             }
             fail_pending_host_requests(h, "Host reconnecting before request completed");
@@ -5129,7 +5232,7 @@ impl OrbitAppCore {
                     h.slot_confirmed_gen.clear();
                     h.silent_attach_req_ids.clear();
 
-                    let outbox = std::mem::take(&mut h.pending_outbox);
+                    let outbox = std::mem::take(&mut h.transient_requests);
                     let resubs: Vec<(String, u64)> = h
                         .timelines
                         .iter()
@@ -5407,6 +5510,9 @@ impl OrbitAppCore {
                     let _ = handle.send_wire(queued_msg).await;
                 }
 
+                self.flush_host_outbox(host_id);
+                self.schedule_cloud_auto_sync(true);
+
                 // Wake any disconnected/LAN-isolated peers that can now bridge through this host,
                 // and ensure the account-wide zero-config fleet relay/mesh fabric is converging.
                 self.kick_pending_host_reconnects_excluding(host_id);
@@ -5545,7 +5651,12 @@ impl OrbitAppCore {
             h.slot_confirmed_gen.clear();
             h.pending_slot_frames.clear();
             h.silent_attach_req_ids.clear();
-            if h.pending_outbox.is_empty() {
+            if h.transient_requests.is_empty()
+                && self
+                    .store
+                    .has_pending_outbox(host_id)
+                    .is_ok_and(|pending| !pending)
+            {
                 h.agent_req_by_req_id.clear();
                 h.pending_queue_adds.clear();
                 h.pending_queue_removals.clear();
@@ -8567,64 +8678,186 @@ impl OrbitAppCore {
         }
     }
 
-    /// Sends immediately if connected, or queues into `pending_outbox` without requiring `&Arc<Self>`,
-    /// so `&self` sync mutations (read state, pins, projects, drag order) converge reliably across reconnects.
-    fn dispatch_wire_or_queue(&self, host_id: &str, msg: WireMessage) {
-        let mut live_handle = None;
-        if let Ok(mut guard) = self.hosts.write()
-            && let Some(h) = guard.get_mut(host_id)
-        {
-            if let Some(ref handle) = h.session {
-                live_handle = Some(handle.clone());
-            } else {
-                h.pending_outbox.push(msg.clone());
-            }
-        }
-        if let Some(handle) = live_handle {
-            let hosts = Arc::clone(&self.hosts);
-            let owned_host = host_id.to_string();
-            self.runtime.spawn(async move {
-                if handle.send_wire(msg.clone()).await.is_err()
-                    && let Ok(mut guard) = hosts.write()
-                    && let Some(h) = guard.get_mut(&owned_host)
-                {
-                    h.pending_outbox.push(msg);
+    fn flush_host_outbox(&self, host_id: &str) {
+        const OUTBOX_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+        const MAX_OUTBOX_ATTEMPTS: u32 = 8;
+        let Some(writer) = self.hosts.read().ok().and_then(|hosts| {
+            let h = hosts.get(host_id)?;
+            h.session.as_ref()?;
+            Some(h.outbox_writer.clone())
+        }) else {
+            return;
+        };
+        let hosts = Arc::clone(&self.hosts);
+        let store = Arc::clone(&self.store);
+        let host_id = host_id.to_owned();
+        self.runtime.spawn(async move {
+            let _guard = writer.lock().await;
+            let Some(handle) = hosts.read().ok().and_then(|hosts| {
+                let h = hosts.get(&host_id)?;
+                if Arc::ptr_eq(&writer, &h.outbox_writer) {
+                    h.session.clone()
+                } else {
+                    None
                 }
-            });
-        }
+            }) else {
+                return;
+            };
+            let list_store = Arc::clone(&store);
+            let list_host = host_id.clone();
+            let rows = match tokio::task::spawn_blocking(move || {
+                let _ = list_store.prune_stale_outbox(OUTBOX_MAX_AGE_MS);
+                list_store.list_pending_outbox(&list_host)
+            })
+            .await
+            {
+                Ok(Ok(rows)) => rows,
+                Ok(Err(error)) => {
+                    tracing::warn!(%host_id, %error, "outbox load deferred");
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(%host_id, %error, "outbox load worker failed");
+                    return;
+                }
+            };
+            for row in rows {
+                if row.attempts >= MAX_OUTBOX_ATTEMPTS {
+                    tracing::warn!(
+                        %host_id,
+                        outbox_id = row.id,
+                        attempts = row.attempts,
+                        "evicting poison-pill outbox entry after max retries"
+                    );
+                    let rm_store = Arc::clone(&store);
+                    let row_id = row.id;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        rm_store.remove_pending_outbox(row_id)
+                    })
+                    .await;
+                    continue;
+                }
+                let msg: WireMessage = match serde_json::from_str(&row.payload_json) {
+                    Ok(msg) => msg,
+                    Err(error) => {
+                        tracing::warn!(
+                            %host_id,
+                            outbox_id = row.id,
+                            %error,
+                            "evicting unparseable stored outbox frame"
+                        );
+                        let rm_store = Arc::clone(&store);
+                        let row_id = row.id;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            rm_store.remove_pending_outbox(row_id)
+                        })
+                        .await;
+                        continue;
+                    }
+                };
+                match handle.send_wire_confirmed(msg).await {
+                    Ok(()) => {
+                        let rm_store = Arc::clone(&store);
+                        let row_id = row.id;
+                        if let Ok(Err(error)) = tokio::task::spawn_blocking(move || {
+                            rm_store.remove_pending_outbox(row_id)
+                        })
+                        .await
+                        {
+                            tracing::warn!(%host_id, outbox_id = row_id, %error, "outbox remove failed");
+                        }
+                    }
+                    Err(crate::OutboxSendError::EncodeFailed) => {
+                        tracing::warn!(
+                            %host_id,
+                            outbox_id = row.id,
+                            "evicting non-encodable outbox frame"
+                        );
+                        let rm_store = Arc::clone(&store);
+                        let row_id = row.id;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            rm_store.remove_pending_outbox(row_id)
+                        })
+                        .await;
+                    }
+                    Err(crate::OutboxSendError::TransportFailed) => {
+                        let mark_store = Arc::clone(&store);
+                        let row_id = row.id;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            mark_store.mark_outbox_attempt(row_id, "transport write failed")
+                        })
+                        .await;
+                        tracing::warn!(%host_id, outbox_id = row_id, "outbox delivery deferred");
+                        break;
+                    }
+                }
+            }
+        });
     }
 
-    /// Sends immediately if connected, or queues into `pending_outbox` and triggers background reconnect so user messages are NEVER dropped!
-    fn dispatch_wire_queued(self: &Arc<Self>, host_id: &str, msg: WireMessage) {
-        let mut live_handle = None;
-        let mut needs_reconnect = false;
-
-        if let Ok(mut guard) = self.hosts.write()
-            && let Some(h) = guard.get_mut(host_id)
+    fn dispatch_wire_or_queue(&self, host_id: &str, msg: WireMessage) {
+        if matches!(msg, WireMessage::Ping { .. } | WireMessage::Pong { .. }) {
+            self.dispatch_wire(host_id, msg);
+            return;
+        }
+        if let Ok(mut hosts) = self.hosts.write()
+            && let Some(h) = hosts.get_mut(host_id)
         {
-            if let Some(ref handle) = h.session {
-                live_handle = Some(handle.clone());
-            } else {
-                h.pending_outbox.push(msg.clone());
-                needs_reconnect = !h.connecting_in_flight;
+            if matches!(
+                msg,
+                WireMessage::AttachTerminal { .. }
+                    | WireMessage::SubscribeTimeline { .. }
+                    | WireMessage::SubscribeProviderSubagent { .. }
+                    | WireMessage::GetGitDiff { .. }
+                    | WireMessage::GetGitStatus { .. }
+                    | WireMessage::GetWorkspaceBoard { .. }
+                    | WireMessage::InspectGitRepos { .. }
+                    | WireMessage::ListAcpAgents { .. }
+                    | WireMessage::ListDirectory { .. }
+                    | WireMessage::ListPendingPermissions { .. }
+                    | WireMessage::ListProviderModels { .. }
+                    | WireMessage::ListProviderSubagents { .. }
+                    | WireMessage::ListScheduleRuns { .. }
+                    | WireMessage::ListWorkspaceEvents { .. }
+                    | WireMessage::ListWorkspaceFiles { .. }
+                    | WireMessage::ListWorkspaceScripts { .. }
+                    | WireMessage::RefreshQuotas { .. }
+            ) {
+                if let Some(handle) = h.session.clone() {
+                    self.runtime.spawn(async move {
+                        let _ = handle.send_wire(msg).await;
+                    });
+                } else {
+                    h.transient_requests.push(msg);
+                }
+                return;
+            }
+            let result = serde_json::to_string(&msg)
+                .map_err(orbit_store::StoreError::from)
+                .and_then(|json| self.store.enqueue_pending_outbox(host_id, &json));
+            if let Err(error) = result {
+                h.last_error = Some(error.to_string());
+                drop(hosts);
+                tracing::warn!(%host_id,%error,"could not queue host request");
+                self.emit(|revision| CoreNotification::HostChanged {
+                    revision,
+                    host_id: host_id.to_owned(),
+                });
+                return;
             }
         }
+        self.flush_host_outbox(host_id);
+    }
 
-        if let Some(handle) = live_handle {
-            let fallback_core = Arc::clone(self);
-            let owned_host = host_id.to_string();
-            self.runtime.spawn(async move {
-                if handle.send_wire(msg.clone()).await.is_err() {
-                    if let Ok(mut guard) = fallback_core.hosts.write()
-                        && let Some(h) = guard.get_mut(&owned_host)
-                    {
-                        h.pending_outbox.push(msg);
-                    }
-                    fallback_core.connect_host_async(owned_host);
-                }
-            });
-        } else if needs_reconnect {
-            self.connect_host_async(host_id.to_string());
+    fn dispatch_wire_queued(self: &Arc<Self>, host_id: &str, msg: WireMessage) {
+        self.dispatch_wire_or_queue(host_id, msg);
+        if self.hosts.read().ok().and_then(|hosts| {
+            hosts
+                .get(host_id)
+                .map(|h| h.session.is_none() && !h.connecting_in_flight)
+        }) == Some(true)
+        {
+            self.connect_host_async(host_id.to_owned());
         }
     }
 
@@ -14179,6 +14412,7 @@ impl OrbitAppCore {
         }
 
         for (host_id, handle, resubs) in connected {
+            self.flush_host_outbox(&host_id);
             let core = Arc::clone(self);
             self.runtime.spawn(async move {
                 let ping_res = handle
@@ -18401,9 +18635,29 @@ impl OrbitAppCore {
                 platform: req.platform,
                 device_name: req.device_name,
                 device_token: req.device_token,
+                live_activity_token: req.live_activity_token,
                 sandbox: req.sandbox,
             },
             "register push device",
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    pub async fn register_live_activity_token(
+        self: &Arc<Self>,
+        host_id: &str,
+        device_id: String,
+        live_activity_token: Option<String>,
+    ) -> Result<PushDevicesSnapshotView, String> {
+        self.dispatch_push_snapshot_rpc(
+            host_id.to_owned(),
+            move |request_id| WireMessage::RegisterLiveActivityToken {
+                request_id,
+                device_id,
+                live_activity_token,
+            },
+            "register live activity",
             Duration::from_secs(15),
         )
         .await
@@ -20940,6 +21194,74 @@ impl OrbitAppCore {
         .await
     }
 
+    /// Drive a mobile bridge RPC on the application's Tokio runtime safely even if invoked
+    /// re-entrantly from a Tokio worker thread (e.g. inside `CoreEventSubscriber::on_notification`).
+    pub fn run_mobile_rpc<F>(&self, rpc: F) -> F::Output
+    where
+        F: std::future::Future + Send,
+        F::Output: Send,
+    {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| self.runtime.block_on(rpc))
+                    .join()
+                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+            })
+        } else {
+            self.runtime.block_on(rpc)
+        }
+    }
+
+    pub async fn get_session_usage(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+    ) -> Result<orbit_protocol::SessionUsage, String> {
+        let session = self.require_online_session(host_id)?;
+        let id = Uuid::new_v4();
+        let mut events = session.subscribe();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            session
+                .send_wire(WireMessage::GetSessionUsage {
+                    request_id: id,
+                    agent_id: agent_id.to_string(),
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            loop {
+                match events.recv().await.map_err(|e| e.to_string())? {
+                    ClientInboundEvent::Wire(WireMessage::SessionUsageResponse {
+                        request_id,
+                        usage,
+                    }) if request_id == id && usage.agent_id == agent_id => return Ok(usage),
+                    ClientInboundEvent::Wire(WireMessage::RpcError {
+                        request_id: Some(request_id),
+                        message,
+                        ..
+                    }) if request_id == id => return Err(message),
+                    ClientInboundEvent::Disconnected => return Err("host disconnected".into()),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| "session usage request timed out".to_owned())?
+    }
+
+    /// Current mesh registrations grouped by the host that owns them, including offline hosts.
+    pub fn get_fleet_mesh_snapshot(
+        &self,
+    ) -> Result<HashMap<String, Vec<ConnectedHostSummary>>, String> {
+        Ok(self
+            .hosts
+            .read()
+            .map_err(|_| "host lock poisoned")?
+            .iter()
+            .map(|(id, h)| (id.clone(), h.connected_hosts.clone()))
+            .collect())
+    }
+
     fn require_online_session(&self, host_id: &str) -> Result<HostSessionHandle, String> {
         let guard = self
             .hosts
@@ -22020,12 +22342,13 @@ impl OrbitAppCore {
 
     /// Trigger a non-blocking background Cloud Sync (used after local mutations or foreground resume).
     pub fn schedule_cloud_auto_sync(self: &Arc<Self>, throttled: bool) {
+        let dirty = self.store.cloud_dirty_revision().ok().flatten().is_some();
         let cfg = load_sync_config_from_store(&self.store);
         if !cfg.auto_sync_enabled || !cfg.is_signed_in() || cfg.derived_key().is_none() {
             return;
         }
         let now = unix_ms_now();
-        if throttled {
+        if throttled && !dirty {
             let last = self.cloud_sync_last_auto_ms.load(Ordering::SeqCst);
             if now.saturating_sub(last) < 30_000 {
                 return;
@@ -22242,6 +22565,24 @@ impl OrbitAppCore {
         let now_ms = now_unix_ms();
         let mut local_meta = load_sync_meta_from_store(&self.store);
         let mut local_prefs = load_sync_prefs_from_store(&self.store);
+        for pref in self
+            .store
+            .list_client_thread_prefs()
+            .map_err(|e| CloudSyncError::Storage(e.to_string()))?
+        {
+            if pref.updated_at_ms > 0 {
+                let key = thread_sync_key(&pref);
+                let value = serde_json::to_value(&pref)
+                    .map_err(|e| CloudSyncError::Storage(e.to_string()))?;
+                local_prefs.insert(
+                    key,
+                    SyncedPreferenceEntry {
+                        value,
+                        updated_at_ms: pref.updated_at_ms,
+                    },
+                );
+            }
+        }
         if !local_prefs.contains_key("primary_router_selection")
             && let Ok(Some(raw_sel)) = self.store.get_client_kv("primary_router_selection")
             && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw_sel)
@@ -22497,6 +22838,38 @@ impl OrbitAppCore {
         // Apply merged preferences if remote won
         if !outcome.preferences_to_apply.is_empty() {
             for (k, entry) in &outcome.preferences_to_apply {
+                if k.starts_with(THREAD_SYNC_PREFIX) {
+                    let pref: ClientThreadPref = serde_json::from_value(entry.value.clone())
+                        .map_err(|e| CloudSyncError::InvalidVault(e.to_string()))?;
+                    if thread_sync_key(&pref) != *k || pref.updated_at_ms != entry.updated_at_ms {
+                        return Err(CloudSyncError::InvalidVault(
+                            "invalid thread preference identity or timestamp".into(),
+                        ));
+                    }
+                    if outcome
+                        .merged
+                        .hosts
+                        .get(&pref.host_id)
+                        .is_some_and(|h| h.deleted_at_ms.is_none())
+                    {
+                        let mut guard = self.thread_prefs.write().map_err(|_| {
+                            CloudSyncError::Storage("thread preference lock poisoned".into())
+                        })?;
+                        let id = (pref.host_id.clone(), pref.agent_id.clone());
+                        if guard
+                            .get(&id)
+                            .is_none_or(|current| current.updated_at_ms < pref.updated_at_ms)
+                        {
+                            self.store
+                                .upsert_client_thread_pref(&pref)
+                                .map_err(|e| CloudSyncError::Storage(e.to_string()))?;
+                            self.pin_order_seq
+                                .fetch_max(pref.pinned_order.max(0) as u64, Ordering::Relaxed);
+                            guard.insert(id, pref);
+                        }
+                    }
+                    continue;
+                }
                 local_prefs.insert(k.clone(), entry.clone());
                 if k == "primary_router_selection"
                     && let Ok(raw_json) = serde_json::to_string(&entry.value)
@@ -22508,7 +22881,8 @@ impl OrbitAppCore {
                     );
                 }
             }
-            let _ = save_sync_prefs_to_store(&self.store, &local_prefs);
+            local_prefs.retain(|k, _| !k.starts_with(THREAD_SYNC_PREFIX));
+            save_sync_prefs_to_store(&self.store, &local_prefs)?;
         }
 
         if let Some(ref net) = outcome.fleet_network_changed {
@@ -22533,6 +22907,11 @@ impl OrbitAppCore {
         if let Ok(mut fp_guard) = self.last_vault_fingerprint.write() {
             *fp_guard = Some(vault_fp.clone());
         }
+
+        // Snapshot dirty revision AFTER remote-apply SQLite writes and BEFORE network push so
+        // remote pulls never leave `cloud_sync_dirty` stuck true while concurrent local edits
+        // made during `push_vault_payload` advance past `synced_dirty_rev` and stay dirty.
+        let synced_dirty_rev = self.store.cloud_dirty_revision().ok().flatten();
 
         // Push encrypted vault to GitHub Secret Gist if local state contributed new changes
         if outcome.needs_push {
@@ -22585,6 +22964,9 @@ impl OrbitAppCore {
         cfg.synced_project_count = active_projects;
         cfg.last_error = None;
         save_sync_config_to_store(&self.store, cfg)?;
+        if let Some(revision) = synced_dirty_rev {
+            let _ = self.store.clear_cloud_dirty_revision(revision);
+        }
 
         if let Ok(mut guard) = self.hosts.write() {
             for (hid, h) in guard.iter_mut() {
@@ -22651,7 +23033,12 @@ impl OrbitAppCore {
                     .fetch_vault_gist_conditional(&token, &gist_id, cfg.last_etag.as_deref())
                     .await
                 {
-                    Ok(GistConditionalFetch::NotModified) => continue,
+                    Ok(GistConditionalFetch::NotModified) => {
+                        if core.store.cloud_dirty_revision().ok().flatten().is_some() {
+                            let _ = core.cloud_sync_now_async().await;
+                        }
+                        continue;
+                    }
                     Ok(GistConditionalFetch::Updated { gist, etag }) => {
                         let _guard = core.cloud_sync_mutex.lock().await;
                         core.cloud_sync_in_flight.store(true, Ordering::SeqCst);
@@ -24598,6 +24985,139 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mobile_outbox_reopens_and_waits_for_the_transport_receipt() {
+        let path = std::env::temp_dir().join(format!("orbit-mobile-replay-{}.db", Uuid::new_v4()));
+        {
+            let store = OrbitStore::open(&path).expect("store");
+            store
+                .upsert_client_host(&StoredHostProfile {
+                    host_id: "mobile-host".into(),
+                    display_name: "Mobile".into(),
+                    daemon_pubkey_b64: "test-key".into(),
+                    direct_endpoints: vec![],
+                    relay_url: None,
+                    pairing_secret: "paired".into(),
+                    meta: Default::default(),
+                })
+                .expect("host");
+        }
+        let id = Uuid::new_v4();
+        {
+            let core = OrbitAppCore::open_with_master_key(&path, Some([4; 32])).expect("core");
+            core.dispatch_wire_or_queue(
+                "mobile-host",
+                WireMessage::MarkAgentUnread {
+                    request_id: id,
+                    agent_id: "a".into(),
+                },
+            );
+            core.dispatch_wire_or_queue("mobile-host", WireMessage::Ping { ts_ms: 10 });
+            core.resize_terminal("mobile-host", 80, 24);
+        }
+        let core = OrbitAppCore::open_with_master_key(&path, Some([4; 32])).expect("reopen");
+        let rows = core.store.list_pending_outbox("mobile-host").expect("read");
+        assert_eq!(rows.len(), 1);
+        let attach = |handle| {
+            core.hosts
+                .write()
+                .expect("hosts")
+                .get_mut("mobile-host")
+                .expect("host")
+                .session = Some(handle);
+        };
+        let (handle, mut rx) = crate::HostSessionHandle::new_test_channel();
+        attach(handle);
+        core.flush_host_outbox("mobile-host");
+        let frame = core.runtime.block_on(rx.recv()).expect("wire");
+        let crate::OutboundPayload::ConfirmedWire(
+            WireMessage::MarkAgentUnread { request_id, .. },
+            receipt,
+        ) = frame
+        else {
+            panic!("expected durable unread command")
+        };
+        assert_eq!(request_id, id);
+        assert!(
+            core.store
+                .has_pending_outbox("mobile-host")
+                .expect("pending")
+        );
+        drop(receipt);
+        core.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while core.store.list_pending_outbox("mobile-host").expect("rows")[0].attempts == 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("failed attempt recorded");
+        });
+        let (handle, mut rx) = crate::HostSessionHandle::new_test_channel();
+        attach(handle);
+        core.flush_host_outbox("mobile-host");
+        let frame = core.runtime.block_on(rx.recv()).expect("retry");
+        let crate::OutboundPayload::ConfirmedWire(
+            WireMessage::MarkAgentUnread { request_id, .. },
+            receipt,
+        ) = frame
+        else {
+            panic!("expected retry")
+        };
+        assert_eq!(request_id, id);
+        receipt.send(Ok(())).expect("acknowledge write");
+        core.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while core
+                    .store
+                    .has_pending_outbox("mobile-host")
+                    .expect("pending")
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("row retired");
+        });
+
+        // P0-1: Corrupt head-of-line outbox row is evicted rather than blocking subsequent frames.
+        core.store
+            .enqueue_pending_outbox("mobile-host", "{not-valid-json")
+            .expect("enqueue corrupt");
+        let valid_id = Uuid::new_v4();
+        core.store
+            .enqueue_pending_outbox(
+                "mobile-host",
+                &serde_json::to_string(&WireMessage::MarkAgentUnread {
+                    request_id: valid_id,
+                    agent_id: "a1".into(),
+                })
+                .expect("json"),
+            )
+            .expect("enqueue valid");
+        core.flush_host_outbox("mobile-host");
+        let next = core.runtime.block_on(rx.recv()).expect("valid delivered");
+        let crate::OutboundPayload::ConfirmedWire(
+            WireMessage::MarkAgentUnread {
+                request_id: got_id, ..
+            },
+            receipt2,
+        ) = next
+        else {
+            panic!("expected valid frame after corrupt row eviction");
+        };
+        assert_eq!(got_id, valid_id);
+        receipt2.send(Ok(())).expect("ack valid");
+
+        // P0-2: run_mobile_rpc safely runs even when invoked re-entrantly inside a Tokio worker.
+        let val = core
+            .runtime
+            .block_on(async { core.run_mobile_rpc(async { 42u32 }) });
+        assert_eq!(val, 42);
+        drop(core);
+        let _ = std::fs::remove_file(&path);
+    }
+    #[test]
     fn app_core_persists_paired_host_projects_rename_and_optimistic_outbox() {
         let core = OrbitAppCore::open_in_memory().expect("open core");
         let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keypair");
@@ -25234,10 +25754,12 @@ mod tests {
 
         core.send_prompt("host_rpc_err", "ag_existing", "follow up");
         let req_id = {
-            let guard = core.hosts.read().expect("read");
-            let h = guard.get("host_rpc_err").expect("host");
-            assert_eq!(h.pending_outbox.len(), 1);
-            match &h.pending_outbox[0] {
+            let pending = core
+                .store
+                .list_pending_outbox("host_rpc_err")
+                .expect("list");
+            assert_eq!(pending.len(), 1);
+            match &serde_json::from_str::<WireMessage>(&pending[0].payload_json).expect("wire") {
                 WireMessage::SendPrompt { request_id, .. } => *request_id,
                 other => panic!("unexpected outbox msg: {other:?}"),
             }
@@ -26696,7 +27218,7 @@ mod tests {
             let mut hosts = core.hosts.write().expect("hosts write");
             let h = hosts.get_mut("h_reconn").expect("host");
             h.session_gen = 3;
-            h.pending_outbox.clear();
+            h.transient_requests.clear();
         }
         let reused_slot = core
             .ensure_terminal_attached("h_reconn", "term-detached-a")
@@ -26705,7 +27227,7 @@ mod tests {
         let hosts = core.hosts.read().expect("hosts read");
         let h = hosts.get("h_reconn").expect("host");
         assert!(
-            h.pending_outbox.iter().any(|m| matches!(
+            h.transient_requests.iter().any(|m| matches!(
                 m,
                 WireMessage::AttachTerminal { terminal_id, slot: 1, .. } if terminal_id == "term-detached-a"
             )),
@@ -29744,12 +30266,9 @@ mod tests {
         });
         assert!(opt_id.starts_with("opt_"));
 
-        // Clear any pending queued wire messages from `create_agent`
-        {
-            let mut hosts = core.hosts.write().expect("hosts");
-            if let Some(h) = hosts.get_mut("host_opt") {
-                h.pending_outbox.clear();
-            }
+        // Clear the durable CreateAgent before checking for spurious UpdateAgent writes.
+        for row in core.store.list_pending_outbox("host_opt").expect("outbox") {
+            core.store.remove_pending_outbox(row.id).expect("remove");
         }
 
         let counter = Arc::new(EventCounter {
@@ -29770,7 +30289,10 @@ mod tests {
             let h = hosts.get("host_opt").expect("host");
             assert!(h.agents.get(&opt_id).expect("opt agent").fast_mode);
             assert!(
-                h.pending_outbox.is_empty(),
+                core.store
+                    .list_pending_outbox("host_opt")
+                    .expect("list")
+                    .is_empty(),
                 "update_agent_full must not dispatch wire messages for opt_* agents"
             );
         }
@@ -30036,7 +30558,7 @@ mod tests {
                     .contains(&("ag_p1".to_string(), "sub_a".to_string()))
             );
             // Clear initial outbox so we can observe follow-up pagination messages cleanly
-            h.pending_outbox.clear();
+            h.transient_requests.clear();
         }
 
         // 2. Catchup page 1 with `has_more = true` must enqueue follow-up `since_seq = 2`
@@ -30077,7 +30599,7 @@ mod tests {
             let mut hosts = core.hosts.write().expect("hosts");
             let h = hosts.get_mut(host_id).expect("host");
             assert!(
-                h.pending_outbox.iter().any(|m| matches!(
+                h.transient_requests.iter().any(|m| matches!(
                     m,
                     WireMessage::SubscribeProviderSubagent {
                         parent_agent_id,
@@ -30088,7 +30610,7 @@ mod tests {
                 )),
                 "has_more=true must trigger follow-up SubscribeProviderSubagent with since_seq=2"
             );
-            h.pending_outbox.clear();
+            h.transient_requests.clear();
 
             // 3. Reconnect helper must resubscribe active provider subagent at latest seq = 2
             let resubs = collect_provider_subagent_resubscriptions(h);
@@ -30110,7 +30632,7 @@ mod tests {
             let hosts = core.hosts.read().expect("hosts");
             let h = hosts.get(host_id).expect("host");
             assert!(
-                h.pending_outbox.is_empty(),
+                h.transient_requests.is_empty(),
                 "empty catchup must not loop even if has_more=true"
             );
         }
@@ -30164,7 +30686,11 @@ mod tests {
         // Now catchup delivers older page [seq 3, seq 4] with has_more=true while live seq 12 is already cached!
         {
             let mut hosts = core.hosts.write().expect("hosts");
-            hosts.get_mut(host_id).expect("host").pending_outbox.clear();
+            hosts
+                .get_mut(host_id)
+                .expect("host")
+                .transient_requests
+                .clear();
         }
         core.handle_inbound_wire(
             host_id,
@@ -30203,7 +30729,7 @@ mod tests {
             let hosts = core.hosts.read().expect("hosts");
             let h = hosts.get(host_id).expect("host");
             assert!(
-                h.pending_outbox.iter().any(|m| matches!(
+                h.transient_requests.iter().any(|m| matches!(
                     m,
                     WireMessage::SubscribeProviderSubagent {
                         parent_agent_id,
@@ -31355,17 +31881,17 @@ mod tests {
             Some(ssh_uri.as_str())
         );
         assert!(
-            hosts
-                .get("h1")
-                .expect("h1")
-                .pending_outbox
+            core.store
+                .list_pending_outbox("h1")
+                .expect("rows")
                 .iter()
+                .map(|r| serde_json::from_str::<WireMessage>(&r.payload_json).expect("wire"))
                 .any(|m| matches!(
                     m,
                     WireMessage::ConfigureHostRelay {
                         relay_url: Some(url),
                         ..
-                    } if url == &ssh_uri
+                    } if url == ssh_uri
                 ))
         );
     }

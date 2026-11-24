@@ -2,15 +2,75 @@
   "color": [
     {
       "name": "start_window_background",
-      "value": "#000000"
+      "value": "#17181E"
+    },
+    {
+      "name": "orbit_surface_recessed",
+      "value": "#121318"
+    },
+    {
+      "name": "orbit_surface_base",
+      "value": "#17181E"
+    },
+    {
+      "name": "orbit_surface_raised",
+      "value": "#20222B"
+    },
+    {
+      "name": "orbit_surface_overlay",
+      "value": "#272A35"
+    },
+    {
+      "name": "orbit_surface_subtle",
+      "value": "#232630"
+    },
+    {
+      "name": "orbit_ink_primary",
+      "value": "#F1F2F7"
+    },
+    {
+      "name": "orbit_ink_secondary",
+      "value": "#B2B6C7"
+    },
+    {
+      "name": "orbit_ink_tertiary",
+      "value": "#83889C"
+    },
+    {
+      "name": "orbit_ink_faint",
+      "value": "#5F6477"
+    },
+    {
+      "name": "orbit_border_subtle",
+      "value": "#14FFFFFF"
+    },
+    {
+      "name": "orbit_border_default",
+      "value": "#1FFFFFFF"
+    },
+    {
+      "name": "orbit_border_strong",
+      "value": "#33FFFFFF"
     },
     {
       "name": "orbit_code_bg",
-      "value": "#16171A"
+      "value": "#121318"
+    },
+    {
+      "name": "orbit_status_direct",
+      "value": "#3ED598"
     },
     {
       "name": "orbit_status_direct_soft",
-      "value": "#2464BB5C"
+      "value": "#223ED598"
+    },
+    {
+      "name": "orbit_status_info",
+      "value": "#6FA8FF"
+    },
+    {
+      "name": "orbit_status_info_soft",
+      "value": "#226FA8FF"
     },
     {
       "name": "orbit_status_relay",
@@ -21,44 +81,52 @@
       "value": "#24A78BFA"
     },
     {
+      "name": "orbit_status_warning",
+      "value": "#F5B749"
+    },
+    {
       "name": "orbit_status_warning_soft",
-      "value": "#24ED6F21"
+      "value": "#24F5B749"
+    },
+    {
+      "name": "orbit_status_danger",
+      "value": "#F87171"
     },
     {
       "name": "orbit_status_danger_soft",
-      "value": "#24E84026"
+      "value": "#24F87171"
     },
     {
       "name": "orbit_brand",
-      "value": "#F4F4F6"
+      "value": "#F1F2F7"
     },
     {
       "name": "orbit_on_brand",
-      "value": "#141416"
+      "value": "#14161D"
     },
     {
       "name": "orbit_accent_soft",
-      "value": "#1AF4F4F6"
+      "value": "#1AF1F2F7"
     },
     {
       "name": "orbit_diff_added_bg",
-      "value": "#2464BB5C"
+      "value": "#223ED598"
     },
     {
       "name": "orbit_diff_removed_bg",
-      "value": "#24E84026"
+      "value": "#24F87171"
     },
     {
       "name": "orbit_terminal_bg",
-      "value": "#0A0B0E"
+      "value": "#0E1015"
     },
     {
       "name": "orbit_terminal_fg",
-      "value": "#EFEFF2"
+      "value": "#F1F2F7"
     },
     {
       "name": "orbit_badge_unread",
-      "value": "#F4F4F6"
+      "value": "#F1F2F7"
     },
     {
       "name": "orbit_scrim",
@@ -66,27 +134,27 @@
     },
     {
       "name": "orbit_overlay_pill_bg",
-      "value": "#CC000000"
+      "value": "#D9121318"
     },
     {
       "name": "orbit_syntax_string",
-      "value": "#A3BE8C"
+      "value": "#3ED598"
     },
     {
       "name": "orbit_syntax_number",
-      "value": "#EBCB8B"
+      "value": "#F5B749"
     },
     {
       "name": "orbit_syntax_keyword",
-      "value": "#8FA1B3"
+      "value": "#6FA8FF"
     },
     {
       "name": "orbit_syntax_type",
-      "value": "#B48EAD"
+      "value": "#C4B5FD"
     },
     {
       "name": "orbit_syntax_error",
-      "value": "#BF616A"
+      "value": "#F87171"
     }
   ]
 }

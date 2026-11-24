@@ -3,6 +3,7 @@ import UIKit
 
 @main
 struct OrbitMobileApp: App {
+    @UIApplicationDelegateAdaptor(OrbitAppDelegate.self) private var appDelegate
     @StateObject private var store = OrbitIosStore()
     @AppStorage("orbit.appearance") private var appearanceRaw: String = OrbitAppearanceMode.system.rawValue
     @State private var debugAppearanceOverride: OrbitAppearanceMode?
@@ -33,6 +34,8 @@ struct OrbitMobileApp: App {
                 store.handleDeepLink(url)
             }
             .onAppear {
+                appDelegate.store = store
+                store.bindLiveActivityManager()
                 store.applyLaunchArguments(CommandLine.arguments) { mode in
                     debugAppearanceOverride = mode
                 }

@@ -75,6 +75,16 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.stringResource
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
+import androidx.compose.ui.unit.Dp
+import dev.orbit.android.R
+import dev.orbit.android.store.PlanApprovalReducer
+import dev.orbit.android.ui.shell.OrbitFoldablePosture
+import uniffi.orbit_ffi_uniffi.FfiTimelineItem
 import dev.orbit.android.store.OrbitAndroidStore
 import dev.orbit.android.store.OrbitFormatters
 import dev.orbit.android.store.OrbitUiState
@@ -93,6 +103,8 @@ import uniffi.orbit_ffi_uniffi.FfiConnectionState
 fun StreamStageScreen(
     ui: OrbitUiState,
     store: OrbitAndroidStore,
+    tabletop: OrbitFoldablePosture.TabletopSplit?,
+    inlineTerminalOpen: Boolean,
     onOpenContextPicker: () -> Unit,
     onOpenModelSelector: () -> Unit,
     onOpenDiffForFile: (String?) -> Unit,
@@ -128,6 +140,40 @@ fun StreamStageScreen(
         }
     }
 
+    val hasLoadOlderHeader = ui.stageHasOlderTurns && turns.isNotEmpty()
+    val headerOffset = if (hasLoadOlderHeader) 1 else 0
+    val lastListIndex = (headerOffset + turns.lastIndex).coerceAtLeast(0)
+
+    var anchor by remember { mutableStateOf<Pair<String, Int>?>(null) }
+    fun earlier() {
+        if (ui.isLoadingOlderTurns || !ui.stageHasOlderTurns || turns.isEmpty()) return
+        val firstTurnIndex = (listState.firstVisibleItemIndex - headerOffset).coerceIn(0, turns.lastIndex)
+        val first = turns.getOrNull(firstTurnIndex) ?: return
+        val offset = if (listState.firstVisibleItemIndex < headerOffset) 0 else listState.firstVisibleItemScrollOffset
+        anchor = first.key to offset
+        store.loadOlderTimeline()
+    }
+    val isAtTop by remember { derivedStateOf { listState.firstVisibleItemIndex == 0 } }
+    val dragging by listState.interactionSource.collectIsDraggedAsState()
+    LaunchedEffect(isAtTop, dragging) {
+        if (dragging && isAtTop && listState.canScrollForward) earlier()
+    }
+    LaunchedEffect(ui.isLoadingOlderTurns, turns.firstOrNull()?.key) {
+        val saved = anchor
+        if (!ui.isLoadingOlderTurns && saved != null) {
+            // Stable LazyColumn keys already preserve a reader who kept scrolling during the fetch.
+            val turnIndex = dev.orbit.android.store.StageDeltaReducer.resolvePrependedAnchorIndex(
+                saved.first,
+                turns.map { it.key },
+                0,
+            )
+            if (turnIndex != null && listState.firstVisibleItemIndex <= headerOffset) {
+                listState.scrollToItem(turnIndex + headerOffset, saved.second)
+            }
+            anchor = null
+        }
+    }
+
     val canScrollForward by remember {
         derivedStateOf { listState.canScrollForward }
     }
@@ -157,155 +203,248 @@ fun StreamStageScreen(
             stageViewportHeightPx in 1 until prevStageViewportHeightPx
         prevStageViewportHeightPx = stageViewportHeightPx
         if (turns.isNotEmpty() && anchoredAtBottom && (shrank || activeDecisionCount > 0)) {
-            listState.scrollToItem(turns.lastIndex, scrollOffset = 100_000)
+            listState.scrollToItem(lastListIndex, scrollOffset = 100_000)
         }
     }
 
-    // Smart auto-scroll to bottom when pinned at bottom and stage sequence advances
+    // Smart auto-scroll to bottom ONLY when stageSeq advances (never when prepending older history)
     val stageSeq = stage?.latestSeq ?: 0uL
-    val turnCount = turns.size
-    LaunchedEffect(ui.selectedAgentId) {
+    var lastAutoScrolledSeq by remember(ui.selectedHostId, ui.selectedAgentId) {
+        mutableStateOf(0uL)
+    }
+    LaunchedEffect(ui.selectedHostId, ui.selectedAgentId) {
         anchoredAtBottom = true
+        lastAutoScrolledSeq = stageSeq
         if (turns.isNotEmpty()) {
-            listState.scrollToItem(turns.lastIndex, scrollOffset = 100_000)
+            listState.scrollToItem(lastListIndex, scrollOffset = 100_000)
         }
     }
-    LaunchedEffect(stageSeq, turnCount) {
-        if (turns.isNotEmpty() && !canScrollForward) {
-            listState.animateScrollToItem(turns.lastIndex, scrollOffset = 100_000)
-        }
-    }
-
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .background(colors.canvas),
-    ) {
-        // Error Banner
-        ui.lastError?.let { err ->
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = OrbitSpacing.lg, vertical = OrbitSpacing.xs)
-                    .background(colors.diffRemovedBg, RoundedCornerShape(OrbitSpacing.sm))
-                    .border(OrbitSpacing.hairline, colors.dangerRemoved.copy(alpha = 0.45f), RoundedCornerShape(OrbitSpacing.sm))
-                    .padding(start = OrbitSpacing.md),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text(
-                    text = err,
-                    style = typography.subhead,
-                    color = colors.dangerRemoved,
-                    modifier = Modifier
-                        .weight(1f)
-                        .padding(vertical = OrbitSpacing.sm),
-                )
-                Box(
-                    modifier = Modifier
-                        .size(44.dp)
-                        .clickable { store.dismissError() },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.Close,
-                        contentDescription = "Dismiss error",
-                        tint = colors.dangerRemoved,
-                        modifier = Modifier.size(OrbitSpacing.iconMd),
-                    )
+    LaunchedEffect(stageSeq) {
+        val prevSeq = lastAutoScrolledSeq
+        if (stageSeq > prevSeq) {
+            lastAutoScrolledSeq = stageSeq
+            if (turns.isNotEmpty() && anchor == null && !ui.isLoadingOlderTurns) {
+                if (prevSeq == 0uL && anchoredAtBottom) {
+                    listState.scrollToItem(lastListIndex, scrollOffset = 100_000)
+                } else if (!canScrollForward) {
+                    listState.animateScrollToItem(lastListIndex, scrollOffset = 100_000)
                 }
             }
         }
+    }
 
-        // Main Editorial Stage Area with Native Pull-to-Refresh
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-                .pointerInput(Unit) {
-                    awaitEachGesture {
-                        awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                        val up = waitForUpOrCancellation(pass = PointerEventPass.Initial)
-                        if (up != null) {
-                            focusManager.clearFocus()
-                            keyboardController?.hide()
+    var windowTop by remember { mutableStateOf(0.dp) }
+    val density = LocalDensity.current
+    Column(
+        modifier = modifier
+            .then(
+                if (tabletop != null) {
+                    Modifier.onGloballyPositioned { coords ->
+                        val nextTop = with(density) { coords.positionInWindow().y.toDp() }
+                        if (windowTop != nextTop) windowTop = nextTop
+                    }
+                } else {
+                    Modifier
+                }
+            )
+            .fillMaxSize()
+            .background(colors.canvas),
+    ) {
+        Column(if (tabletop == null) Modifier.weight(1f) else Modifier.height((tabletop.upperStageHeightDp - windowTop).coerceAtLeast(0.dp))) {
+            StageLineage(ui, store)
+            // Error Banner
+            ui.lastError?.let { err ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = OrbitSpacing.lg, vertical = OrbitSpacing.xs)
+                        .background(colors.diffRemovedBg, RoundedCornerShape(OrbitSpacing.sm))
+                        .border(OrbitSpacing.hairline, colors.dangerRemoved.copy(alpha = 0.45f), RoundedCornerShape(OrbitSpacing.sm))
+                        .padding(start = OrbitSpacing.md),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        text = err,
+                        style = typography.subhead,
+                        color = colors.dangerRemoved,
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(vertical = OrbitSpacing.sm),
+                    )
+                    Box(
+                        modifier = Modifier
+                            .size(44.dp)
+                            .clickable { store.dismissError() },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Close,
+                            contentDescription = "Dismiss error",
+                            tint = colors.dangerRemoved,
+                            modifier = Modifier.size(OrbitSpacing.iconMd),
+                        )
+                    }
+                }
+            }
+
+            // Main Editorial Stage Area with Native Pull-to-Refresh
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .pointerInput(Unit) {
+                        awaitEachGesture {
+                            awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                            val up = waitForUpOrCancellation(pass = PointerEventPass.Initial)
+                            if (up != null) {
+                                focusManager.clearFocus()
+                                keyboardController?.hide()
+                            }
+                        }
+                    }
+                    .onSizeChanged { size ->
+                        stageViewportHeightPx = size.height
+                    },
+            ) {
+                if (ui.hosts.isEmpty()) {
+                    UnpairedWelcomeHero(
+                        localDaemonAvailable = ui.localDaemonUri != null,
+                        onOpenPairSheet = onOpenPairSheet,
+                        onConnectLocal = { store.discoverLocalDaemon() },
+                        modifier = Modifier.align(Alignment.Center),
+                    )
+                } else {
+                    PullToRefreshBox(
+                        isRefreshing = ui.isRefreshingStage,
+                        onRefresh = { store.refreshStageAndHost() },
+                        state = pullRefreshState,
+                        modifier = Modifier.fillMaxSize(),
+                        indicator = {
+                            PullToRefreshDefaults.Indicator(
+                                state = pullRefreshState,
+                                isRefreshing = ui.isRefreshingStage,
+                                containerColor = colors.elevated,
+                                color = colors.primary,
+                                modifier = Modifier.align(Alignment.TopCenter),
+                            )
+                        },
+                    ) {
+                        if (turns.isEmpty()) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .verticalScroll(rememberScrollState()),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                NewSessionZenCanvas(
+                                    ui = ui,
+                                    onSelectProject = { path -> store.selectWorkspaceCwd(path) },
+                                    onSelectHost = { hostId -> store.selectHost(hostId) },
+                                    onSetDraftUseWorktree = { useWt -> store.setDraftUseWorktree(useWt) },
+                                )
+                            }
+                        } else {
+                            LazyColumn(
+                                state = listState,
+                                modifier = Modifier.fillMaxSize(),
+                                contentPadding = PaddingValues(
+                                    horizontal = OrbitSpacing.lg,
+                                    vertical = OrbitSpacing.lg,
+                                ),
+                                // STRICT 24dp vertical spacing between conversation turns
+                                verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xl),
+                            ) {
+                                if (hasLoadOlderHeader) {
+                                    item(key = "load_older_header") {
+                                        Box(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            androidx.compose.material3.TextButton(
+                                                onClick = ::earlier,
+                                                enabled = !ui.isLoadingOlderTurns,
+                                            ) {
+                                                Text(
+                                                    stringResource(
+                                                        if (ui.isLoadingOlderTurns) R.string.stage_loading_older
+                                                        else R.string.stage_load_older
+                                                    )
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                                itemsIndexed(
+                                    items = turns,
+                                    key = { _, it -> it.key },
+                                ) { index, turn ->
+                                    val isTurnActive = isActiveAgentRunning && index == turns.lastIndex
+                                    TurnItem(
+                                        turn = turn,
+                                        isTurnActive = isTurnActive,
+                                        activeCwd = ui.activeCwd,
+                                        describeStep = { store.describeStep(it) },
+                                        onOpenDiffFile = { filePath -> onOpenDiffForFile(filePath) },
+                                        onQuoteDiffLine = { path, lineLabel, content ->
+                                            store.addQuotedDiffLine(path, lineLabel, content)
+                                        },
+                                        onCopyAssistantReply = { replyText ->
+                                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                            cm?.setPrimaryClip(ClipData.newPlainText("assistant_reply", replyText))
+                                            store.showToast("Copied reply to clipboard")
+                                        },
+                                        onQuoteAssistantReply = { replyText ->
+                                            store.addQuotedAssistantReply(replyText)
+                                        },
+                                        onInterruptDeliver = { store.interruptAgentAndContinue() },
+                                    )
+                                }
+                            }
                         }
                     }
                 }
-                .onSizeChanged { size ->
-                    stageViewportHeightPx = size.height
-                },
-        ) {
-            if (ui.hosts.isEmpty()) {
-                UnpairedWelcomeHero(
-                    localDaemonAvailable = ui.localDaemonUri != null,
-                    onOpenPairSheet = onOpenPairSheet,
-                    onConnectLocal = { store.discoverLocalDaemon() },
-                    modifier = Modifier.align(Alignment.Center),
-                )
-            } else {
-                PullToRefreshBox(
-                    isRefreshing = ui.isRefreshingStage,
-                    onRefresh = { store.refreshStageAndHost() },
-                    state = pullRefreshState,
-                    modifier = Modifier.fillMaxSize(),
-                    indicator = {
-                        PullToRefreshDefaults.Indicator(
-                            state = pullRefreshState,
-                            isRefreshing = ui.isRefreshingStage,
-                            containerColor = colors.elevated,
-                            color = colors.primary,
-                            modifier = Modifier.align(Alignment.TopCenter),
-                        )
-                    },
+
+                // Native 36.dp circular scroll-to-bottom button above OmniComposer (standard fade, no bounce)
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = turns.isNotEmpty() && canScrollForward,
+                    enter = fadeIn(),
+                    exit = fadeOut(),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = OrbitSpacing.sm),
                 ) {
-                    if (turns.isEmpty()) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .verticalScroll(rememberScrollState()),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            NewSessionZenCanvas(
-                                ui = ui,
-                                onSelectProject = { path -> store.selectWorkspaceCwd(path) },
-                                onSelectHost = { hostId -> store.selectHost(hostId) },
-                                onSetDraftUseWorktree = { useWt -> store.setDraftUseWorktree(useWt) },
+                    Surface(
+                        shape = CircleShape,
+                        color = colors.elevated,
+                        tonalElevation = 1.dp,
+                        shadowElevation = 2.dp,
+                        modifier = Modifier
+                            .size(36.dp)
+                            .border(OrbitSpacing.hairline, colors.hairline, CircleShape)
+                            .clip(CircleShape)
+                            .clickable {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                scope.launch {
+                                    if (turns.isNotEmpty()) {
+                                        listState.animateScrollToItem(lastListIndex, scrollOffset = 100_000)
+                                    }
+                                }
+                            },
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = Icons.Outlined.ArrowDownward,
+                                contentDescription = "Scroll to bottom",
+                                tint = colors.fgPrimary,
+                                modifier = Modifier.size(18.dp),
                             )
-                        }
-                    } else {
-                        LazyColumn(
-                            state = listState,
-                            modifier = Modifier.fillMaxSize(),
-                            contentPadding = PaddingValues(
-                                horizontal = OrbitSpacing.lg,
-                                vertical = OrbitSpacing.lg,
-                            ),
-                            // STRICT 24dp vertical spacing between conversation turns
-                            verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xl),
-                        ) {
-                            itemsIndexed(
-                                items = turns,
-                                key = { _, it -> it.key },
-                            ) { index, turn ->
-                                val isTurnActive = isActiveAgentRunning && index == turns.lastIndex
-                                TurnItem(
-                                    turn = turn,
-                                    isTurnActive = isTurnActive,
-                                    activeCwd = ui.activeCwd,
-                                    describeStep = { store.describeStep(it) },
-                                    onOpenDiffFile = { filePath -> onOpenDiffForFile(filePath) },
-                                    onQuoteDiffLine = { path, lineLabel, content ->
-                                        store.addQuotedDiffLine(path, lineLabel, content)
-                                    },
-                                    onCopyAssistantReply = { replyText ->
-                                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                                        cm?.setPrimaryClip(ClipData.newPlainText("assistant_reply", replyText))
-                                        store.showToast("Copied reply to clipboard")
-                                    },
-                                    onQuoteAssistantReply = { replyText ->
-                                        store.addQuotedAssistantReply(replyText)
-                                    },
+                            if (isActiveAgentRunning) {
+                                BreathingDot(
+                                    color = colors.primary,
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(6.dp),
                                 )
                             }
                         }
@@ -313,123 +452,103 @@ fun StreamStageScreen(
                 }
             }
 
-            // Native 36.dp circular scroll-to-bottom button above OmniComposer (standard fade, no bounce)
-            androidx.compose.animation.AnimatedVisibility(
-                visible = turns.isNotEmpty() && canScrollForward,
-                enter = fadeIn(),
-                exit = fadeOut(),
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = OrbitSpacing.sm),
-            ) {
-                Surface(
-                    shape = CircleShape,
-                    color = colors.elevated,
-                    tonalElevation = 1.dp,
-                    shadowElevation = 2.dp,
-                    modifier = Modifier
-                        .size(36.dp)
-                        .border(OrbitSpacing.hairline, colors.hairline, CircleShape)
-                        .clip(CircleShape)
-                        .clickable {
-                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            scope.launch {
-                                if (turns.isNotEmpty()) {
-                                    listState.animateScrollToItem(turns.lastIndex, scrollOffset = 100_000)
-                                }
-                            }
-                        },
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = Icons.Outlined.ArrowDownward,
-                            contentDescription = "Scroll to bottom",
-                            tint = colors.fgPrimary,
-                            modifier = Modifier.size(18.dp),
-                        )
-                        if (isActiveAgentRunning) {
-                            BreathingDot(
-                                color = colors.primary,
-                                modifier = Modifier
-                                    .align(Alignment.TopEnd)
-                                    .padding(6.dp),
-                            )
-                        }
-                    }
-                }
-            }
         }
-
+        if (tabletop != null) Spacer(Modifier.height(tabletop.hingeGapDp))
         val showBottomControls = ui.hosts.isNotEmpty() ||
             activeDecisionCount > 0 ||
             ui.composer.text.isNotEmpty() ||
             ui.composer.hasContextAttachments
 
-        if (showBottomControls) {
-            if (activeDecisionCount > 0) {
-                StickyDecisionBar(
-                    pendingPermissions = mergedPermissions,
-                    pendingQuestions = mergedQuestions,
-                    onResolvePermission = { reqId, decision -> store.resolvePermission(reqId, decision) },
-                    onAnswerQuestion = { reqId, answers -> store.answerQuestion(reqId, answers) },
+        if (showBottomControls && !inlineTerminalOpen) {
+            val bottomDeckContent: @Composable () -> Unit = {
+                val plans = mergedPermissions.filterIsInstance<FfiTimelineItem.PermissionRequest>()
+                    .mapNotNull(PlanApprovalReducer::detectPlanApproval)
+                val normalPermissions = mergedPermissions.filterNot { item ->
+                    item is FfiTimelineItem.PermissionRequest && plans.any { it.requestId == item.requestId }
+                }
+                plans.firstOrNull()?.let { PlanReview(it, store) }
+                if (normalPermissions.isNotEmpty() || mergedQuestions.isNotEmpty()) {
+                    StickyDecisionBar(
+                        pendingPermissions = normalPermissions,
+                        pendingQuestions = mergedQuestions,
+                        onResolvePermission = { reqId, decision -> store.resolvePermission(reqId, decision) },
+                        onAnswerQuestion = { reqId, answers -> store.answerQuestion(reqId, answers) },
+                    )
+                }
+
+                OmniComposer(
+                    draft = ui.composer,
+                    workspaceFiles = ui.workspaceFiles,
+                    queuedPrompts = ui.activeQueuedPrompts,
+                    hostDetail = ui.hostDetail,
+                    activeCwd = ui.activeCwd,
+                    isNewSession = ui.isNewSessionMode || ui.selectedAgentId == null,
+                    isAgentRunning = isActiveAgentRunning,
+                    hasHost = ui.selectedHostId != null || ui.composer.text.isNotEmpty(),
+                    onTextChange = { store.updateComposerText(it) },
+                    onVoiceNavigate = { when (it) {
+                        dev.orbit.android.ui.composer.VoiceNavigation.OVERVIEW -> store.openGlobalOverview()
+                        dev.orbit.android.ui.composer.VoiceNavigation.SEARCH -> store.requestSheet("search")
+                    } },
+                    onSend = { store.submitComposerPrompt() },
+                    onQueue = { store.enqueueComposerPrompt() },
+                    onInterrupt = { store.interruptActiveAgent() },
+                    onOpenContextPicker = onOpenContextPicker,
+                    onOpenModelSelector = onOpenModelSelector,
+                    onSelectMode = { store.selectSessionMode(it) },
+                    onToggleFastMode = { store.toggleFastMode() },
+                    onRequestRefreshFiles = { store.refreshWorkspaceFiles() },
+                    onAddFileMention = { store.addFileMention(it) },
+                    onRemoveFileMention = { store.removeFileMention(it) },
+                    onAttachGitDiff = { store.attachGitDiffContext() },
+                    onToggleGitDiff = { store.toggleGitDiffContext() },
+                    onAttachStagedDiff = { store.attachStagedDiffContext() },
+                    onToggleStagedDiff = { store.toggleStagedDiffContext() },
+                    onAttachTerminal = { store.attachTerminalContext() },
+                    onToggleTerminal = { store.toggleTerminalContext() },
+                    onSelectSlash = { store.setSlashCommand(it) },
+                    onClearSlash = { store.setSlashCommand(null) },
+                    onRemoveQuotedSnippet = { store.removeQuotedSnippet(it) },
+                    onEditQueuedPrompt = { store.editQueuedPrompt(it) },
+                    onSendQueuedPromptNow = { store.sendQueuedPromptNow(it) },
+                    onRemoveQueuedPrompt = { store.removeQueuedPrompt(it) },
+                    onAttachImageBytes = { name, mime, bytes -> store.attachImageBytes(name, mime, bytes) },
+                    onAttachFileBytes = { name, mime, bytes -> store.attachFileBytes(name, mime, bytes) },
+                    onRemoveStagedAttachment = { store.removeStagedAttachment(it) },
+                    onRegisterInlineMention = { token, kind, path, staged, label ->
+                        store.registerInlineMention(token, kind, path, staged, label)
+                    },
+                    slashCommands = ui.slashCommands,
+                    onFilterSlashCommands = { store.filterSlashCommands(it) },
+                    onRankMentions = { store.rankMentionCandidates(it) },
+                    onExecuteSlashCommand = { cmd ->
+                        store.executeSlashCommand(
+                            cmd = cmd,
+                            onOpenTerminal = onOpenTerminal,
+                            onOpenSettings = onOpenSettings,
+                            onOpenSideQuestion = onOpenSideQuestion,
+                            onOpenAutomations = onOpenAutomations,
+                            onOpenWorkspaceBoard = onOpenWorkspaceBoard,
+                            onOpenArchived = onOpenArchived,
+                            onOpenFork = onOpenForkDialog,
+                            onExportTranscript = onExportTranscript,
+                        )
+                    },
                 )
             }
-
-            OmniComposer(
-                draft = ui.composer,
-                workspaceFiles = ui.workspaceFiles,
-                queuedPrompts = ui.activeQueuedPrompts,
-                hostDetail = ui.hostDetail,
-                activeCwd = ui.activeCwd,
-                isNewSession = ui.isNewSessionMode || ui.selectedAgentId == null,
-                isAgentRunning = isActiveAgentRunning,
-                hasHost = ui.selectedHostId != null || ui.composer.text.isNotEmpty(),
-                onTextChange = { store.updateComposerText(it) },
-                onSend = { store.submitComposerPrompt() },
-                onQueue = { store.enqueueComposerPrompt() },
-                onInterrupt = { store.interruptActiveAgent() },
-                onOpenContextPicker = onOpenContextPicker,
-                onOpenModelSelector = onOpenModelSelector,
-                onSelectMode = { store.selectSessionMode(it) },
-                onToggleFastMode = { store.toggleFastMode() },
-                onRequestRefreshFiles = { store.refreshWorkspaceFiles() },
-                onAddFileMention = { store.addFileMention(it) },
-                onRemoveFileMention = { store.removeFileMention(it) },
-                onAttachGitDiff = { store.attachGitDiffContext() },
-                onToggleGitDiff = { store.toggleGitDiffContext() },
-                onAttachStagedDiff = { store.attachStagedDiffContext() },
-                onToggleStagedDiff = { store.toggleStagedDiffContext() },
-                onAttachTerminal = { store.attachTerminalContext() },
-                onToggleTerminal = { store.toggleTerminalContext() },
-                onSelectSlash = { store.setSlashCommand(it) },
-                onClearSlash = { store.setSlashCommand(null) },
-                onRemoveQuotedSnippet = { store.removeQuotedSnippet(it) },
-                onEditQueuedPrompt = { store.editQueuedPrompt(it) },
-                onSendQueuedPromptNow = { store.sendQueuedPromptNow(it) },
-                onRemoveQueuedPrompt = { store.removeQueuedPrompt(it) },
-                onAttachImageBytes = { name, mime, bytes -> store.attachImageBytes(name, mime, bytes) },
-                onAttachFileBytes = { name, mime, bytes -> store.attachFileBytes(name, mime, bytes) },
-                onRemoveStagedAttachment = { store.removeStagedAttachment(it) },
-                onRegisterInlineMention = { token, kind, path, staged, label ->
-                    store.registerInlineMention(token, kind, path, staged, label)
-                },
-                slashCommands = ui.slashCommands,
-                onFilterSlashCommands = { store.filterSlashCommands(it) },
-                onRankMentions = { store.rankMentionCandidates(it) },
-                onExecuteSlashCommand = { cmd ->
-                    store.executeSlashCommand(
-                        cmd = cmd,
-                        onOpenTerminal = onOpenTerminal,
-                        onOpenSettings = onOpenSettings,
-                        onOpenSideQuestion = onOpenSideQuestion,
-                        onOpenAutomations = onOpenAutomations,
-                        onOpenWorkspaceBoard = onOpenWorkspaceBoard,
-                        onOpenArchived = onOpenArchived,
-                        onOpenFork = onOpenForkDialog,
-                        onExportTranscript = onExportTranscript,
-                    )
-                },
-            )
+            if (tabletop != null) {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.Bottom,
+                ) {
+                    bottomDeckContent()
+                }
+            } else {
+                bottomDeckContent()
+            }
         }
     }
 }

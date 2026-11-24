@@ -39,6 +39,8 @@ struct SettingsAndQuotasSheet: View {
                 VStack(alignment: .leading, spacing: OrbitSpacing.xl) {
                     appearanceSection
                     generalPreferencesSection
+                    pushAndLiveActivitySection
+                    personalAgentAndMeshSection
                     cloudSyncSection
                     hostsSection
                     if store.activeHost != nil {
@@ -78,6 +80,8 @@ struct SettingsAndQuotasSheet: View {
             store.refreshCloudSyncStatus()
             if store.activeHost != nil {
                 store.refreshQuotas()
+                store.refreshPushDevices()
+                store.refreshRouterAndMesh()
             }
         }
         .onChange(of: store.cloudSyncStatus?.state) { nextState in
@@ -240,6 +244,167 @@ struct SettingsAndQuotasSheet: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+
+    // MARK: - 1b-2. Push Notifications & ActivityKit Live Activity
+
+    private var pushAndLiveActivitySection: some View {
+        let prefs = store.pushDevicesSnapshot?.preferences
+        let devices = store.pushDevicesSnapshot?.devices ?? []
+        return VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
+            Text(OrbitL10n.tr("Push Notifications & Live Activity"))
+                .font(OrbitTypography.meta(.medium))
+                .foregroundStyle(palette.fgMuted)
+                .padding(.horizontal, OrbitSpacing.xs)
+
+            VStack(spacing: 0) {
+                Toggle(isOn: Binding(
+                    get: { store.liveActivitiesEnabled },
+                    set: { store.setLiveActivitiesEnabled($0) }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(OrbitL10n.tr("Live Activity"))
+                            .font(OrbitTypography.subhead(.regular))
+                            .foregroundStyle(palette.fgPrimary)
+                        Text("Dynamic Island & Lock Screen agent status + approval badge")
+                            .font(OrbitTypography.meta(.regular))
+                            .foregroundStyle(palette.fgMuted)
+                    }
+                }
+                .tint(palette.direct)
+                .padding(.horizontal, OrbitSpacing.md)
+                .padding(.vertical, 10)
+
+                OrbitHairline().padding(.leading, OrbitSpacing.md)
+
+                HStack(spacing: OrbitSpacing.sm) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(OrbitL10n.tr("Enable Notifications"))
+                            .font(OrbitTypography.subhead(.regular))
+                            .foregroundStyle(palette.fgPrimary)
+                        Text(
+                            store.apnsDeviceTokenHex != nil
+                                ? "APNs registered · \(devices.count) device(s) on host"
+                                : "Zero-knowledge APNs alerts for approvals, errors & completions"
+                        )
+                        .font(OrbitTypography.meta(.regular))
+                        .foregroundStyle(palette.fgMuted)
+                    }
+                    Spacer()
+                    Button(store.apnsDeviceTokenHex != nil ? OrbitL10n.tr("Send Test Push") : "Enable") {
+                        store.hapticLight()
+                        if store.apnsDeviceTokenHex != nil {
+                            store.sendTestPushNotification()
+                        } else {
+                            store.requestPushPermissionsAndRegister()
+                        }
+                    }
+                    .font(OrbitTypography.meta(.semibold))
+                    .foregroundStyle(palette.onPrimary)
+                    .padding(.horizontal, 11)
+                    .frame(height: 30)
+                    .background(palette.primary, in: Capsule())
+                    .buttonStyle(.plain)
+                    .disabled(store.pushBusy)
+                }
+                .padding(.horizontal, OrbitSpacing.md)
+                .padding(.vertical, 10)
+
+                if let prefs {
+                    OrbitHairline().padding(.leading, OrbitSpacing.md)
+
+                    pushPrefToggle(OrbitL10n.tr("Permission Required"), value: prefs.notifyPermissionRequired) { v in
+                        var next = prefs.asPushPreferences
+                        next.notifyPermissionRequired = v
+                        store.updatePushPreferences(next)
+                    }
+                    OrbitHairline().padding(.leading, OrbitSpacing.md)
+                    pushPrefToggle(OrbitL10n.tr("Turn Completed"), value: prefs.notifyTurnCompleted) { v in
+                        var next = prefs.asPushPreferences
+                        next.notifyTurnCompleted = v
+                        store.updatePushPreferences(next)
+                    }
+                    OrbitHairline().padding(.leading, OrbitSpacing.md)
+                    pushPrefToggle(OrbitL10n.tr("Agent Error"), value: prefs.notifyAgentError) { v in
+                        var next = prefs.asPushPreferences
+                        next.notifyAgentError = v
+                        store.updatePushPreferences(next)
+                    }
+                    OrbitHairline().padding(.leading, OrbitSpacing.md)
+                    pushPrefToggle(OrbitL10n.tr("Goal Finished"), value: prefs.notifyGoalFinished) { v in
+                        var next = prefs.asPushPreferences
+                        next.notifyGoalFinished = v
+                        store.updatePushPreferences(next)
+                    }
+                    OrbitHairline().padding(.leading, OrbitSpacing.md)
+                    pushPrefToggle(OrbitL10n.tr("Include Message Preview"), value: prefs.includeMessagePreview) { v in
+                        var next = prefs.asPushPreferences
+                        next.includeMessagePreview = v
+                        store.updatePushPreferences(next)
+                    }
+                }
+            }
+            .background(palette.elevated)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(palette.hairline, lineWidth: 0.5))
+        }
+    }
+
+    private func pushPrefToggle(_ title: String, value: Bool, onChange: @escaping (Bool) -> Void) -> some View {
+        Toggle(title, isOn: Binding(get: { value }, set: onChange))
+            .font(OrbitTypography.subhead(.regular))
+            .tint(palette.direct)
+            .padding(.horizontal, OrbitSpacing.md)
+            .padding(.vertical, 9)
+    }
+
+    // MARK: - 1b-3. Personal Agent & Fleet Mesh Entry
+
+    private var personalAgentAndMeshSection: some View {
+        VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
+            Text(OrbitL10n.tr("Fleet Mesh & Personal Agent"))
+                .font(OrbitTypography.meta(.medium))
+                .foregroundStyle(palette.fgMuted)
+                .padding(.horizontal, OrbitSpacing.xs)
+
+            Button {
+                store.hapticLight()
+                store.presentSheetSafely(.personalRouter)
+            } label: {
+                HStack(spacing: OrbitSpacing.md) {
+                    Image(systemName: "point.3.connected.trianglepath.dotted")
+                        .font(.system(size: 14.5, weight: .medium))
+                        .foregroundStyle(palette.fgPrimary)
+                        .frame(width: 22)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(OrbitL10n.tr("Personal Agent"))
+                            .font(OrbitTypography.subhead(.medium))
+                            .foregroundStyle(palette.fgPrimary)
+                        Text(
+                            store.primaryRouterCandidate.map {
+                                "\($0.hostName) · \($0.routerEnabled ? "Active" : "Ready")"
+                            } ?? "Configure global fleet router & mesh peers"
+                        )
+                        .font(OrbitTypography.meta(.regular))
+                        .foregroundStyle(palette.fgMuted)
+                    }
+
+                    Spacer()
+
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(palette.fgMuted)
+                }
+                .padding(.horizontal, OrbitSpacing.md)
+                .padding(.vertical, 12)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .background(palette.elevated)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(palette.hairline, lineWidth: 0.5))
+        }
     }
 
     // MARK: - 1c. Zero-Server E2EE Cloud Sync (GitHub Secret Gist)

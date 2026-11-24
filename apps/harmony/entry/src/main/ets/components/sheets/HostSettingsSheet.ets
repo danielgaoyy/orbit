@@ -6,6 +6,7 @@ import {
 import {
   HostCardDto,
   ProviderQuotaDto,
+  PushPreferencesDto,
   QuotaWindowDto,
   formatConnectionStateLabel,
   formatProviderLabel,
@@ -45,6 +46,8 @@ export struct HostSettingsSheet {
   @Local relayUrlDraft: string = '';
   @Local cloudTokenDraft: string = '';
   @Local cloudPassphraseDraft: string = '';
+  @Local deviceLinkUriDraft: string = '';
+  @Local showDeviceLinkQr: boolean = false;
   @Local appearanceItems: SegmentButtonV2Items = new SegmentButtonV2Items([
     { text: 'System' },
     { text: 'Light' },
@@ -569,6 +572,48 @@ export struct HostSettingsSheet {
           Button({ type: ButtonType.Normal, stateEffect: true }) {
             Row({ space: 10 }) {
               Row() {
+                SymbolGlyph($r('sys.symbol.link'))
+                  .fontSize(16)
+                  .fontColor([this.store.palette.iconPrimary])
+              }
+              .width(20)
+              .justifyContent(FlexAlign.Center)
+
+              Column({ space: 2 }) {
+                Text($r('app.string.nav_personal_router'))
+                  .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
+                Text(
+                  this.store.primaryRouterHostId.length > 0
+                    ? `${this.store.fleetMeshPeers.length} mesh peer(s)`
+                    : 'Configure fleet router & mesh'
+                )
+                  .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+                  .maxLines(1)
+              }
+              .alignItems(HorizontalAlign.Start)
+              .layoutWeight(1)
+
+              SymbolGlyph($r('sys.symbol.chevron_right'))
+                .fontSize(13)
+                .fontColor([this.store.palette.fgMuted])
+            }
+            .width('100%')
+            .alignItems(VerticalAlign.Center)
+          }
+          .width('100%')
+          .constraintSize({ minHeight: 56 })
+          .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: 8, bottom: 8 })
+          .backgroundColor(Color.Transparent)
+          .onClick(() => {
+            this.store.showHostSettingsSheet = false;
+            this.store.openRouterMeshSheet();
+          })
+        }
+
+        ListItem() {
+          Button({ type: ButtonType.Normal, stateEffect: true }) {
+            Row({ space: 10 }) {
+              Row() {
                 SymbolGlyph($r('sys.symbol.bell'))
                   .fontSize(16)
                   .fontColor([this.store.palette.iconPrimary])
@@ -577,11 +622,11 @@ export struct HostSettingsSheet {
               .justifyContent(FlexAlign.Center)
 
               Column({ space: 2 }) {
-                Text('Push Kit & Notifications')
+                Text($r('app.string.push_title'))
                   .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
                 Text(
                   this.store.pushToken.length > 0
-                    ? `Token ${this.store.pushToken.substring(0, 12)}…`
+                    ? `Synced to ${this.store.pushSyncedHostIds.length} host(s)`
                     : (this.store.pushStatusMessage.length > 0
                       ? this.store.pushStatusMessage
                       : 'Tap to register Push Kit token')
@@ -593,8 +638,9 @@ export struct HostSettingsSheet {
               .alignItems(HorizontalAlign.Start)
               .layoutWeight(1)
 
-              Text(this.store.notificationsEnabled ? 'Enabled' : 'Enable')
-                .attributeModifier(orbitTextMeta(this.store.palette.accentPrimary, FontWeight.Medium))
+              SymbolGlyph($r('sys.symbol.chevron_right'))
+                .fontSize(13)
+                .fontColor([this.store.palette.fgMuted])
             }
             .width('100%')
             .alignItems(VerticalAlign.Center)
@@ -604,7 +650,8 @@ export struct HostSettingsSheet {
           .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: 8, bottom: 8 })
           .backgroundColor(Color.Transparent)
           .onClick(() => {
-            this.store.configurePushAndNotifications(this.getUIContext().getHostContext());
+            this.navPathStack.pushPathByName('push_settings', null);
+            this.store.triggerHaptic(6);
           })
         }
       }
@@ -626,6 +673,30 @@ export struct HostSettingsSheet {
       ListItemGroup() {
         ListItem() {
           Row() {
+            Text($r('app.string.sync_huks_security'))
+              .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary))
+            Blank()
+            Text(
+              this.store.keyProtectionMode === 'huks_hardware'
+                ? $r('app.string.sync_huks_hardware')
+                : $r('app.string.sync_huks_fallback')
+            )
+              .attributeModifier(
+                orbitTextMono(
+                  this.store.keyProtectionMode === 'huks_hardware'
+                    ? this.store.palette.statusDirect
+                    : this.store.palette.fgMuted
+                )
+              )
+          }
+          .width('100%')
+          .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+          .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+          .alignItems(VerticalAlign.Center)
+        }
+
+        ListItem() {
+          Row() {
             Text('Encryption')
               .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary))
             Blank()
@@ -643,7 +714,7 @@ export struct HostSettingsSheet {
             Text('Platform')
               .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary))
             Blank()
-            Text('HarmonyOS 7 · ArkUI V2')
+            Text('HarmonyOS NEXT · ArkUI V2')
               .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
           }
           .width('100%')
@@ -783,6 +854,16 @@ export struct HostSettingsSheet {
                   bottom: OrbitTokens.SPACE_SM
                 })
             }
+          }
+
+          ListItem() {
+            Button($r('app.string.settings_upgrade_daemon'), { type: ButtonType.Normal, stateEffect: true })
+              .attributeModifier(orbitButtonSubhead(this.store.palette.accentPrimary, Color.Transparent))
+              .width('100%')
+              .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+              .onClick(() => {
+                this.store.upgradeHostDaemon(host.host_id);
+              })
           }
 
           if (host.host_id !== this.store.selectedHostId) {
@@ -1176,8 +1257,25 @@ export struct HostSettingsSheet {
                   type: ToggleType.Switch,
                   isOn: this.store.cloudSyncStatus.auto_sync_enabled
                 })
+                  .selectedColor(this.store.palette.accentPrimaryFill)
                   .onChange((isOn: boolean) => {
                     this.store.cloudSyncSetAutoSync(isOn);
+                  })
+              }
+              .width('100%')
+              .alignItems(VerticalAlign.Center)
+
+              Row() {
+                Text($r('app.string.sync_zero_passphrase'))
+                  .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary))
+                  .layoutWeight(1)
+                Toggle({
+                  type: ToggleType.Switch,
+                  isOn: this.store.cloudSyncStatus.instant_unlock_enabled !== false
+                })
+                  .selectedColor(this.store.palette.accentPrimaryFill)
+                  .onChange((isOn: boolean) => {
+                    this.store.setCloudSyncManualPassphraseMode(!isOn);
                   })
               }
               .width('100%')
@@ -1202,6 +1300,124 @@ export struct HostSettingsSheet {
         }
 
         if (this.store.cloudSyncStatus === null || this.store.cloudSyncStatus.state === 'signed_out') {
+          // 1-Scan Device Link QR Onboarding
+          ListItem() {
+            Column({ space: OrbitTokens.SPACE_SM }) {
+              Text($r('app.string.sync_device_link_qr'))
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
+              Text('Link instantaneously from another Orbit device with zero passphrase typing.')
+                .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+
+              Button($r('app.string.sync_scan_device_link'), { type: ButtonType.Normal, stateEffect: true })
+                .attributeModifier(
+                  orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
+                )
+                .width('100%')
+                .height(OrbitTokens.HIT_MIN)
+                .borderRadius(OrbitTokens.RADIUS_MD)
+                .enabled(!this.store.cloudSyncBusy)
+                .onClick(() => {
+                  this.store.scanDeviceLinkQr(this.getUIContext().getHostContext());
+                })
+
+              Row({ space: OrbitTokens.SPACE_SM }) {
+                TextInput({ placeholder: 'orbit://link/…', text: this.deviceLinkUriDraft })
+                  .attributeModifier(
+                    orbitInputMono(
+                      this.store.palette.fgPrimary,
+                      this.store.palette.fgMuted,
+                      this.store.palette.subtleSurface
+                    )
+                  )
+                  .height(OrbitTokens.HIT_COMPACT)
+                  .borderRadius(OrbitTokens.RADIUS_MD)
+                  .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
+                  .layoutWeight(1)
+                  .onChange((val: string) => {
+                    this.deviceLinkUriDraft = val;
+                  })
+
+                Button($r('app.string.action_confirm'), { type: ButtonType.Capsule, stateEffect: true })
+                  .attributeModifier(
+                    orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.subtleSurface)
+                  )
+                  .height(OrbitTokens.HIT_COMPACT)
+                  .padding({ left: 12, right: 12 })
+                  .enabled(!this.store.cloudSyncBusy && this.deviceLinkUriDraft.trim().length > 0)
+                  .onClick(() => {
+                    dismissHarmonyKeyboard(this.getUIContext());
+                    const uriVal = this.deviceLinkUriDraft;
+                    this.store.importCloudSyncDeviceLinkUri(uriVal).then((ok: boolean) => {
+                      if (ok) {
+                        this.deviceLinkUriDraft = '';
+                      }
+                    });
+                  })
+              }
+              .width('100%')
+            }
+            .width('100%')
+            .padding(OrbitTokens.SPACE_LG)
+            .backgroundColor(this.store.palette.listCard)
+            .borderRadius(OrbitTokens.RADIUS_LG)
+            .alignItems(HorizontalAlign.Start)
+          }
+
+          // GitHub OAuth Device Flow Sign-In
+          ListItem() {
+            Column({ space: OrbitTokens.SPACE_SM }) {
+              Text($r('app.string.sync_github_device_flow'))
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
+
+              if (this.store.githubDeviceFlow !== null) {
+                Text(`Code: ${this.store.githubDeviceFlow.user_code}`)
+                  .attributeModifier(orbitTextMono(this.store.palette.accentPrimary, FontWeight.Bold))
+                Text(this.store.githubDeviceFlow.verification_uri)
+                  .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+                  .copyOption(CopyOptions.LocalDevice)
+                Row({ space: OrbitTokens.SPACE_SM }) {
+                  Button($r('app.string.action_copy'), { type: ButtonType.Capsule, stateEffect: true })
+                    .attributeModifier(orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.subtleSurface))
+                    .height(36)
+                    .layoutWeight(1)
+                    .onClick(() => {
+                      this.store.copyToClipboard(
+                        this.store.githubDeviceFlow?.user_code ?? '',
+                        'Copied GitHub code'
+                      );
+                    })
+                  Button('Verify Sign-In', { type: ButtonType.Capsule, stateEffect: true })
+                    .attributeModifier(
+                      orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
+                    )
+                    .height(36)
+                    .layoutWeight(1)
+                    .onClick(() => {
+                      this.store.pollGithubDeviceFlow();
+                    })
+                }
+                .width('100%')
+              } else {
+                Button($r('app.string.sync_github_device_flow'), { type: ButtonType.Normal, stateEffect: true })
+                  .attributeModifier(
+                    orbitButtonSubhead(this.store.palette.fgPrimary, this.store.palette.subtleSurface)
+                  )
+                  .width('100%')
+                  .height(OrbitTokens.HIT_MIN)
+                  .borderRadius(OrbitTokens.RADIUS_MD)
+                  .enabled(!this.store.cloudSyncBusy)
+                  .onClick(() => {
+                    this.store.startGithubDeviceFlow();
+                  })
+              }
+            }
+            .width('100%')
+            .padding(OrbitTokens.SPACE_LG)
+            .backgroundColor(this.store.palette.listCard)
+            .borderRadius(OrbitTokens.RADIUS_LG)
+            .alignItems(HorizontalAlign.Start)
+          }
+
           ListItem() {
             Column({ space: OrbitTokens.SPACE_SM }) {
               Text('GitHub Personal Access Token')
@@ -1336,6 +1552,79 @@ export struct HostSettingsSheet {
                 this.store.cloudSyncNow();
               })
           }
+
+          // Device Link QR Export & Scan Card
+          ListItem() {
+            Column({ space: OrbitTokens.SPACE_SM }) {
+              Text($r('app.string.sync_device_link_qr'))
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
+              Text('Scan from another phone, tablet, or desktop to transfer your E2EE vault key securely.')
+                .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+
+              if (this.showDeviceLinkQr && this.store.deviceLinkUri.length > 0) {
+                Column({ space: OrbitTokens.SPACE_SM }) {
+                  Column() {
+                    QRCode(this.store.deviceLinkUri)
+                      .width(180)
+                      .height(180)
+                      .color('#14161D')
+                      .backgroundColor('#FFFFFF')
+                  }
+                  .padding(OrbitTokens.SPACE_MD)
+                  .backgroundColor('#FFFFFF')
+                  .borderRadius(OrbitTokens.RADIUS_MD)
+
+                  Row({ space: OrbitTokens.SPACE_SM }) {
+                    Button($r('app.string.action_copy'), { type: ButtonType.Capsule, stateEffect: true })
+                      .attributeModifier(orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.subtleSurface))
+                      .height(34)
+                      .layoutWeight(1)
+                      .onClick(() => {
+                        this.store.copyToClipboard(this.store.deviceLinkUri, 'Copied Device Link URI');
+                      })
+                    Button($r('app.string.action_close'), { type: ButtonType.Capsule, stateEffect: true })
+                      .attributeModifier(orbitButtonMeta(this.store.palette.fgSecondary, this.store.palette.subtleSurface))
+                      .height(34)
+                      .layoutWeight(1)
+                      .onClick(() => {
+                        this.showDeviceLinkQr = false;
+                      })
+                  }
+                  .width('100%')
+                }
+                .width('100%')
+                .alignItems(HorizontalAlign.Center)
+              } else {
+                Row({ space: OrbitTokens.SPACE_SM }) {
+                  Button($r('app.string.sync_export_qr'), { type: ButtonType.Capsule, stateEffect: true })
+                    .attributeModifier(
+                      orbitButtonMeta(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
+                    )
+                    .height(OrbitTokens.HIT_COMPACT)
+                    .layoutWeight(1)
+                    .onClick(() => {
+                      const uri = this.store.exportCloudSyncDeviceLinkUri();
+                      if (uri.length > 0) {
+                        this.showDeviceLinkQr = true;
+                      }
+                    })
+                  Button($r('app.string.sync_scan_device_link'), { type: ButtonType.Capsule, stateEffect: true })
+                    .attributeModifier(orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.subtleSurface))
+                    .height(OrbitTokens.HIT_COMPACT)
+                    .layoutWeight(1)
+                    .onClick(() => {
+                      this.store.scanDeviceLinkQr(this.getUIContext().getHostContext());
+                    })
+                }
+                .width('100%')
+              }
+            }
+            .width('100%')
+            .padding(OrbitTokens.SPACE_LG)
+            .backgroundColor(this.store.palette.listCard)
+            .borderRadius(OrbitTokens.RADIUS_LG)
+            .alignItems(HorizontalAlign.Start)
+          }
         }
 
         if (this.store.cloudSyncStatus !== null && this.store.cloudSyncStatus.state !== 'signed_out') {
@@ -1371,6 +1660,199 @@ export struct HostSettingsSheet {
     .backgroundColor(this.store.palette.drawer)
   }
 
+  private updatePushPrefField(field: string, nextVal: boolean): void {
+    const cur = this.store.pushPrefs;
+    const updated: PushPreferencesDto = {
+      enabled: field === 'enabled' ? nextVal : cur.enabled,
+      notify_permission_required: field === 'permissions' ? nextVal : cur.notify_permission_required,
+      notify_turn_completed: field === 'turns' ? nextVal : cur.notify_turn_completed,
+      notify_agent_error: field === 'errors' ? nextVal : cur.notify_agent_error,
+      notify_goal_finished: field === 'goals' ? nextVal : cur.notify_goal_finished,
+      notify_timer_fired: field === 'goals' ? nextVal : cur.notify_timer_fired,
+      include_message_preview: field === 'preview' ? nextVal : cur.include_message_preview
+    };
+    this.store.updatePushPreferences(updated);
+  }
+
+  @Builder
+  private renderPushSettingsDestination() {
+    NavDestination() {
+      List({ space: OrbitTokens.SPACE_MD }) {
+        ListItem() {
+          Column({ space: OrbitTokens.SPACE_SM }) {
+            Row() {
+              Text('Push Kit Token')
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
+              Blank()
+              Text(
+                this.store.pushToken.length > 0
+                  ? `${this.store.pushToken.substring(0, 12)}…`
+                  : 'Not registered'
+              )
+                .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
+            }
+            .width('100%')
+
+            Row() {
+              Text('Synced Daemons')
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary))
+              Blank()
+              Text(`${this.store.pushSyncedHostIds.length} / ${this.store.hosts.length}`)
+                .attributeModifier(
+                  orbitTextMono(
+                    this.store.pushSyncedHostIds.length > 0
+                      ? this.store.palette.statusDirect
+                      : this.store.palette.fgMuted
+                  )
+                )
+            }
+            .width('100%')
+
+            if (this.store.pushStatusMessage.length > 0) {
+              Text(this.store.pushStatusMessage)
+                .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
+                .width('100%')
+            }
+
+            Button($r('app.string.push_sync_hosts'), { type: ButtonType.Normal, stateEffect: true })
+              .attributeModifier(
+                orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
+              )
+              .width('100%')
+              .height(OrbitTokens.HIT_MIN)
+              .borderRadius(OrbitTokens.RADIUS_MD)
+              .onClick(() => {
+                if (this.store.pushToken.length === 0 || !this.store.notificationsEnabled) {
+                  this.store.configurePushAndNotifications(this.getUIContext().getHostContext());
+                } else {
+                  this.store.syncPushTokenToAllHosts(true);
+                }
+              })
+
+            Button($r('app.string.push_test_button'), { type: ButtonType.Normal, stateEffect: true })
+              .attributeModifier(
+                orbitButtonSubhead(this.store.palette.fgPrimary, this.store.palette.subtleSurface)
+              )
+              .width('100%')
+              .height(OrbitTokens.HIT_COMPACT)
+              .borderRadius(OrbitTokens.RADIUS_MD)
+              .onClick(() => {
+                this.store.sendTestPushNotification();
+              })
+          }
+          .width('100%')
+          .padding(OrbitTokens.SPACE_LG)
+          .backgroundColor(this.store.palette.listCard)
+          .borderRadius(OrbitTokens.RADIUS_LG)
+          .alignItems(HorizontalAlign.Start)
+        }
+
+        ListItemGroup() {
+          ListItem() {
+            Row() {
+              Text($r('app.string.push_pref_permissions'))
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary))
+                .layoutWeight(1)
+              Toggle({ type: ToggleType.Switch, isOn: this.store.pushPrefs.notify_permission_required })
+                .selectedColor(this.store.palette.accentPrimaryFill)
+                .onChange((val: boolean) => {
+                  this.updatePushPrefField('permissions', val);
+                })
+            }
+            .width('100%')
+            .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+            .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+          }
+
+          ListItem() {
+            Row() {
+              Text($r('app.string.push_pref_turns'))
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary))
+                .layoutWeight(1)
+              Toggle({ type: ToggleType.Switch, isOn: this.store.pushPrefs.notify_turn_completed })
+                .selectedColor(this.store.palette.accentPrimaryFill)
+                .onChange((val: boolean) => {
+                  this.updatePushPrefField('turns', val);
+                })
+            }
+            .width('100%')
+            .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+            .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+          }
+
+          ListItem() {
+            Row() {
+              Text($r('app.string.push_pref_errors'))
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary))
+                .layoutWeight(1)
+              Toggle({ type: ToggleType.Switch, isOn: this.store.pushPrefs.notify_agent_error })
+                .selectedColor(this.store.palette.accentPrimaryFill)
+                .onChange((val: boolean) => {
+                  this.updatePushPrefField('errors', val);
+                })
+            }
+            .width('100%')
+            .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+            .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+          }
+
+          ListItem() {
+            Row() {
+              Text($r('app.string.push_pref_goals'))
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary))
+                .layoutWeight(1)
+              Toggle({ type: ToggleType.Switch, isOn: this.store.pushPrefs.notify_goal_finished })
+                .selectedColor(this.store.palette.accentPrimaryFill)
+                .onChange((val: boolean) => {
+                  this.updatePushPrefField('goals', val);
+                })
+            }
+            .width('100%')
+            .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+            .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+          }
+
+          ListItem() {
+            Row() {
+              Text($r('app.string.push_pref_preview'))
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary))
+                .layoutWeight(1)
+              Toggle({ type: ToggleType.Switch, isOn: this.store.pushPrefs.include_message_preview })
+                .selectedColor(this.store.palette.accentPrimaryFill)
+                .onChange((val: boolean) => {
+                  this.updatePushPrefField('preview', val);
+                })
+            }
+            .width('100%')
+            .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+            .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+          }
+        }
+        .backgroundColor(this.store.palette.listCard)
+        .borderRadius(OrbitTokens.RADIUS_LG)
+        .clip(true)
+        .divider({
+          strokeWidth: OrbitTokens.HAIRLINE,
+          color: this.store.palette.hairline,
+          startMargin: OrbitTokens.SPACE_LG,
+          endMargin: OrbitTokens.SPACE_LG
+        })
+      }
+      .width('100%')
+      .height('100%')
+      .padding({
+        left: OrbitTokens.SPACE_LG,
+        right: OrbitTokens.SPACE_LG,
+        top: OrbitTokens.SPACE_MD,
+        bottom: Math.max(OrbitTokens.SPACE_XL, this.store.safeBottomVp)
+      })
+      .scrollBar(BarState.Auto)
+      .edgeEffect(EdgeEffect.Spring)
+    }
+    .title($r('app.string.push_title'))
+    .backgroundColor(this.store.palette.drawer)
+  }
+
   @Builder
   private buildNavDestination(name: string, _param: Object | null) {
     if (name === 'host_detail' && this.inspectedHost !== null) {
@@ -1379,6 +1861,8 @@ export struct HostSettingsSheet {
       this.renderPairHostDestination()
     } else if (name === 'cloud_sync') {
       this.renderCloudSyncDestination()
+    } else if (name === 'push_settings') {
+      this.renderPushSettingsDestination()
     }
   }
 

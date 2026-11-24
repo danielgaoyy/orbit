@@ -16,6 +16,26 @@ struct Index {
       this.store.showModelPickerSheet = false;
       return true;
     }
+    if (this.store.showFileExplorerSheet) {
+      this.store.showFileExplorerSheet = false;
+      return true;
+    }
+    if (this.store.showGlobalSearchSheet) {
+      this.store.showGlobalSearchSheet = false;
+      return true;
+    }
+    if (this.store.showRouterMeshSheet) {
+      this.store.showRouterMeshSheet = false;
+      return true;
+    }
+    if (this.store.showExportTranscriptSheet) {
+      this.store.showExportTranscriptSheet = false;
+      return true;
+    }
+    if (this.store.showSubagentSheet) {
+      this.store.showSubagentSheet = false;
+      return true;
+    }
     if (this.store.showSideQuestionSheet) {
       this.store.showSideQuestionSheet = false;
       return true;
@@ -42,5 +62,6 @@ struct Index {
     .width('100%')
     .height('100%')
     .backgroundColor(this.store.palette.canvas)
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 }

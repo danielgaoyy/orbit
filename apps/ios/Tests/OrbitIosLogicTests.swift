@@ -685,6 +685,152 @@ final class OrbitIosLogicTests: OrbitLogicTestCase {
         try checkTrue(OrbitAgentLogic.shouldDispatchMarkAgentSeen(lastMarkedSeq: 42, nextSeq: 42, force: true))
         try checkTrue(OrbitAgentLogic.shouldDispatchMarkAgentSeen(lastMarkedSeq: 42, nextSeq: 0, force: true))
     }
+
+    // MARK: 35-40 iOS 5.0 Parity Logic (Plan Review, Batch Safety, Raw PTY, Push Deep Links, Voice, Keychain)
+
+    func testPlanApprovalDetectionAndMarkdownExtraction() throws {
+        try checkTrue(OrbitPlanApprovalLogic.isPlanApprovalToolName("ExitPlanMode"))
+        try checkTrue(OrbitPlanApprovalLogic.isPlanApprovalToolName("claude:exit_plan_mode"))
+        try checkTrue(OrbitPlanApprovalLogic.isPlanApprovalToolName("request_plan_approval"))
+        try checkFalse(OrbitPlanApprovalLogic.isPlanApprovalToolName("Bash"))
+
+        let argsJson = """
+        {
+          "plan": "# Auth Migration Plan\\n\\n1. Add Keychain key\\n2. Migrate DB",
+          "plan_file_path": "/repo/.claude/plans/auth.md",
+          "allowedPrompts": [{"tool": "Bash", "prompt": "cargo test"}]
+        }
+        """
+        let parsed = OrbitPlanApprovalLogic.parsePlanApproval(
+            requestId: "req-plan-1",
+            title: "Claude wants to use ExitPlanMode",
+            commandOrPath: "",
+            toolName: "ExitPlanMode",
+            argumentsJson: argsJson
+        )
+        try checkEqual(parsed?.title, "Auth Migration Plan")
+        try checkEqual(parsed?.planFilePath, "/repo/.claude/plans/auth.md")
+        try checkEqual(parsed?.allowedPrompts, ["Bash: cargo test"])
+
+        let codexPlan = OrbitPlanApprovalLogic.extractCodexProposedPlan(
+            from: "Intro <proposed_plan>\n# Codex Plan\n- Step A\n</proposed_plan> outro"
+        )
+        try checkEqual(codexPlan, "# Codex Plan\n- Step A")
+    }
+
+    func testBatchApprovalSafetyExcludesPlansQuestionsAndHighRisk() throws {
+        let queue: [OrbitBatchApprovalCandidate] = [
+            OrbitBatchApprovalCandidate(
+                hostId: "h1", agentId: "a1", requestId: "r-low",
+                title: "Read Cargo.toml", commandOrPath: "Cargo.toml",
+                toolName: "Read", allowedDecisions: ["deny", "allow"]
+            ),
+            OrbitBatchApprovalCandidate(
+                hostId: "h1", agentId: "a1", requestId: "r-plan",
+                title: "ExitPlanMode", commandOrPath: "",
+                toolName: "ExitPlanMode", allowedDecisions: ["deny", "allow"]
+            ),
+            OrbitBatchApprovalCandidate(
+                hostId: "h1", agentId: "a1", requestId: "r-rmrf",
+                title: "Run shell", commandOrPath: "rm -rf /tmp/build",
+                toolName: "Bash", allowedDecisions: ["deny", "allow"]
+            ),
+            OrbitBatchApprovalCandidate(
+                hostId: "h1", agentId: "a1", requestId: "r-push",
+                title: "Run shell", commandOrPath: "git push origin main",
+                toolName: "Bash", allowedDecisions: ["deny", "allow"]
+            ),
+            OrbitBatchApprovalCandidate(
+                hostId: "h1", agentId: "a1", requestId: "r-question",
+                title: "Pick target", commandOrPath: "Which env?",
+                allowedDecisions: ["allow"], isQuestion: true
+            ),
+            OrbitBatchApprovalCandidate(
+                hostId: "h1", agentId: "a1", requestId: "r-deny-only",
+                title: "Read file", commandOrPath: "README.md",
+                toolName: "Read", allowedDecisions: ["deny"]
+            )
+        ]
+
+        let safe = OrbitBatchApprovalLogic.selectSafeBatchPermissions(queue)
+        try checkEqual(safe.map(\.requestId), ["r-low"], "Only low/medium non-plan non-question allow-permitted items qualify")
+    }
+
+    func testRawPtyEncoderProducesAccurateVt100AndCtrlBytes() throws {
+        try checkEqual(OrbitPtyInputLogic.encodeSpecialKey(.escape), Data([0x1B]))
+        try checkEqual(OrbitPtyInputLogic.encodeSpecialKey(.tab), Data([0x09]))
+        try checkEqual(OrbitPtyInputLogic.encodeSpecialKey(.backspace), Data([0x7F]))
+        try checkEqual(OrbitPtyInputLogic.encodeSpecialKey(.enter), Data([0x0D]))
+        try checkEqual(OrbitPtyInputLogic.encodeSpecialKey(.arrowUp), Data("\u{001B}[A".utf8))
+        try checkEqual(OrbitPtyInputLogic.encodeSpecialKey(.arrowDown), Data("\u{001B}[B".utf8))
+        try checkEqual(OrbitPtyInputLogic.encodeSpecialKey(.arrowRight), Data("\u{001B}[C".utf8))
+        try checkEqual(OrbitPtyInputLogic.encodeSpecialKey(.arrowLeft), Data("\u{001B}[D".utf8))
+        try checkEqual(OrbitPtyInputLogic.encodeText("c", ctrl: true), Data([0x03]), "Ctrl+C -> ETX")
+        try checkEqual(OrbitPtyInputLogic.encodeText("D", ctrl: true), Data([0x04]), "Ctrl+D -> EOT")
+        try checkEqual(OrbitPtyInputLogic.encodeText("b", alt: true), Data("\u{001B}b".utf8), "Alt+b -> ESC b")
+        try checkEqual(OrbitPtyInputLogic.encodeText("\n"), Data([0x0D]), "Soft Return -> CR")
+        try checkEqual(OrbitPtyInputLogic.encodeText("hello"), Data("hello".utf8))
+    }
+
+    func testPushNotificationDeepLinkAndUserInfoRouting() throws {
+        let openAction = OrbitPushDeepLinkLogic.parseDeepLink("orbit://open?host=host_devbox&agent=ag_7")
+        try checkEqual(openAction, .openSession(hostId: "host_devbox", agentId: "ag_7"))
+
+        let pairAction = OrbitPushDeepLinkLogic.parseDeepLink("orbit://pair/abc123")
+        try checkEqual(pairAction, .pairHost(uri: "orbit://pair/abc123"))
+
+        let syncAction = OrbitPushDeepLinkLogic.parseDeepLink("orbit://sync-login?token=xyz")
+        try checkEqual(syncAction, .syncLogin(uri: "orbit://sync-login?token=xyz"))
+
+        let fromPayload = OrbitPushDeepLinkLogic.parseNotificationUserInfo([
+            "event_kind": "permission_required",
+            "host_id": "host_1",
+            "agent_id": "ag_99",
+            "deep_link": "orbit://open?host=host_1&agent=ag_99"
+        ])
+        try checkEqual(fromPayload, .openSession(hostId: "host_1", agentId: "ag_99"))
+
+        let fallbackFields = OrbitPushDeepLinkLogic.parseNotificationUserInfo([
+            "host_id": "host_2",
+            "agent_id": "ag_42"
+        ])
+        try checkEqual(fallbackFields, .openSession(hostId: "host_2", agentId: "ag_42"))
+    }
+
+    func testVoiceDictationTranscriptMergeAndIntentClassification() throws {
+        try checkEqual(
+            OrbitVoiceCommandLogic.mergeDictatedText(existingDraft: "", spokenSegment: "Run all tests"),
+            "Run all tests"
+        )
+        try checkEqual(
+            OrbitVoiceCommandLogic.mergeDictatedText(existingDraft: "Fix auth", spokenSegment: "and update docs"),
+            "Fix auth and update docs"
+        )
+        try checkEqual(OrbitVoiceCommandLogic.classifyTranscript("clear draft"), .clearDraft)
+        try checkEqual(OrbitVoiceCommandLogic.classifyTranscript("清空草稿"), .clearDraft)
+        try checkEqual(OrbitVoiceCommandLogic.classifyTranscript("下書きをクリア"), .clearDraft)
+        try checkEqual(
+            OrbitVoiceCommandLogic.classifyTranscript("Refactor the network layer"),
+            .appendText("Refactor the network layer")
+        )
+    }
+
+    func testKeychainCsprngAndProtectedFallbackPersistence() throws {
+        let randomKey = try OrbitKeychain.generateRandomBytes(count: OrbitKeychain.masterKeyByteCount)
+        try checkEqual(randomKey.count, 32)
+
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("orbit-keychain-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let serviceName = "dev.orbit.app.unit-test.\(UUID().uuidString)"
+        let kc = OrbitKeychain(service: serviceName)
+        let first = try kc.loadOrCreateMasterKey(fallbackDirectory: tempDir)
+        let second = try kc.loadOrCreateMasterKey(fallbackDirectory: tempDir)
+        try checkEqual(first.key.count, 32)
+        try checkEqual(first.key, second.key, "Repeated opens must return the identical persisted 32-byte master key")
+        try checkFalse(second.newlyGenerated, "Second load must reuse existing key")
+    }
 }
 
 #if ORBIT_CLI_TEST_RUNNER
@@ -730,6 +876,12 @@ enum OrbitLogicCliMain {
             ("testTimeDurationCompactAndHexColorParsing", suite.testTimeDurationCompactAndHexColorParsing),
             ("testStoreSharedValueTypesScopeUploadUndoAndCloudPrefs", suite.testStoreSharedValueTypesScopeUploadUndoAndCloudPrefs),
             ("testStorageProtectionExcludesDatabaseAndSidecarsFromBackup", suite.testStorageProtectionExcludesDatabaseAndSidecarsFromBackup),
+            ("testPlanApprovalDetectionAndMarkdownExtraction", suite.testPlanApprovalDetectionAndMarkdownExtraction),
+            ("testBatchApprovalSafetyExcludesPlansQuestionsAndHighRisk", suite.testBatchApprovalSafetyExcludesPlansQuestionsAndHighRisk),
+            ("testRawPtyEncoderProducesAccurateVt100AndCtrlBytes", suite.testRawPtyEncoderProducesAccurateVt100AndCtrlBytes),
+            ("testPushNotificationDeepLinkAndUserInfoRouting", suite.testPushNotificationDeepLinkAndUserInfoRouting),
+            ("testVoiceDictationTranscriptMergeAndIntentClassification", suite.testVoiceDictationTranscriptMergeAndIntentClassification),
+            ("testKeychainCsprngAndProtectedFallbackPersistence", suite.testKeychainCsprngAndProtectedFallbackPersistence),
         ]
 
         var passed = 0

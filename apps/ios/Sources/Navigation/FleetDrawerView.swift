@@ -369,6 +369,44 @@ struct FleetDrawerView: View {
 
     @ViewBuilder
     private var searchResultsContent: some View {
+        Button {
+            store.hapticLight()
+            let q = trimmedSearchQuery
+            if isCompactOverlay {
+                store.isDrawerOpen = false
+            }
+            store.globalSearchQuery = q
+            store.performGlobalSearch(query: q)
+            store.activeSheet = .globalSearch
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "text.magnifyingglass")
+                    .font(.system(size: 13.5, weight: .semibold))
+                    .foregroundStyle(palette.primary)
+                    .frame(width: 16, height: 16)
+
+                Text(OrbitL10n.tr("Search across all hosts"))
+                    .font(OrbitTypography.subhead(.semibold))
+                    .foregroundStyle(palette.fgPrimary)
+                    .lineLimit(1)
+
+                Spacer(minLength: 4)
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(palette.fgMuted)
+            }
+            .padding(.horizontal, 10)
+            .frame(minHeight: 38)
+            .background(palette.elevated, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(palette.hairline, lineWidth: 0.5))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 6, trailing: 8))
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
+
         if searchMatchedConversations.isEmpty && searchMatchedProjects.isEmpty {
             VStack(alignment: .leading, spacing: OrbitSpacing.xs) {
                 Text("No matches for \"\(trimmedSearchQuery)\"")
@@ -443,7 +481,10 @@ struct FleetDrawerView: View {
 
     @ViewBuilder
     private var missionControlContent: some View {
-        // 0. Quick Automations Entry
+        // 0a. Personal Agent Global Overview Entry
+        homeOverviewNavRow
+
+        // 0b. Quick Automations Entry
         automationsNavRow
 
         // 1. Conditional Needs Attention (0pt when empty)
@@ -619,6 +660,47 @@ struct FleetDrawerView: View {
         if hiddenCount > 0 {
             showMoreLessRow(projectId: project.id, hiddenCount: hiddenCount, isExpandedAll: isExpandedAll)
         }
+    }
+
+    private var homeOverviewNavRow: some View {
+        let isSelected = store.isShowingGlobalOverview
+        let pendingCount = Int(store.totalPendingApprovals)
+        return Button {
+            store.openGlobalOverview()
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "square.grid.2x2")
+                    .font(.system(size: 13.5, weight: .medium))
+                    .foregroundStyle(isSelected ? palette.fgPrimary : palette.fgSecondary)
+                    .frame(width: 16, height: 16)
+
+                Text(OrbitL10n.tr("Overview"))
+                    .font(OrbitTypography.subhead(isSelected ? .semibold : .medium))
+                    .foregroundStyle(isSelected ? palette.fgPrimary : palette.fgPrimary.opacity(0.9))
+
+                Spacer(minLength: 4)
+
+                if pendingCount > 0 {
+                    Text("\(pendingCount)")
+                        .font(OrbitTypography.meta(.semibold))
+                        .foregroundStyle(palette.warning)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(palette.warning.opacity(0.15), in: Capsule())
+                }
+            }
+            .padding(.horizontal, 8)
+            .frame(minHeight: 34)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(isSelected ? selectedRowFill : Color.clear)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
     }
 
     private var automationsNavRow: some View {

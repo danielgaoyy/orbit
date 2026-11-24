@@ -53,6 +53,10 @@ struct SessionOverviewPanel: View {
                     sessionSummaryCard(agent)
                 }
 
+                if let usage = store.activeSessionUsage, usage.turns > 0 {
+                    sessionUsageCard(usage)
+                }
+
                 quickActionsSection
 
                 if !backgroundTasks.isEmpty {
@@ -67,6 +71,54 @@ struct SessionOverviewPanel: View {
             .padding(.vertical, OrbitSpacing.md)
         }
         .background((palette.isDark ? palette.canvas : palette.drawer).ignoresSafeArea())
+        .onAppear {
+            store.refreshActiveSessionUsage()
+        }
+    }
+
+    private func sessionUsageCard(_ usage: SessionUsage) -> some View {
+        VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
+            Text(OrbitL10n.tr("Session Usage"))
+                .font(OrbitTypography.meta(.semibold))
+                .foregroundStyle(palette.fgMuted)
+                .padding(.horizontal, 4)
+
+            HStack(spacing: OrbitSpacing.md) {
+                usageMetric(label: "Turns", value: "\(usage.turns)")
+                OrbitHairline(axis: .vertical).frame(height: 26)
+                usageMetric(label: "In / Out", value: "\(formatTokenCount(usage.inputTokens)) / \(formatTokenCount(usage.outputTokens))")
+                OrbitHairline(axis: .vertical).frame(height: 26)
+                usageMetric(label: "Est. Cost", value: String(format: "$%.3f", usage.estimatedCostUsd))
+            }
+            .padding(OrbitSpacing.md)
+            .frame(maxWidth: .infinity)
+            .background(palette.elevated)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(palette.hairline, lineWidth: 0.5))
+        }
+    }
+
+    private func usageMetric(label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(palette.fgMuted)
+            Text(value)
+                .font(OrbitTypography.code(.semibold))
+                .foregroundStyle(palette.fgPrimary)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func formatTokenCount(_ count: UInt64) -> String {
+        if count >= 1_000_000 {
+            return String(format: "%.1fM", Double(count) / 1_000_000.0)
+        }
+        if count >= 1_000 {
+            return String(format: "%.1fk", Double(count) / 1_000.0)
+        }
+        return "\(count)"
     }
 
     // MARK: - 1. Session Summary + AI Sparkle
@@ -222,12 +274,25 @@ struct SessionOverviewPanel: View {
                 OrbitHairline().padding(.leading, 44)
 
                 actionRow(
-                    title: "Side Question (/btw)",
+                    title: OrbitL10n.tr("Side Question (/btw)"),
                     icon: "bubble.left.and.text.bubble.right",
                     badge: btwCount > 0 ? "\(btwCount)" : nil
                 ) {
                     onNavigateAction?()
                     store.openSideQuestion()
+                }
+
+                if store.activeAgent != nil {
+                    OrbitHairline().padding(.leading, 44)
+
+                    actionRow(
+                        title: OrbitL10n.tr("Export Transcript"),
+                        icon: "square.and.arrow.up",
+                        badge: nil
+                    ) {
+                        onNavigateAction?()
+                        store.presentSheetSafely(.transcriptExport)
+                    }
                 }
 
                 if let ws = store.activeWorkspace, ws.isCurated || store.activeWorkspacePeers.count > 1 {

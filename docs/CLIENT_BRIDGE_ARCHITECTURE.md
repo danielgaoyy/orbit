@@ -58,7 +58,7 @@ Bridges emit lightweight invalidation notifications (`CoreNotification`) contain
 
 Rust replays supported plan tool snapshots and ACP checklist notices. Task creation appends a row and task updates apply by ID, including deletion. A new prompt retains the current plan until a valid replacement or creation arrives. Updates can finish an earlier turn's tasks. Empty snapshots and deletion of the last row clear the shelf. Malformed snapshots and failed or denied tool calls leave the prior plan in place.
 
-Desktop Tauri and HarmonyOS N-API serialize the core stage DTO. Desktop renders the plan above its composer and reconciles the foreground indicator locally. The current Swift and Kotlin UniFFI insights records expose a subset of the DTO. Exposing the plan on those clients requires adding the record fields and regenerating both bindings.
+Desktop Tauri and HarmonyOS N-API serialize the core stage DTO. Desktop renders the plan above its composer and reconciles the foreground indicator locally. The Swift and Kotlin insights records expose the same ordered plan steps and full-history outline prompts. Empty defaults preserve existing native initializers.
 
 ### Full-history outline anchor projection
 
@@ -73,7 +73,7 @@ All Contract v2 request/response DTOs are canonically defined in `crates/orbit-c
 | Capability | Rust Core (`orbit-client-core`) | Desktop Tauri (`src-tauri`) | UniFFI (`orbit-ffi-uniffi`) | HarmonyOS N-API (`orbit-ffi-ohos`) |
 | --- | --- | --- | --- | --- |
 | Bridge version & caps | `BridgeInfoView` | `get_bridge_info` | `bridge_info()` | `bridgeInfoJson()` |
-| Full-history FTS5 search | `search_messages` / `search_messages_remote` (`WireMessage::SearchMessages`) | `search_messages` / `search_messages_remote` | `search_messages` | `searchMessagesJson` |
+| Full-history FTS5 search | `search_messages` / `search_messages_remote` (`WireMessage::SearchMessages`) | `search_messages` / `search_messages_remote` | `search_messages` / `search_messages_remote` | `searchMessagesJson` / `searchMessagesRemoteJson` |
 | Sidebar tree + search + prefs | `fleet_sidebar` / `FleetSidebarRequest` | `get_fleet_sidebar` | `fleet_sidebar_request` / `fleet_sidebar` | `fleetSidebarByRequestJson` / `fleetSidebarJson` |
 | Incremental stage projection | `agent_stage_delta` / `AgentStageDeltaRequest` | `get_agent_stage` / `get_agent_stage_delta` | `agent_stage_delta_request` / `agent_stage_delta` | `agentStageDeltaByRequestJson` / `agentStageDeltaJson` |
 | Delivery lifecycle & stall observability | `AgentMessageDeliveryUpdated` in-place fold, `StageTurnView.latest_activity_ms` / `latest_visible_progress_ms`, `interrupt_agent_and_continue` | `interrupt_agent_and_continue` | `FfiAgentMessageDeliveryStatus`, `interrupt_agent_and_continue` | `interruptAgentAndContinue` |
@@ -89,7 +89,7 @@ All Contract v2 request/response DTOs are canonically defined in `crates/orbit-c
 | Session creation & prompting | `CreateSessionRequest`, `SendPromptRequest` | `create_agent`, `send_prompt` | `create_session`, `send_prompt_request` | `createSessionJson`, `sendPromptJson` |
 | Lifecycle & connectivity | `on_app_foreground`, `on_app_background`, `on_network_changed` | `on_app_foreground`, `on_app_background`, `on_network_changed` | `on_app_foreground`, `on_app_background`, `on_network_changed` | `onAppForeground`, `onAppBackground`, `onNetworkChanged` |
 | Host & Agent identity flags | `HostCardView.is_local`, `AgentCardView.has_armed_timers` | Same JSON fields + `isAgentTimerWaiting` | `FfiHostCard.isLocal`, `FfiAgentCard.hasArmedTimers` | Same DTO fields via N-API |
-| Global Personal Agent routing | `discover_fleet_router_hosts`, `primary_router_selection` (APP-level) | Wired via Desktop Tauri (`App -> Personal Agent`, host-independent) | Mobile FFI exposure planned | Mobile FFI exposure planned |
+| Global Personal Agent routing | `discover_fleet_router_hosts`, `primary_router_selection` (APP-level) | Wired via Desktop Tauri (`App -> Personal Agent`, host-independent) | `discover_fleet_router_hosts` / `get_router_config` | `discoverFleetRouterHostsJson` / `getRouterConfigJson` |
 | SEP-1865 MCP Apps bridge | `read_mcp_resource_async`, `call_artifact_mcp_tool_async` | `read_mcp_resource`, `call_artifact_mcp_tool` | Mobile FFI exposure planned | Mobile FFI exposure planned |
 | M3 Security, Audit, Diagnostics & IDE Migration | `get_sandbox_config`, `update_sandbox_config`, `get_audit_chain_status`, `export_audit_chain`, `export_diagnostic_bundle`, `compact_agent_context`, `inspect_external_ide_migration`, `execute_external_ide_migration` | Wired 1:1 in Tauri IPC + `WasmWebBackend` | Mobile FFI exposure planned | Mobile FFI exposure planned |
 | M4 Project Memory | `list_project_memories`, `upsert_project_memory`, `confirm_project_memory`, `delete_project_memory`, `recall_project_memory` | Wired 1:1 in Tauri IPC + `WasmWebBackend` (`Instructions & Rules -> Memory`) | Mobile FFI exposure planned | Mobile FFI exposure planned |
@@ -125,6 +125,14 @@ Thread metadata (`seen_seq`, `is_pinned`, `pinned_order`, `updated_at_ms`) is pe
 
 ---
 
+## Mobile writes, approvals and automation
+
+Swift and Kotlin use generated UniFFI methods. HarmonyOS exposes the same host-scoped operations through `OrbitHarmonyCore`. The N-API worker pool returns promises for network requests. Git operations retain the daemon's expected OID, conflict hash and rebase step checks. Permission batches pass agent and request IDs together for server-side verification. Remote search returns host success/failure counts. Session usage totals are scoped to one agent on one host over the retained daemon ledger.
+
+The SQLite `client_pending_outbox` stores durable wire commands in host-scoped FIFO order. A full queue rejects the next write at 100 entries and surfaces a host error. The client retains the original request ID until a local transport write succeeds. This gives at-least-once delivery across a crash between transport completion and row deletion. Terminal resize, input, heartbeats and ephemeral subscriptions have separate live-session lifetimes.
+
+Pass a platform-protected 32-byte key through `OrbitMobileCore.newWithMasterKey` (bytes) or `OrbitHarmonyCore.newWithMasterKey` (standard Base64). Harmony also exports the same constructor as `OhosOrbitCore.newWithMasterKey`. The platform owns key creation, protection and recovery. Use the same key across opens of the same database. See [Cloud Sync](cloud-sync.md) for migration and dirty-state semantics.
+
 ## 6. Binding Synchronization & Verification Workflow
 
 Whenever Rust FFI types in `crates/orbit-client-core` or `crates/orbit-ffi-uniffi` change, regenerate Swift and Kotlin bindings and run the workspace checks:
@@ -132,6 +140,8 @@ Whenever Rust FFI types in `crates/orbit-client-core` or `crates/orbit-ffi-uniff
 ```bash
 # 1. Regenerate iOS (Swift) and Android (Kotlin) UniFFI bindings
 bash scripts/sync-bindings.sh
+bash scripts/check-ohos-dts-sync.sh --write
+bash scripts/check-ohos-dts-sync.sh
 
 # 2. Rust formatting, strict Clippy, and workspace unit/integration tests
 cargo fmt --all -- --check

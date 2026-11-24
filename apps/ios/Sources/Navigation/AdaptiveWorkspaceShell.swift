@@ -324,6 +324,12 @@ struct AdaptiveWorkspaceShell: View {
                 isGitRepo: isGitRepo,
                 moveAgentId: moveAgentId
             )
+        case .globalSearch:
+            GlobalSearchSheet(store: store)
+        case .personalRouter:
+            PersonalRouterAndMeshSheet(store: store)
+        case .transcriptExport:
+            TranscriptExportSheet(store: store)
         }
     }
 
@@ -433,17 +439,20 @@ private struct WorkspaceHeaderContext {
         if store.hosts.isEmpty {
             return "Orbit"
         }
+        if store.isShowingGlobalOverview {
+            return OrbitL10n.tr("Overview")
+        }
         if let agent = store.activeAgent {
             let trimmed = agent.title.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
                 return trimmed
             }
         }
-        return "New Conversation"
+        return OrbitL10n.tr("New Conversation")
     }
 
     var isDraftTitle: Bool {
-        !store.hosts.isEmpty && store.activeAgent == nil
+        !store.hosts.isEmpty && !store.isShowingGlobalOverview && store.activeAgent == nil
     }
 
     var isMultiHost: Bool {
@@ -646,16 +655,43 @@ private func workspaceHeaderMoreMenuItems(
         Button {
             store.openSideQuestion()
         } label: {
-            Text("Side Question (/btw)")
+            Text(OrbitL10n.tr("Side Question (/btw)"))
             if !store.activeSideQuestions.isEmpty {
                 Text("\(store.activeSideQuestions.count)")
             }
             Image(systemName: "bubble.left.and.text.bubble.right")
         }
+
+        Button {
+            store.hapticLight()
+            store.activeSheet = .globalSearch
+        } label: {
+            Label(OrbitL10n.tr("Global Search"), systemImage: "magnifyingglass")
+        }
+
+        Button {
+            store.hapticLight()
+            store.activeSheet = .automations
+        } label: {
+            Label(OrbitL10n.tr("Automations"), systemImage: "clock.arrow.circlepath")
+        }
+
+        Button {
+            store.openGlobalOverview()
+        } label: {
+            Label(OrbitL10n.tr("Home Overview"), systemImage: "square.grid.2x2")
+        }
     }
 
     if let agent = store.activeAgent {
         Section {
+            Button {
+                store.hapticLight()
+                store.activeSheet = .transcriptExport
+            } label: {
+                Label(OrbitL10n.tr("Export Transcript"), systemImage: "square.and.arrow.up")
+            }
+
             if let hid = store.selectedHostId {
                 Button {
                     store.renameTarget = .agent(

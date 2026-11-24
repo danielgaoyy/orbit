@@ -3305,6 +3305,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "ed25519-dalek",
+ "orbit-crypto",
  "orbit-protocol",
  "rusqlite",
  "serde",
@@ -3313,6 +3314,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

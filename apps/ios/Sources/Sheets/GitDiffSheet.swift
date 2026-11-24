@@ -78,6 +78,11 @@ private struct GitDiffWorkspacePanel: View {
 
     @Environment(\.orbitPalette) private var palette
     @State private var expandedOverrides: [String: Bool] = [:]
+    @State private var isCommitSheetPresented: Bool = false
+    @State private var isPrSheetPresented: Bool = false
+    @State private var isStashSheetPresented: Bool = false
+    @State private var isBranchAlertPresented: Bool = false
+    @State private var newBranchName: String = ""
 
     private var review: FfiGitReview? {
         store.gitReview
@@ -141,11 +146,74 @@ private struct GitDiffWorkspacePanel: View {
         VStack(spacing: 0) {
             headerBar
             branchAndStagedControls
+            gitWriteActionsBar
+            if let rebase = store.gitRebaseStatus, rebase.inProgress {
+                rebaseProgressBanner(rebase)
+            }
+            if !store.gitConflicts.isEmpty {
+                conflictsBanner
+            }
+            if let pr = store.gitPrStatus, pr.availability == .available, let num = pr.number {
+                openPrStatusBanner(pr, number: num)
+            }
+            if let err = store.gitWriteError, !err.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(palette.danger)
+                    Text(err)
+                        .font(OrbitTypography.meta(.regular))
+                        .foregroundStyle(palette.danger)
+                        .lineLimit(2)
+                    Spacer()
+                    Button { store.gitWriteError = nil } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(palette.fgMuted)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, OrbitSpacing.lg)
+                .padding(.vertical, 6)
+                .background(palette.danger.opacity(0.08))
+            }
             OrbitHairline()
             diffScrollBody
         }
         .onAppear {
             store.refreshGitReview()
+            store.refreshGitWriteMetadata()
+        }
+        .sheet(isPresented: $isCommitSheetPresented) {
+            GitCommitModalSheet(store: store)
+                .environment(\.orbitPalette, palette)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+        }
+        .sheet(isPresented: $isPrSheetPresented) {
+            GitCreatePrModalSheet(store: store)
+                .environment(\.orbitPalette, palette)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+        }
+        .sheet(isPresented: $isStashSheetPresented) {
+            GitStashManagerSheet(store: store)
+                .environment(\.orbitPalette, palette)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+        }
+        .alert("Create & Checkout Branch", isPresented: $isBranchAlertPresented) {
+            TextField("feat/my-branch", text: $newBranchName)
+            Button("Create") {
+                let name = newBranchName.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !name.isEmpty {
+                    let safeName = name.replacingOccurrences(of: " ", with: "-")
+                    onClose()
+                    store.runGitCommandInTerminal("git checkout -b '\(safeName)'")
+                }
+                newBranchName = ""
+            }
+            Button(OrbitL10n.tr("Cancel"), role: .cancel) { newBranchName = "" }
         }
     }
 
@@ -345,6 +413,172 @@ private struct GitDiffWorkspacePanel: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+
+    // MARK: - Git Write Actions Bar (Stage, Commit, Push, Branch, Stash, Create PR)
+
+    private var gitWriteActionsBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                if store.gitReviewScope == .staged {
+                    gitActionChip(OrbitL10n.tr("Unstage All"), icon: "minus.circle") {
+                        store.gitUnstage(paths: [], all: true)
+                    }
+                } else {
+                    gitActionChip(OrbitL10n.tr("Stage All"), icon: "plus.circle") {
+                        store.gitStage(paths: [], all: true)
+                    }
+                }
+
+                gitActionChip(OrbitL10n.tr("Commit"), icon: "checkmark.circle", prominent: true) {
+                    isCommitSheetPresented = true
+                }
+
+                gitActionChip(OrbitL10n.tr("Push"), icon: "arrow.up.circle") {
+                    onClose()
+                    store.runGitCommandInTerminal("git push")
+                }
+
+                gitActionChip("Branch", icon: "arrow.triangle.branch") {
+                    isBranchAlertPresented = true
+                }
+
+                gitActionChip(
+                    store.gitStashes.isEmpty ? OrbitL10n.tr("Stash") : "\(OrbitL10n.tr("Stash")) (\(store.gitStashes.count))",
+                    icon: "tray.and.arrow.down"
+                ) {
+                    isStashSheetPresented = true
+                }
+
+                gitActionChip(OrbitL10n.tr("Create PR"), icon: "arrow.triangle.pull") {
+                    isPrSheetPresented = true
+                }
+            }
+            .padding(.horizontal, OrbitSpacing.lg)
+            .padding(.bottom, OrbitSpacing.sm)
+        }
+        .disabled(store.gitWriteBusy)
+        .opacity(store.gitWriteBusy ? 0.65 : 1.0)
+    }
+
+    private func gitActionChip(_ title: String, icon: String, prominent: Bool = false, action: @escaping () -> Void) -> some View {
+        Button {
+            store.hapticLight()
+            action()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.system(size: 11, weight: .semibold))
+                Text(title)
+                    .font(OrbitTypography.meta(.semibold))
+            }
+            .foregroundStyle(prominent ? palette.onPrimary : palette.fgPrimary)
+            .padding(.horizontal, 11)
+            .frame(height: 30)
+            .background(prominent ? palette.primary : palette.subtleFill, in: Capsule())
+            .overlay(
+                Capsule().strokeBorder(prominent ? Color.clear : palette.hairline, lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func openPrStatusBanner(_ pr: GitPrStatus, number: UInt64) -> some View {
+        HStack(spacing: OrbitSpacing.sm) {
+            Image(systemName: "arrow.triangle.pull")
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundStyle(palette.direct)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text("PR #\(number) · \(pr.title ?? "")")
+                    .font(OrbitTypography.meta(.semibold))
+                    .foregroundStyle(palette.fgPrimary)
+                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    if pr.passingChecks > 0 {
+                        Text("✓\(pr.passingChecks)")
+                            .foregroundStyle(palette.direct)
+                    }
+                    if pr.failingChecks > 0 {
+                        Text("✕\(pr.failingChecks)")
+                            .foregroundStyle(palette.danger)
+                    }
+                    if pr.pendingChecks > 0 {
+                        Text("•\(pr.pendingChecks)")
+                            .foregroundStyle(palette.warning)
+                    }
+                    if let decision = pr.reviewDecision, !decision.isEmpty {
+                        Text(decision)
+                            .foregroundStyle(palette.fgMuted)
+                    }
+                }
+                .font(.system(size: 11, weight: .medium))
+            }
+
+            Spacer(minLength: 4)
+
+            if let urlStr = pr.url, let url = URL(string: urlStr) {
+                Button("Open") {
+                    UIApplication.shared.open(url)
+                }
+                .font(OrbitTypography.meta(.semibold))
+                .foregroundStyle(palette.accentSky)
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, OrbitSpacing.lg)
+        .padding(.vertical, 8)
+        .background(palette.recessed)
+    }
+
+    private func rebaseProgressBanner(_ rebase: GitRebaseStatus) -> some View {
+        HStack(spacing: OrbitSpacing.sm) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(palette.warning)
+            Text(OrbitL10n.tr("Rebase in Progress"))
+                .font(OrbitTypography.meta(.semibold))
+                .foregroundStyle(palette.fgPrimary)
+            Spacer()
+            Button(OrbitL10n.tr("Continue")) { store.performGitRebaseAction("continue") }
+                .font(OrbitTypography.meta(.semibold))
+                .foregroundStyle(palette.direct)
+            Button(OrbitL10n.tr("Skip")) { store.performGitRebaseAction("skip") }
+                .font(OrbitTypography.meta(.medium))
+                .foregroundStyle(palette.fgSecondary)
+            Button(OrbitL10n.tr("Abort")) { store.performGitRebaseAction("abort") }
+                .font(OrbitTypography.meta(.semibold))
+                .foregroundStyle(palette.danger)
+        }
+        .padding(.horizontal, OrbitSpacing.lg)
+        .padding(.vertical, 8)
+        .background(palette.warning.opacity(0.10))
+    }
+
+    private var conflictsBanner: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("\(OrbitL10n.tr("Merge Conflicts")) (\(store.gitConflicts.count))")
+                .font(OrbitTypography.meta(.semibold))
+                .foregroundStyle(palette.danger)
+            ForEach(store.gitConflicts.prefix(4), id: \.path) { file in
+                HStack(spacing: 6) {
+                    Text(OrbitFormatters.shortPath(file.path))
+                        .font(OrbitTypography.code(.medium))
+                        .foregroundStyle(palette.fgPrimary)
+                        .lineLimit(1)
+                    Spacer()
+                    Button(OrbitL10n.tr("Keep Ours")) { store.resolveGitConflict(file: file, resolution: .ours) }
+                        .font(.system(size: 11, weight: .semibold)).foregroundStyle(palette.accentSky)
+                    Button(OrbitL10n.tr("Keep Theirs")) { store.resolveGitConflict(file: file, resolution: .theirs) }
+                        .font(.system(size: 11, weight: .semibold)).foregroundStyle(palette.warning)
+                    Button(OrbitL10n.tr("Keep Both")) { store.resolveGitConflict(file: file, resolution: .both) }
+                        .font(.system(size: 11, weight: .medium)).foregroundStyle(palette.fgSecondary)
+                }
+            }
+        }
+        .padding(.horizontal, OrbitSpacing.lg)
+        .padding(.vertical, 8)
+        .background(palette.danger.opacity(0.08))
     }
 
     // MARK: - Horizontal File Jump Pills & Virtualized Diff Stream
@@ -597,6 +831,23 @@ private struct DiffFileSectionCard: View {
                 }
                 .buttonStyle(.plain)
 
+                // Per-file Stage / Unstage button
+                Button {
+                    if store.gitReviewScope == .staged {
+                        store.gitUnstage(paths: [file.path], all: false)
+                    } else {
+                        store.gitStage(paths: [file.path], all: false)
+                    }
+                } label: {
+                    Image(systemName: store.gitReviewScope == .staged ? "minus.circle" : "plus.circle")
+                        .font(.system(size: 13.5, weight: .medium))
+                        .foregroundStyle(store.gitReviewScope == .staged ? palette.warning : palette.direct)
+                        .frame(width: 34, height: OrbitSpacing.hitTarget)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(store.gitReviewScope == .staged ? OrbitL10n.tr("Unstage") : OrbitL10n.tr("Stage"))
+
                 if hunkOffsets.count > 1 {
                     Button {
                         let nextCursor = (currentHunkCursor < 0 || currentHunkCursor + 1 >= hunkOffsets.count)
@@ -739,6 +990,174 @@ private struct DiffFileSectionCard: View {
         case .removed: return palette.removed.opacity(0.12)
         case .hunkHeader: return palette.primary.opacity(0.08)
         case .meta, .context: return Color.clear
+        }
+    }
+}
+
+// MARK: - Git Commit, Stash & Create PR Modals
+
+private struct GitCommitModalSheet: View {
+    @ObservedObject var store: OrbitIosStore
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.orbitPalette) private var palette
+
+    @State private var message: String = ""
+    @State private var amend: Bool = false
+    @State private var isGenerating: Bool = false
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Commit Message") {
+                    TextEditor(text: $message)
+                        .font(OrbitTypography.body(.regular))
+                        .frame(minHeight: 110)
+
+                    Button {
+                        isGenerating = true
+                        Task {
+                            if let generated = await store.generateGitCommitMessage() {
+                                message = generated
+                            }
+                            isGenerating = false
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            if isGenerating {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Image(systemName: "sparkles")
+                            }
+                            Text(OrbitL10n.tr("Generate Message"))
+                        }
+                    }
+                    .disabled(isGenerating || store.gitWriteBusy)
+
+                    Toggle(OrbitL10n.tr("Amend previous commit"), isOn: $amend)
+                }
+            }
+            .navigationTitle(OrbitL10n.tr("Commit Changes"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button(OrbitL10n.tr("Cancel")) { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(OrbitL10n.tr("Commit")) {
+                        store.commitGitChanges(message: message, amend: amend) {
+                            dismiss()
+                        }
+                    }
+                    .disabled(message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.gitWriteBusy)
+                }
+            }
+        }
+    }
+}
+
+private struct GitCreatePrModalSheet: View {
+    @ObservedObject var store: OrbitIosStore
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var title: String = ""
+    @State private var bodyText: String = ""
+    @State private var baseBranch: String = "main"
+    @State private var isDraft: Bool = false
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(OrbitL10n.tr("Pull Request")) {
+                    TextField("PR title", text: $title)
+                    TextField("Base branch (e.g. main)", text: $baseBranch)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Toggle(OrbitL10n.tr("Draft PR"), isOn: $isDraft)
+                }
+                Section("Description") {
+                    TextEditor(text: $bodyText)
+                        .frame(minHeight: 120)
+                }
+            }
+            .navigationTitle(OrbitL10n.tr("Create PR"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button(OrbitL10n.tr("Cancel")) { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(OrbitL10n.tr("Create PR")) {
+                        store.createGitPullRequest(
+                            title: title,
+                            body: bodyText,
+                            base: baseBranch.isEmpty ? nil : baseBranch,
+                            draft: isDraft
+                        ) { _ in
+                            dismiss()
+                        }
+                    }
+                    .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.gitWriteBusy)
+                }
+            }
+        }
+    }
+}
+
+private struct GitStashManagerSheet: View {
+    @ObservedObject var store: OrbitIosStore
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.orbitPalette) private var palette
+
+    @State private var stashMessage: String = ""
+    @State private var includeUntracked: Bool = true
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section(OrbitL10n.tr("Save Stash")) {
+                    TextField("Optional stash message", text: $stashMessage)
+                    Toggle("Include untracked files", isOn: $includeUntracked)
+                    Button(OrbitL10n.tr("Save Stash")) {
+                        store.saveGitStash(message: stashMessage, includeUntracked: includeUntracked)
+                        stashMessage = ""
+                    }
+                    .disabled(store.gitWriteBusy)
+                }
+
+                Section("Saved Stashes (\(store.gitStashes.count))") {
+                    if store.gitStashes.isEmpty {
+                        Text("No stashes in this repository.")
+                            .foregroundStyle(palette.fgMuted)
+                    } else {
+                        ForEach(store.gitStashes, id: \.stashRef) { entry in
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(entry.message.isEmpty ? entry.stashRef : entry.message)
+                                    .font(OrbitTypography.subhead(.medium))
+                                Text("\(entry.stashRef) · \(entry.branch ?? "")")
+                                    .font(OrbitTypography.code(.regular))
+                                    .foregroundStyle(palette.fgMuted)
+                                HStack(spacing: 14) {
+                                    Button(OrbitL10n.tr("Pop")) { store.applyGitStash(entry, pop: true) }
+                                        .font(OrbitTypography.meta(.semibold))
+                                    Button(OrbitL10n.tr("Apply")) { store.applyGitStash(entry, pop: false) }
+                                        .font(OrbitTypography.meta(.medium))
+                                    Spacer()
+                                    Button(OrbitL10n.tr("Drop"), role: .destructive) { store.dropGitStash(entry) }
+                                        .font(OrbitTypography.meta(.medium))
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+                }
+            }
+            .navigationTitle(OrbitL10n.tr("Stash"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) { Button(OrbitL10n.tr("Done")) { dismiss() } }
+            }
+            .onAppear {
+                store.refreshGitWriteMetadata()
+            }
         }
     }
 }

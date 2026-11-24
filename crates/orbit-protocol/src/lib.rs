@@ -3356,6 +3356,14 @@ pub enum WireMessage {
         items: serde_json::Value,
     },
     // Usage Insights, Cost Ledger & Context Occupancy Telemetry
+    GetSessionUsage {
+        request_id: Uuid,
+        agent_id: String,
+    },
+    SessionUsageResponse {
+        request_id: Uuid,
+        usage: SessionUsage,
+    },
     GetUsageInsights {
         request_id: Uuid,
         #[serde(default = "wire_default_usage_days")]
@@ -3821,8 +3829,15 @@ pub enum WireMessage {
         platform: PushPlatform,
         device_name: String,
         device_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        live_activity_token: Option<String>,
         #[serde(default)]
         sandbox: bool,
+    },
+    RegisterLiveActivityToken {
+        request_id: Uuid,
+        device_id: String,
+        live_activity_token: Option<String>,
     },
     UnregisterPushDevice {
         request_id: Uuid,
@@ -6231,6 +6246,7 @@ mod tests {
                 platform: PushPlatform::Apns,
                 device_name: "Jess iPhone".into(),
                 device_token: "apns_token_123456abcdef".into(),
+                live_activity_token: None,
                 sandbox: false,
             },
             WireMessage::UnregisterPushDevice {

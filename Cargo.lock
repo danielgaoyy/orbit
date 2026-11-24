@@ -1489,6 +1489,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1613,7 +1632,9 @@ checksum = "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c"
 dependencies = [
  "atomic-waker",
  "bytes",
+ "futures-channel",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "httparse",
@@ -2531,9 +2552,11 @@ dependencies = [
  "orbit-relay-transport",
  "orbit-shim",
  "orbit-store",
+ "p256",
  "pulldown-cmark",
  "rand 0.9.5",
  "reqwest",
+ "rsa",
  "rustix",
  "serde",
  "serde-saphyr",
@@ -2556,6 +2579,7 @@ dependencies = [
 name = "orbit-ffi-ohos"
 version = "0.10.5"
 dependencies = [
+ "base64 0.22.1",
  "napi-build-ohos",
  "napi-derive-ohos",
  "napi-ohos",
@@ -2564,18 +2588,21 @@ dependencies = [
  "orbit-protocol",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
 name = "orbit-ffi-uniffi"
 version = "0.10.5"
 dependencies = [
+ "chrono",
  "orbit-client-core",
  "orbit-crypto",
  "orbit-protocol",
  "serde_json",
  "thiserror 2.0.21",
  "uniffi",
+ "zeroize",
 ]
 
 [[package]]
@@ -2664,6 +2691,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "ed25519-dalek",
+ "orbit-crypto",
  "orbit-protocol",
  "rusqlite",
  "serde",
@@ -2672,6 +2700,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -3235,6 +3264,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -4281,6 +4311,20 @@ dependencies = [
  "log",
  "tokio",
  "tungstenite 0.29.0",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.7.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "libc",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]

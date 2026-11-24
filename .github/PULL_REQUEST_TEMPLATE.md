@@ -25,6 +25,7 @@
 <!-- Check all verifications run locally and summarize any platform-specific notes. -->
 
 - [ ] `cargo fmt --all -- --check` and `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check`
+- [ ] `bash scripts/check-ohos-dts-sync.sh` for the HarmonyOS N-API declarations
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] `cargo test --workspace` (or targeted crate tests for scoped changes)
 - [ ] Desktop: `node --experimental-strip-types --test "src/**/*.test.ts"`, `npm run build`, `npm run test:smoke`

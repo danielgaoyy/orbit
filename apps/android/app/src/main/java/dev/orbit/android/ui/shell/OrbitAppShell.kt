@@ -1,5 +1,10 @@
 package dev.orbit.android.ui.shell
 
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.runtime.key
+import androidx.compose.ui.res.stringResource
+import dev.orbit.android.R
+import dev.orbit.android.ui.sheets.*
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -76,6 +81,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import dev.orbit.android.notifications.PendingDeepLinkConfirmation
+import dev.orbit.android.notifications.PendingDeepLinkKind
 import dev.orbit.android.store.OrbitAndroidStore
 import dev.orbit.android.store.OrbitFormatters
 import dev.orbit.android.store.OrbitUiState
@@ -122,11 +129,11 @@ private enum class ActiveModalSheet {
     WORKSPACE_BOARD,
     SIDE_QUESTION,
     ARCHIVED_SESSIONS,
-    CLOUD_SYNC,
+    CLOUD_SYNC, SEARCH, FILES, GIT_WRITE, ROUTER, EXPORT, LINK_SCAN,
 }
 
 @Composable
-fun AdaptiveOrbitShell(
+fun OrbitAppShell(
     ui: OrbitUiState,
     store: OrbitAndroidStore,
     modifier: Modifier = Modifier,
@@ -135,9 +142,11 @@ fun AdaptiveOrbitShell(
     val typography = OrbitTheme.typography
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val screenState = androidx.compose.runtime.saveable.rememberSaveableStateHolder()
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
 
     var activeSheet by rememberSaveable { mutableStateOf(ActiveModalSheet.NONE) }
+    var terminalDraft by remember { mutableStateOf("") }
     var showForkDialog by rememberSaveable { mutableStateOf(false) }
     var lastToastText by remember { mutableStateOf("") }
     if (ui.toastMessage != null) {
@@ -153,6 +162,8 @@ fun AdaptiveOrbitShell(
 
     LaunchedEffect(ui.pendingSheetTriggerId, ui.pendingSheetTrigger) {
         when (ui.pendingSheetTrigger) {
+            "search" -> activeSheet = ActiveModalSheet.SEARCH
+            "router" -> activeSheet = ActiveModalSheet.ROUTER
             "btw" -> activeSheet = ActiveModalSheet.SIDE_QUESTION
             "automations" -> activeSheet = ActiveModalSheet.AUTOMATIONS
             "board" -> activeSheet = ActiveModalSheet.WORKSPACE_BOARD
@@ -175,14 +186,17 @@ fun AdaptiveOrbitShell(
     ) {
         // >= 700.dp supports collapsible 260.dp sidebar; Zen mode collapses sidebar to 0.dp.
         // Side-by-side 360.dp GitDiffInspectorPane activates whenever maxWidth >= 1024.dp OR (maxWidth - effectiveDrawerWidth) >= 780.dp.
-        val hasPermanentDrawer = maxWidth >= TWO_PANE_BREAKPOINT
-        val effectiveDrawerWidth = if (hasPermanentDrawer && !ui.isPermanentDrawerCollapsed) {
+        val posture = rememberOrbitFoldablePosture(constraints.maxWidth, constraints.maxHeight)
+        val book = posture as? OrbitFoldablePosture.BookDualPane
+        val tabletop = posture as? OrbitFoldablePosture.TabletopSplit
+        val hasPermanentDrawer = book != null || maxWidth >= TWO_PANE_BREAKPOINT
+        val effectiveDrawerWidth = book?.masterWidthDp ?: if (hasPermanentDrawer && !ui.isPermanentDrawerCollapsed) {
             PERMANENT_DRAWER_WIDTH
         } else {
             0.dp
         }
-        val supportsThreePane = maxWidth >= THREE_PANE_BREAKPOINT ||
-            (maxWidth - effectiveDrawerWidth) >= SIDE_BY_SIDE_DIFF_STAGE_THRESHOLD
+        val supportsThreePane = book == null && (maxWidth >= THREE_PANE_BREAKPOINT ||
+            (maxWidth - effectiveDrawerWidth) >= SIDE_BY_SIDE_DIFF_STAGE_THRESHOLD)
 
         LaunchedEffect(hasPermanentDrawer) {
             if (hasPermanentDrawer && drawerState.isOpen) {
@@ -259,7 +273,9 @@ fun AdaptiveOrbitShell(
                     if (!hasPermanentDrawer && drawerState.isOpen) drawerState.close()
                     activeSheet = ActiveModalSheet.CLOUD_SYNC
                 }
+                "overview" -> store.openGlobalOverview()
                 "none", "stage" -> {
+                    store.closeGlobalOverview()
                     activeSheet = ActiveModalSheet.NONE
                     store.closeDiffInspector()
                     if (!hasPermanentDrawer && drawerState.isOpen) drawerState.close()
@@ -281,13 +297,14 @@ fun AdaptiveOrbitShell(
         // Predictive Back / BackHandler closes active sheets, diff inspector, or compact drawer smoothly
         val shouldInterceptBack = activeSheet != ActiveModalSheet.NONE ||
             ui.isDiffInspectorOpen ||
-            (!hasPermanentDrawer && drawerState.isOpen)
+            (!hasPermanentDrawer && drawerState.isOpen) || (!ui.showGlobalOverview && book == null)
 
         BackHandler(enabled = shouldInterceptBack) {
             when {
                 activeSheet != ActiveModalSheet.NONE -> activeSheet = ActiveModalSheet.NONE
                 ui.isDiffInspectorOpen -> store.closeDiffInspector()
                 !hasPermanentDrawer && drawerState.isOpen -> scope.launch { drawerState.close() }
+                else -> store.openGlobalOverview()
             }
         }
 
@@ -367,14 +384,29 @@ fun AdaptiveOrbitShell(
             )
         }
 
+        val overview: @Composable () -> Unit = {
+            screenState.SaveableStateProvider("overview") { OverviewScreen(ui, store, onSidebar = {
+                if (book != null) store.closeGlobalOverview()
+                else if (hasPermanentDrawer) store.togglePermanentDrawerCollapsed()
+                else scope.launch { drawerState.open() }
+            }, onSearch = { activeSheet = ActiveModalSheet.SEARCH },
+                onSettings = { activeSheet = ActiveModalSheet.SETTINGS }, onPair = { activeSheet = ActiveModalSheet.PAIR_QR }) }
+        }
+
         val mainStageColumn: @Composable (Modifier) -> Unit = { colModifier ->
-            Column(modifier = colModifier.fillMaxHeight()) {
+            if (book == null && ui.showGlobalOverview) {
+                Box(colModifier.fillMaxHeight()) { overview() }
+            } else Column(modifier = colModifier.fillMaxHeight()) {
                 OrbitStageTopBar(
                     ui = ui,
                     isWideViewport = hasPermanentDrawer,
                     isInlineDiffOpen = supportsThreePane && ui.isDiffInspectorOpen,
+                    onOverview = store::openGlobalOverview,
+                    onSearch = { activeSheet = ActiveModalSheet.SEARCH },
+                    onFiles = { activeSheet = ActiveModalSheet.FILES },
+                    onGitWrite = { activeSheet = ActiveModalSheet.GIT_WRITE },
                     onOpenDrawer = { scope.launch { drawerState.open() } },
-                    onTogglePermanentDrawer = { store.togglePermanentDrawerCollapsed() },
+                    onTogglePermanentDrawer = { if (book != null) store.openGlobalOverview() else store.togglePermanentDrawerCollapsed() },
                     onOpenDirectoryBrowser = { activeSheet = ActiveModalSheet.DIRECTORY_BROWSER },
                     onCopyPath = { path ->
                         val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
@@ -393,7 +425,7 @@ fun AdaptiveOrbitShell(
                     onOpenAutomations = { activeSheet = ActiveModalSheet.AUTOMATIONS },
                     onOpenArchived = { activeSheet = ActiveModalSheet.ARCHIVED_SESSIONS },
                     onOpenForkDialog = { showForkDialog = true },
-                    onExportTranscript = { store.exportActiveTranscriptMarkdown() },
+                    onExportTranscript = { activeSheet = ActiveModalSheet.EXPORT },
                     onNewSession = { store.startNewSession() },
                     onArchiveSession = { agentId -> store.archiveAgent(agentId) },
                     onOpenSettings = { activeSheet = ActiveModalSheet.SETTINGS },
@@ -402,7 +434,10 @@ fun AdaptiveOrbitShell(
                 if (showTopBarDivider) {
                     HorizontalDivider(thickness = OrbitSpacing.hairline, color = colors.hairline)
                 }
-                StreamStageScreen(
+                HostConnectionBanner(ui, store)
+                key(ui.selectedHostId, ui.selectedAgentId) { StreamStageScreen(
+                    tabletop = tabletop,
+                    inlineTerminalOpen = tabletop != null && activeSheet == ActiveModalSheet.TERMINAL,
                     ui = ui,
                     store = store,
                     onOpenContextPicker = { activeSheet = ActiveModalSheet.CONTEXT_MENTION },
@@ -416,27 +451,27 @@ fun AdaptiveOrbitShell(
                     onOpenWorkspaceBoard = { activeSheet = ActiveModalSheet.WORKSPACE_BOARD },
                     onOpenArchived = { activeSheet = ActiveModalSheet.ARCHIVED_SESSIONS },
                     onOpenForkDialog = { showForkDialog = true },
-                    onExportTranscript = { store.exportActiveTranscriptMarkdown() },
+                    onExportTranscript = { activeSheet = ActiveModalSheet.EXPORT },
                     modifier = Modifier.weight(1f),
-                )
+                ) }
             }
         }
 
         if (hasPermanentDrawer) {
             Row(modifier = Modifier.fillMaxSize()) {
                 AnimatedVisibility(
-                    visible = !ui.isPermanentDrawerCollapsed,
+                    visible = book != null || !ui.isPermanentDrawerCollapsed,
                     enter = expandHorizontally() + fadeIn(),
                     exit = shrinkHorizontally() + fadeOut(),
                 ) {
                     Row(
                         modifier = Modifier
-                            .width(PERMANENT_DRAWER_WIDTH)
+                            .width(effectiveDrawerWidth)
                             .fillMaxHeight()
                             .background(colors.drawer),
                     ) {
                         Box(modifier = Modifier.weight(1f)) {
-                            drawerBody()
+                            if (book != null && ui.showGlobalOverview) overview() else drawerBody()
                         }
                         Box(
                             modifier = Modifier
@@ -446,6 +481,7 @@ fun AdaptiveOrbitShell(
                         )
                     }
                 }
+                if (book != null) Spacer(Modifier.width(book.hingeGapDp))
                 mainStageColumn(Modifier.weight(1f))
                 if (supportsThreePane && ui.isDiffInspectorOpen) {
                     GitDiffInspectorPane(
@@ -457,6 +493,7 @@ fun AdaptiveOrbitShell(
                         isRefreshing = ui.isRefreshingGitDiff,
                         onRefresh = { store.loadGitReview() },
                         onPullRefresh = { store.refreshGitDiff() },
+                        onWrite = { store.closeDiffInspector(); activeSheet = ActiveModalSheet.GIT_WRITE },
                         onSetStagedMode = { store.setGitStagedMode(it) },
                         onSelectPath = { store.selectGitFileFilter(it) },
                         onQuoteLine = { path, lineLabel, content ->
@@ -485,7 +522,7 @@ fun AdaptiveOrbitShell(
         }
 
         // Non-overlapping transient toast pill positioned strictly below the 52.dp top header bar (padding(top = 56.dp))
-        val stageStartInset = effectiveDrawerWidth
+        val stageStartInset = effectiveDrawerWidth + (book?.hingeGapDp ?: 0.dp)
         val stageEndInset = if (supportsThreePane && ui.isDiffInspectorOpen) {
             INLINE_DIFF_PANE_WIDTH
         } else {
@@ -537,6 +574,7 @@ fun AdaptiveOrbitShell(
                 isRefreshing = ui.isRefreshingGitDiff,
                 onRefresh = { store.loadGitReview() },
                 onPullRefresh = { store.refreshGitDiff() },
+                onWrite = { store.closeDiffInspector(); activeSheet = ActiveModalSheet.GIT_WRITE },
                 onSetStagedMode = { store.setGitStagedMode(it) },
                 onSelectPath = { store.selectGitFileFilter(it) },
                 onQuoteLine = { path, lineLabel, content ->
@@ -549,6 +587,24 @@ fun AdaptiveOrbitShell(
 
         // Modal Bottom Sheets
         when (activeSheet) {
+            ActiveModalSheet.SEARCH -> GlobalSearchSheet(ui, store) { activeSheet = ActiveModalSheet.NONE }
+            ActiveModalSheet.FILES -> WorkspaceFileSheet(ui, store) { activeSheet = ActiveModalSheet.NONE }
+            ActiveModalSheet.GIT_WRITE -> GitWriteSheet(ui, store, onDiff = {
+                activeSheet = ActiveModalSheet.FULL_DIFF
+                store.loadGitReview()
+            }, onPush = { command ->
+                terminalDraft = command
+                activeSheet = ActiveModalSheet.TERMINAL
+            }) { activeSheet = ActiveModalSheet.NONE }
+            ActiveModalSheet.ROUTER -> RouterSheet(ui, store) { activeSheet = ActiveModalSheet.NONE }
+            ActiveModalSheet.EXPORT -> ExportSheet { format ->
+                activeSheet = ActiveModalSheet.NONE
+                format?.let(store::exportActiveTranscript)
+            }
+            ActiveModalSheet.LINK_SCAN -> DeviceLinkScanner({ uri ->
+                activeSheet = ActiveModalSheet.CLOUD_SYNC
+                store.importCloudSyncDeviceLinkUri(uri)
+            }, { activeSheet = ActiveModalSheet.CLOUD_SYNC })
             ActiveModalSheet.NONE -> Unit
 
             ActiveModalSheet.FULL_DIFF -> {
@@ -561,6 +617,7 @@ fun AdaptiveOrbitShell(
                     isRefreshing = ui.isRefreshingGitDiff,
                     onRefresh = { store.loadGitReview() },
                     onPullRefresh = { store.refreshGitDiff() },
+                    onWrite = { store.closeDiffInspector(); activeSheet = ActiveModalSheet.GIT_WRITE },
                     onSetStagedMode = { store.setGitStagedMode(it) },
                     onSelectPath = { store.selectGitFileFilter(it) },
                     onQuoteLine = { path, lineLabel, content ->
@@ -572,24 +629,35 @@ fun AdaptiveOrbitShell(
             }
 
             ActiveModalSheet.TERMINAL -> {
-                PtyTerminalSheet(
-                    cwd = ui.activeCwd,
-                    terminals = ui.hostDetail?.terminals.orEmpty(),
-                    activeTerminalId = ui.hostDetail?.activeTerminalId,
-                    screen = ui.terminalScreen,
-                    onEnsureStarted = { store.ensureTerminalStarted(ui.activeCwd) },
-                    onSpawnTerminal = { store.spawnNewTerminal(ui.activeCwd) },
-                    onAttachTerminal = { store.attachTerminalSession(it) },
-                    onKillTerminal = { store.killTerminalSession(it) },
-                    onViewportMeasured = { c, r -> store.onTerminalViewportMeasured(c, r) },
-                    onSendKeys = { store.sendTerminalKeys(it) },
-                    onCopiedOutput = { store.showToast("Copied terminal output") },
-                    onQuoteTerminal = {
-                        store.quoteTerminalToComposer()
-                        activeSheet = ActiveModalSheet.NONE
-                    },
-                    onDismiss = { activeSheet = ActiveModalSheet.NONE },
-                )
+                androidx.compose.runtime.DisposableEffect(Unit) { onDispose { terminalDraft = "" } }
+                val terminal: @Composable () -> Unit = {
+                    PtyTerminalSheet(
+                        cwd = ui.activeCwd,
+                        terminals = ui.hostDetail?.terminals.orEmpty(),
+                        activeTerminalId = ui.hostDetail?.activeTerminalId,
+                        screen = ui.terminalScreen,
+                        onEnsureStarted = { store.ensureTerminalStarted(ui.activeCwd) },
+                        onSpawnTerminal = { store.spawnNewTerminal(ui.activeCwd) },
+                        onAttachTerminal = { store.attachTerminalSession(it) },
+                        onKillTerminal = { store.killTerminalSession(it) },
+                        onViewportMeasured = { c, r -> store.onTerminalViewportMeasured(c, r) },
+                        onSendKeys = { store.sendTerminalBytes(it.toByteArray()) },
+                        onSendBytes = { store.sendTerminalBytes(it) },
+                        initialLine = terminalDraft,
+                        inlineDeck = tabletop != null,
+                        onCopiedOutput = { store.showToast("Copied terminal output") },
+                        onQuoteTerminal = {
+                            store.quoteTerminalToComposer()
+                            activeSheet = ActiveModalSheet.NONE
+                        },
+                        onDismiss = { activeSheet = ActiveModalSheet.NONE },
+                    )
+                }
+                if (tabletop == null) terminal() else {
+                    Box(Modifier.fillMaxSize().padding(top = tabletop.upperStageHeightDp + tabletop.hingeGapDp)) {
+                        Box(Modifier.fillMaxSize().background(colors.elevated)) { terminal() }
+                    }
+                }
             }
 
             ActiveModalSheet.MODEL_SELECTOR -> {
@@ -666,6 +734,7 @@ fun AdaptiveOrbitShell(
 
             ActiveModalSheet.SETTINGS -> {
                 SettingsSheet(
+                    onRouter = { activeSheet = ActiveModalSheet.ROUTER },
                     appearanceMode = ui.appearanceMode,
                     hosts = ui.hosts,
                     selectedHostId = ui.selectedHostId,
@@ -699,6 +768,7 @@ fun AdaptiveOrbitShell(
 
             ActiveModalSheet.AUTOMATIONS -> {
                 AutomationsSheet(
+                    ui = ui, store = store,
                     schedules = ui.hostDetail?.schedules.orEmpty(),
                     scheduleRunsById = ui.scheduleRunsById,
                     conditionalTimers = ui.hostDetail?.conditionalTimers.orEmpty(),
@@ -768,6 +838,7 @@ fun AdaptiveOrbitShell(
 
             ActiveModalSheet.CLOUD_SYNC -> {
                 CloudSyncSheet(
+                    deviceLinkControls = { DeviceLinkControls(ui, store) { activeSheet = ActiveModalSheet.LINK_SCAN } },
                     status = ui.cloudSyncStatus,
                     deviceFlow = ui.cloudSyncDeviceFlow,
                     isBusy = ui.cloudSyncBusy,
@@ -802,8 +873,86 @@ fun AdaptiveOrbitShell(
                 onDismiss = { showForkDialog = false },
             )
         }
+
+        ui.pendingDeepLinkConfirmation?.let { pending ->
+            ExternalDeepLinkConfirmationDialog(
+                pending = pending,
+                onConfirm = { store.confirmPendingDeepLink() },
+                onDismiss = { store.dismissPendingDeepLink() },
+            )
+        }
     }
     }
+}
+
+@Composable
+private fun ExternalDeepLinkConfirmationDialog(
+    pending: PendingDeepLinkConfirmation,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val colors = OrbitTheme.colors
+    val typography = OrbitTheme.typography
+    val isSyncTakeover = pending.kind == PendingDeepLinkKind.IMPORT_CLOUD_SYNC_DEVICE_LINK
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = colors.elevated,
+        titleContentColor = colors.fgPrimary,
+        textContentColor = colors.fgSecondary,
+        title = {
+            Text(
+                text = stringResource(
+                    if (isSyncTakeover) R.string.deeplink_confirm_sync_title
+                    else R.string.deeplink_confirm_pair_title
+                ),
+                style = typography.title,
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm)) {
+                Text(
+                    text = stringResource(
+                        if (isSyncTakeover) R.string.deeplink_confirm_sync_body
+                        else R.string.deeplink_confirm_pair_body,
+                        pending.endpointSummary,
+                    ),
+                    style = typography.subhead,
+                    color = colors.fgSecondary,
+                )
+                Text(
+                    text = pending.endpointSummary,
+                    style = typography.code,
+                    color = colors.fgPrimary,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(colors.subtleFill, RoundedCornerShape(8.dp))
+                        .padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.xs),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text(
+                    text = stringResource(
+                        if (isSyncTakeover) R.string.deeplink_confirm_sync_action
+                        else R.string.nav_pair_host
+                    ),
+                    color = if (isSyncTakeover) colors.dangerRemoved else colors.primary,
+                    style = typography.subheadSemiBold,
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(
+                    text = stringResource(R.string.nav_cancel),
+                    color = colors.fgSecondary,
+                    style = typography.subheadMedium,
+                )
+            }
+        },
+    )
 }
 
 @Composable
@@ -940,6 +1089,10 @@ private fun OrbitStageTopBar(
     onCopyPath: (String) -> Unit,
     onOpenPairSheet: () -> Unit,
     onToggleDiff: () -> Unit,
+    onOverview: () -> Unit,
+    onSearch: () -> Unit,
+    onFiles: () -> Unit,
+    onGitWrite: () -> Unit,
     onOpenFullDiff: () -> Unit,
     onOpenTerminal: () -> Unit,
     onOpenSideQuestion: () -> Unit,
@@ -1225,6 +1378,13 @@ private fun OrbitStageTopBar(
                         onDismissRequest = { moreMenuExpanded = false },
                         containerColor = colors.elevated,
                     ) {
+                        listOf(R.string.nav_overview to onOverview, R.string.nav_global_search to onSearch,
+                            R.string.nav_files to onFiles, R.string.git_changes to onGitWrite).forEach { (label, action) ->
+                            DropdownMenuItem(text = { Text(stringResource(label)) }, onClick = {
+                                moreMenuExpanded = false
+                                action()
+                            })
+                        }
                         DropdownMenuItem(
                             text = {
                                 Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {

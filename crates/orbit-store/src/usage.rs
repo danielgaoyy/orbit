@@ -200,6 +200,14 @@ impl OrbitStore {
     }
 
     /// Return the most recent `usage_ledger` entry for `agent_id`, if any.
+    pub fn session_usage(
+        &self,
+        agent_id: &str,
+    ) -> Result<orbit_protocol::SessionUsage, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        Ok(conn.query_row("SELECT COUNT(*),COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(cache_read_tokens),0),COALESCE(SUM(cache_write_tokens),0),TOTAL(estimated_cost_usd),TOTAL(cache_savings_usd) FROM usage_ledger WHERE agent_id=?1",[agent_id],|r| Ok(orbit_protocol::SessionUsage{agent_id:agent_id.into(),turns:r.get(0)?,input_tokens:r.get(1)?,output_tokens:r.get(2)?,cache_read_tokens:r.get(3)?,cache_write_tokens:r.get(4)?,estimated_cost_usd:r.get(5)?,cache_savings_usd:r.get(6)?}))?)
+    }
+
     pub fn latest_usage_entry_for_agent(
         &self,
         agent_id: &str,

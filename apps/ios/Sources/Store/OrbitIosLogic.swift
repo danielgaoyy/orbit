@@ -1202,3 +1202,459 @@ public enum OrbitStorageProtection {
         return storageDir.appendingPathComponent(fileName, isDirectory: false)
     }
 }
+
+// MARK: - Plan Approval Extraction & Safety Logic (Desktop Parity)
+
+public struct OrbitParsedPlanApproval: Equatable, Sendable {
+    public let requestId: String
+    public let title: String
+    public let planMarkdown: String
+    public let planFilePath: String?
+    public let allowedPrompts: [String]
+
+    public init(
+        requestId: String,
+        title: String,
+        planMarkdown: String,
+        planFilePath: String?,
+        allowedPrompts: [String]
+    ) {
+        self.requestId = requestId
+        self.title = title
+        self.planMarkdown = planMarkdown
+        self.planFilePath = planFilePath
+        self.allowedPrompts = allowedPrompts
+    }
+}
+
+public enum OrbitPlanApprovalLogic {
+    private static let planApprovalToolLeaves: Set<String> = [
+        "exitplanmode",
+        "approveplan",
+        "planapproval",
+        "submitplan",
+        "proposeplan",
+        "reviewplan",
+        "requestplanapproval"
+    ]
+
+    public static func normalizeToolLeaf(_ rawToolName: String) -> String {
+        let leaf = rawToolName
+            .split(whereSeparator: { $0 == ":" || $0 == "." || $0 == "/" })
+            .last
+            .map(String.init) ?? rawToolName
+        return leaf
+            .lowercased()
+            .filter { $0.isLetter || $0.isNumber }
+    }
+
+    /// Mirrors Rust `orbit_protocol::is_plan_approval_tool_name`.
+    public static func isPlanApprovalToolName(_ toolName: String?) -> Bool {
+        guard let toolName, !toolName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        return planApprovalToolLeaves.contains(normalizeToolLeaf(toolName))
+    }
+
+    public static func isPlanApprovalPermission(
+        title: String,
+        commandOrPath: String,
+        toolName: String?,
+        argumentsJson: String?
+    ) -> Bool {
+        if isPlanApprovalToolName(toolName) {
+            return true
+        }
+        let combinedTitle = "\(title) \(commandOrPath)".lowercased()
+        if combinedTitle.contains("exitplanmode")
+            || combinedTitle.contains("plan approval")
+            || combinedTitle.contains("approve plan")
+            || combinedTitle.contains("review plan") {
+            return true
+        }
+        if let json = argumentsJson, extractPlanMarkdown(fromArgumentsJson: json) != nil {
+            if combinedTitle.contains("plan") {
+                return true
+            }
+        }
+        return false
+    }
+
+    public static func extractPlanMarkdown(fromArgumentsJson rawJson: String?) -> String? {
+        guard let rawJson,
+              let data = rawJson.data(using: .utf8),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let keys = ["plan", "plan_markdown", "planMarkdown", "markdown", "proposal", "content"]
+        for key in keys {
+            if let str = dict[key] as? String {
+                let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    return extractCodexProposedPlan(from: trimmed) ?? trimmed
+                }
+            }
+        }
+        return nil
+    }
+
+    public static func extractCodexProposedPlan(from text: String) -> String? {
+        let lower = text.lowercased()
+        guard let openRange = lower.range(of: "<proposed_plan"),
+              let closeTagStart = lower.range(of: "</proposed_plan>", range: openRange.upperBound..<lower.endIndex),
+              let openEnd = text[openRange.lowerBound..<text.endIndex].firstIndex(of: ">") else {
+            return nil
+        }
+        let bodyStart = text.index(after: openEnd)
+        guard bodyStart <= closeTagStart.lowerBound else { return nil }
+        let body = String(text[bodyStart..<closeTagStart.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return body.isEmpty ? nil : body
+    }
+
+    public static func extractPlanTitle(fromMarkdown markdown: String) -> String? {
+        for line in markdown.split(separator: "\n", omittingEmptySubsequences: false).prefix(24) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { continue }
+            if trimmed.hasPrefix("#") {
+                let heading = trimmed
+                    .drop(while: { $0 == "#" })
+                    .trimmingCharacters(in: .whitespaces)
+                    .replacingOccurrences(of: #"\s*#+\s*$"#, with: "", options: .regularExpression)
+                    .trimmingCharacters(in: .whitespaces)
+                if !heading.isEmpty {
+                    return heading.count > 96 ? String(heading.prefix(95)) + "…" : heading
+                }
+            }
+        }
+        return nil
+    }
+
+    public static func parsePlanApproval(
+        requestId: String,
+        title: String,
+        commandOrPath: String,
+        toolName: String?,
+        argumentsJson: String?
+    ) -> OrbitParsedPlanApproval? {
+        guard isPlanApprovalPermission(
+            title: title,
+            commandOrPath: commandOrPath,
+            toolName: toolName,
+            argumentsJson: argumentsJson
+        ) else {
+            return nil
+        }
+        var planFilePath: String? = nil
+        var allowedPrompts: [String] = []
+        if let rawJson = argumentsJson,
+           let data = rawJson.data(using: .utf8),
+           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            for key in ["plan_file_path", "planFilePath", "file_path", "path"] {
+                if let path = dict[key] as? String, !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    planFilePath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+                    break
+                }
+            }
+            if let arr = (dict["allowedPrompts"] ?? dict["allowed_prompts"]) as? [Any] {
+                for entry in arr {
+                    if let s = entry as? String {
+                        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !t.isEmpty { allowedPrompts.append(t) }
+                    } else if let obj = entry as? [String: Any] {
+                        let tool = (obj["tool"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                        let prompt = (obj["prompt"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                        if !tool.isEmpty && !prompt.isEmpty {
+                            allowedPrompts.append("\(tool): \(prompt)")
+                        } else if !prompt.isEmpty {
+                            allowedPrompts.append(prompt)
+                        } else if !tool.isEmpty {
+                            allowedPrompts.append(tool)
+                        }
+                    }
+                }
+            }
+        }
+
+        let extractedMarkdown = extractPlanMarkdown(fromArgumentsJson: argumentsJson)
+            ?? extractCodexProposedPlan(from: commandOrPath)
+            ?? (commandOrPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? title : commandOrPath)
+        let resolvedTitle = extractPlanTitle(fromMarkdown: extractedMarkdown)
+            ?? (title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Implementation Plan" : title)
+        return OrbitParsedPlanApproval(
+            requestId: requestId,
+            title: resolvedTitle,
+            planMarkdown: extractedMarkdown,
+            planFilePath: planFilePath,
+            allowedPrompts: allowedPrompts
+        )
+    }
+}
+
+// MARK: - Batch Approval Safety Filter (Desktop `selectSafeBatchPermissions` Parity)
+
+public enum OrbitPermissionRiskLevel: String, Equatable, Sendable {
+    case low
+    case medium
+    case high
+    case critical
+}
+
+public struct OrbitBatchApprovalCandidate: Equatable, Sendable {
+    public let hostId: String
+    public let agentId: String
+    public let requestId: String
+    public let title: String
+    public let commandOrPath: String
+    public let toolName: String?
+    public let argumentsJson: String?
+    public let allowedDecisions: [String]
+    public let isQuestion: Bool
+
+    public init(
+        hostId: String,
+        agentId: String,
+        requestId: String,
+        title: String,
+        commandOrPath: String,
+        toolName: String? = nil,
+        argumentsJson: String? = nil,
+        allowedDecisions: [String],
+        isQuestion: Bool = false
+    ) {
+        self.hostId = hostId
+        self.agentId = agentId
+        self.requestId = requestId
+        self.title = title
+        self.commandOrPath = commandOrPath
+        self.toolName = toolName
+        self.argumentsJson = argumentsJson
+        self.allowedDecisions = allowedDecisions
+        self.isQuestion = isQuestion
+    }
+}
+
+public enum OrbitBatchApprovalLogic {
+    private static let highRiskSubstrings: [String] = [
+        "rm -rf", "rm -fr", "sudo ", "su ", "mkfs", "dd if=", "chmod 777", "chmod -r 777",
+        "git push --force", "git push -f", "git reset --hard", "git clean -fd",
+        "drop table", "drop database", "truncate table", "delete from",
+        "curl | sh", "curl | bash", "wget | sh", "kubectl delete", "terraform destroy",
+        "docker system prune", "shutdown", "reboot", "launchctl unload", "> /dev/"
+    ]
+
+    public static func permitsSingleAllowDecision(_ allowedDecisions: [String]) -> Bool {
+        guard !allowedDecisions.isEmpty else { return false }
+        return allowedDecisions.contains { raw in
+            let norm = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return norm == "allow" || norm == "allow_once" || norm == "accept"
+        }
+    }
+
+    public static func assessRisk(title: String, commandOrPath: String, toolName: String?) -> OrbitPermissionRiskLevel {
+        if OrbitPlanApprovalLogic.isPlanApprovalPermission(
+            title: title,
+            commandOrPath: commandOrPath,
+            toolName: toolName,
+            argumentsJson: nil
+        ) {
+            return .high
+        }
+        let combined = "\(title) \(commandOrPath) \(toolName ?? "")".lowercased()
+        for danger in highRiskSubstrings {
+            if combined.contains(danger) {
+                return .critical
+            }
+        }
+        if combined.contains("git push")
+            || combined.contains("npm publish")
+            || combined.contains("cargo publish")
+            || combined.contains("ssh ")
+            || combined.contains("scp ")
+            || combined.contains("rm ") {
+            return .high
+        }
+        if combined.contains("write") || combined.contains("edit") || combined.contains("bash") || combined.contains("shell") {
+            return .medium
+        }
+        return .low
+    }
+
+    /// Returns strictly non-plan, non-question, non-High/Critical permissions that explicitly allow single-shot approval.
+    public static func selectSafeBatchPermissions(_ queue: [OrbitBatchApprovalCandidate]) -> [OrbitBatchApprovalCandidate] {
+        queue.filter { item in
+            guard !item.isQuestion else { return false }
+            guard !OrbitPlanApprovalLogic.isPlanApprovalPermission(
+                title: item.title,
+                commandOrPath: item.commandOrPath,
+                toolName: item.toolName,
+                argumentsJson: item.argumentsJson
+            ) else {
+                return false
+            }
+            let risk = assessRisk(title: item.title, commandOrPath: item.commandOrPath, toolName: item.toolName)
+            guard risk == .low || risk == .medium else { return false }
+            return permitsSingleAllowDecision(item.allowedDecisions)
+        }
+    }
+}
+
+// MARK: - Raw VT100 / PTY Key Encoder Logic
+
+public enum OrbitPtySpecialKey: Equatable, Sendable {
+    case escape
+    case tab
+    case backTab
+    case enter
+    case backspace
+    case deleteForward
+    case arrowUp
+    case arrowDown
+    case arrowLeft
+    case arrowRight
+    case home
+    case end
+    case pageUp
+    case pageDown
+}
+
+public enum OrbitPtyInputLogic {
+    /// Encodes a special terminal key into standard VT100 / xterm UTF-8 byte sequence.
+    public static func encodeSpecialKey(_ key: OrbitPtySpecialKey) -> Data {
+        switch key {
+        case .escape:        return Data([0x1B])
+        case .tab:           return Data([0x09])
+        case .backTab:       return Data("\u{001B}[Z".utf8)
+        case .enter:         return Data([0x0D])
+        case .backspace:     return Data([0x7F])
+        case .deleteForward: return Data("\u{001B}[3~".utf8)
+        case .arrowUp:       return Data("\u{001B}[A".utf8)
+        case .arrowDown:     return Data("\u{001B}[B".utf8)
+        case .arrowRight:    return Data("\u{001B}[C".utf8)
+        case .arrowLeft:     return Data("\u{001B}[D".utf8)
+        case .home:          return Data("\u{001B}[H".utf8)
+        case .end:           return Data("\u{001B}[F".utf8)
+        case .pageUp:        return Data("\u{001B}[5~".utf8)
+        case .pageDown:      return Data("\u{001B}[6~".utf8)
+        }
+    }
+
+    /// Encodes printable text or a modified keystroke (Ctrl / Alt) directly into raw PTY bytes.
+    public static func encodeText(_ text: String, ctrl: Bool = false, alt: Bool = false) -> Data {
+        guard !text.isEmpty else { return Data() }
+        if ctrl, let first = text.first {
+            if let ctrlByte = controlByte(for: first) {
+                var out = Data()
+                if alt { out.append(0x1B) }
+                out.append(ctrlByte)
+                return out
+            }
+        }
+        // Normalize soft-keyboard newline to carriage return for raw PTY lines.
+        let normalized = text == "\n" ? "\r" : text
+        if alt {
+            var out = Data([0x1B])
+            out.append(contentsOf: normalized.utf8)
+            return out
+        }
+        return Data(normalized.utf8)
+    }
+
+    /// Converts ASCII characters (`a`-`z`, `A`-`Z`, `@`, `[`, `\`, `]`, `^`, `_`, `?`) into their Ctrl byte.
+    public static func controlByte(for character: Character) -> UInt8? {
+        guard let ascii = character.asciiValue else { return nil }
+        switch ascii {
+        case 0x40...0x5F: // '@' .. '_'
+            return ascii & 0x1F
+        case 0x61...0x7A: // 'a' .. 'z'
+            return (ascii - 0x20) & 0x1F
+        case 0x3F: // '?'
+            return 0x7F
+        case 0x20: // Ctrl+Space -> NUL
+            return 0x00
+        default:
+            return nil
+        }
+    }
+}
+
+// MARK: - APNs Notification & Deep Link Routing Logic
+
+public enum OrbitDeepLinkAction: Equatable, Sendable {
+    case openSession(hostId: String, agentId: String?)
+    case pairHost(uri: String)
+    case syncLogin(uri: String)
+}
+
+public enum OrbitPushDeepLinkLogic {
+    /// Parses `orbit://open?host=<id>&agent=<id>`, `orbit://pair/...`, or `orbit://sync-login?...`.
+    public static func parseDeepLink(_ rawUrl: String) -> OrbitDeepLinkAction? {
+        let trimmed = rawUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+        if lower.hasPrefix("orbit://pair/") {
+            return .pairHost(uri: trimmed)
+        }
+        if lower.hasPrefix("orbit://sync-login") {
+            return .syncLogin(uri: trimmed)
+        }
+        guard let comps = URLComponents(string: trimmed),
+              comps.scheme?.lowercased() == "orbit",
+              comps.host?.lowercased() == "open" else {
+            return nil
+        }
+        let items = comps.queryItems ?? []
+        let hostId = items.first(where: { $0.name == "host" || $0.name == "host_id" })?.value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let agentId = items.first(where: { $0.name == "agent" || $0.name == "agent_id" })?.value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let hostId, !hostId.isEmpty else { return nil }
+        return .openSession(hostId: hostId, agentId: (agentId?.isEmpty == false) ? agentId : nil)
+    }
+
+    /// Parses an APNs `userInfo` dictionary (`deep_link`, `host_id`, `agent_id`, `event_kind`).
+    public static func parseNotificationUserInfo(_ userInfo: [AnyHashable: Any]) -> OrbitDeepLinkAction? {
+        if let deepLink = userInfo["deep_link"] as? String,
+           let parsed = parseDeepLink(deepLink) {
+            return parsed
+        }
+        if let hostId = (userInfo["host_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !hostId.isEmpty {
+            let agentId = (userInfo["agent_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return .openSession(hostId: hostId, agentId: (agentId?.isEmpty == false) ? agentId : nil)
+        }
+        return nil
+    }
+}
+
+// MARK: - Codex-Style Voice Dictation Intent Logic
+
+public enum OrbitVoiceTranscriptAction: Equatable, Sendable {
+    case appendText(String)
+    case clearDraft
+    case focusOverview
+}
+
+public enum OrbitVoiceCommandLogic {
+    /// Merges newly dictated text into an existing draft without duplicating leading whitespace or trailing periods.
+    public static func mergeDictatedText(existingDraft: String, spokenSegment: String) -> String {
+        let spoken = spokenSegment.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !spoken.isEmpty else { return existingDraft }
+        let base = existingDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if base.isEmpty {
+            return spoken
+        }
+        let separator = existingDraft.hasSuffix("\n") || existingDraft.hasSuffix(" ") ? "" : " "
+        return existingDraft + separator + spoken
+    }
+
+    /// Classifies safe non-destructive voice transcript intents.
+    /// Never auto-approves high-risk actions or auto-sends without explicit user action.
+    public static func classifyTranscript(_ raw: String) -> OrbitVoiceTranscriptAction {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+        if lower == "clear draft" || lower == "清空草稿" || lower == "下書きをクリア" {
+            return .clearDraft
+        }
+        return .appendText(trimmed)
+    }
+}
+

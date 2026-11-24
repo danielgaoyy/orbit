@@ -19,6 +19,7 @@ struct OmniComposerView: View {
     @State private var isPermissionPickerPresented: Bool = false
     @State private var cachedSlashCommands: [FfiSlashCommand] = []
     @State private var cachedMentionCandidates: [FfiMentionCandidate] = []
+    @StateObject private var voiceController = OrbitVoiceDictationController()
 
     private var hasHomeIndicatorInset: Bool {
         guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
@@ -205,6 +206,11 @@ struct OmniComposerView: View {
         .onAppear {
             cursorOffset = store.composerText.count
             refreshAutocompleteCache()
+        }
+        .onDisappear {
+            if voiceController.isRecording {
+                voiceController.stopRecording(discard: false)
+            }
         }
         .onChange(of: store.composerText) { newText in
             if !isComposerFocused || cursorOffset > newText.count {
@@ -485,6 +491,14 @@ struct OmniComposerView: View {
 
     private var composerCard: some View {
         VStack(alignment: .leading, spacing: 0) {
+            if voiceController.isRecording {
+                OrbitVoiceRecordingStrip(controller: voiceController) {
+                    store.hapticLight()
+                    voiceController.stopRecording(discard: true)
+                }
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+
             if hasTrayItems {
                 attachmentsTray
             }
@@ -697,8 +711,27 @@ struct OmniComposerView: View {
                     .accessibilityLabel("Stop Generation")
                 }
 
-                // Primary Right Circle Action: Stop ■ / Queue ⤒ / Send ↑ (only control with background)
-                if showPrimaryStopButton {
+                // Primary Right Circle Action (Codex-Style Single Stationary Circle):
+                // Recording -> Stop Mic | Running empty -> Stop ■ | Running+draft -> Queue ⤒ | Empty+idle -> Voice Mic | Text/Attachments -> Send ↑
+                if voiceController.isRecording {
+                    Button {
+                        store.hapticMedium()
+                        voiceController.stopRecording(discard: false)
+                    } label: {
+                        ZStack {
+                            Circle()
+                                .fill(palette.danger)
+                                .frame(width: 32, height: 32)
+                            RoundedRectangle(cornerRadius: 2.5, style: .continuous)
+                                .fill(Color.white)
+                                .frame(width: 10, height: 10)
+                        }
+                        .frame(width: 36, height: Self.controlBarHeight)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(OrbitL10n.tr("Stop Recording"))
+                } else if showPrimaryStopButton {
                     Button {
                         store.interruptActiveAgent()
                     } label: {
@@ -707,14 +740,14 @@ struct OmniComposerView: View {
                                 .fill(palette.subtleFill)
                                 .frame(width: 32, height: 32)
                             RoundedRectangle(cornerRadius: 2.5, style: .continuous)
-                                .fill(Color(hex: "#EF4444"))
+                                .fill(palette.danger)
                                 .frame(width: 11, height: 11)
                         }
                         .frame(width: 36, height: Self.controlBarHeight)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Stop Generation")
+                    .accessibilityLabel(OrbitL10n.tr("Stop Generation"))
                 } else if isRunningWithDraft {
                     Button {
                         store.enqueueComposerPrompt()
@@ -731,29 +764,55 @@ struct OmniComposerView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Queue Next Prompt")
-                } else {
+                    .accessibilityLabel(OrbitL10n.tr("Queue Next Prompt"))
+                } else if store.canSubmitComposer {
                     Button {
-                        if store.canSubmitComposer {
-                            store.submitComposer()
-                        } else if store.selectedHostId == nil {
-                            store.activeSheet = .qrPair
-                        }
+                        store.submitComposer()
                     } label: {
                         ZStack {
                             Circle()
-                                .fill(store.canSubmitComposer ? palette.primary : palette.subtleFill)
+                                .fill(palette.primary)
                                 .frame(width: 32, height: 32)
                             Image(systemName: "arrow.up")
                                 .font(.system(size: 14, weight: .semibold))
-                                .foregroundStyle(store.canSubmitComposer ? palette.onPrimary : palette.fgMuted)
+                                .foregroundStyle(palette.onPrimary)
                         }
                         .frame(width: 36, height: Self.controlBarHeight)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .disabled(!store.canSubmitComposer && store.selectedHostId != nil)
-                    .accessibilityLabel("Send Prompt")
+                    .accessibilityLabel(OrbitL10n.tr("Send Prompt"))
+                } else {
+                    Button {
+                        if store.selectedHostId == nil && !store.hasDemoStageOverlay && !store.isDemoChatMode {
+                            store.activeSheet = .qrPair
+                        } else {
+                            isComposerFocused = false
+                            store.hapticLight()
+                            voiceController.toggleRecording(
+                                currentDraft: store.composerText,
+                                onTranscriptChanged: { updated in
+                                    store.composerText = updated
+                                },
+                                onPermissionDenied: { msg in
+                                    store.showToast(msg)
+                                }
+                            )
+                        }
+                    } label: {
+                        ZStack {
+                            Circle()
+                                .fill(palette.subtleFill)
+                                .frame(width: 32, height: 32)
+                            Image(systemName: "mic.fill")
+                                .font(.system(size: 13.5, weight: .semibold))
+                                .foregroundStyle(palette.fgPrimary)
+                        }
+                        .frame(width: 36, height: Self.controlBarHeight)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(OrbitL10n.tr("Voice Input"))
                 }
             }
             .padding(.leading, 6)

@@ -65,22 +65,38 @@ public enum OrbitAppearanceMode: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-// MARK: - Quiet Precision Palette
+// MARK: - Quiet Precision Palette (Aligned 1:1 with Desktop OKLCH 258° Neutral Axis)
 
 public struct OrbitPalette: Equatable, Sendable {
     public let isDark: Bool
+    /// `--surface-base` (`#FCFCFE` light / `#17181E` dark)
     public let canvas: Color
+    /// `--surface-recessed` (`#F5F6F8` light / `#121318` dark)
     public let drawer: Color
+    /// `--surface-raised` (`#FFFFFF` light / `#20222B` dark)
     public let elevated: Color
+    /// `--surface-overlay` (`#FFFFFF` light / `#272A35` dark)
+    public let overlay: Color
+    /// Recessed code/diff/terminal surface (`#F5F6F8` light / `#121318` dark)
     public let code: Color
+    /// `--ink-primary` (`#14161D` light / `#F1F2F7` dark)
     public let fgPrimary: Color
+    /// `--ink-secondary` (`#4A5060` light / `#B2B6C7` dark)
     public let fgSecondary: Color
+    /// `--ink-tertiary` / `--ink-muted` (`#6E7487` light / `#83889C` dark)
     public let fgMuted: Color
+    /// `--ink-faint` (`#969CAE` light / `#5F6477` dark)
+    public let fgFaint: Color
+    /// `--border-subtle`
     public let hairline: Color
+    /// `--border-default`
+    public let borderDefault: Color
+    /// `--border-strong`
+    public let borderStrong: Color
     public let subtleFill: Color
     public let activeRowFill: Color
 
-    // Semantic Accents (aligned with Desktop monochrome primary + restrained semantic palette)
+    // Semantic Accents (Desktop Monochrome Primary + WCAG AA Semantic Signals)
     public let primary: Color
     public let onPrimary: Color
     public let direct: Color
@@ -92,75 +108,92 @@ public struct OrbitPalette: Equatable, Sendable {
     public let accentSky: Color
     public let accentViolet: Color
 
+    /// Alias matching Desktop `--surface-recessed`
+    public var recessed: Color { drawer }
+
+    /// Light — Alabaster Paper (OKLCH hue ~258°)
     public static let light = OrbitPalette(
         isDark: false,
-        canvas: Color(hex: "#FFFFFF"),
-        drawer: Color(hex: "#F4F4F6"),
+        canvas: Color(hex: "#FCFCFE"),
+        drawer: Color(hex: "#F5F6F8"),
         elevated: Color(hex: "#FFFFFF"),
-        code: Color(hex: "#F4F4F6"),
-        fgPrimary: Color(hex: "#121314"),
-        fgSecondary: Color(hex: "#5A5C60"),
-        fgMuted: Color(hex: "#8B8E94"),
-        hairline: Color.black.opacity(0.072),
-        subtleFill: Color.black.opacity(0.055),
-        activeRowFill: Color(hex: "#ECEDEF"),
-        primary: Color(hex: "#141416"),
-        onPrimary: Color(hex: "#FFFFFF"),
-        direct: Color(hex: "#059669"),
-        added: Color(hex: "#059669"),
-        relay: Color(hex: "#7C3AED"),
-        warning: Color(hex: "#D97706"),
-        danger: Color(hex: "#EF4444"),
-        removed: Color(hex: "#E11D48"),
-        accentSky: Color(hex: "#0EA5E9"),
-        accentViolet: Color(hex: "#7C3AED")
+        overlay: Color(hex: "#FFFFFF"),
+        code: Color(hex: "#F5F6F8"),
+        fgPrimary: Color(hex: "#14161D"),
+        fgSecondary: Color(hex: "#4A5060"),
+        fgMuted: Color(hex: "#6E7487"),
+        fgFaint: Color(hex: "#969CAE"),
+        hairline: Color(hex: "#14161D").opacity(0.08),
+        borderDefault: Color(hex: "#14161D").opacity(0.12),
+        borderStrong: Color(hex: "#14161D").opacity(0.22),
+        subtleFill: Color(hex: "#14161D").opacity(0.05),
+        activeRowFill: Color(hex: "#ECEEF3"),
+        primary: Color(hex: "#14161D"),
+        onPrimary: Color(hex: "#FCFCFE"),
+        direct: Color(hex: "#0F7B55"),
+        added: Color(hex: "#0F7B55"),
+        relay: Color(hex: "#6D28D9"),
+        warning: Color(hex: "#B45309"),
+        danger: Color(hex: "#C8283B"),
+        removed: Color(hex: "#C8283B"),
+        accentSky: Color(hex: "#2563EB"),
+        accentViolet: Color(hex: "#6D28D9")
     )
 
+    /// Dark — Obsidian Graphite (OKLCH hue ~258°)
     public static let graphiteDark = OrbitPalette(
         isDark: true,
-        canvas: Color(hex: "#191A1C"),
-        drawer: Color(hex: "#111214"),
-        elevated: Color(hex: "#212326"),
-        code: Color(hex: "#131416"),
-        fgPrimary: Color(hex: "#ECEDEF"),
-        fgSecondary: Color(hex: "#989A9D"),
-        fgMuted: Color(hex: "#686B70"),
-        hairline: Color.white.opacity(0.075),
-        subtleFill: Color.white.opacity(0.08),
-        activeRowFill: Color(hex: "#2A2C2F"),
-        primary: Color(hex: "#F4F4F6"),
-        onPrimary: Color(hex: "#141416"),
-        direct: Color(hex: "#34D399"),
-        added: Color(hex: "#34D399"),
+        canvas: Color(hex: "#17181E"),
+        drawer: Color(hex: "#121318"),
+        elevated: Color(hex: "#20222B"),
+        overlay: Color(hex: "#272A35"),
+        code: Color(hex: "#121318"),
+        fgPrimary: Color(hex: "#F1F2F7"),
+        fgSecondary: Color(hex: "#B2B6C7"),
+        fgMuted: Color(hex: "#83889C"),
+        fgFaint: Color(hex: "#5F6477"),
+        hairline: Color.white.opacity(0.08),
+        borderDefault: Color.white.opacity(0.12),
+        borderStrong: Color.white.opacity(0.22),
+        subtleFill: Color.white.opacity(0.07),
+        activeRowFill: Color(hex: "#272A35"),
+        primary: Color(hex: "#F1F2F7"),
+        onPrimary: Color(hex: "#14161D"),
+        direct: Color(hex: "#3ED598"),
+        added: Color(hex: "#3ED598"),
         relay: Color(hex: "#A78BFA"),
-        warning: Color(hex: "#FBBF24"),
+        warning: Color(hex: "#F5B749"),
         danger: Color(hex: "#F87171"),
-        removed: Color(hex: "#FB7185"),
-        accentSky: Color(hex: "#38BDF8"),
+        removed: Color(hex: "#F87171"),
+        accentSky: Color(hex: "#6FA8FF"),
         accentViolet: Color(hex: "#A78BFA")
     )
 
     public static let oledPure = OrbitPalette(
         isDark: true,
         canvas: Color(hex: "#000000"),
-        drawer: Color(hex: "#08090B"),
-        elevated: Color(hex: "#121317"),
-        code: Color(hex: "#0A0B0E"),
-        fgPrimary: Color(hex: "#F4F4F6"),
-        fgSecondary: Color(hex: "#989A9D"),
-        fgMuted: Color(hex: "#63666B"),
-        hairline: Color.white.opacity(0.11),
-        subtleFill: Color.white.opacity(0.085),
+        drawer: Color(hex: "#0A0B0F"),
+        elevated: Color(hex: "#14161C"),
+        overlay: Color(hex: "#1C1F28"),
+        code: Color(hex: "#0A0B0F"),
+        fgPrimary: Color(hex: "#F1F2F7"),
+        fgSecondary: Color(hex: "#B2B6C7"),
+        fgMuted: Color(hex: "#83889C"),
+        fgFaint: Color(hex: "#5F6477"),
+        hairline: Color.white.opacity(0.10),
+        borderDefault: Color.white.opacity(0.14),
+        borderStrong: Color.white.opacity(0.24),
+        subtleFill: Color.white.opacity(0.08),
         activeRowFill: Color.white.opacity(0.10),
-        primary: Color(hex: "#F4F4F6"),
+        primary: Color(hex: "#F1F2F7"),
         onPrimary: Color(hex: "#000000"),
-        direct: Color(hex: "#34D399"),
-        added: Color(hex: "#34D399"),
+        direct: Color(hex: "#3ED598"),
+        added: Color(hex: "#3ED598"),
         relay: Color(hex: "#A78BFA"),
-        warning: Color(hex: "#FBBF24"),
+        warning: Color(hex: "#F5B749"),
         danger: Color(hex: "#F87171"),
-        removed: Color(hex: "#FB7185"),
-        accentSky: Color(hex: "#38BDF8"),
+        removed: Color(hex: "#F87171"),
+        accentSky: Color(hex: "#6FA8FF"),
         accentViolet: Color(hex: "#A78BFA")
     )
 
@@ -406,6 +439,31 @@ public struct OrbitGlassContainer<Content: View>: View {
 
 // MARK: - Shared Components & Formatters
 
+// MARK: - Canonical Motion Tokens & Localization Helper
+
+public enum OrbitMotion {
+    /// 110ms — tactile press, micro highlights
+    public static let fast: Animation = .easeOut(duration: 0.11)
+    /// 150ms — controls, toggles, cross-dissolve
+    public static let ui: Animation = .easeOut(duration: 0.15)
+    /// 190ms — popovers, docks, overlays
+    public static let overlay: Animation = .easeOut(duration: 0.19)
+    /// 240ms — structural panes & sheets
+    public static let panel: Animation = .spring(response: 0.26, dampingFraction: 0.90)
+}
+
+public enum OrbitL10n {
+    /// Looks up a localized string from `Localizable.xcstrings` (`en`, `zh-Hans`, `ja`) with English fallback.
+    public static func tr(_ key: String) -> String {
+        NSLocalizedString(key, tableName: nil, bundle: .main, value: key, comment: "")
+    }
+
+    public static func fmt(_ key: String, _ args: CVarArg...) -> String {
+        let format = tr(key)
+        return String(format: format, locale: Locale.current, arguments: args)
+    }
+}
+
 public struct OrbitHairline: View {
     @Environment(\.orbitPalette) private var palette
     public var axis: Axis = .horizontal
@@ -430,6 +488,7 @@ public struct OrbitHairline: View {
 public struct PulsingDotView: View {
     public let color: Color
     public var size: CGFloat = 6
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isPulsing = false
 
     public init(color: Color, size: CGFloat = 6) {
@@ -441,13 +500,15 @@ public struct PulsingDotView: View {
         Circle()
             .fill(color)
             .frame(width: size, height: size)
-            .opacity(isPulsing ? 0.38 : 1.0)
+            .opacity(reduceMotion ? 1.0 : (isPulsing ? 0.38 : 1.0))
             .animation(
-                .easeInOut(duration: 0.9).repeatForever(autoreverses: true),
+                reduceMotion ? nil : .easeInOut(duration: 1.0).repeatForever(autoreverses: true),
                 value: isPulsing
             )
             .onAppear {
-                isPulsing = true
+                if !reduceMotion {
+                    isPulsing = true
+                }
             }
     }
 }
@@ -455,6 +516,7 @@ public struct PulsingDotView: View {
 public struct OrbitSpinnerRingView: View {
     public let color: Color
     public var size: CGFloat = 12.5
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isSpinning = false
 
     public init(color: Color, size: CGFloat = 12.5) {
@@ -464,12 +526,15 @@ public struct OrbitSpinnerRingView: View {
 
     public var body: some View {
         Circle()
-            .trim(from: 0, to: 0.72)
+            .trim(from: 0, to: reduceMotion ? 1.0 : 0.72)
             .stroke(color, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
             .frame(width: size, height: size)
-            .rotationEffect(.degrees(isSpinning ? 360 : 0))
+            .opacity(reduceMotion ? (isSpinning ? 0.45 : 1.0) : 1.0)
+            .rotationEffect(.degrees(reduceMotion ? 0 : (isSpinning ? 360 : 0)))
             .animation(
-                .linear(duration: 0.9).repeatForever(autoreverses: false),
+                reduceMotion
+                    ? .easeInOut(duration: 2.4).repeatForever(autoreverses: true)
+                    : .linear(duration: 0.9).repeatForever(autoreverses: false),
                 value: isSpinning
             )
             .onAppear {

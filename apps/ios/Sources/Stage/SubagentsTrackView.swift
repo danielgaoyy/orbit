@@ -558,3 +558,129 @@ struct SubagentsListSheet: View {
         }
     }
 }
+
+// MARK: - Subagent Lineage Strip (Parent <-> Child / Sibling Navigation)
+
+struct SubagentLineageStripView: View {
+    @ObservedObject var store: OrbitIosStore
+    @Environment(\.orbitPalette) private var palette
+
+    private var activeAgent: FfiAgentCard? {
+        store.activeAgent
+    }
+
+    private var parentAgent: FfiAgentCard? {
+        guard let parentId = activeAgent?.parentAgentId, !parentId.isEmpty else { return nil }
+        let parentHostId = activeAgent?.parentHostId ?? store.selectedHostId
+        return store.detail(forHostId: parentHostId)?.agents.first(where: { $0.agentId == parentId })
+    }
+
+    private var childSubagents: [FfiAgentCard] {
+        store.visibleManagedSubagents
+    }
+
+    private var shouldShowStrip: Bool {
+        guard !store.isShowingGlobalOverview else { return false }
+        return activeAgent?.parentAgentId != nil || !childSubagents.isEmpty
+    }
+
+    var body: some View {
+        if shouldShowStrip {
+            VStack(spacing: 0) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        if let parentId = activeAgent?.parentAgentId, !parentId.isEmpty {
+                            let targetHostId = activeAgent?.parentHostId ?? store.selectedHostId ?? ""
+                            Button {
+                                store.hapticLight()
+                                store.selectAgent(hostId: targetHostId, agentId: parentId)
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.turn.left.up")
+                                        .font(.system(size: 10.5, weight: .semibold))
+                                    Text(parentAgent?.title.isEmpty == false ? parentAgent!.title : OrbitL10n.tr("Parent"))
+                                        .font(OrbitTypography.meta(.semibold))
+                                        .lineLimit(1)
+                                }
+                                .foregroundStyle(palette.fgPrimary)
+                                .padding(.horizontal, 9)
+                                .frame(height: 26)
+                                .background(palette.subtleFill, in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(palette.fgFaint)
+
+                            if let current = activeAgent {
+                                Text(current.title.isEmpty ? OrbitL10n.tr("Subagents") : current.title)
+                                    .font(OrbitTypography.meta(.medium))
+                                    .foregroundStyle(palette.fgSecondary)
+                                    .lineLimit(1)
+                            }
+                        } else if !childSubagents.isEmpty {
+                            HStack(spacing: 4) {
+                                Image(systemName: "point.topleft.down.to.point.bottomright.curvepath")
+                                    .font(.system(size: 10.5, weight: .medium))
+                                    .foregroundStyle(palette.fgMuted)
+                                Text(OrbitL10n.tr("Lineage"))
+                                    .font(OrbitTypography.meta(.semibold))
+                                    .foregroundStyle(palette.fgMuted)
+                            }
+
+                            ForEach(childSubagents.prefix(6), id: \.agentId) { child in
+                                Button {
+                                    store.hapticLight()
+                                    if let hid = store.selectedHostId, let pid = store.selectedAgentId {
+                                        store.subagentInspectorTarget = OrbitSubagentInspectorTarget(
+                                            hostId: hid,
+                                            parentAgentId: pid,
+                                            childAgentId: child.agentId,
+                                            title: child.title.isEmpty ? OrbitL10n.tr("Subagents") : child.title
+                                        )
+                                    }
+                                } label: {
+                                    HStack(spacing: 5) {
+                                        if child.isAwaitingPermission {
+                                            Circle().fill(palette.warning).frame(width: 6, height: 6)
+                                        } else if child.isForegroundRunning {
+                                            OrbitSpinnerRingView(color: palette.direct, size: 10)
+                                        } else {
+                                            Circle().fill(palette.fgFaint).frame(width: 5, height: 5)
+                                        }
+                                        Text(OrbitFormatters.semanticAgentTabLabel(
+                                            handle: child.handle,
+                                            title: child.title,
+                                            taskSummary: child.taskSummary,
+                                            agentId: child.agentId
+                                        ))
+                                        .font(OrbitTypography.meta(.medium))
+                                        .foregroundStyle(palette.fgPrimary)
+                                        .lineLimit(1)
+                                    }
+                                    .padding(.horizontal, 9)
+                                    .frame(height: 26)
+                                    .background(palette.elevated, in: Capsule())
+                                    .overlay(
+                                        Capsule().strokeBorder(
+                                            child.isAwaitingPermission ? palette.warning.opacity(0.45) : palette.hairline,
+                                            lineWidth: 0.5
+                                        )
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, OrbitSpacing.lg)
+                    .padding(.vertical, 6)
+                }
+                .background(palette.recessed.opacity(0.6))
+
+                OrbitHairline()
+            }
+        }
+    }
+}
+

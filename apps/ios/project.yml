@@ -21,9 +21,12 @@ targets:
     sources:
       - path: Sources
       - path: Generated/orbit_ffi_uniffi.swift
+      - path: LiveActivity/OrbitAgentActivityAttributes.swift
     dependencies:
       - framework: Frameworks/OrbitCoreFFI.xcframework
         embed: false
+      - target: OrbitLiveActivityExtension
+        embed: true
     info:
       path: Sources/Info.plist
       properties:
@@ -46,6 +49,11 @@ targets:
           NSAllowsLocalNetworking: true
         NSCameraUsageDescription: "Scan `orbit pair` QR codes and take photos to attach to your coding agents."
         NSLocalNetworkUsageDescription: "Orbit connects to paired daemons on your local network."
+        NSMicrophoneUsageDescription: "Record voice prompts directly in the Orbit composer."
+        NSSpeechRecognitionUsageDescription: "Transcribe spoken prompts into the Orbit composer."
+        NSSupportsLiveActivities: true
+        UIBackgroundModes:
+          - remote-notification
         CFBundleURLTypes:
           - CFBundleTypeRole: Editor
             CFBundleURLName: dev.orbit.app
@@ -61,12 +69,37 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         OTHER_LDFLAGS: "$(inherited) -lc++"
 
+  OrbitLiveActivityExtension:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "16.4"
+    sources:
+      - path: LiveActivity
+    info:
+      path: LiveActivity/Info.plist
+      properties:
+        CFBundleDisplayName: Orbit Live Activity
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSSupportsLiveActivities: true
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.orbit.app.live-activity
+        SKIP_INSTALL: YES
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SUPPORTS_MACCATALYST: NO
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        TARGETED_DEVICE_FAMILY: "1,2"
+
   OrbitMobileLogicTests:
     type: bundle.unit-test
     platform: iOS
     deploymentTarget: "16.4"
     sources:
       - path: Sources/Store/OrbitIosLogic.swift
+      - path: Sources/Store/OrbitKeychain.swift
       - path: Tests/OrbitIosLogicTests.swift
     settings:
       base:
@@ -79,6 +112,7 @@ schemes:
     build:
       targets:
         OrbitMobile: all
+        OrbitLiveActivityExtension: all
         OrbitMobileLogicTests: [test]
     test:
       config: Debug

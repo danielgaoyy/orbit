@@ -39,34 +39,126 @@ struct StickyDecisionDock: View {
         return min(max(0, focusedIndex), combinedQueue.count - 1)
     }
 
+    private var safeBatchCandidateDecisions: [OrbitGlobalPendingDecision] {
+        guard let hid = store.selectedHostId, let aid = store.selectedAgentId else { return [] }
+        let hostName = store.activeHost?.displayName ?? hid
+        let agentTitle = store.activeAgent?.title ?? "Agent"
+        return pendingPermissions.compactMap { item -> OrbitGlobalPendingDecision? in
+            guard case let .permissionRequest(_, rid, title, cmdOrPath, detail, allowed, _, _) = item else { return nil }
+            let (toolName, argsJson): (String?, String?) = {
+                if case let .generic(tn, args) = detail { return (tn, args) }
+                return (nil, nil)
+            }()
+            let isPlan = OrbitPlanApprovalLogic.isPlanApprovalPermission(
+                title: title,
+                commandOrPath: cmdOrPath,
+                toolName: toolName,
+                argumentsJson: argsJson
+            )
+            let risk = OrbitBatchApprovalLogic.assessRisk(title: title, commandOrPath: cmdOrPath, toolName: toolName)
+            let decision = OrbitGlobalPendingDecision(
+                id: "\(hid)::\(aid)::\(rid)",
+                hostId: hid,
+                hostName: hostName,
+                agentId: aid,
+                agentTitle: agentTitle,
+                requestId: rid,
+                title: title,
+                commandOrPath: cmdOrPath,
+                toolName: toolName,
+                argumentsJson: argsJson,
+                allowedDecisions: allowed,
+                isPlanApproval: isPlan,
+                isQuestion: false,
+                riskLevel: risk
+            )
+            return decision.isSafeForBatchAllow ? decision : nil
+        }
+    }
+
     var body: some View {
         if !combinedQueue.isEmpty {
             let currentIdx = activeIndex
             let currentItem = combinedQueue[currentIdx]
             let totalCount = combinedQueue.count
 
-            VStack(spacing: 0) {
+            VStack(spacing: OrbitSpacing.xs) {
+                if safeBatchCandidateDecisions.count >= 2 {
+                    HStack {
+                        Spacer()
+                        Button {
+                            store.approveLowRiskBatch(decisions: safeBatchCandidateDecisions)
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: "checkmark.shield")
+                                    .font(.system(size: 11, weight: .semibold))
+                                Text(OrbitL10n.fmt("Approve %d Low-Risk", safeBatchCandidateDecisions.count))
+                                    .font(OrbitTypography.meta(.semibold))
+                            }
+                            .foregroundStyle(palette.onPrimary)
+                            .padding(.horizontal, 12)
+                            .frame(height: 28)
+                            .background(palette.primary, in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
                 switch currentItem {
                 case let .permissionRequest(_, requestId, title, commandOrPath, detail, allowedDecisions, _, _):
-                    PermissionApprovalCard(
-                        store: store,
+                    let (toolName, argsJson): (String?, String?) = {
+                        if case let .generic(tn, args) = detail { return (tn, args) }
+                        return (nil, nil)
+                    }()
+                    if let parsedPlan = OrbitPlanApprovalLogic.parsePlanApproval(
                         requestId: requestId,
                         title: title,
                         commandOrPath: commandOrPath,
-                        detail: detail,
-                        allowedDecisions: allowedDecisions,
-                        queuePosition: currentIdx + 1,
-                        totalQueued: totalCount,
-                        isSubmitting: submittingRequestIds.contains(requestId),
-                        onResolve: { decision in
-                            guard !submittingRequestIds.contains(requestId) else { return }
-                            submittingRequestIds.insert(requestId)
-                            store.resolvePermission(requestId: requestId, decision: decision)
-                        },
-                        onStepQueue: { delta in
-                            stepQueue(by: delta, total: totalCount)
-                        }
-                    )
+                        toolName: toolName,
+                        argumentsJson: argsJson
+                    ) {
+                        PlanReviewCardView(
+                            store: store,
+                            plan: parsedPlan,
+                            queuePosition: currentIdx + 1,
+                            totalQueued: totalCount,
+                            isSubmitting: submittingRequestIds.contains(requestId),
+                            onStepQueue: { delta in
+                                stepQueue(by: delta, total: totalCount)
+                            },
+                            onResolvePlan: { action, editedMd, feedback, mode in
+                                guard !submittingRequestIds.contains(requestId) else { return }
+                                submittingRequestIds.insert(requestId)
+                                store.resolvePlanApproval(
+                                    requestId: requestId,
+                                    action: action,
+                                    editedPlanMarkdown: editedMd,
+                                    feedback: feedback,
+                                    targetMode: mode
+                                )
+                            }
+                        )
+                    } else {
+                        PermissionApprovalCard(
+                            store: store,
+                            requestId: requestId,
+                            title: title,
+                            commandOrPath: commandOrPath,
+                            detail: detail,
+                            allowedDecisions: allowedDecisions,
+                            queuePosition: currentIdx + 1,
+                            totalQueued: totalCount,
+                            isSubmitting: submittingRequestIds.contains(requestId),
+                            onResolve: { decision in
+                                guard !submittingRequestIds.contains(requestId) else { return }
+                                submittingRequestIds.insert(requestId)
+                                store.resolvePermission(requestId: requestId, decision: decision)
+                            },
+                            onStepQueue: { delta in
+                                stepQueue(by: delta, total: totalCount)
+                            }
+                        )
+                    }
 
                 case let .questionRequest(_, requestId, questions, _, _):
                     QuestionDecisionCard(

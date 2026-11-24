@@ -44,11 +44,21 @@
 	<string>Scan `orbit pair` QR codes and take photos to attach to your coding agents.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Orbit connects to paired daemons on your local network.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Record voice prompts directly in the Orbit composer.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Transcribe spoken prompts into the Orbit composer.</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
 		<false/>
 	</dict>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

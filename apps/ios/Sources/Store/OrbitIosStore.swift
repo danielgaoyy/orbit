@@ -19,6 +19,9 @@ public enum OrbitSheetDestination: Identifiable, Equatable {
     case archivedThreads
     case spawnPeer(workspaceId: String)
     case createWorkspace(projectRoot: String, projectName: String, isGitRepo: Bool, moveAgentId: String?)
+    case globalSearch
+    case personalRouter
+    case transcriptExport
 
     public var id: String {
         switch self {
@@ -35,6 +38,9 @@ public enum OrbitSheetDestination: Identifiable, Equatable {
         case .archivedThreads: return "archivedThreads"
         case let .spawnPeer(wsId): return "spawnPeer:\(wsId)"
         case let .createWorkspace(root, _, _, moveId): return "createWorkspace:\(root):\(moveId ?? "")"
+        case .globalSearch: return "globalSearch"
+        case .personalRouter: return "personalRouter"
+        case .transcriptExport: return "transcriptExport"
         }
     }
 
@@ -685,6 +691,39 @@ public final class OrbitIosStore: ObservableObject {
     @Published public private(set) var cloudSyncDeviceFlow: FfiGitHubDeviceFlowStart?
     private var cloudDeviceFlowTask: Task<Void, Never>?
 
+    // 5.0 Parity State — Global Overview, Keychain, Push/LiveActivity, 6-Tab Automations, Git Write, Search, Router & Mesh
+    @Published public var isShowingGlobalOverview: Bool = false
+    @Published public private(set) var masterKeySource: OrbitKeychain.MasterKeySource? = nil
+    @Published public var liveActivitiesEnabled: Bool = true
+    @Published public internal(set) var apnsDeviceTokenHex: String? = nil
+    @Published public internal(set) var liveActivityTokenHex: String? = nil
+    @Published public internal(set) var pushDevicesSnapshot: FfiPushDevicesSnapshot? = nil
+    @Published public internal(set) var pushBusy: Bool = false
+    @Published public internal(set) var goalRuns: [FfiGoalRunRecord] = []
+    @Published public internal(set) var monitorWatches: [FfiMonitorWatchRecord] = []
+    @Published public internal(set) var conditionalTimers: [FfiConditionalTimerRecord] = []
+    @Published public internal(set) var workflowRuns: [FfiWorkflowRunRecord] = []
+    @Published public internal(set) var permissionRules: [PermissionRuleRecord] = []
+    @Published public internal(set) var guardianConfigSnapshot: GuardianConfigSnapshotView? = nil
+    @Published public internal(set) var automationsLoading: Bool = false
+    @Published public internal(set) var gitPrStatus: GitPrStatus? = nil
+    @Published public internal(set) var gitStashes: [GitStashEntry] = []
+    @Published public internal(set) var gitConflicts: [GitConflictFile] = []
+    @Published public internal(set) var gitRebaseStatus: GitRebaseStatus? = nil
+    @Published public internal(set) var gitWriteBusy: Bool = false
+    @Published public var gitWriteError: String? = nil
+    @Published public var globalSearchQuery: String = ""
+    @Published public internal(set) var globalSearchHits: [ConversationSearchHit] = []
+    @Published public internal(set) var globalSearchRemoteQueried: UInt32 = 0
+    @Published public internal(set) var globalSearchRemoteFailed: UInt32 = 0
+    @Published public internal(set) var isSearchingGlobal: Bool = false
+    @Published public internal(set) var routerHostCandidates: [RouterHostCapabilities] = []
+    @Published public internal(set) var routerStatusByHost: [String: RouterStatusSnapshot] = [:]
+    @Published public internal(set) var fleetMeshSnapshot: [String: [ConnectedHostSummary]] = [:]
+    @Published public internal(set) var routerBusy: Bool = false
+    @Published public internal(set) var activeSessionUsage: SessionUsage? = nil
+    @Published public internal(set) var personalAgentDraftPrompt: String = ""
+
     // Windowed tail-first pagination & off-main-thread core read pipeline
     @Published public private(set) var stageHasOlderTurns: Bool = false
     @Published public private(set) var isLoadingOlderTurns: Bool = false
@@ -696,7 +735,7 @@ public final class OrbitIosStore: ObservableObject {
     private var pendingTimelineRefreshWorkItem: DispatchWorkItem?
     private var isTimelineRefreshCoalescing = false
 
-    private var core: OrbitMobileCore?
+    var core: OrbitMobileCore?
     private var listenerBridge: WeakMobileListenerBridge?
     private let pathMonitor = NWPathMonitor()
     private let pathMonitorQueue = DispatchQueue(label: "dev.orbit.ios.nwpath", qos: .utility)
@@ -752,7 +791,23 @@ public final class OrbitIosStore: ObservableObject {
                 throw OrbitStorageError.applicationSupportUnavailable
             }
             let dbURL = try OrbitStorageProtection.prepareProtectedDatabaseURL(in: appSupportDir)
-            let instance = try OrbitMobileCore.openWithOptions(dbPath: dbURL.path, autoDiscoverLocal: false)
+            if UserDefaults.standard.object(forKey: "orbit.ios.liveActivitiesEnabled") != nil {
+                self.liveActivitiesEnabled = UserDefaults.standard.bool(forKey: "orbit.ios.liveActivitiesEnabled")
+            }
+            let instance: OrbitMobileCore
+            do {
+                let keyResult = try OrbitKeychain.shared.loadOrCreateMasterKey(
+                    fallbackDirectory: dbURL.deletingLastPathComponent()
+                )
+                self.masterKeySource = keyResult.source
+                instance = try OrbitMobileCore.newWithMasterKey(
+                    dbPath: dbURL.path,
+                    masterKeyBytes: keyResult.key
+                )
+            } catch {
+                // Clean fallback exclusively for constrained sandbox environments where Keychain is unavailable.
+                instance = try OrbitMobileCore.openWithOptions(dbPath: dbURL.path, autoDiscoverLocal: false)
+            }
             self.core = instance
 
             if !UserDefaults.standard.bool(forKey: Self.migratedThreadPrefsDefaultsKey) {
@@ -1281,6 +1336,15 @@ public final class OrbitIosStore: ObservableObject {
     public func handleDeepLink(_ url: URL) {
         let raw = url.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard raw.lowercased().hasPrefix("orbit://") else { return }
+        if let parsed = OrbitPushDeepLinkLogic.parseDeepLink(raw) {
+            switch parsed {
+            case let .openSession(hostId, agentId):
+                navigateToSessionFromDeepLink(hostId: hostId, agentId: agentId)
+                return
+            case .pairHost, .syncLogin:
+                break
+            }
+        }
         handleScannedOrPastedUri(raw)
         if activeSheet == .qrPair {
             activeSheet = nil
@@ -1507,17 +1571,20 @@ public final class OrbitIosStore: ObservableObject {
             if let hid = selectedHostId {
                 reloadHostDetail(hid)
             }
+            syncLiveActivityFromFleetState()
 
         case let .hostChanged(_, hostId):
             reloadFleet()
             if hostId == selectedHostId {
                 reloadHostDetail(hostId)
             }
+            syncLiveActivityFromFleetState()
 
         case let .timelineChanged(_, hostId, agentId):
             if hostId == selectedHostId, agentId == selectedAgentId {
                 scheduleCoalescedStageReload(hostId: hostId, agentId: agentId)
             }
+            syncLiveActivityFromFleetState()
 
         case let .gitChanged(_, hostId, _):
             if hostId == selectedHostId {
@@ -1958,6 +2025,7 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public func selectAgent(hostId: String, agentId: String) {
+        isShowingGlobalOverview = false
         let hostChanged = selectedHostId != hostId
         let agentChanged = selectedAgentId != agentId || hostChanged
         if agentChanged {
@@ -2231,6 +2299,7 @@ public final class OrbitIosStore: ObservableObject {
         provider: FfiProviderKind? = nil,
         workspaceId: String? = nil
     ) {
+        isShowingGlobalOverview = false
         saveCurrentComposerDraft()
         let wasViewingAgent = selectedAgentId != nil
         selectedAgentId = nil

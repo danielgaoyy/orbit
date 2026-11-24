@@ -57,11 +57,14 @@ struct StreamStageView: View {
         VStack(spacing: 0) {
             if !store.hosts.isEmpty {
                 ConnectionStatusBannerView(store: store)
+                SubagentLineageStripView(store: store)
                 WorkspacePeerStripView(store: store)
             }
 
             Group {
-                if store.hosts.isEmpty && !store.hasDemoStageOverlay && !store.isDemoChatMode {
+                if store.isShowingGlobalOverview && !store.hosts.isEmpty {
+                    GlobalOverviewView(store: store)
+                } else if store.hosts.isEmpty && !store.hasDemoStageOverlay && !store.isDemoChatMode {
                     unpairedZeroState
                 } else if store.isDraftNewSession && turns.isEmpty {
                     newSessionZeroState
@@ -76,11 +79,12 @@ struct StreamStageView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(palette.canvas.ignoresSafeArea())
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            if !store.hosts.isEmpty || store.hasDemoStageOverlay || store.isDemoChatMode {
+            if !store.isShowingGlobalOverview && (!store.hosts.isEmpty || store.hasDemoStageOverlay || store.isDemoChatMode) {
                 VStack(spacing: 0) {
                     SubagentApprovalBanner(store: store)
                     SubagentsTrackPill(store: store)
                     StickyDecisionDock(store: store)
+                    SessionPlanShelfView(store: store)
                     OmniComposerView(store: store)
                 }
             }

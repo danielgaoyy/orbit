@@ -1085,6 +1085,18 @@ export const ja: MessageDictionary = {
   "review.markUnviewed": "未確認に戻す",
   "review.openFullFile": "ファイル全体を開く",
 
+  // Stage 配信・停滞テレメトリ
+  "stage.deliveryQueued": "待機中",
+  "stage.deliveryQueuedWaiting": "待機中 · {duration} 経過",
+  "stage.deliveryProcessing": "処理中",
+  "stage.deliveryDeliveredWaited": "配信済み · {duration} 待機",
+  "stage.deliveryDropped": "配信前にキャンセル",
+  "stage.interruptAndDeliver": "中断して配信",
+  "stage.interruptAndContinue": "中断して続行",
+  "stage.thinkingNoProgress": "思考中（目立った進展なし）",
+  "stage.waitingForResponse": "応答を待機中",
+  "stage.queuedCount": "{count} 件待機中",
+
   // Session Overview HUD
   "overview.title": "概要",
   "overview.ariaLabel": "セッション概要",

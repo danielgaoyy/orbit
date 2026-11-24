@@ -141,7 +141,7 @@ pub enum ClientInboundEvent {
 
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
-enum OutboundPayload {
+pub(crate) enum OutboundPayload {
     Wire(WireMessage),
     Terminal(TerminalBinaryFrame),
 }
@@ -213,6 +213,21 @@ pub struct HostSessionHandle {
 }
 
 impl HostSessionHandle {
+    #[cfg(test)]
+    pub(crate) fn new_test_channel() -> (Self, mpsc::Receiver<OutboundPayload>) {
+        let (out_tx, out_rx) = mpsc::channel(32);
+        let (events_tx, _) = broadcast::channel(16);
+        let handle = Self {
+            mode: HostConnectionState::OnlineDirect,
+            via_ssh_tunnel: false,
+            welcome_host: None,
+            out_tx,
+            events_tx,
+            _ssh_tunnel: None,
+        };
+        (handle, out_rx)
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<ClientInboundEvent> {
         self.events_tx.subscribe()
     }

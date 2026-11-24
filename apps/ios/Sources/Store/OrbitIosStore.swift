@@ -1686,7 +1686,8 @@ public final class OrbitIosStore: ObservableObject {
                 .assistantMessage(key: "demo-am-1", item: replyItem1)
             ],
             turnDiffs: [], hasError: false, hasUnrecoveredError: false, hasActiveItem: false,
-            startedAtMs: startMs, completedAtMs: nowMs
+            startedAtMs: startMs, completedAtMs: nowMs,
+            latestActivityMs: nowMs, latestVisibleProgressMs: nowMs
         )
         agentStage = FfiAgentStage(
             revision: 1, hostId: demoHostId, agent: demoCard, turns: [turn1],
@@ -3587,6 +3588,12 @@ public final class OrbitIosStore: ObservableObject {
     public func interruptAgent() {
         guard let hid = selectedHostId, let aid = selectedAgentId else { return }
         core?.interruptAgent(hostId: hid, agentId: aid)
+        hapticRigid()
+    }
+
+    public func interruptAgentAndContinue() {
+        guard let hid = selectedHostId, let aid = selectedAgentId else { return }
+        core?.interruptAgentAndContinue(hostId: hid, agentId: aid)
         hapticRigid()
     }
 

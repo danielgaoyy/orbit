@@ -24,7 +24,11 @@
 - **防轮次错位与跨轮去重不变式**：
   1. 在并发 `steer`（改向）、`interrupt`（打断）或排队消息自动冲刷时，每一条 assistant 响应与 finalize 事件必须严格绑定并校验当前活跃 turn 上下文，严禁下一轮错收到上一轮残留输出（off-by-one lag）。
   2. 延迟到达的跨轮 finalize 消息必须在持久化与 WebSocket 广播路径（`crates/orbit-daemon/src/manager.rs` / `lib.rs`）正确归位或去重。
-  - **必跑验证**：改动此区域必跑 `pitfall_01`、`pitfall_02`、`pitfall_06`（见 `docs/engineering/testing-and-ci.md`）。
+- **消息源解耦（`PromptOrigin`）与非打断排队生命周期**（Issue #52）：
+  1. 驱动命令 `DriverCommand::SendPrompt` 显式区分 `PromptOrigin::Human` 与 `PromptOrigin::Agent`。仅人类主动改向（`Human + Steer`）可在 ACP / Antigravity 驱动上触发 `session/cancel` 抢占当前轮；来自子代理 / Peer 的异步汇报与唤醒（`Agent`）在 ACP / Antigravity 上强制走非打断 FIFO 排队（`Steer` 自动降级为 `Queue`），在 `Codex` / `Claude Code` / `Pi` 上统一通过本地/原生队列顺序投递且绝不在活跃轮中途取消正在执行的工作。
+  2. 新增保队列中断 `DriverCommand::InterruptAndDrainQueue`（对应 `WireMessage::InterruptTurn { preserve_queue: true }`）：在人类判定上游长考停滞时终止当前卡死轮，但**保留**所有已排队消息继续冲刷；硬停止（`DriverCommand::Interrupt`）则取消当前轮并丢弃未投递队列。
+  3. 全 6 个 Provider 驱动统一通过 `DriverEvent::PromptDeliveryUpdated` 上报权威状态流 `Queued -> Dispatched -> Settled / Dropped`（`Settled` 必须在 `StatusChanged(Idle)` 之前发射），由 `AgentOrchestrator` 持久化隐私安全日志（仅含 ID / turn ID / 时长）与时间线状态更新事件。
+  - **必跑验证**：改动此区域必跑 `pitfall_01`、`pitfall_02`、`pitfall_06`、`pitfall_08`（见 `docs/engineering/testing-and-ci.md`）。
 
 ---
 

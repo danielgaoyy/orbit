@@ -4011,7 +4011,12 @@ async fn handle_wire_rpc(
         WireMessage::InterruptTurn {
             request_id,
             agent_id,
-        } => match runtime.orchestrator.interrupt_agent(&agent_id).await {
+            preserve_queue,
+        } => match runtime
+            .orchestrator
+            .interrupt_agent_with_options(&agent_id, preserve_queue)
+            .await
+        {
             Ok(()) => Some(WireMessage::Ack { request_id }),
             Err(e) => Some(rpc_err(request_id, "interrupt_failed", e)),
         },

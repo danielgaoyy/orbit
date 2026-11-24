@@ -1086,6 +1086,18 @@ export const en = {
   "review.markUnviewed": "Mark as unviewed",
   "review.openFullFile": "Open full file",
 
+  // Stage Delivery & Stall Telemetry
+  "stage.deliveryQueued": "Queued",
+  "stage.deliveryQueuedWaiting": "Queued · waiting {duration}",
+  "stage.deliveryProcessing": "Processing",
+  "stage.deliveryDeliveredWaited": "Delivered · waited {duration}",
+  "stage.deliveryDropped": "Canceled before delivery",
+  "stage.interruptAndDeliver": "Interrupt & deliver",
+  "stage.interruptAndContinue": "Interrupt & continue",
+  "stage.thinkingNoProgress": "thinking without visible progress",
+  "stage.waitingForResponse": "waiting for response",
+  "stage.queuedCount": "{count} queued",
+
   // Session Overview HUD
   "overview.title": "Overview",
   "overview.ariaLabel": "Session overview",

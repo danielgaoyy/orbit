@@ -123,6 +123,10 @@ fn wire_default_workflow_concurrency() -> u32 {
     3
 }
 
+fn wire_is_false(v: &bool) -> bool {
+    !*v
+}
+
 /// First-class supported coding agent CLIs in Orbit (native drivers + Universal ACP).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -880,6 +884,7 @@ pub struct TimelineEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum TimelinePayload {
     UserPrompt {
         message_id: String,
@@ -941,6 +946,29 @@ pub enum TimelinePayload {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_context: Option<PermissionCheckpointRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_status: Option<AgentMessageDeliveryStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocking_turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queued_at_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatched_at_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settled_at_ms: Option<i64>,
+    },
+    /// Monotonic lifecycle update for an already-emitted [`TimelinePayload::AgentMessage`],
+    /// preserving chronological `seq` order while letting clients update delivery status in place.
+    AgentMessageDeliveryUpdated {
+        message_id: String,
+        status: AgentMessageDeliveryStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocking_turn_id: Option<String>,
+        timestamp_ms: i64,
     },
     StatusChanged {
         status: AgentStatus,
@@ -1464,6 +1492,8 @@ pub enum WireMessage {
     InterruptTurn {
         request_id: Uuid,
         agent_id: String,
+        #[serde(default, skip_serializing_if = "wire_is_false")]
+        preserve_queue: bool,
     },
     SetSessionMode {
         request_id: Uuid,
@@ -5178,5 +5208,89 @@ mod tests {
             is_valid_github_repo(&effective),
             "configured_github_repo() must always return a valid slug, got `{effective}`"
         );
+    }
+
+    #[test]
+    fn agent_message_delivery_status_and_interrupt_preserve_queue_roundtrip_and_compat() {
+        let legacy_agent_msg = serde_json::json!({
+            "type": "agent_message",
+            "message_id": "am_legacy",
+            "kind": "finish_notification",
+            "source_agent_id": "ag_child",
+            "text": "Done"
+        });
+        let decoded_legacy: TimelinePayload =
+            serde_json::from_value(legacy_agent_msg).expect("deserialize legacy AgentMessage");
+        match decoded_legacy {
+            TimelinePayload::AgentMessage {
+                delivery_status,
+                delivery_turn_id,
+                blocking_turn_id,
+                queued_at_ms,
+                dispatched_at_ms,
+                settled_at_ms,
+                ..
+            } => {
+                assert!(delivery_status.is_none());
+                assert!(delivery_turn_id.is_none());
+                assert!(blocking_turn_id.is_none());
+                assert!(queued_at_ms.is_none());
+                assert!(dispatched_at_ms.is_none());
+                assert!(settled_at_ms.is_none());
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+
+        let updated = TimelinePayload::AgentMessageDeliveryUpdated {
+            message_id: "am_1".into(),
+            status: AgentMessageDeliveryStatus::Dispatched,
+            delivery_turn_id: Some("turn_2".into()),
+            blocking_turn_id: None,
+            timestamp_ms: 1_732_400_000_000,
+        };
+        let roundtrip: TimelinePayload =
+            serde_json::from_str(&serde_json::to_string(&updated).expect("ser")).expect("de");
+        match roundtrip {
+            TimelinePayload::AgentMessageDeliveryUpdated {
+                message_id,
+                status,
+                delivery_turn_id,
+                blocking_turn_id,
+                timestamp_ms,
+            } => {
+                assert_eq!(message_id, "am_1");
+                assert_eq!(status, AgentMessageDeliveryStatus::Dispatched);
+                assert_eq!(delivery_turn_id.as_deref(), Some("turn_2"));
+                assert!(blocking_turn_id.is_none());
+                assert_eq!(timestamp_ms, 1_732_400_000_000);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+
+        let req_id = Uuid::new_v4();
+        let legacy_interrupt = serde_json::json!({
+            "op": "interrupt_turn",
+            "request_id": req_id,
+            "agent_id": "ag_p"
+        });
+        let parsed_legacy_int: WireMessage =
+            serde_json::from_value(legacy_interrupt).expect("deserialize legacy InterruptTurn");
+        match parsed_legacy_int {
+            WireMessage::InterruptTurn { preserve_queue, .. } => assert!(!preserve_queue),
+            other => panic!("unexpected wire: {other:?}"),
+        }
+
+        let continue_wire = WireMessage::InterruptTurn {
+            request_id: req_id,
+            agent_id: "ag_p".into(),
+            preserve_queue: true,
+        };
+        let encoded = serde_json::to_string(&continue_wire).expect("ser interrupt");
+        assert!(encoded.contains("\"preserve_queue\":true"));
+        let decoded_wire: WireMessage = serde_json::from_str(&encoded).expect("de interrupt");
+        match decoded_wire {
+            WireMessage::InterruptTurn { preserve_queue, .. } => assert!(preserve_queue),
+            other => panic!("unexpected wire: {other:?}"),
+        }
     }
 }

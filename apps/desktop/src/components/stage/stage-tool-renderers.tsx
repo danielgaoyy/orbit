@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { useI18n } from "@/lib/i18n";
 import type { DiffLineView, TimelineItemView } from "@/lib/orbit-ipc";
 import {
   type ResolvedSubagentItem,
@@ -115,18 +116,73 @@ export function resolveToolStepIcon(
   }
 }
 
-/** Isolated 1-second live elapsed ticker with offline & silent-stall hints. */
+const SILENT_STALL_THRESHOLD_MS = 45_000;
+const THINKING_STALL_THRESHOLD_MS = 60_000;
+const QUEUED_NO_PROGRESS_THRESHOLD_MS = 30_000;
+
+export function computeLiveStallState({
+  nowMs,
+  startedAtMs,
+  lastActivityMs,
+  lastVisibleProgressMs,
+  isNetworkOffline = false,
+  stallLabel,
+  queuedNotificationCount = 0,
+}: {
+  nowMs: number;
+  startedAtMs: number;
+  lastActivityMs?: number | null;
+  lastVisibleProgressMs?: number | null;
+  isNetworkOffline?: boolean;
+  stallLabel?: string | null;
+  queuedNotificationCount?: number;
+}) {
+  const elapsedMs = Math.max(0, nowMs - startedAtMs);
+  const effectiveActivityMs = lastActivityMs ?? startedAtMs;
+  const effectiveVisibleProgressMs = lastVisibleProgressMs ?? effectiveActivityMs;
+  const silentMs = Math.max(0, nowMs - effectiveActivityMs);
+  const noProgressMs = Math.max(0, nowMs - effectiveVisibleProgressMs);
+
+  const isSilentStall =
+    !isNetworkOffline && stallLabel !== null && silentMs >= SILENT_STALL_THRESHOLD_MS;
+  const isThinkingStall =
+    !isNetworkOffline &&
+    stallLabel !== null &&
+    !isSilentStall &&
+    typeof lastVisibleProgressMs === "number" &&
+    effectiveActivityMs > lastVisibleProgressMs &&
+    noProgressMs >= THINKING_STALL_THRESHOLD_MS;
+  const showInterruptContinue =
+    !isNetworkOffline &&
+    (isSilentStall ||
+      isThinkingStall ||
+      (queuedNotificationCount > 0 && noProgressMs >= QUEUED_NO_PROGRESS_THRESHOLD_MS));
+
+  return {
+    elapsedMs,
+    isSilentStall,
+    isThinkingStall,
+    showInterruptContinue,
+  };
+}
+
+/** Isolated 1-second live elapsed ticker with offline, thinking-stall, and queue hints. */
 export const InlineLiveElapsed = memo(function InlineLiveElapsed({
   startedAtMs,
   lastActivityMs,
+  lastVisibleProgressMs,
   isNetworkOffline = false,
-  stallLabel = "waiting for response",
+  stallLabel,
+  queuedNotificationCount = 0,
 }: {
   startedAtMs: number;
   lastActivityMs?: number | null;
+  lastVisibleProgressMs?: number | null;
   isNetworkOffline?: boolean;
   stallLabel?: string | null;
+  queuedNotificationCount?: number;
 }) {
+  const { t } = useI18n();
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
@@ -135,29 +191,100 @@ export const InlineLiveElapsed = memo(function InlineLiveElapsed({
     return () => window.clearInterval(id);
   }, [startedAtMs]);
 
-  const elapsedMs = Math.max(0, nowMs - startedAtMs);
-  const silentMs = Math.max(0, nowMs - (lastActivityMs ?? startedAtMs));
-  const isStalled = !isNetworkOffline && stallLabel !== null && silentMs >= 45_000;
+  const { elapsedMs, isSilentStall, isThinkingStall } = computeLiveStallState({
+    nowMs,
+    startedAtMs,
+    lastActivityMs,
+    lastVisibleProgressMs,
+    isNetworkOffline,
+    stallLabel,
+    queuedNotificationCount,
+  });
 
-  if (elapsedMs < 1000 && !isNetworkOffline) return null;
+  if (elapsedMs < 1000 && !isNetworkOffline && queuedNotificationCount === 0) return null;
 
   return (
     <>
       {elapsedMs >= 1000 && (
-        <span className="text-muted-foreground/75 tabular-nums shrink-0 text-[12.5px]">
+        <span className="text-ink-muted shrink-0 font-mono text-[12.5px] tabular-nums">
           · {formatDurationCompact(elapsedMs)}
         </span>
       )}
       {isNetworkOffline ? (
-        <span className="shrink-0 text-[12px] text-amber-600 dark:text-amber-400">
+        <span className="text-signal-warning shrink-0 text-[12px]">
           · offline
         </span>
-      ) : isStalled ? (
-        <span className="text-muted-foreground/65 shrink-0 text-[12px]">
-          · {stallLabel}
+      ) : isSilentStall ? (
+        <span className="text-ink-muted shrink-0 text-[12px]">
+          · {stallLabel ?? t("stage.waitingForResponse")}
+        </span>
+      ) : isThinkingStall ? (
+        <span className="text-signal-warning shrink-0 text-[12px]">
+          · {t("stage.thinkingNoProgress")}
         </span>
       ) : null}
+      {queuedNotificationCount > 0 && (
+        <span className="text-signal-warning shrink-0 font-mono text-[12px] tabular-nums">
+          · {t("stage.queuedCount", { count: queuedNotificationCount })}
+        </span>
+      )}
     </>
+  );
+});
+
+/** Explicit sibling button shown only when a turn is stalled or blocking queued notifications. */
+export const LiveStallInterruptButton = memo(function LiveStallInterruptButton({
+  startedAtMs,
+  lastActivityMs,
+  lastVisibleProgressMs,
+  isNetworkOffline = false,
+  stallLabel,
+  queuedNotificationCount = 0,
+  onInterruptAndContinue,
+}: {
+  startedAtMs: number;
+  lastActivityMs?: number | null;
+  lastVisibleProgressMs?: number | null;
+  isNetworkOffline?: boolean;
+  stallLabel?: string | null;
+  queuedNotificationCount?: number;
+  onInterruptAndContinue?: (() => void) | null;
+}) {
+  const { t } = useI18n();
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!onInterruptAndContinue) return;
+    setNowMs(Date.now());
+    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [startedAtMs, onInterruptAndContinue]);
+
+  if (!onInterruptAndContinue) return null;
+
+  const { showInterruptContinue } = computeLiveStallState({
+    nowMs,
+    startedAtMs,
+    lastActivityMs,
+    lastVisibleProgressMs,
+    isNetworkOffline,
+    stallLabel,
+    queuedNotificationCount,
+  });
+
+  if (!showInterruptContinue) return null;
+
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        onInterruptAndContinue();
+      }}
+      className="border-signal-warning-border bg-signal-warning-bg text-signal-warning hover:bg-signal-warning-bg/80 inline-flex h-[22px] shrink-0 cursor-pointer items-center rounded-[6px] border px-2 text-[11px] font-medium transition-colors"
+    >
+      {t("stage.interruptAndContinue")}
+    </button>
   );
 });
 

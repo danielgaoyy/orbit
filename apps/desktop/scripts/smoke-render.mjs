@@ -343,8 +343,32 @@ const MOCK_TAURI_PAGINATED_INIT_SCRIPT = (() => {
       has_active_item: false,
       started_at_ms: 1732360000000 + idx * 1000,
       completed_at_ms: 1732360001000 + idx * 1000,
+      latest_activity_ms: 1732360001000 + idx * 1000,
+      latest_visible_progress_ms: 1732360001000 + idx * 1000,
     };
   });
+  if (turns.length > 0) {
+    turns[0].agent_message = {
+      item_type: "agent_message",
+      seq: 350,
+      message_id: "am_smoke_queued_1",
+      kind: "finish_notification",
+      source_agent_id: "ag_smoke_worker",
+      source_host_id: "host_smoke_1",
+      source_title: "Codex Worker",
+      event: "finished",
+      text: "Worker finished cleanly while parent turn was running",
+      permission_context: null,
+      delivery_status: "queued",
+      delivery_turn_id: null,
+      blocking_turn_id: "turn_parent_1",
+      queued_at_ms: 1732360000500,
+      dispatched_at_ms: null,
+      settled_at_ms: null,
+      blocks: [],
+      timestamp_ms: 1732360000500,
+    };
+  }
   const baseScript = MOCK_TAURI_INIT_SCRIPT.slice(0, -5);
   return `${baseScript}
   const origInvoke = window.__TAURI_INTERNALS__.invoke;

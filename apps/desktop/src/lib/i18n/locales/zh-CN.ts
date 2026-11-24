@@ -1063,6 +1063,18 @@ export const zhCN: MessageDictionary = {
   "review.markUnviewed": "取消已阅标记",
   "review.openFullFile": "打开完整文件",
 
+  // Stage 投递与卡滞观测
+  "stage.deliveryQueued": "已排队",
+  "stage.deliveryQueuedWaiting": "已排队 · 已等待 {duration}",
+  "stage.deliveryProcessing": "正在处理",
+  "stage.deliveryDeliveredWaited": "已送达 · 等待 {duration}",
+  "stage.deliveryDropped": "送达前已取消",
+  "stage.interruptAndDeliver": "中断并立即送达",
+  "stage.interruptAndContinue": "中断并继续",
+  "stage.thinkingNoProgress": "持续思考中，暂无可见进展",
+  "stage.waitingForResponse": "等待响应中",
+  "stage.queuedCount": "{count} 条排队中",
+
   // Session Overview HUD
   "overview.title": "概览",
   "overview.ariaLabel": "会话概览",

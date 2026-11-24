@@ -33,7 +33,8 @@ Mission Workspace 中会话标题与 `@handle` 会根据进展自动或手动更
 ## 4. Peer 通信与防反复唤醒原则
 
 - 向同工作区伙伴发消息时，按实际需求设置 `notify_on_finish`；避免无意义互相 `@` 触发无穷唤醒回声链。
-- **必跑验证**：改动上述任何模块必跑 `pitfall_05`（`e2e_pitfall_regressions`）及 `e2e_workspace_sync_and_worktree`、`e2e_orchestration`。
+- **非打断默认排队（Non-Interrupting Async Delivery）**：`message_peer`、`send_agent_prompt` 与带 `ORBIT_AGENT_ID` 的 `orbit send` 在未显式传入 `active_turn_behavior` 时**一律默认使用 `queue`**；持久化完成唤醒（`finish_subscriptions.rs`）同样以 `Queue` 合批投递并仅在入队时记录 `Enqueued ... notification`（绝不提前宣称 `Delivered`，也不将消息正文写入日志），绝不自动取消父 Agent 正在进行的思考或工具回合。
+- **必跑验证**：改动上述任何模块必跑 `pitfall_05`、`pitfall_08`（`e2e_pitfall_regressions`）及 `e2e_workspace_sync_and_worktree`、`e2e_orchestration`。
 
 ---
 

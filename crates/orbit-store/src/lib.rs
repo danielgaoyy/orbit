@@ -1361,6 +1361,8 @@ impl OrbitStore {
             }
         }
 
+        patch_agent_message_delivery_in_table(&tx, true, agent_id, &payload)?;
+
         {
             let mut ins_stmt = tx.prepare_cached(
                 "INSERT INTO timeline_events (epoch, agent_id, turn_id, timestamp, payload_json, event_type, coalesce_key)
@@ -1599,6 +1601,8 @@ impl OrbitStore {
             }
         }
 
+        patch_agent_message_delivery_in_table(&tx, false, &ev.agent_id, &ev.payload)?;
+
         {
             let mut ins_stmt = tx.prepare_cached(
                 "INSERT INTO client_replica_events (agent_id, seq, epoch, turn_id, timestamp, payload_json, event_type, coalesce_key)
@@ -1705,6 +1709,7 @@ impl OrbitStore {
                     let _ = del_stmt.execute(params![ev.agent_id, boundary_seq, seq_i64, key_val]);
                 }
             }
+            patch_agent_message_delivery_in_table(&tx, false, &ev.agent_id, &ev.payload)?;
             {
                 let mut ins_stmt = tx.prepare_cached(
                     "INSERT INTO client_replica_events (agent_id, seq, epoch, turn_id, timestamp, payload_json, event_type, coalesce_key)
@@ -3353,6 +3358,103 @@ fn query_coalesce_boundary_seq(
     }
 }
 
+fn patch_agent_message_delivery_in_table(
+    tx: &rusqlite::Transaction<'_>,
+    is_daemon_table: bool,
+    agent_id: &str,
+    delivery_payload: &TimelinePayload,
+) -> Result<(), StoreError> {
+    let TimelinePayload::AgentMessageDeliveryUpdated {
+        message_id,
+        status,
+        delivery_turn_id,
+        blocking_turn_id,
+        timestamp_ms,
+    } = delivery_payload
+    else {
+        return Ok(());
+    };
+    if message_id.trim().is_empty() {
+        return Ok(());
+    }
+    let select_sql = if is_daemon_table {
+        "SELECT seq, payload_json
+         FROM timeline_events
+         WHERE agent_id = ?1
+           AND event_type = 'agent_message'
+           AND json_extract(payload_json, '$.message_id') = ?2
+         ORDER BY seq DESC
+         LIMIT 1"
+    } else {
+        "SELECT seq, payload_json
+         FROM client_replica_events
+         WHERE agent_id = ?1
+           AND event_type = 'agent_message'
+           AND json_extract(payload_json, '$.message_id') = ?2
+         ORDER BY seq DESC
+         LIMIT 1"
+    };
+    let existing: Option<(i64, String)> = tx
+        .prepare_cached(select_sql)?
+        .query_row(params![agent_id, message_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?;
+    let Some((target_seq, raw_json)) = existing else {
+        return Ok(());
+    };
+    let Ok(mut target_payload) = serde_json::from_str::<TimelinePayload>(&raw_json) else {
+        return Ok(());
+    };
+    if let TimelinePayload::AgentMessage {
+        ref mut delivery_status,
+        delivery_turn_id: ref mut d_turn,
+        blocking_turn_id: ref mut b_turn,
+        ref mut dispatched_at_ms,
+        ref mut settled_at_ms,
+        ..
+    } = target_payload
+    {
+        *delivery_status = Some(*status);
+        if let Some(tid) = delivery_turn_id {
+            *d_turn = Some(tid.clone());
+        }
+        match status {
+            orbit_protocol::AgentMessageDeliveryStatus::Queued => {
+                if let Some(btid) = blocking_turn_id {
+                    *b_turn = Some(btid.clone());
+                }
+            }
+            orbit_protocol::AgentMessageDeliveryStatus::Dispatched => {
+                *b_turn = None;
+                if dispatched_at_ms.is_none() {
+                    *dispatched_at_ms = Some(*timestamp_ms);
+                }
+            }
+            orbit_protocol::AgentMessageDeliveryStatus::Settled => {
+                *b_turn = None;
+                if dispatched_at_ms.is_none() {
+                    *dispatched_at_ms = Some(*timestamp_ms);
+                }
+                *settled_at_ms = Some(*timestamp_ms);
+            }
+            orbit_protocol::AgentMessageDeliveryStatus::Dropped => {
+                *b_turn = None;
+                *settled_at_ms = Some(*timestamp_ms);
+            }
+        }
+        let updated_json = serde_json::to_string(&target_payload)?;
+        let update_sql = if is_daemon_table {
+            "UPDATE timeline_events SET payload_json = ?1 WHERE agent_id = ?2 AND seq = ?3"
+        } else {
+            "UPDATE client_replica_events SET payload_json = ?1 WHERE agent_id = ?2 AND seq = ?3"
+        };
+        tx.prepare_cached(update_sql)?
+            .execute(params![updated_json, agent_id, target_seq])?;
+    }
+    Ok(())
+}
+
 fn payload_event_type(payload: &TimelinePayload) -> &'static str {
     match payload {
         TimelinePayload::UserPrompt { .. } => "user_prompt",
@@ -3365,6 +3467,7 @@ fn payload_event_type(payload: &TimelinePayload) -> &'static str {
         TimelinePayload::QuestionResolved { .. } => "question_resolved",
         TimelinePayload::Notice { .. } => "notice",
         TimelinePayload::AgentMessage { .. } => "agent_message",
+        TimelinePayload::AgentMessageDeliveryUpdated { .. } => "agent_message_delivery_updated",
         TimelinePayload::StatusChanged { .. } => "status_changed",
     }
 }
@@ -6884,5 +6987,199 @@ mod tests {
             rep_before.iter().map(|e| e.seq).collect::<Vec<_>>(),
             vec![seqs[0], seqs[1], seqs[2]]
         );
+    }
+
+    #[test]
+    fn agent_message_delivery_updates_patch_original_row_preserving_seq() {
+        let store = OrbitStore::open_in_memory().expect("open store");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_1".into(),
+                title: "ws".into(),
+                cwd: "/tmp/w".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_deliv".into(),
+                    workspace_id: "ws_1".into(),
+                    cwd: "/tmp/w".into(),
+                    title: "Parent".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    acp_agent_id: None,
+                    mode: SessionMode::AcceptEdits,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    queued_prompts: vec![],
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        let ev_msg = store
+            .append_timeline_event(
+                "ag_deliv",
+                1,
+                Some("turn_fin"),
+                TimelinePayload::AgentMessage {
+                    message_id: "fin_42".into(),
+                    kind: orbit_protocol::AgentMessageKind::FinishNotification,
+                    source_agent_id: Some("ag_child".into()),
+                    source_host_id: None,
+                    source_title: Some("Child".into()),
+                    event: Some("finished".into()),
+                    text: "Child completed".into(),
+                    permission_context: None,
+                    delivery_status: Some(orbit_protocol::AgentMessageDeliveryStatus::Queued),
+                    delivery_turn_id: Some("turn_fin".into()),
+                    blocking_turn_id: Some("turn_active".into()),
+                    queued_at_ms: Some(1_000),
+                    dispatched_at_ms: None,
+                    settled_at_ms: None,
+                },
+            )
+            .expect("append AgentMessage");
+
+        let ev_reply = store
+            .append_timeline_event(
+                "ag_deliv",
+                1,
+                Some("turn_active"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "msg_1".into(),
+                    text: "Parent active reply finished".into(),
+                    streaming: false,
+                },
+            )
+            .expect("append AssistantMessage");
+
+        let ev_disp = store
+            .append_timeline_event(
+                "ag_deliv",
+                1,
+                None,
+                TimelinePayload::AgentMessageDeliveryUpdated {
+                    message_id: "fin_42".into(),
+                    status: orbit_protocol::AgentMessageDeliveryStatus::Dispatched,
+                    delivery_turn_id: Some("turn_fin".into()),
+                    blocking_turn_id: None,
+                    timestamp_ms: 2_500,
+                },
+            )
+            .expect("append Dispatched");
+
+        let ev_settled = store
+            .append_timeline_event(
+                "ag_deliv",
+                1,
+                None,
+                TimelinePayload::AgentMessageDeliveryUpdated {
+                    message_id: "fin_42".into(),
+                    status: orbit_protocol::AgentMessageDeliveryStatus::Settled,
+                    delivery_turn_id: Some("turn_fin".into()),
+                    blocking_turn_id: None,
+                    timestamp_ms: 4_200,
+                },
+            )
+            .expect("append Settled");
+
+        assert!(ev_msg.seq < ev_reply.seq);
+        assert!(ev_reply.seq < ev_disp.seq);
+        assert!(ev_disp.seq < ev_settled.seq);
+
+        let (events, _) = store
+            .fetch_timeline_since("ag_deliv", 0, 50)
+            .expect("fetch timeline");
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].seq, ev_msg.seq);
+        match &events[0].payload {
+            TimelinePayload::AgentMessage {
+                delivery_status,
+                blocking_turn_id,
+                queued_at_ms,
+                dispatched_at_ms,
+                settled_at_ms,
+                ..
+            } => {
+                assert_eq!(
+                    *delivery_status,
+                    Some(orbit_protocol::AgentMessageDeliveryStatus::Settled)
+                );
+                assert!(blocking_turn_id.is_none());
+                assert_eq!(*queued_at_ms, Some(1_000));
+                assert_eq!(*dispatched_at_ms, Some(2_500));
+                assert_eq!(*settled_at_ms, Some(4_200));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+
+        // Verify replica table also patches in place on batch upsert
+        store
+            .upsert_replica_timeline_events_batch(&[
+                ev_msg.clone(),
+                ev_reply.clone(),
+                ev_disp,
+                ev_settled,
+            ])
+            .expect("upsert replica batch");
+        let (rep_events, _) = store
+            .fetch_replica_timeline_tail("ag_deliv", 10)
+            .expect("fetch replica");
+        match &rep_events[0].payload {
+            TimelinePayload::AgentMessage {
+                delivery_status,
+                dispatched_at_ms,
+                settled_at_ms,
+                ..
+            } => {
+                assert_eq!(
+                    *delivery_status,
+                    Some(orbit_protocol::AgentMessageDeliveryStatus::Settled)
+                );
+                assert_eq!(*dispatched_at_ms, Some(2_500));
+                assert_eq!(*settled_at_ms, Some(4_200));
+            }
+            other => panic!("unexpected replica payload: {other:?}"),
+        }
     }
 }

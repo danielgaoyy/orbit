@@ -33,6 +33,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         OrbitNotificationHelper.ensureChannels(this)
+        dev.orbit.android.notifications.OrbitFirebaseMessagingBridge.fetchCurrentTokenIfConfigured(this)
 
         if (savedInstanceState == null) {
             store.applyLaunchIntent(intent)

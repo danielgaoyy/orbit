@@ -60,7 +60,7 @@ object OrbitFoldablePostureMapper {
             return OrbitFoldablePosture.FlatOrStandard
         }
 
-        if (hinge.isVerticalAxis) {
+        if (hinge.isVerticalAxis && (hinge.isSeparatingSurface || hinge.isHalfFolded)) {
             val leftWidthDp = hinge.leftPx / density
             val gapDp = hinge.spanWidthPx / density
             val rightWidthDp = (viewportWidthPx - hinge.rightPx) / density

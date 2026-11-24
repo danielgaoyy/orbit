@@ -33,9 +33,48 @@ object OrbitVt100Encoder {
             '\\' -> 0x1C
             ']' -> 0x1D
             '^' -> 0x1E
-            '_' -> 0x1F
+            '_', '/' -> 0x1F
             '?' -> DEL_BYTE
             else -> null
+        }
+    }
+
+    private fun encodeCsiArrow(finalChar: Char, ctrlActive: Boolean, altActive: Boolean): ByteArray {
+        val mod = 1 + (if (altActive) 2 else 0) + (if (ctrlActive) 4 else 0)
+        val seq = if (mod > 1) "\u001B[1;${mod}$finalChar" else "\u001B[$finalChar"
+        return seq.toByteArray(Charsets.UTF_8)
+    }
+
+    fun encodeDeveloperKey(
+        sequence: String,
+        ctrlLatched: Boolean = false,
+        altLatched: Boolean = false,
+    ): ByteArray {
+        if (sequence.isEmpty()) return ByteArray(0)
+        if (!ctrlLatched && !altLatched) return sequence.toByteArray(Charsets.UTF_8)
+
+        // xterm CSI arrow sequences (\u001B[A..D)
+        if (sequence.length == 3 && sequence[0] == '\u001B' && sequence[1] == '[' && sequence[2] in 'A'..'D') {
+            return encodeCsiArrow(sequence[2], ctrlLatched, altLatched)
+        }
+
+        if (sequence.length == 1) {
+            val ch = sequence[0]
+            if (ch.code < 0x20 || ch.code == 0x7F) {
+                // Control character (ESC, TAB, ^C, ^D, ^L, ^Z): Alt prefixes ESC except on ESC itself
+                return if (altLatched && ch != '\u001B') {
+                    byteArrayOf(ESC_BYTE, ch.code.toByte())
+                } else {
+                    byteArrayOf(ch.code.toByte())
+                }
+            }
+            return encodeCommittedText(sequence, ctrlLatched = ctrlLatched, altLatched = altLatched)
+        }
+
+        return if (altLatched && !sequence.startsWith("\u001B")) {
+            byteArrayOf(ESC_BYTE) + sequence.toByteArray(Charsets.UTF_8)
+        } else {
+            sequence.toByteArray(Charsets.UTF_8)
         }
     }
 
@@ -72,10 +111,10 @@ object OrbitVt100Encoder {
         KeyEvent.KEYCODE_FORWARD_DEL -> "\u001B[3~".toByteArray(Charsets.UTF_8)
         KeyEvent.KEYCODE_TAB -> byteArrayOf('\t'.code.toByte())
         KeyEvent.KEYCODE_ESCAPE -> byteArrayOf(ESC_BYTE)
-        KeyEvent.KEYCODE_DPAD_UP -> "\u001B[A".toByteArray(Charsets.UTF_8)
-        KeyEvent.KEYCODE_DPAD_DOWN -> "\u001B[B".toByteArray(Charsets.UTF_8)
-        KeyEvent.KEYCODE_DPAD_RIGHT -> "\u001B[C".toByteArray(Charsets.UTF_8)
-        KeyEvent.KEYCODE_DPAD_LEFT -> "\u001B[D".toByteArray(Charsets.UTF_8)
+        KeyEvent.KEYCODE_DPAD_UP -> encodeCsiArrow('A', ctrlActive, altActive)
+        KeyEvent.KEYCODE_DPAD_DOWN -> encodeCsiArrow('B', ctrlActive, altActive)
+        KeyEvent.KEYCODE_DPAD_RIGHT -> encodeCsiArrow('C', ctrlActive, altActive)
+        KeyEvent.KEYCODE_DPAD_LEFT -> encodeCsiArrow('D', ctrlActive, altActive)
         KeyEvent.KEYCODE_MOVE_HOME -> "\u001B[H".toByteArray(Charsets.UTF_8)
         KeyEvent.KEYCODE_MOVE_END -> "\u001B[F".toByteArray(Charsets.UTF_8)
         KeyEvent.KEYCODE_PAGE_UP -> "\u001B[5~".toByteArray(Charsets.UTF_8)
@@ -139,8 +178,7 @@ class OrbitRawTerminalView(context: Context) : View(context) {
 
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
         outAttrs.inputType = InputType.TYPE_CLASS_TEXT or
-            InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
-            InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+            InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN or
             EditorInfo.IME_FLAG_NO_EXTRACT_UI or
             EditorInfo.IME_ACTION_NONE
@@ -165,6 +203,9 @@ class OrbitRawTerminalView(context: Context) : View(context) {
                 if (afterLength > 0) emitBytes("\u001B[3~".repeat(afterLength).toByteArray())
                 return true
             }
+
+            override fun deleteSurroundingTextInCodePoints(beforeLength: Int, afterLength: Int): Boolean =
+                deleteSurroundingText(beforeLength, afterLength)
 
             override fun sendKeyEvent(event: KeyEvent): Boolean {
                 if (event.action == KeyEvent.ACTION_DOWN) {

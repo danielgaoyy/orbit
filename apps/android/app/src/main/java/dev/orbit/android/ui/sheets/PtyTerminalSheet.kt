@@ -41,6 +41,7 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -87,6 +88,7 @@ private val DeveloperKeys = listOf(
     DevKeySpec("ALT", isStickyAlt = true),
     DevKeySpec("^C", "\u0003"),
     DevKeySpec("^D", "\u0004"),
+    DevKeySpec("^Z", "\u001A"),
     DevKeySpec("^L", "\u000C"),
     DevKeySpec("↑", "\u001B[A"),
     DevKeySpec("↓", "\u001B[B"),
@@ -130,7 +132,7 @@ fun PtyTerminalSheet(
     var stickyAlt by remember { mutableStateOf(false) }
     var inputLine by remember { mutableStateOf(initialLine) }
     var raw by remember { mutableStateOf(initialLine.isBlank()) }
-    var focusRequest by remember { mutableStateOf(0) }
+    var focusRequest by remember { mutableIntStateOf(0) }
 
     val visibleSnapshotText = remember(screen) {
         screen?.rowsData.orEmpty()
@@ -416,7 +418,13 @@ fun PtyTerminalSheet(
                                     key.isStickyCtrl -> stickyCtrl = !stickyCtrl
                                     key.isStickyAlt -> stickyAlt = !stickyAlt
                                     key.sequence != null -> {
-                                        onSendBytes(key.sequence.toByteArray())
+                                        onSendBytes(
+                                            OrbitVt100Encoder.encodeDeveloperKey(
+                                                sequence = key.sequence,
+                                                ctrlLatched = stickyCtrl,
+                                                altLatched = stickyAlt,
+                                            )
+                                        )
                                         stickyCtrl = false
                                         stickyAlt = false
                                     }

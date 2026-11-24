@@ -102,6 +102,12 @@ import uniffi.orbit_ffi_uniffi.FfiWorkflowKind
 import uniffi.orbit_ffi_uniffi.FfiWorkflowRunRecord
 import uniffi.orbit_ffi_uniffi.FfiWorkflowRunStatus
 import uniffi.orbit_ffi_uniffi.FfiWorkflowStepStatus
+import uniffi.orbit_ffi_uniffi.PermissionRuleDecision
+import uniffi.orbit_ffi_uniffi.PermissionRulePatternKind
+import uniffi.orbit_ffi_uniffi.PermissionRuleScopeKind
+import uniffi.orbit_ffi_uniffi.PermissionRuleSource
+import uniffi.orbit_ffi_uniffi.PermissionRuleToolKind
+import uniffi.orbit_ffi_uniffi.UpsertPermissionRuleInput
 
 private enum class AutomationTab(val label: Int) {
     GOALS(R.string.auto_tab_goals), SCHEDULES(R.string.auto_tab_schedules),
@@ -158,6 +164,12 @@ fun AutomationsSheet(
 
     LaunchedEffect(Unit) {
         onRefreshAll()
+    }
+
+    LaunchedEffect(activeTab, ui.selectedHostId, activeCwd) {
+        if (activeTab == AutomationTab.HOOKS) {
+            store.refreshPermissionRulesAndGuardian()
+        }
     }
 
     BackHandler(enabled = isCreatingSchedule) {
@@ -402,20 +414,56 @@ fun AutomationsSheet(
                         }
                     }
 
-                    AutomationTab.GOALS -> LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(16.dp)) {
-                        items(goalRuns, key = { it.goalId }) { goal ->
-                            GoalRunCard(goal) { onControlGoal(goal.goalId, it) }
+                    AutomationTab.GOALS -> {
+                        if (goalRuns.isEmpty()) {
+                            AutomationEmptyState(
+                                icon = Icons.Outlined.Flag,
+                                title = stringResource(R.string.auto_empty_goals_title),
+                                subtitle = stringResource(R.string.auto_empty_goals_subtitle),
+                                modifier = Modifier.weight(1f),
+                            )
+                        } else {
+                            LazyColumn(
+                                modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(OrbitSpacing.lg),
+                                verticalArrangement = Arrangement.spacedBy(OrbitSpacing.md),
+                            ) {
+                                items(goalRuns, key = { it.goalId }) { goal ->
+                                    GoalRunCard(goal) { onControlGoal(goal.goalId, it) }
+                                }
+                            }
                         }
                     }
-                    AutomationTab.MONITORS -> LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(16.dp)) {
-                        items(monitorWatches, key = { it.monitorId }) { watch ->
-                            MonitorWatchCard(watch) { onStopMonitor(watch.monitorId) }
+
+                    AutomationTab.MONITORS -> {
+                        if (monitorWatches.isEmpty()) {
+                            AutomationEmptyState(
+                                icon = Icons.Outlined.Visibility,
+                                title = stringResource(R.string.auto_empty_monitors_title),
+                                subtitle = stringResource(R.string.auto_empty_monitors_subtitle),
+                                modifier = Modifier.weight(1f),
+                            )
+                        } else {
+                            LazyColumn(
+                                modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(OrbitSpacing.lg),
+                                verticalArrangement = Arrangement.spacedBy(OrbitSpacing.md),
+                            ) {
+                                items(monitorWatches, key = { it.monitorId }) { watch ->
+                                    MonitorWatchCard(watch) { onStopMonitor(watch.monitorId) }
+                                }
+                            }
                         }
                     }
-                    AutomationTab.HOOKS -> ui.selectedHostId?.let { host ->
-                        Text(".orbit/hooks.json", style = typography.code, modifier = Modifier.padding(12.dp))
-                        WorkspaceFileContent(host, activeCwd, ".orbit/hooks.json", store)
-                    } ?: Unit
+
+                    AutomationTab.HOOKS -> {
+                        HooksRulesAndGuardianTab(
+                            ui = ui,
+                            activeCwd = activeCwd,
+                            store = store,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
 
                     AutomationTab.WORKFLOWS -> {
                         if (workflowRuns.isEmpty()) {
@@ -1370,6 +1418,238 @@ private fun CompactActionPill(
 }
 
 @Composable
+private fun HooksRulesAndGuardianTab(
+    ui: OrbitUiState,
+    activeCwd: String,
+    store: OrbitAndroidStore,
+    modifier: Modifier = Modifier,
+) {
+    val colors = OrbitTheme.colors
+    val typography = OrbitTheme.typography
+    val cardShape = RoundedCornerShape(14.dp)
+    var showAddRule by remember { mutableStateOf(false) }
+
+    if (showAddRule) {
+        var pattern by remember { mutableStateOf("") }
+        var allow by remember { mutableStateOf(true) }
+        var projectScope by remember { mutableStateOf(true) }
+        AlertDialog(
+            onDismissRequest = { showAddRule = false },
+            containerColor = colors.elevated,
+            title = { Text(stringResource(R.string.auto_new_rule), style = typography.title) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = pattern,
+                        onValueChange = { pattern = it },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text(stringResource(R.string.auto_rule_pattern_label)) },
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(onClick = { allow = true }) {
+                            Text(
+                                stringResource(R.string.auto_rule_allow),
+                                color = if (allow) colors.directAdded else colors.fgMuted,
+                                style = if (allow) typography.subheadSemiBold else typography.subhead,
+                            )
+                        }
+                        TextButton(onClick = { allow = false }) {
+                            Text(
+                                stringResource(R.string.auto_rule_deny),
+                                color = if (!allow) colors.dangerRemoved else colors.fgMuted,
+                                style = if (!allow) typography.subheadSemiBold else typography.subhead,
+                            )
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(onClick = { projectScope = true }) {
+                            Text(
+                                stringResource(R.string.auto_rule_scope_project),
+                                color = if (projectScope) colors.fgPrimary else colors.fgMuted,
+                                style = if (projectScope) typography.subheadSemiBold else typography.subhead,
+                            )
+                        }
+                        TextButton(onClick = { projectScope = false }) {
+                            Text(
+                                stringResource(R.string.auto_rule_scope_host),
+                                color = if (!projectScope) colors.fgPrimary else colors.fgMuted,
+                                style = if (!projectScope) typography.subheadSemiBold else typography.subhead,
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = pattern.isNotBlank() && ui.selectedHostId != null,
+                    onClick = {
+                        store.upsertPermissionRule(
+                            UpsertPermissionRuleInput(
+                                id = null,
+                                scopeKind = if (projectScope) PermissionRuleScopeKind.PROJECT else PermissionRuleScopeKind.HOST,
+                                projectCwd = if (projectScope) activeCwd else null,
+                                provider = null,
+                                toolKind = PermissionRuleToolKind.SHELL,
+                                patternKind = PermissionRulePatternKind.COMMAND_PREFIX,
+                                pattern = pattern.trim(),
+                                decision = if (allow) PermissionRuleDecision.ALLOW else PermissionRuleDecision.DENY,
+                                source = PermissionRuleSource.MANUAL,
+                                note = null,
+                            )
+                        )
+                        showAddRule = false
+                    },
+                ) {
+                    Text(stringResource(R.string.nav_save))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAddRule = false }) {
+                    Text(stringResource(R.string.nav_cancel))
+                }
+            },
+        )
+    }
+
+    LazyColumn(
+        modifier = modifier.fillMaxWidth(),
+        contentPadding = PaddingValues(OrbitSpacing.lg),
+        verticalArrangement = Arrangement.spacedBy(OrbitSpacing.md),
+    ) {
+        ui.guardianSnapshot?.let { snapshot ->
+            item(key = "guardian_policy_card") {
+                val cfg = snapshot.config
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(cardShape)
+                        .background(colors.elevated, cardShape)
+                        .border(OrbitSpacing.hairline, colors.hairline, cardShape)
+                        .padding(OrbitSpacing.md),
+                    verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(
+                            text = stringResource(R.string.auto_guardian_title),
+                            style = typography.subheadSemiBold,
+                            color = colors.fgPrimary,
+                        )
+                        StatusPill(
+                            label = stringResource(
+                                R.string.auto_guardian_max_risk,
+                                cfg.autoApproveMaxRisk.name.lowercase().replaceFirstChar { it.uppercase() },
+                            ),
+                            color = colors.relay,
+                        )
+                    }
+                    ToggleRow(R.string.auto_guardian_enabled, cfg.enabled) {
+                        store.updateGuardianConfig(cfg.copy(enabled = it))
+                    }
+                    ToggleRow(R.string.auto_guardian_read_only, cfg.allowReadOnlyTools) {
+                        store.updateGuardianConfig(cfg.copy(allowReadOnlyTools = it))
+                    }
+                    ToggleRow(R.string.auto_guardian_tests, cfg.allowWorkspaceTests) {
+                        store.updateGuardianConfig(cfg.copy(allowWorkspaceTests = it))
+                    }
+                }
+            }
+        }
+
+        item(key = "permission_rules_header") {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    text = stringResource(R.string.auto_tab_hooks),
+                    style = typography.subheadSemiBold,
+                    color = colors.fgPrimary,
+                )
+                TextButton(
+                    enabled = ui.selectedHostId != null,
+                    onClick = { showAddRule = true },
+                ) {
+                    Text(stringResource(R.string.auto_new_rule))
+                }
+            }
+        }
+
+        if (ui.permissionRules.isEmpty()) {
+            item(key = "permission_rules_empty") {
+                Text(
+                    text = stringResource(R.string.auto_rules_empty),
+                    style = typography.meta,
+                    color = colors.fgMuted,
+                )
+            }
+        } else {
+            items(ui.permissionRules, key = { it.id }) { rule ->
+                val isAllow = rule.decision == PermissionRuleDecision.ALLOW
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(cardShape)
+                        .background(colors.elevated, cardShape)
+                        .border(OrbitSpacing.hairline, colors.hairline, cardShape)
+                        .padding(OrbitSpacing.md),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+                ) {
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            text = rule.pattern,
+                            style = typography.codeMedium,
+                            color = colors.fgPrimary,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            text = "${rule.toolKind.name.lowercase()} · ${rule.scopeKind.name.lowercase()} · ${rule.matchCount}×",
+                            style = typography.meta,
+                            color = colors.fgSecondary,
+                        )
+                    }
+                    StatusPill(
+                        label = stringResource(if (isAllow) R.string.auto_rule_allow else R.string.auto_rule_deny),
+                        color = if (isAllow) colors.directAdded else colors.dangerRemoved,
+                    )
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .clickable { store.deletePermissionRule(rule.id) },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.DeleteOutline,
+                            contentDescription = stringResource(R.string.nav_delete),
+                            tint = colors.dangerRemoved,
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
+            }
+        }
+
+        ui.selectedHostId?.let { host ->
+            item(key = "hooks_json_section") {
+                Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs)) {
+                    HorizontalDivider(thickness = OrbitSpacing.hairline, color = colors.hairline)
+                    Text(".orbit/hooks.json", style = typography.code, color = colors.fgSecondary)
+                    WorkspaceFileContent(host, activeCwd, ".orbit/hooks.json", store)
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun NewAutomationAction(tab: AutomationTab, ui: OrbitUiState, store: OrbitAndroidStore) {
     val label = when (tab) {
         AutomationTab.GOALS -> R.string.auto_start_goal
@@ -1379,8 +1659,12 @@ private fun NewAutomationAction(tab: AutomationTab, ui: OrbitUiState, store: Orb
         else -> return
     }
     var open by androidx.compose.runtime.remember(tab) { mutableStateOf(false) }
-    TextButton(onClick = { open = true }, enabled = ui.selectedHostId != null &&
-        (tab == AutomationTab.WORKFLOWS || ui.selectedAgentId != null)) { Text(stringResource(label)) }
+    TextButton(
+        onClick = { open = true },
+        enabled = ui.selectedHostId != null,
+    ) {
+        Text(stringResource(label))
+    }
     if (!open) return
     var input by remember { mutableStateOf("") }
     var argument by remember { mutableStateOf("") }
@@ -1389,29 +1673,71 @@ private fun NewAutomationAction(tab: AutomationTab, ui: OrbitUiState, store: Orb
         AutomationTab.WORKFLOWS, AutomationTab.MONITORS -> argument.isNotBlank()
         else -> true
     }
-    AlertDialog(onDismissRequest = { open = false }, title = { Text(stringResource(label)) }, text = {
-        Column {
-            OutlinedTextField(input, { input = it }, label = {
-                Text(stringResource(if (tab == AutomationTab.MONITORS || tab == AutomationTab.WORKFLOWS) R.string.automation_name else R.string.automation_prompt))
-            })
-            if (tab != AutomationTab.GOALS) OutlinedTextField(argument, { argument = it }, label = {
-                Text(stringResource(when (tab) {
-                    AutomationTab.TRIGGERS -> R.string.duration_seconds
-                    AutomationTab.MONITORS -> R.string.log_path
-                    else -> R.string.automation_prompt
-                }))
-            })
-        }
-    }, confirmButton = {
-        TextButton(enabled = valid, onClick = {
-            when (tab) {
-                AutomationTab.GOALS -> store.startGoalRun(input, emptyList(), null, null)
-                AutomationTab.TRIGGERS -> store.createConditionalTimer(argument.toULong(), input)
-                AutomationTab.WORKFLOWS -> store.startSimpleDagWorkflow(input, argument)
-                AutomationTab.MONITORS -> store.createMonitorWatch(input, uniffi.orbit_ffi_uniffi.MonitorKind.LogFileTail(argument, ".*"))
-                else -> Unit
+    AlertDialog(
+        onDismissRequest = { open = false },
+        title = { Text(stringResource(label)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    input,
+                    { input = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = {
+                        Text(
+                            stringResource(
+                                if (tab == AutomationTab.MONITORS || tab == AutomationTab.WORKFLOWS) {
+                                    R.string.automation_name
+                                } else {
+                                    R.string.automation_prompt
+                                }
+                            )
+                        )
+                    },
+                )
+                if (tab != AutomationTab.GOALS) {
+                    OutlinedTextField(
+                        argument,
+                        { argument = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = {
+                            Text(
+                                stringResource(
+                                    when (tab) {
+                                        AutomationTab.TRIGGERS -> R.string.duration_seconds
+                                        AutomationTab.MONITORS -> R.string.log_path
+                                        else -> R.string.automation_prompt
+                                    }
+                                )
+                            )
+                        },
+                    )
+                }
             }
-            open = false
-        }) { Text(stringResource(label)) }
-    })
+        },
+        confirmButton = {
+            TextButton(
+                enabled = valid,
+                onClick = {
+                    when (tab) {
+                        AutomationTab.GOALS -> store.startGoalRun(input, emptyList(), null, null)
+                        AutomationTab.TRIGGERS -> store.createConditionalTimer(argument.toULong(), input)
+                        AutomationTab.WORKFLOWS -> store.startSimpleDagWorkflow(input, argument)
+                        AutomationTab.MONITORS -> store.createMonitorWatch(
+                            input,
+                            uniffi.orbit_ffi_uniffi.MonitorKind.LogFileTail(argument, ".*"),
+                        )
+                        else -> Unit
+                    }
+                    open = false
+                },
+            ) {
+                Text(stringResource(label))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = { open = false }) {
+                Text(stringResource(R.string.nav_cancel))
+            }
+        },
+    )
 }

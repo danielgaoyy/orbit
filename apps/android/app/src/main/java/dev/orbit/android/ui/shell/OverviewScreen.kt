@@ -125,27 +125,64 @@ internal fun OverviewScreen(
             }
             if (pending.isNotEmpty()) {
                 item { Text(stringResource(R.string.overview_needs_decision), style = type.title) }
-                items(pending) { row ->
-                    OverviewRow(row.permission.title, row.hostName + " · " + row.agentTitle) {
+                items(
+                    items = pending,
+                    key = { "${it.hostId}::${it.agentId}::${it.permission.requestId}" },
+                ) { row ->
+                    val badgeText = when {
+                        row.isPlanApproval -> stringResource(R.string.plan_review_title)
+                        row.isSafeLowRisk -> stringResource(R.string.overview_risk_safe)
+                        row.riskLevel != null -> stringResource(
+                            R.string.overview_risk_level,
+                            row.riskLevel.name.lowercase().replaceFirstChar { it.uppercase() },
+                        )
+                        else -> null
+                    }
+                    val badgeColor = when {
+                        row.isPlanApproval -> colors.primary
+                        row.isSafeLowRisk -> colors.directAdded
+                        row.riskLevel == uniffi.orbit_ffi_uniffi.GuardianRiskLevel.HIGH ||
+                            row.riskLevel == uniffi.orbit_ffi_uniffi.GuardianRiskLevel.CRITICAL -> colors.dangerRemoved
+                        row.riskLevel == uniffi.orbit_ffi_uniffi.GuardianRiskLevel.MEDIUM -> colors.warning
+                        else -> colors.fgSecondary
+                    }
+                    val commandPreview = row.permission.commandOrPath
+                        .trim()
+                        .takeIf { it.isNotEmpty() && it != row.permission.title.trim() }
+                    OverviewRow(
+                        title = row.permission.title,
+                        detail = row.hostName + " · " + row.agentTitle,
+                        badge = badgeText,
+                        badgeColor = badgeColor,
+                        codePreview = commandPreview,
+                    ) {
                         store.selectHostAndAgent(row.hostId, row.agentId)
                     }
                 }
                 val safe = pending.filter { it.isSafeLowRisk }
                 if (safe.isNotEmpty())
                     item {
-                        TextButton(
-                            onClick = {
-                                safe
-                                    .groupBy { it.hostId }
-                                    .forEach { (host, rows) ->
-                                        store.resolvePermissionsBatchSafe(
-                                            host,
-                                            rows.map { it.agentId to it.permission },
-                                        )
-                                    }
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            TextButton(
+                                onClick = {
+                                    safe
+                                        .groupBy { it.hostId }
+                                        .forEach { (host, rows) ->
+                                            store.resolvePermissionsBatchSafe(
+                                                host,
+                                                rows.map { it.agentId to it.permission },
+                                            )
+                                        }
+                                }
+                            ) {
+                                Text(stringResource(R.string.overview_batch_approve_safe, safe.size))
                             }
-                        ) {
-                            Text(stringResource(R.string.overview_batch_approve_safe, safe.size))
+                            Text(
+                                text = stringResource(R.string.overview_batch_approve_hint),
+                                style = type.meta,
+                                color = colors.fgMuted,
+                                modifier = Modifier.padding(horizontal = 4.dp),
+                            )
                         }
                     }
             }
@@ -207,7 +244,14 @@ internal fun OverviewScreen(
 }
 
 @Composable
-internal fun OverviewRow(title: String, detail: String, onClick: () -> Unit) {
+internal fun OverviewRow(
+    title: String,
+    detail: String,
+    badge: String? = null,
+    badgeColor: androidx.compose.ui.graphics.Color = OrbitTheme.colors.fgSecondary,
+    codePreview: String? = null,
+    onClick: () -> Unit,
+) {
     val colors = OrbitTheme.colors
     val shape = RoundedCornerShape(12.dp)
     Column(
@@ -216,14 +260,33 @@ internal fun OverviewRow(title: String, detail: String, onClick: () -> Unit) {
             .border(0.5.dp, colors.hairline, shape)
             .clickable(onClick = onClick)
             .heightIn(min = 48.dp)
-            .padding(12.dp)
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(3.dp),
     ) {
-        Text(
-            title,
-            style = OrbitTheme.typography.subheadMedium,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                title,
+                style = OrbitTheme.typography.subheadMedium,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            if (!badge.isNullOrBlank()) {
+                Text(
+                    text = badge,
+                    style = OrbitTheme.typography.metaSemiBold,
+                    color = badgeColor,
+                    maxLines = 1,
+                    modifier = Modifier
+                        .background(badgeColor.copy(alpha = 0.14f), RoundedCornerShape(6.dp))
+                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                )
+            }
+        }
         Text(
             detail,
             style = OrbitTheme.typography.meta,
@@ -231,6 +294,15 @@ internal fun OverviewRow(title: String, detail: String, onClick: () -> Unit) {
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
         )
+        if (!codePreview.isNullOrBlank()) {
+            Text(
+                text = codePreview,
+                style = OrbitTheme.typography.code,
+                color = colors.fgMuted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
     }
 }
 

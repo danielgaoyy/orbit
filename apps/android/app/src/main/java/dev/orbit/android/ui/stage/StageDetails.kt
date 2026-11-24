@@ -5,6 +5,8 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
@@ -35,9 +37,12 @@ internal fun StageLineage(ui: OrbitUiState, store: OrbitAndroidStore) {
     selectedProviderChild?.let { id ->
         var events by remember(id) { mutableStateOf<List<FfiProviderSubagentEvent>>(emptyList()) }
         var error by remember(id) { mutableStateOf<String?>(null) }
+        var opened by remember(id) { mutableStateOf(false) }
         LaunchedEffect(id, ui.hostDetail?.revision, ui.agentStage?.revision) {
             try {
-                events = store.providerTimeline(host, agent.agentId, id, events.isEmpty())
+                val shouldOpen = !opened
+                events = store.providerTimeline(host, agent.agentId, id, shouldOpen)
+                opened = true
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -96,7 +101,10 @@ internal fun StageLineage(ui: OrbitUiState, store: OrbitAndroidStore) {
 }
 
 @Composable
-internal fun AgentMessageBody(message: FfiTimelineItem.AgentMessage) {
+internal fun AgentMessageBody(
+    message: FfiTimelineItem.AgentMessage,
+    onInterruptDeliver: (() -> Unit)? = null,
+) {
     MarkdownBlocks(blocks = message.blocks, fallbackText = message.text)
     message.deliveryStatus?.let { status ->
         val label =
@@ -106,26 +114,47 @@ internal fun AgentMessageBody(message: FfiTimelineItem.AgentMessage) {
                 FfiAgentMessageDeliveryStatus.SETTLED -> R.string.stage_delivery_settled
                 FfiAgentMessageDeliveryStatus.DROPPED -> R.string.stage_delivery_dropped
             }
-        Text(
-            stringResource(label),
-            Modifier.border(0.5.dp, OrbitTheme.colors.hairline, RoundedCornerShape(6.dp))
-                .padding(horizontal = 8.dp, vertical = 2.dp),
-            style = OrbitTheme.typography.meta,
-            color =
-                if (status == FfiAgentMessageDeliveryStatus.DROPPED) OrbitTheme.colors.dangerRemoved
-                else OrbitTheme.colors.fgSecondary,
-        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                stringResource(label),
+                Modifier.border(0.5.dp, OrbitTheme.colors.hairline, RoundedCornerShape(6.dp))
+                    .padding(horizontal = 8.dp, vertical = 2.dp),
+                style = OrbitTheme.typography.meta,
+                color =
+                    if (status == FfiAgentMessageDeliveryStatus.DROPPED) OrbitTheme.colors.dangerRemoved
+                    else OrbitTheme.colors.fgSecondary,
+            )
+            if (status == FfiAgentMessageDeliveryStatus.QUEUED && onInterruptDeliver != null) {
+                TextButton(
+                    onClick = onInterruptDeliver,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                ) {
+                    Text(
+                        stringResource(R.string.stage_interrupt_deliver),
+                        style = OrbitTheme.typography.metaMedium,
+                        color = OrbitTheme.colors.primary,
+                    )
+                }
+            }
+        }
     }
 }
 
 @Composable
 internal fun PlanReview(plan: PlanApprovalSpec, store: OrbitAndroidStore) =
     key(plan.requestId) {
-        var expanded by remember { mutableStateOf(false) }
-        var edits by remember { mutableStateOf(plan.planMarkdown) }
-        var feedback by remember { mutableStateOf("") }
-        var mode by remember { mutableStateOf<SessionMode>(SessionMode.Default) }
-        var editing by remember { mutableStateOf(false) }
+        var expanded by rememberSaveable(plan.requestId) { mutableStateOf(false) }
+        var edits by rememberSaveable(plan.requestId) { mutableStateOf(plan.planMarkdown) }
+        var feedback by rememberSaveable(plan.requestId) { mutableStateOf("") }
+        var mode by remember(plan.requestId) { mutableStateOf<SessionMode>(SessionMode.Default) }
+        var editing by rememberSaveable(plan.requestId) { mutableStateOf(false) }
+        val isEdited = remember(plan.planMarkdown, edits) {
+            plan.planMarkdown.replace("\r\n", "\n").trim() != edits.replace("\r\n", "\n").trim()
+        }
+        val canRequestChanges = feedback.isNotBlank() || isEdited
         Surface(
             onClick = { expanded = true },
             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
@@ -156,7 +185,10 @@ internal fun PlanReview(plan: PlanApprovalSpec, store: OrbitAndroidStore) =
                 onDismissRequest = { expanded = false },
                 title = { Text(stringResource(R.string.plan_review_title)) },
                 text = {
-                    Column(Modifier.verticalScroll(rememberScrollState())) {
+                    Column(
+                        modifier = Modifier.verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
                         TextButton(onClick = { editing = !editing }) {
                             Text(
                                 stringResource(
@@ -170,11 +202,13 @@ internal fun PlanReview(plan: PlanApprovalSpec, store: OrbitAndroidStore) =
                             OutlinedTextField(
                                 edits,
                                 { edits = it },
+                                modifier = Modifier.fillMaxWidth(),
                                 label = { Text(stringResource(R.string.plan_tab_edit)) },
                             )
                         OutlinedTextField(
                             feedback,
                             { feedback = it },
+                            modifier = Modifier.fillMaxWidth(),
                             label = { Text(stringResource(R.string.plan_feedback_placeholder)) },
                         )
                         TextButton(
@@ -192,6 +226,44 @@ internal fun PlanReview(plan: PlanApprovalSpec, store: OrbitAndroidStore) =
                                         else R.string.mode_accept_edits
                                     )
                             )
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            OutlinedButton(
+                                enabled = canRequestChanges,
+                                onClick = {
+                                    store.resolvePlanApproval(
+                                        plan.requestId,
+                                        PlanApprovalAction.REQUEST_CHANGES,
+                                        plan.planMarkdown,
+                                        edits,
+                                        feedback,
+                                    )
+                                    expanded = false
+                                },
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Text(stringResource(R.string.plan_request_changes), maxLines = 1)
+                            }
+                            TextButton(
+                                onClick = {
+                                    store.resolvePlanApproval(
+                                        plan.requestId,
+                                        PlanApprovalAction.DISMISS,
+                                        plan.planMarkdown,
+                                        edits,
+                                        "",
+                                    )
+                                    expanded = false
+                                }
+                            ) {
+                                Text(
+                                    stringResource(R.string.plan_dismiss),
+                                    color = OrbitTheme.colors.dangerRemoved,
+                                )
+                            }
                         }
                     }
                 },
@@ -213,19 +285,8 @@ internal fun PlanReview(plan: PlanApprovalSpec, store: OrbitAndroidStore) =
                     }
                 },
                 dismissButton = {
-                    TextButton(
-                        onClick = {
-                            store.resolvePlanApproval(
-                                plan.requestId,
-                                PlanApprovalAction.REQUEST_CHANGES,
-                                plan.planMarkdown,
-                                edits,
-                                feedback,
-                            )
-                            expanded = false
-                        }
-                    ) {
-                        Text(stringResource(R.string.plan_request_changes))
+                    TextButton(onClick = { expanded = false }) {
+                        Text(stringResource(R.string.nav_cancel))
                     }
                 },
             )

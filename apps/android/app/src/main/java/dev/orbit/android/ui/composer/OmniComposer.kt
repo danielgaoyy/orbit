@@ -79,7 +79,9 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -118,6 +120,7 @@ import dev.orbit.android.ui.theme.OrbitSpacing
 import dev.orbit.android.ui.theme.OrbitTheme
 import dev.orbit.android.ui.theme.orbitSemanticFileIcon
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.orbit_ffi_uniffi.FfiHostDetail
@@ -252,8 +255,8 @@ fun OmniComposer(
     onRemoveStagedAttachment: (String) -> Unit = {},
     onRegisterInlineMention: (token: String, kind: String, path: String?, staged: Boolean, label: String) -> Unit = { _, _, _, _, _ -> },
     slashCommands: List<FfiSlashCommand> = emptyList(),
-    onFilterSlashCommands: (String) -> List<FfiSlashCommand> = { emptyList() },
-    onRankMentions: (String) -> List<FfiMentionCandidate> = { emptyList() },
+    onFilterSlashCommands: suspend (String) -> List<FfiSlashCommand> = { emptyList() },
+    onRankMentions: suspend (String) -> List<FfiMentionCandidate> = { emptyList() },
     onExecuteSlashCommand: (FfiSlashCommand) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
@@ -327,19 +330,29 @@ fun OmniComposer(
         )
     }
 
-    val filteredSlashCommands = remember(trigger, slashCommands) {
+    var filteredSlashCommands by remember { mutableStateOf<List<FfiSlashCommand>>(emptyList()) }
+    LaunchedEffect(trigger, slashCommands) {
         if (trigger is AutocompleteTrigger.Slash) {
-            onFilterSlashCommands(trigger.query)
+            if (trigger.query.isEmpty()) {
+                filteredSlashCommands = slashCommands
+            } else {
+                delay(40)
+                filteredSlashCommands = onFilterSlashCommands(trigger.query)
+            }
         } else {
-            emptyList()
+            filteredSlashCommands = emptyList()
         }
     }
 
-    val rankedMentionCandidates = remember(trigger, workspaceFiles, activeCwd) {
+    var rankedMentionCandidates by remember { mutableStateOf<List<FfiMentionCandidate>>(emptyList()) }
+    LaunchedEffect(trigger, workspaceFiles, activeCwd) {
         if (trigger is AutocompleteTrigger.Mention) {
-            onRankMentions(trigger.query)
+            if (trigger.query.isNotEmpty()) {
+                delay(50)
+            }
+            rankedMentionCandidates = onRankMentions(trigger.query)
         } else {
-            emptyList()
+            rankedMentionCandidates = emptyList()
         }
     }
 
@@ -718,8 +731,14 @@ fun OmniComposer(
                 // Inline Input Row (`/` directive prefix lives INSIDE the input row!)
                 val placeholderText = "Ask anything, @ to mention, / for actions"
 
-                if (listening) Text(androidx.compose.ui.res.stringResource(dev.orbit.android.R.string.composer_voice_listening),
-                    style = typography.meta, color = colors.fgSecondary)
+                if (listening) {
+                    Text(
+                        text = androidx.compose.ui.res.stringResource(dev.orbit.android.R.string.composer_voice_listening),
+                        style = typography.meta,
+                        color = colors.fgSecondary,
+                        modifier = Modifier.padding(horizontal = OrbitSpacing.lg, vertical = 2.dp),
+                    )
+                }
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -805,41 +824,49 @@ fun OmniComposer(
                     }
                 }
 
-                // Bottom Toolbar
+                // Bottom Toolbar (crisp 32-34.dp visual controls centered inside 48.dp touch hitboxes)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(start = 8.dp, end = 8.dp, bottom = 6.dp)
+                        .padding(start = 4.dp, end = 4.dp, bottom = 2.dp)
                         .height(48.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    // Left Cluster: `+` Attachment Menu, Model Pill, Permission Pill
+                    // Left Cluster: `+` Attachment Menu, Model Pill, Fast Pill, Permission Shield
                     Row(
                         modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+                        horizontalArrangement = Arrangement.spacedBy(2.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         // `+` Attachment Menu Button (ONLY Photos, Camera, Files)
                         Box {
                             Box(
                                 modifier = Modifier
+                                    .minimumInteractiveComponentSize()
                                     .size(48.dp)
                                     .clip(CircleShape)
-                                    .background(colors.subtleFill, CircleShape)
-                                    .border(OrbitSpacing.hairline, colors.hairline, CircleShape)
                                     .clickable(enabled = hasHost) {
                                         haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                         plusMenuExpanded = true
                                     },
                                 contentAlignment = Alignment.Center,
                             ) {
-                                Icon(
-                                    imageVector = Icons.Outlined.Add,
-                                    contentDescription = "Add attachment",
-                                    tint = if (hasHost) colors.fgPrimary else colors.fgMuted,
-                                    modifier = Modifier.size(OrbitSpacing.iconMd),
-                                )
+                                Box(
+                                    modifier = Modifier
+                                        .size(34.dp)
+                                        .clip(CircleShape)
+                                        .background(colors.subtleFill, CircleShape)
+                                        .border(OrbitSpacing.hairline, colors.hairline, CircleShape),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.Add,
+                                        contentDescription = "Add attachment",
+                                        tint = if (hasHost) colors.fgPrimary else colors.fgMuted,
+                                        modifier = Modifier.size(OrbitSpacing.iconMd),
+                                    )
+                                }
                             }
 
                             DropdownMenu(
@@ -925,90 +952,108 @@ fun OmniComposer(
                             }
                         }
 
-                        // Model Pill with OrbitProviderIcon
+                        // Model Pill with OrbitProviderIcon (34.dp visual pill inside 48.dp touch target)
                         val pillShape = RoundedCornerShape(10.dp)
-                        Row(
+                        Box(
                             modifier = Modifier
+                                .minimumInteractiveComponentSize()
                                 .height(48.dp)
-                                .widthIn(min = 48.dp, max = 224.dp)
                                 .clip(pillShape)
-                                .background(colors.subtleFill, pillShape)
-                                .border(OrbitSpacing.hairline, colors.hairline, pillShape)
                                 .clickable {
                                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                     onOpenModelSelector()
-                                }
-                                .padding(horizontal = OrbitSpacing.sm),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                },
+                            contentAlignment = Alignment.Center,
                         ) {
-                            OrbitProviderIcon(
-                                provider = draft.provider,
-                                size = 14.dp,
-                            )
-                            Text(
-                                text = modelLabel,
-                                style = typography.metaMedium,
-                                color = colors.fgPrimary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f, fill = false),
-                            )
-                            if (effortTag != null) {
+                            Row(
+                                modifier = Modifier
+                                    .height(34.dp)
+                                    .widthIn(min = 48.dp, max = 224.dp)
+                                    .clip(pillShape)
+                                    .background(colors.subtleFill, pillShape)
+                                    .border(OrbitSpacing.hairline, colors.hairline, pillShape)
+                                    .padding(horizontal = OrbitSpacing.sm),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                            ) {
+                                OrbitProviderIcon(
+                                    provider = draft.provider,
+                                    size = 14.dp,
+                                )
                                 Text(
-                                    text = effortTag,
-                                    style = typography.meta,
-                                    color = colors.fgMuted,
+                                    text = modelLabel,
+                                    style = typography.metaMedium,
+                                    color = colors.fgPrimary,
                                     maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f, fill = false),
                                 )
-                            }
-                            Icon(
-                                imageVector = Icons.Outlined.KeyboardArrowDown,
-                                contentDescription = null,
-                                tint = colors.fgMuted,
-                                modifier = Modifier.size(14.dp),
-                            )
-                        }
-                        // Fast Mode Toggle Pill
-                        val fastPillShape = RoundedCornerShape(10.dp)
-                        Row(
-                            modifier = Modifier
-                                .height(48.dp)
-                                .clip(fastPillShape)
-                                .background(
-                                    if (draft.fastMode) colors.warning.copy(alpha = 0.16f) else Color.Transparent,
-                                    fastPillShape,
-                                )
-                                .border(
-                                    OrbitSpacing.hairline,
-                                    if (draft.fastMode) colors.warning.copy(alpha = 0.45f) else Color.Transparent,
-                                    fastPillShape,
-                                )
-                                .clickable {
-                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    onToggleFastMode()
+                                if (effortTag != null) {
+                                    Text(
+                                        text = effortTag,
+                                        style = typography.meta,
+                                        color = colors.fgMuted,
+                                        maxLines = 1,
+                                    )
                                 }
-                                .padding(horizontal = if (draft.fastMode) 7.dp else 6.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(2.dp),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Outlined.Bolt,
-                                contentDescription = if (draft.fastMode) "Fast mode on" else "Fast mode off",
-                                tint = if (draft.fastMode) colors.warning else colors.fgMuted,
-                                modifier = Modifier.size(OrbitSpacing.iconSm),
-                            )
-                            if (draft.fastMode) {
-                                Text(
-                                    text = "Fast",
-                                    style = typography.metaSemiBold,
-                                    color = colors.warning,
-                                    maxLines = 1,
+                                Icon(
+                                    imageVector = Icons.Outlined.KeyboardArrowDown,
+                                    contentDescription = null,
+                                    tint = colors.fgMuted,
+                                    modifier = Modifier.size(14.dp),
                                 )
                             }
                         }
 
-                        // Compact Access Permissions Shield Button + Unified Menu
+                        // Fast Mode Toggle Pill (32.dp visual pill inside 48.dp touch target)
+                        val fastPillShape = RoundedCornerShape(10.dp)
+                        Box(
+                            modifier = Modifier
+                                .minimumInteractiveComponentSize()
+                                .height(48.dp)
+                                .widthIn(min = 48.dp)
+                                .clip(fastPillShape)
+                                .clickable {
+                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    onToggleFastMode()
+                                },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .height(32.dp)
+                                    .clip(fastPillShape)
+                                    .background(
+                                        if (draft.fastMode) colors.warning.copy(alpha = 0.16f) else Color.Transparent,
+                                        fastPillShape,
+                                    )
+                                    .border(
+                                        OrbitSpacing.hairline,
+                                        if (draft.fastMode) colors.warning.copy(alpha = 0.45f) else Color.Transparent,
+                                        fastPillShape,
+                                    )
+                                    .padding(horizontal = if (draft.fastMode) 8.dp else 7.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.Bolt,
+                                    contentDescription = if (draft.fastMode) "Fast mode on" else "Fast mode off",
+                                    tint = if (draft.fastMode) colors.warning else colors.fgMuted,
+                                    modifier = Modifier.size(OrbitSpacing.iconSm),
+                                )
+                                if (draft.fastMode) {
+                                    Text(
+                                        text = "Fast",
+                                        style = typography.metaSemiBold,
+                                        color = colors.warning,
+                                        maxLines = 1,
+                                    )
+                                }
+                            }
+                        }
+
+                        // Compact Access Permissions Shield Button + Unified Menu (32.dp circle inside 48.dp touch target)
                         Box {
                             val modeIcon = when (normalizedMode) {
                                 FfiSessionMode.Auto -> Icons.Outlined.AutoAwesome
@@ -1018,6 +1063,7 @@ fun OmniComposer(
                             }
                             Box(
                                 modifier = Modifier
+                                    .minimumInteractiveComponentSize()
                                     .size(48.dp)
                                     .clip(CircleShape)
                                     .clickable {
@@ -1026,12 +1072,19 @@ fun OmniComposer(
                                     },
                                 contentAlignment = Alignment.Center,
                             ) {
-                                Icon(
-                                    imageVector = modeIcon,
-                                    contentDescription = "Access Permissions: ${OrbitFormatters.sessionModeLabel(normalizedMode)}",
-                                    tint = if (normalizedMode == FfiSessionMode.Auto) colors.relay else colors.fgSecondary,
-                                    modifier = Modifier.size(OrbitSpacing.iconSm),
-                                )
+                                Box(
+                                    modifier = Modifier
+                                        .size(32.dp)
+                                        .clip(CircleShape),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Icon(
+                                        imageVector = modeIcon,
+                                        contentDescription = "Access Permissions: ${OrbitFormatters.sessionModeLabel(normalizedMode)}",
+                                        tint = if (normalizedMode == FfiSessionMode.Auto) colors.relay else colors.fgSecondary,
+                                        modifier = Modifier.size(OrbitSpacing.iconSm),
+                                    )
+                                }
                             }
 
                             OrbitCompactDropdownMenu(

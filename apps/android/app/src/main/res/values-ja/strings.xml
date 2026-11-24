@@ -217,4 +217,32 @@
     <string name="terminal_busy">ターミナルの入力バッファーがいっぱいです</string>
     <string name="create_hooks_file">プロジェクトのフックファイルを作成</string>
     <string name="sync_qr_failed">デバイスリンクを生成できませんでした。同期状態を確認して再試行してください。</string>
+
+    <!-- 外部ディープリンク確認 -->
+    <string name="deeplink_confirm_pair_title">外部リンクからホストをペアリングしますか？</string>
+    <string name="deeplink_confirm_pair_body">外部リンクが %1$s とのペアリングを要求しています。ご自身のワークステーションから開始した場合のみ続行してください。</string>
+    <string name="deeplink_confirm_sync_title">クラウド同期アカウントを切り替えますか？</string>
+    <string name="deeplink_confirm_sync_body">この外部デバイスリンク（%1$s）を取り込むと、クラウド同期アカウントが切り替わり、ローカルのペアリング済みホストがそのアカウントの暗号化ボルトへ統合・アップロードされます。信頼できるリンクの場合のみ続行してください。</string>
+    <string name="deeplink_confirm_sync_action">取り込んで切替</string>
+
+    <!-- 概要・検索・Git・自動化の追加項目 -->
+    <string name="overview_router_setup_toast">先にパーソナルルーターホストを設定して有効にしてください。</string>
+    <string name="overview_risk_safe">低リスク · 安全</string>
+    <string name="overview_risk_level">%1$s リスク</string>
+    <string name="search_remote_failed_summary">%1$d 台のリモートホストを検索 · %2$d 台失敗</string>
+    <string name="git_stashes_section">スタッシュ</string>
+    <string name="auto_empty_goals_title">稼働中のゴールはありません</string>
+    <string name="auto_empty_goals_subtitle">このホストで実行中の自律ゴールがここに表示されます。</string>
+    <string name="auto_empty_monitors_title">稼働中の監視はありません</string>
+    <string name="auto_empty_monitors_subtitle">ログ監視やヘルスチェックを開始するとここに表示されます。</string>
+    <string name="auto_guardian_enabled">Guardian 自動レビューを有効化</string>
+    <string name="auto_guardian_read_only">読み取り専用ツールを自動承認</string>
+    <string name="auto_guardian_tests">ワークスペーステストを自動承認</string>
+    <string name="auto_guardian_max_risk">上限: %1$s</string>
+    <string name="auto_rules_empty">ホストまたはプロジェクトの権限ルールはまだ設定されていません。</string>
+    <string name="auto_rule_pattern_label">コマンド接頭辞またはパターン</string>
+    <string name="auto_rule_allow">許可</string>
+    <string name="auto_rule_deny">拒否</string>
+    <string name="auto_rule_scope_project">プロジェクト</string>
+    <string name="auto_rule_scope_host">ホスト全体</string>
 </resources>

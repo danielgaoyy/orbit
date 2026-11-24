@@ -11,6 +11,7 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
@@ -19,8 +20,11 @@ import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material.icons.outlined.Stop
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
@@ -44,6 +48,11 @@ enum class VoiceNavigation(val phrase: Int) {
         }
     }
 }
+
+internal fun isBenignSpeechError(error: Int): Boolean =
+    error == SpeechRecognizer.ERROR_NO_MATCH ||
+        error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
+        error == SpeechRecognizer.ERROR_CLIENT
 
 /** Recognition supplies an editable draft. Sending always requires a separate user gesture. */
 @Composable
@@ -121,7 +130,9 @@ internal fun ComposerAction(
                     override fun onError(error: Int) {
                         if (session === recognizer) {
                             finish()
-                            unavailable()
+                            if (!isBenignSpeechError(error)) {
+                                unavailable()
+                            }
                         }
                     }
 
@@ -150,6 +161,13 @@ internal fun ComposerAction(
         }
     }
 
+    // Auto-cancel any active/pending speech session as soon as the user starts typing or agent runs
+    LaunchedEffect(hasDraft, running) {
+        if ((hasDraft || running) && session != null) {
+            finish()
+        }
+    }
+
     val permission =
         rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted && enabled && !hasDraft && !running) start()
@@ -171,19 +189,21 @@ internal fun ComposerAction(
             finish()
         }
     }
-    val action = ComposerActionReducer.resolve(recording, running, hasDraft)
+    val voiceSessionActive = session != null
+    val action = ComposerActionReducer.resolve(voiceSessionActive, running, hasDraft)
     val (icon, label) =
         when (action) {
             ComposerRightActionState.VOICE -> Icons.Outlined.Mic to R.string.composer_voice_start
             ComposerRightActionState.RECORDING_STOP ->
-                Icons.Outlined.Stop to R.string.composer_voice_stop
+                Icons.Outlined.Stop to
+                    if (recording) R.string.composer_voice_stop else R.string.composer_voice_cancel
             ComposerRightActionState.STOP -> Icons.Outlined.Stop to R.string.composer_stop
             ComposerRightActionState.QUEUE -> Icons.Outlined.ArrowUpward to R.string.composer_queue
             ComposerRightActionState.SEND -> Icons.Outlined.ArrowUpward to R.string.composer_send
         }
     IconButton(
-        enabled = enabled && (session == null || recording),
-        modifier = Modifier.size(48.dp).background(OrbitTheme.colors.primary, CircleShape),
+        enabled = enabled,
+        modifier = Modifier.minimumInteractiveComponentSize().size(48.dp),
         onClick = {
             when (action) {
                 ComposerRightActionState.VOICE ->
@@ -195,12 +215,36 @@ internal fun ComposerAction(
                     )
                         start()
                     else permission.launch(Manifest.permission.RECORD_AUDIO)
-                ComposerRightActionState.RECORDING_STOP -> session?.stopListening()
+                ComposerRightActionState.RECORDING_STOP -> {
+                    if (recording) {
+                        recording = false
+                        listening(false)
+                        runCatching { session?.stopListening() }.onFailure { finish() }
+                    } else {
+                        finish()
+                    }
+                }
                 ComposerRightActionState.STOP -> onInterrupt()
                 else -> onSubmit()
             }
         },
     ) {
-        Icon(icon, stringResource(label), tint = OrbitTheme.colors.onPrimary)
+        Box(
+            modifier = Modifier
+                .size(34.dp)
+                .clip(CircleShape)
+                .background(
+                    if (enabled) OrbitTheme.colors.primary else OrbitTheme.colors.subtleFill,
+                    CircleShape,
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = stringResource(label),
+                tint = if (enabled) OrbitTheme.colors.onPrimary else OrbitTheme.colors.fgMuted,
+                modifier = Modifier.size(18.dp),
+            )
+        }
     }
 }

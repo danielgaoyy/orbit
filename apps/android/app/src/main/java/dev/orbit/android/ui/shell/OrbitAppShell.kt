@@ -81,6 +81,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import dev.orbit.android.notifications.PendingDeepLinkConfirmation
+import dev.orbit.android.notifications.PendingDeepLinkKind
 import dev.orbit.android.store.OrbitAndroidStore
 import dev.orbit.android.store.OrbitFormatters
 import dev.orbit.android.store.OrbitUiState
@@ -520,7 +522,7 @@ fun OrbitAppShell(
         }
 
         // Non-overlapping transient toast pill positioned strictly below the 52.dp top header bar (padding(top = 56.dp))
-        val stageStartInset = effectiveDrawerWidth
+        val stageStartInset = effectiveDrawerWidth + (book?.hingeGapDp ?: 0.dp)
         val stageEndInset = if (supportsThreePane && ui.isDiffInspectorOpen) {
             INLINE_DIFF_PANE_WIDTH
         } else {
@@ -871,8 +873,86 @@ fun OrbitAppShell(
                 onDismiss = { showForkDialog = false },
             )
         }
+
+        ui.pendingDeepLinkConfirmation?.let { pending ->
+            ExternalDeepLinkConfirmationDialog(
+                pending = pending,
+                onConfirm = { store.confirmPendingDeepLink() },
+                onDismiss = { store.dismissPendingDeepLink() },
+            )
+        }
     }
     }
+}
+
+@Composable
+private fun ExternalDeepLinkConfirmationDialog(
+    pending: PendingDeepLinkConfirmation,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val colors = OrbitTheme.colors
+    val typography = OrbitTheme.typography
+    val isSyncTakeover = pending.kind == PendingDeepLinkKind.IMPORT_CLOUD_SYNC_DEVICE_LINK
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = colors.elevated,
+        titleContentColor = colors.fgPrimary,
+        textContentColor = colors.fgSecondary,
+        title = {
+            Text(
+                text = stringResource(
+                    if (isSyncTakeover) R.string.deeplink_confirm_sync_title
+                    else R.string.deeplink_confirm_pair_title
+                ),
+                style = typography.title,
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm)) {
+                Text(
+                    text = stringResource(
+                        if (isSyncTakeover) R.string.deeplink_confirm_sync_body
+                        else R.string.deeplink_confirm_pair_body,
+                        pending.endpointSummary,
+                    ),
+                    style = typography.subhead,
+                    color = colors.fgSecondary,
+                )
+                Text(
+                    text = pending.endpointSummary,
+                    style = typography.code,
+                    color = colors.fgPrimary,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(colors.subtleFill, RoundedCornerShape(8.dp))
+                        .padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.xs),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text(
+                    text = stringResource(
+                        if (isSyncTakeover) R.string.deeplink_confirm_sync_action
+                        else R.string.nav_pair_host
+                    ),
+                    color = if (isSyncTakeover) colors.dangerRemoved else colors.primary,
+                    style = typography.subheadSemiBold,
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(
+                    text = stringResource(R.string.nav_cancel),
+                    color = colors.fgSecondary,
+                    style = typography.subheadMedium,
+                )
+            }
+        },
+    )
 }
 
 @Composable

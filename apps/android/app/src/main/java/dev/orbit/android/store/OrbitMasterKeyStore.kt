@@ -31,7 +31,22 @@ object MasterKeyEnvelopeCodec {
         val version: Byte,
         val iv: ByteArray,
         val ciphertext: ByteArray,
-    )
+    ) {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is SealedEnvelope) return false
+            return version == other.version &&
+                iv.contentEquals(other.iv) &&
+                ciphertext.contentEquals(other.ciphertext)
+        }
+
+        override fun hashCode(): Int {
+            var result = version.toInt()
+            result = 31 * result + iv.contentHashCode()
+            result = 31 * result + ciphertext.contentHashCode()
+            return result
+        }
+    }
 
     fun generateRandomMasterKey(rng: SecureRandom = SecureRandom()): ByteArray =
         ByteArray(MASTER_KEY_BYTES).also { rng.nextBytes(it) }
@@ -44,25 +59,33 @@ object MasterKeyEnvelopeCodec {
             "Invalid ciphertext length (${ciphertext.size} bytes)"
         }
         val raw = ByteArray(1 + iv.size + ciphertext.size)
-        raw[0] = FORMAT_VERSION
-        System.arraycopy(iv, 0, raw, 1, iv.size)
-        System.arraycopy(ciphertext, 0, raw, 1 + iv.size, ciphertext.size)
-        return Base64.getEncoder().encodeToString(raw)
+        return try {
+            raw[0] = FORMAT_VERSION
+            System.arraycopy(iv, 0, raw, 1, iv.size)
+            System.arraycopy(ciphertext, 0, raw, 1 + iv.size, ciphertext.size)
+            Base64.getEncoder().encodeToString(raw)
+        } finally {
+            raw.fill(0)
+        }
     }
 
     fun decodeEnvelope(encoded: String): SealedEnvelope {
         val raw = Base64.getDecoder().decode(encoded.trim())
-        val minLen = 1 + GCM_IV_BYTES + MASTER_KEY_BYTES + GCM_TAG_BYTES
-        require(raw.size == minLen) {
-            "Corrupt master key envelope (${raw.size} bytes)"
+        return try {
+            val minLen = 1 + GCM_IV_BYTES + MASTER_KEY_BYTES + GCM_TAG_BYTES
+            require(raw.size == minLen) {
+                "Corrupt master key envelope (${raw.size} bytes)"
+            }
+            val version = raw[0]
+            require(version == FORMAT_VERSION) {
+                "Unsupported master key envelope version: $version"
+            }
+            val iv = raw.copyOfRange(1, 1 + GCM_IV_BYTES)
+            val ciphertext = raw.copyOfRange(1 + GCM_IV_BYTES, raw.size)
+            SealedEnvelope(version = version, iv = iv, ciphertext = ciphertext)
+        } finally {
+            raw.fill(0)
         }
-        val version = raw[0]
-        require(version == FORMAT_VERSION) {
-            "Unsupported master key envelope version: $version"
-        }
-        val iv = raw.copyOfRange(1, 1 + GCM_IV_BYTES)
-        val ciphertext = raw.copyOfRange(1 + GCM_IV_BYTES, raw.size)
-        return SealedEnvelope(version = version, iv = iv, ciphertext = ciphertext)
     }
 
     fun wrapWithKey(plaintextKey: ByteArray, wrappingKey: SecretKey): String {
@@ -71,6 +94,7 @@ object MasterKeyEnvelopeCodec {
         }
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, wrappingKey)
+        cipher.updateAAD(byteArrayOf(FORMAT_VERSION))
         val iv = cipher.iv
         require(iv != null && iv.size == GCM_IV_BYTES) {
             "AES-GCM provider returned invalid IV"
@@ -83,6 +107,7 @@ object MasterKeyEnvelopeCodec {
         val env = decodeEnvelope(encoded)
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.DECRYPT_MODE, wrappingKey, GCMParameterSpec(GCM_TAG_BITS, env.iv))
+        cipher.updateAAD(byteArrayOf(env.version))
         val plaintext = cipher.doFinal(env.ciphertext)
         require(plaintext.size == MASTER_KEY_BYTES) {
             "Unwrapped master key length mismatch (${plaintext.size} bytes)"

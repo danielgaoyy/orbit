@@ -1,10 +1,14 @@
 package dev.orbit.android.notifications
 
 import android.content.Context
+import com.google.firebase.FirebaseApp
+import com.google.firebase.messaging.FirebaseMessaging
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.net.URLDecoder
+import java.util.Base64
+import java.util.Locale
 
 /**
  * Canonical Orbit push event categories emitted by `orbit-daemon` (`crates/orbit-protocol/src/push.rs`).
@@ -55,6 +59,140 @@ sealed interface OrbitDeepLinkAction {
         val hostId: String,
         val eventKind: OrbitPushEventKind? = null,
     ) : OrbitDeepLinkAction
+}
+
+enum class PendingDeepLinkKind {
+    PAIR_HOST,
+    IMPORT_CLOUD_SYNC_DEVICE_LINK,
+}
+
+data class PendingDeepLinkConfirmation(
+    val kind: PendingDeepLinkKind,
+    val uri: String,
+    val endpointSummary: String,
+)
+
+sealed interface ExternalDeepLinkDisposition {
+    data class RequireConfirmation(val confirmation: PendingDeepLinkConfirmation) : ExternalDeepLinkDisposition
+    data class ImmediateNavigate(val action: OrbitDeepLinkAction) : ExternalDeepLinkDisposition
+}
+
+/**
+ * Security boundary for external `ACTION_VIEW` deep links.
+ *
+ * State-mutating links (`orbit://pair/...`, `orbit://sync-login?...`) MUST NEVER execute
+ * automatically from external intents; they always yield [ExternalDeepLinkDisposition.RequireConfirmation]
+ * with a non-secret summary for explicit user approval.
+ */
+object OrbitDeepLinkSecurityPolicy {
+    private val JSON_STRING_FIELD = Regex("\"([A-Za-z0-9_]+)\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
+    private val JSON_ENDPOINTS_ARRAY = Regex("\"direct_endpoints\"\\s*:\\s*\\[([^\\]]*)]")
+    private val JSON_QUOTED_ITEM = Regex("\"((?:[^\"\\\\]|\\\\.)*)\"")
+
+    fun resolveExternalAction(rawUri: String?): ExternalDeepLinkDisposition? {
+        val action = OrbitPushRouter.parseDeepLink(rawUri) ?: return null
+        return when (action) {
+            is OrbitDeepLinkAction.PairHost -> ExternalDeepLinkDisposition.RequireConfirmation(
+                PendingDeepLinkConfirmation(
+                    kind = PendingDeepLinkKind.PAIR_HOST,
+                    uri = action.uri,
+                    endpointSummary = summarizePairUri(action.uri),
+                )
+            )
+            is OrbitDeepLinkAction.ImportDeviceLink -> ExternalDeepLinkDisposition.RequireConfirmation(
+                PendingDeepLinkConfirmation(
+                    kind = PendingDeepLinkKind.IMPORT_CLOUD_SYNC_DEVICE_LINK,
+                    uri = action.uri,
+                    endpointSummary = summarizeSyncLinkUri(action.uri),
+                )
+            )
+            is OrbitDeepLinkAction.OpenThread,
+            is OrbitDeepLinkAction.OpenHost -> ExternalDeepLinkDisposition.ImmediateNavigate(action)
+        }
+    }
+
+    internal fun summarizePairUri(rawUri: String): String {
+        val trimmed = rawUri.trim()
+        val payloadB64 = trimmed
+            .substringAfter("orbit://pair/", missingDelimiterValue = "")
+            .substringBefore('?')
+            .substringBefore('#')
+            .trim()
+        val json = decodeBase64UrlUtf8(payloadB64)
+        if (json != null) {
+            val fields = extractSafeJsonFields(json)
+            val hostname = fields["hostname"]?.takeIf { it.isNotBlank() }
+            val hostId = fields["host_id"]?.takeIf { it.isNotBlank() }
+            val endpoints = extractStringArray(json, JSON_ENDPOINTS_ARRAY).take(2)
+            val relay = fields["relay_url"]?.takeIf { it.isNotBlank() }
+            val label = hostname ?: hostId
+            val targets = buildList {
+                addAll(endpoints)
+                if (relay != null) add(relay)
+            }
+            if (label != null && targets.isNotEmpty()) {
+                return "$label (${targets.joinToString(", ")})"
+            }
+            if (label != null) return label
+            if (targets.isNotEmpty()) return targets.joinToString(", ")
+        }
+        return "Unverified host pairing link"
+    }
+
+    internal fun summarizeSyncLinkUri(rawUri: String): String {
+        val query = rawUri.substringAfter('?', missingDelimiterValue = "").substringBefore('#')
+        val pValue = query.split('&')
+            .mapNotNull { pair ->
+                val idx = pair.indexOf('=')
+                if (idx > 0 && pair.substring(0, idx) == "p") pair.substring(idx + 1) else null
+            }
+            .firstOrNull()
+            .orEmpty()
+        val json = decodeBase64UrlUtf8(pValue)
+        if (json != null) {
+            val fields = extractSafeJsonFields(json)
+            val login = fields["github_login"]?.takeIf { it.isNotBlank() }?.let {
+                if (it.startsWith("@")) it else "@$it"
+            }
+            val relay = fields["relay_url"]?.takeIf { it.isNotBlank() }
+            val parts = listOfNotNull(login, relay)
+            if (parts.isNotEmpty()) return parts.joinToString(" · ")
+        }
+        return "External Cloud Sync account"
+    }
+
+    private fun decodeBase64UrlUtf8(raw: String): String? {
+        if (raw.isBlank()) return null
+        val bytes = runCatching { Base64.getUrlDecoder().decode(raw) }.getOrNull()
+            ?: runCatching { Base64.getDecoder().decode(raw) }.getOrNull()
+            ?: return null
+        return runCatching { String(bytes, Charsets.UTF_8) }.getOrNull()
+    }
+
+    private fun extractSafeJsonFields(json: String): Map<String, String> {
+        val allowedKeys = setOf("hostname", "host_id", "relay_url", "github_login")
+        val out = LinkedHashMap<String, String>()
+        JSON_STRING_FIELD.findAll(json).forEach { match ->
+            val key = match.groupValues[1]
+            if (key in allowedKeys) {
+                val value = dev.orbit.android.store.PlanApprovalReducer
+                    .unescapeJsonString(match.groupValues[2])
+                    .trim()
+                if (value.isNotEmpty()) {
+                    out[key] = value
+                }
+            }
+        }
+        return out
+    }
+
+    private fun extractStringArray(json: String, arrayPattern: Regex): List<String> {
+        val body = arrayPattern.find(json)?.groupValues?.getOrNull(1) ?: return emptyList()
+        return JSON_QUOTED_ITEM.findAll(body)
+            .map { dev.orbit.android.store.PlanApprovalReducer.unescapeJsonString(it.groupValues[1]).trim() }
+            .filter { it.isNotEmpty() }
+            .toList()
+    }
 }
 
 /**
@@ -219,7 +357,7 @@ object OrbitPushRouter {
             if (isUnreserved) {
                 sb.append(c.toChar())
             } else {
-                sb.append(String.format("%%%02X", c))
+                sb.append(String.format(Locale.US, "%%%02X", c))
             }
         }
         return sb.toString()
@@ -229,12 +367,16 @@ object OrbitPushRouter {
 /**
  * Push notification token & remote payload bridge for Firebase Cloud Messaging (FCM).
  *
- * Distribution builds with `google-services.json` delegate from `OrbitFirebaseMessagingService`:
+ * Distribution builds with `google-services.json` initialize Firebase at startup and forward
+ * token and payload callbacks through `OrbitFirebaseMessagingService`:
  * - `onNewToken(token)` -> [OrbitFirebaseMessagingBridge.onNewFcmToken]
  * - `onMessageReceived(remoteMessage)` -> [OrbitFirebaseMessagingBridge.onRemotePushPayload]
+ * - Startup active token sync -> [OrbitFirebaseMessagingBridge.fetchCurrentTokenIfConfigured]
  *
- * Keeping the bridge decoupled allows debug/FOSS builds to compile cleanly with zero Play Services
- * dependency while still executing the real `registerPushDevice` UniFFI RPC on every connected host.
+ * All Firebase Messaging calls are guarded by `FirebaseApp.getApps(context).isNotEmpty()` so
+ * debug/FOSS builds without `google-services.json` run cleanly without throwing
+ * `IllegalStateException`, while configured builds still execute the real `registerPushDevice`
+ * UniFFI RPC on every connected host.
  */
 object OrbitFirebaseMessagingBridge {
     const val PLATFORM_ANDROID_FCM = "fcm"
@@ -247,6 +389,18 @@ object OrbitFirebaseMessagingBridge {
 
     @Volatile
     private var tokenListener: ((String) -> Unit)? = null
+
+    fun fetchCurrentTokenIfConfigured(context: Context) {
+        val appContext = context.applicationContext
+        if (FirebaseApp.getApps(appContext).isEmpty()) return
+        runCatching {
+            FirebaseMessaging.getInstance().token.addOnSuccessListener { token ->
+                if (!token.isNullOrBlank()) {
+                    onNewFcmToken(appContext, token)
+                }
+            }
+        }
+    }
 
     fun attachTokenListener(context: Context, listener: (String) -> Unit) {
         tokenListener = listener

@@ -176,13 +176,42 @@ object PlanApprovalReducer {
         return permission.commandOrPath.ifBlank { permission.title }
     }
 
-    private fun unescapeJsonString(escaped: String): String =
-        escaped
-            .replace("\\n", "\n")
-            .replace("\\r", "\r")
-            .replace("\\t", "\t")
-            .replace("\\\"", "\"")
-            .replace("\\\\", "\\")
+    internal fun unescapeJsonString(escaped: String): String {
+        val out = StringBuilder(escaped.length)
+        var i = 0
+        while (i < escaped.length) {
+            val ch = escaped[i]
+            if (ch == '\\' && i + 1 < escaped.length) {
+                when (val next = escaped[i + 1]) {
+                    '\\' -> { out.append('\\'); i += 2 }
+                    '"' -> { out.append('"'); i += 2 }
+                    '/' -> { out.append('/'); i += 2 }
+                    'n' -> { out.append('\n'); i += 2 }
+                    'r' -> { out.append('\r'); i += 2 }
+                    't' -> { out.append('\t'); i += 2 }
+                    'b' -> { out.append('\b'); i += 2 }
+                    'f' -> { out.append('\u000C'); i += 2 }
+                    'u' -> {
+                        if (i + 5 < escaped.length) {
+                            val code = escaped.substring(i + 2, i + 6).toIntOrNull(16)
+                            if (code != null) {
+                                out.append(code.toChar())
+                                i += 6
+                                continue
+                            }
+                        }
+                        out.append("\\u")
+                        i += 2
+                    }
+                    else -> { out.append(next); i += 2 }
+                }
+            } else {
+                out.append(ch)
+                i++
+            }
+        }
+        return out.toString()
+    }
 
     fun buildSubmitPayload(
         action: PlanApprovalAction,

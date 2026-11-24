@@ -70,14 +70,25 @@ internal fun GlobalSearchSheet(ui: OrbitUiState, store: OrbitAndroidStore, onClo
         if (query.trim().length >= 2 && ui.globalSearchQuery == query) {
             if (ui.isSearchingGlobal) LinearProgressIndicator(Modifier.fillMaxWidth())
             else if (ui.globalSearchHits.isEmpty()) Text(stringResource(R.string.search_no_results))
-            if (remote && !ui.isSearchingGlobal)
+            if (remote && !ui.isSearchingGlobal) {
+                val failedCount = ui.globalSearchRemoteFailed.toInt()
                 Text(
-                    stringResource(
-                        R.string.search_remote_summary,
-                        ui.globalSearchRemoteQueried.toInt(),
-                    ),
+                    text = if (failedCount > 0) {
+                        stringResource(
+                            R.string.search_remote_failed_summary,
+                            ui.globalSearchRemoteQueried.toInt(),
+                            failedCount,
+                        )
+                    } else {
+                        stringResource(
+                            R.string.search_remote_summary,
+                            ui.globalSearchRemoteQueried.toInt(),
+                        )
+                    },
                     style = OrbitTheme.typography.meta,
+                    color = if (failedCount > 0) OrbitTheme.colors.warning else OrbitTheme.colors.fgSecondary,
                 )
+            }
             LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 items(ui.globalSearchHits) { hit ->
                     OverviewRow(hit.hostName + " · " + hit.title, hit.snippet) {

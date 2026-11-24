@@ -191,6 +191,46 @@ class OrbitReducersTest {
         assertEquals("revise", revise.feedback)
         assertEquals("B", revise.editedPlanMarkdown)
         assertNull(revise.targetMode)
+
+        val dismiss =
+            PlanApprovalReducer.buildSubmitPayload(
+                PlanApprovalAction.DISMISS,
+                "A",
+                "B",
+                "ignored",
+            )
+        assertNull(dismiss.editedPlanMarkdown)
+        assertNull(dismiss.feedback)
+        assertNull(dismiss.targetMode)
+    }
+
+    @Test
+    fun planJsonUnescaperHandlesEscapedBackslashesAndUnicode() {
+        // Double-backslash followed by n must decode to literal "\n", NOT a newline
+        val raw = """Literal \\n plus real\nline, quote \"ok\", slash \/, tab\t, cr\r, bs\b, ff\f, uni \u003c\u4e2d\u6587\u003e \uD83D\uDE80"""
+        val expected = "Literal \\n plus real\nline, quote \"ok\", slash /, tab\t, cr\r, bs\b, ff\u000C, uni <中文> 🚀"
+        assertEquals(expected, PlanApprovalReducer.unescapeJsonString(raw))
+
+        val plan =
+            read.copy(
+                detail = FfiToolCallDetail.Generic(
+                    "ExitPlanMode",
+                    """{"plan":"Use \\\\n in regex\nNext: \"escaped\" \u0026 ready"}""",
+                )
+            )
+        assertEquals(
+            "Use \\\\n in regex\nNext: \"escaped\" & ready",
+            PlanApprovalReducer.detectPlanApproval(plan)?.planMarkdown,
+        )
+    }
+
+    @Test
+    fun benignSpeechErrorsAreClassifiedCorrectly() {
+        assertTrue(dev.orbit.android.ui.composer.isBenignSpeechError(android.speech.SpeechRecognizer.ERROR_NO_MATCH))
+        assertTrue(dev.orbit.android.ui.composer.isBenignSpeechError(android.speech.SpeechRecognizer.ERROR_SPEECH_TIMEOUT))
+        assertTrue(dev.orbit.android.ui.composer.isBenignSpeechError(android.speech.SpeechRecognizer.ERROR_CLIENT))
+        assertFalse(dev.orbit.android.ui.composer.isBenignSpeechError(android.speech.SpeechRecognizer.ERROR_AUDIO))
+        assertFalse(dev.orbit.android.ui.composer.isBenignSpeechError(android.speech.SpeechRecognizer.ERROR_NETWORK))
     }
 
     @Test

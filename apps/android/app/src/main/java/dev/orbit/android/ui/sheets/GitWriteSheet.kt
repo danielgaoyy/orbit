@@ -13,6 +13,24 @@ import dev.orbit.android.R
 import dev.orbit.android.store.OrbitAndroidStore
 import dev.orbit.android.store.OrbitUiState
 import dev.orbit.android.ui.theme.OrbitTheme
+import uniffi.orbit_ffi_uniffi.GitConflictResolution
+
+internal fun buildGitPushTerminalCommand(cwd: String): String? {
+    val trimmed = cwd.trim()
+    if (trimmed.isEmpty() || trimmed.any { it.isISOControl() }) return null
+    return when {
+        trimmed == "~" -> "git -C ~ push"
+        trimmed.startsWith("~/") -> {
+            val suffix = trimmed.removePrefix("~/").replace("'", "'\\''")
+            "git -C ~/'$suffix' push"
+        }
+        trimmed.startsWith("/") -> {
+            val escaped = trimmed.replace("'", "'\\''")
+            "git -C '$escaped' push"
+        }
+        else -> null
+    }
+}
 
 @Composable
 internal fun GitWriteSheet(
@@ -108,15 +126,109 @@ internal fun GitWriteSheet(
                         Text(stringResource(R.string.git_commit))
                     }
                 }
+                val pushCommand = remember(ui.activeCwd) { buildGitPushTerminalCommand(ui.activeCwd) }
                 TextButton(
-                    enabled =
-                        ready &&
-                            review?.isGitRepo == true &&
-                            ui.activeCwd.startsWith("/") &&
-                            ui.activeCwd.none { it.isISOControl() },
-                    onClick = { onPush("git -C '" + ui.activeCwd.replace("'", "'\\''") + "' push") },
+                    enabled = ready && review?.isGitRepo == true && pushCommand != null,
+                    onClick = { pushCommand?.let(onPush) },
                 ) {
                     Text(stringResource(R.string.git_push_terminal))
+                }
+                if (ui.gitConflicts.isNotEmpty()) {
+                    HorizontalDivider(thickness = 0.5.dp)
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(
+                            text = stringResource(R.string.git_conflicts_banner, ui.gitConflicts.size),
+                            style = OrbitTheme.typography.subheadSemiBold,
+                            color = OrbitTheme.colors.dangerRemoved,
+                        )
+                        ui.gitConflicts.forEach { conflict ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                Text(
+                                    text = conflict.path,
+                                    style = OrbitTheme.typography.code,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                TextButton(
+                                    enabled = ready && !conflict.isBinary,
+                                    onClick = {
+                                        store.gitResolveConflict(
+                                            conflict.path,
+                                            GitConflictResolution.Ours,
+                                            conflict.contentSha256,
+                                        )
+                                    },
+                                ) {
+                                    Text(stringResource(R.string.git_resolve_ours))
+                                }
+                                TextButton(
+                                    enabled = ready && !conflict.isBinary,
+                                    onClick = {
+                                        store.gitResolveConflict(
+                                            conflict.path,
+                                            GitConflictResolution.Theirs,
+                                            conflict.contentSha256,
+                                        )
+                                    },
+                                ) {
+                                    Text(stringResource(R.string.git_resolve_theirs))
+                                }
+                            }
+                        }
+                    }
+                }
+                HorizontalDivider(thickness = 0.5.dp)
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(
+                            text = stringResource(R.string.git_stashes_section),
+                            style = OrbitTheme.typography.subheadSemiBold,
+                        )
+                        TextButton(
+                            enabled = ready && review?.changedFiles.orEmpty().isNotEmpty(),
+                            onClick = { store.gitStashSave() },
+                        ) {
+                            Text(stringResource(R.string.git_stash_save))
+                        }
+                    }
+                    ui.gitStashes.forEach { stash ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    text = stash.stashRef,
+                                    style = OrbitTheme.typography.codeMedium,
+                                )
+                                Text(
+                                    text = stash.message.ifBlank { stash.branch.orEmpty() },
+                                    style = OrbitTheme.typography.meta,
+                                    color = OrbitTheme.colors.fgSecondary,
+                                )
+                            }
+                            TextButton(
+                                enabled = ready,
+                                onClick = { store.gitStashPop(stash.stashRef, stash.oid) },
+                            ) {
+                                Text(stringResource(R.string.git_stash_pop))
+                            }
+                        }
+                    }
                 }
                 HorizontalDivider(thickness = 0.5.dp)
                 ui.gitPrStatus?.let { pr ->

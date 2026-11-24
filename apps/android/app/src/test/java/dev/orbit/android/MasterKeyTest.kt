@@ -51,5 +51,27 @@ class MasterKeyTest {
         assertThrows(AEADBadTagException::class.java) {
             Codec.unwrapWithKey(sealed, SecretKeySpec(ByteArray(32), "AES"))
         }
+
+        // Verify FORMAT_VERSION is cryptographically bound via GCM AAD
+        val unauthenticatedCipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding").apply {
+            init(javax.crypto.Cipher.ENCRYPT_MODE, wrapping)
+        }
+        val forgedNoAad =
+            Codec.encodeEnvelope(unauthenticatedCipher.iv, unauthenticatedCipher.doFinal(ByteArray(32)))
+        assertThrows(AEADBadTagException::class.java) {
+            Codec.unwrapWithKey(forgedNoAad, wrapping)
+        }
+    }
+
+    @Test
+    fun sealedEnvelopeImplementsContentEquality() {
+        val iv = ByteArray(12) { it.toByte() }
+        val ct = ByteArray(48) { (it + 7).toByte() }
+        val a = Codec.SealedEnvelope(Codec.FORMAT_VERSION, iv.copyOf(), ct.copyOf())
+        val b = Codec.SealedEnvelope(Codec.FORMAT_VERSION, iv.copyOf(), ct.copyOf())
+        assertEquals(a, b)
+        assertEquals(a.hashCode(), b.hashCode())
+        val c = Codec.SealedEnvelope(Codec.FORMAT_VERSION, iv.copyOf(), ct.copyOf().apply { this[0] = 99 })
+        assertNotEquals(a, c)
     }
 }

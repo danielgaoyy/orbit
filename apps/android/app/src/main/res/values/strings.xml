@@ -217,4 +217,32 @@
     <string name="terminal_busy">Terminal input buffer is full</string>
     <string name="create_hooks_file">Create project hook file</string>
     <string name="sync_qr_failed">Could not generate a device link. Check your sync status and try again.</string>
+
+    <!-- External Deep-Link Confirmation -->
+    <string name="deeplink_confirm_pair_title">Pair Host from External Link?</string>
+    <string name="deeplink_confirm_pair_body">An external link wants to pair Orbit with %1$s. Only continue if you initiated this pairing from your own workstation.</string>
+    <string name="deeplink_confirm_sync_title">Switch Cloud Sync Account?</string>
+    <string name="deeplink_confirm_sync_body">Importing this external device link (%1$s) will switch your Cloud Sync account, merge your local paired hosts, and upload them to that account\'s encrypted vault. Only continue if you trust this link.</string>
+    <string name="deeplink_confirm_sync_action">Import &amp; Switch</string>
+
+    <!-- Hardened Overview, Search, Git & Automations -->
+    <string name="overview_router_setup_toast">Configure and activate a Personal Router host first.</string>
+    <string name="overview_risk_safe">Low risk · Safe</string>
+    <string name="overview_risk_level">%1$s risk</string>
+    <string name="search_remote_failed_summary">%1$d remote hosts queried · %2$d failed</string>
+    <string name="git_stashes_section">Stashes</string>
+    <string name="auto_empty_goals_title">No Active Goals</string>
+    <string name="auto_empty_goals_subtitle">Autonomous multi-iteration goals running on this host will appear here.</string>
+    <string name="auto_empty_monitors_title">No Active Monitors</string>
+    <string name="auto_empty_monitors_subtitle">Log tails, health probes, and stream monitors will appear here once started.</string>
+    <string name="auto_guardian_enabled">Enable Guardian auto-review</string>
+    <string name="auto_guardian_read_only">Auto-approve read-only tools</string>
+    <string name="auto_guardian_tests">Auto-approve workspace tests</string>
+    <string name="auto_guardian_max_risk">Max: %1$s</string>
+    <string name="auto_rules_empty">No host or project permission rules configured yet.</string>
+    <string name="auto_rule_pattern_label">Command prefix or pattern</string>
+    <string name="auto_rule_allow">Allow</string>
+    <string name="auto_rule_deny">Deny</string>
+    <string name="auto_rule_scope_project">Project</string>
+    <string name="auto_rule_scope_host">Host</string>
 </resources>

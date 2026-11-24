@@ -140,23 +140,36 @@ fun StreamStageScreen(
         }
     }
 
+    val hasLoadOlderHeader = ui.stageHasOlderTurns && turns.isNotEmpty()
+    val headerOffset = if (hasLoadOlderHeader) 1 else 0
+    val lastListIndex = (headerOffset + turns.lastIndex).coerceAtLeast(0)
+
     var anchor by remember { mutableStateOf<Pair<String, Int>?>(null) }
     fun earlier() {
-        if (ui.isLoadingOlderTurns || !ui.stageHasOlderTurns) return
-        val first = turns.getOrNull(listState.firstVisibleItemIndex) ?: return
-        anchor = first.key to listState.firstVisibleItemScrollOffset
+        if (ui.isLoadingOlderTurns || !ui.stageHasOlderTurns || turns.isEmpty()) return
+        val firstTurnIndex = (listState.firstVisibleItemIndex - headerOffset).coerceIn(0, turns.lastIndex)
+        val first = turns.getOrNull(firstTurnIndex) ?: return
+        val offset = if (listState.firstVisibleItemIndex < headerOffset) 0 else listState.firstVisibleItemScrollOffset
+        anchor = first.key to offset
         store.loadOlderTimeline()
     }
+    val isAtTop by remember { derivedStateOf { listState.firstVisibleItemIndex == 0 } }
     val dragging by listState.interactionSource.collectIsDraggedAsState()
-    LaunchedEffect(listState.firstVisibleItemIndex == 0, dragging) {
-        if (dragging && listState.firstVisibleItemIndex == 0 && listState.canScrollForward) earlier()
+    LaunchedEffect(isAtTop, dragging) {
+        if (dragging && isAtTop && listState.canScrollForward) earlier()
     }
     LaunchedEffect(ui.isLoadingOlderTurns, turns.firstOrNull()?.key) {
         val saved = anchor
         if (!ui.isLoadingOlderTurns && saved != null) {
             // Stable LazyColumn keys already preserve a reader who kept scrolling during the fetch.
-            val index = dev.orbit.android.store.StageDeltaReducer.resolvePrependedAnchorIndex(saved.first, turns.map { it.key }, 0)
-            if (index != null && listState.firstVisibleItemIndex == 0) listState.scrollToItem(index, saved.second)
+            val turnIndex = dev.orbit.android.store.StageDeltaReducer.resolvePrependedAnchorIndex(
+                saved.first,
+                turns.map { it.key },
+                0,
+            )
+            if (turnIndex != null && listState.firstVisibleItemIndex <= headerOffset) {
+                listState.scrollToItem(turnIndex + headerOffset, saved.second)
+            }
             anchor = null
         }
     }
@@ -190,29 +203,50 @@ fun StreamStageScreen(
             stageViewportHeightPx in 1 until prevStageViewportHeightPx
         prevStageViewportHeightPx = stageViewportHeightPx
         if (turns.isNotEmpty() && anchoredAtBottom && (shrank || activeDecisionCount > 0)) {
-            listState.scrollToItem(turns.lastIndex, scrollOffset = 100_000)
+            listState.scrollToItem(lastListIndex, scrollOffset = 100_000)
         }
     }
 
-    // Smart auto-scroll to bottom when pinned at bottom and stage sequence advances
+    // Smart auto-scroll to bottom ONLY when stageSeq advances (never when prepending older history)
     val stageSeq = stage?.latestSeq ?: 0uL
-    val turnCount = turns.size
-    LaunchedEffect(ui.selectedAgentId) {
+    var lastAutoScrolledSeq by remember(ui.selectedHostId, ui.selectedAgentId) {
+        mutableStateOf(0uL)
+    }
+    LaunchedEffect(ui.selectedHostId, ui.selectedAgentId) {
         anchoredAtBottom = true
+        lastAutoScrolledSeq = stageSeq
         if (turns.isNotEmpty()) {
-            listState.scrollToItem(turns.lastIndex, scrollOffset = 100_000)
+            listState.scrollToItem(lastListIndex, scrollOffset = 100_000)
         }
     }
-    LaunchedEffect(stageSeq, turnCount) {
-        if (turns.isNotEmpty() && anchor == null && !canScrollForward) {
-            listState.animateScrollToItem(turns.lastIndex, scrollOffset = 100_000)
+    LaunchedEffect(stageSeq) {
+        val prevSeq = lastAutoScrolledSeq
+        if (stageSeq > prevSeq) {
+            lastAutoScrolledSeq = stageSeq
+            if (turns.isNotEmpty() && anchor == null && !ui.isLoadingOlderTurns) {
+                if (prevSeq == 0uL && anchoredAtBottom) {
+                    listState.scrollToItem(lastListIndex, scrollOffset = 100_000)
+                } else if (!canScrollForward) {
+                    listState.animateScrollToItem(lastListIndex, scrollOffset = 100_000)
+                }
+            }
         }
     }
 
     var windowTop by remember { mutableStateOf(0.dp) }
     val density = LocalDensity.current
     Column(
-        modifier = modifier.onGloballyPositioned { windowTop = with(density) { it.positionInWindow().y.toDp() } }
+        modifier = modifier
+            .then(
+                if (tabletop != null) {
+                    Modifier.onGloballyPositioned { coords ->
+                        val nextTop = with(density) { coords.positionInWindow().y.toDp() }
+                        if (windowTop != nextTop) windowTop = nextTop
+                    }
+                } else {
+                    Modifier
+                }
+            )
             .fillMaxSize()
             .background(colors.canvas),
     ) {
@@ -251,12 +285,6 @@ fun StreamStageScreen(
                             modifier = Modifier.size(OrbitSpacing.iconMd),
                         )
                     }
-                }
-            }
-
-            if (ui.stageHasOlderTurns && turns.isNotEmpty() && listState.firstVisibleItemIndex == 0) {
-                androidx.compose.material3.TextButton(onClick = ::earlier, enabled = !ui.isLoadingOlderTurns) {
-                    Text(stringResource(if (ui.isLoadingOlderTurns) R.string.stage_loading_older else R.string.stage_load_older))
                 }
             }
 
@@ -327,6 +355,26 @@ fun StreamStageScreen(
                                 // STRICT 24dp vertical spacing between conversation turns
                                 verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xl),
                             ) {
+                                if (hasLoadOlderHeader) {
+                                    item(key = "load_older_header") {
+                                        Box(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            androidx.compose.material3.TextButton(
+                                                onClick = ::earlier,
+                                                enabled = !ui.isLoadingOlderTurns,
+                                            ) {
+                                                Text(
+                                                    stringResource(
+                                                        if (ui.isLoadingOlderTurns) R.string.stage_loading_older
+                                                        else R.string.stage_load_older
+                                                    )
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
                                 itemsIndexed(
                                     items = turns,
                                     key = { _, it -> it.key },
@@ -349,6 +397,7 @@ fun StreamStageScreen(
                                         onQuoteAssistantReply = { replyText ->
                                             store.addQuotedAssistantReply(replyText)
                                         },
+                                        onInterruptDeliver = { store.interruptAgentAndContinue() },
                                     )
                                 }
                             }
@@ -378,7 +427,7 @@ fun StreamStageScreen(
                                 haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                 scope.launch {
                                     if (turns.isNotEmpty()) {
-                                        listState.animateScrollToItem(turns.lastIndex, scrollOffset = 100_000)
+                                        listState.animateScrollToItem(lastListIndex, scrollOffset = 100_000)
                                     }
                                 }
                             },
@@ -411,80 +460,95 @@ fun StreamStageScreen(
             ui.composer.hasContextAttachments
 
         if (showBottomControls && !inlineTerminalOpen) {
-            val plans = mergedPermissions.filterIsInstance<FfiTimelineItem.PermissionRequest>()
-                .mapNotNull(PlanApprovalReducer::detectPlanApproval)
-            val normalPermissions = mergedPermissions.filterNot { item ->
-                item is FfiTimelineItem.PermissionRequest && plans.any { it.requestId == item.requestId }
-            }
-            plans.firstOrNull()?.let { PlanReview(it, store) }
-            if (normalPermissions.isNotEmpty() || mergedQuestions.isNotEmpty()) {
-                StickyDecisionBar(
-                    pendingPermissions = normalPermissions,
-                    pendingQuestions = mergedQuestions,
-                    onResolvePermission = { reqId, decision -> store.resolvePermission(reqId, decision) },
-                    onAnswerQuestion = { reqId, answers -> store.answerQuestion(reqId, answers) },
+            val bottomDeckContent: @Composable () -> Unit = {
+                val plans = mergedPermissions.filterIsInstance<FfiTimelineItem.PermissionRequest>()
+                    .mapNotNull(PlanApprovalReducer::detectPlanApproval)
+                val normalPermissions = mergedPermissions.filterNot { item ->
+                    item is FfiTimelineItem.PermissionRequest && plans.any { it.requestId == item.requestId }
+                }
+                plans.firstOrNull()?.let { PlanReview(it, store) }
+                if (normalPermissions.isNotEmpty() || mergedQuestions.isNotEmpty()) {
+                    StickyDecisionBar(
+                        pendingPermissions = normalPermissions,
+                        pendingQuestions = mergedQuestions,
+                        onResolvePermission = { reqId, decision -> store.resolvePermission(reqId, decision) },
+                        onAnswerQuestion = { reqId, answers -> store.answerQuestion(reqId, answers) },
+                    )
+                }
+
+                OmniComposer(
+                    draft = ui.composer,
+                    workspaceFiles = ui.workspaceFiles,
+                    queuedPrompts = ui.activeQueuedPrompts,
+                    hostDetail = ui.hostDetail,
+                    activeCwd = ui.activeCwd,
+                    isNewSession = ui.isNewSessionMode || ui.selectedAgentId == null,
+                    isAgentRunning = isActiveAgentRunning,
+                    hasHost = ui.selectedHostId != null || ui.composer.text.isNotEmpty(),
+                    onTextChange = { store.updateComposerText(it) },
+                    onVoiceNavigate = { when (it) {
+                        dev.orbit.android.ui.composer.VoiceNavigation.OVERVIEW -> store.openGlobalOverview()
+                        dev.orbit.android.ui.composer.VoiceNavigation.SEARCH -> store.requestSheet("search")
+                    } },
+                    onSend = { store.submitComposerPrompt() },
+                    onQueue = { store.enqueueComposerPrompt() },
+                    onInterrupt = { store.interruptActiveAgent() },
+                    onOpenContextPicker = onOpenContextPicker,
+                    onOpenModelSelector = onOpenModelSelector,
+                    onSelectMode = { store.selectSessionMode(it) },
+                    onToggleFastMode = { store.toggleFastMode() },
+                    onRequestRefreshFiles = { store.refreshWorkspaceFiles() },
+                    onAddFileMention = { store.addFileMention(it) },
+                    onRemoveFileMention = { store.removeFileMention(it) },
+                    onAttachGitDiff = { store.attachGitDiffContext() },
+                    onToggleGitDiff = { store.toggleGitDiffContext() },
+                    onAttachStagedDiff = { store.attachStagedDiffContext() },
+                    onToggleStagedDiff = { store.toggleStagedDiffContext() },
+                    onAttachTerminal = { store.attachTerminalContext() },
+                    onToggleTerminal = { store.toggleTerminalContext() },
+                    onSelectSlash = { store.setSlashCommand(it) },
+                    onClearSlash = { store.setSlashCommand(null) },
+                    onRemoveQuotedSnippet = { store.removeQuotedSnippet(it) },
+                    onEditQueuedPrompt = { store.editQueuedPrompt(it) },
+                    onSendQueuedPromptNow = { store.sendQueuedPromptNow(it) },
+                    onRemoveQueuedPrompt = { store.removeQueuedPrompt(it) },
+                    onAttachImageBytes = { name, mime, bytes -> store.attachImageBytes(name, mime, bytes) },
+                    onAttachFileBytes = { name, mime, bytes -> store.attachFileBytes(name, mime, bytes) },
+                    onRemoveStagedAttachment = { store.removeStagedAttachment(it) },
+                    onRegisterInlineMention = { token, kind, path, staged, label ->
+                        store.registerInlineMention(token, kind, path, staged, label)
+                    },
+                    slashCommands = ui.slashCommands,
+                    onFilterSlashCommands = { store.filterSlashCommands(it) },
+                    onRankMentions = { store.rankMentionCandidates(it) },
+                    onExecuteSlashCommand = { cmd ->
+                        store.executeSlashCommand(
+                            cmd = cmd,
+                            onOpenTerminal = onOpenTerminal,
+                            onOpenSettings = onOpenSettings,
+                            onOpenSideQuestion = onOpenSideQuestion,
+                            onOpenAutomations = onOpenAutomations,
+                            onOpenWorkspaceBoard = onOpenWorkspaceBoard,
+                            onOpenArchived = onOpenArchived,
+                            onOpenFork = onOpenForkDialog,
+                            onExportTranscript = onExportTranscript,
+                        )
+                    },
                 )
             }
-
-            OmniComposer(
-                draft = ui.composer,
-                workspaceFiles = ui.workspaceFiles,
-                queuedPrompts = ui.activeQueuedPrompts,
-                hostDetail = ui.hostDetail,
-                activeCwd = ui.activeCwd,
-                isNewSession = ui.isNewSessionMode || ui.selectedAgentId == null,
-                isAgentRunning = isActiveAgentRunning,
-                hasHost = ui.selectedHostId != null || ui.composer.text.isNotEmpty(),
-                onTextChange = { store.updateComposerText(it) },
-                onVoiceNavigate = { when (it) {
-                    dev.orbit.android.ui.composer.VoiceNavigation.OVERVIEW -> store.openGlobalOverview()
-                    dev.orbit.android.ui.composer.VoiceNavigation.SEARCH -> store.requestSheet("search")
-                } },
-                onSend = { store.submitComposerPrompt() },
-                onQueue = { store.enqueueComposerPrompt() },
-                onInterrupt = { store.interruptActiveAgent() },
-                onOpenContextPicker = onOpenContextPicker,
-                onOpenModelSelector = onOpenModelSelector,
-                onSelectMode = { store.selectSessionMode(it) },
-                onToggleFastMode = { store.toggleFastMode() },
-                onRequestRefreshFiles = { store.refreshWorkspaceFiles() },
-                onAddFileMention = { store.addFileMention(it) },
-                onRemoveFileMention = { store.removeFileMention(it) },
-                onAttachGitDiff = { store.attachGitDiffContext() },
-                onToggleGitDiff = { store.toggleGitDiffContext() },
-                onAttachStagedDiff = { store.attachStagedDiffContext() },
-                onToggleStagedDiff = { store.toggleStagedDiffContext() },
-                onAttachTerminal = { store.attachTerminalContext() },
-                onToggleTerminal = { store.toggleTerminalContext() },
-                onSelectSlash = { store.setSlashCommand(it) },
-                onClearSlash = { store.setSlashCommand(null) },
-                onRemoveQuotedSnippet = { store.removeQuotedSnippet(it) },
-                onEditQueuedPrompt = { store.editQueuedPrompt(it) },
-                onSendQueuedPromptNow = { store.sendQueuedPromptNow(it) },
-                onRemoveQueuedPrompt = { store.removeQueuedPrompt(it) },
-                onAttachImageBytes = { name, mime, bytes -> store.attachImageBytes(name, mime, bytes) },
-                onAttachFileBytes = { name, mime, bytes -> store.attachFileBytes(name, mime, bytes) },
-                onRemoveStagedAttachment = { store.removeStagedAttachment(it) },
-                onRegisterInlineMention = { token, kind, path, staged, label ->
-                    store.registerInlineMention(token, kind, path, staged, label)
-                },
-                slashCommands = ui.slashCommands,
-                onFilterSlashCommands = { store.filterSlashCommands(it) },
-                onRankMentions = { store.rankMentionCandidates(it) },
-                onExecuteSlashCommand = { cmd ->
-                    store.executeSlashCommand(
-                        cmd = cmd,
-                        onOpenTerminal = onOpenTerminal,
-                        onOpenSettings = onOpenSettings,
-                        onOpenSideQuestion = onOpenSideQuestion,
-                        onOpenAutomations = onOpenAutomations,
-                        onOpenWorkspaceBoard = onOpenWorkspaceBoard,
-                        onOpenArchived = onOpenArchived,
-                        onOpenFork = onOpenForkDialog,
-                        onExportTranscript = onExportTranscript,
-                    )
-                },
-            )
+            if (tabletop != null) {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.Bottom,
+                ) {
+                    bottomDeckContent()
+                }
+            } else {
+                bottomDeckContent()
+            }
         }
     }
 }
@@ -500,10 +564,8 @@ private fun UnpairedWelcomeHero(
     val typography = OrbitTheme.typography
     val btnShape = RoundedCornerShape(OrbitSpacing.md)
 
-    var windowTop by remember { mutableStateOf(0.dp) }
-    val density = LocalDensity.current
     Column(
-        modifier = modifier.onGloballyPositioned { windowTop = with(density) { it.positionInWindow().y.toDp() } }
+        modifier = modifier
             .fillMaxWidth()
             .navigationBarsPadding()
             .padding(horizontal = OrbitSpacing.xl),
@@ -601,10 +663,8 @@ private fun NewSessionZenCanvas(
         FfiConnectionState.DISCONNECTED -> colors.dangerRemoved
     }
 
-    var windowTop by remember { mutableStateOf(0.dp) }
-    val density = LocalDensity.current
     Column(
-        modifier = modifier.onGloballyPositioned { windowTop = with(density) { it.positionInWindow().y.toDp() } }
+        modifier = modifier
             .fillMaxWidth()
             .padding(horizontal = OrbitSpacing.lg)
             .padding(bottom = 24.dp),

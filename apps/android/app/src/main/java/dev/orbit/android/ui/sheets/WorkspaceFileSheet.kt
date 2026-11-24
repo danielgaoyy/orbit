@@ -9,7 +9,10 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import dev.orbit.android.R
 import dev.orbit.android.store.OrbitAndroidStore
@@ -22,7 +25,11 @@ import uniffi.orbit_ffi_uniffi.FfiWorkspaceFile
 
 @Composable
 internal fun WorkspaceFileSheet(ui: OrbitUiState, store: OrbitAndroidStore, onClose: () -> Unit) {
-    val host = ui.selectedHostId ?: return
+    val host = ui.selectedHostId
+    LaunchedEffect(host) {
+        if (host == null) onClose()
+    }
+    if (host == null) return
     key(host, ui.activeCwd) {
         var directory by rememberSaveable { mutableStateOf("") }
         var path by rememberSaveable { mutableStateOf<String?>(null) }
@@ -97,9 +104,9 @@ internal fun WorkspaceFileContent(
     key(host, cwd, path) {
         var file by remember { mutableStateOf<FfiWorkspaceFile?>(null) }
         var error by remember { mutableStateOf<String?>(null) }
-        var edits by rememberSaveable { mutableStateOf<String?>(null) }
         var busy by remember { mutableStateOf(false) }
         var revision by remember { mutableIntStateOf(0) }
+        var edits by remember(host, cwd, path, revision) { mutableStateOf<String?>(null) }
         val scope = rememberCoroutineScope()
         val conflictText = stringResource(R.string.files_conflict)
         LaunchedEffect(revision) {
@@ -156,23 +163,54 @@ internal fun WorkspaceFileContent(
                     remember(current) {
                         current.highlightedLines.associateBy { it.lineNumber.toInt() }
                     }
+                val codeStyle = OrbitTheme.typography.code
+                val density = LocalDensity.current
+                val textMeasurer = rememberTextMeasurer()
+                val charWidthPx = remember(codeStyle, density) {
+                    val m = textMeasurer.measure(AnnotatedString("MMMMMMMMMM"), style = codeStyle)
+                    (m.size.width / 10f).coerceAtLeast(6f)
+                }
+                val maxColumns = remember(lines) {
+                    lines.maxOfOrNull { line ->
+                        var cols = 0
+                        for (ch in line) {
+                            cols += if (ch == '\t') 4 else if (ch.code > 0x7F) 2 else 1
+                        }
+                        cols
+                    } ?: 0
+                }
+                val contentWidthDp = with(density) { (maxColumns * charWidthPx).toDp() } + 32.dp
                 val scroll = rememberScrollState()
-                LazyColumn(
+                BoxWithConstraints(
                     Modifier.fillMaxWidth()
                         .heightIn(max = 520.dp)
                         .background(OrbitTheme.colors.code)
-                        .horizontalScroll(scroll)
-                        .padding(8.dp)
                 ) {
-                    items(lines.size) { index ->
-                        val fg = OrbitTheme.colors.fgPrimary
-                        val tokens = highlighted[index + 1]
-                        if (tokens == null) Text(lines[index], style = OrbitTheme.typography.code)
-                        else
-                            Text(
-                                remember(tokens, fg) { buildHighlightedLine(tokens, fg) },
-                                style = OrbitTheme.typography.code,
-                            )
+                    val stableWidth = maxOf(maxWidth, contentWidthDp)
+                    Box(Modifier.fillMaxWidth().horizontalScroll(scroll)) {
+                        LazyColumn(
+                            Modifier.width(stableWidth).padding(8.dp)
+                        ) {
+                            items(lines.size) { index ->
+                                val fg = OrbitTheme.colors.fgPrimary
+                                val tokens = highlighted[index + 1]
+                                if (tokens == null) {
+                                    Text(
+                                        lines[index],
+                                        style = codeStyle,
+                                        softWrap = false,
+                                        maxLines = 1,
+                                    )
+                                } else {
+                                    Text(
+                                        remember(tokens, fg) { buildHighlightedLine(tokens, fg) },
+                                        style = codeStyle,
+                                        softWrap = false,
+                                        maxLines = 1,
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             } else {

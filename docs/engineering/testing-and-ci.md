@@ -13,12 +13,13 @@
    - 文档索引与体积防膨胀检查（`bash scripts/check-docs-index.sh`）
    - Workspace 与 `apps/desktop/src-tauri` 格式检查（`cargo fmt --all -- --check`）
    - 严格静态检查（`cargo clippy --workspace --all-targets -- -D warnings`）
+   - WASM ViewModel 编译校验（`cargo check -p orbit-client-wasm --target wasm32-unknown-unknown`）
    - 单元测试与二进制内部测试（`cargo test --workspace --lib --bins`）
 2. **`e2e-regression-matrix`**（4 分片并发执行，共享 `Swatinem/rust-cache@v2` `shared-key: "orbit-rust-e2e"`，固定使用 `TMPDIR=/tmp ... -- --test-threads=4`）：
    - `Pitfall Regressions`：`-p orbit-cli --test e2e_pitfall_regressions`
-   - `Relay E2EE & Isolation`：`-p orbit-cli --test e2e_relay_and_pty --test e2e_multi_user_isolation`
-   - `Orchestration & Fleet Mesh`：`-p orbit-cli --test e2e_orchestration`
-     此分片还通过 CLI、鉴权 WebSocket 和 HTTP MCP 验证插件安装、启停、调用与条件工具目录。
+   - `Relay E2EE & Isolation`：`-p orbit-cli --test e2e_relay_and_pty --test e2e_multi_user_isolation --test e2e_browser_noise`
+   - `Orchestration & Fleet Mesh`：`-p orbit-cli --test e2e_orchestration --test e2e_voice`
+     此分片同时验证插件安装/启停/调用/条件 MCP 目录以及本地离线语音控制面端到端流程。
    - `Workspace Sync & Worktree`：`-p orbit-cli --test e2e_workspace_sync_and_worktree`
 3. **跨端构建与烟测任务**：
    - `desktop-frontend-build`（`Desktop Frontend Typecheck & Build`）：Node unit tests + `npm run build` + `npm run test:smoke`

@@ -875,6 +875,8 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                   right: ctxLine,
                   rowIdx: -100000 - eIdx,
                   isLastInFile: false,
+                  patrolAnchorKey: null,
+                  patrolFindings: null,
                 });
               } else {
                 out.push({
@@ -885,6 +887,8 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                   line: ctxLine,
                   lineIdx: -100000 - eIdx,
                   isLastInFile: false,
+                  patrolAnchorKey: null,
+                  patrolFindings: null,
                 });
               }
             }

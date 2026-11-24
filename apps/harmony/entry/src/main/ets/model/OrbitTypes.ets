@@ -474,11 +474,26 @@ export interface CloudSyncStatusDto {
   gist_html_url: string | null;
   remote_vault_exists: boolean;
   auto_sync_enabled: boolean;
+  instant_unlock_enabled?: boolean;
   last_synced_at_ms: number | null;
   last_vault_revision: number;
   synced_host_count: number;
   synced_project_count: number;
   last_error: string | null;
+}
+
+export interface GithubDeviceFlowStartDto {
+  device_code: string;
+  user_code: string;
+  verification_uri: string;
+  expires_in: number;
+  interval: number;
+}
+
+export interface GithubDeviceFlowPollDto {
+  status: string; // 'pending' | 'slow_down' | 'expired' | 'denied' | 'authorized'
+  interval_secs?: number;
+  cloud_status?: CloudSyncStatusDto | null;
 }
 
 export interface CloudSyncResultDto {
@@ -649,6 +664,11 @@ export interface TimelineItemDto {
   resolved_answers?: string[][] | null;
   level?: string;
   message?: string;
+  kind?: string;
+  source_agent_id?: string | null;
+  source_host_id?: string | null;
+  source_title?: string | null;
+  event?: string | null;
   delivery_status?: 'queued' | 'dispatched' | 'settled' | 'dropped' | null;
   delivery_turn_id?: string | null;
   blocking_turn_id?: string | null;
@@ -742,6 +762,50 @@ export interface StageTurnDto {
   latest_visible_progress_ms?: number | null;
 }
 
+export interface SessionPlanStepDto {
+  id: string;
+  title: string;
+  status: string; // 'pending' | 'in_progress' | 'completed' | 'skipped' | 'failed'
+  active_form?: string | null;
+  updated_seq: number;
+}
+
+export interface SessionOutlinePromptDto {
+  seq: number;
+  preview: string;
+}
+
+export interface SessionSubagentEntryDto {
+  id: string;
+  role: string;
+  prompt_preview: string;
+  status: string;
+  child_agent_id: string | null;
+  provider_subagent_id?: string | null;
+  last_seq: number;
+}
+
+export interface SessionInsightsDto {
+  outline_prompts?: SessionOutlinePromptDto[];
+  plan_steps?: SessionPlanStepDto[];
+  subagents?: SessionSubagentEntryDto[];
+  detected_local_urls?: string[];
+}
+
+export interface PendingPlanApprovalDto {
+  seq: number;
+  request_id: string;
+  title: string;
+  plan_markdown: string;
+  plan_title?: string | null;
+  plan_file_path?: string | null;
+  summary?: string | null;
+  allowed_prompts?: string[];
+  source?: string | null;
+  blocks?: RichBlockDto[];
+  timestamp_ms?: number | null;
+}
+
 export interface AgentStageDto {
   revision: number;
   host_id: string;
@@ -749,7 +813,9 @@ export interface AgentStageDto {
   turns: StageTurnDto[];
   pending_permissions: TimelineItemDto[];
   pending_questions: TimelineItemDto[];
+  pending_plan_approval?: PendingPlanApprovalDto | null;
   session_turn_diffs: DiffFileDto[];
+  insights?: SessionInsightsDto;
   latest_seq: number;
 }
 
@@ -758,13 +824,21 @@ export interface AgentStageDeltaDto {
   host_id: string;
   agent: AgentCardDto | null;
   replace_from_turn_index: number;
+  window_start_turn_index?: number;
   changed_turns: StageTurnDto[];
   total_turn_count: number;
   pending_permissions: TimelineItemDto[];
   pending_questions: TimelineItemDto[];
+  pending_plan_approval?: PendingPlanApprovalDto | null;
   session_turn_diffs: DiffFileDto[];
+  insights?: SessionInsightsDto;
   latest_seq: number;
   reset: boolean;
+  aux_revision?: number;
+  aux_unchanged?: boolean;
+  has_older_turns?: boolean;
+  has_older_history?: boolean;
+  oldest_loaded_seq?: number;
 }
 
 export interface FleetSidebarRequestDto {
@@ -1568,4 +1642,275 @@ export function formatCompactRelativeTime(rfc3339: string): string {
     return `${Math.floor(deltaSecs / 86400)}d`;
   }
   return `${Math.floor(deltaSecs / 604800)}w`;
+}
+
+// --- M2-Core & Full Feature Parity DTOs ---
+
+export interface RegisterPushDeviceRequestDto {
+  device_id: string;
+  platform: string; // 'harmony_push_kit'
+  device_name: string;
+  device_token: string;
+  live_activity_token: string | null;
+  sandbox: boolean;
+}
+
+export interface PushPreferencesDto {
+  enabled: boolean;
+  notify_permission_required: boolean;
+  notify_turn_completed: boolean;
+  notify_agent_error: boolean;
+  notify_goal_finished: boolean;
+  notify_timer_fired: boolean;
+  include_message_preview: boolean;
+}
+
+export interface PushRegistrationStatusDto {
+  platform: string;
+  token_registered: boolean;
+  token_preview: string | null;
+  relay_sync_supported: boolean;
+}
+
+export interface PermissionBatchItemDto {
+  agent_id: string;
+  permission_request_id: string;
+}
+
+export interface OverviewPendingApprovalItem {
+  key: string;
+  host_id: string;
+  host_name: string;
+  agent_id: string;
+  agent_title: string;
+  request_id: string;
+  title: string;
+  target_preview: string;
+  is_low_risk: boolean;
+}
+
+export interface ConversationSearchHitDto {
+  host_id: string;
+  host_name: string;
+  agent_id: string;
+  seq: number;
+  turn_id?: string | null;
+  role: string;
+  title: string;
+  project_name: string;
+  snippet: string;
+  updated_at_rfc3339: string;
+  is_remote: boolean;
+  is_unloaded: boolean;
+}
+
+export interface SearchMessagesRequestDto {
+  query: string;
+  host_id: string | null;
+  agent_id: string | null;
+  limit: number | null;
+}
+
+export interface SearchMessagesResponseDto {
+  hits: ConversationSearchHitDto[];
+  remote_hosts_queried: number;
+  remote_hosts_failed: number;
+}
+
+export interface WriteWorkspaceFileRequestDto {
+  host_id: string;
+  cwd: string;
+  path: string;
+  content: string;
+  expected_etag: string | null;
+  force: boolean;
+}
+
+export interface CreateWorkspaceEntryRequestDto {
+  host_id: string;
+  cwd: string;
+  path: string;
+  is_dir: boolean;
+  initial_content: string | null;
+}
+
+export interface RenameWorkspaceEntryRequestDto {
+  host_id: string;
+  cwd: string;
+  old_path: string;
+  new_path: string;
+}
+
+export interface DeleteWorkspaceEntryRequestDto {
+  host_id: string;
+  cwd: string;
+  path: string;
+}
+
+export interface GitCommitResultDto {
+  commit_sha: string;
+  short_sha: string;
+  summary: string;
+  branch?: string | null;
+}
+
+export interface GitGeneratedCommitMessageDto {
+  message?: string;
+  subject?: string;
+  body?: string | null;
+}
+
+export interface GitPrCheckItemDto {
+  name: string;
+  status: string;
+  conclusion?: string | null;
+}
+
+export interface GitPrStatusDto {
+  availability: string;
+  reason?: string | null;
+  number?: number | null;
+  title?: string | null;
+  url?: string | null;
+  state?: string | null;
+  is_draft?: boolean;
+  head_ref?: string | null;
+  base_ref?: string | null;
+  passing_checks?: number;
+  failing_checks?: number;
+  checks?: GitPrCheckItemDto[];
+}
+
+export interface GitCreatePrResultDto {
+  url: string;
+  number?: number | null;
+  title: string;
+}
+
+export interface GitStashEntryDto {
+  stash_ref: string;
+  oid?: string | null;
+  message: string;
+  branch?: string | null;
+}
+
+export interface GitConflictEntryDto {
+  path: string;
+  sha256?: string | null;
+  block_count?: number;
+}
+
+export interface GitRebaseStatusDto {
+  in_progress: boolean;
+  current_step?: number | null;
+  total_steps?: number | null;
+  onto_ref?: string | null;
+}
+
+export interface RouterHostCapabilitiesDto {
+  host_id: string;
+  host_name: string;
+  is_local: boolean;
+  online: boolean;
+  hermes_installed: boolean;
+  hermes_version?: string | null;
+  hermes_has_existing_memory: boolean;
+  hermes_acp_ready: boolean;
+  hermes_gateway_running: boolean;
+  available_providers: string[];
+  active_router_agent_id?: string | null;
+  router_enabled: boolean;
+  recommended_score: number;
+  recommendation_reason?: string | null;
+}
+
+export interface PersonalRouterConfigDto {
+  enabled: boolean;
+  router_agent_id: string | null;
+  provider: string;
+  acp_agent_id: string | null;
+  model: string | null;
+  effort: string | null;
+  cwd: string | null;
+  scope: string; // 'global_fleet' | 'local_host_only'
+  pre_review_mode: string; // 'disabled' | 'medium_risk_only' | 'assist_only'
+  share_host_hermes_memory: boolean;
+  soul_prompt_override: string | null;
+  external_webhook_url: string | null;
+  has_external_webhook_secret: boolean;
+}
+
+export interface RouterStatusSnapshotDto {
+  config: PersonalRouterConfigDto;
+  host_capabilities: RouterHostCapabilitiesDto;
+  managed_workers_count: number;
+  pending_approvals_count: number;
+}
+
+export interface ConnectedHostSummaryDto {
+  registration_id: string;
+  host_id?: string | null;
+  label: string;
+  daemon_pubkey_b64: string;
+  direct_endpoints?: string[];
+  relay_url?: string | null;
+  enabled: boolean;
+  status: string;
+  last_error?: string | null;
+  hostname?: string | null;
+  daemon_version?: string | null;
+}
+
+export interface OrbitMeshPeerRow {
+  owner_host_id: string;
+  owner_host_name: string;
+  peer: ConnectedHostSummaryDto;
+}
+
+export interface SessionUsageDto {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_tokens?: number;
+  total_cost_usd?: number | null;
+  context_percent?: number | null;
+}
+
+export interface StartGoalRunRequestDto {
+  host_id: string;
+  agent_id: string;
+  objective: string;
+  criteria: string[];
+  verify_command: string | null;
+  max_iterations: number | null;
+  max_duration_secs: number | null;
+}
+
+export interface StartMonitorWatchRequestDto {
+  host_id: string;
+  agent_id: string;
+  name: string;
+  kind: MonitorKindDto;
+  expires_in_secs: number | null;
+}
+
+export interface DagStepSpecDto {
+  step_id: string;
+  name: string;
+  prompt: string;
+  depends_on: string[];
+}
+
+export interface StartDagWorkflowRequestDto {
+  host_id: string;
+  name: string;
+  cwd: string;
+  steps: DagStepSpecDto[];
+  default_provider: string;
+  default_mode: string;
+  max_concurrency: number | null;
+}
+
+export interface ProviderSubagentTimelineDto {
+  subagent_id: string;
+  items: TimelineItemDto[];
 }

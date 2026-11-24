@@ -1,13 +1,9 @@
 import {
-  CapsuleSegmentButtonV2,
-  LengthMetrics,
-  SegmentButtonV2Items
-} from '@kit.ArkUI';
-import {
   ConditionalTimerRecordDto,
   GoalCriterionDto,
   GoalRunRecordDto,
   MonitorWatchRecordDto,
+  ScheduleRunRecordDto,
   ScheduleSpecDto,
   WorkflowRunRecordDto,
   WorkflowStepRecordDto,
@@ -22,19 +18,29 @@ import {
   orbitButtonSubhead,
   orbitInputMono,
   orbitInputSubhead,
-  orbitSegmentSelectedBg,
-  orbitSegmentSelectedFg,
   orbitTextMeta,
   orbitTextMono,
   orbitTextSubhead,
   orbitTextTitle
 } from '../../theme/OrbitTokens';
+import { OrbitTheme } from '../../theme/OrbitTheme';
 import {
-  OrbitSectionHeader,
   dismissHarmonyKeyboard
 } from '../common/OrbitCommonControls';
 
+interface OrbitAutomationTabItem {
+  idx: number;
+  label: Resource;
+}
+
 const CRON_PRESETS: string[] = ['*/15 * * * *', '0 * * * *', '0 9 * * *'];
+const AUTOMATION_TABS: OrbitAutomationTabItem[] = [
+  { idx: 0, label: $r('app.string.automations_schedules') },
+  { idx: 1, label: $r('app.string.automations_timers') },
+  { idx: 2, label: $r('app.string.automations_goals') },
+  { idx: 3, label: $r('app.string.automations_monitors') },
+  { idx: 4, label: $r('app.string.automations_workflows') }
+];
 
 @ComponentV2
 export struct AutomationsSheet {
@@ -44,12 +50,27 @@ export struct AutomationsSheet {
   @Local draftCron: string = '0 9 * * *';
   @Local draftPrompt: string = '';
   @Local draftWorktree: boolean = false;
-  @Local tabItems: SegmentButtonV2Items = new SegmentButtonV2Items([
-    { text: 'Schedules' },
-    { text: 'Timers' },
-    { text: 'Goals' },
-    { text: 'Workflows' }
-  ]);
+  @Local expandedScheduleRunsId: string = '';
+  // Timer creation state
+  @Local showTimerForm: boolean = false;
+  @Local draftTimerSecs: string = '300';
+  @Local draftTimerCond: string = 'never';
+  @Local draftTimerPrompt: string = '';
+  // Goal creation state
+  @Local showGoalForm: boolean = false;
+  @Local draftGoalObjective: string = '';
+  @Local draftGoalVerifyCmd: string = '';
+  @Local draftGoalMaxIter: string = '6';
+  // Monitor creation state
+  @Local showMonitorForm: boolean = false;
+  @Local draftMonitorName: string = '';
+  @Local draftMonitorKind: string = 'command_stream';
+  @Local draftMonitorTarget: string = '';
+  @Local draftMonitorPattern: string = '';
+  // Workflow creation state
+  @Local showWorkflowForm: boolean = false;
+  @Local draftWorkflowName: string = '';
+  @Local draftWorkflowPrompt: string = '';
 
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
 
@@ -378,6 +399,21 @@ export struct AutomationsSheet {
                       this.store.runScheduleOnce(sched.schedule_id);
                     })
 
+                  Button('Runs', { type: ButtonType.Capsule, stateEffect: true })
+                    .attributeModifier(
+                      orbitButtonMeta(this.store.palette.fgSecondary, this.store.palette.subtleSurface)
+                    )
+                    .height(32)
+                    .padding({ left: 10, right: 10 })
+                    .onClick(() => {
+                      if (this.expandedScheduleRunsId === sched.schedule_id) {
+                        this.expandedScheduleRunsId = '';
+                      } else {
+                        this.expandedScheduleRunsId = sched.schedule_id;
+                        this.store.loadScheduleRuns(sched.schedule_id);
+                      }
+                    })
+
                   Button({ type: ButtonType.Circle, stateEffect: true }) {
                     SymbolGlyph($r('sys.symbol.trash'))
                       .fontSize(14)
@@ -394,6 +430,38 @@ export struct AutomationsSheet {
                 }
                 .width('100%')
                 .alignItems(VerticalAlign.Center)
+
+                if (this.expandedScheduleRunsId === sched.schedule_id) {
+                  Column({ space: 4 }) {
+                    if ((this.store.scheduleRunsById[sched.schedule_id] ?? []).length === 0) {
+                      Text('No run history recorded yet.')
+                        .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+                    } else {
+                      ForEach(
+                        this.store.scheduleRunsById[sched.schedule_id] ?? [],
+                        (runRec: ScheduleRunRecordDto) => {
+                          Row({ space: OrbitTokens.SPACE_SM }) {
+                            Text(this.formatStatusLabel(runRec.status))
+                              .attributeModifier(
+                                orbitTextMeta(this.runStatusColor(runRec.status), FontWeight.Medium)
+                              )
+                            Text(runRec.summary ?? runRec.error ?? runRec.started_at)
+                              .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
+                              .maxLines(1)
+                              .textOverflow({ overflow: TextOverflow.Ellipsis })
+                              .layoutWeight(1)
+                          }
+                          .width('100%')
+                        },
+                        (runRec: ScheduleRunRecordDto): string => `srun_${runRec.run_id}_${runRec.status}`
+                      )
+                    }
+                  }
+                  .width('100%')
+                  .padding(OrbitTokens.SPACE_SM)
+                  .backgroundColor(this.store.palette.recessed)
+                  .borderRadius(OrbitTokens.RADIUS_SM)
+                }
               }
               .width('100%')
               .padding(OrbitTokens.SPACE_LG)
@@ -418,6 +486,97 @@ export struct AutomationsSheet {
   @Builder
   private renderTimersTab() {
     List({ space: OrbitTokens.SPACE_MD }) {
+      ListItem() {
+        Row({ space: OrbitTokens.SPACE_SM }) {
+          Text(`${this.armedTimers.length} armed`)
+            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Medium))
+          Blank()
+          Button(this.showTimerForm ? $r('app.string.action_close') : $r('app.string.automations_new_timer'), {
+            type: ButtonType.Capsule,
+            stateEffect: true
+          })
+            .attributeModifier(
+              orbitButtonMeta(
+                this.showTimerForm ? this.store.palette.fgPrimary : this.store.palette.onAccent,
+                this.showTimerForm ? this.store.palette.subtleSurface : this.store.palette.accentPrimaryFill
+              )
+            )
+            .height(34)
+            .padding({ left: 12, right: 12 })
+            .onClick(() => {
+              this.showTimerForm = !this.showTimerForm;
+            })
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+      }
+
+      if (this.showTimerForm) {
+        ListItem() {
+          Column({ space: OrbitTokens.SPACE_SM }) {
+            Row({ space: OrbitTokens.SPACE_SM }) {
+              TextInput({ placeholder: 'Seconds (e.g. 300)', text: this.draftTimerSecs })
+                .type(InputType.Number)
+                .attributeModifier(
+                  orbitInputMono(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
+                )
+                .height(40)
+                .borderRadius(OrbitTokens.RADIUS_MD)
+                .width(120)
+                .onChange((v: string) => {
+                  this.draftTimerSecs = v;
+                })
+              Button(this.draftTimerCond === 'never' ? 'Unconditional' : 'Cancel on Reply', {
+                type: ButtonType.Capsule,
+                stateEffect: true
+              })
+                .attributeModifier(orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.subtleSurface))
+                .height(40)
+                .layoutWeight(1)
+                .onClick(() => {
+                  this.draftTimerCond = this.draftTimerCond === 'never' ? 'any_message' : 'never';
+                })
+            }
+            .width('100%')
+
+            TextArea({ placeholder: 'Follow-up prompt when timer fires…', text: this.draftTimerPrompt })
+              .fontSize(OrbitTokens.FONT_SUBHEAD_RES)
+              .fontColor(this.store.palette.fgPrimary)
+              .placeholderColor(this.store.palette.fgMuted)
+              .backgroundColor(this.store.palette.recessed)
+              .borderRadius(OrbitTokens.RADIUS_MD)
+              .constraintSize({ minHeight: 60, maxHeight: 110 })
+              .width('100%')
+              .onChange((v: string) => {
+                this.draftTimerPrompt = v;
+              })
+
+            Button($r('app.string.action_create'), { type: ButtonType.Capsule, stateEffect: true })
+              .attributeModifier(orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill))
+              .width('100%')
+              .height(OrbitTokens.HIT_COMPACT)
+              .onClick(() => {
+                dismissHarmonyKeyboard(this.getUIContext());
+                const secs = Number(this.draftTimerSecs);
+                this.store.createConditionalTimer(
+                  Number.isFinite(secs) && secs >= 10 ? secs : 300,
+                  this.draftTimerPrompt,
+                  this.draftTimerCond
+                ).then((ok: boolean) => {
+                  if (ok) {
+                    this.draftTimerPrompt = '';
+                    this.showTimerForm = false;
+                  }
+                });
+              })
+          }
+          .width('100%')
+          .padding(OrbitTokens.SPACE_MD)
+          .borderRadius(OrbitTokens.RADIUS_LG)
+          .attributeModifier(OrbitTheme.raisedCard(this.store.palette))
+        }
+      }
+
       if (this.armedTimers.length === 0) {
         ListItem() {
           this.renderEmptyState(
@@ -497,7 +656,96 @@ export struct AutomationsSheet {
   private renderGoalsTab() {
     List({ space: OrbitTokens.SPACE_MD }) {
       ListItem() {
-        OrbitSectionHeader({ title: `Goals (${this.store.goalRuns.length})`, isFirst: true })
+        Row({ space: OrbitTokens.SPACE_SM }) {
+          Text(`${this.store.goalRuns.length} goal(s)`)
+            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Medium))
+          Blank()
+          Button(this.showGoalForm ? $r('app.string.action_close') : $r('app.string.automations_new_goal'), {
+            type: ButtonType.Capsule,
+            stateEffect: true
+          })
+            .attributeModifier(
+              orbitButtonMeta(
+                this.showGoalForm ? this.store.palette.fgPrimary : this.store.palette.onAccent,
+                this.showGoalForm ? this.store.palette.subtleSurface : this.store.palette.accentPrimaryFill
+              )
+            )
+            .height(34)
+            .padding({ left: 12, right: 12 })
+            .onClick(() => {
+              this.showGoalForm = !this.showGoalForm;
+            })
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+      }
+
+      if (this.showGoalForm) {
+        ListItem() {
+          Column({ space: OrbitTokens.SPACE_SM }) {
+            TextArea({ placeholder: 'Autonomous goal objective…', text: this.draftGoalObjective })
+              .fontSize(OrbitTokens.FONT_SUBHEAD_RES)
+              .fontColor(this.store.palette.fgPrimary)
+              .placeholderColor(this.store.palette.fgMuted)
+              .backgroundColor(this.store.palette.recessed)
+              .borderRadius(OrbitTokens.RADIUS_MD)
+              .constraintSize({ minHeight: 60, maxHeight: 110 })
+              .width('100%')
+              .onChange((v: string) => {
+                this.draftGoalObjective = v;
+              })
+
+            Row({ space: OrbitTokens.SPACE_SM }) {
+              TextInput({ placeholder: 'Verify command (optional)', text: this.draftGoalVerifyCmd })
+                .attributeModifier(
+                  orbitInputMono(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
+                )
+                .height(40)
+                .borderRadius(OrbitTokens.RADIUS_MD)
+                .layoutWeight(1)
+                .onChange((v: string) => {
+                  this.draftGoalVerifyCmd = v;
+                })
+              TextInput({ placeholder: 'Max', text: this.draftGoalMaxIter })
+                .type(InputType.Number)
+                .attributeModifier(
+                  orbitInputMono(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
+                )
+                .height(40)
+                .borderRadius(OrbitTokens.RADIUS_MD)
+                .width(64)
+                .onChange((v: string) => {
+                  this.draftGoalMaxIter = v;
+                })
+            }
+            .width('100%')
+
+            Button($r('app.string.action_create'), { type: ButtonType.Capsule, stateEffect: true })
+              .attributeModifier(orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill))
+              .width('100%')
+              .height(OrbitTokens.HIT_COMPACT)
+              .onClick(() => {
+                dismissHarmonyKeyboard(this.getUIContext());
+                const maxIt = Number(this.draftGoalMaxIter);
+                this.store.startGoalRun(
+                  this.draftGoalObjective,
+                  [],
+                  this.draftGoalVerifyCmd.trim().length > 0 ? this.draftGoalVerifyCmd.trim() : null,
+                  Number.isFinite(maxIt) && maxIt >= 1 ? maxIt : 6
+                ).then((ok: boolean) => {
+                  if (ok) {
+                    this.draftGoalObjective = '';
+                    this.draftGoalVerifyCmd = '';
+                    this.showGoalForm = false;
+                  }
+                });
+              })
+          }
+          .width('100%')
+          .padding(OrbitTokens.SPACE_MD)
+          .borderRadius(OrbitTokens.RADIUS_LG)
+          .attributeModifier(OrbitTheme.raisedCard(this.store.palette))
+        }
       }
 
       if (this.store.goalRuns.length === 0) {
@@ -563,6 +811,18 @@ export struct AutomationsSheet {
                 if (goal.status === 'running' || goal.status === 'verifying' || goal.status === 'paused') {
                   Row({ space: OrbitTokens.SPACE_SM }) {
                     Blank()
+                    if (goal.status === 'running') {
+                      Button($r('app.string.automations_verify_now'), { type: ButtonType.Capsule, stateEffect: true })
+                        .attributeModifier(
+                          orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.accentPrimarySoft)
+                        )
+                        .height(32)
+                        .padding({ left: 10, right: 10 })
+                        .onClick(() => {
+                          this.store.controlGoalRun(goal.goal_id, 'verify_now');
+                        })
+                    }
+
                     if (goal.status === 'paused') {
                       Button('Resume', { type: ButtonType.Capsule, stateEffect: true })
                         .attributeModifier(
@@ -608,12 +868,160 @@ export struct AutomationsSheet {
           (goal: GoalRunRecordDto): string => `goal_${goal.goal_id}_${goal.status}_${goal.current_iteration}_${goal.updated_at_ms}`
         )
       }
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .scrollBar(BarState.Auto)
+    .edgeEffect(EdgeEffect.Spring)
+  }
 
-      if (this.store.monitorWatches.length > 0) {
-        ListItem() {
-          OrbitSectionHeader({ title: `Monitors (${this.store.monitorWatches.length})` })
+  @Builder
+  private renderMonitorsTab() {
+    List({ space: OrbitTokens.SPACE_MD }) {
+      ListItem() {
+        Row({ space: OrbitTokens.SPACE_SM }) {
+          Text(`${this.store.monitorWatches.length} monitor(s)`)
+            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Medium))
+          Blank()
+          Button(this.showMonitorForm ? $r('app.string.action_close') : $r('app.string.automations_new_monitor'), {
+            type: ButtonType.Capsule,
+            stateEffect: true
+          })
+            .attributeModifier(
+              orbitButtonMeta(
+                this.showMonitorForm ? this.store.palette.fgPrimary : this.store.palette.onAccent,
+                this.showMonitorForm ? this.store.palette.subtleSurface : this.store.palette.accentPrimaryFill
+              )
+            )
+            .height(34)
+            .padding({ left: 12, right: 12 })
+            .onClick(() => {
+              this.showMonitorForm = !this.showMonitorForm;
+            })
         }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+      }
 
+      if (this.showMonitorForm) {
+        ListItem() {
+          Column({ space: OrbitTokens.SPACE_SM }) {
+            TextInput({ placeholder: 'Monitor name', text: this.draftMonitorName })
+              .attributeModifier(
+                orbitInputSubhead(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
+              )
+              .height(40)
+              .borderRadius(OrbitTokens.RADIUS_MD)
+              .width('100%')
+              .onChange((v: string) => {
+                this.draftMonitorName = v;
+              })
+
+            Row({ space: OrbitTokens.SPACE_XS }) {
+              Button('Command', { type: ButtonType.Capsule, stateEffect: true })
+                .attributeModifier(
+                  orbitButtonMeta(
+                    this.draftMonitorKind === 'command_stream' ? this.store.palette.onAccent : this.store.palette.fgSecondary,
+                    this.draftMonitorKind === 'command_stream' ? this.store.palette.accentPrimaryFill : this.store.palette.subtleSurface
+                  )
+                )
+                .height(32)
+                .layoutWeight(1)
+                .onClick(() => {
+                  this.draftMonitorKind = 'command_stream';
+                })
+              Button('Log File', { type: ButtonType.Capsule, stateEffect: true })
+                .attributeModifier(
+                  orbitButtonMeta(
+                    this.draftMonitorKind === 'log_file_tail' ? this.store.palette.onAccent : this.store.palette.fgSecondary,
+                    this.draftMonitorKind === 'log_file_tail' ? this.store.palette.accentPrimaryFill : this.store.palette.subtleSurface
+                  )
+                )
+                .height(32)
+                .layoutWeight(1)
+                .onClick(() => {
+                  this.draftMonitorKind = 'log_file_tail';
+                })
+              Button('HTTP', { type: ButtonType.Capsule, stateEffect: true })
+                .attributeModifier(
+                  orbitButtonMeta(
+                    this.draftMonitorKind === 'http_health' ? this.store.palette.onAccent : this.store.palette.fgSecondary,
+                    this.draftMonitorKind === 'http_health' ? this.store.palette.accentPrimaryFill : this.store.palette.subtleSurface
+                  )
+                )
+                .height(32)
+                .layoutWeight(1)
+                .onClick(() => {
+                  this.draftMonitorKind = 'http_health';
+                })
+            }
+            .width('100%')
+
+            TextInput({
+              placeholder: this.draftMonitorKind === 'http_health'
+                ? 'https://service.local/health'
+                : (this.draftMonitorKind === 'log_file_tail' ? '/var/log/app.log' : 'tail -f build.log'),
+              text: this.draftMonitorTarget
+            })
+              .attributeModifier(
+                orbitInputMono(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
+              )
+              .height(40)
+              .borderRadius(OrbitTokens.RADIUS_MD)
+              .width('100%')
+              .onChange((v: string) => {
+                this.draftMonitorTarget = v;
+              })
+
+            if (this.draftMonitorKind !== 'http_health') {
+              TextInput({ placeholder: 'Regex / pattern (optional)', text: this.draftMonitorPattern })
+                .attributeModifier(
+                  orbitInputMono(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
+                )
+                .height(40)
+                .borderRadius(OrbitTokens.RADIUS_MD)
+                .width('100%')
+                .onChange((v: string) => {
+                  this.draftMonitorPattern = v;
+                })
+            }
+
+            Button($r('app.string.action_create'), { type: ButtonType.Capsule, stateEffect: true })
+              .attributeModifier(orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill))
+              .width('100%')
+              .height(OrbitTokens.HIT_COMPACT)
+              .onClick(() => {
+                dismissHarmonyKeyboard(this.getUIContext());
+                this.store.createMonitorWatch(
+                  this.draftMonitorName,
+                  this.draftMonitorKind,
+                  this.draftMonitorTarget,
+                  this.draftMonitorPattern.trim().length > 0 ? this.draftMonitorPattern.trim() : null
+                ).then((ok: boolean) => {
+                  if (ok) {
+                    this.draftMonitorName = '';
+                    this.draftMonitorTarget = '';
+                    this.draftMonitorPattern = '';
+                    this.showMonitorForm = false;
+                  }
+                });
+              })
+          }
+          .width('100%')
+          .padding(OrbitTokens.SPACE_MD)
+          .borderRadius(OrbitTokens.RADIUS_LG)
+          .attributeModifier(OrbitTheme.raisedCard(this.store.palette))
+        }
+      }
+
+      if (this.store.monitorWatches.length === 0) {
+        ListItem() {
+          this.renderEmptyState(
+            'No active monitors',
+            'Watch live command streams, log files, or HTTP health endpoints.'
+          )
+        }
+      } else {
         ForEach(
           this.store.monitorWatches,
           (mon: MonitorWatchRecordDto) => {
@@ -674,6 +1082,78 @@ export struct AutomationsSheet {
   @Builder
   private renderWorkflowsTab() {
     List({ space: OrbitTokens.SPACE_MD }) {
+      ListItem() {
+        Row({ space: OrbitTokens.SPACE_SM }) {
+          Text(`${this.store.workflowRuns.length} run(s)`)
+            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Medium))
+          Blank()
+          Button(this.showWorkflowForm ? $r('app.string.action_close') : $r('app.string.automations_new_workflow'), {
+            type: ButtonType.Capsule,
+            stateEffect: true
+          })
+            .attributeModifier(
+              orbitButtonMeta(
+                this.showWorkflowForm ? this.store.palette.fgPrimary : this.store.palette.onAccent,
+                this.showWorkflowForm ? this.store.palette.subtleSurface : this.store.palette.accentPrimaryFill
+              )
+            )
+            .height(34)
+            .padding({ left: 12, right: 12 })
+            .onClick(() => {
+              this.showWorkflowForm = !this.showWorkflowForm;
+            })
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+      }
+
+      if (this.showWorkflowForm) {
+        ListItem() {
+          Column({ space: OrbitTokens.SPACE_SM }) {
+            TextInput({ placeholder: 'Workflow name', text: this.draftWorkflowName })
+              .attributeModifier(
+                orbitInputSubhead(this.store.palette.fgPrimary, this.store.palette.fgMuted, this.store.palette.recessed)
+              )
+              .height(40)
+              .borderRadius(OrbitTokens.RADIUS_MD)
+              .width('100%')
+              .onChange((v: string) => {
+                this.draftWorkflowName = v;
+              })
+
+            TextArea({ placeholder: 'Primary step instructions…', text: this.draftWorkflowPrompt })
+              .fontSize(OrbitTokens.FONT_SUBHEAD_RES)
+              .fontColor(this.store.palette.fgPrimary)
+              .placeholderColor(this.store.palette.fgMuted)
+              .backgroundColor(this.store.palette.recessed)
+              .borderRadius(OrbitTokens.RADIUS_MD)
+              .constraintSize({ minHeight: 60, maxHeight: 110 })
+              .width('100%')
+              .onChange((v: string) => {
+                this.draftWorkflowPrompt = v;
+              })
+
+            Button($r('app.string.action_create'), { type: ButtonType.Capsule, stateEffect: true })
+              .attributeModifier(orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill))
+              .width('100%')
+              .height(OrbitTokens.HIT_COMPACT)
+              .onClick(() => {
+                dismissHarmonyKeyboard(this.getUIContext());
+                this.store.startDagWorkflow(this.draftWorkflowName, this.draftWorkflowPrompt).then((ok: boolean) => {
+                  if (ok) {
+                    this.draftWorkflowName = '';
+                    this.draftWorkflowPrompt = '';
+                    this.showWorkflowForm = false;
+                  }
+                });
+              })
+          }
+          .width('100%')
+          .padding(OrbitTokens.SPACE_MD)
+          .borderRadius(OrbitTokens.RADIUS_LG)
+          .attributeModifier(OrbitTheme.raisedCard(this.store.palette))
+        }
+      }
       if (this.store.workflowRuns.length === 0) {
         ListItem() {
           this.renderEmptyState(
@@ -806,21 +1286,37 @@ export struct AutomationsSheet {
       .width('100%')
       .alignItems(VerticalAlign.Center)
 
-      CapsuleSegmentButtonV2({
-        items: this.tabItems,
-        selectedIndex: this.activeTabIndex,
-        onItemClicked: (idx: number) => {
-          this.activeTabIndex = idx;
-          this.store.triggerHaptic(6);
-        },
-        itemFontSize: LengthMetrics.fp(OrbitTokens.FONT_META),
-        itemSelectedFontSize: LengthMetrics.fp(OrbitTokens.FONT_META),
-        itemSelectedBackgroundColor: orbitSegmentSelectedBg(this.store.palette),
-        itemSelectedFontColor: orbitSegmentSelectedFg(this.store.palette),
-        itemMaxFontScale: 1.3,
-        itemMinHeight: LengthMetrics.vp(36)
-      })
-        .width('100%')
+      Scroll() {
+        Row({ space: OrbitTokens.SPACE_XS }) {
+          ForEach(
+            AUTOMATION_TABS,
+            (tab: OrbitAutomationTabItem) => {
+              Button(tab.label, { type: ButtonType.Capsule, stateEffect: true })
+                .attributeModifier(
+                  orbitButtonMeta(
+                    this.activeTabIndex === tab.idx
+                      ? this.store.palette.onAccent
+                      : this.store.palette.fgSecondary,
+                    this.activeTabIndex === tab.idx
+                      ? this.store.palette.accentPrimaryFill
+                      : this.store.palette.listCard
+                  )
+                )
+                .height(34)
+                .padding({ left: 12, right: 12 })
+                .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+                .onClick(() => {
+                  this.activeTabIndex = tab.idx;
+                  this.store.triggerHaptic(6);
+                })
+            },
+            (tab: OrbitAutomationTabItem): string => `auto_tab_${tab.idx}`
+          )
+        }
+      }
+      .scrollable(ScrollDirection.Horizontal)
+      .scrollBar(BarState.Off)
+      .width('100%')
 
       if (this.activeTabIndex === 0) {
         this.renderSchedulesTab()
@@ -828,6 +1324,8 @@ export struct AutomationsSheet {
         this.renderTimersTab()
       } else if (this.activeTabIndex === 2) {
         this.renderGoalsTab()
+      } else if (this.activeTabIndex === 3) {
+        this.renderMonitorsTab()
       } else {
         this.renderWorkflowsTab()
       }

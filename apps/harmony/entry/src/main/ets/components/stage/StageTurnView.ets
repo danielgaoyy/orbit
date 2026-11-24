@@ -506,7 +506,21 @@ struct StepItemRow {
         }
         .width('100%')
 
-        Row() {
+        Row({ space: OrbitTokens.SPACE_SM }) {
+          if (desc !== null && desc.open_path !== null && desc.open_path.length > 0) {
+            Button($r('app.string.action_open'), { type: ButtonType.Capsule, stateEffect: true })
+              .attributeModifier(
+                orbitButtonMeta(this.store.palette.fgSecondary, this.store.palette.subtleSurface)
+              )
+              .height(OrbitTokens.HIT_COMPACT)
+              .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
+              .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+              .onClick(() => {
+                if (desc.open_path !== null) {
+                  this.store.openFileExplorer(desc.open_path);
+                }
+              })
+          }
           Button('Inspect Full Diff', { type: ButtonType.Capsule, stateEffect: true })
             .attributeModifier(
               orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.subtleSurface)
@@ -530,7 +544,21 @@ struct StepItemRow {
       })
     } else {
       Column({ space: OrbitTokens.SPACE_XS }) {
-        Row() {
+        Row({ space: OrbitTokens.SPACE_XS }) {
+          if (desc !== null && desc.open_path !== null && desc.open_path.length > 0) {
+            Button($r('app.string.action_open'), { type: ButtonType.Capsule, stateEffect: true })
+              .attributeModifier(
+                orbitButtonMeta(this.store.palette.fgSecondary, this.store.palette.subtleSurface)
+              )
+              .height(28)
+              .padding({ left: 10, right: 10 })
+              .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+              .onClick(() => {
+                if (desc.open_path !== null) {
+                  this.store.openFileExplorer(desc.open_path);
+                }
+              })
+          }
           Blank()
           OrbitCopyIconButton({
             content: this.buildFullStepSnippet(desc),
@@ -540,6 +568,7 @@ struct StepItemRow {
           })
         }
         .width('100%')
+        .alignItems(VerticalAlign.Center)
 
         Text(this.buildFullStepSnippet(desc))
           .attributeModifier(orbitTextMono(this.store.palette.fgPrimary))
@@ -823,6 +852,111 @@ export struct StageTurnView {
     .width('100%')
   }
 
+  private deliveryPillLabel(status: string): Resource {
+    if (status === 'queued') {
+      return $r('app.string.stage_delivery_queued');
+    }
+    if (status === 'dispatched') {
+      return $r('app.string.stage_delivery_dispatched');
+    }
+    if (status === 'dropped') {
+      return $r('app.string.stage_delivery_dropped');
+    }
+    return $r('app.string.stage_delivery_settled');
+  }
+
+  private deliveryPillTextColor(status: string): ResourceColor {
+    if (status === 'queued') {
+      return this.store.palette.statusWarning;
+    }
+    if (status === 'dispatched') {
+      return this.store.palette.accentPrimary;
+    }
+    if (status === 'dropped') {
+      return this.store.palette.statusDanger;
+    }
+    return this.store.palette.statusDirect;
+  }
+
+  private deliveryPillBgColor(status: string): ResourceColor {
+    if (status === 'queued') {
+      return this.store.palette.statusWarningSoft;
+    }
+    if (status === 'dispatched') {
+      return this.store.palette.accentPrimarySoft;
+    }
+    if (status === 'dropped') {
+      return this.store.palette.statusDangerSoft;
+    }
+    return this.store.palette.statusDirectSoft;
+  }
+
+  private agentMessageSenderLabel(item: TimelineItemDto): string {
+    if (item.source_title !== undefined && item.source_title !== null && item.source_title.trim().length > 0) {
+      return item.source_title.trim();
+    }
+    if (item.kind !== undefined && item.kind.length > 0) {
+      return item.kind.replace(/_/g, ' ');
+    }
+    return 'Agent message';
+  }
+
+  @Builder
+  private renderAgentMessageCard(item: TimelineItemDto) {
+    Column({ space: OrbitTokens.SPACE_XS }) {
+      Row({ space: OrbitTokens.SPACE_SM }) {
+        SymbolGlyph($r('sys.symbol.person_2'))
+          .fontSize(12)
+          .fontColor([this.store.palette.accentPrimary])
+
+        Text(this.agentMessageSenderLabel(item))
+          .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+
+        if (item.delivery_status !== undefined && item.delivery_status !== null) {
+          Text(this.deliveryPillLabel(item.delivery_status))
+            .attributeModifier(
+              orbitTextMeta(this.deliveryPillTextColor(item.delivery_status), FontWeight.Medium)
+            )
+            .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+            .backgroundColor(this.deliveryPillBgColor(item.delivery_status))
+            .borderRadius(999)
+        }
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+
+      RichMarkdownView({
+        blocks: item.blocks ?? [],
+        fallbackText: item.text ?? '',
+        turnIndex: this.turn.turn_index
+      })
+
+      if (item.delivery_status === 'queued' && this.store.isActiveAgentRunning()) {
+        Row() {
+          Blank()
+          Button($r('app.string.stage_interrupt_and_deliver'), { type: ButtonType.Capsule, stateEffect: true })
+            .attributeModifier(
+              orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.accentPrimarySoft)
+            )
+            .height(28)
+            .padding({ left: 10, right: 10 })
+            .onClick(() => {
+              this.store.interruptAndContinueCurrentAgent();
+            })
+        }
+        .width('100%')
+      }
+    }
+    .width('100%')
+    .padding(OrbitTokens.SPACE_MD)
+    .backgroundColor(this.store.palette.subtleSurface)
+    .borderRadius(OrbitTokens.RADIUS_LG)
+    .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+  }
+
   @Builder
   private renderTurnFooter() {
     Row({ space: OrbitTokens.SPACE_SM }) {
@@ -833,6 +967,19 @@ export struct StageTurnView {
           .color(this.store.palette.fgMuted)
         Text(`${Math.floor(this.elapsedSeconds / 60)}:${(this.elapsedSeconds % 60).toString().padStart(2, '0')}`)
           .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+        Blank()
+        if (this.elapsedSeconds >= 8) {
+          Button($r('app.string.stage_interrupt_and_continue'), { type: ButtonType.Capsule, stateEffect: true })
+            .attributeModifier(
+              orbitButtonMeta(this.store.palette.fgSecondary, this.store.palette.subtleSurface)
+            )
+            .height(28)
+            .padding({ left: 10, right: 10 })
+            .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+            .onClick(() => {
+              this.store.interruptAndContinueCurrentAgent();
+            })
+        }
       } else {
         if (this.turn.terminal_reply !== null && this.extractReplyText(this.turn.terminal_reply).length > 0) {
           OrbitCopyIconButton({
@@ -1021,11 +1168,7 @@ export struct StageTurnView {
               turnIndex: this.turn.turn_index
             })
           } else if (seg.kind === 'agent_message' && seg.item !== undefined) {
-            RichMarkdownView({
-              blocks: seg.item.blocks ?? [],
-              fallbackText: seg.item.text ?? '',
-              turnIndex: this.turn.turn_index
-            })
+            this.renderAgentMessageCard(seg.item)
           } else if (seg.kind === 'compaction') {
             this.renderCompactionDivider(seg.label ?? 'Context compacted')
           } else if (seg.kind === 'wakeup') {
@@ -1158,6 +1301,8 @@ export struct StageTurnView {
         this.renderCompactionDivider('Context compacted')
       } else if (this.turn.user_prompt !== null) {
         this.renderUserBubble(this.turn.user_prompt)
+      } else if (this.turn.agent_message !== undefined && this.turn.agent_message !== null) {
+        this.renderAgentMessageCard(this.turn.agent_message)
       }
 
       if (this.isEffectiveActive()) {

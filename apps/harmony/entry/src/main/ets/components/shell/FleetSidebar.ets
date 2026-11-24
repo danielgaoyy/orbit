@@ -244,9 +244,19 @@ export struct FleetSidebar {
           })
 
         MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.doc_text'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: $r('app.string.nav_file_explorer')
+        })
+          .onClick(() => {
+            this.store.setActiveCwd(group.primary_cwd);
+            this.store.openFileExplorer();
+          })
+
+        MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.arrow_left_arrow_right'))
             .fontColor([this.store.palette.iconPrimary]),
-          content: 'Diff Review'
+          content: $r('app.string.nav_git_review')
         })
           .onClick(() => {
             this.store.inspectGitDiffForCwd(group.primary_cwd);
@@ -683,9 +693,91 @@ export struct FleetSidebar {
         .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD, top: OrbitTokens.SPACE_LG })
       } else {
         List() {
+          // Orbital Global Overview + Fleet Search + Personal Router Navigation
+          ListItem() {
+            Column({ space: 2 }) {
+              Row({ space: OrbitTokens.SPACE_SM }) {
+                SymbolGlyph($r('sys.symbol.house'))
+                  .fontSize(16)
+                  .fontColor([
+                    this.store.showGlobalOverview
+                      ? this.store.palette.accentPrimary
+                      : this.store.palette.iconSecondary
+                  ])
+                Text($r('app.string.nav_overview'))
+                  .attributeModifier(
+                    orbitTextSubhead(
+                      this.store.palette.fgPrimary,
+                      this.store.showGlobalOverview ? FontWeight.Medium : FontWeight.Normal
+                    )
+                  )
+                  .layoutWeight(1)
+                if (this.store.totalPendingApprovals > 0) {
+                  Text(`${this.store.totalPendingApprovals}`)
+                    .attributeModifier(orbitTextMeta(this.store.palette.statusWarning, FontWeight.Bold))
+                    .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+                    .borderRadius(OrbitTokens.RADIUS_SM)
+                    .backgroundColor(this.store.palette.statusWarningSoft)
+                }
+              }
+              .width('100%')
+              .constraintSize({ minHeight: 42 })
+              .padding({ left: 12, right: 12 })
+              .borderRadius(OrbitTokens.RADIUS_MD)
+              .backgroundColor(
+                this.store.showGlobalOverview
+                  ? this.store.palette.subtleSurface
+                  : Color.Transparent
+              )
+              .alignItems(VerticalAlign.Center)
+              .onClick(() => {
+                dismissHarmonyKeyboard(this.getUIContext());
+                this.store.openGlobalOverview();
+              })
+
+              Row({ space: OrbitTokens.SPACE_SM }) {
+                SymbolGlyph($r('sys.symbol.magnifyingglass'))
+                  .fontSize(15)
+                  .fontColor([this.store.palette.iconSecondary])
+                Text($r('app.string.nav_search_fleet'))
+                  .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Normal))
+                  .layoutWeight(1)
+              }
+              .width('100%')
+              .constraintSize({ minHeight: 40 })
+              .padding({ left: 12, right: 12 })
+              .borderRadius(OrbitTokens.RADIUS_MD)
+              .alignItems(VerticalAlign.Center)
+              .onClick(() => {
+                dismissHarmonyKeyboard(this.getUIContext());
+                this.store.openGlobalSearch();
+              })
+
+              Row({ space: OrbitTokens.SPACE_SM }) {
+                SymbolGlyph($r('sys.symbol.link'))
+                  .fontSize(15)
+                  .fontColor([this.store.palette.iconSecondary])
+                Text($r('app.string.nav_personal_router'))
+                  .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Normal))
+                  .layoutWeight(1)
+              }
+              .width('100%')
+              .constraintSize({ minHeight: 40 })
+              .padding({ left: 12, right: 12 })
+              .borderRadius(OrbitTokens.RADIUS_MD)
+              .alignItems(VerticalAlign.Center)
+              .onClick(() => {
+                dismissHarmonyKeyboard(this.getUIContext());
+                this.store.openRouterMeshSheet();
+              })
+            }
+            .width('100%')
+            .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM, bottom: OrbitTokens.SPACE_XS })
+          }
+
           if (this.needsAttentionList.length > 0) {
             ListItem() {
-              Text('Needs Attention')
+              Text($r('app.string.sidebar_needs_attention'))
                 .attributeModifier(orbitTextMeta(this.store.palette.statusWarning, FontWeight.Medium))
                 .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: 6, bottom: 4 })
             }
@@ -701,7 +793,7 @@ export struct FleetSidebar {
 
           if (this.pinnedList.length > 0) {
             ListItem() {
-              Text('Pinned')
+              Text($r('app.string.sidebar_pinned'))
                 .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Medium))
                 .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: 10, bottom: 4 })
             }
@@ -717,7 +809,7 @@ export struct FleetSidebar {
 
           ListItem() {
             Row({ space: 4 }) {
-              Text('Projects')
+              Text($r('app.string.sidebar_projects'))
                 .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Medium))
                 .layoutWeight(1)
 

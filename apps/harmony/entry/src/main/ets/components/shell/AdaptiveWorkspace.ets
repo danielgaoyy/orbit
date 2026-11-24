@@ -19,18 +19,25 @@ import {
   resolveSelectedHost
 } from '../common/OrbitCommonControls';
 import { FleetSidebar } from './FleetSidebar';
+import { PersonalOverviewView } from './PersonalOverviewView';
 import { StreamStage } from '../stage/StreamStage';
+import { PlanReviewCard } from '../stage/PlanReviewCard';
 import { StickyDecisionDock } from '../stage/StickyDecisionDock';
 import { OmniComposer } from '../composer/OmniComposer';
 import { ContextPickerSheet } from '../composer/ContextPickerSheet';
 import { GitDiffSheet } from '../sheets/GitDiffSheet';
-import { PtyTerminalSheet } from '../sheets/PtyTerminalSheet';
+import { OrbitTerminalView } from '../sheets/OrbitTerminalView';
 import { HostSettingsSheet } from '../sheets/HostSettingsSheet';
 import { DirectoryBrowserSheet } from '../sheets/DirectoryBrowserSheet';
 import { AutomationsSheet } from '../sheets/AutomationsSheet';
 import { WorkspaceBoardSheet } from '../sheets/WorkspaceBoardSheet';
 import { SideQuestionSheet } from '../sheets/SideQuestionSheet';
 import { ArchivedSessionsSheet } from '../sheets/ArchivedSessionsSheet';
+import { FileExplorerSheet } from '../sheets/FileExplorerSheet';
+import { GlobalSearchSheet } from '../sheets/GlobalSearchSheet';
+import { PersonalRouterMeshSheet } from '../sheets/PersonalRouterMeshSheet';
+import { ExportTranscriptSheet } from '../sheets/ExportTranscriptSheet';
+import { SubagentTimelineSheet } from '../sheets/SubagentTimelineSheet';
 
 @ComponentV2
 export struct AdaptiveWorkspace {
@@ -56,7 +63,21 @@ export struct AdaptiveWorkspace {
   }
 
   private isPhoneLayout(): boolean {
+    if (this.store.foldPosture === 'folded') {
+      return true;
+    }
+    if (this.store.foldPosture === 'expanded' && this.store.windowWidthVp >= 540) {
+      return false;
+    }
     return this.store.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN;
+  }
+
+  private isHalfFoldedHover(): boolean {
+    return this.store.isFoldableDevice && this.store.foldPosture === 'half_folded';
+  }
+
+  private isShowingOverview(): boolean {
+    return this.hasPairedHosts() && this.store.showGlobalOverview;
   }
 
   private resolvedSideBarWidth(): number {
@@ -101,6 +122,9 @@ export struct AdaptiveWorkspace {
   private topBarTitle(): string {
     if (!this.hasPairedHosts()) {
       return 'Orbit';
+    }
+    if (this.isShowingOverview()) {
+      return 'Overview';
     }
     if (this.store.currentAgent !== null && this.store.currentAgent.title.trim().length > 0) {
       return this.store.currentAgent.title.trim();
@@ -189,7 +213,7 @@ export struct AdaptiveWorkspace {
 
   @Builder
   private buildPtyTerminalSheet() {
-    PtyTerminalSheet()
+    OrbitTerminalView()
   }
 
   @Builder
@@ -228,6 +252,31 @@ export struct AdaptiveWorkspace {
   }
 
   @Builder
+  private buildFileExplorerSheet() {
+    FileExplorerSheet()
+  }
+
+  @Builder
+  private buildGlobalSearchSheet() {
+    GlobalSearchSheet()
+  }
+
+  @Builder
+  private buildPersonalRouterMeshSheet() {
+    PersonalRouterMeshSheet()
+  }
+
+  @Builder
+  private buildExportTranscriptSheet() {
+    ExportTranscriptSheet()
+  }
+
+  @Builder
+  private buildSubagentTimelineSheet() {
+    SubagentTimelineSheet()
+  }
+
+  @Builder
   private renderTitleMenu() {
     Menu() {
       MenuItem({
@@ -254,6 +303,35 @@ export struct AdaptiveWorkspace {
   private renderMoreMenu() {
     Menu() {
       MenuItemGroup() {
+        if (!this.isShowingOverview()) {
+          MenuItem({
+            symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.house'))
+              .fontColor([this.store.palette.iconPrimary]),
+            content: $r('app.string.nav_overview')
+          })
+            .onClick(() => {
+              this.store.openGlobalOverview();
+            })
+        }
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.magnifyingglass'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: $r('app.string.nav_search_fleet')
+        })
+          .onClick(() => {
+            this.store.openGlobalSearch();
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.folder'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: $r('app.string.nav_file_explorer')
+        })
+          .onClick(() => {
+            this.store.openFileExplorer();
+          })
+
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.arrow_left_arrow_right'))
             .fontColor([this.store.palette.iconPrimary]),
@@ -315,6 +393,15 @@ export struct AdaptiveWorkspace {
           .onClick(() => {
             this.store.openAutomationsSheet();
           })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.link'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: $r('app.string.nav_personal_router')
+        })
+          .onClick(() => {
+            this.store.openRouterMeshSheet();
+          })
       }
 
       if (this.hasActiveConversation()) {
@@ -338,12 +425,12 @@ export struct AdaptiveWorkspace {
             })
 
           MenuItem({
-            symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.square_and_square'))
+            symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.upload'))
               .fontColor([this.store.palette.iconPrimary]),
-            content: 'Export Markdown'
+            content: $r('app.string.nav_export_transcript')
           })
             .onClick(() => {
-              this.store.exportCurrentSessionMarkdown();
+              this.store.openExportTranscriptSheet();
             })
 
           MenuItem({
@@ -409,7 +496,19 @@ export struct AdaptiveWorkspace {
         })
       }
 
-      if (this.hasPairedHosts() && this.isDraftTitle()) {
+      if (this.hasPairedHosts() && this.isShowingOverview()) {
+        Column({ space: 2 }) {
+          Text($r('app.string.overview_title'))
+            .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold))
+            .maxLines(1)
+          Text(`${this.store.hosts.length} host(s)`)
+            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+            .maxLines(1)
+        }
+        .layoutWeight(1)
+        .justifyContent(FlexAlign.Center)
+        .alignItems(HorizontalAlign.Start)
+      } else if (this.hasPairedHosts() && this.isDraftTitle()) {
         Blank()
           .layoutWeight(1)
       } else if (this.hasPairedHosts()) {
@@ -547,28 +646,71 @@ export struct AdaptiveWorkspace {
         Stack({ alignContent: Alignment.Top }) {
           HdsNavigation(this.mainNavStack) {
             Row() {
-              Column() {
+              if (this.isShowingOverview()) {
                 Column() {
-                  StreamStage()
+                  PersonalOverviewView()
                 }
-                .width('100%')
                 .layoutWeight(1)
-                .parallelGesture(
-                  TapGesture({ count: 1 }).onAction(() => {
-                    if (this.store.keyboardHeightVp > 0) {
-                      dismissHarmonyKeyboard(this.getUIContext());
-                    }
-                  })
-                )
+                .height('100%')
+                .backgroundColor(this.store.palette.canvas)
+              } else if (this.isHalfFoldedHover()) {
+                FolderStack({ upperItems: ['orbit_stage_upper'] }) {
+                  Column() {
+                    StreamStage()
+                  }
+                  .id('orbit_stage_upper')
+                  .width('100%')
+                  .height('100%')
+                  .parallelGesture(
+                    TapGesture({ count: 1 }).onAction(() => {
+                      if (this.store.keyboardHeightVp > 0) {
+                        dismissHarmonyKeyboard(this.getUIContext());
+                      }
+                    })
+                  )
 
-                if (this.hasPairedHosts()) {
-                  StickyDecisionDock()
-                  OmniComposer()
+                  Column() {
+                    if (this.hasPairedHosts()) {
+                      PlanReviewCard()
+                      StickyDecisionDock()
+                      OmniComposer()
+                    }
+                  }
+                  .width('100%')
+                  .alignItems(HorizontalAlign.Center)
                 }
+                .enableAnimation(true)
+                .autoHalfFold(true)
+                .alignContent(Alignment.Bottom)
+                .layoutWeight(1)
+                .height('100%')
+                .backgroundColor(this.store.palette.canvas)
+              } else {
+                Column() {
+                  Column() {
+                    StreamStage()
+                  }
+                  .width('100%')
+                  .layoutWeight(1)
+                  .parallelGesture(
+                    TapGesture({ count: 1 }).onAction(() => {
+                      if (this.store.keyboardHeightVp > 0) {
+                        dismissHarmonyKeyboard(this.getUIContext());
+                      }
+                    })
+                  )
+
+                  if (this.hasPairedHosts()) {
+                    PlanReviewCard()
+                    StickyDecisionDock()
+                    OmniComposer()
+                  }
+                }
+                .layoutWeight(1)
+                .height('100%')
+                .alignItems(HorizontalAlign.Center)
+                .backgroundColor(this.store.palette.canvas)
               }
-              .layoutWeight(1)
-              .height('100%')
-              .backgroundColor(this.store.palette.canvas)
 
               if (
                 this.canShowInlineDiff() &&
@@ -769,6 +911,66 @@ export struct AdaptiveWorkspace {
             this.store.showArchivedSessionsSheet = false;
           },
           this.store.palette.drawer
+        ))
+
+      Column()
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.None)
+        .bindSheet($$this.store.showFileExplorerSheet, this.buildFileExplorerSheet(), this.buildSheetOptions(
+          [SheetSize.LARGE, SheetSize.MEDIUM],
+          () => {
+            this.store.showFileExplorerSheet = false;
+          },
+          this.store.palette.canvas
+        ))
+
+      Column()
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.None)
+        .bindSheet($$this.store.showGlobalSearchSheet, this.buildGlobalSearchSheet(), this.buildSheetOptions(
+          [SheetSize.LARGE, SheetSize.MEDIUM],
+          () => {
+            this.store.showGlobalSearchSheet = false;
+          },
+          this.store.palette.canvas
+        ))
+
+      Column()
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.None)
+        .bindSheet($$this.store.showRouterMeshSheet, this.buildPersonalRouterMeshSheet(), this.buildSheetOptions(
+          [SheetSize.LARGE, SheetSize.MEDIUM],
+          () => {
+            this.store.showRouterMeshSheet = false;
+          },
+          this.store.palette.canvas
+        ))
+
+      Column()
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.None)
+        .bindSheet($$this.store.showExportTranscriptSheet, this.buildExportTranscriptSheet(), this.buildSheetOptions(
+          [SheetSize.LARGE, SheetSize.MEDIUM],
+          () => {
+            this.store.showExportTranscriptSheet = false;
+          },
+          this.store.palette.canvas
+        ))
+
+      Column()
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.None)
+        .bindSheet($$this.store.showSubagentSheet, this.buildSubagentTimelineSheet(), this.buildSheetOptions(
+          [SheetSize.LARGE, SheetSize.MEDIUM],
+          () => {
+            this.store.showSubagentSheet = false;
+          },
+          this.store.palette.canvas
         ))
     }
     .width('100%')

@@ -33,11 +33,11 @@ export function orbitColorMetrics(color: ResourceColor): ColorMetrics | undefine
 }
 
 export function orbitSegmentSelectedBg(palette: OrbitThemePalette): ColorMetrics | undefined {
-  return orbitColorMetrics(palette.isDark ? '#F4F4F6' : '#141416');
+  return orbitColorMetrics(palette.isDark ? '#F1F2F7' : '#14161D');
 }
 
 export function orbitSegmentSelectedFg(palette: OrbitThemePalette): ColorMetrics | undefined {
-  return orbitColorMetrics(palette.isDark ? '#141416' : '#FFFFFF');
+  return orbitColorMetrics(palette.isDark ? '#14161D' : '#FCFCFE');
 }
 
 export function orbitTintColorFilter(hexColor: string): drawing.ColorFilter | undefined {
@@ -73,33 +73,41 @@ export function orbitTintColorFilter(hexColor: string): drawing.ColorFilter | un
 }
 
 export class OrbitTokens {
-  // HarmonyOS 7 Official Typography Scale ($r('sys.float.*'))
+  // HarmonyOS NEXT Typography Scale ($r('sys.float.*')) paired with Orbital Quiet Precision hierarchy
   public static readonly FONT_TITLE_RES: Resource = $r('sys.float.Title_S');       // 20fp
   public static readonly FONT_SUBTITLE_RES: Resource = $r('sys.float.Subtitle_M'); // 16fp
-  public static readonly FONT_BODY_RES: Resource = $r('sys.float.Body_L');         // 16fp
-  public static readonly FONT_SUBHEAD_RES: Resource = $r('sys.float.Body_M');      // 14fp
-  public static readonly FONT_META_RES: Resource = $r('sys.float.Body_S');         // 12fp
-  public static readonly FONT_CAPTION_RES: Resource = $r('sys.float.Caption_M');   // 10fp
+  public static readonly FONT_BODY_RES: Resource = $r('sys.float.Body_L');         // 15-16fp reading
+  public static readonly FONT_SUBHEAD_RES: Resource = $r('sys.float.Body_M');      // 14fp interface
+  public static readonly FONT_META_RES: Resource = $r('sys.float.Body_S');         // 12fp meta
+  public static readonly FONT_CAPTION_RES: Resource = $r('sys.float.Caption_M');   // 10-11fp eyebrow
 
   // Numeric equivalents strictly for Span / LengthMetrics APIs that require numeric fp
   public static readonly FONT_TITLE: number = 20;
-  public static readonly FONT_BODY: number = 16;
-  public static readonly FONT_SUBHEAD: number = 14;
-  public static readonly FONT_META: number = 12;
+  public static readonly FONT_BODY: number = 15;
+  public static readonly FONT_SUBHEAD: number = 13;
+  public static readonly FONT_META: number = 11;
 
   public static readonly MAX_FONT_SCALE_CHROME: number = 1.45;
   public static readonly MAX_FONT_SCALE_BODY: number = 2.0;
 
   public static readonly FAMILY_MONO: string = 'HarmonyOS Sans Mono';
 
-  // HarmonyOS 7 Spatial Grid (vp)
+  // Orbital Quiet Precision 4vp Spatial Grid
   public static readonly SPACE_XS: number = 4;
   public static readonly SPACE_SM: number = 8;
   public static readonly SPACE_MD: number = 12;
   public static readonly SPACE_LG: number = 16;
   public static readonly SPACE_XL: number = 24;
+  public static readonly SPACE_XXL: number = 32;
 
-  // HarmonyOS 7 Corner Radius Tokens ($r('sys.float.corner_radius_level*'))
+  // Canonical Motion Durations (ms) aligned with .interface-design/system.md
+  public static readonly DUR_FAST: number = 110;
+  public static readonly DUR_UI: number = 150;
+  public static readonly DUR_OVERLAY: number = 190;
+  public static readonly DUR_PANEL: number = 240;
+  public static readonly DUR_EXIT: number = 130;
+
+  // HarmonyOS Corner Radius Scale ($r('sys.float.corner_radius_level*'))
   public static readonly RADIUS_XS: Resource = $r('sys.float.corner_radius_level2');  // 4vp
   public static readonly RADIUS_SM: Resource = $r('sys.float.corner_radius_level4');  // 8vp
   public static readonly RADIUS_MD: Resource = $r('sys.float.corner_radius_level6');  // 12vp
@@ -107,47 +115,60 @@ export class OrbitTokens {
   public static readonly RADIUS_XL: Resource = $r('sys.float.corner_radius_level10'); // 20vp
   public static readonly RADIUS_XXL: Resource = $r('sys.float.corner_radius_level12'); // 24vp
 
-  // Touch Targets & Chrome Metrics (HarmonyOS 7: 48vp primary / 40vp compact)
+  // Touch Targets & Chrome Metrics (48vp primary / 40vp compact)
   public static readonly HIT_MIN: number = 48;
   public static readonly HIT_COMPACT: number = 40;
   public static readonly TOP_BAR_HEIGHT: number = 56;
   public static readonly DOT_SIZE: number = 6;
   public static readonly HAIRLINE: number = 0.5;
 
-  // Multi-Form-Factor Breakpoints
-  public static readonly BP_FOLDABLE_MIN: number = 700;
+  // Multi-Form-Factor & Foldable Breakpoints
+  public static readonly BP_FOLDABLE_MIN: number = 680;
   public static readonly BP_EXPANDED_MIN: number = 1024;
   public static readonly SIDEBAR_FOLD_WIDTH: number = 280;
-  public static readonly DIFF_PANE_EXPANDED_WIDTH: number = 360;
+  public static readonly STAGE_MAX_READING_WIDTH: number = 740;
+  public static readonly DIFF_PANE_EXPANDED_WIDTH: number = 368;
 }
 
 /**
- * Pure HarmonyOS 7 native semantic palette backed exclusively by `$r('sys.color.*')`
- * and dual `base/` + `dark/` `$r('app.color.*')` resources so `configColorModeChangePerformanceInArkUI`
- * performs zero-JS-rebuild dark/light transitions natively.
+ * Orbital Quiet Precision (OKLCH 258° cool-slate neutral) semantic palette
+ * backed by dual `base/` (Alabaster Paper) + `dark/` (Obsidian Graphite) `$r('app.color.*')`
+ * resources so `configColorModeChangePerformanceInArkUI` switches Light/Dark atomically.
  */
 export interface OrbitThemePalette {
   id: string;
   isDark: boolean;
+  // 4-tier neutral surface elevation
+  recessed: ResourceColor;
   canvas: ResourceColor;
   drawer: ResourceColor;
   elevated: ResourceColor;
   listCard: ResourceColor;
+  overlay: ResourceColor;
   code: ResourceColor;
   subtleSurface: ResourceColor;
   userBubble: ResourceColor;
+  // 4-tier ink hierarchy
   fgPrimary: ResourceColor;
   fgSecondary: ResourceColor;
   fgMuted: ResourceColor;
+  fgFaint: ResourceColor;
   iconPrimary: ResourceColor;
   iconSecondary: ResourceColor;
+  // Hairline progression
   hairline: ResourceColor;
+  borderDefault: ResourceColor;
+  borderStrong: ResourceColor;
+  // Monochrome primary action
   accentPrimary: ResourceColor;
   accentPrimaryFill: ResourceColor;
   accentPrimarySoft: ResourceColor;
   onAccent: ResourceColor;
+  // WCAG AA semantic signals
   statusDirect: ResourceColor;
   statusDirectSoft: ResourceColor;
+  statusInfo: ResourceColor;
+  statusInfoSoft: ResourceColor;
   statusRelay: ResourceColor;
   statusRelaySoft: ResourceColor;
   statusWarning: ResourceColor;
@@ -161,41 +182,49 @@ export interface OrbitThemePalette {
   unreadBadge: ResourceColor;
   scrim: ResourceColor;
   overlayPillBg: ResourceColor;
-  // Raw hex strings strictly for non-Resource APIs (drawing.ColorFilter)
+  // Raw hex strings strictly for non-Resource APIs (drawing.ColorFilter / system bar tint)
   tintPrimaryHex: string;
   tintMutedHex: string;
   tintDirectHex: string;
   tintWarningHex: string;
   tintDangerHex: string;
+  statusBarContentHex: string;
 }
 
 const SHARED_NATIVE_COLORS_LIGHT: OrbitThemePalette = {
   id: 'light',
   isDark: false,
-  canvas: $r('sys.color.background_primary'),
-  drawer: $r('sys.color.background_secondary'),
-  elevated: $r('sys.color.comp_background_primary'),
-  listCard: $r('sys.color.comp_background_list_card'),
+  recessed: $r('app.color.orbit_surface_recessed'),
+  canvas: $r('app.color.orbit_surface_base'),
+  drawer: $r('app.color.orbit_surface_base'),
+  elevated: $r('app.color.orbit_surface_raised'),
+  listCard: $r('app.color.orbit_surface_raised'),
+  overlay: $r('app.color.orbit_surface_overlay'),
   code: $r('app.color.orbit_code_bg'),
-  subtleSurface: $r('sys.color.comp_background_tertiary'),
-  userBubble: $r('sys.color.comp_background_list_card'),
-  fgPrimary: $r('sys.color.font_primary'),
-  fgSecondary: $r('sys.color.font_secondary'),
-  fgMuted: $r('sys.color.font_tertiary'),
-  iconPrimary: $r('sys.color.icon_primary'),
-  iconSecondary: $r('sys.color.icon_secondary'),
-  hairline: $r('sys.color.comp_divider'),
+  subtleSurface: $r('app.color.orbit_surface_subtle'),
+  userBubble: $r('app.color.orbit_surface_raised'),
+  fgPrimary: $r('app.color.orbit_ink_primary'),
+  fgSecondary: $r('app.color.orbit_ink_secondary'),
+  fgMuted: $r('app.color.orbit_ink_tertiary'),
+  fgFaint: $r('app.color.orbit_ink_faint'),
+  iconPrimary: $r('app.color.orbit_ink_primary'),
+  iconSecondary: $r('app.color.orbit_ink_secondary'),
+  hairline: $r('app.color.orbit_border_subtle'),
+  borderDefault: $r('app.color.orbit_border_default'),
+  borderStrong: $r('app.color.orbit_border_strong'),
   accentPrimary: $r('app.color.orbit_brand'),
   accentPrimaryFill: $r('app.color.orbit_brand'),
   accentPrimarySoft: $r('app.color.orbit_accent_soft'),
   onAccent: $r('app.color.orbit_on_brand'),
-  statusDirect: $r('sys.color.confirm'),
+  statusDirect: $r('app.color.orbit_status_direct'),
   statusDirectSoft: $r('app.color.orbit_status_direct_soft'),
+  statusInfo: $r('app.color.orbit_status_info'),
+  statusInfoSoft: $r('app.color.orbit_status_info_soft'),
   statusRelay: $r('app.color.orbit_status_relay'),
   statusRelaySoft: $r('app.color.orbit_status_relay_soft'),
-  statusWarning: $r('sys.color.warning'),
+  statusWarning: $r('app.color.orbit_status_warning'),
   statusWarningSoft: $r('app.color.orbit_status_warning_soft'),
-  statusDanger: $r('sys.color.alert'),
+  statusDanger: $r('app.color.orbit_status_danger'),
   statusDangerSoft: $r('app.color.orbit_status_danger_soft'),
   diffAddedBg: $r('app.color.orbit_diff_added_bg'),
   diffRemovedBg: $r('app.color.orbit_diff_removed_bg'),
@@ -204,40 +233,48 @@ const SHARED_NATIVE_COLORS_LIGHT: OrbitThemePalette = {
   unreadBadge: $r('app.color.orbit_badge_unread'),
   scrim: $r('app.color.orbit_scrim'),
   overlayPillBg: $r('app.color.orbit_overlay_pill_bg'),
-  tintPrimaryHex: '#E6000000',
-  tintMutedHex: '#99000000',
-  tintDirectHex: '#FF64BB5C',
-  tintWarningHex: '#FFED6F21',
-  tintDangerHex: '#FFE84026'
+  tintPrimaryHex: '#FF14161D',
+  tintMutedHex: '#FF6E7487',
+  tintDirectHex: '#FF0F7B55',
+  tintWarningHex: '#FFB45309',
+  tintDangerHex: '#FFC8283B',
+  statusBarContentHex: '#14161D'
 };
 
 const SHARED_NATIVE_COLORS_DARK: OrbitThemePalette = {
   id: 'dark',
   isDark: true,
-  canvas: $r('sys.color.background_primary'),
-  drawer: $r('sys.color.background_secondary'),
-  elevated: $r('sys.color.comp_background_primary'),
-  listCard: $r('sys.color.comp_background_list_card'),
+  recessed: $r('app.color.orbit_surface_recessed'),
+  canvas: $r('app.color.orbit_surface_base'),
+  drawer: $r('app.color.orbit_surface_base'),
+  elevated: $r('app.color.orbit_surface_raised'),
+  listCard: $r('app.color.orbit_surface_raised'),
+  overlay: $r('app.color.orbit_surface_overlay'),
   code: $r('app.color.orbit_code_bg'),
-  subtleSurface: $r('sys.color.comp_background_tertiary'),
-  userBubble: $r('sys.color.comp_background_list_card'),
-  fgPrimary: $r('sys.color.font_primary'),
-  fgSecondary: $r('sys.color.font_secondary'),
-  fgMuted: $r('sys.color.font_tertiary'),
-  iconPrimary: $r('sys.color.icon_primary'),
-  iconSecondary: $r('sys.color.icon_secondary'),
-  hairline: $r('sys.color.comp_divider'),
+  subtleSurface: $r('app.color.orbit_surface_subtle'),
+  userBubble: $r('app.color.orbit_surface_raised'),
+  fgPrimary: $r('app.color.orbit_ink_primary'),
+  fgSecondary: $r('app.color.orbit_ink_secondary'),
+  fgMuted: $r('app.color.orbit_ink_tertiary'),
+  fgFaint: $r('app.color.orbit_ink_faint'),
+  iconPrimary: $r('app.color.orbit_ink_primary'),
+  iconSecondary: $r('app.color.orbit_ink_secondary'),
+  hairline: $r('app.color.orbit_border_subtle'),
+  borderDefault: $r('app.color.orbit_border_default'),
+  borderStrong: $r('app.color.orbit_border_strong'),
   accentPrimary: $r('app.color.orbit_brand'),
   accentPrimaryFill: $r('app.color.orbit_brand'),
   accentPrimarySoft: $r('app.color.orbit_accent_soft'),
   onAccent: $r('app.color.orbit_on_brand'),
-  statusDirect: $r('sys.color.confirm'),
+  statusDirect: $r('app.color.orbit_status_direct'),
   statusDirectSoft: $r('app.color.orbit_status_direct_soft'),
+  statusInfo: $r('app.color.orbit_status_info'),
+  statusInfoSoft: $r('app.color.orbit_status_info_soft'),
   statusRelay: $r('app.color.orbit_status_relay'),
   statusRelaySoft: $r('app.color.orbit_status_relay_soft'),
-  statusWarning: $r('sys.color.warning'),
+  statusWarning: $r('app.color.orbit_status_warning'),
   statusWarningSoft: $r('app.color.orbit_status_warning_soft'),
-  statusDanger: $r('sys.color.alert'),
+  statusDanger: $r('app.color.orbit_status_danger'),
   statusDangerSoft: $r('app.color.orbit_status_danger_soft'),
   diffAddedBg: $r('app.color.orbit_diff_added_bg'),
   diffRemovedBg: $r('app.color.orbit_diff_removed_bg'),
@@ -246,11 +283,12 @@ const SHARED_NATIVE_COLORS_DARK: OrbitThemePalette = {
   unreadBadge: $r('app.color.orbit_badge_unread'),
   scrim: $r('app.color.orbit_scrim'),
   overlayPillBg: $r('app.color.orbit_overlay_pill_bg'),
-  tintPrimaryHex: '#DBFFFFFF',
-  tintMutedHex: '#99FFFFFF',
-  tintDirectHex: '#FF64BB5C',
-  tintWarningHex: '#FFED6F21',
-  tintDangerHex: '#FFE84026'
+  tintPrimaryHex: '#FFF1F2F7',
+  tintMutedHex: '#FF83889C',
+  tintDirectHex: '#FF3ED598',
+  tintWarningHex: '#FFF5B749',
+  tintDangerHex: '#FFF87171',
+  statusBarContentHex: '#F1F2F7'
 };
 
 export const LIGHT_PALETTE: OrbitThemePalette = SHARED_NATIVE_COLORS_LIGHT;
@@ -266,7 +304,7 @@ export function resolveOrbitPalette(themeMode: string, systemIsDark: boolean): O
   return systemIsDark ? DARK_PALETTE : LIGHT_PALETTE;
 }
 
-// Centralized ArkUI V2 AttributeModifiers using HarmonyOS 7 `$r('sys.float.*')` & scalable `maxFontScale`
+// Centralized ArkUI V2 AttributeModifiers
 
 export class OrbitTextModifier implements AttributeModifier<TextAttribute> {
   private readonly sizeRes: Resource;
@@ -402,7 +440,6 @@ export class OrbitSurfaceModifier implements AttributeModifier<CommonAttribute> 
   }
 }
 
-// Modifier caches to avoid per-render heap allocations for common presets
 const textModifierCache: Map<string, OrbitTextModifier> = new Map<string, OrbitTextModifier>();
 
 function cachedTextMod(
@@ -476,7 +513,7 @@ export function orbitTextMono(
 }
 
 export function orbitSpanHeadingFont(level: number): Font {
-  const size = level <= 1 ? OrbitTokens.FONT_TITLE : (level === 2 ? 18 : OrbitTokens.FONT_BODY);
+  const size = level <= 1 ? OrbitTokens.FONT_TITLE : (level === 2 ? 17 : OrbitTokens.FONT_BODY);
   return {
     size: size,
     weight: FontWeight.Bold
@@ -567,7 +604,7 @@ export function orbitComposerArea(
 
 export function orbitSurface(
   bg: ResourceColor,
-  borderCol: ResourceColor = $r('sys.color.comp_divider'),
+  borderCol: ResourceColor = $r('app.color.orbit_border_subtle'),
   borderWidth: number = OrbitTokens.HAIRLINE,
   shadowStyle?: ShadowStyle
 ): OrbitSurfaceModifier {

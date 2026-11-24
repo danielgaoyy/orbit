@@ -1,6 +1,7 @@
 import { common } from '@kit.AbilityKit';
 import { preferences } from '@kit.ArkData';
 import { fileIo } from '@kit.CoreFileKit';
+import { cryptoFramework } from '@kit.CryptoArchitectureKit';
 import { orbitLogWarn } from './OrbitLogger';
 
 const PREFS_NAME: string = 'orbit_harmony_prefs';
@@ -8,6 +9,8 @@ const KEY_THEME_MODE: string = 'theme_mode';
 const KEY_PINNED_THREADS: string = 'pinned_threads_json';
 const KEY_MIGRATED_THREAD_PREFS_V1: string = 'migrated_thread_prefs_v1';
 const KEY_DRAFT_PREFS: string = 'draft_prefs_v1';
+const KEY_DEVICE_ID: string = 'orbit_harmony_device_id_v1';
+const KEY_PRIMARY_ROUTER_HOST: string = 'primary_router_host_id_v1';
 
 export interface OrbitDraftPrefs {
   provider: string;
@@ -16,6 +19,34 @@ export interface OrbitDraftPrefs {
   permissionMode: string;
   sidebarProjectSort: string;
   sidebarThreadFilter: string;
+}
+
+function generateAnonymousDeviceId(): string {
+  const bytes = new Uint8Array(12);
+  let filled = false;
+  try {
+    if (canIUse('SystemCapability.Security.CryptoFramework.Rand')) {
+      const blob = cryptoFramework.createRandom().generateRandomSync(12);
+      if (blob.data.length === 12) {
+        for (let i = 0; i < 12; i++) {
+          bytes[i] = blob.data[i];
+        }
+        filled = true;
+      }
+    }
+  } catch (_err) {
+    filled = false;
+  }
+  if (!filled) {
+    for (let i = 0; i < 12; i++) {
+      bytes[i] = Math.floor(Math.random() * 256) & 0xFF;
+    }
+  }
+  let hex = '';
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, '0');
+  }
+  return `ohos-${hex}`;
 }
 
 export class OrbitPreferencesStore {
@@ -29,6 +60,53 @@ export class OrbitPreferencesStore {
       this.prefs = preferences.getPreferencesSync(context, { name: PREFS_NAME });
     } catch (err) {
       orbitLogWarn('OrbitPrefs', 'Failed to initialize preferences', err as Object);
+    }
+  }
+
+  public getOrCreateDeviceId(): string {
+    if (this.prefs !== null) {
+      try {
+        const stored = this.prefs.getSync(KEY_DEVICE_ID, '') as string;
+        if (typeof stored === 'string' && stored.trim().length > 0) {
+          return stored.trim();
+        }
+        const fresh = generateAnonymousDeviceId();
+        this.prefs.putSync(KEY_DEVICE_ID, fresh);
+        this.prefs.flush().catch((err: Object) => {
+          orbitLogWarn('OrbitPrefs', 'Failed to flush device id', err);
+        });
+        return fresh;
+      } catch (err) {
+        orbitLogWarn('OrbitPrefs', 'Failed to read/write device id', err as Object);
+      }
+    }
+    return generateAnonymousDeviceId();
+  }
+
+  public getPrimaryRouterHostId(): string {
+    if (this.prefs === null) {
+      return '';
+    }
+    try {
+      const stored = this.prefs.getSync(KEY_PRIMARY_ROUTER_HOST, '') as string;
+      return typeof stored === 'string' ? stored.trim() : '';
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to read primary router host', err as Object);
+      return '';
+    }
+  }
+
+  public setPrimaryRouterHostId(hostId: string): void {
+    if (this.prefs === null) {
+      return;
+    }
+    try {
+      this.prefs.putSync(KEY_PRIMARY_ROUTER_HOST, hostId.trim());
+      this.prefs.flush().catch((err: Object) => {
+        orbitLogWarn('OrbitPrefs', 'Failed to flush primary router host', err);
+      });
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to save primary router host', err as Object);
     }
   }
 
@@ -101,7 +179,6 @@ export class OrbitPreferencesStore {
       }
     }
 
-    // One-time migration from legacy sidecar JSON file
     if (legacyFilePath.length > 0) {
       try {
         if (fileIo.accessSync(legacyFilePath)) {
@@ -145,7 +222,6 @@ export class OrbitPreferencesStore {
       }
     }
 
-    // One-time migration from legacy sidecar file
     if (legacyFilePath.length > 0) {
       try {
         if (fileIo.accessSync(legacyFilePath)) {

@@ -1,7 +1,7 @@
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
 import { HostCardDto } from '../../model/OrbitTypes';
 import { orbitLogWarn } from '../../model/OrbitLogger';
-import { OrbitTokens, orbitTextMeta } from '../../theme/OrbitTokens';
+import { OrbitTokens, orbitTextMeta, orbitTextSubhead } from '../../theme/OrbitTokens';
 
 export function dismissHarmonyKeyboard(uiContext: UIContext): void {
   try {
@@ -44,7 +44,7 @@ export function resolveSelectedHost(store: OrbitHarmonyStore): HostCardDto | nul
 
 @ComponentV2
 export struct OrbitSectionHeader {
-  @Param @Require title: string;
+  @Param @Require title: ResourceStr;
   @Param isFirst: boolean = false;
 
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
@@ -62,6 +62,64 @@ export struct OrbitSectionHeader {
       top: this.isFirst ? 6 : 20,
       bottom: 6
     })
+  }
+}
+
+@ComponentV2
+export struct OrbitSheetHeader {
+  @Param @Require title: ResourceStr;
+  @Param subtitle: string = '';
+  @Event onClose: () => void = () => {};
+
+  private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
+
+  build() {
+    Column({ space: 0 }) {
+      Row({ space: OrbitTokens.SPACE_SM }) {
+        Column({ space: 2 }) {
+          Text(this.title)
+            .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          if (this.subtitle.length > 0) {
+            Text(this.subtitle)
+              .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        Button({ type: ButtonType.Circle, stateEffect: true }) {
+          SymbolGlyph($r('sys.symbol.xmark'))
+            .fontSize(15)
+            .fontColor([this.store.palette.iconPrimary])
+        }
+        .width(OrbitTokens.HIT_COMPACT)
+        .height(OrbitTokens.HIT_COMPACT)
+        .padding(0)
+        .backgroundColor(this.store.palette.subtleSurface)
+        .accessibilityText('Close')
+        .onClick(() => {
+          this.onClose();
+        })
+      }
+      .width('100%')
+      .padding({
+        left: OrbitTokens.SPACE_LG,
+        right: OrbitTokens.SPACE_LG,
+        top: OrbitTokens.SPACE_MD,
+        bottom: OrbitTokens.SPACE_SM
+      })
+      .alignItems(VerticalAlign.Center)
+
+      Divider()
+        .strokeWidth(OrbitTokens.HAIRLINE)
+        .color(this.store.palette.hairline)
+        .width('100%')
+    }
+    .width('100%')
   }
 }
 

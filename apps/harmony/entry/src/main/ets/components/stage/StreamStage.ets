@@ -1,7 +1,9 @@
 import { SymbolGlyphModifier } from '@kit.ArkUI';
 import {
+  AgentCardDto,
   HostCardDto,
   LaunchpadProjectDto,
+  SessionSubagentEntryDto,
   StageTurnDto,
   basenameOfPath,
   cwdPathsEquivalent,
@@ -10,11 +12,13 @@ import {
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
 import {
   OrbitTokens,
+  orbitButtonMeta,
   orbitButtonSubhead,
   orbitInputMono,
   orbitSurface,
   orbitTextBody,
   orbitTextMeta,
+  orbitTextMono,
   orbitTextSubhead,
   orbitTextTitle
 } from '../../theme/OrbitTokens';
@@ -78,12 +82,17 @@ export struct StreamStage {
     return '~';
   }
 
+  private lastListItemIndex(): number {
+    const headerOffset = this.store.stageHasOlderHistory ? 1 : 0;
+    return Math.max(0, this.store.stageTurns.length + headerOffset - 1);
+  }
+
   private showJumpToLatest(): boolean {
     const totalItems = this.store.stageTurns.length;
     if (totalItems === 0) {
       return false;
     }
-    if (this.lastVisibleIndex < totalItems - 1) {
+    if (this.lastVisibleIndex < this.lastListItemIndex()) {
       return true;
     }
     return !this.atBottomEdge;
@@ -131,6 +140,232 @@ export struct StreamStage {
 
   private isDraftSession(): boolean {
     return this.store.isNewSessionDraft || this.store.selectedAgentId.length === 0;
+  }
+
+  @Computed
+  get workspacePeers(): AgentCardDto[] {
+    const active = this.store.currentAgent;
+    const detail = this.store.currentHostDetail;
+    if (active === null || detail === null || active.workspace_id.length === 0) {
+      return [];
+    }
+    const peers: AgentCardDto[] = [];
+    for (let i = 0; i < detail.agents.length; i++) {
+      const cand = detail.agents[i];
+      if (
+        cand.agent_id !== active.agent_id &&
+        cand.workspace_id === active.workspace_id &&
+        (cand.archived_at_rfc3339 === undefined || cand.archived_at_rfc3339 === null || cand.archived_at_rfc3339.length === 0)
+      ) {
+        peers.push(cand);
+      }
+    }
+    return peers;
+  }
+
+  private hasParentAgent(): boolean {
+    const active = this.store.currentAgent;
+    return active !== null && active.parent_agent_id !== null && active.parent_agent_id.length > 0;
+  }
+
+  private formatUsagePill(): string {
+    const usage = this.store.activeSessionUsage;
+    if (usage === null) {
+      return '';
+    }
+    const totalTok = (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0);
+    const parts: string[] = [];
+    if (totalTok >= 1000) {
+      parts.push(`${(totalTok / 1000).toFixed(1)}k tok`);
+    } else if (totalTok > 0) {
+      parts.push(`${totalTok} tok`);
+    }
+    if (usage.total_cost_usd !== undefined && usage.total_cost_usd !== null && usage.total_cost_usd > 0) {
+      parts.push(`$${usage.total_cost_usd.toFixed(3)}`);
+    }
+    if (usage.context_percent !== undefined && usage.context_percent !== null && usage.context_percent > 0) {
+      parts.push(`${Math.round(usage.context_percent)}% ctx`);
+    }
+    return parts.join(' · ');
+  }
+
+  private showLineageStrip(): boolean {
+    return this.hasParentAgent() ||
+      this.store.stageSubagents.length > 0 ||
+      this.workspacePeers.length > 0 ||
+      this.formatUsagePill().length > 0;
+  }
+
+  private subagentStatusColor(status: string): ResourceColor {
+    const s = status.toLowerCase();
+    if (s === 'running' || s === 'working' || s === 'streaming') {
+      return this.store.palette.accentPrimary;
+    }
+    if (s === 'failed' || s === 'error') {
+      return this.store.palette.statusDanger;
+    }
+    if (s === 'completed' || s === 'done' || s === 'succeeded') {
+      return this.store.palette.statusDirect;
+    }
+    return this.store.palette.fgMuted;
+  }
+
+  @Builder
+  private renderOfflineBanner(host: HostCardDto) {
+    Row({ space: OrbitTokens.SPACE_SM }) {
+      Row()
+        .width(7)
+        .height(7)
+        .borderRadius(3.5)
+        .backgroundColor(resolveHostStatusColor(host, this.store))
+
+      Column({ space: 2 }) {
+        Text(
+          host.connection_state === 'connecting'
+            ? $r('app.string.stage_reconnecting_banner')
+            : $r('app.string.stage_offline_banner')
+        )
+          .attributeModifier(orbitTextMeta(this.store.palette.fgPrimary, FontWeight.Medium))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+
+        if (host.last_error !== null && host.last_error.trim().length > 0) {
+          Text(host.last_error.trim())
+            .attributeModifier(orbitTextMeta(this.store.palette.statusDanger))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+
+      Button($r('app.string.action_reconnect'), { type: ButtonType.Capsule, stateEffect: true })
+        .attributeModifier(
+          orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.listCard)
+        )
+        .height(30)
+        .padding({ left: 10, right: 10 })
+        .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.borderDefault })
+        .onClick(() => {
+          this.store.reconnectHost(host.host_id);
+        })
+    }
+    .width('100%')
+    .constraintSize({ maxWidth: OrbitTokens.STAGE_MAX_READING_WIDTH })
+    .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD, top: 8, bottom: 8 })
+    .backgroundColor(
+      host.connection_state === 'connecting'
+        ? this.store.palette.statusWarningSoft
+        : this.store.palette.statusDangerSoft
+    )
+    .borderRadius(OrbitTokens.RADIUS_MD)
+    .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+    .alignItems(VerticalAlign.Center)
+  }
+
+  @Builder
+  private renderLineageAndUsageStrip() {
+    Scroll() {
+      Row({ space: OrbitTokens.SPACE_XS }) {
+        if (this.hasParentAgent()) {
+          Button({ type: ButtonType.Capsule, stateEffect: true }) {
+            Row({ space: 4 }) {
+              SymbolGlyph($r('sys.symbol.chevron_left'))
+                .fontSize(11)
+                .fontColor([this.store.palette.accentPrimary])
+              Text($r('app.string.stage_lineage_parent'))
+                .attributeModifier(orbitTextMeta(this.store.palette.accentPrimary, FontWeight.Medium))
+            }
+            .alignItems(VerticalAlign.Center)
+          }
+          .height(28)
+          .padding({ left: 8, right: 10 })
+          .backgroundColor(this.store.palette.accentPrimarySoft)
+          .onClick(() => {
+            const parentId = this.store.currentAgent?.parent_agent_id ?? '';
+            if (parentId.length > 0) {
+              this.store.selectAgent(parentId);
+            }
+          })
+        }
+
+        ForEach(
+          this.store.stageSubagents,
+          (sub: SessionSubagentEntryDto) => {
+            Button({ type: ButtonType.Capsule, stateEffect: true }) {
+              Row({ space: 5 }) {
+                Row()
+                  .width(6)
+                  .height(6)
+                  .borderRadius(3)
+                  .backgroundColor(this.subagentStatusColor(sub.status))
+                Text(sub.role.trim().length > 0 ? sub.role.trim() : 'Subagent')
+                  .attributeModifier(orbitTextMeta(this.store.palette.fgPrimary, FontWeight.Medium))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .constraintSize({ maxWidth: 140 })
+              }
+              .alignItems(VerticalAlign.Center)
+            }
+            .height(28)
+            .padding({ left: 9, right: 10 })
+            .backgroundColor(this.store.palette.subtleSurface)
+            .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+            .onClick(() => {
+              this.store.inspectSubagent(sub);
+            })
+          },
+          (sub: SessionSubagentEntryDto) => `sub_${sub.id}_${sub.status}`
+        )
+
+        ForEach(
+          this.workspacePeers,
+          (peer: AgentCardDto) => {
+            Button({ type: ButtonType.Capsule, stateEffect: true }) {
+              Row({ space: 5 }) {
+                SymbolGlyph($r('sys.symbol.person_2'))
+                  .fontSize(11)
+                  .fontColor([this.store.palette.fgMuted])
+                Text(
+                  peer.handle !== undefined && peer.handle !== null && peer.handle.length > 0
+                    ? `@${peer.handle}`
+                    : (peer.title.trim().length > 0 ? peer.title.trim() : peer.provider_label)
+                )
+                  .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .constraintSize({ maxWidth: 120 })
+              }
+              .alignItems(VerticalAlign.Center)
+            }
+            .height(28)
+            .padding({ left: 9, right: 10 })
+            .backgroundColor(this.store.palette.subtleSurface)
+            .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+            .onClick(() => {
+              this.store.selectAgent(peer.agent_id);
+            })
+          },
+          (peer: AgentCardDto) => `peer_${peer.agent_id}`
+        )
+
+        if (this.formatUsagePill().length > 0) {
+          Text(this.formatUsagePill())
+            .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
+            .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+            .backgroundColor(this.store.palette.recessed)
+            .borderRadius(999)
+            .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+        }
+      }
+      .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+      .alignItems(VerticalAlign.Center)
+    }
+    .scrollable(ScrollDirection.Horizontal)
+    .scrollBar(BarState.Off)
+    .width('100%')
+    .constraintSize({ maxWidth: OrbitTokens.STAGE_MAX_READING_WIDTH + OrbitTokens.SPACE_XL })
+    .padding({ top: OrbitTokens.SPACE_XS, bottom: OrbitTokens.SPACE_XS })
   }
 
   @Builder
@@ -493,62 +728,129 @@ export struct StreamStage {
       .height('100%')
     } else {
       Stack({ alignContent: Alignment.Bottom }) {
-        Refresh({ refreshing: $$this.isRefreshing }) {
-          List({
-            space: OrbitTokens.SPACE_XL,
-            initialIndex: Math.max(0, this.store.stageTurns.length - 1),
-            scroller: this.listScroller
-          }) {
-            Repeat<StageTurnDto>(this.store.stageTurns)
-              .each((ri: RepeatItem<StageTurnDto>) => {
-                ListItem() {
-                  StageTurnView({
-                    turn: ri.item,
-                    isTurnActive: ri.item.has_active_item ||
-                      (this.store.isActiveAgentRunning() && ri.index === this.store.stageTurns.length - 1)
-                  })
-                }
-              })
-              .key((t: StageTurnDto) => t.key)
-              .virtualScroll()
+        Column({ space: 0 }) {
+          if (this.activeHostCard !== null && !this.isHostOnline(this.activeHostCard)) {
+            Column() {
+              this.renderOfflineBanner(this.activeHostCard)
+            }
+            .width('100%')
+            .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: OrbitTokens.SPACE_SM })
+            .alignItems(HorizontalAlign.Center)
           }
+
+          if (this.showLineageStrip()) {
+            Column() {
+              this.renderLineageAndUsageStrip()
+            }
+            .width('100%')
+            .alignItems(HorizontalAlign.Center)
+          }
+
+          Refresh({ refreshing: $$this.isRefreshing }) {
+            List({
+              space: OrbitTokens.SPACE_XL,
+              initialIndex: Math.max(0, this.store.stageTurns.length - 1),
+              scroller: this.listScroller
+            }) {
+              if (this.store.stageHasOlderHistory) {
+                ListItem() {
+                  Row() {
+                    if (this.store.stageLoadingOlder) {
+                      Row({ space: OrbitTokens.SPACE_SM }) {
+                        LoadingProgress()
+                          .width(14)
+                          .height(14)
+                          .color(this.store.palette.fgMuted)
+                        Text($r('app.string.stage_loading_older'))
+                          .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+                      }
+                      .alignItems(VerticalAlign.Center)
+                    } else {
+                      Button($r('app.string.stage_load_older'), { type: ButtonType.Capsule, stateEffect: true })
+                        .attributeModifier(
+                          orbitButtonMeta(this.store.palette.fgSecondary, this.store.palette.subtleSurface)
+                        )
+                        .height(34)
+                        .padding({ left: 14, right: 14 })
+                        .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+                        .onClick(() => {
+                          this.store.loadOlderHistory();
+                        })
+                    }
+                  }
+                  .width('100%')
+                  .justifyContent(FlexAlign.Center)
+                  .padding({ bottom: OrbitTokens.SPACE_XS })
+                }
+              }
+
+              Repeat<StageTurnDto>(this.store.stageTurns)
+                .each((ri: RepeatItem<StageTurnDto>) => {
+                  ListItem() {
+                    Column() {
+                      StageTurnView({
+                        turn: ri.item,
+                        isTurnActive: ri.item.has_active_item ||
+                          (this.store.isActiveAgentRunning() && ri.index === this.store.stageTurns.length - 1)
+                      })
+                        .constraintSize({ maxWidth: OrbitTokens.STAGE_MAX_READING_WIDTH })
+                    }
+                    .width('100%')
+                    .alignItems(HorizontalAlign.Center)
+                  }
+                })
+                .key((t: StageTurnDto) => t.key)
+                .virtualScroll()
+            }
+            .width('100%')
+            .height('100%')
+            .padding({
+              left: OrbitTokens.SPACE_LG,
+              right: OrbitTokens.SPACE_LG,
+              top: OrbitTokens.SPACE_LG,
+              bottom: OrbitTokens.SPACE_XL
+            })
+            .scrollBar(BarState.Auto)
+            .edgeEffect(EdgeEffect.Spring)
+            .onReachStart(() => {
+              if (
+                this.store.stageHasOlderHistory &&
+                !this.store.stageLoadingOlder &&
+                this.store.stageTurns.length > 0
+              ) {
+                this.store.loadOlderHistory();
+              }
+            })
+            .onScrollStart(() => {
+              if (this.store.keyboardHeightVp > 0) {
+                dismissHarmonyKeyboard(this.getUIContext());
+              }
+            })
+            .onScrollIndex((firstIndex: number, endIndex: number) => {
+              const lastIdx = this.lastListItemIndex();
+              this.firstVisibleIndex = firstIndex;
+              this.lastVisibleIndex = endIndex;
+              if (!this.isAutoAnchoringResize && this.store.stageTurns.length > 0 && endIndex < lastIdx) {
+                this.atBottomEdge = false;
+              }
+            })
+            .onReachEnd(() => {
+              this.atBottomEdge = true;
+              this.lastVisibleIndex = this.lastListItemIndex();
+            })
+            .onScrollFrameBegin((offset: number, _state: ScrollState) => {
+              if (offset < -2 && this.store.stageTurns.length > 0) {
+                this.atBottomEdge = false;
+              }
+              return { offsetRemain: offset };
+            })
+          }
+          .onRefreshing(() => {
+            this.handlePullRefresh();
+          })
           .width('100%')
-          .height('100%')
-          .padding({
-            left: OrbitTokens.SPACE_LG,
-            right: OrbitTokens.SPACE_LG,
-            top: OrbitTokens.SPACE_LG,
-            bottom: OrbitTokens.SPACE_XL
-          })
-          .scrollBar(BarState.Auto)
-          .edgeEffect(EdgeEffect.Spring)
-          .onScrollStart(() => {
-            if (this.store.keyboardHeightVp > 0) {
-              dismissHarmonyKeyboard(this.getUIContext());
-            }
-          })
-          .onScrollIndex((firstIndex: number, endIndex: number) => {
-            const totalItems = this.store.stageTurns.length;
-            this.firstVisibleIndex = firstIndex;
-            this.lastVisibleIndex = endIndex;
-            if (!this.isAutoAnchoringResize && totalItems > 0 && endIndex < totalItems - 1) {
-              this.atBottomEdge = false;
-            }
-          })
-          .onReachEnd(() => {
-            this.atBottomEdge = true;
-            this.lastVisibleIndex = Math.max(0, this.store.stageTurns.length - 1);
-          })
-          .onScrollFrameBegin((offset: number, _state: ScrollState) => {
-            if (offset < -2 && this.store.stageTurns.length > 0) {
-              this.atBottomEdge = false;
-            }
-            return { offsetRemain: offset };
-          })
+          .layoutWeight(1)
         }
-        .onRefreshing(() => {
-          this.handlePullRefresh();
-        })
         .width('100%')
         .height('100%')
 
@@ -584,7 +886,7 @@ export struct StreamStage {
                 : 'Scroll to latest message'
             )
             .onClick(() => {
-              const lastIdx = Math.max(0, this.store.stageTurns.length - 1);
+              const lastIdx = this.lastListItemIndex();
               this.atBottomEdge = true;
               this.lastVisibleIndex = lastIdx;
               this.listScroller.scrollToIndex(lastIdx, true, ScrollAlign.END);
@@ -607,7 +909,7 @@ export struct StreamStage {
           this.atBottomEdge &&
           this.store.stageTurns.length > 0
         ) {
-          const lastIdx = Math.max(0, this.store.stageTurns.length - 1);
+          const lastIdx = this.lastListItemIndex();
           this.isAutoAnchoringResize = true;
           this.lastVisibleIndex = lastIdx;
           this.listScroller.scrollToIndex(lastIdx, true, ScrollAlign.END);

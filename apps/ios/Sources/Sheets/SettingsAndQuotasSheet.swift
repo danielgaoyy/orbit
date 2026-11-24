@@ -404,6 +404,23 @@ struct SettingsAndQuotasSheet: View {
                                 .foregroundStyle(palette.fgMuted)
                         }
                         .buttonStyle(.plain)
+
+                        OrbitHairline()
+
+                        Button {
+                            store.presentSheetSafely(.qrPair)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "qrcode.viewfinder")
+                                Text("Scan 1-Step Device Link QR")
+                                    .font(OrbitTypography.subhead(.semibold))
+                            }
+                            .foregroundStyle(palette.fgPrimary)
+                            .frame(maxWidth: .infinity, minHeight: 38)
+                            .background(palette.subtleFill)
+                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
                     }
                 } else if state == .locked, let status {
                     HStack {
@@ -504,7 +521,7 @@ struct SettingsAndQuotasSheet: View {
                             Text("@\(status.accountLogin ?? "github")")
                                 .font(OrbitTypography.subhead(.semibold))
                                 .foregroundStyle(palette.fgPrimary)
-                            Text("\(status.syncedHostCount) hosts · \(status.syncedProjectCount) projects · rev #\(status.lastVaultRevision)")
+                            Text("\(status.syncedHostCount) hosts · \(status.syncedProjectCount) projects · rev #\(status.lastVaultRevision) · \(status.instantUnlockEnabled ? "Instant Unlock" : "Manual Passphrase")")
                                 .font(OrbitTypography.meta(.regular))
                                 .foregroundStyle(palette.fgMuted)
                         }
@@ -543,8 +560,35 @@ struct SettingsAndQuotasSheet: View {
                     }
                     .tint(palette.direct)
 
+                    Toggle(isOn: Binding(
+                        get: { !status.instantUnlockEnabled },
+                        set: { store.setCloudSyncManualPassphraseMode($0) }
+                    )) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Require manual passphrase")
+                                .font(OrbitTypography.subhead(.regular))
+                                .foregroundStyle(palette.fgPrimary)
+                            Text("Off = new devices auto-unlock cleanly via Dual-Gist.")
+                                .font(OrbitTypography.meta(.regular))
+                                .foregroundStyle(palette.fgMuted)
+                        }
+                    }
+                    .tint(palette.direct)
+
                     HStack {
+                        Button("Copy Link URI") {
+                            if let uri = store.exportCloudSyncDeviceLinkUri() {
+                                UIPasteboard.general.string = uri
+                                store.showToast("Device Link URI copied — keep secret")
+                            } else {
+                                store.showToast("Unlock Cloud Sync first")
+                            }
+                        }
+                        .font(OrbitTypography.meta(.medium))
+                        .foregroundStyle(palette.accentSky)
+
                         if let gistUrl = status.gistHtmlUrl, let url = URL(string: gistUrl), !gistUrl.isEmpty {
+                            Text("·").foregroundStyle(palette.fgMuted)
                             Button("View Secret Gist") {
                                 UIApplication.shared.open(url)
                             }

@@ -1254,7 +1254,7 @@ public final class OrbitIosStore: ObservableObject {
               !raw.isEmpty else {
             return nil
         }
-        if let range = raw.range(of: "orbit://pair/[^\\s\"']+", options: .regularExpression) {
+        if let range = raw.range(of: "orbit://(pair|sync-login)[^\\s\"']+", options: .regularExpression) {
             return String(raw[range])
         }
         return raw
@@ -1268,10 +1268,11 @@ public final class OrbitIosStore: ObservableObject {
               !raw.isEmpty else {
             return nil
         }
-        if let range = raw.range(of: "orbit://pair/[^\\s\"']+", options: [.regularExpression, .caseInsensitive]) {
+        if let range = raw.range(of: "orbit://(pair|sync-login)[^\\s\"']+", options: [.regularExpression, .caseInsensitive]) {
             return String(raw[range])
         }
-        if raw.lowercased().hasPrefix("orbit://pair/") {
+        let lower = raw.lowercased()
+        if lower.hasPrefix("orbit://pair/") || lower.hasPrefix("orbit://sync-login") {
             return raw
         }
         return nil
@@ -1280,7 +1281,7 @@ public final class OrbitIosStore: ObservableObject {
     public func handleDeepLink(_ url: URL) {
         let raw = url.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard raw.lowercased().hasPrefix("orbit://") else { return }
-        pairHost(uri: raw)
+        handleScannedOrPastedUri(raw)
         if activeSheet == .qrPair {
             activeSheet = nil
         }
@@ -5411,6 +5412,80 @@ public final class OrbitIosStore: ObservableObject {
             showToast("Signed out of Cloud Sync")
         } catch {
             cloudSyncError = Self.describeCloudSyncError(error)
+        }
+    }
+
+    @discardableResult
+    public func handleScannedOrPastedUri(_ rawUri: String) -> Bool {
+        let trimmed = rawUri.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.lowercased().hasPrefix("orbit://sync-login") {
+            return importCloudSyncDeviceLink(uri: trimmed)
+        }
+        return pairHost(uri: trimmed)
+    }
+
+    @discardableResult
+    public func importCloudSyncDeviceLink(uri: String) -> Bool {
+        guard let core = self.core else { return false }
+        let trimmed = uri.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.lowercased().hasPrefix("orbit://sync-login") else {
+            cloudSyncError = "Invalid Orbit device link URI."
+            return false
+        }
+        cloudSyncBusy = true
+        cloudSyncError = nil
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let result: FfiCloudSyncResult = try await Task.detached(priority: .userInitiated) {
+                    try core.cloudSyncImportDeviceLinkUri(uri: trimmed)
+                }.value
+                self.cloudSyncBusy = false
+                self.cloudSyncStatus = core.cloudSyncStatus()
+                self.cloudSyncDeviceFlow = nil
+                self.cloudSyncError = nil
+                self.hydrateCloudSyncPreferences()
+                self.reloadFleet()
+                self.refreshSidebar()
+                self.hapticSuccess()
+                self.showToast(Self.formatCloudSyncResult(result))
+            } catch {
+                self.cloudSyncBusy = false
+                self.cloudSyncStatus = core.cloudSyncStatus()
+                self.cloudSyncError = Self.describeCloudSyncError(error)
+            }
+        }
+        return true
+    }
+
+    public func exportCloudSyncDeviceLinkUri() -> String? {
+        guard let core = self.core else { return nil }
+        return try? core.cloudSyncExportDeviceLinkUri()
+    }
+
+    public func setCloudSyncManualPassphraseMode(_ requireManual: Bool) {
+        guard let core = self.core else { return }
+        cloudSyncBusy = true
+        cloudSyncError = nil
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let status: FfiCloudSyncStatus = try await Task.detached(priority: .userInitiated) {
+                    try core.cloudSyncSetManualPassphraseMode(requireManual: requireManual)
+                }.value
+                self.cloudSyncBusy = false
+                self.cloudSyncStatus = status
+                self.cloudSyncError = nil
+                self.hapticLight()
+                self.showToast(
+                    status.instantUnlockEnabled
+                        ? "Instant zero-passphrase auto-unlock enabled"
+                        : "Manual passphrase required on new devices"
+                )
+            } catch {
+                self.cloudSyncBusy = false
+                self.cloudSyncError = Self.describeCloudSyncError(error)
+            }
         }
     }
 

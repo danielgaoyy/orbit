@@ -198,6 +198,23 @@ enum RelayAction {
         #[arg(long)]
         fleet_token_stdin: bool,
     },
+    /// Expose a zero-inbound-port local Relay (`127.0.0.1:<port>`) over Cloudflare Tunnel (ideal for firewalled / intranet machines).
+    Tunnel {
+        #[arg(long, default_value_t = 7878)]
+        port: u16,
+        /// Authorize one or more host public keys (merged into `~/.orbit/relay.json`).
+        #[arg(long = "allow-pubkey")]
+        allow_pubkeys: Vec<String>,
+        /// Optional custom hostname for a Cloudflare Named Tunnel (paired with `--tunnel-token-stdin`).
+        #[arg(long)]
+        hostname: Option<String>,
+        /// Read a Cloudflare Named Tunnel token from stdin (`0o600` EnvironmentFile, never stored in argv).
+        #[arg(long)]
+        tunnel_token_stdin: bool,
+        /// Do not auto-configure the local Orbit Daemon to attach to the provisioned tunnel URL.
+        #[arg(long)]
+        no_attach_daemon: bool,
+    },
     /// Add host public key(s) to the Relay allowlist (`~/.orbit/relay.json`) and reload Relay immediately.
     Allow {
         #[arg(required = true)]
@@ -309,6 +326,18 @@ enum Commands {
         /// Optional Sync Passphrase to unlock or initialize the encrypted Vault non-interactively.
         #[arg(long, env = "ORBIT_SYNC_PASSPHRASE")]
         passphrase: Option<String>,
+        /// Import an `orbit://sync-login?...` Device Link URI from an existing Orbit device without burning a GitHub OAuth token.
+        #[arg(long, env = "ORBIT_DEVICE_LINK_URI")]
+        device_link: Option<String>,
+        /// Read an `orbit://sync-login?...` Device Link URI from stdin (recommended over passing secrets in argv).
+        #[arg(long)]
+        device_link_stdin: bool,
+        /// Force a new GitHub OAuth Device Flow even if a valid cached GitHub session already exists locally.
+        #[arg(long)]
+        reauth: bool,
+        /// Require manual Sync Passphrase entry on new devices instead of Dual-Gist Instant Unlock.
+        #[arg(long)]
+        manual_passphrase: bool,
         /// Skip registering this machine's local Orbit Daemon into the synced fleet.
         #[arg(long)]
         no_register_host: bool,
@@ -325,6 +354,9 @@ enum Commands {
         /// Also wire all other synced hosts into this machine's local Daemon Connected Hosts mesh.
         #[arg(long)]
         mesh: bool,
+        /// Print an `orbit://sync-login?...` 1-scan Device Link URI for onboarding another phone/laptop without consuming a GitHub token slot.
+        #[arg(long)]
+        export_device_link: bool,
     },
 
     /// Sign out of GitHub Cloud Sync on this machine (keeps your remote encrypted GitHub Gist intact).
@@ -1127,6 +1159,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             token,
             client_id,
             passphrase,
+            device_link,
+            device_link_stdin,
+            reauth,
+            manual_passphrase,
             no_register_host,
             mesh,
         } => {
@@ -1136,6 +1172,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     token,
                     client_id,
                     passphrase,
+                    device_link,
+                    device_link_stdin,
+                    reauth,
+                    manual_passphrase,
                     no_register_host,
                     sync_mesh: mesh,
                     json_mode,
@@ -1147,12 +1187,14 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Sync {
             no_register_host,
             mesh,
+            export_device_link,
         } => {
             cloud_sync_cli::cmd_sync(
                 &home_dir,
                 cloud_sync_cli::SyncOptions {
                     no_register_host,
                     sync_mesh: mesh,
+                    export_device_link,
                     json_mode,
                 },
             )
@@ -1402,6 +1444,149 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 println!(
                     "\n(Tip: Make sure inbound TCP port {bound_port} is open in your cloud firewall / AWS Security Group)"
                 );
+            }
+            Some(RelayAction::Tunnel {
+                port,
+                allow_pubkeys: sub_keys,
+                hostname,
+                tunnel_token_stdin,
+                no_attach_daemon,
+            }) => {
+                let tunnel_token = if tunnel_token_stdin {
+                    let mut raw = String::new();
+                    std::io::stdin().read_to_string(&mut raw)?;
+                    let tok = raw
+                        .lines()
+                        .next()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "--tunnel-token-stdin expected non-empty Cloudflare token on stdin"
+                            )
+                        })?
+                        .to_string();
+                    Some(tok)
+                } else {
+                    None
+                };
+                let clean_hostname = hostname
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        s.trim_start_matches("https://")
+                            .trim_start_matches("http://")
+                            .trim_start_matches("wss://")
+                            .trim_start_matches("ws://")
+                            .trim_end_matches('/')
+                            .to_string()
+                    });
+                if clean_hostname.is_some() ^ tunnel_token.is_some() {
+                    anyhow::bail!(
+                        "--hostname and --tunnel-token-stdin must be supplied together for a Named Cloudflare Tunnel"
+                    );
+                }
+
+                let fleet_token =
+                    orbit_client_core::desktop_ops::load_or_create_fleet_relay_token(&home_dir)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+
+                let mut persisted = RelayPersistedConfig::load(&home_dir);
+                persisted.listen_addr = SocketAddr::from(([127, 0, 0, 1], port));
+                persisted.fleet_token = Some(fleet_token.clone());
+                if let Some((_, local_pk)) = read_local_host_identity(&home_dir)
+                    && !persisted.allowed_pubkeys.contains(&local_pk)
+                {
+                    persisted.allowed_pubkeys.push(local_pk);
+                }
+                for k in allow_pubkeys.into_iter().chain(sub_keys) {
+                    let trimmed = k.trim().to_string();
+                    if !trimmed.is_empty() && !persisted.allowed_pubkeys.contains(&trimmed) {
+                        persisted.allowed_pubkeys.push(trimmed);
+                    }
+                }
+                persisted.save(&home_dir)?;
+
+                let mgr =
+                    install_and_start_service(ServiceRole::Relay, &home_dir, port, None).await?;
+                let cf_bin = ensure_cloudflared_binary().await?;
+                let tunnel_mgr = start_cloudflare_tunnel_service(
+                    &home_dir,
+                    &cf_bin,
+                    port,
+                    clean_hostname.as_deref(),
+                    tunnel_token.as_deref(),
+                )?;
+                let cf_host = if let Some(host) = clean_hostname {
+                    host
+                } else {
+                    wait_for_trycloudflare_host(&home_dir.join("cloudflared-tunnel.log")).await?
+                };
+                let canonical_url = format!("wss://{cf_host}?ft={fleet_token}");
+
+                let mut attached_local = false;
+                if !no_attach_daemon && let Some((hid, _)) = read_local_host_identity(&home_dir) {
+                    let mut d_cfg = DaemonPersistedConfig::load(&home_dir);
+                    d_cfg.relay_url = Some(canonical_url.clone());
+                    if d_cfg.save(&home_dir).is_ok() {
+                        attached_local = true;
+                        let live_port = find_live_daemon_port_for_host(
+                            &hid,
+                            d_cfg
+                                .listen_addr
+                                .unwrap_or_else(default_daemon_listen)
+                                .port(),
+                        )
+                        .await;
+                        if probe_daemon_port(live_port, &hid).await == PortOwnership::Mine {
+                            let ws_url = format!("ws://127.0.0.1:{live_port}/ws");
+                            if let Ok(client) = connect_cli_server(&home_dir, &ws_url, false).await
+                            {
+                                let req_id = Uuid::new_v4();
+                                let _ = client
+                                    .request(
+                                        WireMessage::ConfigureHostRelay {
+                                            request_id: req_id,
+                                            relay_url: Some(canonical_url.clone()),
+                                        },
+                                        Duration::from_secs(5),
+                                        |w| {
+                                            matches!(
+                                                w,
+                                                WireMessage::HostRelayConfigured { request_id: r, .. }
+                                                    if *r == req_id
+                                            )
+                                        },
+                                    )
+                                    .await;
+                            } else {
+                                let _ = install_and_start_service(
+                                    ServiceRole::Daemon,
+                                    &home_dir,
+                                    live_port,
+                                    Some(&hid),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
+
+                println!(
+                    "[✓] Orbit Zero-Port Cloudflare Tunnel Relay running ({mgr} + {tunnel_mgr})!"
+                );
+                println!("    Local Relay : {}", persisted.listen_addr);
+                println!(
+                    "    Public URL  : https://{cf_host} (zero inbound firewall ports needed)"
+                );
+                if attached_local {
+                    println!("    Local Daemon: attached and reloaded cleanly");
+                }
+                println!(
+                    "\nAttach any other machine (keeping the `?ft=` fleet admission token secret):"
+                );
+                println!("  orbit use-relay '{canonical_url}'");
             }
             Some(RelayAction::Allow { pubkeys }) => {
                 let mut persisted = RelayPersistedConfig::load(&home_dir);
@@ -1892,6 +2077,245 @@ pub(crate) fn read_local_host_identity(home_dir: &std::path::Path) -> Option<(St
     let kp: orbit_crypto::HostIdentityKeypair = serde_json::from_str(&raw).ok()?;
     let host_id = kp.host_id().ok()?;
     Some((host_id, kp.public_key_b64))
+}
+
+async fn ensure_cloudflared_binary() -> anyhow::Result<PathBuf> {
+    if let Some(path_os) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_os) {
+            let candidate = dir.join("cloudflared");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    let home = orbit_client_core::desktop_ops::resolve_user_home()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve user home directory for cloudflared"))?;
+    let bin_dir = home.join(".local/bin");
+    std::fs::create_dir_all(&bin_dir)?;
+    let target = bin_dir.join("cloudflared");
+    if target.is_file() {
+        return Ok(target);
+    }
+
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => anyhow::bail!("Unsupported architecture for auto-installing cloudflared: {other}"),
+    };
+    let os = std::env::consts::OS;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .user_agent("orbit-cli")
+        .build()?;
+    match os {
+        "linux" => {
+            let url = format!(
+                "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{arch}"
+            );
+            let bytes = client
+                .get(&url)
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
+            std::fs::write(&target, &bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
+            }
+            Ok(target)
+        }
+        "macos" => {
+            let url = format!(
+                "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-{arch}.tgz"
+            );
+            let bytes = client
+                .get(&url)
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
+            let tmp_tgz = bin_dir.join(format!("cloudflared-{}.tgz", std::process::id()));
+            std::fs::write(&tmp_tgz, &bytes)?;
+            let extract_ok = std::process::Command::new("tar")
+                .args(["-xzf"])
+                .arg(&tmp_tgz)
+                .arg("-C")
+                .arg(&bin_dir)
+                .status()
+                .is_ok_and(|s| s.success());
+            let _ = std::fs::remove_file(&tmp_tgz);
+            if !extract_ok || !target.is_file() {
+                anyhow::bail!(
+                    "Failed to extract cloudflared archive; install manually with `brew install cloudflared`"
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
+            }
+            Ok(target)
+        }
+        other => anyhow::bail!("Unsupported OS `{other}` for auto-installing cloudflared"),
+    }
+}
+
+fn start_cloudflare_tunnel_service(
+    home_dir: &std::path::Path,
+    cf_bin: &std::path::Path,
+    relay_port: u16,
+    hostname: Option<&str>,
+    tunnel_token: Option<&str>,
+) -> anyhow::Result<&'static str> {
+    std::fs::create_dir_all(home_dir)?;
+    let env_path = home_dir.join("cloudflared-tunnel.env");
+    let log_path = home_dir.join("cloudflared-tunnel.log");
+    let pid_path = home_dir.join("cloudflared-tunnel.pid");
+    let _ = std::fs::write(&log_path, "");
+
+    if let Some(tok) = tunnel_token {
+        std::fs::write(&env_path, format!("TUNNEL_TOKEN={tok}\n"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    } else if env_path.exists() {
+        let _ = std::fs::remove_file(&env_path);
+    }
+
+    let exec_cmd = if hostname.is_some() && tunnel_token.is_some() {
+        format!(
+            "\"{}\" tunnel --no-autoupdate --logfile \"{}\" run",
+            cf_bin.display(),
+            log_path.display()
+        )
+    } else {
+        format!(
+            "\"{}\" tunnel --no-autoupdate --url http://127.0.0.1:{relay_port} --logfile \"{}\"",
+            cf_bin.display(),
+            log_path.display()
+        )
+    };
+
+    if cfg!(target_os = "linux")
+        && let Some(user_home) = orbit_client_core::desktop_ops::resolve_user_home()
+        && std::process::Command::new("systemctl")
+            .args(["--user", "status"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    {
+        let systemd_dir = user_home.join(".config/systemd/user");
+        std::fs::create_dir_all(&systemd_dir)?;
+        let env_line = if env_path.exists() {
+            format!("EnvironmentFile={}\n", env_path.display())
+        } else {
+            String::new()
+        };
+        let unit = format!(
+            "[Unit]\n\
+             Description=Orbit Zero-Port Cloudflare Tunnel Relay\n\
+             After=network-online.target\n\
+             \n\
+             [Service]\n\
+             Type=simple\n\
+             {env_line}\
+             ExecStart={exec_cmd}\n\
+             Restart=always\n\
+             RestartSec=3\n\
+             StandardOutput=append:{log}\n\
+             StandardError=append:{log}\n\
+             \n\
+             [Install]\n\
+             WantedBy=default.target\n",
+            log = log_path.display()
+        );
+        std::fs::write(systemd_dir.join("orbit-relay-tunnel.service"), unit)?;
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "enable", "orbit-relay-tunnel.service"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let ok = std::process::Command::new("systemctl")
+            .args(["--user", "restart", "orbit-relay-tunnel.service"])
+            .status()
+            .is_ok_and(|s| s.success());
+        if ok {
+            return Ok("systemd --user");
+        }
+    }
+
+    if let Ok(old_pid_str) = std::fs::read_to_string(&pid_path)
+        && let Ok(old_pid) = old_pid_str.trim().parse::<u32>()
+    {
+        let _ = std::process::Command::new("kill")
+            .arg(old_pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    let out_file = std::fs::File::options()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let err_file = out_file.try_clone()?;
+
+    let mut cmd = std::process::Command::new(cf_bin);
+    cmd.args(["tunnel", "--no-autoupdate"]);
+    if hostname.is_some()
+        && let Some(tok) = tunnel_token
+    {
+        cmd.arg("--logfile").arg(&log_path).arg("run");
+        cmd.env("TUNNEL_TOKEN", tok);
+    } else {
+        cmd.arg("--url")
+            .arg(format!("http://127.0.0.1:{relay_port}"))
+            .arg("--logfile")
+            .arg(&log_path);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(out_file))
+        .stderr(std::process::Stdio::from(err_file));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd.spawn()?;
+    let _ = std::fs::write(&pid_path, format!("{}\n", child.id()));
+    Ok("background process")
+}
+
+async fn wait_for_trycloudflare_host(log_path: &std::path::Path) -> anyhow::Result<String> {
+    for _ in 0..50 {
+        if let Ok(content) = std::fs::read_to_string(log_path) {
+            for token in content.split(|c: char| {
+                !c.is_ascii_alphanumeric() && c != '-' && c != '.' && c != ':' && c != '/'
+            }) {
+                if let Some(host) = token.strip_prefix("https://")
+                    && host.ends_with(".trycloudflare.com")
+                    && host.len() > ".trycloudflare.com".len()
+                {
+                    return Ok(host.to_string());
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    anyhow::bail!(
+        "Timed out waiting for trycloudflare.com URL in {}",
+        log_path.display()
+    )
 }
 
 pub(crate) fn advertised_direct_endpoints(bind_ip: std::net::IpAddr, port: u16) -> Vec<String> {

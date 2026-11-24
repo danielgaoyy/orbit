@@ -878,6 +878,26 @@ export const zhCN: MessageDictionary = {
   "settings.signInGithub": "使用 GitHub 登录",
   "settings.oauthDeviceFlow": "GitHub OAuth（设备授权）",
   "settings.personalAccessToken": "个人访问令牌 (PAT)",
+  "settings.deviceLinkTab": "设备直连码",
+  "settings.deviceLinkTabDesc":
+    "粘贴来自另一台已登录 Orbit 设备的 orbit://sync-login 链接，一步复用 GitHub 登录、解密密钥与全网 Relay，不额外占用 GitHub Token 配额。",
+  "settings.deviceLinkPlaceholder": "orbit://sync-login?v=1&p=…",
+  "settings.deviceLinkConnect": "一键关联",
+  "settings.linkDeviceQr": "扫码关联新设备",
+  "settings.deviceLinkQrTitle": "一码关联新设备",
+  "settings.deviceLinkQrDesc":
+    "使用 Orbit iOS 扫码或复制链接 URI，即可在新手机或新电脑上一步完成登录、解锁与全量主机导入。",
+  "settings.deviceLinkQrHint":
+    "此二维码包含你的 GitHub 会话与主密钥，请勿分享给他人。",
+  "settings.copyDeviceLinkUri": "复制关联 URI",
+  "settings.cloudSyncInstantSummary":
+    "Orbit 使用 AES-256-GCM 在本地加密你的主机与偏好设置，并保存于私有 GitHub Secret Gist。默认开启双 Gist 免密瞬时解锁——新设备登录后自动同步，无需复杂口令。",
+  "settings.cloudSyncAdvancedTitle": "高级安全与恢复口令",
+  "settings.cloudSyncInstantBadge": "免密瞬时解锁",
+  "settings.cloudSyncManualBadge": "需手动口令",
+  "settings.cloudSyncRequireManualTitle": "在新设备上强制输入同步口令",
+  "settings.cloudSyncRequireManualDesc":
+    "从 GitHub 删除自动解锁密钥 Gist，后续新设备登录需手动输入 Argon2id 同步口令（一码直连二维码仍可正常使用）。",
   "settings.copyCodeOpenGithub": "复制验证码并打开 GitHub",
   "settings.neverSynced": "尚未同步",
 
@@ -1863,4 +1883,12 @@ export const zhCN: MessageDictionary = {
   "review.expandContextLines": "展开 {count} 行",
   "review.showAllHiddenContext": "全部展开",
   "review.findInDiffPlaceholder": "在 Diff 中查找…",
+
+  "settings.deployCloudflareShort": "Cloudflare 零端口",
+  "settings.deployCfCustomToggle": "高级：使用固定域名 Cloudflare Tunnel（可选）",
+  "settings.deployCfHostnamePlaceholder": "relay.yourdomain.com（留空即秒建免费隧道）",
+  "settings.deployCfTokenPlaceholder": "Cloudflare Tunnel Token (eyJh…)",
+  "settings.deployCfConfirmTitle": "通过 Cloudflare 隧道在 {alias} 开启零端口中继？",
+  "settings.deployCfConfirmDesc":
+    "将在 {alias} 安装仅监听本机的 Orbit Relay (127.0.0.1:7878) 与 cloudflared 隧道（无需开放任何公网入站端口），并自动下发给全部 {count} 台主机。",
 };

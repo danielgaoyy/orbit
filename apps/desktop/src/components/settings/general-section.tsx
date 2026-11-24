@@ -116,7 +116,7 @@ export function GeneralSection() {
     return t("common.offline");
   };
 
-  const appVersion = normalizeSemver(storeAppVersion) ?? "0.10.4";
+  const appVersion = normalizeSemver(storeAppVersion) ?? "0.10.5";
   const autoCheckedRef = useRef(false);
 
   // Gently check for the latest release once when opening General settings

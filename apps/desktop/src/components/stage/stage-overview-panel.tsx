@@ -600,7 +600,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
               collapsed={collapsedSections.goals}
               isRunning={goalIsActive || hasArmedTimers}
               hasAlert={goalIsPaused}
-              runningTone={goalIsActive ? "emerald" : "info"}
+              runningTone={goalIsActive ? "emerald" : "timer"}
             >
               <div className="flex flex-col gap-0.5 pb-1">
                 {activeGoal && <OverviewGoalRow hostId={hostId} goal={activeGoal} />}

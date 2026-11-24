@@ -6,6 +6,7 @@
 //! 5. Mission Workspace parallel-first worktree isolation & historical handle alias resolution
 //! 6. Cross-turn late assistant finalization dedup over live WebSocket & fresh catchup
 //! 7. Archiving an agent kills ONLY that agent's shim/PGID without broadcast-signaling siblings (`--` before `-<pgid>`)
+//! 8. Multi-agent non-interrupting subagent/peer delivery, thinking-stall progress telemetry, queue-preserving interrupt, and human preemption ordering
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -13,14 +14,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use orbit_client_core::app_core::OrbitAppCore;
+use orbit_client_core::app_core::{OrbitAppCore, TimelineItemView};
 use orbit_client_core::contract::AgentStageDeltaRequest;
+use orbit_client_core::stage::TurnLiveSegmentView;
 use orbit_client_core::{HostConnectionState, connect_via_relay};
 use orbit_daemon::manager::DaemonBroadcast;
 use orbit_daemon::{DaemonRuntime, spawn_embedded_daemon};
 use orbit_protocol::{
-    AgentSummary, AttentionState, ProviderKind, SessionMode, TimelinePayload, ToolCallDetail,
-    ToolCallStatus, WorkspaceSetupStatus, WorkspaceSummary,
+    AgentMessageDeliveryStatus, AgentSummary, AttentionState, ProviderKind, SessionMode,
+    TimelinePayload, ToolCallDetail, ToolCallStatus, WorkspaceSetupStatus, WorkspaceSummary,
 };
 use orbit_relay::{RelayConfig, run_relay};
 use uuid::Uuid;
@@ -31,6 +33,8 @@ static ORBIT_EXE_INIT: std::sync::Once = std::sync::Once::new();
 static MOCK_CLAUDE_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 #[cfg(unix)]
 static MOCK_CODEX_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+#[cfg(unix)]
+static MOCK_ANTIGRAVITY_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 #[cfg(unix)]
 fn init_orbit_exe_override() {
@@ -288,6 +292,17 @@ while True:
         resolved_via_alias = any(bool(d.get("resolved_via_alias")) for d in delivered)
         reply_parts.append(f"MSG_OK={bool(sc.get('ok'))} RESOLVED_VIA_ALIAS={resolved_via_alias}")
 
+    if "[MOCK:SEND_AGENT_PROMPT]" in text:
+        target_id = kv.get("TARGET_ID", "")
+        msg_text = kv.get("MSG", "PING")
+        res = mcp_call("send_agent_prompt", {
+            "agent_id": target_id,
+            "prompt": msg_text,
+        })
+        result_obj = res.get("result", {})
+        ok = "error" not in res and not bool(result_obj.get("isError", False))
+        reply_parts.append(f"SEND_OK={ok}")
+
     if echo_tok and not reply_parts:
         reply_parts.append(f"REPLY={echo_tok}")
     elif not reply_parts:
@@ -466,6 +481,250 @@ while True:
             "method": "turn/completed",
             "params": {"turn": {"id": nt, "status": "completed"}}
         })
+"#;
+
+#[cfg(unix)]
+const MOCK_ANTIGRAVITY_SCRIPT: &str = r#"#!/usr/bin/env python3
+import collections
+import json
+import os
+import re
+import select
+import sys
+import time
+import urllib.request
+
+if "--version" in sys.argv[1:]:
+    sys.stdout.write("1.0.0 (mock-agy)\n")
+    sys.stdout.flush()
+    sys.exit(0)
+
+STDIN_FD = sys.stdin.fileno()
+READ_BUF = bytearray()
+PENDING_LINES = collections.deque()
+SESSION_ID = "mock-agy-sess-1"
+CWD = os.getcwd()
+TRACE_PATH = os.path.join(CWD, ".mock_acp_trace.jsonl")
+MCP_URL = os.environ.get("ORBIT_MCP_URL")
+MCP_HEADERS = {}
+if os.environ.get("ORBIT_MCP_TOKEN"):
+    MCP_HEADERS["Authorization"] = "Bearer " + os.environ["ORBIT_MCP_TOKEN"]
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+def log_trace(entry):
+    with open(TRACE_PATH, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+        fh.flush()
+
+def read_line(timeout_sec):
+    if PENDING_LINES:
+        return PENDING_LINES.popleft()
+    deadline = None if timeout_sec is None else (time.monotonic() + timeout_sec)
+    while True:
+        nl = READ_BUF.find(b"\n")
+        if nl != -1:
+            line = bytes(READ_BUF[:nl + 1]).decode("utf-8", errors="replace")
+            del READ_BUF[:nl + 1]
+            return line
+        wait = None if deadline is None else max(0.0, deadline - time.monotonic())
+        if wait is not None and wait <= 0.0:
+            return None
+        rlist, _, _ = select.select([STDIN_FD], [], [], wait)
+        if not rlist:
+            return None
+        chunk = os.read(STDIN_FD, 4096)
+        if not chunk:
+            if READ_BUF:
+                line = bytes(READ_BUF).decode("utf-8", errors="replace")
+                READ_BUF.clear()
+                return line
+            return ""
+        READ_BUF.extend(chunk)
+
+def configure_mcp(mcp_servers):
+    global MCP_URL, MCP_HEADERS
+    if not isinstance(mcp_servers, list):
+        return
+    for srv in mcp_servers:
+        if isinstance(srv, dict) and srv.get("type") == "http" and srv.get("url"):
+            MCP_URL = srv.get("url")
+            hdrs = {}
+            raw_hdrs = srv.get("headers")
+            if isinstance(raw_hdrs, list):
+                for h in raw_hdrs:
+                    if isinstance(h, dict) and h.get("name"):
+                        hdrs[h["name"]] = h.get("value", "")
+            elif isinstance(raw_hdrs, dict):
+                hdrs.update(raw_hdrs)
+            if hdrs:
+                MCP_HEADERS = hdrs
+            return
+
+def mcp_call(tool_name, arguments):
+    headers = dict(MCP_HEADERS)
+    if "Authorization" not in headers and os.environ.get("ORBIT_MCP_TOKEN"):
+        headers["Authorization"] = "Bearer " + os.environ["ORBIT_MCP_TOKEN"]
+    url = MCP_URL or os.environ.get("ORBIT_MCP_URL")
+    headers["Content-Type"] = "application/json"
+    body = json.dumps({
+        "jsonrpc": "2.0",
+        "id": int(time.time() * 1000) % 1000000,
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": arguments},
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+def extract_prompt_text(params):
+    parts = []
+    for block in params.get("prompt", []) or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text", ""))
+    return "\n".join(parts)
+
+def strip_envelopes(raw):
+    s = re.sub(r"<orbit-workspace(?:\s[^>]*)?>[\s\S]*?</orbit-workspace>", "", raw)
+    s = re.sub(r"<orbit-workspace-delta(?:\s[^>]*)?>[\s\S]*?</orbit-workspace-delta>", "", s)
+    s = re.sub(r"<WORKSPACE_RULES>[\s\S]*?</WORKSPACE_RULES>", "", s)
+    return s
+
+def parse_kv(text):
+    out = {}
+    for tok in text.split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+while True:
+    line = read_line(None)
+    if line == "":
+        break
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+
+    rid = msg.get("id")
+    method = msg.get("method")
+    params = msg.get("params", {}) or {}
+
+    if method == "initialize":
+        emit({
+            "jsonrpc": "2.0",
+            "id": rid,
+            "result": {"protocolVersion": 1, "agentCapabilities": {}},
+        })
+        continue
+
+    if method in ("session/new", "session/load", "session/fork"):
+        if params.get("cwd"):
+            CWD = params["cwd"]
+            TRACE_PATH = os.path.join(CWD, ".mock_acp_trace.jsonl")
+        configure_mcp(params.get("mcpServers"))
+        emit({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": SESSION_ID}})
+        continue
+
+    if method == "session/cancel":
+        log_trace({"method": "session/cancel"})
+        if rid is not None:
+            emit({"jsonrpc": "2.0", "id": rid, "result": {}})
+        continue
+
+    if method != "session/prompt":
+        if rid is not None and method is not None:
+            emit({"jsonrpc": "2.0", "id": rid, "result": {}})
+        continue
+
+    raw_text = extract_prompt_text(params)
+    text = strip_envelopes(raw_text)
+    kv = parse_kv(text)
+    log_trace({"method": "session/prompt", "text": text})
+
+    if kv.get("SPAWN_CODEX_PROMPT"):
+        mcp_call("create_agent", {
+            "provider": "codex",
+            "cwd": CWD,
+            "initial_prompt": kv["SPAWN_CODEX_PROMPT"],
+            "notify_on_finish": True,
+            "mode": "accept_edits",
+        })
+
+    wait_file = kv.get("WAIT_FILE")
+    think_loop = kv.get("THINK_LOOP") == "1"
+    cancelled = False
+    if wait_file:
+        next_think_at = time.monotonic() + 0.15
+        think_step = 0
+        while not os.path.exists(wait_file):
+            now_m = time.monotonic()
+            if think_loop and now_m >= next_think_at:
+                think_step += 1
+                emit({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": SESSION_ID,
+                        "update": {
+                            "sessionUpdate": "agent_thought_chunk",
+                            "content": {"type": "text", "text": f"thinking step {think_step}\n"},
+                        },
+                    },
+                })
+                next_think_at = now_m + 0.15
+            slice_sec = 0.025
+            if think_loop:
+                slice_sec = min(slice_sec, max(0.005, next_think_at - time.monotonic()))
+            nxt = read_line(slice_sec)
+            if nxt == "":
+                sys.exit(0)
+            if nxt is None:
+                continue
+            try:
+                nmsg = json.loads(nxt)
+            except Exception:
+                continue
+            nmethod = nmsg.get("method")
+            nrid = nmsg.get("id")
+            if nmethod == "session/cancel":
+                log_trace({"method": "session/cancel"})
+                if nrid is not None:
+                    emit({"jsonrpc": "2.0", "id": nrid, "result": {}})
+                emit({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "cancelled"}})
+                cancelled = True
+                break
+            elif nrid is not None and nmethod is not None:
+                emit({"jsonrpc": "2.0", "id": nrid, "result": {}})
+
+    if cancelled:
+        continue
+
+    tag_match = re.search(r"NOTIFY_TAG=([A-Za-z0-9_]+)", text)
+    if tag_match:
+        reply = f"REPLY={tag_match.group(1)}"
+    elif "CODEX_NOTIFY" in text:
+        reply = "REPLY=CODEX_NOTIFY"
+    elif kv.get("ECHO"):
+        reply = f"REPLY={kv['ECHO']}"
+    else:
+        reply = "REPLY=ACK_TURN"
+
+    emit({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": SESSION_ID,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": reply},
+            },
+        },
+    })
+    emit({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
 "#;
 
 #[cfg(unix)]
@@ -1281,6 +1540,7 @@ async fn pitfall_04_off_lan_relay_propagation_and_fleet_configure_host_relay() {
         let _ = run_relay(RelayConfig {
             listen_addr: relay_addr,
             allowed_pubkeys: Arc::new(allowed),
+            fleet_token: None,
         })
         .await;
     });
@@ -2085,6 +2345,589 @@ async fn pitfall_07_archive_agent_terminates_only_target_shim_pgid_without_signa
         })
         .await,
         "Agent B should still process prompts cleanly after Agent A is archived"
+    );
+
+    drop_core(core).await;
+    drop(rt);
+}
+
+// ============================================================================
+// PITFALL 8: Multi-Agent Non-Interrupting Delivery, Stall Telemetry & Preemption
+// ============================================================================
+#[cfg(unix)]
+fn collect_stage_agent_messages(
+    stage: &orbit_client_core::stage::AgentStageView,
+) -> Vec<&TimelineItemView> {
+    let mut out = Vec::new();
+    for turn in &stage.turns {
+        if let Some(item @ TimelineItemView::AgentMessage { .. }) = turn.agent_message.as_ref() {
+            out.push(item);
+        }
+        for seg in &turn.live_segments {
+            if let TurnLiveSegmentView::AgentMessage { item, .. } = seg {
+                out.push(item);
+            }
+        }
+        for item in &turn.folded_steps {
+            if matches!(item, TimelineItemView::AgentMessage { .. }) {
+                out.push(item);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
+fn read_mock_acp_trace(trace_path: &Path) -> Vec<serde_json::Value> {
+    let Ok(raw) = std::fs::read_to_string(trace_path) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect()
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pitfall_08_multi_agent_non_interrupting_delivery_and_stall_recovery() {
+    install_mock_script(
+        &MOCK_ANTIGRAVITY_PATH,
+        ProviderKind::Antigravity,
+        "mock_agy_reg.py",
+        MOCK_ANTIGRAVITY_SCRIPT,
+    );
+    install_mock_script(
+        &MOCK_CODEX_PATH,
+        ProviderKind::Codex,
+        "mock_codex_reg.py",
+        MOCK_CODEX_SCRIPT,
+    );
+    install_mock_script(
+        &MOCK_CLAUDE_PATH,
+        ProviderKind::ClaudeCode,
+        "mock_claude_reg.py",
+        MOCK_CLAUDE_SCRIPT,
+    );
+
+    let home = new_temp_dir("p8_h");
+    let work = new_temp_dir("p8_w");
+    let trace_path = work.join(".mock_acp_trace.jsonl");
+
+    let (addr, rt) = spawn_embedded_daemon(home.to_path_buf(), None)
+        .await
+        .expect("spawn daemon");
+    let uri = rt
+        .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("offer")
+        .to_qr_uri()
+        .expect("uri");
+    let (core, host_id) = open_and_connect_core(home.join("c8.db"), uri).await;
+
+    // Spawn Antigravity parent & wait until idle.
+    core.create_agent(
+        &host_id,
+        &work.to_string_lossy(),
+        ProviderKind::Antigravity,
+        SessionMode::AcceptEdits,
+        "ECHO=PARENT_BOOT",
+        None,
+    );
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            async move {
+                c.host_detail(&hid).is_some_and(|d| {
+                    d.agents.iter().any(|a| {
+                        !a.agent_id.starts_with("opt_")
+                            && a.provider == ProviderKind::Antigravity
+                            && !a.is_running
+                            && a.latest_seq > 0
+                    })
+                })
+            }
+        })
+        .await,
+        "Antigravity parent must boot and finish initial turn"
+    );
+    let parent_id = core
+        .host_detail(&host_id)
+        .expect("host detail")
+        .agents
+        .into_iter()
+        .find(|a| !a.agent_id.starts_with("opt_") && a.provider == ProviderKind::Antigravity)
+        .expect("parent summary")
+        .agent_id;
+    core.open_agent_timeline(&host_id, &parent_id);
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = parent_id.clone();
+            async move { stage_settled_with_text(&c, &hid, &aid, "REPLY=PARENT_BOOT") }
+        })
+        .await,
+        "Parent boot turn should render REPLY=PARENT_BOOT"
+    );
+
+    // Verify Scenario B baseline invariant on settled turn: latest_visible_progress_ms == latest_activity_ms.
+    let boot_stage = core.agent_stage(&host_id, &parent_id);
+    let boot_turn = boot_stage.turns.last().expect("boot turn present");
+    assert!(boot_turn.latest_activity_ms.is_some());
+    assert_eq!(
+        boot_turn.latest_visible_progress_ms, boot_turn.latest_activity_ms,
+        "settled reply turn must keep latest_visible_progress_ms equal to latest_activity_ms"
+    );
+
+    // Spawn Claude peer & wait until idle.
+    core.create_agent(
+        &host_id,
+        &work.to_string_lossy(),
+        ProviderKind::ClaudeCode,
+        SessionMode::AcceptEdits,
+        "ECHO=CLAUDE_BOOT",
+        None,
+    );
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            async move {
+                c.host_detail(&hid).is_some_and(|d| {
+                    d.agents.iter().any(|a| {
+                        !a.agent_id.starts_with("opt_")
+                            && a.provider == ProviderKind::ClaudeCode
+                            && !a.is_running
+                            && a.latest_seq > 0
+                    })
+                })
+            }
+        })
+        .await,
+        "Claude peer must boot and finish initial turn"
+    );
+    let claude_id = core
+        .host_detail(&host_id)
+        .expect("host detail after claude")
+        .agents
+        .into_iter()
+        .find(|a| !a.agent_id.starts_with("opt_") && a.provider == ProviderKind::ClaudeCode)
+        .expect("claude summary")
+        .agent_id;
+
+    // ------------------------------------------------------------------------
+    // Scenario A: Non-interrupting multi-provider queueing & FIFO settlement
+    // ------------------------------------------------------------------------
+    let gate1 = work.join("gate1.flag");
+    core.send_prompt(
+        &host_id,
+        &parent_id,
+        &format!(
+            "WAIT_FILE={} SPAWN_CODEX_PROMPT=ECHO=CODEX_NOTIFY ECHO=PARENT_T1",
+            gate1.display()
+        ),
+    );
+
+    // Wait for Codex child to finish AND its finish notification to coalesce & enter Queued state.
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let pid = parent_id.clone();
+            async move {
+                let st = c.agent_stage(&hid, &pid);
+                collect_stage_agent_messages(&st).iter().any(|it| {
+                    matches!(
+                        it,
+                        TimelineItemView::AgentMessage {
+                            delivery_status: Some(AgentMessageDeliveryStatus::Queued),
+                            blocking_turn_id: Some(_),
+                            ..
+                        }
+                    )
+                })
+            }
+        })
+        .await,
+        "Codex finish notification must enqueue as Queued while parent turn is active"
+    );
+
+    // Now have Claude peer call MCP `send_agent_prompt` omitting `active_turn_behavior` (defaults to queue).
+    core.send_prompt(
+        &host_id,
+        &claude_id,
+        &format!("[MOCK:SEND_AGENT_PROMPT] TARGET_ID={parent_id} MSG=NOTIFY_TAG=CLAUDE_PEER"),
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let pid = parent_id.clone();
+            async move {
+                let st = c.agent_stage(&hid, &pid);
+                let queued_count = collect_stage_agent_messages(&st)
+                    .iter()
+                    .filter(|it| {
+                        matches!(
+                            it,
+                            TimelineItemView::AgentMessage {
+                                delivery_status: Some(AgentMessageDeliveryStatus::Queued),
+                                blocking_turn_id: Some(_),
+                                ..
+                            }
+                        )
+                    })
+                    .count();
+                queued_count >= 2
+            }
+        })
+        .await,
+        "Both Codex finish notification and Claude peer message must queue without interrupting parent"
+    );
+
+    let cancel_count_before_release = read_mock_acp_trace(&trace_path)
+        .iter()
+        .filter(|e| e.get("method").and_then(|v| v.as_str()) == Some("session/cancel"))
+        .count();
+    assert_eq!(
+        cancel_count_before_release, 0,
+        "agent notifications must trigger 0 session/cancel calls while parent is busy"
+    );
+
+    // Release gate1 -> parent finishes turn 1 and drains both queued items FIFO.
+    std::fs::write(&gate1, "go").expect("write gate1");
+
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let pid = parent_id.clone();
+            async move {
+                let parent_idle = c
+                    .host_detail(&hid)
+                    .and_then(|d| d.agents.into_iter().find(|a| a.agent_id == pid))
+                    .is_some_and(|a| !a.is_running);
+                if !parent_idle {
+                    return false;
+                }
+                let st = c.agent_stage(&hid, &pid);
+                let msgs = collect_stage_agent_messages(&st);
+                msgs.len() >= 2
+                    && msgs.iter().take(2).all(|it| {
+                        matches!(
+                            it,
+                            TimelineItemView::AgentMessage {
+                                delivery_status: Some(AgentMessageDeliveryStatus::Settled),
+                                ..
+                            }
+                        )
+                    })
+                    && stage_has_text(&c, &hid, &pid, "REPLY=CODEX_NOTIFY")
+                    && stage_has_text(&c, &hid, &pid, "REPLY=CLAUDE_PEER")
+            }
+        })
+        .await,
+        "Both queued notifications must drain FIFO and settle cleanly after gate1 release"
+    );
+
+    let st_after_a = core.agent_stage(&host_id, &parent_id);
+    let msgs_a = collect_stage_agent_messages(&st_after_a);
+    let mut dispatch_times_a = Vec::new();
+    for msg in msgs_a.iter().take(2) {
+        if let TimelineItemView::AgentMessage {
+            queued_at_ms,
+            dispatched_at_ms,
+            settled_at_ms,
+            ..
+        } = msg
+        {
+            let q = queued_at_ms.expect("queued_at_ms");
+            let d = dispatched_at_ms.expect("dispatched_at_ms");
+            let s = settled_at_ms.expect("settled_at_ms");
+            assert!(
+                q <= d && d <= s,
+                "timestamps must be monotonic: q={q} d={d} s={s}"
+            );
+            dispatch_times_a.push(d);
+        }
+    }
+    assert!(
+        dispatch_times_a[0] <= dispatch_times_a[1],
+        "queued messages must dispatch in FIFO order: {dispatch_times_a:?}"
+    );
+
+    let trace_a = read_mock_acp_trace(&trace_path);
+    assert_eq!(
+        trace_a
+            .iter()
+            .filter(|e| e.get("method").and_then(|v| v.as_str()) == Some("session/cancel"))
+            .count(),
+        0,
+        "Scenario A must have zero session/cancel calls"
+    );
+    let codex_pos = trace_a
+        .iter()
+        .position(|e| {
+            e.get("text")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("CODEX_NOTIFY") && !s.contains("WAIT_FILE="))
+        })
+        .expect("codex notification prompt recorded");
+    let claude_pos = trace_a
+        .iter()
+        .position(|e| {
+            e.get("text")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("CLAUDE_PEER"))
+        })
+        .expect("claude peer prompt recorded");
+    assert!(
+        codex_pos < claude_pos,
+        "Codex notification ({codex_pos}) must dispatch before Claude peer ({claude_pos})"
+    );
+
+    // ------------------------------------------------------------------------
+    // Scenario B: Thinking-stall detection + queue-preserving InterruptAndContinue
+    // ------------------------------------------------------------------------
+    let gate2 = work.join("gate2.flag");
+    core.send_prompt(
+        &host_id,
+        &parent_id,
+        &format!(
+            "WAIT_FILE={} THINK_LOOP=1 ECHO=THINK_STALL",
+            gate2.display()
+        ),
+    );
+    core.send_prompt(
+        &host_id,
+        &claude_id,
+        &format!("[MOCK:SEND_AGENT_PROMPT] TARGET_ID={parent_id} MSG=NOTIFY_TAG=STALL_QUEUED"),
+    );
+
+    let reached_stall = wait_until(Duration::from_secs(15), || {
+        let c = Arc::clone(&core);
+        let hid = host_id.clone();
+        let pid = parent_id.clone();
+        async move {
+            let st = c.agent_stage(&hid, &pid);
+            let thinking_stalled = st.turns.last().is_some_and(|t| {
+                matches!(
+                    (t.latest_activity_ms, t.latest_visible_progress_ms),
+                    (Some(act), Some(vis)) if act > vis
+                )
+            });
+            let has_queued = collect_stage_agent_messages(&st).iter().any(|it| {
+                matches!(
+                    it,
+                    TimelineItemView::AgentMessage {
+                        text,
+                        delivery_status: Some(AgentMessageDeliveryStatus::Queued),
+                        ..
+                    } if text.contains("STALL_QUEUED")
+                )
+            });
+            thinking_stalled && has_queued
+        }
+    })
+    .await;
+    if !reached_stall {
+        let st_dbg = core.agent_stage(&host_id, &parent_id);
+        let last_dbg = st_dbg.turns.last().map(|t| {
+            (
+                t.key.clone(),
+                t.started_at_ms,
+                t.latest_activity_ms,
+                t.latest_visible_progress_ms,
+                t.folded_steps.len(),
+                t.live_segments.len(),
+            )
+        });
+        let msgs_dbg: Vec<_> = collect_stage_agent_messages(&st_dbg)
+            .into_iter()
+            .filter_map(|it| match it {
+                TimelineItemView::AgentMessage {
+                    message_id,
+                    delivery_status,
+                    text,
+                    ..
+                } => Some((message_id.clone(), *delivery_status, text.clone())),
+                _ => None,
+            })
+            .collect();
+        let claude_st_dbg = core.agent_stage(&host_id, &claude_id);
+        panic!(
+            "Thinking loop must advance latest_activity_ms past latest_visible_progress_ms while STALL_QUEUED stays Queued; last_turn={last_dbg:?}, parent_msgs={msgs_dbg:?}, claude_turns={:?}, trace={:?}",
+            claude_st_dbg
+                .turns
+                .iter()
+                .map(turn_reply_texts)
+                .collect::<Vec<_>>(),
+            read_mock_acp_trace(&trace_path)
+        );
+    }
+
+    core.interrupt_agent_and_continue(&host_id, &parent_id);
+
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let pid = parent_id.clone();
+            async move {
+                let parent_idle = c
+                    .host_detail(&hid)
+                    .and_then(|d| d.agents.into_iter().find(|a| a.agent_id == pid))
+                    .is_some_and(|a| !a.is_running);
+                if !parent_idle {
+                    return false;
+                }
+                let st = c.agent_stage(&hid, &pid);
+                let settled = collect_stage_agent_messages(&st).iter().any(|it| {
+                    matches!(
+                        it,
+                        TimelineItemView::AgentMessage {
+                            text,
+                            delivery_status: Some(AgentMessageDeliveryStatus::Settled),
+                            ..
+                        } if text.contains("STALL_QUEUED")
+                    )
+                });
+                settled && stage_has_text(&c, &hid, &pid, "REPLY=STALL_QUEUED")
+            }
+        })
+        .await,
+        "interrupt_agent_and_continue must cancel thinking turn and deliver queued STALL_QUEUED message"
+    );
+
+    let cancel_after_b = read_mock_acp_trace(&trace_path)
+        .iter()
+        .filter(|e| e.get("method").and_then(|v| v.as_str()) == Some("session/cancel"))
+        .count();
+    assert_eq!(
+        cancel_after_b, 1,
+        "Scenario B must issue exactly 1 session/cancel via interrupt_agent_and_continue"
+    );
+
+    // ------------------------------------------------------------------------
+    // Scenario C: Issue #52 exact sequence (queued notification + human preemption)
+    // ------------------------------------------------------------------------
+    let gate3 = work.join("gate3.flag");
+    core.send_prompt(
+        &host_id,
+        &parent_id,
+        &format!("WAIT_FILE={} ECHO=PARENT_T3", gate3.display()),
+    );
+    core.send_prompt(
+        &host_id,
+        &claude_id,
+        &format!("[MOCK:SEND_AGENT_PROMPT] TARGET_ID={parent_id} MSG=NOTIFY_TAG=SUB_AFTER_HUMAN"),
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let pid = parent_id.clone();
+            async move {
+                let st = c.agent_stage(&hid, &pid);
+                collect_stage_agent_messages(&st).iter().any(|it| {
+                    matches!(
+                        it,
+                        TimelineItemView::AgentMessage {
+                            text,
+                            delivery_status: Some(AgentMessageDeliveryStatus::Queued),
+                            ..
+                        } if text.contains("SUB_AFTER_HUMAN")
+                    )
+                })
+            }
+        })
+        .await,
+        "SUB_AFTER_HUMAN must enter Queued state without interrupting PARENT_T3"
+    );
+    assert_eq!(
+        read_mock_acp_trace(&trace_path)
+            .iter()
+            .filter(|e| e.get("method").and_then(|v| v.as_str()) == Some("session/cancel"))
+            .count(),
+        1,
+        "queuing SUB_AFTER_HUMAN must not add any session/cancel"
+    );
+
+    // Now human sends preemption prompt while PARENT_T3 is still blocked and SUB_AFTER_HUMAN is queued.
+    core.send_prompt(&host_id, &parent_id, "ECHO=HUMAN_PREEMPT");
+
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let pid = parent_id.clone();
+            async move {
+                let parent_idle = c
+                    .host_detail(&hid)
+                    .and_then(|d| d.agents.into_iter().find(|a| a.agent_id == pid))
+                    .is_some_and(|a| !a.is_running);
+                if !parent_idle {
+                    return false;
+                }
+                let st = c.agent_stage(&hid, &pid);
+                let sub_settled = collect_stage_agent_messages(&st).iter().any(|it| {
+                    matches!(
+                        it,
+                        TimelineItemView::AgentMessage {
+                            text,
+                            delivery_status: Some(AgentMessageDeliveryStatus::Settled),
+                            ..
+                        } if text.contains("SUB_AFTER_HUMAN")
+                    )
+                });
+                sub_settled
+                    && stage_has_text(&c, &hid, &pid, "REPLY=HUMAN_PREEMPT")
+                    && stage_has_text(&c, &hid, &pid, "REPLY=SUB_AFTER_HUMAN")
+            }
+        })
+        .await,
+        "Human preemption must execute immediately and still deliver queued SUB_AFTER_HUMAN afterward"
+    );
+
+    let trace_c = read_mock_acp_trace(&trace_path);
+    assert_eq!(
+        trace_c
+            .iter()
+            .filter(|e| e.get("method").and_then(|v| v.as_str()) == Some("session/cancel"))
+            .count(),
+        2,
+        "human preemption must issue 1 additional session/cancel (total 2)"
+    );
+    let human_pos = trace_c
+        .iter()
+        .position(|e| {
+            e.get("text")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("ECHO=HUMAN_PREEMPT"))
+        })
+        .expect("HUMAN_PREEMPT prompt dispatched");
+    let sub_matches: Vec<usize> = trace_c
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, e)| {
+            e.get("text")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("SUB_AFTER_HUMAN"))
+                .then_some(idx)
+        })
+        .collect();
+    assert_eq!(
+        sub_matches.len(),
+        1,
+        "SUB_AFTER_HUMAN must be dispatched exactly once, got indices {sub_matches:?}"
+    );
+    assert!(
+        human_pos < sub_matches[0],
+        "Human preemption ({human_pos}) must run BEFORE queued SUB_AFTER_HUMAN ({})",
+        sub_matches[0]
     );
 
     drop_core(core).await;

@@ -123,6 +123,10 @@ fn wire_default_workflow_concurrency() -> u32 {
     3
 }
 
+fn wire_is_false(v: &bool) -> bool {
+    !*v
+}
+
 /// First-class supported coding agent CLIs in Orbit (native drivers + Universal ACP).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -985,6 +989,7 @@ pub struct TimelineEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum TimelinePayload {
     UserPrompt {
         message_id: String,
@@ -1046,6 +1051,29 @@ pub enum TimelinePayload {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_context: Option<PermissionCheckpointRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_status: Option<AgentMessageDeliveryStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocking_turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queued_at_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatched_at_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settled_at_ms: Option<i64>,
+    },
+    /// Monotonic lifecycle update for an already-emitted [`TimelinePayload::AgentMessage`],
+    /// preserving chronological `seq` order while letting clients update delivery status in place.
+    AgentMessageDeliveryUpdated {
+        message_id: String,
+        status: AgentMessageDeliveryStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocking_turn_id: Option<String>,
+        timestamp_ms: i64,
     },
     StatusChanged {
         status: AgentStatus,
@@ -1569,6 +1597,8 @@ pub enum WireMessage {
     InterruptTurn {
         request_id: Uuid,
         agent_id: String,
+        #[serde(default, skip_serializing_if = "wire_is_false")]
+        preserve_queue: bool,
     },
     SetSessionMode {
         request_id: Uuid,
@@ -1911,6 +1941,10 @@ pub enum WireMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
         pairing_uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh_alias: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_daemon_port: Option<u16>,
     },
     ConnectedHostAdded {
         request_id: Uuid,
@@ -3056,6 +3090,42 @@ pub enum WireMessage {
         attempted: u32,
         delivered: u32,
         detail: String,
+    },
+
+    /// Request an online bridge Daemon to open an E2EE tunnel to another registered Connected Host
+    /// reachable from that bridge (including LAN-only or SSH-tunneled nodes).
+    PeerBridgeOpen {
+        request_id: Uuid,
+        bridge_id: Uuid,
+        target_host_id: String,
+    },
+    /// Bridge Daemon opened the upstream `/ws/e2ee` stream and is ready to forward ciphertext.
+    PeerBridgeOpened {
+        request_id: Uuid,
+        bridge_id: Uuid,
+    },
+    /// Opaque Noise_NK E2EE ciphertext frame forwarded across a Peer Bridge.
+    PeerBridgeData {
+        bridge_id: Uuid,
+        payload_b64: String,
+    },
+    /// Either side closed the Peer Bridge stream cleanly or due to an upstream error.
+    PeerBridgeClosed {
+        bridge_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
+    /// Notify other sessions on the same account that Cloud Sync Vault state changed.
+    NotifyFleetVaultChanged {
+        request_id: Uuid,
+        vault_fingerprint: String,
+        revision: u64,
+    },
+    /// Daemon broadcast pushed to other connected clients when another device updates the vault.
+    FleetVaultChanged {
+        vault_fingerprint: String,
+        revision: u64,
     },
 
     RpcError {
@@ -5307,5 +5377,89 @@ mod tests {
             is_valid_github_repo(&effective),
             "configured_github_repo() must always return a valid slug, got `{effective}`"
         );
+    }
+
+    #[test]
+    fn agent_message_delivery_status_and_interrupt_preserve_queue_roundtrip_and_compat() {
+        let legacy_agent_msg = serde_json::json!({
+            "type": "agent_message",
+            "message_id": "am_legacy",
+            "kind": "finish_notification",
+            "source_agent_id": "ag_child",
+            "text": "Done"
+        });
+        let decoded_legacy: TimelinePayload =
+            serde_json::from_value(legacy_agent_msg).expect("deserialize legacy AgentMessage");
+        match decoded_legacy {
+            TimelinePayload::AgentMessage {
+                delivery_status,
+                delivery_turn_id,
+                blocking_turn_id,
+                queued_at_ms,
+                dispatched_at_ms,
+                settled_at_ms,
+                ..
+            } => {
+                assert!(delivery_status.is_none());
+                assert!(delivery_turn_id.is_none());
+                assert!(blocking_turn_id.is_none());
+                assert!(queued_at_ms.is_none());
+                assert!(dispatched_at_ms.is_none());
+                assert!(settled_at_ms.is_none());
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+
+        let updated = TimelinePayload::AgentMessageDeliveryUpdated {
+            message_id: "am_1".into(),
+            status: AgentMessageDeliveryStatus::Dispatched,
+            delivery_turn_id: Some("turn_2".into()),
+            blocking_turn_id: None,
+            timestamp_ms: 1_732_400_000_000,
+        };
+        let roundtrip: TimelinePayload =
+            serde_json::from_str(&serde_json::to_string(&updated).expect("ser")).expect("de");
+        match roundtrip {
+            TimelinePayload::AgentMessageDeliveryUpdated {
+                message_id,
+                status,
+                delivery_turn_id,
+                blocking_turn_id,
+                timestamp_ms,
+            } => {
+                assert_eq!(message_id, "am_1");
+                assert_eq!(status, AgentMessageDeliveryStatus::Dispatched);
+                assert_eq!(delivery_turn_id.as_deref(), Some("turn_2"));
+                assert!(blocking_turn_id.is_none());
+                assert_eq!(timestamp_ms, 1_732_400_000_000);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+
+        let req_id = Uuid::new_v4();
+        let legacy_interrupt = serde_json::json!({
+            "op": "interrupt_turn",
+            "request_id": req_id,
+            "agent_id": "ag_p"
+        });
+        let parsed_legacy_int: WireMessage =
+            serde_json::from_value(legacy_interrupt).expect("deserialize legacy InterruptTurn");
+        match parsed_legacy_int {
+            WireMessage::InterruptTurn { preserve_queue, .. } => assert!(!preserve_queue),
+            other => panic!("unexpected wire: {other:?}"),
+        }
+
+        let continue_wire = WireMessage::InterruptTurn {
+            request_id: req_id,
+            agent_id: "ag_p".into(),
+            preserve_queue: true,
+        };
+        let encoded = serde_json::to_string(&continue_wire).expect("ser interrupt");
+        assert!(encoded.contains("\"preserve_queue\":true"));
+        let decoded_wire: WireMessage = serde_json::from_str(&encoded).expect("de interrupt");
+        match decoded_wire {
+            WireMessage::InterruptTurn { preserve_queue, .. } => assert!(preserve_queue),
+            other => panic!("unexpected wire: {other:?}"),
+        }
     }
 }

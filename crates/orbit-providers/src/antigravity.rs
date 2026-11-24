@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentStatus, BackgroundTaskInfo, ProviderKind, ProviderModelCatalog,
-    ProviderModelSpec, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentStatus,
-    QuestionItem, QuotaWindow, ReasoningEffort, SessionMode, ThinkingOptionSpec, TimelinePayload,
-    ToolCallDetail, ToolCallStatus,
+    ActiveTurnBehavior, AgentMessageDeliveryStatus, AgentStatus, BackgroundTaskInfo, ProviderKind,
+    ProviderModelCatalog, ProviderModelSpec, ProviderQuotaSnapshot, ProviderSubagentDescriptor,
+    ProviderSubagentStatus, QuestionItem, QuotaWindow, ReasoningEffort, SessionMode,
+    ThinkingOptionSpec, TimelinePayload, ToolCallDetail, ToolCallStatus,
 };
 use orbit_shim::{
     ShimFrame, ShimMode, ShimSpawnSpec, connect_existing_shim_after, spawn_detached_shim,
@@ -25,7 +25,8 @@ use tracing::{info, warn};
 
 use crate::attachments::{AcpPromptMediaCaps, build_acp_prompt_blocks_async, is_path_within_dir};
 use crate::driver::{
-    DriverCommand, DriverEvent, ProviderSessionHandle, RpcId, SessionLaunchConfig,
+    DriverCommand, DriverEvent, PromptOrigin, ProviderSessionHandle, QueuedDriverPrompt, RpcId,
+    SessionLaunchConfig, emit_dropped_queued_prompts, emit_prompt_delivery,
 };
 
 fn build_agy_launch_env(cfg: &SessionLaunchConfig) -> HashMap<String, String> {
@@ -769,7 +770,7 @@ async fn run_agy_actor(
     let mut active_prompt_rpc_key: Option<String> = None;
     let mut post_reattach_non_prompt_rpcs: HashSet<String> = HashSet::new();
     let mut pending_fast_mode_rpcs: HashMap<String, bool> = HashMap::new();
-    let mut last_dispatched_prompt: Option<(String, String)> = None;
+    let mut last_dispatched_prompt: Option<QueuedDriverPrompt> = None;
     let mut seg_state = if let Some(ref tid) = active_turn_id {
         AgyStreamSegmentState {
             turn_tag: tid.clone(),
@@ -782,8 +783,9 @@ async fn run_agy_actor(
     let mut tool_cache: HashMap<String, ToolCallDetail> = HashMap::new();
     let mut pending_perms: HashMap<String, PendingPerm> = HashMap::new();
     let mut pending_elicits: HashMap<String, PendingElicitation> = HashMap::new();
-    let mut pending_prompts: VecDeque<(String, String)> = VecDeque::new();
-    let mut pending_interrupt_replacement: Option<(String, String)> = None;
+    let mut pending_prompts: VecDeque<QueuedDriverPrompt> = VecDeque::new();
+    let mut pending_interrupt_replacement: Option<QueuedDriverPrompt> = None;
+    let mut active_turn_message_ids: Vec<String> = Vec::new();
     let mut subagent_monitors: HashMap<String, (ProviderSubagentDescriptor, AgyTranscriptMonitor)> =
         HashMap::new();
 
@@ -968,15 +970,39 @@ async fn run_agy_actor(
                         turn_id,
                         prompt,
                         behavior,
+                        origin,
+                        message_ids,
                     } => {
                         user_interrupted = false;
                         pending_self_heal = None;
                         consecutive_self_heals = 0;
                         if active_prompt_rpc_key.is_some() || active_turn_id.is_some() {
-                            if matches!(behavior, ActiveTurnBehavior::Queue) {
+                            // `agy acp` lacks native non-destructive mid-turn steering; degrade
+                            // agent-originated `Steer` to `Queue` so subagents never cancel active turns.
+                            let effective_behavior = if origin == PromptOrigin::Agent
+                                && matches!(behavior, ActiveTurnBehavior::Steer)
+                            {
+                                ActiveTurnBehavior::Queue
+                            } else {
+                                behavior
+                            };
+                            let blocking_tid = active_turn_id.clone();
+                            if matches!(effective_behavior, ActiveTurnBehavior::Queue) {
                                 // Always enqueue FIFO notifications/prompts even while awaiting permission
-                                pending_prompts.push_back((turn_id, prompt));
-                            } else if matches!(behavior, ActiveTurnBehavior::Interrupt) {
+                                emit_prompt_delivery(
+                                    &evt_tx,
+                                    &turn_id,
+                                    &message_ids,
+                                    AgentMessageDeliveryStatus::Queued,
+                                    blocking_tid,
+                                )
+                                .await;
+                                pending_prompts.push_back(QueuedDriverPrompt {
+                                    turn_id,
+                                    prompt,
+                                    message_ids,
+                                });
+                            } else if matches!(effective_behavior, ActiveTurnBehavior::Interrupt) {
                                 cancel_pending_agy_perms_and_elicits(
                                     &shim,
                                     &mut pending_perms,
@@ -996,11 +1022,55 @@ async fn run_agy_actor(
                                 })
                                 .to_string();
                                 if shim.write_stdin_line(cancel).await.is_err() {
+                                    emit_dropped_queued_prompts(
+                                        &evt_tx,
+                                        pending_interrupt_replacement.take(),
+                                        &mut pending_prompts,
+                                    )
+                                    .await;
+                                    emit_prompt_delivery(
+                                        &evt_tx,
+                                        &turn_id,
+                                        &message_ids,
+                                        AgentMessageDeliveryStatus::Dropped,
+                                        None,
+                                    )
+                                    .await;
                                     let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
                                     break;
                                 }
-                                pending_interrupt_replacement = Some((turn_id, prompt));
+                                if let Some(prev_rep) = pending_interrupt_replacement.take() {
+                                    emit_prompt_delivery(
+                                        &evt_tx,
+                                        &prev_rep.turn_id,
+                                        &prev_rep.message_ids,
+                                        AgentMessageDeliveryStatus::Dropped,
+                                        None,
+                                    )
+                                    .await;
+                                }
+                                emit_prompt_delivery(
+                                    &evt_tx,
+                                    &turn_id,
+                                    &message_ids,
+                                    AgentMessageDeliveryStatus::Queued,
+                                    blocking_tid,
+                                )
+                                .await;
+                                pending_interrupt_replacement = Some(QueuedDriverPrompt {
+                                    turn_id,
+                                    prompt,
+                                    message_ids,
+                                });
                             } else if !pending_perms.is_empty() || !pending_elicits.is_empty() {
+                                emit_prompt_delivery(
+                                    &evt_tx,
+                                    &turn_id,
+                                    &message_ids,
+                                    AgentMessageDeliveryStatus::Dropped,
+                                    None,
+                                )
+                                .await;
                                 let _ = evt_tx
                                     .send(DriverEvent::Notice {
                                         level: "warning".into(),
@@ -1008,7 +1078,7 @@ async fn run_agy_actor(
                                     })
                                     .await;
                             } else {
-                                // `ActiveTurnBehavior::Steer`: `agy acp` has no native mid-RPC steer without
+                                // `ActiveTurnBehavior::Steer` for human prompts: `agy acp` has no native mid-RPC steer without
                                 // `session/cancel`. Cancel cleanly, flush streaming buffers, preserve accepted
                                 // FIFO `pending_prompts`, and schedule this replacement as priority next turn.
                                 finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
@@ -1023,10 +1093,46 @@ async fn run_agy_actor(
                                 })
                                 .to_string();
                                 if shim.write_stdin_line(cancel).await.is_err() {
+                                    emit_dropped_queued_prompts(
+                                        &evt_tx,
+                                        pending_interrupt_replacement.take(),
+                                        &mut pending_prompts,
+                                    )
+                                    .await;
+                                    emit_prompt_delivery(
+                                        &evt_tx,
+                                        &turn_id,
+                                        &message_ids,
+                                        AgentMessageDeliveryStatus::Dropped,
+                                        None,
+                                    )
+                                    .await;
                                     let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
                                     break;
                                 }
-                                pending_interrupt_replacement = Some((turn_id, prompt));
+                                if let Some(prev_rep) = pending_interrupt_replacement.take() {
+                                    emit_prompt_delivery(
+                                        &evt_tx,
+                                        &prev_rep.turn_id,
+                                        &prev_rep.message_ids,
+                                        AgentMessageDeliveryStatus::Dropped,
+                                        None,
+                                    )
+                                    .await;
+                                }
+                                emit_prompt_delivery(
+                                    &evt_tx,
+                                    &turn_id,
+                                    &message_ids,
+                                    AgentMessageDeliveryStatus::Queued,
+                                    blocking_tid,
+                                )
+                                .await;
+                                pending_interrupt_replacement = Some(QueuedDriverPrompt {
+                                    turn_id,
+                                    prompt,
+                                    message_ids,
+                                });
                             }
                             continue;
                         }
@@ -1039,8 +1145,12 @@ async fn run_agy_actor(
                         } else {
                             prompt
                         };
-                        last_dispatched_prompt =
-                            Some((turn_id.clone(), effective_prompt.clone()));
+                        active_turn_message_ids = message_ids.clone();
+                        last_dispatched_prompt = Some(QueuedDriverPrompt {
+                            turn_id: turn_id.clone(),
+                            prompt: effective_prompt.clone(),
+                            message_ids,
+                        });
                         wakeup_tools.begin_turn();
                         if dispatch_agy_prompt(
                             &shim,
@@ -1055,20 +1165,38 @@ async fn run_agy_actor(
                             &mut seg_state,
                             &mut last_ask_question_raw,
                             &evt_tx,
-                            turn_id,
+                            turn_id.clone(),
                             effective_prompt,
                         )
                         .await
                         .is_err()
                         {
+                            let dropped = std::mem::take(&mut active_turn_message_ids);
+                            emit_prompt_delivery(
+                                &evt_tx,
+                                &turn_id,
+                                &dropped,
+                                AgentMessageDeliveryStatus::Dropped,
+                                None,
+                            )
+                            .await;
                             break;
                         }
+                        emit_prompt_delivery(
+                            &evt_tx,
+                            &turn_id,
+                            &active_turn_message_ids,
+                            AgentMessageDeliveryStatus::Dispatched,
+                            None,
+                        )
+                        .await;
                     }
                     DriverCommand::Interrupt => {
                         user_interrupted = true;
                         pending_self_heal = None;
-                        pending_prompts.clear();
-                        pending_interrupt_replacement = None;
+                        let dropped_rep = pending_interrupt_replacement.take();
+                        emit_dropped_queued_prompts(&evt_tx, dropped_rep, &mut pending_prompts)
+                            .await;
                         finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
                         let had_active =
                             active_prompt_rpc_key.is_some() || active_turn_id.is_some();
@@ -1115,6 +1243,99 @@ async fn run_agy_actor(
                         if shim.write_stdin_line(cancel).await.is_err() {
                             let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
                             break;
+                        }
+                    }
+                    DriverCommand::InterruptAndDrainQueue => {
+                        user_interrupted = false;
+                        pending_self_heal = None;
+                        finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
+                        cancel_pending_agy_perms_and_elicits(
+                            &shim,
+                            &mut pending_perms,
+                            &mut pending_elicits,
+                            &mut last_ask_question_raw,
+                        )
+                        .await;
+                        let had_active =
+                            active_prompt_rpc_key.is_some() || active_turn_id.is_some();
+                        if had_active {
+                            cancelling_active_turn = true;
+                            cancel_deadline =
+                                Some(tokio::time::Instant::now() + Duration::from_secs(10));
+                            let cancel = json!({
+                                "jsonrpc": "2.0",
+                                "method": "session/cancel",
+                                "params": { "sessionId": session_id }
+                            })
+                            .to_string();
+                            if shim.write_stdin_line(cancel).await.is_err() {
+                                emit_dropped_queued_prompts(
+                                    &evt_tx,
+                                    pending_interrupt_replacement.take(),
+                                    &mut pending_prompts,
+                                )
+                                .await;
+                                let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
+                                break;
+                            }
+                        } else if let Some(next) = pending_interrupt_replacement
+                            .take()
+                            .or_else(|| pending_prompts.pop_front())
+                        {
+                            let effective_prompt = if inject_handoff_on_next_prompt {
+                                inject_handoff_on_next_prompt = false;
+                                prepend_handoff_context(
+                                    pending_handoff_context.take(),
+                                    &next.prompt,
+                                )
+                            } else {
+                                next.prompt
+                            };
+                            active_turn_message_ids = next.message_ids.clone();
+                            last_dispatched_prompt = Some(QueuedDriverPrompt {
+                                turn_id: next.turn_id.clone(),
+                                prompt: effective_prompt.clone(),
+                                message_ids: next.message_ids,
+                            });
+                            wakeup_tools.begin_turn();
+                            if dispatch_agy_prompt(
+                                &shim,
+                                &session_id,
+                                cfg.attachments_dir.as_deref(),
+                                prompt_media_caps,
+                                &mut next_rpc_id,
+                                &mut active_turn_id,
+                                &mut active_prompt_rpc_key,
+                                &mut autonomous_turn_id,
+                                &mut transcript_monitor,
+                                &mut seg_state,
+                                &mut last_ask_question_raw,
+                                &evt_tx,
+                                next.turn_id.clone(),
+                                effective_prompt,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                let dropped = std::mem::take(&mut active_turn_message_ids);
+                                emit_prompt_delivery(
+                                    &evt_tx,
+                                    &next.turn_id,
+                                    &dropped,
+                                    AgentMessageDeliveryStatus::Dropped,
+                                    None,
+                                )
+                                .await;
+                                break;
+                            }
+                            emit_prompt_delivery(
+                                &evt_tx,
+                                &next.turn_id,
+                                &active_turn_message_ids,
+                                AgentMessageDeliveryStatus::Dispatched,
+                                None,
+                            )
+                            .await;
                         }
                     }
                     DriverCommand::SetMode { mode: new_mode } => {
@@ -1285,7 +1506,26 @@ async fn run_agy_actor(
             }
 
             maybe_frame = shim.rx.recv() => {
-                let Some(frame) = maybe_frame else { break; };
+                let Some(frame) = maybe_frame else {
+                    emit_dropped_queued_prompts(
+                        &evt_tx,
+                        pending_interrupt_replacement.take(),
+                        &mut pending_prompts,
+                    )
+                    .await;
+                    if let Some(ref tid) = active_turn_id {
+                        let active_ids = std::mem::take(&mut active_turn_message_ids);
+                        emit_prompt_delivery(
+                            &evt_tx,
+                            tid,
+                            &active_ids,
+                            AgentMessageDeliveryStatus::Dropped,
+                            None,
+                        )
+                        .await;
+                    }
+                    break;
+                };
                 if let Some(seq) = frame.seq() {
                     cfg.shim_seq_tracker.fetch_max(seq, Ordering::Relaxed);
                 }
@@ -1332,7 +1572,7 @@ async fn run_agy_actor(
                                     last_ask_question_raw = None;
                                     // Finalize any streaming message buffers
                                     finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
-                                    active_turn_id = None;
+                                    let finished_turn_id = active_turn_id.take();
 
                                     // Transparently recover when `session/load` silently accepted an
                                     // evicted Antigravity session ID and `session/prompt` then fails
@@ -1346,8 +1586,7 @@ async fn run_agy_actor(
                                             .unwrap_or("");
                                         if !recovered_missing_trajectory
                                             && is_agy_missing_trajectory_error(err_msg)
-                                            && let Some((failed_turn_id, failed_prompt)) =
-                                                last_dispatched_prompt.take()
+                                            && let Some(failed_q) = last_dispatched_prompt.take()
                                         {
                                             recovered_missing_trajectory = true;
                                             let old_short: String =
@@ -1394,12 +1633,14 @@ async fn run_agy_actor(
                                                         .await;
                                                     let recovered_prompt = prepend_handoff_context(
                                                         pending_handoff_context.take(),
-                                                        &failed_prompt,
+                                                        &failed_q.prompt,
                                                     );
-                                                    last_dispatched_prompt = Some((
-                                                        failed_turn_id.clone(),
-                                                        recovered_prompt.clone(),
-                                                    ));
+                                                    last_dispatched_prompt =
+                                                        Some(QueuedDriverPrompt {
+                                                            turn_id: failed_q.turn_id.clone(),
+                                                            prompt: recovered_prompt.clone(),
+                                                            message_ids: failed_q.message_ids,
+                                                        });
                                                     wakeup_tools.begin_turn();
                                                     if dispatch_agy_prompt(
                                                         &shim,
@@ -1414,12 +1655,29 @@ async fn run_agy_actor(
                                                         &mut seg_state,
                                                         &mut last_ask_question_raw,
                                                         &evt_tx,
-                                                        failed_turn_id,
+                                                        failed_q.turn_id.clone(),
                                                         recovered_prompt,
                                                     )
                                                     .await
                                                     .is_err()
                                                     {
+                                                        let dropped = std::mem::take(
+                                                            &mut active_turn_message_ids,
+                                                        );
+                                                        emit_prompt_delivery(
+                                                            &evt_tx,
+                                                            &failed_q.turn_id,
+                                                            &dropped,
+                                                            AgentMessageDeliveryStatus::Dropped,
+                                                            None,
+                                                        )
+                                                        .await;
+                                                        emit_dropped_queued_prompts(
+                                                            &evt_tx,
+                                                            pending_interrupt_replacement.take(),
+                                                            &mut pending_prompts,
+                                                        )
+                                                        .await;
                                                         break;
                                                     }
                                                     continue;
@@ -1435,6 +1693,18 @@ async fn run_agy_actor(
                                         }
                                     }
                                     last_dispatched_prompt = None;
+                                    let settled_msg_ids =
+                                        std::mem::take(&mut active_turn_message_ids);
+                                    if let Some(ref tid) = finished_turn_id {
+                                        emit_prompt_delivery(
+                                            &evt_tx,
+                                            tid,
+                                            &settled_msg_ids,
+                                            AgentMessageDeliveryStatus::Settled,
+                                            None,
+                                        )
+                                        .await;
+                                    }
 
                                     // Fast-forward transcript reader past foreground steps while still
                                     // capturing any newly spawned/completed background task IDs.
@@ -1469,13 +1739,12 @@ async fn run_agy_actor(
                                             .await;
                                     }
                                     // Drain interrupted-replacement or accepted FIFO queued prompt
-                                    if let Some((next_turn_id, next_prompt)) =
-                                        pending_interrupt_replacement
-                                            .take()
-                                            .or_else(|| pending_prompts.pop_front())
+                                    if let Some(next_q) = pending_interrupt_replacement
+                                        .take()
+                                        .or_else(|| pending_prompts.pop_front())
                                     {
-                                        last_dispatched_prompt =
-                                            Some((next_turn_id.clone(), next_prompt.clone()));
+                                        active_turn_message_ids = next_q.message_ids.clone();
+                                        last_dispatched_prompt = Some(next_q.clone());
                                         wakeup_tools.begin_turn();
                                         if dispatch_agy_prompt(
                                             &shim,
@@ -1490,14 +1759,38 @@ async fn run_agy_actor(
                                             &mut seg_state,
                                             &mut last_ask_question_raw,
                                             &evt_tx,
-                                            next_turn_id,
-                                            next_prompt,
+                                            next_q.turn_id.clone(),
+                                            next_q.prompt,
                                         )
                                         .await
                                         .is_err()
                                         {
+                                            let dropped =
+                                                std::mem::take(&mut active_turn_message_ids);
+                                            emit_prompt_delivery(
+                                                &evt_tx,
+                                                &next_q.turn_id,
+                                                &dropped,
+                                                AgentMessageDeliveryStatus::Dropped,
+                                                None,
+                                            )
+                                            .await;
+                                            emit_dropped_queued_prompts(
+                                                &evt_tx,
+                                                pending_interrupt_replacement.take(),
+                                                &mut pending_prompts,
+                                            )
+                                            .await;
                                             break;
                                         }
+                                        emit_prompt_delivery(
+                                            &evt_tx,
+                                            &next_q.turn_id,
+                                            &active_turn_message_ids,
+                                            AgentMessageDeliveryStatus::Dispatched,
+                                            None,
+                                        )
+                                        .await;
                                     } else if let Some(err_obj) = val.get("error") {
                                         let msg = err_obj
                                             .get("message")
@@ -1632,6 +1925,23 @@ async fn run_agy_actor(
                         }
                     }
                     ShimFrame::Exited { code } => {
+                        emit_dropped_queued_prompts(
+                            &evt_tx,
+                            pending_interrupt_replacement.take(),
+                            &mut pending_prompts,
+                        )
+                        .await;
+                        if let Some(ref tid) = active_turn_id {
+                            let active_ids = std::mem::take(&mut active_turn_message_ids);
+                            emit_prompt_delivery(
+                                &evt_tx,
+                                tid,
+                                &active_ids,
+                                AgentMessageDeliveryStatus::Dropped,
+                                None,
+                            )
+                            .await;
+                        }
                         if code != Some(0) {
                             warn!(
                                 agent_id = %cfg.agent_id,
@@ -2064,6 +2374,7 @@ async fn run_agy_actor(
                                 let recovery_turn =
                                     format!("selfheal_{}", uuid::Uuid::new_v4().simple());
                                 let recovery_prompt = build_self_heal_prompt(&heal, attempt);
+                                active_turn_message_ids.clear();
                                 wakeup_tools.begin_turn();
                         if dispatch_agy_prompt(
                                     &shim,
@@ -2103,7 +2414,18 @@ async fn run_agy_actor(
                 cancelling_active_turn = false;
                 reattached_turn_in_flight = false;
                 active_prompt_rpc_key = None;
-                active_turn_id = None;
+                let timed_out_tid = active_turn_id.take();
+                let settled_msg_ids = std::mem::take(&mut active_turn_message_ids);
+                if let Some(ref tid) = timed_out_tid {
+                    emit_prompt_delivery(
+                        &evt_tx,
+                        tid,
+                        &settled_msg_ids,
+                        AgentMessageDeliveryStatus::Settled,
+                        None,
+                    )
+                    .await;
+                }
                 pending_perms.clear();
                 pending_elicits.clear();
                 last_ask_question_raw = None;
@@ -2114,12 +2436,12 @@ async fn run_agy_actor(
                         message: "Antigravity cancel timed out waiting for turn settlement; resetting active turn state.".into(),
                     })
                     .await;
-                if let Some((next_turn_id, next_prompt)) = pending_interrupt_replacement
+                if let Some(next_q) = pending_interrupt_replacement
                     .take()
                     .or_else(|| pending_prompts.pop_front())
                 {
-                    last_dispatched_prompt =
-                        Some((next_turn_id.clone(), next_prompt.clone()));
+                    active_turn_message_ids = next_q.message_ids.clone();
+                    last_dispatched_prompt = Some(next_q.clone());
                     wakeup_tools.begin_turn();
                     if dispatch_agy_prompt(
                         &shim,
@@ -2134,14 +2456,37 @@ async fn run_agy_actor(
                         &mut seg_state,
                         &mut last_ask_question_raw,
                         &evt_tx,
-                        next_turn_id,
-                        next_prompt,
+                        next_q.turn_id.clone(),
+                        next_q.prompt,
                     )
                     .await
                     .is_err()
                     {
+                        let dropped = std::mem::take(&mut active_turn_message_ids);
+                        emit_prompt_delivery(
+                            &evt_tx,
+                            &next_q.turn_id,
+                            &dropped,
+                            AgentMessageDeliveryStatus::Dropped,
+                            None,
+                        )
+                        .await;
+                        emit_dropped_queued_prompts(
+                            &evt_tx,
+                            pending_interrupt_replacement.take(),
+                            &mut pending_prompts,
+                        )
+                        .await;
                         break;
                     }
+                    emit_prompt_delivery(
+                        &evt_tx,
+                        &next_q.turn_id,
+                        &active_turn_message_ids,
+                        AgentMessageDeliveryStatus::Dispatched,
+                        None,
+                    )
+                    .await;
                 } else {
                     let _ = evt_tx
                         .send(DriverEvent::StatusChanged(AgentStatus::Idle))
@@ -3951,6 +4296,7 @@ enum WakeupStep {
 const WAKEUP_ERROR_STALL_TIMEOUT: Duration = Duration::from_secs(90);
 const WAKEUP_ERROR_EXHAUSTED_TIMEOUT: Duration = Duration::from_secs(15);
 const WAKEUP_ERROR_EXHAUSTED_COUNT: u32 = 8;
+const WAKEUP_IDLE_SETTLE_GRACE: Duration = Duration::from_secs(3);
 const SELF_HEAL_GRACE_PERIOD: Duration = Duration::from_secs(4);
 const MAX_CONSECUTIVE_SELF_HEALS: u32 = 3;
 const IN_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -3961,6 +4307,18 @@ fn is_one_shot_timer_expired(expires_at: Option<DateTime<Utc>>, now: DateTime<Ut
         .is_some_and(|exp| now > exp + chrono::Duration::seconds(ONE_SHOT_TIMER_EXPIRY_GRACE_SECS))
 }
 
+fn is_timer_bg_description(desc: Option<&str>) -> bool {
+    let Some(raw) = desc else {
+        return false;
+    };
+    let lower = raw.to_ascii_lowercase();
+    lower.contains("timer")
+        || lower.contains("schedule")
+        || lower.contains("cron")
+        || lower.contains("alarm")
+        || lower.contains("wakeup")
+}
+
 #[derive(Debug, Clone)]
 struct BgTaskInfo {
     task_id: String,
@@ -3968,6 +4326,7 @@ struct BgTaskInfo {
     log_path: Option<String>,
     meta: Option<BackgroundTaskInfo>,
     expires_at: Option<DateTime<Utc>>,
+    is_timer: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -4025,6 +4384,11 @@ impl BackgroundTaskTracker {
         if self.finished_tasks.contains(&task_id) {
             return;
         }
+        let meta_is_timer = expires_at.is_some()
+            || meta
+                .as_ref()
+                .and_then(|m| m.label.as_deref())
+                .is_some_and(|l| is_timer_bg_description(Some(l)));
         let entry = self
             .tasks
             .entry(task_id.clone())
@@ -4034,7 +4398,11 @@ impl BackgroundTaskTracker {
                 log_path: None,
                 meta: None,
                 expires_at: None,
+                is_timer: false,
             });
+        if meta_is_timer {
+            entry.is_timer = true;
+        }
         if call_id.is_some() {
             entry.call_id = call_id;
         }
@@ -4111,7 +4479,13 @@ impl BackgroundTaskTracker {
 
     fn waiting_source_label(&self) -> String {
         let n = self.tasks.len();
-        if n == 1 {
+        if n > 0 && self.tasks.values().all(|t| t.is_timer) {
+            if n == 1 {
+                "waiting:1 timer".to_string()
+            } else {
+                format!("waiting:{n} timers")
+            }
+        } else if n == 1 {
             "waiting:1 background task".to_string()
         } else {
             format!("waiting:{n} background tasks")
@@ -5636,6 +6010,7 @@ struct AgyTranscriptMonitor {
     last_error_message: Option<String>,
     in_progress_thinking_lens: HashMap<u64, usize>,
     last_in_progress_heartbeat: Option<Instant>,
+    last_wakeup_activity_at: Option<Instant>,
     seen_undelivered_files: HashSet<PathBuf>,
     last_checked_path: Option<PathBuf>,
     last_checked_mtime: Option<std::time::SystemTime>,
@@ -5674,6 +6049,7 @@ impl AgyTranscriptMonitor {
             last_error_message: None,
             in_progress_thinking_lens: HashMap::new(),
             last_in_progress_heartbeat: None,
+            last_wakeup_activity_at: None,
             seen_undelivered_files: HashSet::new(),
             last_checked_path: None,
             last_checked_mtime: None,
@@ -5736,14 +6112,39 @@ impl AgyTranscriptMonitor {
         self.last_error_message = None;
         self.in_progress_thinking_lens.clear();
         self.last_in_progress_heartbeat = None;
+        self.last_wakeup_activity_at = None;
         bg_deltas
     }
 
     fn poll_post_turn_wakeup(&mut self) -> Vec<WakeupStep> {
         let mut bg_deltas = Vec::new();
         let mut out = self.read_new_lines(false, &mut bg_deltas);
-        self.check_error_stall(&mut out, Instant::now());
+        let now = Instant::now();
+        self.check_error_stall(&mut out, now);
+        self.check_wakeup_idle_settle(&mut out, now);
         out
+    }
+
+    /// When a post-turn wakeup arms a background timer/task (e.g. `schedule`) and finishes its
+    /// tool call without a trailing empty-tool `PLANNER_RESPONSE(DONE)`, settle cleanly once
+    /// no pending tool calls remain so the conversation returns to talkable `waiting:*` state.
+    fn check_wakeup_idle_settle(&mut self, out: &mut Vec<WakeupStep>, now: Instant) {
+        if self.always_active
+            || !self.in_wakeup
+            || !self.pending_tools.is_empty()
+            || self.active_bg_tasks.is_empty()
+            || self.consecutive_errors != 0
+        {
+            return;
+        }
+        let Some(last_act) = self.last_wakeup_activity_at else {
+            return;
+        };
+        if now.saturating_duration_since(last_act) >= WAKEUP_IDLE_SETTLE_GRACE {
+            self.in_wakeup = false;
+            self.last_wakeup_activity_at = None;
+            out.push(WakeupStep::Settled);
+        }
     }
 
     /// Scan `<brain_dir>/.system_generated/messages/undelivered/` for `MESSAGE_PRIORITY_LOW`
@@ -6334,6 +6735,7 @@ impl AgyTranscriptMonitor {
                     self.last_error_at = None;
                     self.last_error_message = None;
                     self.last_in_progress_heartbeat = Some(Instant::now());
+                    self.last_wakeup_activity_at = Some(Instant::now());
                     out.push(WakeupStep::Started {
                         source: if self.always_active {
                             "message".into()
@@ -6386,6 +6788,7 @@ impl AgyTranscriptMonitor {
                 self.last_error_at = None;
                 self.last_error_message = None;
                 self.last_in_progress_heartbeat = Some(Instant::now());
+                self.last_wakeup_activity_at = Some(Instant::now());
                 if let Some(th) = step.get("thinking").and_then(|v| v.as_str())
                     && !th.trim().is_empty()
                 {
@@ -6407,6 +6810,7 @@ impl AgyTranscriptMonitor {
                     .unwrap_or_default();
                 if calls.is_empty() && status == "DONE" {
                     self.in_wakeup = false;
+                    self.last_wakeup_activity_at = None;
                     self.pending_tools.clear();
                     out.push(WakeupStep::Settled);
                 } else {
@@ -6432,6 +6836,7 @@ impl AgyTranscriptMonitor {
                 self.last_error_at = None;
                 self.last_error_message = None;
                 self.last_in_progress_heartbeat = Some(Instant::now());
+                self.last_wakeup_activity_at = Some(Instant::now());
                 let (cid, orig_detail) = self.pending_tools.remove(0);
                 let detail = attach_transcript_tool_result(orig_detail, content);
                 if status == "RUNNING"
@@ -9318,6 +9723,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
                 turn_id: "turn_recover_1".into(),
                 prompt: "做一个友好的登录界面".into(),
                 behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
             })
             .await
             .expect("send prompt");
@@ -9834,6 +10241,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
                 turn_id: "turn_fast_1".into(),
                 prompt: "ping".into(),
                 behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
             })
             .await
             .expect("send prompt");
@@ -10718,6 +11127,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
                 turn_id: "t_slow_1".into(),
                 prompt: "SLOW_1".into(),
                 behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
             })
             .await
             .expect("send slow 1");
@@ -10742,6 +11153,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
                 turn_id: "t_stale_q".into(),
                 prompt: "STALE_QUEUED_MUST_NOT_RUN".into(),
                 behavior: ActiveTurnBehavior::Queue,
+                origin: PromptOrigin::Agent,
+                message_ids: Vec::new(),
             })
             .await
             .expect("queue stale");
@@ -10789,6 +11202,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
                 turn_id: "t_slow_2".into(),
                 prompt: "SLOW_2".into(),
                 behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
             })
             .await
             .expect("send slow 2");
@@ -10813,6 +11228,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
                 turn_id: "t_fifo_2".into(),
                 prompt: "FIFO_PRESERVED".into(),
                 behavior: ActiveTurnBehavior::Queue,
+                origin: PromptOrigin::Agent,
+                message_ids: Vec::new(),
             })
             .await
             .expect("queue fifo 2");
@@ -10821,6 +11238,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
                 turn_id: "t_replace".into(),
                 prompt: "REPLACEMENT_NOW".into(),
                 behavior: ActiveTurnBehavior::Interrupt,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
             })
             .await
             .expect("send interrupt replacement");
@@ -10885,5 +11304,758 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
         let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agy_agent_steer_degrades_to_queue_and_interrupt_and_drain_queue_preserves_fifo() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let short_id: String = uuid::Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(8)
+            .collect();
+        let sock_path = std::env::temp_dir().join(format!("o_agy_deliv_{short_id}.sock"));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
+
+        let received_prompts: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let prompts_bg = Arc::clone(&received_prompts);
+        let cancel_count = Arc::new(AtomicU64::new(0));
+        let cancel_bg = Arc::clone(&cancel_count);
+        let (release_think_tx, mut release_think_rx) = mpsc::channel::<()>(4);
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+            }
+
+            let mut inflight_prompt_id: Option<Value> = None;
+
+            loop {
+                tokio::select! {
+                    _ = release_think_rx.recv() => {
+                        if let Some(pid) = inflight_prompt_id.take() {
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/update",
+                                    "params": {
+                                        "sessionId": "sess-deliv-1",
+                                        "update": {
+                                            "sessionUpdate": "agent_message_chunk",
+                                            "content": { "type": "text", "text": "done:THINK_SLOW" }
+                                        }
+                                    }
+                                }),
+                            )
+                            .await;
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": pid,
+                                    "result": { "stopReason": "end_turn" }
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                    maybe_line = lines.next_line() => {
+                        let Ok(Some(raw_line)) = maybe_line else { break; };
+                        let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw_line) else {
+                            continue;
+                        };
+                        let Ok(req) = serde_json::from_str::<Value>(&line) else { continue; };
+                        let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                        match method {
+                            "initialize" => {
+                                send_stdout(
+                                    &mut wh,
+                                    &mut seq,
+                                    json!({
+                                        "jsonrpc": "2.0",
+                                        "id": req["id"],
+                                        "result": { "protocolVersion": 1 }
+                                    }),
+                                )
+                                .await;
+                            }
+                            "session/new" => {
+                                send_stdout(
+                                    &mut wh,
+                                    &mut seq,
+                                    json!({
+                                        "jsonrpc": "2.0",
+                                        "id": req["id"],
+                                        "result": {
+                                            "sessionId": "sess-deliv-1",
+                                            "models": {
+                                                "currentModelId": "gemini-3.1-pro",
+                                                "availableModels": [{ "modelId": "gemini-3.1-pro" }]
+                                            }
+                                        }
+                                    }),
+                                )
+                                .await;
+                            }
+                            "session/prompt" => {
+                                let text = req
+                                    .pointer("/params/prompt/0/text")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                prompts_bg.lock().await.push(text.clone());
+                                if text.starts_with("THINK_") {
+                                    send_stdout(
+                                        &mut wh,
+                                        &mut seq,
+                                        json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "session/update",
+                                            "params": {
+                                                "sessionId": "sess-deliv-1",
+                                                "update": {
+                                                    "sessionUpdate": "agent_thought_chunk",
+                                                    "content": { "type": "text", "text": "thinking..." }
+                                                }
+                                            }
+                                        }),
+                                    )
+                                    .await;
+                                    inflight_prompt_id = Some(req["id"].clone());
+                                } else if text.starts_with("SLOW_") {
+                                    send_stdout(
+                                        &mut wh,
+                                        &mut seq,
+                                        json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "session/update",
+                                            "params": {
+                                                "sessionId": "sess-deliv-1",
+                                                "update": {
+                                                    "sessionUpdate": "agent_thought_chunk",
+                                                    "content": { "type": "text", "text": format!("thinking:{text}") }
+                                                }
+                                            }
+                                        }),
+                                    )
+                                    .await;
+                                    inflight_prompt_id = Some(req["id"].clone());
+                                } else {
+                                    send_stdout(
+                                        &mut wh,
+                                        &mut seq,
+                                        json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "session/update",
+                                            "params": {
+                                                "sessionId": "sess-deliv-1",
+                                                "update": {
+                                                    "sessionUpdate": "agent_message_chunk",
+                                                    "content": { "type": "text", "text": format!("reply:{text}") }
+                                                }
+                                            }
+                                        }),
+                                    )
+                                    .await;
+                                    send_stdout(
+                                        &mut wh,
+                                        &mut seq,
+                                        json!({
+                                            "jsonrpc": "2.0",
+                                            "id": req["id"],
+                                            "result": { "stopReason": "end_turn" }
+                                        }),
+                                    )
+                                    .await;
+                                }
+                            }
+                            "session/cancel" => {
+                                cancel_bg.fetch_add(1, Ordering::SeqCst);
+                                if let Some(pid) = inflight_prompt_id.take() {
+                                    send_stdout(
+                                        &mut wh,
+                                        &mut seq,
+                                        json!({
+                                            "jsonrpc": "2.0",
+                                            "id": pid,
+                                            "result": { "stopReason": "cancelled" }
+                                        }),
+                                    )
+                                    .await;
+                                }
+                            }
+                            _ => {
+                                if let Some(id) = req.get("id") {
+                                    send_stdout(
+                                        &mut wh,
+                                        &mut seq,
+                                        json!({
+                                            "jsonrpc": "2.0",
+                                            "id": id,
+                                            "result": {}
+                                        }),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect mock shim");
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let (evt_tx, mut evt_rx) = mpsc::channel(128);
+        let seq_tracker = Arc::new(AtomicU64::new(0));
+        let cfg = SessionLaunchConfig {
+            agent_id: "ag_deliv_test".into(),
+            provider: ProviderKind::Antigravity,
+            executable: PathBuf::from("/bin/true"),
+            orbit_exe: PathBuf::from("/bin/true"),
+            shim_socket: sock_path.clone(),
+            runtime_dir: std::env::temp_dir(),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: Some("gemini-3.1-pro".into()),
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::Default,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: seq_tracker,
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
+        };
+        let actor = tokio::spawn(run_agy_actor(cfg, shim, false, cmd_rx, evt_tx));
+
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        // Phase A: Long thinking turn + Agent Queue -> 0 session/cancel, Queued -> Dispatched -> Settled
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_think".into(),
+                prompt: "THINK_SLOW".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
+            })
+            .await
+            .expect("send think");
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("think chunk")
+                .expect("ev");
+            if matches!(ev, DriverEvent::ThinkingText { .. }) {
+                break;
+            }
+        }
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_ag_q1".into(),
+                prompt: "AGENT_Q1".into(),
+                behavior: ActiveTurnBehavior::Queue,
+                origin: PromptOrigin::Agent,
+                message_ids: vec!["msg_ag_q1".into()],
+            })
+            .await
+            .expect("queue agent msg");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            received_prompts.lock().await.len(),
+            1,
+            "queued agent msg must not dispatch while THINK_SLOW is active"
+        );
+        release_think_tx.send(()).await.expect("release think");
+
+        let mut phase_a_statuses = Vec::new();
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("phase a settle")
+                .expect("ev");
+            match ev {
+                DriverEvent::PromptDeliveryUpdated {
+                    message_ids,
+                    status,
+                    blocking_turn_id,
+                    ..
+                } if message_ids == vec!["msg_ag_q1".to_string()] => {
+                    phase_a_statuses.push((status, blocking_turn_id));
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle)
+                    if phase_a_statuses
+                        .iter()
+                        .any(|(s, _)| *s == AgentMessageDeliveryStatus::Settled) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            phase_a_statuses,
+            vec![
+                (
+                    AgentMessageDeliveryStatus::Queued,
+                    Some("t_think".to_string())
+                ),
+                (AgentMessageDeliveryStatus::Dispatched, None),
+                (AgentMessageDeliveryStatus::Settled, None),
+            ]
+        );
+
+        // Phase B: Agent Steer degrades to Queue (0 cancel), then Human Steer preempts first!
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_slow_b".into(),
+                prompt: "SLOW_B".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
+            })
+            .await
+            .expect("send slow b");
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("slow b thinking")
+                .expect("ev");
+            if matches!(ev, DriverEvent::ThinkingText { .. }) {
+                break;
+            }
+        }
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_ag_steer".into(),
+                prompt: "AGENT_DEGRADED_STEER".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Agent,
+                message_ids: vec!["msg_ag_steer".into()],
+            })
+            .await
+            .expect("agent steer");
+        let queued_ev = loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("degraded queued")
+                .expect("ev");
+            if let DriverEvent::PromptDeliveryUpdated {
+                message_ids,
+                status,
+                blocking_turn_id,
+                ..
+            } = ev
+                && message_ids == vec!["msg_ag_steer".to_string()]
+            {
+                break (status, blocking_turn_id);
+            }
+        };
+        assert_eq!(
+            queued_ev,
+            (
+                AgentMessageDeliveryStatus::Queued,
+                Some("t_slow_b".to_string())
+            )
+        );
+        assert_eq!(
+            cancel_count.load(Ordering::SeqCst),
+            0,
+            "PromptOrigin::Agent Steer MUST degrade to Queue with zero session/cancel"
+        );
+
+        // Now Human Steer -> triggers 1 cancel, HUMAN_NOW runs 1st, AGENT_DEGRADED_STEER runs 2nd
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_human_steer".into(),
+                prompt: "HUMAN_NOW".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
+            })
+            .await
+            .expect("human steer");
+        let mut steer_statuses = Vec::new();
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("phase b settle")
+                .expect("ev");
+            match ev {
+                DriverEvent::PromptDeliveryUpdated {
+                    message_ids,
+                    status,
+                    ..
+                } if message_ids == vec!["msg_ag_steer".to_string()] => {
+                    steer_statuses.push(status);
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle)
+                    if steer_statuses.contains(&AgentMessageDeliveryStatus::Settled) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            steer_statuses,
+            vec![
+                AgentMessageDeliveryStatus::Dispatched,
+                AgentMessageDeliveryStatus::Settled,
+            ]
+        );
+
+        // Phase C: 2 queued agent messages + InterruptAndDrainQueue -> 1 cancel, FIFO drain
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_slow_c".into(),
+                prompt: "SLOW_C".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
+            })
+            .await
+            .expect("send slow c");
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("slow c thinking")
+                .expect("ev");
+            if matches!(ev, DriverEvent::ThinkingText { .. }) {
+                break;
+            }
+        }
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_fifo_c1".into(),
+                prompt: "FIFO_C1".into(),
+                behavior: ActiveTurnBehavior::Queue,
+                origin: PromptOrigin::Agent,
+                message_ids: vec!["msg_c1".into()],
+            })
+            .await
+            .expect("q c1");
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_fifo_c2".into(),
+                prompt: "FIFO_C2".into(),
+                behavior: ActiveTurnBehavior::Queue,
+                origin: PromptOrigin::Agent,
+                message_ids: vec!["msg_c2".into()],
+            })
+            .await
+            .expect("q c2");
+        cmd_tx
+            .send(DriverCommand::InterruptAndDrainQueue)
+            .await
+            .expect("interrupt and drain");
+
+        let mut c1_states = Vec::new();
+        let mut c2_states = Vec::new();
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("phase c settle")
+                .expect("ev");
+            match ev {
+                DriverEvent::PromptDeliveryUpdated {
+                    message_ids,
+                    status,
+                    ..
+                } => {
+                    if message_ids == vec!["msg_c1".to_string()] {
+                        c1_states.push(status);
+                    } else if message_ids == vec!["msg_c2".to_string()] {
+                        c2_states.push(status);
+                    }
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle)
+                    if c2_states.contains(&AgentMessageDeliveryStatus::Settled) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            c1_states,
+            vec![
+                AgentMessageDeliveryStatus::Queued,
+                AgentMessageDeliveryStatus::Dispatched,
+                AgentMessageDeliveryStatus::Settled,
+            ]
+        );
+        assert_eq!(
+            c2_states,
+            vec![
+                AgentMessageDeliveryStatus::Queued,
+                AgentMessageDeliveryStatus::Dispatched,
+                AgentMessageDeliveryStatus::Settled,
+            ]
+        );
+
+        // Phase D: hard Interrupt drops queued messages
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_slow_d".into(),
+                prompt: "SLOW_D".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
+            })
+            .await
+            .expect("send slow d");
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("slow d thinking")
+                .expect("ev");
+            if matches!(ev, DriverEvent::ThinkingText { .. }) {
+                break;
+            }
+        }
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_drop".into(),
+                prompt: "MUST_DROP".into(),
+                behavior: ActiveTurnBehavior::Queue,
+                origin: PromptOrigin::Agent,
+                message_ids: vec!["msg_drop".into()],
+            })
+            .await
+            .expect("queue drop");
+        cmd_tx
+            .send(DriverCommand::Interrupt)
+            .await
+            .expect("hard stop");
+        let mut saw_dropped = false;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("phase d settle")
+                .expect("ev");
+            match ev {
+                DriverEvent::PromptDeliveryUpdated {
+                    message_ids,
+                    status,
+                    ..
+                } if message_ids == vec!["msg_drop".to_string()]
+                    && status == AgentMessageDeliveryStatus::Dropped =>
+                {
+                    saw_dropped = true;
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle) if saw_dropped => break,
+                _ => {}
+            }
+        }
+        assert!(saw_dropped);
+
+        let prompts = received_prompts.lock().await;
+        assert_eq!(
+            *prompts,
+            vec![
+                "THINK_SLOW".to_string(),
+                "AGENT_Q1".to_string(),
+                "SLOW_B".to_string(),
+                "HUMAN_NOW".to_string(),
+                "AGENT_DEGRADED_STEER".to_string(),
+                "SLOW_C".to_string(),
+                "FIFO_C1".to_string(),
+                "FIFO_C2".to_string(),
+                "SLOW_D".to_string(),
+            ]
+        );
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    fn background_task_tracker_labels_timers_separately_from_bash_tasks() {
+        let mut tracker = BackgroundTaskTracker::default();
+        tracker.record_started_with_expiry(
+            "s1/task-1".into(),
+            None,
+            None,
+            Some(BackgroundTaskInfo {
+                task_id: Some("s1/task-1".into()),
+                label: Some("Timer: 5m, Prompt: Check status".into()),
+                log_path: None,
+            }),
+            Some(Utc::now() + chrono::Duration::minutes(5)),
+        );
+        assert_eq!(tracker.waiting_source_label(), "waiting:1 timer");
+
+        tracker.record_started_with_expiry(
+            "s1/task-2".into(),
+            None,
+            None,
+            Some(BackgroundTaskInfo {
+                task_id: Some("s1/task-2".into()),
+                label: Some("Cron: */5 * * * *".into()),
+                log_path: None,
+            }),
+            None,
+        );
+        assert_eq!(tracker.waiting_source_label(), "waiting:2 timers");
+
+        // Adding a non-timer background task switches label to generic background tasks
+        tracker.record_started(
+            "s1/task-3".into(),
+            None,
+            None,
+            Some(BackgroundTaskInfo {
+                task_id: Some("s1/task-3".into()),
+                label: Some("ffmpeg render".into()),
+                log_path: None,
+            }),
+        );
+        assert_eq!(tracker.waiting_source_label(), "waiting:3 background tasks");
+    }
+
+    #[test]
+    fn wakeup_monitor_settles_idle_timer_without_trailing_done_planner_step() {
+        let dir = std::env::temp_dir().join(format!(
+            "orbit_wake_settle_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let logs = dir.join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        let full_path = logs.join("transcript_full.jsonl");
+        let sess = "sess_wake_settle";
+
+        let content = [
+            json!({
+                "step_index": 1,
+                "type": "USER_INPUT",
+                "status": "DONE",
+                "content": "Wait 5m then check"
+            }),
+            json!({
+                "step_index": 2,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "content": "",
+                "tool_calls": [{ "id": "call_sched_1", "name": "schedule", "args": { "DurationSeconds": 300, "Prompt": "check" } }]
+            }),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n";
+        std::fs::write(&full_path, &content).expect("write");
+
+        let mut monitor = AgyTranscriptMonitor::from_brain_dir_with_session(dir.clone(), sess);
+        monitor.sync_silent();
+        assert!(!monitor.in_wakeup);
+
+        // Append wakeup + schedule re-arm without trailing PLANNER_RESPONSE(DONE)
+        let append = [
+            json!({
+                "step_index": 3,
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "content": "[SYSTEM_MESSAGE]\nTimer fired"
+            }),
+            json!({
+                "step_index": 4,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "content": "",
+                "tool_calls": [{ "id": "call_sched_2", "name": "schedule", "args": { "DurationSeconds": 120, "Prompt": "check again" } }]
+            }),
+            json!({
+                "step_index": 5,
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": format!("Tool is running as a background task with task id: {sess}/task-88\nTask Description: Timer: 2m")
+            }),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n";
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&full_path)
+            .expect("open append");
+        std::io::Write::write_all(&mut f, append.as_bytes()).expect("append");
+
+        let steps = monitor.poll_post_turn_wakeup();
+        assert!(
+            steps
+                .iter()
+                .any(|s| matches!(s, WakeupStep::Started { .. }))
+        );
+        assert!(monitor.in_wakeup);
+        assert!(monitor.pending_tools.is_empty());
+        assert!(!monitor.active_bg_tasks.is_empty());
+
+        // Simulate idle grace elapsed -> monitor settles back to waiting:timer state
+        let mut settled_out = Vec::new();
+        monitor.check_wakeup_idle_settle(
+            &mut settled_out,
+            Instant::now() + WAKEUP_IDLE_SETTLE_GRACE + Duration::from_secs(1),
+        );
+        assert!(!monitor.in_wakeup);
+        assert!(settled_out.iter().any(|s| matches!(s, WakeupStep::Settled)));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

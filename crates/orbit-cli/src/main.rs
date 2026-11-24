@@ -7,7 +7,7 @@ mod ssh_config;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -193,6 +193,9 @@ enum RelayAction {
         /// Optional public URL override for printed onboarding instructions.
         #[arg(long)]
         public_url: Option<String>,
+        /// Read a shared fleet admission token from stdin (`0o600` persisted in `~/.orbit/relay.json`).
+        #[arg(long)]
+        fleet_token_stdin: bool,
     },
     /// Add host public key(s) to the Relay allowlist (`~/.orbit/relay.json`) and reload Relay immediately.
     Allow {
@@ -379,8 +382,8 @@ enum Commands {
     Send {
         agent_id: String,
         prompt: String,
-        #[arg(long, value_enum, default_value = "steer")]
-        behavior: CliBehavior,
+        #[arg(long, value_enum)]
+        behavior: Option<CliBehavior>,
         #[arg(long)]
         no_wait: bool,
         #[arg(long)]
@@ -1102,6 +1105,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 run_relay(RelayConfig {
                     listen_addr: effective_listen,
                     allowed_pubkeys: Arc::new(allowed),
+                    fleet_token: persisted.fleet_token.clone(),
                 })
                 .await?;
             }
@@ -1111,8 +1115,23 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 allow_pubkeys: sub_keys,
                 replace_allowlist,
                 public_url,
+                fleet_token_stdin,
             }) => {
                 let mut persisted = RelayPersistedConfig::load(&home_dir);
+                if fleet_token_stdin {
+                    let mut raw = String::new();
+                    std::io::stdin().read_to_string(&mut raw)?;
+                    let tok = raw
+                        .lines()
+                        .next()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--fleet-token-stdin expected non-empty token on stdin")
+                        })?
+                        .to_string();
+                    persisted.fleet_token = Some(tok);
+                }
                 if let Some(l) = sub_listen.or(listen) {
                     persisted.listen_addr = l;
                 } else if let Some(p) = port {
@@ -1196,6 +1215,9 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     if healthy { "RUNNING" } else { "STOPPED" }
                 );
                 println!("Listen Addr  : {}", persisted.listen_addr);
+                if persisted.fleet_token.is_some() {
+                    println!("Fleet Token  : configured (zero-config fleet admission enabled)");
+                }
                 println!("Allowed Keys : {}", persisted.allowed_pubkeys.len());
                 for k in &persisted.allowed_pubkeys {
                     println!("  - {k}");
@@ -1384,6 +1406,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             let env_caller = std::env::var("ORBIT_AGENT_ID")
                 .ok()
                 .filter(|s| !s.trim().is_empty());
+            let resolved_behavior = resolve_cli_send_behavior(behavior, env_caller.is_some());
             let client = connect_cli_server(&home_dir, &server, via_relay).await?;
             let mut sub_rx = client.subscribe();
             let req_id = Uuid::new_v4();
@@ -1395,7 +1418,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         prompt,
                         display_prompt: None,
                         badges: Vec::new(),
-                        active_turn_behavior: ActiveTurnBehavior::from(behavior),
+                        active_turn_behavior: resolved_behavior,
                         message_id: None,
                         caller_agent_id: env_caller,
                         notify_on_finish,
@@ -1444,6 +1467,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 WireMessage::InterruptTurn {
                     request_id: req_id,
                     agent_id: agent_id.clone(),
+                    preserve_queue: false,
                 },
                 req_id,
                 &format!("Stopped `{agent_id}`"),
@@ -2592,6 +2616,17 @@ pub(crate) fn format_status(s: &AgentStatus) -> &'static str {
     }
 }
 
+fn resolve_cli_send_behavior(
+    explicit: Option<CliBehavior>,
+    has_agent_caller: bool,
+) -> ActiveTurnBehavior {
+    match explicit {
+        Some(b) => ActiveTurnBehavior::from(b),
+        None if has_agent_caller => ActiveTurnBehavior::Queue,
+        None => ActiveTurnBehavior::Steer,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3251,6 +3286,26 @@ mod tests {
         assert!(
             rejected.is_err(),
             "legacy insecure --spec-json CLI flag must be removed"
+        );
+    }
+
+    #[test]
+    fn resolve_cli_send_behavior_decouples_agent_and_human_defaults() {
+        assert_eq!(
+            resolve_cli_send_behavior(None, false),
+            ActiveTurnBehavior::Steer
+        );
+        assert_eq!(
+            resolve_cli_send_behavior(None, true),
+            ActiveTurnBehavior::Queue
+        );
+        assert_eq!(
+            resolve_cli_send_behavior(Some(CliBehavior::Steer), true),
+            ActiveTurnBehavior::Steer
+        );
+        assert_eq!(
+            resolve_cli_send_behavior(Some(CliBehavior::Interrupt), false),
+            ActiveTurnBehavior::Interrupt
         );
     }
 }

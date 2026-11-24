@@ -17,7 +17,7 @@ use axum::{
         Path as AxumPath, Query, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code},
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
 };
@@ -58,6 +58,10 @@ const HEX_LUT: &[u8; 16] = b"0123456789abcdef";
 pub struct RelayPersistedConfig {
     pub listen_addr: SocketAddr,
     pub allowed_pubkeys: Vec<String>,
+    /// Optional shared fleet admission token allowing any host in the user's fleet
+    /// to register/connect without pre-registering individual pubkeys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_token: Option<String>,
 }
 
 impl Default for RelayPersistedConfig {
@@ -65,6 +69,7 @@ impl Default for RelayPersistedConfig {
         Self {
             listen_addr: SocketAddr::from(([0, 0, 0, 0], 7878)),
             allowed_pubkeys: Vec::new(),
+            fleet_token: None,
         }
     }
 }
@@ -80,16 +85,26 @@ impl RelayPersistedConfig {
 
     pub fn save(&self, home_dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(home_dir)?;
+        let path = home_dir.join("relay.json");
         let raw = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(home_dir.join("relay.json"), raw)
+        std::fs::write(&path, raw)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
     }
 }
 
 #[derive(Clone)]
 pub struct RelayConfig {
     pub listen_addr: SocketAddr,
-    /// If non-empty, ONLY daemons whose `pubkey` is in this allowlist can register or receive clients.
+    /// If non-empty (and no matching `fleet_token` is supplied), ONLY daemons whose `pubkey` is in
+    /// this allowlist can register or receive clients.
     pub allowed_pubkeys: Arc<HashSet<String>>,
+    /// Optional shared fleet token enabling dynamic zero-config fleet admission.
+    pub fleet_token: Option<String>,
 }
 
 struct PendingClient {
@@ -117,6 +132,7 @@ struct WaitingTunnel {
 #[derive(Clone)]
 struct RelayState {
     allowed_pubkeys: Arc<HashSet<String>>,
+    fleet_token: Option<String>,
     hosts: Arc<RwLock<HashMap<String, RegisteredHost>>>,
     waiting_tunnels: Arc<RwLock<HashMap<String, WaitingTunnel>>>,
     next_conn_id: Arc<AtomicU64>,
@@ -129,12 +145,16 @@ struct RelayState {
 impl RelayState {
     fn new(
         allowed_pubkeys: Arc<HashSet<String>>,
+        fleet_token: Option<String>,
         pop_timeout: Duration,
         max_concurrent_pops: usize,
         tunnel_timeout: Duration,
     ) -> Self {
         Self {
             allowed_pubkeys,
+            fleet_token: fleet_token
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty()),
             hosts: Arc::new(RwLock::new(HashMap::new())),
             waiting_tunnels: Arc::new(RwLock::new(HashMap::new())),
             next_conn_id: Arc::new(AtomicU64::new(0)),
@@ -149,12 +169,22 @@ impl RelayState {
 #[derive(Deserialize)]
 struct HostRegisterQuery {
     pubkey: String,
+    #[serde(default)]
+    token: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct TunnelAttachQuery {
     tunnel_id: String,
     pubkey: String,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ClientConnectQuery {
+    #[serde(default)]
+    token: Option<String>,
 }
 
 fn build_relay_router(state: RelayState) -> Router {
@@ -168,8 +198,13 @@ fn build_relay_router(state: RelayState) -> Router {
 }
 
 pub async fn run_relay(config: RelayConfig) -> anyhow::Result<()> {
+    let has_fleet_token = config
+        .fleet_token
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty());
     let state = RelayState::new(
         config.allowed_pubkeys.clone(),
+        config.fleet_token,
         DAEMON_POP_TIMEOUT,
         MAX_CONCURRENT_CONTROL_POPS,
         TUNNEL_ATTACH_TIMEOUT,
@@ -180,23 +215,53 @@ pub async fn run_relay(config: RelayConfig) -> anyhow::Result<()> {
     info!(
         addr = %config.listen_addr,
         allowlist_count = config.allowed_pubkeys.len(),
+        has_fleet_token,
         "Orbit Zero-Knowledge Relay listening"
     );
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-fn is_pubkey_allowed(state: &RelayState, pubkey: &str) -> bool {
-    state.allowed_pubkeys.is_empty() || state.allowed_pubkeys.contains(pubkey)
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let raw = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .trim();
+    raw.strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn is_request_authorized(
+    state: &RelayState,
+    pubkey: &str,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> bool {
+    if state.allowed_pubkeys.is_empty() && state.fleet_token.is_none() {
+        return true;
+    }
+    if state.allowed_pubkeys.contains(pubkey) {
+        return true;
+    }
+    if let Some(expected) = state.fleet_token.as_deref()
+        && let Some(candidate) = extract_bearer_token(headers).or(query_token)
+    {
+        return orbit_crypto::constant_time_eq(expected.as_bytes(), candidate.as_bytes());
+    }
+    false
 }
 
 /// Pure read-only preflight probe for CLI onboarding (`orbit use-relay`).
 /// Never opens a control socket or mutates `state.hosts`, so live daemons are never displaced.
 async fn http_daemon_probe(
+    headers: HeaderMap,
     Query(q): Query<HostRegisterQuery>,
     State(state): State<RelayState>,
 ) -> impl IntoResponse {
-    if !is_pubkey_allowed(&state, &q.pubkey) {
+    if !is_request_authorized(&state, &q.pubkey, &headers, q.token.as_deref()) {
         return (StatusCode::FORBIDDEN, "forbidden");
     }
     if q.pubkey.trim() != q.pubkey || decode_key_32(&q.pubkey).is_err() {
@@ -207,10 +272,11 @@ async fn http_daemon_probe(
 
 async fn ws_daemon_control(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     Query(q): Query<HostRegisterQuery>,
     State(state): State<RelayState>,
 ) -> impl IntoResponse {
-    if !is_pubkey_allowed(&state, &q.pubkey) {
+    if !is_request_authorized(&state, &q.pubkey, &headers, q.token.as_deref()) {
         warn!(pubkey = %q.pubkey, "Rejected unauthorized daemon registration");
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -506,10 +572,11 @@ async fn authenticate_tunnel_attach(
 
 async fn ws_daemon_tunnel(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     Query(q): Query<TunnelAttachQuery>,
     State(state): State<RelayState>,
 ) -> impl IntoResponse {
-    if !is_pubkey_allowed(&state, &q.pubkey) {
+    if !is_request_authorized(&state, &q.pubkey, &headers, q.token.as_deref()) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let (attach_secret, deadline) = {
@@ -574,10 +641,12 @@ async fn ws_daemon_tunnel(
 
 async fn ws_client_connect(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     AxumPath(pubkey): AxumPath<String>,
+    Query(q): Query<ClientConnectQuery>,
     State(state): State<RelayState>,
 ) -> impl IntoResponse {
-    if !is_pubkey_allowed(&state, &pubkey) {
+    if !is_request_authorized(&state, &pubkey, &headers, q.token.as_deref()) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let accept_tx = state
@@ -713,8 +782,26 @@ mod tests {
         max_concurrent_pops: usize,
         tunnel_timeout: Duration,
     ) -> (SocketAddr, RelayState, tokio::task::JoinHandle<()>) {
+        spawn_test_relay_with_token(
+            allowed_pubkeys,
+            None,
+            pop_timeout,
+            max_concurrent_pops,
+            tunnel_timeout,
+        )
+        .await
+    }
+
+    async fn spawn_test_relay_with_token(
+        allowed_pubkeys: HashSet<String>,
+        fleet_token: Option<String>,
+        pop_timeout: Duration,
+        max_concurrent_pops: usize,
+        tunnel_timeout: Duration,
+    ) -> (SocketAddr, RelayState, tokio::task::JoinHandle<()>) {
         let state = RelayState::new(
             Arc::new(allowed_pubkeys),
+            fleet_token,
             pop_timeout,
             max_concurrent_pops,
             tunnel_timeout,
@@ -1463,5 +1550,97 @@ mod tests {
 
         server.abort();
         open_server.abort();
+    }
+
+    #[tokio::test]
+    async fn relay_fleet_token_authorizes_unlisted_pubkey_and_rejects_invalid_token() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let allowed_kp = HostIdentityKeypair::generate().expect("allowed");
+        let fleet_kp = HostIdentityKeypair::generate().expect("fleet");
+        let stranger_kp = HostIdentityKeypair::generate().expect("stranger");
+
+        let mut allow = HashSet::new();
+        allow.insert(allowed_kp.public_key_b64.clone());
+        let token = "fleet_tok_0123456789abcdef0123456789abcdef".to_string();
+
+        let (addr, _state, server) = spawn_test_relay_with_token(
+            allow,
+            Some(token.clone()),
+            Duration::from_secs(5),
+            MAX_CONCURRENT_CONTROL_POPS,
+            TUNNEL_ATTACH_TIMEOUT,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        async fn raw_http_get_with_auth(
+            addr: SocketAddr,
+            path: &str,
+            bearer: Option<&str>,
+        ) -> (u16, String) {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.expect("tcp");
+            let auth_hdr = bearer
+                .map(|t| format!("Authorization: Bearer {t}\r\n"))
+                .unwrap_or_default();
+            let req = format!(
+                "GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth_hdr}Connection: close\r\n\r\n"
+            );
+            stream.write_all(req.as_bytes()).await.expect("write");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read");
+            let text = String::from_utf8_lossy(&buf);
+            let status = text
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|c| c.parse::<u16>().ok())
+                .expect("status");
+            let body = text
+                .split_once("\r\n\r\n")
+                .map(|(_, b)| b.to_string())
+                .unwrap_or_default();
+            (status, body)
+        }
+
+        // Static allowlist key still works without token
+        let (st, body) = raw_http_get_with_auth(
+            addr,
+            &format!("/v1/daemon/probe?pubkey={}", allowed_kp.public_key_b64),
+            None,
+        )
+        .await;
+        assert_eq!(st, 200);
+        assert_eq!(body, RELAY_PROBE_OK_BODY);
+
+        // New host NOT in static allowlist is denied without token
+        let (st, _) = raw_http_get_with_auth(
+            addr,
+            &format!("/v1/daemon/probe?pubkey={}", fleet_kp.public_key_b64),
+            None,
+        )
+        .await;
+        assert_eq!(st, 403);
+
+        // Wrong token is denied
+        let (st, _) = raw_http_get_with_auth(
+            addr,
+            &format!("/v1/daemon/probe?pubkey={}", stranger_kp.public_key_b64),
+            Some("wrong-token"),
+        )
+        .await;
+        assert_eq!(st, 403);
+
+        // Matching bearer fleet token admits unlisted host dynamically
+        let (st, body) = raw_http_get_with_auth(
+            addr,
+            &format!("/v1/daemon/probe?pubkey={}", fleet_kp.public_key_b64),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(st, 200);
+        assert_eq!(body, RELAY_PROBE_OK_BODY);
+
+        server.abort();
     }
 }

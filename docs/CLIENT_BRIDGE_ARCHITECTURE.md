@@ -29,7 +29,7 @@ This document describes the unified cross-platform architecture of Orbit across 
 
 ```mermaid
 flowchart TD
-  Hosts["Remote / Local Orbit Daemons"] -->|"Noise_NK_25519_ChaChaPoly_SHA256 + Direct / Relay"| Core["orbit-client-core (OrbitClientCore)"]
+  Hosts["Remote / Local Orbit Daemons"] -->|"Noise_NK_25519_ChaChaPoly_SHA256 + Direct / Relay / Peer-Bridge"| Core["orbit-client-core (OrbitClientCore)"]
   Core <-->|"Replica, Host Profiles, Projects, client_thread_prefs"| Store["orbit-store (SQLite)"]
   Core -->|"Coalesced CoreNotification (Fleet / Host / Stage / Git / Files / Terminal)"| Tauri["Tauri IPC + Channel (Desktop)"]
   Core -->|"MobileCoreListener (iOS / Android)"| UniFFI["orbit-ffi-uniffi (Swift / Kotlin)"]
@@ -75,6 +75,7 @@ All Contract v2 request/response DTOs are canonically defined in `crates/orbit-c
 | Bridge version & caps | `BridgeInfoView` | `get_bridge_info` | `bridge_info()` | `bridgeInfoJson()` |
 | Sidebar tree + search + prefs | `fleet_sidebar` / `FleetSidebarRequest` | `get_fleet_sidebar` | `fleet_sidebar_request` / `fleet_sidebar` | `fleetSidebarByRequestJson` / `fleetSidebarJson` |
 | Incremental stage projection | `agent_stage_delta` / `AgentStageDeltaRequest` | `get_agent_stage` / `get_agent_stage_delta` | `agent_stage_delta_request` / `agent_stage_delta` | `agentStageDeltaByRequestJson` / `agentStageDeltaJson` |
+| Delivery lifecycle & stall observability | `AgentMessageDeliveryUpdated` in-place fold, `StageTurnView.latest_activity_ms` / `latest_visible_progress_ms`, `interrupt_agent_and_continue` | `interrupt_agent_and_continue` | `FfiAgentMessageDeliveryStatus`, `interrupt_agent_and_continue` | `interruptAgentAndContinue` |
 | Thread seen / unread / pin | `mark_agent_seen`, `mark_agent_unread`, `toggle_pin_agent`, `seed_thread_prefs` | `mark_agent_seen`, `mark_agent_unread`, `toggle_pin_agent`, `seed_thread_prefs` | `mark_agent_seen`, `mark_agent_unread`, `toggle_pin_agent`, `seed_thread_prefs` | `markAgentSeen`, `markAgentUnread`, `togglePinAgent`, `seedThreadPrefsJson` |
 | Model catalogs & effort resolution | `fallback_provider_catalogs`, `resolve_model_selection` | `get_fallback_provider_catalogs`, `resolve_model_selection` | `fallback_provider_catalogs`, `resolve_model_selection` | `fallbackProviderCatalogsJson`, `resolveModelSelectionJson` |
 | Slash command catalog | `slash_commands(platform, query)` | `get_slash_commands` | `slash_commands(platform, query)` | `slashCommandsJson(platform, query)` |
@@ -86,6 +87,8 @@ All Contract v2 request/response DTOs are canonically defined in `crates/orbit-c
 | Side questions (`/btw`) | `build_side_question_context`, `ask_side_question` | `build_side_question_context`, `ask_side_question` | `build_side_question_context`, `ask_side_question` | `buildSideQuestionContext`, `askSideQuestion` |
 | Session creation & prompting | `CreateSessionRequest`, `SendPromptRequest` | `create_agent`, `send_prompt` | `create_session`, `send_prompt_request` | `createSessionJson`, `sendPromptJson` |
 | Lifecycle & connectivity | `on_app_foreground`, `on_app_background`, `on_network_changed` | `on_app_foreground`, `on_app_background`, `on_network_changed` | `on_app_foreground`, `on_app_background`, `on_network_changed` | `onAppForeground`, `onAppBackground`, `onNetworkChanged` |
+| Host & Agent identity flags | `HostCardView.is_local`, `AgentCardView.has_armed_timers` | Same JSON fields + `isAgentTimerWaiting` | `FfiHostCard.isLocal`, `FfiAgentCard.hasArmedTimers` | Same DTO fields via N-API |
+| Global Personal Agent routing | `discover_fleet_router_hosts`, `primary_router_selection` (APP-level) | `App -> Personal Agent` (host-independent) | `OrbitIosStore` | ArkTS settings store |
 
 ---
 
@@ -107,7 +110,7 @@ Thread metadata (`seen_seq`, `is_pinned`, `pinned_order`, `updated_at_ms`) is pe
 | Provider fallback catalogs & slug cleanup | `catalog.rs` + `resolve_model_selection` | Thin store consumer | Thin store consumer | Thin store consumer | Thin store consumer |
 | Slash commands & `@` mention ranking | `slash_commands` + `rank_mention_candidates` | Consumes Rust results | Consumes Rust results | Consumes Rust results | Consumes Rust results |
 | Prompt `<WORKFLOW_INSTRUCTION>` & `/btw` | `compose_prompt` | Consumes `ComposedPrompt` | Consumes `ComposedPrompt` | Consumes `ComposedPrompt` | Consumes `ComposedPromptDto` |
-| Stage projection & coalescing | `stage.rs` (`agent_stage_delta`) | Applies `changed_turns` delta | Applies `changed_turns` delta | Applies `changed_turns` delta | Applies `changed_turns` delta |
+| Stage projection & coalescing | `stage.rs` (`agent_stage_delta`, delivery status fold & progress timestamps) | Applies `changed_turns` delta + live stall/queue banner | Applies `changed_turns` delta + delivery pills | Applies `changed_turns` delta | Applies `changed_turns` delta |
 | Side questions (`/btw`) | `ask_side_question` stream | `SideQuestionPanel` | Contract v2 wired in store | Contract v2 wired in store | Contract v2 wired in store |
 | Native diagrams (Mermaid / DOT / SVG) | `diagram.rs` (`mermaid-rs-renderer` + `layout-rs` + SVG sanitizer + LRU) | `DiagramBlock` + GPU lightbox | `DiagramBlockView` (`WKWebView`) + `fullScreenCover` | `DiagramBlockSurface` (`WebView`) + `Dialog` | `DiagramBlockView` (`@kit.ArkWeb`) + `bindSheet` |
 | GPU Layout Animations | N/A | GPU `translate3d` push/pull shell | Native SwiftUI Navigation/Sheet | Compose AnimatedVisibility | ArkUI Sheet / Sidebar Motion |

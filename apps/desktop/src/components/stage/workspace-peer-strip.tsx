@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlarmClock,
   AlertTriangle,
   Check,
   ChevronDown,
@@ -16,6 +17,8 @@ import {
 } from "lucide-react";
 import {
   formatProviderShortLabel,
+  isAgentForegroundRunning,
+  isAgentTimerWaiting,
   isMacDesktop,
   type ProviderKind,
   type SessionMode,
@@ -875,12 +878,14 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                       }}
                       className="inline-flex cursor-pointer items-center gap-1.5"
                     >
-                      {peer.is_running ? (
+                      {isAgentForegroundRunning(peer) ? (
                         <OrbitSpinner size={11} className="text-foreground/70" />
                       ) : peer.is_awaiting_permission ? (
                         <span className="h-[5.5px] w-[5.5px] shrink-0 rounded-full bg-amber-500" />
                       ) : peer.is_unread && !isActive ? (
                         <span className="h-[5.5px] w-[5.5px] shrink-0 rounded-full bg-sky-500" />
+                      ) : isAgentTimerWaiting(peer) ? (
+                        <AlarmClock className="text-ink-faint h-[11.5px] w-[11.5px] shrink-0 stroke-[1.7]" />
                       ) : (
                         <ProviderIcon
                           provider={peer.provider}

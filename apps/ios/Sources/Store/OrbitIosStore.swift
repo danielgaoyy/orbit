@@ -1562,7 +1562,8 @@ public final class OrbitIosStore: ObservableObject {
             workspaceCount: 1,
             agentCount: 1,
             pendingApprovalCount: 0,
-            supportsServerQueue: true
+            supportsServerQueue: true,
+            isLocal: false
         )
         let demoCard = FfiAgentCard(
             agentId: demoAgentId,
@@ -1578,6 +1579,7 @@ public final class OrbitIosStore: ObservableObject {
             statusLabel: "Working",
             isRunning: true,
             hasBackgroundTasks: false,
+            hasArmedTimers: false,
             isAwaitingPermission: false,
             parentAgentId: nil,
             parentHostId: nil,
@@ -1684,7 +1686,8 @@ public final class OrbitIosStore: ObservableObject {
                 .assistantMessage(key: "demo-am-1", item: replyItem1)
             ],
             turnDiffs: [], hasError: false, hasUnrecoveredError: false, hasActiveItem: false,
-            startedAtMs: startMs, completedAtMs: nowMs
+            startedAtMs: startMs, completedAtMs: nowMs,
+            latestActivityMs: nowMs, latestVisibleProgressMs: nowMs
         )
         agentStage = FfiAgentStage(
             revision: 1, hostId: demoHostId, agent: demoCard, turns: [turn1],
@@ -3588,6 +3591,12 @@ public final class OrbitIosStore: ObservableObject {
         hapticRigid()
     }
 
+    public func interruptAgentAndContinue() {
+        guard let hid = selectedHostId, let aid = selectedAgentId else { return }
+        core?.interruptAgentAndContinue(hostId: hid, agentId: aid)
+        hapticRigid()
+    }
+
     // MARK: - Tool Step Descriptor & Approvals / Questions
 
     public func describeTool(_ item: FfiTimelineItem) -> FfiToolStepDescriptor? {
@@ -4950,7 +4959,7 @@ public final class OrbitIosStore: ObservableObject {
     // MARK: - Fleet Daemon Version & One-Click Over-the-Wire Update
 
     public var appShortVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.10.1"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.10.2"
     }
 
     public func isHostProtocolBehind(_ host: FfiHostCard) -> Bool {

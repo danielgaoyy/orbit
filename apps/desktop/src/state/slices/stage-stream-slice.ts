@@ -346,6 +346,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
               prevAgent.latest_seq !== nextAgent.latest_seq ||
               prevAgent.is_running !== nextAgent.is_running ||
               Boolean(prevAgent.has_background_tasks) !== Boolean(nextAgent.has_background_tasks) ||
+              Boolean(prevAgent.has_armed_timers) !== Boolean(nextAgent.has_armed_timers) ||
               Boolean(prevAgent.has_running_subagents) !== Boolean(nextAgent.has_running_subagents) ||
               prevAgent.is_awaiting_permission !== nextAgent.is_awaiting_permission ||
               (prevAgent.queued_prompts?.length ?? 0) !== (nextAgent.queued_prompts?.length ?? 0) ||

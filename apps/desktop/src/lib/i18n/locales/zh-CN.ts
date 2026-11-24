@@ -25,6 +25,7 @@ export const zhCN: MessageDictionary = {
   "common.reset": "重置",
   "common.hide": "收起",
   "common.local": "本机",
+  "common.remote": "远程",
   "common.online": "在线",
   "common.offline": "离线",
   "common.connecting": "连接中",
@@ -218,6 +219,7 @@ export const zhCN: MessageDictionary = {
   "sidebar.error": "出错",
   "sidebar.subagentRunning": "子代理运行中",
   "sidebar.backgroundTaskRunning": "后台任务运行中",
+  "sidebar.timerArmed": "已设定定时唤醒",
   "sidebar.addProject": "添加项目",
   "sidebar.addProjectFrom": "从主机添加项目",
   "sidebar.hostLocal": "本机",
@@ -618,6 +620,7 @@ export const zhCN: MessageDictionary = {
   "settings.navCapabilities": "扩展能力",
   "settings.navExtensions": "工作区与扩展",
   "settings.navNotificationsSync": "通知与同步",
+  "settings.navPersonalRouter": "个人代理",
   "settings.subTabGeneral": "通用",
   "settings.subTabShortcuts": "快捷键",
   "settings.subTabConnectionPairing": "连接与配对",
@@ -1080,6 +1083,18 @@ export const zhCN: MessageDictionary = {
   "review.markUnviewed": "取消已阅标记",
   "review.openFullFile": "打开完整文件",
 
+  // Stage 投递与卡滞观测
+  "stage.deliveryQueued": "已排队",
+  "stage.deliveryQueuedWaiting": "已排队 · 已等待 {duration}",
+  "stage.deliveryProcessing": "正在处理",
+  "stage.deliveryDeliveredWaited": "已送达 · 等待 {duration}",
+  "stage.deliveryDropped": "送达前已取消",
+  "stage.interruptAndDeliver": "中断并立即送达",
+  "stage.interruptAndContinue": "中断并继续",
+  "stage.thinkingNoProgress": "持续思考中，暂无可见进展",
+  "stage.waitingForResponse": "等待响应中",
+  "stage.queuedCount": "{count} 条排队中",
+
   // Session Overview HUD
   "overview.title": "概览",
   "overview.ariaLabel": "会话概览",
@@ -1160,7 +1175,6 @@ export const zhCN: MessageDictionary = {
   "stage.stopped": "已停止",
   "stage.finished": "已完成",
   "stage.message": "消息",
-  "stage.waitingForResponse": "等待响应",
   "stage.offline": "离线",
   "stage.answeredQuestion": "已回答 {count} 个澄清问题",
   "stage.answeredQuestions": "已回答 {count} 个澄清问题",
@@ -1302,4 +1316,40 @@ export const zhCN: MessageDictionary = {
   "overview.stoppedSubagentToast": "已停止 {name}",
   "overview.stopSubagentFailedToast": "停止失败：{error}",
   "overview.moreSubagents": "其余 {count} 个子代理",
+
+  // Personal Agent & Zero-Config Fleet Network
+  "settings.personalAgentTitle": "个人代理 (Personal Agent)",
+  "settings.personalAgentDesc":
+    "在多主机集群中选择一台机器托管你的常驻 Personal Agent。它独立于左侧当前浏览的主机，持续保留长期记忆并跨主机协调任务。",
+  "settings.personalAgentOpenSession": "打开对话",
+  "settings.personalAgentChooseHost": "选择托管主机（多主机 Fleet）",
+  "settings.personalAgentChooseHostDesc":
+    "一键选择在哪台主机上运行个人代理，所有已登录设备都会自动路由到这里。",
+  "settings.personalAgentScanFleet": "刷新主机",
+  "settings.personalAgentScanning": "刷新中…",
+  "settings.personalAgentNoHosts": "暂未检测到在线主机。",
+  "settings.personalAgentActiveBadge": "当前使用",
+  "settings.personalAgentUseAction": "设为个人代理",
+  "settings.personalAgentActivating": "启用中…",
+  "settings.personalAgentOpenAction": "打开对话",
+  "settings.personalAgentEngineLabel": "运行引擎",
+  "settings.personalAgentEngineHint": "切换后将直接在当前主节点生效，使用推荐默认配置。",
+  "settings.personalAgentAdvancedOptions": "高级选项与外部 Hermes 桥接",
+  "settings.personalAgentScopeLabel": "Fleet 可见范围",
+  "settings.personalAgentGuardianLabel": "三级风控预审",
+  "settings.personalAgentShareHermesMemory": "共享宿主机的 ~/.hermes/memories/ 与技能",
+  "settings.personalAgentCustomDiscipline": "自定义路由指令（追加至 SOUL）",
+  "settings.personalAgentWebhookUrl": "外部 Hermes Webhook 地址（可选）",
+  "settings.personalAgentWebhookSecret": "Webhook Bearer 密钥",
+  "settings.personalAgentSavePolicy": "仅保存策略",
+  "settings.personalAgentExportBridge": "导出外部 Hermes MCP 桥接配置",
+  "settings.fleetNetworkTitle": "自动全网互联 (Fleet Network)",
+  "settings.fleetNetworkAutoDesc":
+    "端到端加密 Relay、SSH 隧道与多跳 Peer-Bridge 会在同账号所有设备间自动瞬时同步——即使内网隔绝主机也能自动桥接。",
+  "settings.fleetNetworkMissingReachability":
+    "部分主机目前仅在局域网内直连；只要任意共享主机拥有公网 Relay 或 SSH 通道，即可自动完成跨网桥接。",
+  "settings.advancedRelayTitle": "高级网络与自定义 Relay",
+  "settings.advancedRelayAutoBadge": "自动托管",
+  "settings.advancedRelayDesc":
+    "网络拓扑已由云同步与 SSH Peer-Bridge 自动托管。仅当你需要为该主机手动覆盖自定义 Relay 地址时再展开。",
 };

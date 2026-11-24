@@ -181,7 +181,9 @@ describe("managed child lifecycle", () => {
     ]) assert.equal(resolve("states", [card(state)])[0].status, expected, state);
     for (const [overrides, expected] of [
       [{ is_running: true, is_awaiting_permission: true }, "awaiting_permission"],
-      [{ has_background_tasks: true }, "running"], [{ is_running: true }, "running"],
+      [{ is_running: true, has_background_tasks: true }, "completed"],
+      [{ has_background_tasks: true }, "completed"],
+      [{ is_running: true }, "running"],
       [{ status_label: "Closed" }, "canceled"], [{ status_label: "Stopped" }, "canceled"],
       [{ status_label: "Interrupted" }, "canceled"], [{ status_label: "Canceled" }, "canceled"],
       [{ status_label: "Launch failed" }, "failed"], [{ status_label: "Error" }, "failed"],

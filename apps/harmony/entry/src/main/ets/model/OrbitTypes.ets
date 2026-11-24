@@ -68,6 +68,7 @@ export interface HostCardDto {
   agent_count: number;
   pending_approval_count: number;
   supports_server_queue?: boolean;
+  is_local?: boolean;
 }
 
 export interface FleetOverviewDto {
@@ -112,6 +113,7 @@ export interface AgentCardDto {
   status_label: string;
   is_running: boolean;
   has_background_tasks?: boolean;
+  has_armed_timers?: boolean;
   is_awaiting_permission: boolean;
   parent_agent_id: string | null;
   archived_at_rfc3339?: string | null;
@@ -647,6 +649,12 @@ export interface TimelineItemDto {
   resolved_answers?: string[][] | null;
   level?: string;
   message?: string;
+  delivery_status?: 'queued' | 'dispatched' | 'settled' | 'dropped' | null;
+  delivery_turn_id?: string | null;
+  blocking_turn_id?: string | null;
+  queued_at_ms?: number | null;
+  dispatched_at_ms?: number | null;
+  settled_at_ms?: number | null;
 }
 
 export interface TurnFileDiffSummaryDto {
@@ -730,6 +738,8 @@ export interface StageTurnDto {
   has_active_item: boolean;
   started_at_ms: number | null;
   completed_at_ms: number | null;
+  latest_activity_ms?: number | null;
+  latest_visible_progress_ms?: number | null;
 }
 
 export interface AgentStageDto {

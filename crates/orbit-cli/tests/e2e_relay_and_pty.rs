@@ -56,6 +56,7 @@ async fn full_stack_e2ee_relay_allowlist_git_and_pty_integration() {
     let relay_cfg = RelayConfig {
         listen_addr: relay_addr,
         allowed_pubkeys: Arc::new(allow_set),
+        fleet_token: None,
     };
     tokio::spawn(async move {
         let _ = run_relay(relay_cfg).await;
@@ -364,6 +365,7 @@ async fn ssh_tunneled_e2ee_relay_integration() {
     let relay_cfg = RelayConfig {
         listen_addr: relay_addr,
         allowed_pubkeys: Arc::new(allow_set),
+        fleet_token: None,
     };
     tokio::spawn(async move {
         let _ = run_relay(relay_cfg).await;
@@ -405,6 +407,7 @@ async fn ssh_tunneled_e2ee_relay_integration() {
         relay_port: relay_addr.port(),
         key_seed_b64: tunnel_key.seed_b64.clone(),
         host_key_fps_b64: vec![server_fp],
+        fleet_token: None,
     }
     .to_uri();
 
@@ -416,6 +419,7 @@ async fn ssh_tunneled_e2ee_relay_integration() {
         relay_port: relay_addr.port(),
         key_seed_b64: tunnel_key.seed_b64.clone(),
         host_key_fps_b64: vec!["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()],
+        fleet_token: None,
     }
     .to_uri();
     assert!(
@@ -509,6 +513,7 @@ async fn e2ee_relay_chunked_attachment_staging_integration() {
     let relay_cfg = RelayConfig {
         listen_addr: relay_addr,
         allowed_pubkeys: Arc::new(allow_set),
+        fleet_token: None,
     };
     tokio::spawn(async move {
         let _ = run_relay(relay_cfg).await;
@@ -628,6 +633,7 @@ async fn e2e_relay_pop_blocks_daemon_hijack_while_legitimate_client_succeeds() {
     let relay_cfg = RelayConfig {
         listen_addr: relay_addr,
         allowed_pubkeys: Arc::new(allow_set),
+        fleet_token: None,
     };
     let relay_handle = tokio::spawn(async move {
         let _ = run_relay(relay_cfg).await;
@@ -889,6 +895,7 @@ async fn e2e_relay_e2ee_rejects_wrong_and_empty_pairing_secret() {
     let relay_cfg = RelayConfig {
         listen_addr: relay_addr,
         allowed_pubkeys: Arc::new(allow_set),
+        fleet_token: None,
     };
     let relay_handle = tokio::spawn(async move {
         let _ = run_relay(relay_cfg).await;
@@ -1003,6 +1010,7 @@ async fn e2e_relay_e2ee_disconnects_on_pairing_secret_rotation() {
     let relay_cfg = RelayConfig {
         listen_addr: relay_addr,
         allowed_pubkeys: Arc::new(allow_set),
+        fleet_token: None,
     };
     let relay_handle = tokio::spawn(async move {
         let _ = run_relay(relay_cfg).await;
@@ -1127,6 +1135,7 @@ async fn e2e_relay_e2ee_replayed_msg1_rejected_before_session_start() {
     let relay_cfg = RelayConfig {
         listen_addr: relay_addr,
         allowed_pubkeys: Arc::new(allow_set),
+        fleet_token: None,
     };
     let relay_handle = tokio::spawn(async move {
         let _ = run_relay(relay_cfg).await;
@@ -1234,4 +1243,176 @@ async fn e2e_relay_e2ee_replayed_msg1_rejected_before_session_start() {
 
     relay_handle.abort();
     let _ = std::fs::remove_dir_all(&temp_home);
+}
+
+#[tokio::test]
+async fn e2e_peer_bridge_connects_lan_isolated_host_with_full_e2ee() {
+    let base_tmp = if std::path::Path::new("/tmp").is_dir() {
+        std::path::PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let short_id = &Uuid::new_v4().simple().to_string()[..8];
+    let temp_home_a = base_tmp.join(format!("orb_pb_a_{short_id}"));
+    let temp_home_x = base_tmp.join(format!("orb_pb_x_{short_id}"));
+    std::fs::create_dir_all(&temp_home_a).expect("mkdir bridge A");
+    std::fs::create_dir_all(&temp_home_x).expect("mkdir isolated X");
+
+    // 1. Start Private Relay with empty static allowlist and dynamic fleet_token admission only.
+    let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay probe");
+    let relay_addr = relay_listener.local_addr().expect("relay addr");
+    drop(relay_listener);
+
+    let fleet_token = "fl_e2e_bridge_secret_token_999".to_string();
+    let relay_cfg = RelayConfig {
+        listen_addr: relay_addr,
+        allowed_pubkeys: Arc::new(HashSet::new()),
+        fleet_token: Some(fleet_token.clone()),
+    };
+    let relay_handle = tokio::spawn(async move {
+        let _ = run_relay(relay_cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let relay_url_with_token = format!("ws://{relay_addr}?ft={fleet_token}");
+
+    // 2. Start Isolated Daemon X with NO relay (unreachable from public internet / Relay).
+    let (daemon_x_addr, rt_x) = spawn_embedded_daemon(temp_home_x.clone(), None)
+        .await
+        .expect("spawn isolated daemon X");
+    let x_direct_ep = format!("ws://{daemon_x_addr}/ws");
+    let x_offer = rt_x
+        .build_pairing_offer(vec![x_direct_ep], None)
+        .expect("build pairing offer X");
+    let x_qr_uri = x_offer.to_qr_uri().expect("qr uri X");
+
+    // 3. Start Bridge Daemon A connected to Relay exclusively via fleet_token.
+    let (_daemon_a_addr, rt_a) =
+        spawn_embedded_daemon(temp_home_a.clone(), Some(relay_url_with_token.clone()))
+            .await
+            .expect("spawn bridge daemon A");
+
+    // Wrong / missing fleet_token must be rejected even if daemon pubkey is known.
+    assert!(
+        connect_via_relay(
+            &format!("ws://{relay_addr}?ft=wrong-token"),
+            &rt_a.keypair.public_key_b64,
+            &rt_a.pairing_secret,
+            None,
+        )
+        .await
+        .is_err(),
+        "invalid fleet_token must be rejected by relay"
+    );
+    assert!(
+        connect_via_relay(
+            &format!("ws://{relay_addr}"),
+            &rt_a.keypair.public_key_b64,
+            &rt_a.pairing_secret,
+            None,
+        )
+        .await
+        .is_err(),
+        "missing fleet_token with empty allowlist must be rejected by relay"
+    );
+
+    // Connect client to Bridge Daemon A over Relay (poll briefly until Noise_NK PoP completes).
+    let mut bridge_session = None;
+    for _ in 0..30 {
+        if let Ok(sess) = connect_via_relay(
+            &relay_url_with_token,
+            &rt_a.keypair.public_key_b64,
+            &rt_a.pairing_secret,
+            None,
+        )
+        .await
+        {
+            bridge_session = Some(sess);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let bridge_session = bridge_session.expect("connect to bridge daemon A with valid fleet_token");
+
+    // 4. Register Isolated Daemon X as a Connected Host on Bridge Daemon A.
+    let add_req = Uuid::new_v4();
+    let added = bridge_session
+        .request(
+            WireMessage::AddConnectedHost {
+                request_id: add_req,
+                label: Some("lan-isolated-x".into()),
+                pairing_uri: x_qr_uri,
+                ssh_alias: None,
+                remote_daemon_port: None,
+            },
+            Duration::from_secs(5),
+            |w| matches!(w, WireMessage::ConnectedHostAdded { request_id, .. } if *request_id == add_req),
+        )
+        .await
+        .expect("register isolated daemon X on bridge daemon A");
+    assert!(matches!(added, WireMessage::ConnectedHostAdded { .. }));
+
+    // 5. Tunnel client -> Relay -> Bridge Daemon A -> Isolated Daemon X (/ws/e2ee) with Noise_NKpsk0.
+    let tunneled_x = orbit_client_core::connect_via_peer_bridge(
+        &bridge_session,
+        &x_offer.host_id,
+        &rt_x.keypair.public_key_b64,
+        &rt_x.pairing_secret,
+        None,
+    )
+    .await
+    .expect("peer bridge to LAN-isolated daemon X must succeed with end-to-end Noise_NKpsk0");
+
+    let pong = tunneled_x
+        .request(
+            WireMessage::Ping { ts_ms: 987_654_321 },
+            Duration::from_secs(5),
+            |w| matches!(w, WireMessage::Pong { ts_ms: 987_654_321 }),
+        )
+        .await
+        .expect("encrypted Ping/Pong across Peer-Bridge must succeed");
+    assert!(matches!(pong, WireMessage::Pong { ts_ms: 987_654_321 }));
+
+    // 6. Wrong pairing_secret through Peer-Bridge must still be rejected by Daemon X.
+    let bad_psk_res = orbit_client_core::connect_via_peer_bridge(
+        &bridge_session,
+        &x_offer.host_id,
+        &rt_x.keypair.public_key_b64,
+        "wrong-secret-00000000000000000000",
+        None,
+    )
+    .await;
+    assert!(
+        bad_psk_res.is_err(),
+        "Daemon X must reject wrong pairing_secret even through trusted Peer-Bridge"
+    );
+
+    // 7. SSRF guard: unregistered target_host_id on Bridge Daemon A must fail closed.
+    let ssrf_req = Uuid::new_v4();
+    let ssrf_resp = bridge_session
+        .request(
+            WireMessage::PeerBridgeOpen {
+                request_id: ssrf_req,
+                bridge_id: Uuid::new_v4(),
+                target_host_id: "unregistered-ssrf-target".into(),
+            },
+            Duration::from_secs(5),
+            |w| matches!(w, WireMessage::RpcError { request_id: Some(r), .. } if *r == ssrf_req),
+        )
+        .await
+        .expect("SSRF guard response from bridge daemon A");
+    match ssrf_resp {
+        WireMessage::RpcError { code, .. } => assert_eq!(code, "peer_bridge_not_found"),
+        other => panic!("expected peer_bridge_not_found RpcError, got {other:?}"),
+    }
+
+    drop(tunneled_x);
+    drop(bridge_session);
+    drop(rt_a);
+    drop(rt_x);
+    relay_handle.abort();
+    let _ = std::fs::remove_dir_all(&temp_home_a);
+    let _ = std::fs::remove_dir_all(&temp_home_x);
 }

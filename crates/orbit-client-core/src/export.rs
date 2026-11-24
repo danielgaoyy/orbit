@@ -764,6 +764,7 @@ fn render_markdown(
             | TimelinePayload::PermissionResolved { .. }
             | TimelinePayload::QuestionRequest { .. }
             | TimelinePayload::QuestionResolved { .. }
+            | TimelinePayload::AgentMessageDeliveryUpdated { .. }
             | TimelinePayload::StatusChanged { .. } => {}
         }
     }
@@ -1850,6 +1851,7 @@ fn render_html(
             | TimelinePayload::PermissionResolved { .. }
             | TimelinePayload::QuestionRequest { .. }
             | TimelinePayload::QuestionResolved { .. }
+            | TimelinePayload::AgentMessageDeliveryUpdated { .. }
             | TimelinePayload::StatusChanged { .. } => {}
         }
     }

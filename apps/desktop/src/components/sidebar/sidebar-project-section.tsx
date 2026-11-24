@@ -1,5 +1,6 @@
 import { memo, useEffect, useRef, useState } from "react";
 import {
+  AlarmClock,
   AlertTriangle,
   ChevronRight,
   Folder,
@@ -16,6 +17,7 @@ import {
   type SidebarProjectGroupView,
   type WorkspaceOrganizeEvent,
   isAgentForegroundRunning,
+  isAgentTimerWaiting,
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
@@ -185,6 +187,7 @@ const SidebarWorkspaceGroup = memo(function SidebarWorkspaceGroup({
       selectedAgentId,
     }),
   );
+  const wsHasTimer = ws.visiblePeers.some((c) => isAgentTimerWaiting(c.agent));
   const isDropHover = dragOverDropId === `ws:${ws.workspace_id}`;
 
   return (
@@ -278,6 +281,12 @@ const SidebarWorkspaceGroup = memo(function SidebarWorkspaceGroup({
             )}
             {!ws.has_conflict && !wsHasRunning && wsCollapsed && wsHasUnread && (
               <span className="bg-signal-info size-[5.5px] shrink-0 rounded-full" />
+            )}
+            {!ws.has_conflict && !wsHasRunning && wsCollapsed && !wsHasUnread && wsHasTimer && (
+              <AlarmClock
+                aria-label={t("sidebar.timerArmed")}
+                className="text-ink-faint size-[11px] shrink-0 stroke-[1.7]"
+              />
             )}
           </button>
         )}
@@ -657,6 +666,12 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
         selectedAgentId,
       }),
     );
+  const hasCollapsedTimer =
+    collapsed &&
+    !hasCollapsedApproval &&
+    !hasCollapsedRunning &&
+    !hasCollapsedUnread &&
+    visibleConversations.some((c) => isAgentTimerWaiting(c.agent));
 
   const isProjectOrganizing = organizeEvent?.phase === "running";
   const showEmptyInboxDropZone =
@@ -863,6 +878,7 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
                   hasCollapsedApproval ||
                   hasCollapsedRunning ||
                   hasCollapsedUnread ||
+                  hasCollapsedTimer ||
                   (collapsed && visibleConversations.length > 0)) && (
                   <div
                     className={cn(
@@ -884,14 +900,22 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
                       >
                         <RefreshCw className="size-[12.5px]" />
                       </IconButton>
-                    ) : hasCollapsedApproval || hasCollapsedRunning || hasCollapsedUnread ? (
+                    ) : hasCollapsedApproval ||
+                      hasCollapsedRunning ||
+                      hasCollapsedUnread ||
+                      hasCollapsedTimer ? (
                       <span className="inline-flex h-[22px] w-[22px] items-center justify-center">
                         {hasCollapsedApproval ? (
                           <span className="bg-signal-warning size-[6px] rounded-full" />
                         ) : hasCollapsedRunning ? (
                           <OrbitSpinner size={13} className="text-ink-secondary" />
-                        ) : (
+                        ) : hasCollapsedUnread ? (
                           <span className="bg-signal-info size-[6px] rounded-full" />
+                        ) : (
+                          <AlarmClock
+                            aria-label={t("sidebar.timerArmed")}
+                            className="text-ink-faint size-[11.5px] shrink-0 stroke-[1.7]"
+                          />
                         )}
                       </span>
                     ) : (

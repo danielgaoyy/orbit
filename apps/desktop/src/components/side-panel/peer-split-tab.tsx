@@ -78,6 +78,7 @@ export const PeerSplitTab = memo(function PeerSplitTab({ tab }: { tab: SidePanel
     ? (hostDetail?.workspaces.find((w) => w.workspace_id === agent.workspace_id) ?? null)
     : null;
   const cwd = agent?.cwd ?? tab.cwd ?? "";
+  const peerForegroundRunning = isAgentForegroundRunning(agent);
 
   const selectPeerSession = useMemo(
     () => createStageSessionSelector(hostId || null, peerAgentId || null),
@@ -164,7 +165,7 @@ export const PeerSplitTab = memo(function PeerSplitTab({ tab }: { tab: SidePanel
     try {
       await orbitIpc.sendPrompt(hostId, peerAgentId, trimmed, {
         displayPrompt: trimmed,
-        activeTurnBehavior: agent?.is_running ? "steer" : "queue",
+        activeTurnBehavior: peerForegroundRunning ? "steer" : "queue",
       });
     } catch (err) {
       setReply((cur) => recoverReplyDraftAfterSendError(cur, trimmed));
@@ -184,7 +185,7 @@ export const PeerSplitTab = memo(function PeerSplitTab({ tab }: { tab: SidePanel
       {/* Split Header */}
       <div className="border-border-subtle flex items-center justify-between gap-2 border-b px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
-          {agent?.is_running ? (
+          {peerForegroundRunning ? (
             <OrbitSpinner size={13} className="text-ink-secondary shrink-0" />
           ) : agent ? (
             <ProviderIcon
@@ -300,7 +301,7 @@ export const PeerSplitTab = memo(function PeerSplitTab({ tab }: { tab: SidePanel
             </div>
           ) : (
             <div className="text-ink-tertiary py-8 text-center text-[13px]">
-              {agent?.is_running ? "Peer is working…" : "No turns yet."}
+              {peerForegroundRunning ? "Peer is working…" : "No turns yet."}
             </div>
           )}
         </div>
@@ -339,7 +340,7 @@ export const PeerSplitTab = memo(function PeerSplitTab({ tab }: { tab: SidePanel
             placeholder={`Message ${handleLabel}…`}
             className="text-ink-primary placeholder:text-ink-faint min-w-0 flex-1 bg-transparent text-[13px] leading-[18px] outline-none"
           />
-          {agent?.is_running && !reply.trim() ? (
+          {peerForegroundRunning && !reply.trim() ? (
             <button
               type="button"
               title="Stop peer"

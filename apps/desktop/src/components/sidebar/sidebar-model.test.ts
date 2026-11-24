@@ -210,10 +210,23 @@ describe("sidebar-model pure derivation & invariants", () => {
       is_running: false,
       status_label: "Idle",
     });
+    const childTimerWaiting = makeAgent("child_timer", "Timer subagent", {
+      parent_agent_id: "parent_timer",
+      is_running: false,
+      has_background_tasks: true,
+      has_armed_timers: true,
+      status_label: "Waiting for 1 timer",
+    });
+    const childLegacyTimerWaiting = makeAgent("child_legacy_timer", "Legacy timer subagent", {
+      parent_agent_id: "parent_legacy_timer",
+      is_running: true,
+      has_background_tasks: true,
+      status_label: "Waiting for 1 timer",
+    });
 
     const hostDetails: Record<string, HostDetailView> = {
       h1: {
-        agents: [childRunning, childDone],
+        agents: [childRunning, childDone, childTimerWaiting, childLegacyTimerWaiting],
         provider_subagents: {
           parent_c: [{ subagent_id: "ps_1", status: "running" }],
           parent_d: [{ subagent_id: "ps_2", status: "completed" }],
@@ -232,5 +245,7 @@ describe("sidebar-model pure derivation & invariants", () => {
     assert.equal(runningKeys.has("h1::parent_c"), true);
     assert.equal(runningKeys.has("h1::parent_d"), false);
     assert.equal(runningKeys.has("h1::parent_e"), true);
+    assert.equal(runningKeys.has("h1::parent_timer"), false);
+    assert.equal(runningKeys.has("h1::parent_legacy_timer"), false);
   });
 });

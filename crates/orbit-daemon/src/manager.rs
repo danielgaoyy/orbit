@@ -9,9 +9,9 @@ use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentMessageKind, AgentStatus, AgentSummary, AttentionState, ForkTarget,
-    HostProjectEntry, HostSyncState, KeepAwakeStatus, OrchestrationConfig,
-    PendingPermissionSummary, PromptBadge, ProviderKind, ProviderModelCatalog,
+    ActiveTurnBehavior, AgentMessageDeliveryStatus, AgentMessageKind, AgentStatus, AgentSummary,
+    AttentionState, ForkTarget, HostProjectEntry, HostSyncState, KeepAwakeStatus,
+    OrchestrationConfig, PendingPermissionSummary, PromptBadge, ProviderKind, ProviderModelCatalog,
     ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem, ReasoningEffort, ScheduleSpec,
     SessionMode, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus,
     WorkspaceBoardSnapshot, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
@@ -20,8 +20,9 @@ use orbit_protocol::{
     WorktreeHandoffDirection, WorktreeHandoffMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 use orbit_providers::{
-    DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, SessionLaunchConfig,
-    find_provider_executable, provider_model_supports_fast_mode, spawn_provider_session,
+    DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, PromptOrigin,
+    SessionLaunchConfig, find_provider_executable, provider_model_supports_fast_mode,
+    spawn_provider_session,
 };
 use orbit_shim::{
     ShimClient, ShimFrame, ShimMode, ShimSpawnSpec, connect_existing_shim, kill_existing_shim,
@@ -133,6 +134,11 @@ pub enum DaemonBroadcast {
     GoalRunEvent(orbit_protocol::GoalRunRecord),
     MonitorWatchEvent(orbit_protocol::MonitorWatchRecord),
     WorkflowRunEvent(orbit_protocol::WorkflowRunRecord),
+    FleetVaultChanged {
+        origin_session_id: Uuid,
+        vault_fingerprint: String,
+        revision: u64,
+    },
 }
 
 struct LiveAgentEntry {
@@ -250,6 +256,8 @@ pub struct AgentOrchestrator {
     /// Most recent provider-reported instantaneous single-call context telemetry per `agent_id`
     /// for accurate context occupancy without multi-step turn-sum inflation.
     last_call_prompt_occupancy: RwLock<HashMap<String, orbit_store::AgentContextTelemetry>>,
+    /// Enqueue timestamps (`message_id -> queued_at_ms`) for wait/settlement telemetry (capped at 4096 entries).
+    notification_queued_at: RwLock<HashMap<String, i64>>,
     /// In-flight AI organizer / summarizer locks keyed by `sum:<agent_id>` or `org:<project_root>`.
     /// Uses a synchronous `std::sync::Mutex` (never held across `.await`) so RAII `OrganizerLockGuard`
     /// always releases the lock and marks `keep_awake` idle on cancellation or panic.
@@ -331,6 +339,7 @@ impl AgentOrchestrator {
             suppress_auto_drain: RwLock::new(std::collections::HashSet::new()),
             turn_usage_recorded: RwLock::new(std::collections::HashSet::new()),
             last_call_prompt_occupancy: RwLock::new(HashMap::new()),
+            notification_queued_at: RwLock::new(HashMap::new()),
             organizing_locks: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             auto_name_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
             conditional_timers: RwLock::new(None),
@@ -2147,6 +2156,8 @@ impl AgentOrchestrator {
                                 turn_id,
                                 prompt: wire,
                                 behavior: ActiveTurnBehavior::Steer,
+                                origin: PromptOrigin::Human,
+                                message_ids: Vec::new(),
                             })
                             .await;
                     }
@@ -2704,6 +2715,8 @@ impl AgentOrchestrator {
                                 turn_id,
                                 prompt: wire,
                                 behavior: ActiveTurnBehavior::Steer,
+                                origin: PromptOrigin::Human,
+                                message_ids: Vec::new(),
                             })
                             .await;
                     }
@@ -3144,6 +3157,34 @@ impl AgentOrchestrator {
                 }
             }
         }
+        let blocking_turn_id = match ag.status {
+            AgentStatus::Running { turn_id: ref tid }
+            | AgentStatus::AwaitingPermission {
+                turn_id: ref tid, ..
+            } => Some(tid.clone()),
+            _ => None,
+        };
+        let queued_at_ms = Utc::now().timestamp_millis();
+        let message_ids: Vec<String> = batch
+            .entries
+            .iter()
+            .map(|entry| entry.message_id.clone())
+            .collect();
+        {
+            let mut qmap = self.notification_queued_at.write().await;
+            for msg_id in &message_ids {
+                if qmap.len() >= 4096
+                    && !qmap.contains_key(msg_id)
+                    && let Some(oldest_k) = qmap
+                        .iter()
+                        .min_by_key(|(_, ts)| *ts)
+                        .map(|(k, _)| k.clone())
+                {
+                    qmap.remove(&oldest_k);
+                }
+                qmap.insert(msg_id.clone(), queued_at_ms);
+            }
+        }
         for entry in &batch.entries {
             let ev = self.store.append_timeline_event(
                 &batch.recipient_id,
@@ -3158,19 +3199,56 @@ impl AgentOrchestrator {
                     event: entry.source.event.clone(),
                     text: entry.body.clone(),
                     permission_context: entry.source.permission_context.clone(),
+                    delivery_status: Some(AgentMessageDeliveryStatus::Queued),
+                    delivery_turn_id: Some(turn_id.clone()),
+                    blocking_turn_id: blocking_turn_id.clone(),
+                    queued_at_ms: Some(queued_at_ms),
+                    dispatched_at_ms: None,
+                    settled_at_ms: None,
                 },
             )?;
             let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
         }
 
-        cmd_tx
+        if cmd_tx
             .send(DriverCommand::SendPrompt {
-                turn_id,
+                turn_id: turn_id.clone(),
                 prompt: wire_prompt,
                 behavior: batch.active_turn_behavior,
+                origin: PromptOrigin::Agent,
+                message_ids: message_ids.clone(),
             })
             .await
-            .map_err(|_| anyhow::anyhow!("agent session channel closed"))?;
+            .is_err()
+        {
+            let drop_ts = Utc::now().timestamp_millis();
+            {
+                let mut qmap = self.notification_queued_at.write().await;
+                for msg_id in &message_ids {
+                    qmap.remove(msg_id);
+                }
+            }
+            for msg_id in &message_ids {
+                if let Ok((saved_ev, mutated)) = self.store.append_timeline_event_deduped(
+                    &batch.recipient_id,
+                    1,
+                    Some(&turn_id),
+                    TimelinePayload::AgentMessageDeliveryUpdated {
+                        message_id: msg_id.clone(),
+                        status: AgentMessageDeliveryStatus::Dropped,
+                        delivery_turn_id: Some(turn_id.clone()),
+                        blocking_turn_id: None,
+                        timestamp_ms: drop_ts,
+                    },
+                ) && mutated
+                {
+                    let _ = self
+                        .broadcast_tx
+                        .send(DaemonBroadcast::TimelineLive(saved_ev));
+                }
+            }
+            anyhow::bail!("agent session channel closed");
+        }
         Ok(())
     }
 
@@ -3245,6 +3323,8 @@ impl AgentOrchestrator {
                 turn_id,
                 prompt: wire_prompt,
                 behavior,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
             })
             .await
             .map_err(|_| anyhow::anyhow!("agent session channel closed"))?;
@@ -3331,12 +3411,32 @@ impl AgentOrchestrator {
     }
 
     pub async fn interrupt_agent(&self, agent_id: &str) -> anyhow::Result<()> {
-        self.suppress_auto_drain
-            .write()
-            .await
-            .insert(agent_id.to_string());
+        self.interrupt_agent_with_options(agent_id, false).await
+    }
+
+    /// Interrupt the active turn on `agent_id`.
+    /// When `preserve_queue` is `true`, accepted FIFO notifications and queued follow-ups stay
+    /// intact and drain immediately after settlement (`Interrupt & continue`).
+    pub async fn interrupt_agent_with_options(
+        &self,
+        agent_id: &str,
+        preserve_queue: bool,
+    ) -> anyhow::Result<()> {
+        if preserve_queue {
+            self.suppress_auto_drain.write().await.remove(agent_id);
+        } else {
+            self.suppress_auto_drain
+                .write()
+                .await
+                .insert(agent_id.to_string());
+        }
         if let Some(tx) = self.live_agent_tx(agent_id).await {
-            let _ = tx.send(DriverCommand::Interrupt).await;
+            let cmd = if preserve_queue {
+                DriverCommand::InterruptAndDrainQueue
+            } else {
+                DriverCommand::Interrupt
+            };
+            let _ = tx.send(cmd).await;
         }
         self.cancel_pending_permissions_and_questions(agent_id)
             .await;
@@ -5473,6 +5573,68 @@ impl AgentOrchestrator {
                 });
                 return;
             }
+            DriverEvent::PromptDeliveryUpdated {
+                turn_id,
+                message_ids,
+                status,
+                blocking_turn_id,
+            } => {
+                let timestamp_ms = Utc::now().timestamp_millis();
+                for message_id in message_ids {
+                    let wait_ms = {
+                        let mut qmap = self.notification_queued_at.write().await;
+                        match status {
+                            AgentMessageDeliveryStatus::Queued => {
+                                if qmap.len() >= 4096
+                                    && !qmap.contains_key(&message_id)
+                                    && let Some(oldest_k) = qmap
+                                        .iter()
+                                        .min_by_key(|(_, ts)| *ts)
+                                        .map(|(k, _)| k.clone())
+                                {
+                                    qmap.remove(&oldest_k);
+                                }
+                                let q = *qmap.entry(message_id.clone()).or_insert(timestamp_ms);
+                                Some(timestamp_ms.saturating_sub(q))
+                            }
+                            AgentMessageDeliveryStatus::Dispatched => qmap
+                                .get(&message_id)
+                                .map(|q| timestamp_ms.saturating_sub(*q)),
+                            AgentMessageDeliveryStatus::Settled
+                            | AgentMessageDeliveryStatus::Dropped => qmap
+                                .remove(&message_id)
+                                .map(|q| timestamp_ms.saturating_sub(q)),
+                        }
+                    };
+                    info!(
+                        agent_id = %agent_id,
+                        notification_id = %message_id,
+                        status = ?status,
+                        turn_id = %turn_id,
+                        blocking_turn_id = ?blocking_turn_id,
+                        wait_ms = ?wait_ms,
+                        "Agent notification delivery status updated"
+                    );
+                    if let Ok((saved_ev, mutated)) = self.store.append_timeline_event_deduped(
+                        agent_id,
+                        1,
+                        Some(&turn_id),
+                        TimelinePayload::AgentMessageDeliveryUpdated {
+                            message_id,
+                            status,
+                            delivery_turn_id: Some(turn_id.clone()),
+                            blocking_turn_id: blocking_turn_id.clone(),
+                            timestamp_ms,
+                        },
+                    ) && mutated
+                    {
+                        let _ = self
+                            .broadcast_tx
+                            .send(DaemonBroadcast::TimelineLive(saved_ev));
+                    }
+                }
+                return;
+            }
             _ => {}
         }
 
@@ -6008,7 +6170,8 @@ impl AgentOrchestrator {
             | DriverEvent::ProviderSubagentUpsert(_)
             | DriverEvent::ProviderSubagentTimeline { .. }
             | DriverEvent::ReconcileBackgroundTasks(_)
-            | DriverEvent::TurnUsage { .. } => unreachable!(),
+            | DriverEvent::TurnUsage { .. }
+            | DriverEvent::PromptDeliveryUpdated { .. } => unreachable!(),
         };
 
         let is_status_change = matches!(payload, TimelinePayload::StatusChanged { .. });

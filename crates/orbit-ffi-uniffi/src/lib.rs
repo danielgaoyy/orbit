@@ -67,21 +67,22 @@ use orbit_client_core::stage::{
 };
 use orbit_client_core::{HostConnectionState, HostRouteMode};
 use orbit_protocol::{
-    AcpAgentAvailability, AcpAgentSource, AcpAgentSpec, AcpProbeResult, AgentMessageKind,
-    ArtifactDetail, ArtifactKind, ArtifactRevisionMeta, ArtifactSummary, AttentionState,
-    ConditionalTimerRecord, ConditionalTimerState, DirectoryEntry, DiscoveredProject, ForkTarget,
-    GoalControlAction, GoalCriterion, GoalRunRecord, GoalStatus, HandoffFileChange, MonitorKind,
-    MonitorStatus, MonitorWatchRecord, NestedGitRepo, PermissionCheckpointRef, PromptBadge,
-    ProviderKind, ProviderModelCatalog, ProviderModelSpec, ProviderQuotaSnapshot,
-    ProviderSubagentDescriptor, ProviderSubagentEvent, ProviderSubagentStatus, PushDeviceRecord,
-    PushPlatform, PushPreferences, QuestionItem, QuotaWindow, ReasoningEffort, ScheduleKind,
-    ScheduleNewAgentConfig, ScheduleRunRecord, ScheduleRunStatus, ScheduleSpec, ScheduleStatus,
-    ScheduleTarget, SessionMode, TerminalSummary, ThinkingOptionSpec, TimelinePayload,
-    TimerCondition, ToolCallDetail, ToolCallStatus, WorkflowKind, WorkflowRunRecord,
-    WorkflowRunStatus, WorkflowStepRecord, WorkflowStepStatus, WorkspaceBoardSnapshot,
-    WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceFileConflict,
-    WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceOrganizePhase, WorkspaceSummary,
-    WorktreeHandoffDirection, WorktreeHandoffMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    AcpAgentAvailability, AcpAgentSource, AcpAgentSpec, AcpProbeResult, AgentMessageDeliveryStatus,
+    AgentMessageKind, ArtifactDetail, ArtifactKind, ArtifactRevisionMeta, ArtifactSummary,
+    AttentionState, ConditionalTimerRecord, ConditionalTimerState, DirectoryEntry,
+    DiscoveredProject, ForkTarget, GoalControlAction, GoalCriterion, GoalRunRecord, GoalStatus,
+    HandoffFileChange, MonitorKind, MonitorStatus, MonitorWatchRecord, NestedGitRepo,
+    PermissionCheckpointRef, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderModelSpec,
+    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
+    ProviderSubagentStatus, PushDeviceRecord, PushPlatform, PushPreferences, QuestionItem,
+    QuotaWindow, ReasoningEffort, ScheduleKind, ScheduleNewAgentConfig, ScheduleRunRecord,
+    ScheduleRunStatus, ScheduleSpec, ScheduleStatus, ScheduleTarget, SessionMode, TerminalSummary,
+    ThinkingOptionSpec, TimelinePayload, TimerCondition, ToolCallDetail, ToolCallStatus,
+    WorkflowKind, WorkflowRunRecord, WorkflowRunStatus, WorkflowStepRecord, WorkflowStepStatus,
+    WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord,
+    WorkspaceFileConflict, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceOrganizePhase,
+    WorkspaceSummary, WorktreeHandoffDirection, WorktreeHandoffMode, WorktreeHandoffOutcome,
+    WorktreeHandoffPreview,
 };
 
 uniffi::setup_scaffolding!();
@@ -643,6 +644,7 @@ pub struct FfiHostCard {
     pub agent_count: u32,
     pub pending_approval_count: u32,
     pub supports_server_queue: bool,
+    pub is_local: bool,
 }
 
 impl From<HostCardView> for FfiHostCard {
@@ -672,6 +674,7 @@ impl From<HostCardView> for FfiHostCard {
             agent_count: v.agent_count,
             pending_approval_count: v.pending_approval_count,
             supports_server_queue: v.supports_server_queue,
+            is_local: v.is_local,
         }
     }
 }
@@ -1156,6 +1159,9 @@ fn summarize_provider_subagent_payload(payload: &TimelinePayload) -> String {
         TimelinePayload::QuestionResolved { .. } => "Answered question".into(),
         TimelinePayload::Notice { message, .. } => message.trim().chars().take(240).collect(),
         TimelinePayload::AgentMessage { text, .. } => text.trim().chars().take(280).collect(),
+        TimelinePayload::AgentMessageDeliveryUpdated { status, .. } => {
+            format!("Delivery: {status:?}")
+        }
         TimelinePayload::StatusChanged { status } => format!("Status: {status:?}"),
     }
 }
@@ -1358,6 +1364,7 @@ pub struct FfiAgentCard {
     pub status_label: String,
     pub is_running: bool,
     pub has_background_tasks: bool,
+    pub has_armed_timers: bool,
     pub is_awaiting_permission: bool,
     pub parent_agent_id: Option<String>,
     pub parent_host_id: Option<String>,
@@ -1402,6 +1409,7 @@ impl From<AgentCardView> for FfiAgentCard {
             status_label: v.status_label,
             is_running: v.is_running,
             has_background_tasks: v.has_background_tasks,
+            has_armed_timers: v.has_armed_timers,
             is_awaiting_permission: v.is_awaiting_permission,
             parent_agent_id: v.parent_agent_id,
             parent_host_id: v.parent_host_id,
@@ -2706,6 +2714,25 @@ impl From<AgentMessageKind> for FfiAgentMessageKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiAgentMessageDeliveryStatus {
+    Queued,
+    Dispatched,
+    Settled,
+    Dropped,
+}
+
+impl From<AgentMessageDeliveryStatus> for FfiAgentMessageDeliveryStatus {
+    fn from(v: AgentMessageDeliveryStatus) -> Self {
+        match v {
+            AgentMessageDeliveryStatus::Queued => Self::Queued,
+            AgentMessageDeliveryStatus::Dispatched => Self::Dispatched,
+            AgentMessageDeliveryStatus::Settled => Self::Settled,
+            AgentMessageDeliveryStatus::Dropped => Self::Dropped,
+        }
+    }
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiPermissionCheckpointRef {
     pub child_agent_id: String,
@@ -2796,6 +2823,12 @@ pub enum FfiTimelineItem {
         event: Option<String>,
         text: String,
         permission_context: Option<FfiPermissionCheckpointRef>,
+        delivery_status: Option<FfiAgentMessageDeliveryStatus>,
+        delivery_turn_id: Option<String>,
+        blocking_turn_id: Option<String>,
+        queued_at_ms: Option<i64>,
+        dispatched_at_ms: Option<i64>,
+        settled_at_ms: Option<i64>,
         blocks: Vec<FfiRichBlock>,
         timestamp_ms: Option<i64>,
     },
@@ -2969,6 +3002,12 @@ impl From<TimelineItemView> for FfiTimelineItem {
                 event,
                 text,
                 permission_context,
+                delivery_status,
+                delivery_turn_id,
+                blocking_turn_id,
+                queued_at_ms,
+                dispatched_at_ms,
+                settled_at_ms,
                 blocks,
                 timestamp_ms,
             } => Self::AgentMessage {
@@ -2981,6 +3020,12 @@ impl From<TimelineItemView> for FfiTimelineItem {
                 event,
                 text,
                 permission_context: permission_context.map(Into::into),
+                delivery_status: delivery_status.map(Into::into),
+                delivery_turn_id,
+                blocking_turn_id,
+                queued_at_ms,
+                dispatched_at_ms,
+                settled_at_ms,
                 blocks: blocks.into_iter().map(Into::into).collect(),
                 timestamp_ms,
             },
@@ -3240,6 +3285,8 @@ pub struct FfiStageTurn {
     pub has_active_item: bool,
     pub started_at_ms: Option<i64>,
     pub completed_at_ms: Option<i64>,
+    pub latest_activity_ms: Option<i64>,
+    pub latest_visible_progress_ms: Option<i64>,
 }
 
 impl From<StageTurnView> for FfiStageTurn {
@@ -3271,6 +3318,8 @@ impl From<StageTurnView> for FfiStageTurn {
             has_active_item: v.has_active_item,
             started_at_ms: v.started_at_ms,
             completed_at_ms: v.completed_at_ms,
+            latest_activity_ms: v.latest_activity_ms,
+            latest_visible_progress_ms: v.latest_visible_progress_ms,
         }
     }
 }
@@ -5759,6 +5808,10 @@ impl OrbitMobileCore {
 
     pub fn interrupt_agent(&self, host_id: String, agent_id: String) {
         self.inner.interrupt_agent(&host_id, &agent_id);
+    }
+
+    pub fn interrupt_agent_and_continue(&self, host_id: String, agent_id: String) {
+        self.inner.interrupt_agent_and_continue(&host_id, &agent_id);
     }
 
     pub fn set_session_mode(&self, host_id: String, agent_id: String, mode: FfiSessionMode) {

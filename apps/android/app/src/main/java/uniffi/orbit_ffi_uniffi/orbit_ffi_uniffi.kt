@@ -877,6 +877,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_interrupt_agent(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_interrupt_agent_and_continue(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_kill_terminal(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_list_acp_agents(
@@ -1264,6 +1266,8 @@ internal object UniffiLib {
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_host_detail(`ptr`: Long,`hostId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_interrupt_agent(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_interrupt_agent_and_continue(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_kill_terminal(`ptr`: Long,`hostId`: RustBuffer.ByValue,`terminalId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -1843,6 +1847,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_interrupt_agent() and 0xFFFF) != 55703) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_interrupt_agent_and_continue() and 0xFFFF) != 42475) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_kill_terminal() and 0xFFFF) != 53980) {
@@ -3184,6 +3191,8 @@ public interface OrbitMobileCoreInterface {
     fun `hostDetail`(`hostId`: kotlin.String): FfiHostDetail?
     
     fun `interruptAgent`(`hostId`: kotlin.String, `agentId`: kotlin.String)
+    
+    fun `interruptAgentAndContinue`(`hostId`: kotlin.String, `agentId`: kotlin.String)
     
     fun `killTerminal`(`hostId`: kotlin.String, `terminalId`: kotlin.String)
     
@@ -4542,6 +4551,20 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     callWithHandle {
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_interrupt_agent(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`agentId`),_status)
+}
+    }
+    
+    
+
+    override fun `interruptAgentAndContinue`(`hostId`: kotlin.String, `agentId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_interrupt_agent_and_continue(
         it,
         
         FfiConverterString.lower(`hostId`),
@@ -6715,6 +6738,8 @@ data class FfiAgentCard (
     , 
     var `hasBackgroundTasks`: kotlin.Boolean
     , 
+    var `hasArmedTimers`: kotlin.Boolean
+    , 
     var `isAwaitingPermission`: kotlin.Boolean
     , 
     var `parentAgentId`: kotlin.String?
@@ -6782,6 +6807,7 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
@@ -6817,6 +6843,7 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterString.allocationSize(value.`statusLabel`) +
             FfiConverterBoolean.allocationSize(value.`isRunning`) +
             FfiConverterBoolean.allocationSize(value.`hasBackgroundTasks`) +
+            FfiConverterBoolean.allocationSize(value.`hasArmedTimers`) +
             FfiConverterBoolean.allocationSize(value.`isAwaitingPermission`) +
             FfiConverterOptionalString.allocationSize(value.`parentAgentId`) +
             FfiConverterOptionalString.allocationSize(value.`parentHostId`) +
@@ -6852,6 +6879,7 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterString.write(value.`statusLabel`, buf)
             FfiConverterBoolean.write(value.`isRunning`, buf)
             FfiConverterBoolean.write(value.`hasBackgroundTasks`, buf)
+            FfiConverterBoolean.write(value.`hasArmedTimers`, buf)
             FfiConverterBoolean.write(value.`isAwaitingPermission`, buf)
             FfiConverterOptionalString.write(value.`parentAgentId`, buf)
             FfiConverterOptionalString.write(value.`parentHostId`, buf)
@@ -9825,6 +9853,8 @@ data class FfiHostCard (
     var `pendingApprovalCount`: kotlin.UInt
     , 
     var `supportsServerQueue`: kotlin.Boolean
+    , 
+    var `isLocal`: kotlin.Boolean
     
 ){
     
@@ -9865,6 +9895,7 @@ public object FfiConverterTypeFfiHostCard: FfiConverterRustBuffer<FfiHostCard> {
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -9892,7 +9923,8 @@ public object FfiConverterTypeFfiHostCard: FfiConverterRustBuffer<FfiHostCard> {
             FfiConverterUInt.allocationSize(value.`workspaceCount`) +
             FfiConverterUInt.allocationSize(value.`agentCount`) +
             FfiConverterUInt.allocationSize(value.`pendingApprovalCount`) +
-            FfiConverterBoolean.allocationSize(value.`supportsServerQueue`)
+            FfiConverterBoolean.allocationSize(value.`supportsServerQueue`) +
+            FfiConverterBoolean.allocationSize(value.`isLocal`)
     )
 
     override fun write(value: FfiHostCard, buf: ByteBuffer) {
@@ -9920,6 +9952,7 @@ public object FfiConverterTypeFfiHostCard: FfiConverterRustBuffer<FfiHostCard> {
             FfiConverterUInt.write(value.`agentCount`, buf)
             FfiConverterUInt.write(value.`pendingApprovalCount`, buf)
             FfiConverterBoolean.write(value.`supportsServerQueue`, buf)
+            FfiConverterBoolean.write(value.`isLocal`, buf)
     }
 }
 
@@ -12711,6 +12744,10 @@ data class FfiStageTurn (
     var `startedAtMs`: kotlin.Long?
     , 
     var `completedAtMs`: kotlin.Long?
+    , 
+    var `latestActivityMs`: kotlin.Long?
+    , 
+    var `latestVisibleProgressMs`: kotlin.Long?
     
 ){
     
@@ -12753,6 +12790,8 @@ public object FfiConverterTypeFfiStageTurn: FfiConverterRustBuffer<FfiStageTurn>
             FfiConverterBoolean.read(buf),
             FfiConverterOptionalLong.read(buf),
             FfiConverterOptionalLong.read(buf),
+            FfiConverterOptionalLong.read(buf),
+            FfiConverterOptionalLong.read(buf),
         )
     }
 
@@ -12782,7 +12821,9 @@ public object FfiConverterTypeFfiStageTurn: FfiConverterRustBuffer<FfiStageTurn>
             FfiConverterBoolean.allocationSize(value.`hasUnrecoveredError`) +
             FfiConverterBoolean.allocationSize(value.`hasActiveItem`) +
             FfiConverterOptionalLong.allocationSize(value.`startedAtMs`) +
-            FfiConverterOptionalLong.allocationSize(value.`completedAtMs`)
+            FfiConverterOptionalLong.allocationSize(value.`completedAtMs`) +
+            FfiConverterOptionalLong.allocationSize(value.`latestActivityMs`) +
+            FfiConverterOptionalLong.allocationSize(value.`latestVisibleProgressMs`)
     )
 
     override fun write(value: FfiStageTurn, buf: ByteBuffer) {
@@ -12812,6 +12853,8 @@ public object FfiConverterTypeFfiStageTurn: FfiConverterRustBuffer<FfiStageTurn>
             FfiConverterBoolean.write(value.`hasActiveItem`, buf)
             FfiConverterOptionalLong.write(value.`startedAtMs`, buf)
             FfiConverterOptionalLong.write(value.`completedAtMs`, buf)
+            FfiConverterOptionalLong.write(value.`latestActivityMs`, buf)
+            FfiConverterOptionalLong.write(value.`latestVisibleProgressMs`, buf)
     }
 }
 
@@ -14789,6 +14832,42 @@ public object FfiConverterTypeFfiAcpAgentSource: FfiConverterRustBuffer<FfiAcpAg
     override fun allocationSize(value: FfiAcpAgentSource) = 4UL
 
     override fun write(value: FfiAcpAgentSource, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
+enum class FfiAgentMessageDeliveryStatus {
+    
+    QUEUED,
+    DISPATCHED,
+    SETTLED,
+    DROPPED;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiAgentMessageDeliveryStatus: FfiConverterRustBuffer<FfiAgentMessageDeliveryStatus> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiAgentMessageDeliveryStatus.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiAgentMessageDeliveryStatus) = 4UL
+
+    override fun write(value: FfiAgentMessageDeliveryStatus, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
@@ -17048,6 +17127,12 @@ sealed class FfiTimelineItem {
         val `event`: kotlin.String?, 
         val `text`: kotlin.String, 
         val `permissionContext`: uniffi.orbit_ffi_uniffi.FfiPermissionCheckpointRef?, 
+        val `deliveryStatus`: uniffi.orbit_ffi_uniffi.FfiAgentMessageDeliveryStatus?, 
+        val `deliveryTurnId`: kotlin.String?, 
+        val `blockingTurnId`: kotlin.String?, 
+        val `queuedAtMs`: kotlin.Long?, 
+        val `dispatchedAtMs`: kotlin.Long?, 
+        val `settledAtMs`: kotlin.Long?, 
         val `blocks`: List<uniffi.orbit_ffi_uniffi.FfiRichBlock>, 
         val `timestampMs`: kotlin.Long?) : FfiTimelineItem()
         
@@ -17140,6 +17225,12 @@ public object FfiConverterTypeFfiTimelineItem : FfiConverterRustBuffer<FfiTimeli
                 FfiConverterOptionalString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterOptionalTypeFfiPermissionCheckpointRef.read(buf),
+                FfiConverterOptionalTypeFfiAgentMessageDeliveryStatus.read(buf),
+                FfiConverterOptionalString.read(buf),
+                FfiConverterOptionalString.read(buf),
+                FfiConverterOptionalLong.read(buf),
+                FfiConverterOptionalLong.read(buf),
+                FfiConverterOptionalLong.read(buf),
                 FfiConverterSequenceTypeFfiRichBlock.read(buf),
                 FfiConverterOptionalLong.read(buf),
                 )
@@ -17246,6 +17337,12 @@ public object FfiConverterTypeFfiTimelineItem : FfiConverterRustBuffer<FfiTimeli
                 + FfiConverterOptionalString.allocationSize(value.`event`)
                 + FfiConverterString.allocationSize(value.`text`)
                 + FfiConverterOptionalTypeFfiPermissionCheckpointRef.allocationSize(value.`permissionContext`)
+                + FfiConverterOptionalTypeFfiAgentMessageDeliveryStatus.allocationSize(value.`deliveryStatus`)
+                + FfiConverterOptionalString.allocationSize(value.`deliveryTurnId`)
+                + FfiConverterOptionalString.allocationSize(value.`blockingTurnId`)
+                + FfiConverterOptionalLong.allocationSize(value.`queuedAtMs`)
+                + FfiConverterOptionalLong.allocationSize(value.`dispatchedAtMs`)
+                + FfiConverterOptionalLong.allocationSize(value.`settledAtMs`)
                 + FfiConverterSequenceTypeFfiRichBlock.allocationSize(value.`blocks`)
                 + FfiConverterOptionalLong.allocationSize(value.`timestampMs`)
             )
@@ -17336,6 +17433,12 @@ public object FfiConverterTypeFfiTimelineItem : FfiConverterRustBuffer<FfiTimeli
                 FfiConverterOptionalString.write(value.`event`, buf)
                 FfiConverterString.write(value.`text`, buf)
                 FfiConverterOptionalTypeFfiPermissionCheckpointRef.write(value.`permissionContext`, buf)
+                FfiConverterOptionalTypeFfiAgentMessageDeliveryStatus.write(value.`deliveryStatus`, buf)
+                FfiConverterOptionalString.write(value.`deliveryTurnId`, buf)
+                FfiConverterOptionalString.write(value.`blockingTurnId`, buf)
+                FfiConverterOptionalLong.write(value.`queuedAtMs`, buf)
+                FfiConverterOptionalLong.write(value.`dispatchedAtMs`, buf)
+                FfiConverterOptionalLong.write(value.`settledAtMs`, buf)
                 FfiConverterSequenceTypeFfiRichBlock.write(value.`blocks`, buf)
                 FfiConverterOptionalLong.write(value.`timestampMs`, buf)
                 Unit
@@ -18936,6 +19039,38 @@ public object FfiConverterOptionalTypeFfiWorkspaceSummary: FfiConverterRustBuffe
         } else {
             buf.put(1)
             FfiConverterTypeFfiWorkspaceSummary.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeFfiAgentMessageDeliveryStatus: FfiConverterRustBuffer<FfiAgentMessageDeliveryStatus?> {
+    override fun read(buf: ByteBuffer): FfiAgentMessageDeliveryStatus? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeFfiAgentMessageDeliveryStatus.read(buf)
+    }
+
+    override fun allocationSize(value: FfiAgentMessageDeliveryStatus?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeFfiAgentMessageDeliveryStatus.allocationSize(value)
+        }
+    }
+
+    override fun write(value: FfiAgentMessageDeliveryStatus?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeFfiAgentMessageDeliveryStatus.write(value, buf)
         }
     }
 }

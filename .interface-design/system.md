@@ -90,7 +90,7 @@ Always compose official `shadcn/ui` (`base-nova` / `@base-ui/react`) and Orbit p
    - `UserPromptBubble` and `ConversationUserBubble` collapse on clicking anywhere outside the bubble card.
    - Full-history Outline Rail projects all `SessionInsightsView.outline_prompts`, shows up to 17 ticks before folding earlier prompts, and auto-paginates when jumping to unloaded history.
 2. **Steps, Footers & Parallel Viewport Parity** (`stage-step-group.tsx`, `subagents-track.tsx`, `subagent-tab.tsx`, `peer-split-tab.tsx`):
-   - Folded steps compose `Trace`; compaction/wakeup milestones use `Marker`. Groups of ≥ 10 steps show a bottom collapse action.
+   - Folded steps compose `Trace`; compaction/wakeup milestones use `Marker`. Groups of ≥ 10 steps show a bottom collapse action. Stalled live runs or queued subagent deliveries surface inline status & `Interrupt & continue` / `Interrupt & deliver` controls.
    - Historical `TurnFooter` reveals on hover/focus/touch; `StreamStage`, `SubagentTab`, and `PeerSplitTab` share `TurnStageSection`, `getTurnFooter`, and `getTurnTopGapPx`.
    - `SubagentDispatchRow` and `PeerMessageRow` share a negative-bleed row shell aligned at `x = 0px` with prose. Child subagents live exclusively in the Right Side Panel (`selectAgent` routes child selections to parent thread + right panel).
 3. **Composer Dock Stack** (`components/composer/`, `stage-approval-dock.tsx`):
@@ -102,6 +102,6 @@ Always compose official `shadcn/ui` (`base-nova` / `@base-ui/react`) and Orbit p
    - Docked `288px` card (`.overview-card-surface`) or compact popover (`.floating-surface`), ordered **Live Runtime → Deliverables → Secondary Context**.
    - When Overview is closed or narrow (`< 980px`), `TopBar` shows `SubagentCrewMiniDock` and reason-accurate indicator tooltips.
 5. **Sidebar & Side Panel** (`components/sidebar/`, `components/side-panel/`, `settings/`):
-   - `Needs Attention` and `Pinned` share `SidebarConversationRow` and deduplicate below. Each row reserves a `16px` leading signal column and a single non-shifting trailing status/action cell.
+   - `Needs Attention` and `Pinned` share `SidebarConversationRow` and deduplicate below. Each row reserves a `16px` leading signal column (awaiting / error / unread / idle armed timer `<AlarmClock>` / worktree) and a single non-shifting trailing status/action cell (foreground work & running subagents spin; idle timer-waiting threads stay calm & talkable).
    - File preview (`file-viewer-tab.tsx`, `workspace-slice.ts`) uses Rust 250-line prefix highlighting, promise-deduplicated intent prefetch (`pointerdown` + `65ms` hover dwell), stale-while-revalidate cache, and a `120ms` loading grace delay.
-   - Settings uses a `236px` 3-group rail (`APP`, `HOST`, `WORKSPACE`) and harmonized terminal palettes (`--surface-recessed`).
+   - Settings uses a `236px` 3-group rail (`APP` with top-level `Personal Agent`, `HOST` with collapsed manual Relay overrides in `Host Connection`, `WORKSPACE`), zero-config `Automatic Fleet Network` in `Cloud Sync`, and harmonized terminal palettes (`--surface-recessed`).

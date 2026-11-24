@@ -24,13 +24,32 @@ pub enum AttentionState {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActiveTurnBehavior {
-    /// Steer the running turn in-place when supported; otherwise deliver immediately on turn settle.
+    /// Steer the running turn in-place when supported by the provider runtime.
+    ///
+    /// For human prompts on ACP runtimes without native mid-turn steering, this cancels the
+    /// active turn and replaces it immediately while preserving FIFO queued messages.
+    /// For agent-originated messages/notifications, runtimes without native non-destructive
+    /// steering degrade `Steer` to `Queue` so active parent turns are never aborted.
     #[default]
     Steer,
     /// Queue strictly in FIFO order until the current turn transitions to `Idle`.
     Queue,
     /// Interrupt the current turn, await termination, then dispatch the new prompt.
     Interrupt,
+}
+
+/// Authoritative delivery lifecycle state of an agent-originated message / finish notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMessageDeliveryStatus {
+    /// Accepted into the recipient driver's FIFO queue behind an active turn.
+    Queued,
+    /// Dispatched to the underlying provider runtime (e.g. ACP `session/prompt`, Codex `turn/start`/`turn/steer`, Claude stdin frame, Pi RPC).
+    Dispatched,
+    /// Recipient turn processing this message or notification has settled.
+    Settled,
+    /// Dropped before dispatch (e.g. hard user Stop or driver exit while still queued).
+    Dropped,
 }
 
 /// Isolation mode when creating a workspace.

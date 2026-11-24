@@ -8,6 +8,21 @@ import type {
   TimelineItemView,
 } from "@/lib/orbit-ipc";
 
+function isAgentForegroundRunningLocal(
+  agent: Pick<AgentCardView, "is_running" | "has_background_tasks" | "status_label">,
+): boolean {
+  if (!agent.is_running) return false;
+  if (typeof agent.has_background_tasks === "boolean") {
+    return !agent.has_background_tasks;
+  }
+  const lbl = agent.status_label.trim();
+  return !(
+    /^waiting\b/i.test(lbl) ||
+    /^running\s*\(.*background task/i.test(lbl) ||
+    /^background task$/i.test(lbl)
+  );
+}
+
 export type ResolvedSubagentStatus =
   | "awaiting_permission"
   | "running"
@@ -61,8 +76,14 @@ const STATUS_PRIORITY: Record<ResolvedSubagentStatus, number> = {
 function mapManagedStatus(agent: AgentCardView & { status?: { state: string } }): ResolvedSubagentStatus {
   const state = agent.status?.state;
   if (agent.is_awaiting_permission || state === "awaiting_permission") return "awaiting_permission";
-  if (agent.is_running || agent.has_background_tasks ||
-      state === "initializing" || state === "running" || state === "autonomous_wakeup") return "running";
+  if (
+    isAgentForegroundRunningLocal(agent) ||
+    state === "initializing" ||
+    state === "running" ||
+    state === "autonomous_wakeup"
+  ) {
+    return "running";
+  }
   const lowerLabel = agent.status_label?.toLowerCase() ?? "";
   if (state === "error" || /error|fail/.test(lowerLabel)) return "failed";
   if (state === "closed" || /cancel|interrupt|stopped|closed/.test(lowerLabel)) return "canceled";

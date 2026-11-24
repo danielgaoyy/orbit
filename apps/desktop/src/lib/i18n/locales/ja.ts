@@ -25,6 +25,7 @@ export const ja: MessageDictionary = {
   "common.reset": "リセット",
   "common.hide": "閉じる",
   "common.local": "ローカル",
+  "common.remote": "リモート",
   "common.online": "オンライン",
   "common.offline": "オフライン",
   "common.connecting": "接続中",
@@ -222,6 +223,7 @@ export const ja: MessageDictionary = {
   "sidebar.error": "エラー",
   "sidebar.subagentRunning": "サブエージェント実行中",
   "sidebar.backgroundTaskRunning": "バックグラウンドタスク実行中",
+  "sidebar.timerArmed": "タイマー待機中",
   "sidebar.addProject": "プロジェクトを追加",
   "sidebar.addProjectFrom": "ホストからプロジェクトを追加",
   "sidebar.hostLocal": "ローカル",
@@ -627,6 +629,7 @@ export const ja: MessageDictionary = {
   "settings.navCapabilities": "拡張機能",
   "settings.navExtensions": "ワークスペースと拡張",
   "settings.navNotificationsSync": "通知と同期",
+  "settings.navPersonalRouter": "パーソナルエージェント",
   "settings.subTabGeneral": "一般",
   "settings.subTabShortcuts": "ショートカット",
   "settings.subTabConnectionPairing": "接続とペアリング",
@@ -1104,6 +1107,18 @@ export const ja: MessageDictionary = {
   "review.markUnviewed": "未確認に戻す",
   "review.openFullFile": "ファイル全体を開く",
 
+  // Stage 配信・停滞テレメトリ
+  "stage.deliveryQueued": "待機中",
+  "stage.deliveryQueuedWaiting": "待機中 · {duration} 経過",
+  "stage.deliveryProcessing": "処理中",
+  "stage.deliveryDeliveredWaited": "配信済み · {duration} 待機",
+  "stage.deliveryDropped": "配信前にキャンセル",
+  "stage.interruptAndDeliver": "中断して配信",
+  "stage.interruptAndContinue": "中断して続行",
+  "stage.thinkingNoProgress": "思考中（目立った進展なし）",
+  "stage.waitingForResponse": "応答を待機中",
+  "stage.queuedCount": "{count} 件待機中",
+
   // Session Overview HUD
   "overview.title": "概要",
   "overview.ariaLabel": "セッション概要",
@@ -1184,7 +1199,6 @@ export const ja: MessageDictionary = {
   "stage.stopped": "停止",
   "stage.finished": "完了",
   "stage.message": "メッセージ",
-  "stage.waitingForResponse": "応答待ち",
   "stage.offline": "オフライン",
   "stage.answeredQuestion": "確認事項 {count} 件に回答済み",
   "stage.answeredQuestions": "確認事項 {count} 件に回答済み",
@@ -1326,4 +1340,40 @@ export const ja: MessageDictionary = {
   "overview.stoppedSubagentToast": "{name} を停止しました",
   "overview.stopSubagentFailedToast": "停止に失敗しました：{error}",
   "overview.moreSubagents": "他 {count} 件のサブエージェント",
+
+  // Personal Agent & Zero-Config Fleet Network
+  "settings.personalAgentTitle": "パーソナルエージェント",
+  "settings.personalAgentDesc":
+    "Fleet 内の 1 台のホストを選んで常駐のパーソナルエージェントを動かします。左側のホスト選択とは独立し、長期記憶と全ホスト連携を維持します。",
+  "settings.personalAgentOpenSession": "セッションを開く",
+  "settings.personalAgentChooseHost": "ホストを選択（マルチホスト Fleet）",
+  "settings.personalAgentChooseHostDesc":
+    "プライマリのパーソナルエージェントを動かすホストをワンクリックで選択します。全デバイスから自動的に接続されます。",
+  "settings.personalAgentScanFleet": "ホストを更新",
+  "settings.personalAgentScanning": "更新中…",
+  "settings.personalAgentNoHosts": "接続中のホストがまだ見つかりません。",
+  "settings.personalAgentActiveBadge": "使用中",
+  "settings.personalAgentUseAction": "これを使う",
+  "settings.personalAgentActivating": "有効化中…",
+  "settings.personalAgentOpenAction": "セッションを開く",
+  "settings.personalAgentEngineLabel": "エンジン",
+  "settings.personalAgentEngineHint": "選択中のホストへ推奨設定のまま即座に切り替えます。",
+  "settings.personalAgentAdvancedOptions": "詳細設定と外部 Hermes ブリッジ",
+  "settings.personalAgentScopeLabel": "Fleet 可視範囲",
+  "settings.personalAgentGuardianLabel": "3 段階 Guardian 事前レビュー",
+  "settings.personalAgentShareHermesMemory": "ホストの ~/.hermes/memories/ とスキルを共有",
+  "settings.personalAgentCustomDiscipline": "カスタムルーティング指示（SOUL に追記）",
+  "settings.personalAgentWebhookUrl": "外部 Hermes Webhook URL（任意）",
+  "settings.personalAgentWebhookSecret": "Webhook Bearer シークレット",
+  "settings.personalAgentSavePolicy": "ポリシーのみ保存",
+  "settings.personalAgentExportBridge": "外部 Hermes MCP ブリッジを出力",
+  "settings.fleetNetworkTitle": "自動 Fleet ネットワーク",
+  "settings.fleetNetworkAutoDesc":
+    "E2EE リレー、SSH トンネル、マルチホップ Peer-Bridge は同一アカウントの全デバイスへ自動同期され、閉域 LAN のマシンにもそのまま接続できます。",
+  "settings.fleetNetworkMissingReachability":
+    "一部のホストは現在ローカル LAN 内でのみ到達可能です。共有の SSH ホストまたは Peer-Bridge デーモン経由で自動的に中継されます。",
+  "settings.advancedRelayTitle": "高度なネットワークとカスタムリレー",
+  "settings.advancedRelayAutoBadge": "自動管理",
+  "settings.advancedRelayDesc":
+    "クラウド同期と SSH Peer-Bridge により自動管理されます。このホストのリレーを手動で上書きする場合のみ展開してください。",
 };

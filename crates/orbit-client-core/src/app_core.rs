@@ -14,26 +14,27 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use orbit_crypto::PairingOffer;
 use orbit_protocol::{
-    AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentMessageKind,
-    AgentProfile, AgentStatus, AgentSummary, ArtifactDetail, ArtifactSummary, AttentionState,
-    BackgroundTaskInfo, BrowserPolicyConfig, BrowserSessionSummary, ConditionalTimerRecord,
-    ConditionalTimerState, ConnectedHostSummary, ContextOccupancyBreakdown, DirectoryEntry,
-    DiscoveredProject, EventTriggerDelivery, ExternalMcpServerRecord, GitCommitResult,
-    GitCreatePrResult, GitMutationOutcome, GitPushResult, GitStatusSnapshot, GoalRunRecord,
-    GuardianAssessment, GuardianAuditEntry, GuardianPolicyConfig, HookExecutionRecord, HookScope,
-    HostProjectEntry, HostSyncState, ImChannelRecord, ImPlatform, ImThreadBinding, KeepAwakeStatus,
-    LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
-    ManagedSkillRecord, McpProbeResult, ModelOption, MonitorWatchRecord, OrchestrationConfig,
-    OrchestrationSkillInfo, PathScopedRule, PendingPermissionSummary, PermissionCheckpointRef,
-    PromptBadge, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot,
-    ProviderSubagentDescriptor, ProviderSubagentEvent, PushDeviceRecord, PushPlatform,
-    PushPreferences, QuestionItem, QueuedPromptView, ReasoningEffort, RuleTriggerMode,
-    ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode, SkillWriteScope,
-    TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelineOutlinePrompt, TimelinePayload,
-    TimerCondition, ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot, WireMessage,
-    WorkflowRunRecord, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind,
-    WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo,
-    WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior,
+    AgentMessageDeliveryStatus, AgentMessageKind, AgentProfile, AgentStatus, AgentSummary,
+    ArtifactDetail, ArtifactSummary, AttentionState, BackgroundTaskInfo, BrowserPolicyConfig,
+    BrowserSessionSummary, ConditionalTimerRecord, ConditionalTimerState, ConnectedHostSummary,
+    ContextOccupancyBreakdown, DirectoryEntry, DiscoveredProject, EventTriggerDelivery,
+    ExternalMcpServerRecord, GitCommitResult, GitCreatePrResult, GitMutationOutcome, GitPushResult,
+    GitStatusSnapshot, GoalRunRecord, GuardianAssessment, GuardianAuditEntry, GuardianPolicyConfig,
+    HookExecutionRecord, HookScope, HostProjectEntry, HostSyncState, ImChannelRecord, ImPlatform,
+    ImThreadBinding, KeepAwakeStatus, LifecycleHookRule, LspDiagnostic, LspLocation,
+    LspServerStatus, LspSymbolInfo, ManagedSkillRecord, McpProbeResult, ModelOption,
+    MonitorWatchRecord, OrchestrationConfig, OrchestrationSkillInfo, PathScopedRule,
+    PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
+    ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
+    PushDeviceRecord, PushPlatform, PushPreferences, QuestionItem, QueuedPromptView,
+    ReasoningEffort, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode,
+    SkillWriteScope, TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelineOutlinePrompt,
+    TimelinePayload, TimerCondition, ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot,
+    WireMessage, WorkflowRunRecord, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion,
+    WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent,
+    WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome,
+    WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -42,13 +43,14 @@ use uuid::Uuid;
 
 use crate::cloud_sync::{
     CloudSyncDevicePollStatus, CloudSyncDevicePollView, CloudSyncError, CloudSyncResultView,
-    CloudSyncStatusView, DevicePollOutcome, GitHubCloudClient, GitHubDeviceFlowStartView,
-    LocalHostSyncRecord, PersistedCloudSyncConfig, SyncedPreferenceEntry,
-    decrypt_remote_with_cached_key, generate_sync_passphrase, load_sync_config_from_store,
-    load_sync_meta_from_store, load_sync_prefs_from_store, merge_cloud_vault, now_unix_ms,
-    push_vault_payload, resolve_github_client_id, save_sync_config_to_store,
-    save_sync_meta_to_store, save_sync_prefs_to_store, stored_host_from_synced,
-    unlock_remote_vault_with_passphrase,
+    CloudSyncStatusView, DevicePollOutcome, GistConditionalFetch, GitHubCloudClient,
+    GitHubDeviceFlowStartView, LocalHostSyncRecord, PersistedCloudSyncConfig,
+    SyncedPreferenceEntry, decrypt_remote_with_cached_key, generate_sync_passphrase,
+    is_loopback_endpoint, load_fleet_network_from_store, load_sync_config_from_store,
+    load_sync_meta_from_store, load_sync_prefs_from_store, merge_cloud_vault_with_network,
+    now_unix_ms, push_vault_payload, resolve_github_client_id, save_fleet_network_to_store,
+    save_sync_config_to_store, save_sync_meta_to_store, save_sync_prefs_to_store,
+    stored_host_from_synced, unlock_remote_vault_with_passphrase, vault_fingerprint,
 };
 pub use crate::contract::{
     BrowserActionResponseView, BrowserSessionsSnapshotView, CancelWorkflowRunRequest,
@@ -69,8 +71,9 @@ use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 
 use crate::desktop_ops::{
     StagedAttachmentInfo, bootstrap_ssh_host_and_pair, discover_local_daemon_pairing_uri,
-    extract_ws_port, normalize_relay_input, read_local_daemon_identity, read_local_workspace_file,
-    read_local_workspace_file_with_writable, stage_local_attachment,
+    extract_ws_port, normalize_relay_input, provision_ssh_tunnel_relay_with_home,
+    read_local_daemon_identity, read_local_workspace_file, read_local_workspace_file_with_writable,
+    resolve_orbit_home_dir, stage_local_attachment,
 };
 use crate::render::{
     DiffFileView, HighlightedLineView, RichBlockView, TerminalGridEmulator, TerminalScreenView,
@@ -80,7 +83,7 @@ use crate::render::{
 use crate::stage::{self, SessionInsightsView, StageTurnView};
 use crate::{
     ClientCoreError, ClientInboundEvent, HostConnectionState, HostRouteMode, HostSessionHandle,
-    SavedHostProfile, connect_smart,
+    SavedHostProfile, connect_smart, connect_via_peer_bridge,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,6 +418,8 @@ pub struct HostCardView {
     pub pending_approval_count: u32,
     #[serde(default)]
     pub supports_server_queue: bool,
+    #[serde(default)]
+    pub is_local: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,6 +450,8 @@ pub struct AgentCardView {
     pub is_running: bool,
     #[serde(default)]
     pub has_background_tasks: bool,
+    #[serde(default)]
+    pub has_armed_timers: bool,
     #[serde(default)]
     pub has_running_subagents: bool,
     pub is_awaiting_permission: bool,
@@ -691,6 +698,18 @@ pub enum TimelineItemView {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_context: Option<PermissionCheckpointRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_status: Option<AgentMessageDeliveryStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocking_turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queued_at_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatched_at_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settled_at_ms: Option<i64>,
         blocks: Vec<RichBlockView>,
         #[serde(default)]
         timestamp_ms: Option<i64>,
@@ -999,6 +1018,7 @@ type PendingGitMutationTx =
 struct HostMemoryState {
     profile: SavedHostProfile,
     is_local: bool,
+    bridge_host_ids: Vec<String>,
     last_error: Option<String>,
     via_ssh_tunnel: bool,
     last_ping_ms: Option<u32>,
@@ -1219,6 +1239,7 @@ impl HostMemoryState {
         Self {
             profile,
             is_local: false,
+            bridge_host_ids: Vec::new(),
             last_error: None,
             via_ssh_tunnel: false,
             last_ping_ms: None,
@@ -1681,6 +1702,7 @@ impl HostMemoryState {
                 remote_daemon_port: Some(self.profile.remote_daemon_port),
                 custom_direct_endpoint: self.profile.custom_direct_endpoint.clone(),
                 pairing_secret_updated_at_ms: self.profile.pairing_secret_updated_at_ms,
+                bridge_host_ids: self.bridge_host_ids.clone(),
             },
         }
     }
@@ -1729,6 +1751,7 @@ impl HostMemoryState {
             agent_count: active_agent_count,
             pending_approval_count,
             supports_server_queue: self.daemon_protocol_version.is_some_and(|pv| pv >= 4),
+            is_local: self.is_local,
         }
     }
 }
@@ -1737,6 +1760,7 @@ impl HostMemoryState {
 pub struct OrbitAppCore {
     runtime: tokio::runtime::Runtime,
     store: Arc<OrbitStore>,
+    is_ephemeral_memory: bool,
     hosts: Arc<RwLock<HashMap<String, HostMemoryState>>>,
     projects: Arc<RwLock<HashMap<String, ClientProjectView>>>,
     project_order: Arc<RwLock<Vec<String>>>,
@@ -1750,6 +1774,9 @@ pub struct OrbitAppCore {
     cloud_sync_in_flight: Arc<AtomicBool>,
     cloud_sync_last_auto_ms: Arc<AtomicU64>,
     cloud_sync_mutex: Arc<tokio::sync::Mutex<()>>,
+    fleet_relay_fabric_in_flight: Arc<AtomicBool>,
+    fleet_relay_auto_attempted: Arc<AtomicBool>,
+    last_vault_fingerprint: Arc<RwLock<Option<String>>>,
 }
 
 impl OrbitAppCore {
@@ -1766,7 +1793,7 @@ impl OrbitAppCore {
                 "Purged legacy daemon timeline_events rows from client replica database"
             );
         }
-        Self::from_store(store, auto_discover_local_daemon)
+        Self::from_store(store, auto_discover_local_daemon, false)
     }
 
     pub fn open_in_memory() -> Result<Arc<Self>, ClientCoreError> {
@@ -1777,12 +1804,13 @@ impl OrbitAppCore {
         auto_discover_local_daemon: bool,
     ) -> Result<Arc<Self>, ClientCoreError> {
         let store = Arc::new(OrbitStore::open_in_memory()?);
-        Self::from_store(store, auto_discover_local_daemon)
+        Self::from_store(store, auto_discover_local_daemon, true)
     }
 
     fn from_store(
         store: Arc<OrbitStore>,
         auto_discover_local_daemon: bool,
+        is_ephemeral_memory: bool,
     ) -> Result<Arc<Self>, ClientCoreError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -1809,16 +1837,32 @@ impl OrbitAppCore {
                 let is_saved_local = local_identity
                     .as_ref()
                     .is_some_and(|(id, pubkey)| *id == h.host_id && *pubkey == h.daemon_pubkey_b64);
+                let route_mode = HostRouteMode::from_opt_str(h.meta.route_mode.as_deref());
+                let direct_endpoints = if should_strip_remote_loopback(
+                    is_saved_local,
+                    h.meta.ssh_alias.as_deref(),
+                    route_mode,
+                    h.relay_url.as_deref(),
+                    &h.direct_endpoints,
+                ) {
+                    h.direct_endpoints
+                        .into_iter()
+                        .filter(|ep| !is_loopback_endpoint(ep))
+                        .collect()
+                } else {
+                    h.direct_endpoints
+                };
+                let bridge_host_ids = h.meta.bridge_host_ids;
                 let profile = SavedHostProfile {
                     host_id: h.host_id.clone(),
                     hostname: h.display_name,
                     custom_name: h.meta.custom_name,
                     ssh_alias: h.meta.ssh_alias,
-                    route_mode: HostRouteMode::from_opt_str(h.meta.route_mode.as_deref()),
+                    route_mode,
                     remote_daemon_port: h.meta.remote_daemon_port.unwrap_or(6868),
                     custom_direct_endpoint: h.meta.custom_direct_endpoint,
                     daemon_pubkey_b64: h.daemon_pubkey_b64,
-                    direct_endpoints: h.direct_endpoints,
+                    direct_endpoints,
                     relay_url: h.relay_url,
                     pairing_secret: h.pairing_secret,
                     pairing_secret_updated_at_ms: h.meta.pairing_secret_updated_at_ms,
@@ -1826,6 +1870,7 @@ impl OrbitAppCore {
                 };
                 let mut mem = HostMemoryState::new(profile);
                 mem.is_local = is_saved_local;
+                mem.bridge_host_ids = bridge_host_ids;
                 if let Ok(ws_list) = store.list_replica_workspaces(&h.host_id) {
                     mem.workspaces = ws_list;
                 }
@@ -1925,6 +1970,7 @@ impl OrbitAppCore {
         let core = Arc::new(Self {
             runtime,
             store,
+            is_ephemeral_memory,
             hosts: Arc::new(RwLock::new(initial_hosts)),
             projects: Arc::new(RwLock::new(initial_projects)),
             project_order: Arc::new(RwLock::new(initial_project_order)),
@@ -1938,6 +1984,9 @@ impl OrbitAppCore {
             cloud_sync_in_flight: Arc::new(AtomicBool::new(false)),
             cloud_sync_last_auto_ms: Arc::new(AtomicU64::new(0)),
             cloud_sync_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            fleet_relay_fabric_in_flight: Arc::new(AtomicBool::new(false)),
+            fleet_relay_auto_attempted: Arc::new(AtomicBool::new(false)),
+            last_vault_fingerprint: Arc::new(RwLock::new(None)),
         });
         if !core.store.is_replica_fts_backfill_done() {
             let store_bg = Arc::clone(&core.store);
@@ -1987,6 +2036,9 @@ impl OrbitAppCore {
                     }
                 }
             });
+        }
+        if !core.is_ephemeral_memory {
+            core.spawn_cloud_sync_etag_poller();
         }
         Ok(core)
     }
@@ -2116,6 +2168,7 @@ impl OrbitAppCore {
         let state = guard.get(host_id)?;
         let prefs_guard = self.thread_prefs.read().ok();
         let active_subagent_parents = collect_parents_with_running_subagents(&guard);
+        let armed_timer_agents = collect_agents_with_armed_timers(state);
         let mut agents: Vec<AgentCardView> = state
             .agents
             .values()
@@ -2125,7 +2178,8 @@ impl OrbitAppCore {
                     .and_then(|p| p.get(&(host_id.to_string(), a.agent_id.clone())));
                 let has_running_subagents =
                     active_subagent_parents.contains(&(host_id.to_string(), a.agent_id.clone()));
-                agent_to_card_view_with_subagents(a, pref, has_running_subagents)
+                let has_armed_cond_timer = armed_timer_agents.contains(&a.agent_id);
+                agent_to_card_view_with_timers(a, pref, has_running_subagents, has_armed_cond_timer)
             })
             .collect();
         agents.sort_by(|a, b| b.updated_at_rfc3339.cmp(&a.updated_at_rfc3339));
@@ -2212,13 +2266,19 @@ impl OrbitAppCore {
             && let Some(cached) = host_state.stage_cache.get(agent_id)
         {
             let prefs_guard = self.thread_prefs.read().ok();
+            let armed_timer_agents = collect_agents_with_armed_timers(host_state);
             let current_agent_card = host_state.agents.get(agent_id).map(|ag| {
                 let pref = prefs_guard
                     .as_ref()
                     .and_then(|p| p.get(&(host_id.to_string(), ag.agent_id.clone())));
                 let has_running_subagents =
                     agent_has_running_subagents(&read_guard, host_id, &ag.agent_id);
-                agent_to_card_view_with_subagents(ag, pref, has_running_subagents)
+                agent_to_card_view_with_timers(
+                    ag,
+                    pref,
+                    has_running_subagents,
+                    armed_timer_agents.contains(&ag.agent_id),
+                )
             });
             return reader(current_agent_card.as_ref(), Some(cached));
         }
@@ -2234,13 +2294,19 @@ impl OrbitAppCore {
         self.hydrate_timeline_if_missing(host_state, agent_id);
 
         let prefs_guard = self.thread_prefs.read().ok();
+        let armed_timer_agents = collect_agents_with_armed_timers(host_state);
         let card_for = |ag: &AgentSummary| -> AgentCardView {
             let pref = prefs_guard
                 .as_ref()
                 .and_then(|p| p.get(&(host_id.to_string(), ag.agent_id.clone())));
             let has_running_subagents =
                 active_subagent_parents.contains(&(host_id.to_string(), ag.agent_id.clone()));
-            agent_to_card_view_with_subagents(ag, pref, has_running_subagents)
+            agent_to_card_view_with_timers(
+                ag,
+                pref,
+                has_running_subagents,
+                armed_timer_agents.contains(&ag.agent_id),
+            )
         };
 
         let current_agent_card = host_state.agents.get(agent_id).map(&card_for);
@@ -2281,6 +2347,7 @@ impl OrbitAppCore {
                 aux_dirty: true,
             });
             let (all_resolved_perms, all_resolved_questions) = collect_resolved_gates(raw_events);
+            let delivery_updates = collect_delivery_updates(raw_events);
 
             let force_full = needs_build
                 || dirty_state.force_full
@@ -2313,6 +2380,7 @@ impl OrbitAppCore {
                         ev,
                         &all_resolved_perms,
                         &all_resolved_questions,
+                        &delivery_updates,
                         ev_idx >= highlight_floor,
                         &mut host_state.markdown_cache,
                         &mut host_state.streaming_markdown_cache,
@@ -2380,6 +2448,7 @@ impl OrbitAppCore {
                             ev,
                             &all_resolved_perms,
                             &all_resolved_questions,
+                            &delivery_updates,
                             true,
                             &mut host_state.markdown_cache,
                             &mut host_state.streaming_markdown_cache,
@@ -2941,11 +3010,12 @@ impl OrbitAppCore {
 
         let agent_card = {
             let prefs_guard = self.thread_prefs.read().ok();
+            let has_armed_cond = collect_agents_with_armed_timers(host_state).contains(agent_id);
             host_state.agents.get(agent_id).map(|a| {
                 let pref = prefs_guard
                     .as_ref()
                     .and_then(|p| p.get(&(host_id.to_string(), a.agent_id.clone())));
-                agent_to_card_view_with_subagents(a, pref, has_running_subagents)
+                agent_to_card_view_with_timers(a, pref, has_running_subagents, has_armed_cond)
             })
         };
         let agent_cwd = agent_card.as_ref().map(|a| a.cwd.clone());
@@ -2964,6 +3034,8 @@ impl OrbitAppCore {
         let mut all_resolved_questions: HashMap<String, Vec<Vec<String>>> = HashMap::new();
         let mut delta_resolved_perms: HashMap<String, String> = HashMap::new();
         let mut delta_resolved_questions: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+        let mut delivery_updates = collect_delivery_updates(&events);
+        let mut touched_delivery_ids: HashSet<String> = HashSet::new();
         let mut latest_seq = if needs_reset {
             actual_max_seq
         } else {
@@ -2992,16 +3064,31 @@ impl OrbitAppCore {
                         delta_resolved_questions.insert(request_id.clone(), answers.clone());
                     }
                 }
+                TimelinePayload::AgentMessageDeliveryUpdated { message_id, .. }
+                    if effective_since_seq > 0 && ev.seq > effective_since_seq =>
+                {
+                    touched_delivery_ids.insert(message_id.clone());
+                }
                 _ => {}
             }
         }
+        let _ = &mut delivery_updates;
 
         let mut upserted_items = Vec::new();
         let highlight_floor = events.len().saturating_sub(48);
         for (ev_idx, ev) in events.iter().enumerate() {
             let is_local_notice =
                 ev.seq == 0 && matches!(ev.payload, TimelinePayload::Notice { .. });
-            if effective_since_seq > 0 && ev.seq <= effective_since_seq && !is_local_notice {
+            let is_updated_agent_msg = matches!(
+                &ev.payload,
+                TimelinePayload::AgentMessage { message_id, .. }
+                    if touched_delivery_ids.contains(message_id)
+            );
+            if effective_since_seq > 0
+                && ev.seq <= effective_since_seq
+                && !is_local_notice
+                && !is_updated_agent_msg
+            {
                 continue;
             }
             if let Some(item) = render_timeline_event_view(
@@ -3010,6 +3097,7 @@ impl OrbitAppCore {
                 ev,
                 &all_resolved_perms,
                 &all_resolved_questions,
+                &delivery_updates,
                 ev_idx >= highlight_floor,
                 &mut host_state.markdown_cache,
                 &mut host_state.streaming_markdown_cache,
@@ -3162,6 +3250,7 @@ impl OrbitAppCore {
         if let Some(ref hg) = hosts_guard {
             let active_subagent_parents = collect_parents_with_running_subagents(hg);
             for (hid, state) in hg.iter() {
+                let armed_timer_agents = collect_agents_with_armed_timers(state);
                 let agents_with_order: Vec<(AgentCardView, i64)> = state
                     .agents
                     .values()
@@ -3176,7 +3265,12 @@ impl OrbitAppCore {
                         let has_running_subagents =
                             active_subagent_parents.contains(&(hid.clone(), a.agent_id.clone()));
                         (
-                            agent_to_card_view_with_subagents(a, pref, has_running_subagents),
+                            agent_to_card_view_with_timers(
+                                a,
+                                pref,
+                                has_running_subagents,
+                                armed_timer_agents.contains(&a.agent_id),
+                            ),
                             order,
                         )
                     })
@@ -4341,6 +4435,14 @@ impl OrbitAppCore {
                 if !direct_endpoints.contains(&loopback) {
                     direct_endpoints.insert(0, loopback);
                 }
+            } else if should_strip_remote_loopback(
+                false,
+                ssh_alias.as_deref(),
+                route_mode,
+                offer.relay_url.as_deref(),
+                &direct_endpoints,
+            ) {
+                direct_endpoints.retain(|ep| !is_loopback_endpoint(ep));
             }
 
             let pairing_secret_updated_at_ms = match prev {
@@ -4372,9 +4474,7 @@ impl OrbitAppCore {
                 .entry(offer.host_id.clone())
                 .or_insert_with(|| HostMemoryState::new(profile.clone()));
             entry.profile = profile;
-            if is_local_daemon {
-                entry.is_local = true;
-            }
+            entry.is_local = is_local_daemon;
             entry.ssh_heal_attempted = false;
             (entry.to_card(), entry.to_stored_host())
         };
@@ -4663,7 +4763,22 @@ impl OrbitAppCore {
         };
         self.emit(|revision| CoreNotification::FleetChanged { revision });
 
-        match connect_smart(&profile, Some(self.store.clone())).await {
+        let connect_res = match connect_smart(&profile, Some(self.store.clone())).await {
+            Ok(handle) => Ok(handle),
+            Err(smart_err) if !smart_err.is_auth_error() => {
+                if let Some(bridged) = self
+                    .try_connect_host_via_peer_bridges(host_id, &profile)
+                    .await
+                {
+                    Ok(bridged)
+                } else {
+                    Err(smart_err)
+                }
+            }
+            Err(smart_err) => Err(smart_err),
+        };
+
+        match connect_res {
             Ok(handle) => {
                 let mut rx = handle.subscribe();
                 let welcome_host = handle.welcome_host.clone();
@@ -4972,6 +5087,13 @@ impl OrbitAppCore {
                 for queued_msg in queued_outbox {
                     let _ = handle.send_wire(queued_msg).await;
                 }
+
+                // Wake any disconnected/LAN-isolated peers that can now bridge through this host,
+                // and ensure the account-wide zero-config fleet relay/mesh fabric is converging.
+                self.kick_pending_host_reconnects_excluding(host_id);
+                if !self.is_ephemeral_memory {
+                    self.spawn_on_host_connected_fabric(host_id.to_string());
+                }
             }
             Err(err) => {
                 tracing::warn!(host_id = %host_id, error = %err, "Host connection attempt failed");
@@ -5189,6 +5311,7 @@ impl OrbitAppCore {
         let mut migrated_opt_pref: Option<(String, String)> = None;
         let mut rewound_seen_reset: Option<(String, u64)> = None;
         let mut adopted_daemon_relay = false;
+        let mut schedule_vault_refresh = false;
         let mut persist_has_older: Option<(String, bool)> = None;
         let mut history_page_to_persist: Option<Vec<TimelineEvent>> = None;
 
@@ -5416,7 +5539,9 @@ impl OrbitAppCore {
                         let existing_pref = prefs_guard
                             .as_ref()
                             .and_then(|p| p.get(&(host_id.to_string(), ag_id.clone())));
-                        agent_to_card_view(&agent, existing_pref)
+                        let has_armed_cond =
+                            collect_agents_with_armed_timers(state).contains(&ag_id);
+                        agent_to_card_view_with_timers(&agent, existing_pref, false, has_armed_cond)
                     };
                     if agent.read_seq > 0 || agent.is_pinned {
                         server_pref_syncs.push((
@@ -6023,10 +6148,13 @@ impl OrbitAppCore {
                             updated_at_ms: existing_pref.map(|p| p.updated_at_ms).unwrap_or(0),
                         };
                         let has_running_subagents = host_agent_has_running_subagents(state, &ag_id);
-                        agent_to_card_view_with_subagents(
+                        let has_armed_cond =
+                            collect_agents_with_armed_timers(state).contains(&ag_id);
+                        agent_to_card_view_with_timers(
                             &agent,
                             Some(&reset_pref),
                             has_running_subagents,
+                            has_armed_cond,
                         )
                     };
                     let mut ordered = events;
@@ -7312,8 +7440,24 @@ impl OrbitAppCore {
                         notify_host = true;
                     }
                 }
+                WireMessage::FleetVaultChanged {
+                    vault_fingerprint, ..
+                } => {
+                    let known = self
+                        .last_vault_fingerprint
+                        .read()
+                        .ok()
+                        .and_then(|g| g.clone());
+                    if known.as_deref() != Some(vault_fingerprint.as_str()) {
+                        schedule_vault_refresh = true;
+                    }
+                }
                 _ => {}
             }
+        }
+
+        if schedule_vault_refresh {
+            self.schedule_cloud_auto_sync(true);
         }
 
         if let Some(stored) = host_to_persist {
@@ -8758,6 +8902,19 @@ impl OrbitAppCore {
     }
 
     pub fn interrupt_agent(&self, host_id: &str, agent_id: &str) {
+        self.interrupt_agent_with_options(host_id, agent_id, false);
+    }
+
+    pub fn interrupt_agent_and_continue(&self, host_id: &str, agent_id: &str) {
+        self.interrupt_agent_with_options(host_id, agent_id, true);
+    }
+
+    pub fn interrupt_agent_with_options(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        preserve_queue: bool,
+    ) {
         let req_id = Uuid::new_v4();
         if !agent_id.starts_with("opt_")
             && let Ok(mut guard) = self.hosts.write()
@@ -8771,6 +8928,7 @@ impl OrbitAppCore {
             WireMessage::InterruptTurn {
                 request_id: req_id,
                 agent_id: agent_id.to_string(),
+                preserve_queue,
             },
         );
     }
@@ -10837,12 +10995,25 @@ impl OrbitAppCore {
         label: Option<String>,
         pairing_uri: &str,
     ) {
+        self.add_connected_host_with_transport(host_id, label, pairing_uri, None, None);
+    }
+
+    pub fn add_connected_host_with_transport(
+        self: &Arc<Self>,
+        host_id: &str,
+        label: Option<String>,
+        pairing_uri: &str,
+        ssh_alias: Option<String>,
+        remote_daemon_port: Option<u16>,
+    ) {
         self.dispatch_wire_queued(
             host_id,
             WireMessage::AddConnectedHost {
                 request_id: Uuid::new_v4(),
                 label,
                 pairing_uri: pairing_uri.to_string(),
+                ssh_alias,
+                remote_daemon_port,
             },
         );
     }
@@ -10878,7 +11049,14 @@ impl OrbitAppCore {
     /// 1-click Mesh Sync: generates pairing URIs for all other saved hosts in the user's fleet
     /// and registers them as Daemon-to-Daemon Connected Hosts on `target_host_id`.
     pub fn sync_fleet_connected_hosts(self: &Arc<Self>, target_host_id: &str) -> u32 {
-        let peers: Vec<(String, String)> = {
+        struct MeshPeerSpec {
+            host_id: String,
+            label: String,
+            uri: String,
+            ssh_alias: Option<String>,
+            remote_daemon_port: Option<u16>,
+        }
+        let peers: Vec<MeshPeerSpec> = {
             let Ok(guard) = self.hosts.read() else {
                 return 0;
             };
@@ -10892,21 +11070,12 @@ impl OrbitAppCore {
                     {
                         endpoints.insert(0, custom.clone());
                     }
-                    // Strip loopback-only endpoints when syncing across different machines if another route exists,
-                    // preventing remote daemons from dialing a local process on `127.0.0.1`.
+                    // Strip loopback-only endpoints when syncing across different machines so
+                    // remote daemons never dial a local process on `127.0.0.1`.
                     let non_loopback: Vec<String> = endpoints
-                        .iter()
-                        .filter(|ep| {
-                            let lower = ep.to_ascii_lowercase();
-                            !lower.contains("://127.0.0.1")
-                                && !lower.contains("://localhost")
-                                && !lower.contains("://[::1]")
-                        })
-                        .cloned()
+                        .into_iter()
+                        .filter(|ep| !is_loopback_endpoint(ep))
                         .collect();
-                    if !non_loopback.is_empty() || h.profile.relay_url.is_some() {
-                        endpoints = non_loopback;
-                    }
                     let pairing_secret = if h.is_local {
                         crate::desktop_ops::read_local_daemon_pairing_secret()
                             .filter(|s| !s.trim().is_empty())
@@ -10918,20 +11087,303 @@ impl OrbitAppCore {
                         host_id: h.profile.host_id.clone(),
                         hostname: h.profile.hostname.clone(),
                         daemon_pubkey_b64: h.profile.daemon_pubkey_b64.clone(),
-                        direct_endpoints: endpoints,
+                        direct_endpoints: non_loopback,
                         relay_url: h.profile.relay_url.clone(),
                         pairing_secret,
                     };
                     let uri = offer.to_qr_uri().ok()?;
-                    Some((h.profile.effective_display_name(), uri))
+                    Some(MeshPeerSpec {
+                        host_id: h.profile.host_id.clone(),
+                        label: h.profile.effective_display_name(),
+                        uri,
+                        ssh_alias: h.profile.ssh_alias.clone(),
+                        remote_daemon_port: Some(h.profile.remote_daemon_port),
+                    })
                 })
                 .collect()
         };
         let count = peers.len() as u32;
-        for (label, uri) in peers {
-            self.add_connected_host(target_host_id, Some(label), &uri);
+        for peer in peers {
+            self.add_connected_host_with_transport(
+                target_host_id,
+                Some(peer.label),
+                &peer.uri,
+                peer.ssh_alias,
+                peer.remote_daemon_port,
+            );
+            let _ = peer.host_id;
         }
         count
+    }
+
+    async fn try_connect_host_via_peer_bridges(
+        self: &Arc<Self>,
+        target_host_id: &str,
+        target_profile: &SavedHostProfile,
+    ) -> Option<HostSessionHandle> {
+        let mut candidates: Vec<(String, HostSessionHandle)> = Vec::new();
+        {
+            let Ok(guard) = self.hosts.read() else {
+                return None;
+            };
+            let preferred_ids = guard
+                .get(target_host_id)
+                .map(|h| h.bridge_host_ids.clone())
+                .unwrap_or_default();
+            for bridge_id in preferred_ids {
+                if bridge_id != target_host_id
+                    && let Some(bridge) = guard.get(&bridge_id)
+                    && let Some(ref session) = bridge.session
+                {
+                    candidates.push((bridge_id, session.clone()));
+                }
+            }
+            for (hid, h) in guard.iter() {
+                if hid != target_host_id
+                    && !candidates.iter().any(|(existing, _)| existing == hid)
+                    && let Some(ref session) = h.session
+                {
+                    candidates.push((hid.clone(), session.clone()));
+                }
+            }
+        }
+
+        for (bridge_host_id, bridge_session) in candidates {
+            match connect_via_peer_bridge(
+                &bridge_session,
+                target_host_id,
+                &target_profile.daemon_pubkey_b64,
+                &target_profile.pairing_secret,
+                Some(self.store.clone()),
+            )
+            .await
+            {
+                Ok(handle) => {
+                    let stored_to_persist = if let Ok(mut guard) = self.hosts.write()
+                        && let Some(h) = guard.get_mut(target_host_id)
+                    {
+                        if !h.bridge_host_ids.iter().any(|id| id == &bridge_host_id) {
+                            h.bridge_host_ids.insert(0, bridge_host_id);
+                            h.bridge_host_ids.truncate(16);
+                            Some(h.to_stored_host())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(stored) = stored_to_persist {
+                        let _ = self.store.upsert_client_host(&stored);
+                        let now_ms = now_unix_ms();
+                        self.record_cloud_meta_mutation(|meta| {
+                            meta.record_host_mutated(target_host_id, now_ms);
+                        });
+                    }
+                    return Some(handle);
+                }
+                Err(err) if err.is_auth_error() => return None,
+                Err(_) => continue,
+            }
+        }
+        None
+    }
+
+    fn kick_pending_host_reconnects_excluding(self: &Arc<Self>, newly_online_host_id: &str) {
+        let to_wake: Vec<String> = if let Ok(mut guard) = self.hosts.write() {
+            guard
+                .iter_mut()
+                .filter_map(|(hid, h)| {
+                    if hid != newly_online_host_id && h.session.is_none() && !h.connecting_in_flight
+                    {
+                        h.reconnect_scheduled = false;
+                        h.reconnect_attempt = 0;
+                        Some(hid.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for hid in to_wake {
+            self.connect_host_async(hid);
+        }
+    }
+
+    fn spawn_on_host_connected_fabric(self: &Arc<Self>, connected_host_id: String) {
+        let core = Arc::clone(self);
+        self.runtime.spawn(async move {
+            // 1. Register existing mesh peers onto the newly connected host, and push the newly
+            //    connected host onto all other online hosts so peer-bridging works symmetrically.
+            core.sync_fleet_connected_hosts(&connected_host_id);
+            let other_online: Vec<String> = core
+                .hosts
+                .read()
+                .map(|g| {
+                    g.iter()
+                        .filter(|(hid, h)| hid.as_str() != connected_host_id && h.session.is_some())
+                        .map(|(hid, _)| hid.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for other_hid in other_online {
+                core.sync_fleet_connected_hosts(&other_hid);
+            }
+
+            // 2. Ensure the account has an active primary Relay propagated across all hosts.
+            core.ensure_fleet_relay_fabric_async().await;
+        });
+    }
+
+    async fn ensure_fleet_relay_fabric_async(self: &Arc<Self>) {
+        if self.is_ephemeral_memory {
+            return;
+        }
+        if self
+            .fleet_relay_fabric_in_flight
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let _reset = ResetAtomicBoolGuard(&self.fleet_relay_fabric_in_flight);
+
+        let mut net = load_fleet_network_from_store(&self.store).unwrap_or_default();
+        if net.primary_relay_url.is_none() {
+            // Adopt any existing saved host's relay_url into the shared fleet network first.
+            let candidate = self.hosts.read().ok().and_then(|g| {
+                g.values().find_map(|h| {
+                    h.profile
+                        .relay_url
+                        .as_deref()
+                        .and_then(|u| orbit_relay_transport::normalize_relay_url(u).ok())
+                        .map(|url| (url, h.profile.host_id.clone()))
+                })
+            });
+            if let Some((url, host_id)) = candidate {
+                net.primary_relay_url = Some(url.clone());
+                net.primary_relay_host_id = Some(host_id);
+                if !net.relay_urls.contains(&url) {
+                    net.relay_urls.push(url);
+                }
+                net.updated_at_ms = now_unix_ms();
+                let _ = save_fleet_network_to_store(&self.store, &net);
+            }
+        }
+
+        // If still no relay exists in the fleet and an eligible SSH host is present, quietly
+        // auto-provision a private SSH E2EE Relay with shared fleet_token once per session.
+        if net.primary_relay_url.is_none()
+            && !self.fleet_relay_auto_attempted.swap(true, Ordering::SeqCst)
+            && let Some(home_dir) = resolve_orbit_home_dir()
+        {
+            struct SshRelayCandidate {
+                host_id: String,
+                alias: String,
+                hostname: String,
+                pubkeys: Vec<String>,
+            }
+            let ssh_candidate: Option<SshRelayCandidate> = self.hosts.read().ok().and_then(|g| {
+                let all_pubkeys: Vec<String> = g
+                    .values()
+                    .map(|h| h.profile.daemon_pubkey_b64.clone())
+                    .collect();
+                g.values().find_map(|h| {
+                    let alias = h
+                        .profile
+                        .ssh_alias
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())?
+                        .to_string();
+                    Some(SshRelayCandidate {
+                        host_id: h.profile.host_id.clone(),
+                        alias,
+                        hostname: h.profile.hostname.clone(),
+                        pubkeys: all_pubkeys.clone(),
+                    })
+                })
+            });
+
+            if let Some(SshRelayCandidate {
+                host_id,
+                alias,
+                hostname,
+                pubkeys,
+            }) = ssh_candidate
+            {
+                let tag_owner = host_id.chars().take(12).collect::<String>();
+                if let Ok(relay_uri) = tokio::task::spawn_blocking(move || {
+                    provision_ssh_tunnel_relay_with_home(
+                        &home_dir, &alias, &hostname, None, None, 7878, &pubkeys, &tag_owner,
+                    )
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+                {
+                    net.primary_relay_url = Some(relay_uri.clone());
+                    net.primary_relay_host_id = Some(host_id);
+                    if !net.relay_urls.contains(&relay_uri) {
+                        net.relay_urls.push(relay_uri);
+                    }
+                    net.updated_at_ms = now_unix_ms();
+                    let _ = save_fleet_network_to_store(&self.store, &net);
+                }
+            }
+        }
+
+        let Some(primary_relay) = net.primary_relay_url.as_deref() else {
+            return;
+        };
+        self.propagate_fleet_relay_to_online_hosts(primary_relay);
+    }
+
+    fn propagate_fleet_relay_to_online_hosts(self: &Arc<Self>, relay_url: &str) {
+        let mut to_push: Vec<(String, HostSessionHandle, StoredHostProfile)> = Vec::new();
+        let relay_base = relay_url.split('?').next().unwrap_or(relay_url);
+        let relay_has_ft = relay_url.contains("?ft=") || relay_url.contains("&ft=");
+        if let Ok(mut guard) = self.hosts.write() {
+            for (hid, h) in guard.iter_mut() {
+                let needs_update = match h.profile.relay_url.as_deref() {
+                    None => true,
+                    Some(cur) => {
+                        let cur_base = cur.split('?').next().unwrap_or(cur);
+                        let cur_has_ft = cur.contains("?ft=") || cur.contains("&ft=");
+                        cur_base == relay_base && relay_has_ft && !cur_has_ft
+                    }
+                };
+                if needs_update {
+                    h.profile.relay_url = Some(relay_url.to_string());
+                    let stored = h.to_stored_host();
+                    if let Some(ref session) = h.session {
+                        to_push.push((hid.clone(), session.clone(), stored));
+                    } else {
+                        let _ = self.store.upsert_client_host(&stored);
+                    }
+                }
+            }
+        }
+        let now_ms = now_unix_ms();
+        let pushed_any = !to_push.is_empty();
+        for (hid, session, stored) in to_push {
+            let _ = self.store.upsert_client_host(&stored);
+            self.record_cloud_meta_mutation(|meta| {
+                meta.record_host_mutated(&hid, now_ms);
+            });
+            let owned_url = relay_url.to_string();
+            tokio::spawn(async move {
+                let _ = session
+                    .send_wire(WireMessage::ConfigureHostRelay {
+                        request_id: Uuid::new_v4(),
+                        relay_url: Some(owned_url),
+                    })
+                    .await;
+            });
+        }
+        if pushed_any && self.cloud_sync_status().state == crate::cloud_sync::CloudSyncState::Ready
+        {
+            self.schedule_cloud_auto_sync(false);
+        }
     }
 
     pub fn update_orchestration_config(
@@ -11384,6 +11836,7 @@ impl OrbitAppCore {
         }
 
         let (all_resolved_perms, all_resolved_questions) = collect_resolved_gates(&timeline_events);
+        let delivery_updates = collect_delivery_updates(&timeline_events);
         let cache_scope_id = format!("subagent:{parent_agent_id}:{subagent_id}");
         let mut items: Vec<TimelineItemView> = Vec::with_capacity(timeline_events.len());
         for ev in &timeline_events {
@@ -11393,6 +11846,7 @@ impl OrbitAppCore {
                 ev,
                 &all_resolved_perms,
                 &all_resolved_questions,
+                &delivery_updates,
                 false,
                 &mut host_state.markdown_cache,
                 &mut host_state.streaming_markdown_cache,
@@ -14922,18 +15376,22 @@ impl OrbitAppCore {
             guard
                 .iter()
                 .map(|(hid, h)| {
-                    let is_local = h
-                        .profile
-                        .direct_endpoints
-                        .iter()
-                        .any(|u| u.contains("127.0.0.1") || u.contains("localhost"));
-                    let display_name = h
+                    let is_local = h.is_local;
+                    let custom_alias = h
                         .profile
                         .custom_name
-                        .clone()
-                        .filter(|s| !s.trim().is_empty())
-                        .unwrap_or_else(|| h.profile.hostname.clone());
-                    (hid.clone(), display_name, is_local, h.session.clone())
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned);
+                    let display_name = h.profile.effective_display_name();
+                    (
+                        hid.clone(),
+                        display_name,
+                        custom_alias,
+                        is_local,
+                        h.session.clone(),
+                    )
                 })
                 .collect()
         };
@@ -14942,7 +15400,7 @@ impl OrbitAppCore {
         let (res_tx, res_rx) = tokio::sync::oneshot::channel();
         self.runtime.spawn(async move {
             let mut tasks = Vec::with_capacity(host_entries.len());
-            for (hid, name, is_local, session_opt) in host_entries {
+            for (hid, name, custom_alias, is_local, session_opt) in host_entries {
                 let c = Arc::clone(&core);
                 tasks.push(tokio::spawn(async move {
                     let Some(session) = session_opt else {
@@ -14985,7 +15443,9 @@ impl OrbitAppCore {
                         cap.host_id = hid;
                         cap.is_local = is_local;
                         cap.online = true;
-                        if cap.host_name.trim().is_empty() {
+                        if let Some(alias) = custom_alias {
+                            cap.host_name = alias;
+                        } else if cap.host_name.trim().is_empty() {
                             cap.host_name = name;
                         }
                         return cap;
@@ -15045,13 +15505,14 @@ impl OrbitAppCore {
         serde_json::from_str(&raw).ok()
     }
 
-    /// Persist (or clear) the user's global Primary Personal Router host selection across the Fleet.
+    /// Persist (or clear) the user's global Primary Personal Router host selection across the Fleet
+    /// and sync across devices via Cloud Sync preferences.
     pub fn set_primary_router_selection(
-        &self,
+        self: &Arc<Self>,
         selection: Option<orbit_protocol::PrimaryRouterSelection>,
     ) -> Result<Option<orbit_protocol::PrimaryRouterSelection>, String> {
         let now_ms = chrono::Utc::now().timestamp_millis().max(0);
-        match selection {
+        let result = match selection {
             Some(mut sel) => {
                 if sel.updated_at_ms == 0 {
                     sel.updated_at_ms = now_ms as u64;
@@ -15061,15 +15522,40 @@ impl OrbitAppCore {
                 self.store
                     .set_client_kv("primary_router_selection", &json, now_ms)
                     .map_err(|e| format!("failed to persist primary router selection: {e}"))?;
-                Ok(Some(sel))
+                let mut prefs = load_sync_prefs_from_store(&self.store);
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json) {
+                    prefs.insert(
+                        "primary_router_selection".to_string(),
+                        SyncedPreferenceEntry {
+                            value: val,
+                            updated_at_ms: now_ms,
+                        },
+                    );
+                    let _ = save_sync_prefs_to_store(&self.store, &prefs);
+                }
+                Some(sel)
             }
             None => {
                 self.store
                     .set_client_kv("primary_router_selection", "null", now_ms)
                     .map_err(|e| format!("failed to clear primary router selection: {e}"))?;
-                Ok(None)
+                let mut prefs = load_sync_prefs_from_store(&self.store);
+                prefs.insert(
+                    "primary_router_selection".to_string(),
+                    SyncedPreferenceEntry {
+                        value: serde_json::Value::Null,
+                        updated_at_ms: now_ms,
+                    },
+                );
+                let _ = save_sync_prefs_to_store(&self.store, &prefs);
+                None
             }
+        };
+        if self.cloud_sync_status().state == crate::cloud_sync::CloudSyncState::Ready {
+            self.schedule_cloud_auto_sync(false);
         }
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        Ok(result)
     }
 
     /// Export ready-to-paste external Hermes Gateway MCP + SOUL/Skill configuration for a host.
@@ -18135,6 +18621,23 @@ impl OrbitAppCore {
         let now_ms = now_unix_ms();
         let mut local_meta = load_sync_meta_from_store(&self.store);
         let mut local_prefs = load_sync_prefs_from_store(&self.store);
+        if !local_prefs.contains_key("primary_router_selection")
+            && let Ok(Some(raw_sel)) = self.store.get_client_kv("primary_router_selection")
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw_sel)
+        {
+            let ts = val
+                .get("updated_at_ms")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            local_prefs.insert(
+                "primary_router_selection".to_string(),
+                SyncedPreferenceEntry {
+                    value: val,
+                    updated_at_ms: ts,
+                },
+            );
+        }
+        let local_fleet_network = load_fleet_network_from_store(&self.store);
 
         // Authoritatively prefer this machine's persisted `$ORBIT_HOME/pairing-secret` over any
         // cached or remote synced value before merging so rotated secrets never roll back.
@@ -18214,13 +18717,14 @@ impl OrbitAppCore {
 
         let local_project_order = self.project_order();
 
-        let mut outcome = merge_cloud_vault(
+        let mut outcome = merge_cloud_vault_with_network(
             remote_payload,
             &local_hosts,
             &local_projects,
             &local_project_order,
             &local_prefs,
             &local_meta,
+            local_fleet_network.as_ref(),
             now_ms,
         );
 
@@ -18254,11 +18758,16 @@ impl OrbitAppCore {
                         outcome.needs_push = true;
                     }
                 }
+            } else {
+                stored
+                    .direct_endpoints
+                    .retain(|ep| !is_loopback_endpoint(ep));
             }
             let _ = self.store.upsert_client_host(&stored);
             local_meta.record_host_mutated(&stored.host_id, synced.updated_at_ms);
 
             if let Ok(mut guard) = self.hosts.write() {
+                let bridge_ids = stored.meta.bridge_host_ids.clone();
                 let profile = SavedHostProfile {
                     host_id: stored.host_id.clone(),
                     hostname: stored.display_name.clone(),
@@ -18278,15 +18787,15 @@ impl OrbitAppCore {
                     let prev_state = existing.profile.state;
                     existing.profile = profile;
                     existing.profile.state = prev_state;
-                    if is_this_machine {
-                        existing.is_local = true;
-                    }
+                    existing.is_local = is_this_machine;
+                    existing.bridge_host_ids = bridge_ids;
                     if existing.session.is_none() {
                         hosts_to_connect.push(stored.host_id.clone());
                     }
                 } else {
                     let mut mem = HostMemoryState::new(profile);
                     mem.is_local = is_this_machine;
+                    mem.bridge_host_ids = bridge_ids;
                     if let Some(ref oa) = synced.os_arch {
                         mem.os_arch = Some(oa.clone());
                     }
@@ -18368,8 +18877,24 @@ impl OrbitAppCore {
         if !outcome.preferences_to_apply.is_empty() {
             for (k, entry) in &outcome.preferences_to_apply {
                 local_prefs.insert(k.clone(), entry.clone());
+                if k == "primary_router_selection"
+                    && let Ok(raw_json) = serde_json::to_string(&entry.value)
+                {
+                    let _ = self.store.set_client_kv(
+                        "primary_router_selection",
+                        &raw_json,
+                        entry.updated_at_ms,
+                    );
+                }
             }
             let _ = save_sync_prefs_to_store(&self.store, &local_prefs);
+        }
+
+        if let Some(ref net) = outcome.fleet_network_changed {
+            let _ = save_fleet_network_to_store(&self.store, net);
+            if let Some(ref primary_relay) = net.primary_relay_url {
+                self.propagate_fleet_relay_to_online_hosts(primary_relay);
+            }
         }
 
         // Record authoritative merged host timestamps so local-only pre-sync hosts stay monotonic
@@ -18383,6 +18908,11 @@ impl OrbitAppCore {
         }
         let _ = save_sync_meta_to_store(&self.store, &local_meta);
 
+        let vault_fp = vault_fingerprint(&outcome.merged);
+        if let Ok(mut fp_guard) = self.last_vault_fingerprint.write() {
+            *fp_guard = Some(vault_fp.clone());
+        }
+
         // Push encrypted vault to GitHub Secret Gist if local state contributed new changes
         if outcome.needs_push {
             let (gid, html_url) =
@@ -18391,6 +18921,28 @@ impl OrbitAppCore {
             cfg.gist_id = Some(gid);
             cfg.gist_html_url = Some(html_url);
             cfg.remote_vault_exists = true;
+            cfg.last_etag = None;
+
+            // Broadcast immediate Vault change notification over any shared online Daemons so
+            // sibling devices signed into the same account pull immediately without waiting for poll.
+            let online_sessions: Vec<HostSessionHandle> = self
+                .hosts
+                .read()
+                .map(|g| g.values().filter_map(|h| h.session.clone()).collect())
+                .unwrap_or_default();
+            let rev = outcome.merged.revision;
+            for session in online_sessions {
+                let fp_clone = vault_fp.clone();
+                tokio::spawn(async move {
+                    let _ = session
+                        .send_wire(WireMessage::NotifyFleetVaultChanged {
+                            request_id: Uuid::new_v4(),
+                            vault_fingerprint: fp_clone,
+                            revision: rev,
+                        })
+                        .await;
+                });
+            }
         }
 
         let active_hosts = outcome
@@ -18443,6 +18995,97 @@ impl OrbitAppCore {
             gist_html_url: cfg.gist_html_url.clone(),
         })
     }
+
+    fn spawn_cloud_sync_etag_poller(self: &Arc<Self>) {
+        let core = Arc::clone(self);
+        self.runtime.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let cfg = load_sync_config_from_store(&core.store);
+                if !cfg.auto_sync_enabled
+                    || !cfg.is_signed_in()
+                    || cfg.derived_key().is_none()
+                    || cfg.gist_id.is_none()
+                    || core.cloud_sync_in_flight.load(Ordering::SeqCst)
+                {
+                    continue;
+                }
+                let Some(token) = cfg
+                    .github_access_token
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                else {
+                    continue;
+                };
+                let Some(gist_id) = cfg.gist_id.clone() else {
+                    continue;
+                };
+                let Some(key) = cfg.derived_key() else {
+                    continue;
+                };
+                let client = core.cloud_client();
+                match client
+                    .fetch_vault_gist_conditional(&token, &gist_id, cfg.last_etag.as_deref())
+                    .await
+                {
+                    Ok(GistConditionalFetch::NotModified) => continue,
+                    Ok(GistConditionalFetch::Updated { gist, etag }) => {
+                        let _guard = core.cloud_sync_mutex.lock().await;
+                        core.cloud_sync_in_flight.store(true, Ordering::SeqCst);
+                        let mut fresh_cfg = load_sync_config_from_store(&core.store);
+                        fresh_cfg.last_etag = etag;
+                        fresh_cfg.gist_id = Some(gist.gist_id.clone());
+                        fresh_cfg.gist_html_url = Some(gist.html_url.clone());
+                        fresh_cfg.remote_vault_exists = true;
+                        let sync_res = match decrypt_remote_with_cached_key(&key, &gist) {
+                            Ok(payload) => {
+                                core.merge_apply_and_push_locked(
+                                    &client,
+                                    &token,
+                                    &key,
+                                    &mut fresh_cfg,
+                                    Some(&payload),
+                                )
+                                .await
+                            }
+                            Err(e) => Err(e),
+                        };
+                        core.cloud_sync_in_flight.store(false, Ordering::SeqCst);
+                        if let Err(err) = sync_res {
+                            tracing::debug!(error = %err, "ETag conditional vault refresh failed");
+                        }
+                    }
+                    Ok(GistConditionalFetch::NotFound) | Err(_) => continue,
+                }
+            }
+        });
+    }
+}
+
+struct ResetAtomicBoolGuard<'a>(&'a AtomicBool);
+impl Drop for ResetAtomicBoolGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+fn should_strip_remote_loopback(
+    is_local: bool,
+    ssh_alias: Option<&str>,
+    route_mode: HostRouteMode,
+    relay_url: Option<&str>,
+    direct_endpoints: &[String],
+) -> bool {
+    !is_local
+        && (ssh_alias.is_some_and(|s| !s.trim().is_empty())
+            || matches!(
+                route_mode,
+                HostRouteMode::SshTunnel | HostRouteMode::RelayOnly
+            )
+            || relay_url.is_some_and(|r| !r.trim().is_empty())
+            || direct_endpoints.iter().any(|ep| !is_loopback_endpoint(ep)))
 }
 
 fn read_local_host_identity_pair_in(orbit_dir: &Path) -> Option<(String, String)> {
@@ -19831,8 +20474,112 @@ fn dirty_index_for_event(list: &[TimelineEvent], idx: usize, payload: &TimelineP
                 )
             })
             .map_or(idx, |found| found.min(idx)),
+        TimelinePayload::AgentMessageDeliveryUpdated { message_id, .. } => list
+            .iter()
+            .position(|e| {
+                matches!(
+                    &e.payload,
+                    TimelinePayload::AgentMessage { message_id: mid, .. }
+                        if mid == message_id
+                )
+            })
+            .map_or(idx, |found| found.min(idx)),
         _ => idx,
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgentMessageDeliveryFold {
+    delivery_status: Option<AgentMessageDeliveryStatus>,
+    delivery_turn_id: Option<String>,
+    blocking_turn_id: Option<String>,
+    queued_at_ms: Option<i64>,
+    dispatched_at_ms: Option<i64>,
+    settled_at_ms: Option<i64>,
+}
+
+fn delivery_status_rank(status: AgentMessageDeliveryStatus) -> u8 {
+    match status {
+        AgentMessageDeliveryStatus::Queued => 0,
+        AgentMessageDeliveryStatus::Dispatched => 1,
+        AgentMessageDeliveryStatus::Settled | AgentMessageDeliveryStatus::Dropped => 2,
+    }
+}
+
+fn collect_delivery_updates(events: &[TimelineEvent]) -> HashMap<String, AgentMessageDeliveryFold> {
+    let mut map: HashMap<String, AgentMessageDeliveryFold> = HashMap::new();
+    for ev in events {
+        match &ev.payload {
+            TimelinePayload::AgentMessage {
+                message_id,
+                delivery_status,
+                delivery_turn_id,
+                blocking_turn_id,
+                queued_at_ms,
+                dispatched_at_ms,
+                settled_at_ms,
+                ..
+            } => {
+                let entry = map.entry(message_id.clone()).or_default();
+                if let Some(st) = delivery_status
+                    && entry
+                        .delivery_status
+                        .is_none_or(|prev| delivery_status_rank(*st) > delivery_status_rank(prev))
+                {
+                    entry.delivery_status = Some(*st);
+                }
+                if entry.delivery_turn_id.is_none() && delivery_turn_id.is_some() {
+                    entry.delivery_turn_id = delivery_turn_id.clone();
+                }
+                if entry.blocking_turn_id.is_none() && blocking_turn_id.is_some() {
+                    entry.blocking_turn_id = blocking_turn_id.clone();
+                }
+                if entry.queued_at_ms.is_none() {
+                    entry.queued_at_ms = *queued_at_ms;
+                }
+                if entry.dispatched_at_ms.is_none() {
+                    entry.dispatched_at_ms = *dispatched_at_ms;
+                }
+                if entry.settled_at_ms.is_none() {
+                    entry.settled_at_ms = *settled_at_ms;
+                }
+            }
+            TimelinePayload::AgentMessageDeliveryUpdated {
+                message_id,
+                status,
+                delivery_turn_id,
+                blocking_turn_id,
+                timestamp_ms,
+            } => {
+                let entry = map.entry(message_id.clone()).or_default();
+                if entry
+                    .delivery_status
+                    .is_none_or(|prev| delivery_status_rank(*status) > delivery_status_rank(prev))
+                {
+                    entry.delivery_status = Some(*status);
+                }
+                if delivery_turn_id.is_some() {
+                    entry.delivery_turn_id = delivery_turn_id.clone();
+                }
+                if entry.blocking_turn_id.is_none() && blocking_turn_id.is_some() {
+                    entry.blocking_turn_id = blocking_turn_id.clone();
+                }
+                match status {
+                    AgentMessageDeliveryStatus::Queued => {
+                        entry.queued_at_ms.get_or_insert(*timestamp_ms);
+                    }
+                    AgentMessageDeliveryStatus::Dispatched => {
+                        entry.dispatched_at_ms.get_or_insert(*timestamp_ms);
+                    }
+                    AgentMessageDeliveryStatus::Settled | AgentMessageDeliveryStatus::Dropped => {
+                        entry.settled_at_ms.get_or_insert(*timestamp_ms);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    map
 }
 
 type ResolvedGatesMap = (HashMap<String, String>, HashMap<String, Vec<Vec<String>>>);
@@ -19867,6 +20614,7 @@ fn render_timeline_event_view(
     ev: &TimelineEvent,
     all_resolved_perms: &HashMap<String, String>,
     all_resolved_questions: &HashMap<String, Vec<Vec<String>>>,
+    delivery_updates: &HashMap<String, AgentMessageDeliveryFold>,
     highlight_diff: bool,
     markdown_cache: &mut HashMap<(String, u64, usize), Vec<RichBlockView>>,
     streaming_markdown_cache: &mut HashMap<(String, String), (usize, Vec<RichBlockView>)>,
@@ -20034,6 +20782,12 @@ fn render_timeline_event_view(
             event,
             text,
             permission_context,
+            delivery_status,
+            delivery_turn_id,
+            blocking_turn_id,
+            queued_at_ms,
+            dispatched_at_ms,
+            settled_at_ms,
         } => {
             let key = (agent_id.to_string(), ev.seq, text.len());
             if markdown_cache.len() > 2048 {
@@ -20043,6 +20797,19 @@ fn render_timeline_event_view(
                 .entry(key)
                 .or_insert_with(|| parse_markdown_blocks(text, false))
                 .clone();
+            let folded = delivery_updates.get(message_id);
+            let resolved_status = match (delivery_status, folded.and_then(|f| f.delivery_status)) {
+                (Some(a), Some(b)) => {
+                    if delivery_status_rank(b) >= delivery_status_rank(*a) {
+                        Some(b)
+                    } else {
+                        Some(*a)
+                    }
+                }
+                (Some(a), None) => Some(*a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
             Some(TimelineItemView::AgentMessage {
                 seq: ev.seq,
                 message_id: message_id.clone(),
@@ -20053,6 +20820,18 @@ fn render_timeline_event_view(
                 event: event.clone(),
                 text: text.clone(),
                 permission_context: permission_context.clone(),
+                delivery_status: resolved_status,
+                delivery_turn_id: folded
+                    .and_then(|f| f.delivery_turn_id.clone())
+                    .or_else(|| delivery_turn_id.clone()),
+                blocking_turn_id: folded
+                    .and_then(|f| f.blocking_turn_id.clone())
+                    .or_else(|| blocking_turn_id.clone()),
+                queued_at_ms: queued_at_ms.or_else(|| folded.and_then(|f| f.queued_at_ms)),
+                dispatched_at_ms: folded
+                    .and_then(|f| f.dispatched_at_ms)
+                    .or(*dispatched_at_ms),
+                settled_at_ms: folded.and_then(|f| f.settled_at_ms).or(*settled_at_ms),
                 blocks,
                 timestamp_ms: ts_ms,
             })
@@ -20085,6 +20864,7 @@ fn render_timeline_event_view(
         }
         TimelinePayload::PermissionResolved { .. }
         | TimelinePayload::QuestionResolved { .. }
+        | TimelinePayload::AgentMessageDeliveryUpdated { .. }
         | TimelinePayload::StatusChanged { .. } => None,
     }
 }
@@ -20193,8 +20973,10 @@ fn agent_status_is_active_for_subagent(status: &AgentStatus) -> bool {
         status,
         AgentStatus::Initializing
             | AgentStatus::Running { .. }
-            | AgentStatus::AutonomousWakeup { .. }
             | AgentStatus::AwaitingPermission { .. }
+    ) || matches!(
+        status,
+        AgentStatus::AutonomousWakeup { source, .. } if !source.trim().starts_with("waiting:")
     )
 }
 
@@ -20277,14 +21059,24 @@ fn host_agent_has_running_subagents(state: &HostMemoryState, parent_agent_id: &s
     })
 }
 
-fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> AgentCardView {
-    agent_to_card_view_with_subagents(a, pref, false)
+fn collect_agents_with_armed_timers(state: &HostMemoryState) -> HashSet<String> {
+    state
+        .conditional_timers
+        .iter()
+        .filter(|t| t.state.is_armed())
+        .map(|t| t.agent_id.clone())
+        .collect()
 }
 
-fn agent_to_card_view_with_subagents(
+fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> AgentCardView {
+    agent_to_card_view_with_timers(a, pref, false, false)
+}
+
+fn agent_to_card_view_with_timers(
     a: &AgentSummary,
     pref: Option<&ClientThreadPref>,
     has_running_subagents: bool,
+    has_armed_conditional_timer: bool,
 ) -> AgentCardView {
     let (status_label, is_running, has_background_tasks, is_awaiting_permission) = match &a.status {
         AgentStatus::Initializing => ("Starting".to_string(), true, false, false),
@@ -20311,6 +21103,7 @@ fn agent_to_card_view_with_subagents(
         AgentStatus::Error { .. } => ("Error".to_string(), false, false, false),
         AgentStatus::Closed => ("Closed".to_string(), false, false, false),
     };
+    let has_armed_timers = has_background_tasks || has_armed_conditional_timer;
     let local_seen_seq = pref.map(|p| p.seen_seq).unwrap_or(0);
     let effective_seen_seq = a.read_seq.max(local_seen_seq);
     let is_pinned = a.is_pinned || pref.is_some_and(|p| p.is_pinned);
@@ -20341,6 +21134,7 @@ fn agent_to_card_view_with_subagents(
         status_label,
         is_running,
         has_background_tasks,
+        has_armed_timers,
         has_running_subagents,
         is_awaiting_permission,
         parent_agent_id: a.parent_agent_id.clone(),
@@ -22843,6 +23637,7 @@ mod tests {
             &settled_ev,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             true,
             &mut mem.markdown_cache,
             &mut mem.streaming_markdown_cache,
@@ -22867,6 +23662,7 @@ mod tests {
                 "ag_s",
                 None,
                 &stream_ev,
+                &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
                 true,
@@ -26664,5 +27460,451 @@ mod tests {
     fn open_in_memory_without_local_discovery_starts_empty() {
         let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("open core");
         assert!(core.fleet_overview().hosts.is_empty());
+    }
+
+    #[test]
+    fn remote_host_is_never_local_and_strips_loopback_endpoints() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keygen");
+        let offer = PairingOffer {
+            host_id: kp.host_id().expect("host_id"),
+            hostname: "ip-172-31-33-74.ap-southeast-1.compute.internal".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: vec![
+                "ws://127.0.0.1:6868/ws".into(),
+                "ws://10.0.0.5:6868/ws".into(),
+            ],
+            relay_url: None,
+            pairing_secret: "test-secret-0123456789abcdef0123456789abcdef".into(),
+        };
+        let card = core
+            .pair_host_internal(
+                &offer.to_qr_uri().expect("qr uri"),
+                Some(("devbox".into(), Some(6868))),
+            )
+            .expect("pair ssh host");
+        assert!(!card.is_local, "SSH-paired host must never be marked local");
+        assert!(
+            !card
+                .direct_endpoints
+                .iter()
+                .any(|u| u.contains("127.0.0.1")),
+            "remote host must strip stale loopback endpoints: {:?}",
+            card.direct_endpoints
+        );
+        assert_eq!(card.display_name, "devbox");
+    }
+
+    #[test]
+    fn waiting_timer_is_not_active_subagent_and_sets_has_armed_timers() {
+        assert!(!agent_status_is_active_for_subagent(
+            &AgentStatus::AutonomousWakeup {
+                turn_id: "bgwait_1".into(),
+                source: "waiting:1 timer".into(),
+            }
+        ));
+        assert!(agent_status_is_active_for_subagent(
+            &AgentStatus::AutonomousWakeup {
+                turn_id: "wk_1".into(),
+                source: "background_task".into(),
+            }
+        ));
+
+        let now = Utc::now();
+        let ag = AgentSummary {
+            agent_id: "ag_timer".into(),
+            workspace_id: "ws_1".into(),
+            cwd: "/repo".into(),
+            title: "Timer Thread".into(),
+            provider: ProviderKind::Antigravity,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::Auto,
+            status: AgentStatus::AutonomousWakeup {
+                turn_id: "bgwait_t".into(),
+                source: "waiting:1 timer".into(),
+            },
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 5,
+            timeline_epoch: 1,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 5,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
+        };
+        let card = agent_to_card_view_with_timers(&ag, None, false, false);
+        assert!(!card.is_running);
+        assert!(card.has_armed_timers);
+
+        let idle_with_cond_timer = AgentSummary {
+            status: AgentStatus::Idle,
+            ..ag
+        };
+        let card2 = agent_to_card_view_with_timers(&idle_with_cond_timer, None, false, true);
+        assert!(!card2.is_running);
+        assert!(card2.has_armed_timers);
+    }
+
+    #[test]
+    fn agent_message_delivery_updates_fold_in_place_across_stage_and_stage_delta() {
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("open core");
+        let now = Utc::now();
+        {
+            let mut guard = core.hosts.write().expect("lock hosts");
+            guard.insert(
+                "h_deliv".into(),
+                HostMemoryState::new(SavedHostProfile {
+                    host_id: "h_deliv".into(),
+                    hostname: "h_deliv".into(),
+                    custom_name: None,
+                    ssh_alias: None,
+                    route_mode: HostRouteMode::Auto,
+                    remote_daemon_port: 6868,
+                    custom_direct_endpoint: None,
+                    daemon_pubkey_b64: "pk_deliv".into(),
+                    direct_endpoints: vec![],
+                    relay_url: None,
+                    pairing_secret: String::new(),
+                    pairing_secret_updated_at_ms: 0,
+                    state: HostConnectionState::OnlineDirect,
+                }),
+            );
+        }
+        core.handle_inbound_wire(
+            "h_deliv",
+            WireMessage::Welcome {
+                host: orbit_protocol::HostInfo {
+                    host_id: "h_deliv".into(),
+                    hostname: "h_deliv".into(),
+                    os: "macos".into(),
+                    arch: "aarch64".into(),
+                    public_key_b64: "pk_deliv".into(),
+                    protocol_version: orbit_protocol::PROTOCOL_VERSION,
+                    daemon_version: "0.10.0".into(),
+                    available_providers: vec![],
+                    relay_url: None,
+                },
+            },
+        );
+        core.handle_inbound_wire(
+            "h_deliv",
+            WireMessage::WorkspacesSnapshot {
+                request_id: Uuid::nil(),
+                workspaces: vec![orbit_protocol::WorkspaceSummary {
+                    workspace_id: "ws_deliv".into(),
+                    source_cwd: Some("/tmp/ws".into()),
+                    cwd: "/tmp/ws".into(),
+                    title: "Delivery Fold".into(),
+                    is_worktree: false,
+                    git_branch: None,
+                    base_ref: None,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    project_root: None,
+                    mission_goal: None,
+                    is_curated: false,
+                    parent_workspace_id: None,
+                    setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+                    board_revision: 0,
+                    title_locked: false,
+                    auto_clustered: false,
+                }],
+            },
+        );
+        let ag_summary = orbit_protocol::AgentSummary {
+            agent_id: "ag_deliv".into(),
+            workspace_id: "ws_deliv".into(),
+            cwd: "/tmp/ws".into(),
+            title: "Parent".into(),
+            provider: ProviderKind::Antigravity,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::Default,
+            status: AgentStatus::Running {
+                turn_id: "turn_p1".into(),
+            },
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 3,
+            timeline_epoch: 1,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
+        };
+        core.handle_inbound_wire(
+            "h_deliv",
+            WireMessage::AgentsSnapshot {
+                request_id: Uuid::nil(),
+                agents: vec![ag_summary],
+            },
+        );
+        core.handle_inbound_wire(
+            "h_deliv",
+            WireMessage::TimelineCatchup {
+                request_id: Uuid::nil(),
+                agent_id: "ag_deliv".into(),
+                has_more: false,
+                has_older_history: false,
+                outline_prompts: Vec::new(),
+                events: vec![
+                    TimelineEvent {
+                        seq: 1,
+                        epoch: 1,
+                        agent_id: "ag_deliv".into(),
+                        turn_id: Some("turn_p1".into()),
+                        timestamp: now,
+                        payload: TimelinePayload::UserPrompt {
+                            message_id: "up_1".into(),
+                            text: "Initial task".into(),
+                            badges: Vec::new(),
+                        },
+                    },
+                    TimelineEvent {
+                        seq: 2,
+                        epoch: 1,
+                        agent_id: "ag_deliv".into(),
+                        turn_id: Some("turn_p1".into()),
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantThinking {
+                            item_id: "th_1".into(),
+                            text: "thinking".into(),
+                        },
+                    },
+                    TimelineEvent {
+                        seq: 3,
+                        epoch: 1,
+                        agent_id: "ag_deliv".into(),
+                        turn_id: None,
+                        timestamp: now,
+                        payload: TimelinePayload::AgentMessage {
+                            message_id: "am_fold_1".into(),
+                            kind: orbit_protocol::AgentMessageKind::FinishNotification,
+                            source_agent_id: Some("ag_sub".into()),
+                            source_host_id: Some("h_deliv".into()),
+                            source_title: Some("Worker".into()),
+                            event: Some("finished".into()),
+                            text: "done".into(),
+                            permission_context: None,
+                            delivery_status: Some(
+                                orbit_protocol::AgentMessageDeliveryStatus::Queued,
+                            ),
+                            delivery_turn_id: None,
+                            blocking_turn_id: Some("turn_p1".into()),
+                            queued_at_ms: Some(1_000),
+                            dispatched_at_ms: None,
+                            settled_at_ms: None,
+                        },
+                    },
+                ],
+            },
+        );
+
+        fn find_agent_message(
+            turns: &[crate::stage::StageTurnView],
+            start_offset: usize,
+        ) -> Option<(usize, &TimelineItemView)> {
+            turns.iter().enumerate().find_map(|(offset, turn)| {
+                if let Some(item @ TimelineItemView::AgentMessage { .. }) =
+                    turn.agent_message.as_ref()
+                {
+                    return Some((start_offset + offset, item));
+                }
+                if let Some(item) = turn.live_segments.iter().find_map(|seg| match seg {
+                    crate::stage::TurnLiveSegmentView::AgentMessage { item, .. } => Some(item),
+                    _ => None,
+                }) {
+                    return Some((start_offset + offset, item));
+                }
+                turn.folded_steps
+                    .iter()
+                    .find(|it| matches!(it, TimelineItemView::AgentMessage { .. }))
+                    .map(|item| (start_offset + offset, item))
+            })
+        }
+
+        let stage0 = core.agent_stage("h_deliv", "ag_deliv");
+        let turns_len0 = stage0.turns.len();
+        let (msg_turn_idx, msg_item0) =
+            find_agent_message(&stage0.turns, 0).expect("queued agent_message turn present");
+        match msg_item0 {
+            TimelineItemView::AgentMessage {
+                message_id,
+                delivery_status,
+                delivery_turn_id,
+                blocking_turn_id,
+                queued_at_ms,
+                dispatched_at_ms,
+                settled_at_ms,
+                ..
+            } => {
+                assert_eq!(message_id, "am_fold_1");
+                assert_eq!(
+                    *delivery_status,
+                    Some(orbit_protocol::AgentMessageDeliveryStatus::Queued)
+                );
+                assert!(delivery_turn_id.is_none());
+                assert_eq!(blocking_turn_id.as_deref(), Some("turn_p1"));
+                assert_eq!(*queued_at_ms, Some(1_000));
+                assert!(dispatched_at_ms.is_none());
+                assert!(settled_at_ms.is_none());
+            }
+            other => panic!("unexpected agent_message view: {other:?}"),
+        }
+
+        // Incremental Dispatched delivery update folds onto the original turn via agent_stage_delta.
+        core.handle_inbound_wire(
+            "h_deliv",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 4,
+                    epoch: 1,
+                    agent_id: "ag_deliv".into(),
+                    turn_id: None,
+                    timestamp: now,
+                    payload: TimelinePayload::AgentMessageDeliveryUpdated {
+                        message_id: "am_fold_1".into(),
+                        status: orbit_protocol::AgentMessageDeliveryStatus::Dispatched,
+                        delivery_turn_id: Some("turn_p2".into()),
+                        blocking_turn_id: None,
+                        timestamp_ms: 2_500,
+                    },
+                },
+            },
+        );
+        let d1 = core.agent_stage_delta("h_deliv", "ag_deliv", stage0.revision);
+        assert_eq!(d1.total_turn_count as usize, turns_len0);
+        assert!(d1.replace_from_turn_index as usize <= msg_turn_idx);
+        let (found_delta_idx, delta_item) =
+            find_agent_message(&d1.changed_turns, d1.replace_from_turn_index as usize)
+                .expect("folded agent_message in delta");
+        assert_eq!(found_delta_idx, msg_turn_idx);
+        match delta_item {
+            TimelineItemView::AgentMessage {
+                delivery_status,
+                delivery_turn_id,
+                queued_at_ms,
+                dispatched_at_ms,
+                settled_at_ms,
+                ..
+            } => {
+                assert_eq!(
+                    *delivery_status,
+                    Some(orbit_protocol::AgentMessageDeliveryStatus::Dispatched)
+                );
+                assert_eq!(delivery_turn_id.as_deref(), Some("turn_p2"));
+                assert_eq!(*queued_at_ms, Some(1_000));
+                assert_eq!(*dispatched_at_ms, Some(2_500));
+                assert!(settled_at_ms.is_none());
+            }
+            other => panic!("unexpected delta agent_message: {other:?}"),
+        }
+
+        // Settled update advances status and timestamp in place across both stage and delta.
+        core.handle_inbound_wire(
+            "h_deliv",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 5,
+                    epoch: 1,
+                    agent_id: "ag_deliv".into(),
+                    turn_id: None,
+                    timestamp: now,
+                    payload: TimelinePayload::AgentMessageDeliveryUpdated {
+                        message_id: "am_fold_1".into(),
+                        status: orbit_protocol::AgentMessageDeliveryStatus::Settled,
+                        delivery_turn_id: Some("turn_p2".into()),
+                        blocking_turn_id: None,
+                        timestamp_ms: 4_000,
+                    },
+                },
+            },
+        );
+        let d2 = core.agent_stage_delta("h_deliv", "ag_deliv", d1.revision);
+        assert_eq!(d2.total_turn_count as usize, turns_len0);
+        let stage2 = core.agent_stage("h_deliv", "ag_deliv");
+        assert_eq!(stage2.turns.len(), turns_len0);
+        let (found_stage2_idx, stage2_item) =
+            find_agent_message(&stage2.turns, 0).expect("settled agent_message");
+        assert_eq!(found_stage2_idx, msg_turn_idx);
+        match stage2_item {
+            TimelineItemView::AgentMessage {
+                delivery_status,
+                delivery_turn_id,
+                queued_at_ms,
+                dispatched_at_ms,
+                settled_at_ms,
+                ..
+            } => {
+                assert_eq!(
+                    *delivery_status,
+                    Some(orbit_protocol::AgentMessageDeliveryStatus::Settled)
+                );
+                assert_eq!(delivery_turn_id.as_deref(), Some("turn_p2"));
+                assert_eq!(*queued_at_ms, Some(1_000));
+                assert_eq!(*dispatched_at_ms, Some(2_500));
+                assert_eq!(*settled_at_ms, Some(4_000));
+            }
+            other => panic!("unexpected settled agent_message: {other:?}"),
+        }
+
+        // interrupt_agent_and_continue dispatches InterruptTurn { preserve_queue: true }.
+        let (session_handle, mut out_rx) = crate::HostSessionHandle::new_test_channel();
+        {
+            let mut hosts = core.hosts.write().expect("write hosts");
+            hosts.get_mut("h_deliv").expect("h_deliv").session = Some(session_handle);
+        }
+        core.interrupt_agent_and_continue("h_deliv", "ag_deliv");
+        let sent = core.runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), out_rx.recv())
+                .await
+                .expect("interrupt frame dispatched")
+                .expect("channel open")
+        });
+        match sent {
+            crate::OutboundPayload::Wire(WireMessage::InterruptTurn {
+                agent_id,
+                preserve_queue,
+                ..
+            }) => {
+                assert_eq!(agent_id, "ag_deliv");
+                assert!(preserve_queue);
+            }
+            other => panic!("unexpected outbound payload: {other:?}"),
+        }
     }
 }

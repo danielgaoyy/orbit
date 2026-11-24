@@ -250,20 +250,32 @@ impl PersonalRouterManager {
     /// Ensure the host's canonical `PersonalRouter` conversation exists and is ready.
     pub async fn ensure_router_agent(&self) -> anyhow::Result<AgentSummary> {
         let cfg = self.state.read().await.config.clone();
+        // Determine effective provider (fall back gracefully if configured Hermes ACP isn't installed yet)
+        let (provider, acp_agent_id) = resolve_effective_router_provider(&cfg)?;
+
         if let Some(ref existing_id) = cfg.router_agent_id
             && let Ok(Some(mut ag)) = self.store.get_agent(existing_id)
             && ag.archived_at.is_none()
         {
-            if !ag.is_personal_router() || !ag.is_pinned {
-                ag.set_role(AgentRole::PersonalRouter);
-                ag.is_pinned = true;
-                let _ = self.store.upsert_agent(&ag, None);
+            let engine_matches = ag.provider == provider
+                && (provider != ProviderKind::Acp || ag.acp_agent_id == acp_agent_id);
+            if engine_matches {
+                if !ag.is_personal_router() || !ag.is_pinned {
+                    ag.set_role(AgentRole::PersonalRouter);
+                    ag.is_pinned = true;
+                    let _ = self.store.upsert_agent(&ag, None);
+                }
+                return Ok(ag);
             }
-            return Ok(ag);
+            // Configured engine changed: retire the previous canonical Router conversation cleanly
+            // before spawning a new one on the newly selected provider/harness.
+            let _ = self.orchestrator.archive_agent(&ag.agent_id).await;
+            let mut guard = self.state.write().await;
+            if guard.config.router_agent_id.as_deref() == Some(ag.agent_id.as_str()) {
+                guard.config.router_agent_id = None;
+                let _ = save_router_file(&self.home_dir, &guard);
+            }
         }
-
-        // Determine effective provider (fall back gracefully if configured Hermes ACP isn't installed yet)
-        let (provider, acp_agent_id) = resolve_effective_router_provider(&cfg)?;
         let cwd = cfg
             .cwd
             .as_deref()
@@ -272,44 +284,9 @@ impl PersonalRouterManager {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| resolve_user_home().to_string_lossy().to_string());
 
-        let router_soul = build_router_system_instructions(&cfg);
-        let init_prompt = format!(
-            "[Orbit Personal Router Initialization]\n{router_soul}\n\n\
-             You are now online as the user's Orbit Personal Router (分工师). \
-             Acknowledge briefly in 1-2 sentences that you are ready to route and coordinate tasks."
-        );
-
         let created = self
             .orchestrator
-            .create_and_start_agent(CreateAgentSpec {
-                cwd,
-                extra_dirs: Vec::new(),
-                title: Some("Personal Router · 分工师".to_string()),
-                provider,
-                model: cfg.model.clone(),
-                effort: cfg.effort,
-                fast_mode: Some(true),
-                mode: SessionMode::Auto,
-                initial_prompt: init_prompt,
-                initial_display_prompt: Some(
-                    "Personal Router · 分工师已就绪，正在等待你的指令。".to_string(),
-                ),
-                initial_badges: Vec::new(),
-                worktree: false,
-                workspace_id: None,
-                parent_agent_id: None,
-                parent_host_id: None,
-                profile_id: None,
-                background: false,
-                auto_archive: false,
-                base_ref: None,
-                worktree_mode: WorktreeCreateMode::BranchOff,
-                branch: None,
-                pr_number: None,
-                handle: Some("router".to_string()),
-                auto_cluster: Some(false),
-                acp_agent_id,
-            })
+            .create_and_start_agent(build_router_create_spec(&cfg, provider, acp_agent_id, cwd))
             .await?;
 
         // Mark canonical role, pin at top, and lock title
@@ -1429,6 +1406,25 @@ pub fn find_hermes_executable(user_home: &Path) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
+fn normalize_hermes_version_line(raw_line: &str) -> Option<String> {
+    let mut s = raw_line.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let lower = s.to_ascii_lowercase();
+    for prefix in ["hermes agent ", "hermes-agent ", "hermes "] {
+        if lower.starts_with(prefix) {
+            s = s[prefix.len()..].trim();
+            break;
+        }
+    }
+    if s.is_empty() {
+        None
+    } else {
+        Some(compact_inline(s, 48))
+    }
+}
+
 fn probe_hermes_version(bin: &Path) -> Option<String> {
     let out = std::process::Command::new(bin)
         .arg("--version")
@@ -1438,12 +1434,7 @@ fn probe_hermes_version(bin: &Path) -> Option<String> {
         return None;
     }
     let raw = String::from_utf8_lossy(&out.stdout);
-    let line = raw.lines().next()?.trim();
-    if line.is_empty() {
-        None
-    } else {
-        Some(compact_inline(line, 48))
-    }
+    normalize_hermes_version_line(raw.lines().next()?)
 }
 
 fn detect_hermes_existing_memory(user_home: &Path) -> bool {
@@ -1511,6 +1502,49 @@ fn format_pending_perm_line(p: &PendingPermissionSummary) -> String {
         risk,
         compact_inline(&p.title, 64)
     )
+}
+
+fn build_router_create_spec(
+    cfg: &PersonalRouterConfig,
+    provider: ProviderKind,
+    acp_agent_id: Option<String>,
+    cwd: String,
+) -> CreateAgentSpec {
+    let router_soul = build_router_system_instructions(cfg);
+    let init_prompt = format!(
+        "[Orbit Personal Router Initialization]\n{router_soul}\n\n\
+         You are now online as the user's Orbit Personal Router (分工师). \
+         Acknowledge briefly in 1-2 sentences that you are ready to route and coordinate tasks."
+    );
+    CreateAgentSpec {
+        cwd,
+        extra_dirs: Vec::new(),
+        title: Some("Personal Router · 分工师".to_string()),
+        provider,
+        model: cfg.model.clone(),
+        effort: cfg.effort,
+        fast_mode: None,
+        mode: SessionMode::Auto,
+        initial_prompt: init_prompt,
+        initial_display_prompt: Some(
+            "Personal Router · 分工师已就绪，正在等待你的指令。".to_string(),
+        ),
+        initial_badges: Vec::new(),
+        worktree: false,
+        workspace_id: None,
+        parent_agent_id: None,
+        parent_host_id: None,
+        profile_id: None,
+        background: false,
+        auto_archive: false,
+        base_ref: None,
+        worktree_mode: WorktreeCreateMode::BranchOff,
+        branch: None,
+        pr_number: None,
+        handle: Some("router".to_string()),
+        auto_cluster: Some(false),
+        acp_agent_id,
+    }
 }
 
 fn compact_inline(raw: &str, max_chars: usize) -> String {
@@ -1679,5 +1713,41 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&tmp);
         });
+    }
+
+    #[test]
+    fn normalize_hermes_version_strips_duplicate_product_prefix() {
+        assert_eq!(
+            normalize_hermes_version_line("Hermes Agent v0.22.2 (2026.9.24)").as_deref(),
+            Some("v0.22.2 (2026.9.24)")
+        );
+        assert_eq!(
+            normalize_hermes_version_line("hermes 0.22.2").as_deref(),
+            Some("0.22.2")
+        );
+        assert_eq!(
+            normalize_hermes_version_line("v0.22.2").as_deref(),
+            Some("v0.22.2")
+        );
+        assert_eq!(normalize_hermes_version_line("   "), None);
+    }
+
+    #[test]
+    fn ensure_router_agent_does_not_force_fast_mode_for_acp() {
+        let cfg = PersonalRouterConfig {
+            enabled: true,
+            provider: ProviderKind::Acp,
+            acp_agent_id: Some("hermes".into()),
+            ..PersonalRouterConfig::default()
+        };
+        let spec = build_router_create_spec(
+            &cfg,
+            ProviderKind::Acp,
+            Some("hermes".into()),
+            "/tmp/workspace".into(),
+        );
+        assert_eq!(spec.fast_mode, None);
+        assert_eq!(spec.provider, ProviderKind::Acp);
+        assert_eq!(spec.acp_agent_id.as_deref(), Some("hermes"));
     }
 }

@@ -967,6 +967,15 @@ fn interrupt_agent(state: State<'_, DesktopAppState>, host_id: String, agent_id:
 }
 
 #[tauri::command]
+fn interrupt_agent_and_continue(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+) {
+    state.core.interrupt_agent_and_continue(&host_id, &agent_id);
+}
+
+#[tauri::command]
 fn set_session_mode(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -4107,6 +4116,7 @@ pub fn run() {
             flush_queued_prompt_now,
             reorder_queued_prompts,
             interrupt_agent,
+            interrupt_agent_and_continue,
             set_session_mode,
             set_agent_config,
             set_agent_model,

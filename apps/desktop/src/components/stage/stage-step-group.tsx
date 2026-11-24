@@ -62,7 +62,11 @@ import {
   SubagentDispatchRow,
 } from "./subagents-track";
 import { StageCopyButton } from "./stage-prompt-controls";
-import { InlineLiveElapsed, StepItemRow } from "./stage-tool-renderers";
+import {
+  InlineLiveElapsed,
+  LiveStallInterruptButton,
+  StepItemRow,
+} from "./stage-tool-renderers";
 
 type SubagentMaybeWithAvatar = ResolvedSubagentItem & {
   readonly character?: SubagentCharacterSpec;
@@ -418,6 +422,9 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   autoOpenForError,
   liveStartedAtMs,
   latestActivityMs,
+  latestVisibleProgressMs,
+  queuedNotificationCount = 0,
+  onInterruptAndContinue = null,
   isNetworkOffline = false,
   isBackgroundWait = false,
   settledDurationMs,
@@ -446,6 +453,9 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   autoOpenForError: boolean;
   liveStartedAtMs: number | null;
   latestActivityMs?: number | null;
+  latestVisibleProgressMs?: number | null;
+  queuedNotificationCount?: number;
+  onInterruptAndContinue?: (() => void) | null;
   isNetworkOffline?: boolean;
   isBackgroundWait?: boolean;
   settledDurationMs: number | null;
@@ -525,6 +535,11 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
 
   const hasFailure = !isWorkActive && (labelIncludesFailure || showFailureBadge);
   const SummaryIcon = hasFailure ? AlertTriangle : thoughtOnly || items.length === 0 ? Sparkles : ListChecks;
+  const activeStallLabel = isBackgroundWait
+    ? items.length > 0
+      ? t("stage.runningInBackground")
+      : null
+    : undefined;
   const line = (
     <TraceLine status={isWorkActive ? "running" : hasFailure ? "error" : undefined} className="text-[13px]">
       <TraceIcon><SummaryIcon /></TraceIcon>
@@ -539,8 +554,10 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
         <InlineLiveElapsed
           startedAtMs={effectiveLiveStartedAtMs}
           lastActivityMs={latestActivityMs}
+          lastVisibleProgressMs={latestVisibleProgressMs}
           isNetworkOffline={isNetworkOffline}
-          stallLabel={isBackgroundWait ? (items.length ? t("stage.runningInBackground") : null) : undefined}
+          stallLabel={activeStallLabel}
+          queuedNotificationCount={queuedNotificationCount}
         />
       )}
       {showDiffNumbers && (
@@ -559,12 +576,36 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
     </TraceLine>
   );
 
-  if (items.length === 0) return <Trace>{line}</Trace>;
+  const interruptButton = isWorkActive ? (
+    <LiveStallInterruptButton
+      startedAtMs={effectiveLiveStartedAtMs}
+      lastActivityMs={latestActivityMs}
+      lastVisibleProgressMs={latestVisibleProgressMs}
+      isNetworkOffline={isNetworkOffline}
+      stallLabel={activeStallLabel}
+      queuedNotificationCount={queuedNotificationCount}
+      onInterruptAndContinue={onInterruptAndContinue}
+    />
+  ) : null;
+
+  if (items.length === 0) {
+    return (
+      <Trace>
+        <div className="flex flex-wrap items-center gap-1.5">
+          {line}
+          {interruptButton}
+        </div>
+      </Trace>
+    );
+  }
 
   return (
     <Trace>
       <TraceCollapsible open={isExpanded} onOpenChange={handleOpenChange}>
-        <TraceCollapsibleTrigger ref={foldBtnRef}>{line}</TraceCollapsibleTrigger>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <TraceCollapsibleTrigger ref={foldBtnRef}>{line}</TraceCollapsibleTrigger>
+          {interruptButton}
+        </div>
         <TraceCollapsibleContent>
           <StepTimelineRail
             items={items}

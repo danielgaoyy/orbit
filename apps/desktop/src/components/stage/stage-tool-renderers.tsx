@@ -245,25 +245,85 @@ export function resolveToolStepIcon(
   }
 }
 
-/** Isolated 1-second live elapsed ticker with offline & silent-stall hints. */
+const SILENT_STALL_THRESHOLD_MS = 45_000;
+const THINKING_STALL_THRESHOLD_MS = 60_000;
+const QUEUED_NO_PROGRESS_THRESHOLD_MS = 30_000;
+
+export function computeLiveStallState({
+  nowMs,
+  startedAtMs,
+  lastActivityMs,
+  lastVisibleProgressMs,
+  isNetworkOffline = false,
+  stallLabel,
+  queuedNotificationCount = 0,
+}: {
+  nowMs: number;
+  startedAtMs: number;
+  lastActivityMs?: number | null;
+  lastVisibleProgressMs?: number | null;
+  isNetworkOffline?: boolean;
+  stallLabel?: string | null;
+  queuedNotificationCount?: number;
+}) {
+  const elapsedMs = Math.max(0, nowMs - startedAtMs);
+  const effectiveActivityMs = lastActivityMs ?? startedAtMs;
+  const effectiveVisibleProgressMs = lastVisibleProgressMs ?? effectiveActivityMs;
+  const silentMs = Math.max(0, nowMs - effectiveActivityMs);
+  const noProgressMs = Math.max(0, nowMs - effectiveVisibleProgressMs);
+
+  const isSilentStall =
+    !isNetworkOffline && stallLabel !== null && silentMs >= SILENT_STALL_THRESHOLD_MS;
+  const isThinkingStall =
+    !isNetworkOffline &&
+    stallLabel !== null &&
+    !isSilentStall &&
+    typeof lastVisibleProgressMs === "number" &&
+    effectiveActivityMs > lastVisibleProgressMs &&
+    noProgressMs >= THINKING_STALL_THRESHOLD_MS;
+  const showInterruptContinue =
+    !isNetworkOffline &&
+    (isSilentStall ||
+      isThinkingStall ||
+      (queuedNotificationCount > 0 && noProgressMs >= QUEUED_NO_PROGRESS_THRESHOLD_MS));
+
+  return {
+    elapsedMs,
+    isSilentStall,
+    isThinkingStall,
+    showInterruptContinue,
+  };
+}
+
+/** Isolated 1-second live elapsed ticker with offline, thinking-stall, and queue hints. */
 export const InlineLiveElapsed = memo(function InlineLiveElapsed({
   startedAtMs,
   lastActivityMs,
+  lastVisibleProgressMs,
   isNetworkOffline = false,
   stallLabel,
+  queuedNotificationCount = 0,
 }: {
   startedAtMs: number;
   lastActivityMs?: number | null;
+  lastVisibleProgressMs?: number | null;
   isNetworkOffline?: boolean;
   stallLabel?: string | null;
+  queuedNotificationCount?: number;
 }) {
   const { t, locale } = useI18n();
   const nowMs = useLiveSecondClock(true);
-  const elapsedMs = Math.max(0, nowMs - startedAtMs);
-  const silentMs = Math.max(0, nowMs - (lastActivityMs ?? startedAtMs));
-  const isStalled = !isNetworkOffline && stallLabel !== null && silentMs >= 45_000;
+  const { elapsedMs, isSilentStall, isThinkingStall } = computeLiveStallState({
+    nowMs,
+    startedAtMs,
+    lastActivityMs,
+    lastVisibleProgressMs,
+    isNetworkOffline,
+    stallLabel,
+    queuedNotificationCount,
+  });
 
-  if (elapsedMs < 1000 && !isNetworkOffline) return null;
+  if (elapsedMs < 1000 && !isNetworkOffline && queuedNotificationCount === 0) return null;
 
   return (
     <>
@@ -276,12 +336,70 @@ export const InlineLiveElapsed = memo(function InlineLiveElapsed({
         <TraceDescription className="font-sans text-signal-warning">
           · {t("stage.offline")}
         </TraceDescription>
-      ) : isStalled ? (
+      ) : isSilentStall ? (
         <TraceDescription className="min-w-0 shrink truncate font-sans">
           · {stallLabel ?? t("stage.waitingForResponse")}
         </TraceDescription>
+      ) : isThinkingStall ? (
+        <TraceDescription className="font-sans text-signal-warning">
+          · {t("stage.thinkingNoProgress")}
+        </TraceDescription>
       ) : null}
+      {queuedNotificationCount > 0 && (
+        <TraceDescription className="text-signal-warning">
+          · {t("stage.queuedCount", { count: queuedNotificationCount })}
+        </TraceDescription>
+      )}
     </>
+  );
+});
+
+/** Explicit sibling button shown only when a turn is stalled or blocking queued notifications. */
+export const LiveStallInterruptButton = memo(function LiveStallInterruptButton({
+  startedAtMs,
+  lastActivityMs,
+  lastVisibleProgressMs,
+  isNetworkOffline = false,
+  stallLabel,
+  queuedNotificationCount = 0,
+  onInterruptAndContinue,
+}: {
+  startedAtMs: number;
+  lastActivityMs?: number | null;
+  lastVisibleProgressMs?: number | null;
+  isNetworkOffline?: boolean;
+  stallLabel?: string | null;
+  queuedNotificationCount?: number;
+  onInterruptAndContinue?: (() => void) | null;
+}) {
+  const { t } = useI18n();
+  const nowMs = useLiveSecondClock(Boolean(onInterruptAndContinue));
+
+  if (!onInterruptAndContinue) return null;
+
+  const { showInterruptContinue } = computeLiveStallState({
+    nowMs,
+    startedAtMs,
+    lastActivityMs,
+    lastVisibleProgressMs,
+    isNetworkOffline,
+    stallLabel,
+    queuedNotificationCount,
+  });
+
+  if (!showInterruptContinue) return null;
+
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        onInterruptAndContinue();
+      }}
+      className="orbit-press border-signal-warning-border bg-signal-warning-bg text-signal-warning hover:bg-signal-warning-bg/80 inline-flex h-[22px] shrink-0 cursor-pointer items-center rounded-[6px] border px-2 text-[11px] font-medium"
+    >
+      {t("stage.interruptAndContinue")}
+    </button>
   );
 });
 
@@ -337,7 +455,6 @@ function ToolStepDetail({
       return null;
   }
 }
-
 export const StepItemRow = memo(function StepItemRow({
   item,
   hostId,

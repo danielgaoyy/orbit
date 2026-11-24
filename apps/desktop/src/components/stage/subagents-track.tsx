@@ -13,17 +13,20 @@ import {
   extractCleanAgentMessageBody,
   formatCleanAgentMessagePreview,
 } from "@/lib/agent-message-clean";
+import { useI18n } from "@/lib/i18n";
+import { useLiveSecondClock } from "@/lib/live-clock";
 import type { ResolvedSubagentItem } from "@/lib/subagents";
 import {
   type SubagentCharacterSpec,
   resolveSubagentCharacter,
 } from "@/lib/subagent-avatar";
+import { formatDurationCompact } from "@/lib/timeline-coalesce";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { peerFinishStatus, type CoalescedFinishStatus } from "@/lib/turn-delegation-split";
 import { SubagentAvatar } from "@/components/ui/subagent-avatar";
 import { useOrbitSelector } from "@/state/orbit-store";
-import { useI18n } from "@/lib/i18n";
 import { openSubagent, SubagentPanelAction } from "./subagent-crew-dock";
 import { holdNearestViewport } from "@/components/conversation/conversation-viewport";
 import type { ViewportAnchorHoldFn } from "./stage-helpers";
@@ -192,7 +195,7 @@ export function SubagentDispatchRow({
 
 /** Shared collapsible disclosure for incoming reports and outgoing messages. Opening the peer is a separate action. */
 export function PeerMessageRow({
-  open = false, onOpenChange, holdViewport, avatar, label, statusLabel, preview, failed = false, action, children,
+  open = false, onOpenChange, holdViewport, avatar, label, statusLabel, badges, preview, failed = false, action, children,
 }: {
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
@@ -200,6 +203,7 @@ export function PeerMessageRow({
   avatar: ReactNode;
   label: string;
   statusLabel?: string;
+  badges?: ReactNode;
   preview: string;
   failed?: boolean;
   action?: ReactNode;
@@ -229,6 +233,7 @@ export function PeerMessageRow({
               {statusLabel}
             </span>
           )}
+          {badges}
           {!open && preview && (
             <>
               <span aria-hidden="true" className="shrink-0 text-ink-muted">·</span>
@@ -266,6 +271,8 @@ export const AgentMessageCard = memo(function AgentMessageCard({
   coalescedFinishStatus,
   holdViewport,
   sessionSubagents,
+  isParentTurnRunning = false,
+  onInterruptAndContinue = null,
 }: {
   hostId: string;
   agentId?: string | null;
@@ -274,10 +281,24 @@ export const AgentMessageCard = memo(function AgentMessageCard({
   coalescedFinishStatus?: CoalescedFinishStatus;
   holdViewport?: ViewportAnchorHoldFn;
   sessionSubagents?: readonly SubagentMaybeWithAvatar[];
+  isParentTurnRunning?: boolean;
+  onInterruptAndContinue?: (() => void) | null;
 }) {
+  const { t, locale } = useI18n();
   const [expanded, setExpanded] = useState(false);
   const heartbeat = useAnchoredOpenChange(setExpanded, holdViewport);
-  const { t } = useI18n();
+  const deliveryStatus = item.delivery_status ?? null;
+  const nowMs = useLiveSecondClock(deliveryStatus === "queued");
+  const queuedWaitedMs =
+    deliveryStatus === "queued" && typeof item.queued_at_ms === "number"
+      ? Math.max(0, nowMs - item.queued_at_ms)
+      : 0;
+  const settledWaitedMs =
+    deliveryStatus === "settled" &&
+    typeof item.queued_at_ms === "number" &&
+    typeof item.dispatched_at_ms === "number"
+      ? item.dispatched_at_ms - item.queued_at_ms
+      : 0;
 
   const cleanBody = useMemo(() => extractCleanAgentMessageBody(item.text), [item.text]);
   const cleanPreview = useMemo(() => formatCleanAgentMessagePreview(cleanBody), [cleanBody]);
@@ -379,6 +400,62 @@ export const AgentMessageCard = memo(function AgentMessageCard({
     : finish === "completed" ? t("stage.finished")
     : !preview ? t("stage.message") : undefined;
 
+  const deliveryBadges =
+    deliveryStatus === "queued" ? (
+      <span className="border-signal-warning-border bg-signal-warning-bg text-signal-warning inline-flex shrink-0 items-center rounded-full border px-2 py-0.5 font-mono text-[11px] font-medium tabular-nums">
+        {queuedWaitedMs >= 1000
+          ? t("stage.deliveryQueuedWaiting", {
+              duration: formatDurationCompact(queuedWaitedMs, locale),
+            })
+          : t("stage.deliveryQueued")}
+      </span>
+    ) : deliveryStatus === "dispatched" ? (
+      <span className="border-signal-info-border bg-signal-info-bg text-signal-info inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium">
+        <OrbitSpinner size={10} />
+        <span>{t("stage.deliveryProcessing")}</span>
+      </span>
+    ) : deliveryStatus === "settled" && settledWaitedMs >= 2000 ? (
+      <span className="text-ink-tertiary shrink-0 font-mono text-[11px] tabular-nums">
+        {t("stage.deliveryDeliveredWaited", {
+          duration: formatDurationCompact(settledWaitedMs, locale),
+        })}
+      </span>
+    ) : deliveryStatus === "dropped" ? (
+      <span className="border-signal-danger-border bg-signal-danger-bg text-signal-danger inline-flex shrink-0 items-center rounded-full border px-2 py-0.5 text-[11px] font-medium">
+        {t("stage.deliveryDropped")}
+      </span>
+    ) : undefined;
+
+  const canInterruptDeliver =
+    deliveryStatus === "queued" &&
+    isParentTurnRunning &&
+    Boolean(onInterruptAndContinue || agentId);
+
+  const rowAction =
+    canInterruptDeliver || sender || senderId ? (
+      <div className="flex shrink-0 items-center gap-1">
+        {canInterruptDeliver && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (onInterruptAndContinue) {
+                onInterruptAndContinue();
+              } else if (agentId) {
+                void orbitIpc.interruptAgentAndContinue(hostId, agentId);
+              }
+            }}
+            className="orbit-press border-signal-warning-border bg-signal-warning-bg text-signal-warning hover:bg-signal-warning-bg/80 inline-flex h-[22px] shrink-0 cursor-pointer items-center rounded-[6px] border px-2 text-[11px] font-medium"
+          >
+            {t("stage.interruptAndDeliver")}
+          </button>
+        )}
+        {(sender || senderId) && (
+          <SubagentPanelAction name={senderLabel} inspect={!!perm} onClick={openSender} />
+        )}
+      </div>
+    ) : undefined;
+
   return (
     <div className={wrapperClass}>
       <PeerMessageRow
@@ -387,10 +464,11 @@ export const AgentMessageCard = memo(function AgentMessageCard({
         holdViewport={holdViewport}
         label={senderLabel}
         statusLabel={statusLabel}
+        badges={deliveryBadges}
         failed={finish === "failed"}
         preview={preview}
         avatar={<SubagentAvatar character={senderCharacter} status={finish ?? "completed"} size="sm" showStatusBadge={!!finish} />}
-        action={(sender || senderId) && <SubagentPanelAction name={senderLabel} inspect={!!perm} onClick={openSender} />}
+        action={rowAction}
       >
         {perm ? <p className="selectable-text text-ink-secondary">{perm.title}</p> : detail}
       </PeerMessageRow>

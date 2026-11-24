@@ -20,6 +20,7 @@ import {
   Search,
   Server,
   Settings2,
+  Sparkles,
   X,
 } from "lucide-react";
 import { AddHostSection } from "@/components/settings/add-host-section";
@@ -90,6 +91,7 @@ const CORE_SECTION_ICONS: Record<
   general: Settings2,
   appearance: Palette,
   notifications_sync: Bell,
+  personal_router: Sparkles,
   hosts: Server,
   agents: Cpu,
   usage: BarChart3,
@@ -735,6 +737,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                   {section === "appearance" && <AppearanceSection />}
                   {section === "notifications" && <NotificationsSection />}
                   {section === "cloud_sync" && <CloudSyncSection />}
+                  {section === "personal_router" && <HostPersonalRouterSection />}
                   {section === "archived" && <ArchivedSection />}
                   {section === "add_host" && <AddHostSection />}
                   {parsedHost && !resolvedHost && <AddHostSection />}
@@ -749,12 +752,6 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                   )}
                   {resolvedHost?.tab === "agents" && (
                     <HostAgentsSection hostId={resolvedHost.hostId} />
-                  )}
-                  {resolvedHost?.tab === "router" && (
-                    <HostPersonalRouterSection
-                      key={resolvedHost.hostId}
-                      hostId={resolvedHost.hostId}
-                    />
                   )}
                   {resolvedHost?.tab === "acp" && (
                     <HostAcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />

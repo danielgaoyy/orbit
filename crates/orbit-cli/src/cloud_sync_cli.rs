@@ -12,9 +12,8 @@ use orbit_client_core::cloud_sync::{
     CloudVaultPayload, DevicePollOutcome, GitHubCloudClient, LocalHostSyncRecord,
     PersistedCloudSyncConfig, SyncedHostEntry, decrypt_remote_with_cached_key,
     delete_cli_sync_config, filter_shareable_endpoints, generate_sync_passphrase,
-    load_cli_sync_config, merge_cloud_vault, now_unix_ms, push_vault_payload,
-    resolve_github_client_id, save_cli_sync_config, save_sync_config_to_store,
-    unlock_remote_vault_with_passphrase,
+    load_cli_sync_config, now_unix_ms, push_vault_payload, resolve_github_client_id,
+    save_cli_sync_config, save_sync_config_to_store, unlock_remote_vault_with_passphrase,
 };
 use orbit_client_core::desktop_ops::open_external_url;
 use orbit_crypto::PairingOffer;
@@ -440,14 +439,16 @@ async fn execute_cli_sync(
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default();
     let mut local_prefs = orbit_client_core::cloud_sync::load_sync_prefs_from_store(&store);
+    let local_fleet_network = orbit_client_core::cloud_sync::load_fleet_network_from_store(&store);
 
-    let mut outcome = merge_cloud_vault(
+    let mut outcome = orbit_client_core::cloud_sync::merge_cloud_vault_with_network(
         remote_payload,
         &local_hosts,
         &local_projects,
         &local_project_order,
         &local_prefs,
         &local_meta,
+        local_fleet_network.as_ref(),
         now_ms,
     );
 
@@ -518,6 +519,9 @@ async fn execute_cli_sync(
         }
         let _ = orbit_client_core::cloud_sync::save_sync_prefs_to_store(&store, &local_prefs);
     }
+    if let Some(ref net) = outcome.fleet_network_changed {
+        let _ = orbit_client_core::cloud_sync::save_fleet_network_to_store(&store, net);
+    }
     let _ = orbit_client_core::cloud_sync::save_sync_meta_to_store(&store, &local_meta);
 
     if outcome.needs_push {
@@ -556,12 +560,19 @@ async fn execute_cli_sync(
     save_sync_config_to_store(&store, cfg)?;
 
     // Optionally register all remote synced hosts into this machine's running Daemon connected-host mesh!
+    // Also adopt the account fleet relay URL on this daemon if it is unset.
     let mut mesh_registered = 0usize;
     if sync_mesh {
+        let fleet_relay = outcome
+            .merged
+            .fleet_network
+            .as_ref()
+            .and_then(|n| n.primary_relay_url.as_deref());
         mesh_registered = register_synced_hosts_into_local_daemon_mesh(
             home_dir,
             registered_host_id.as_deref(),
             &active_hosts,
+            fleet_relay,
         )
         .await;
     }
@@ -656,6 +667,7 @@ async fn register_synced_hosts_into_local_daemon_mesh(
     home_dir: &Path,
     self_host_id: Option<&str>,
     hosts: &[SyncedHostEntry],
+    fleet_primary_relay: Option<&str>,
 ) -> usize {
     let owned_local_id = self_host_id
         .map(ToOwned::to_owned)
@@ -681,6 +693,23 @@ async fn register_synced_hosts_into_local_daemon_mesh(
     else {
         return 0;
     };
+    if let Some(relay_url) = fleet_primary_relay
+        && orbit_daemon::DaemonPersistedConfig::load(home_dir)
+            .relay_url
+            .is_none()
+    {
+        let req_id = Uuid::new_v4();
+        let _ = conn
+            .request(
+                WireMessage::ConfigureHostRelay {
+                    request_id: req_id,
+                    relay_url: Some(relay_url.to_string()),
+                },
+                Duration::from_secs(5),
+                |w| matches!(w, WireMessage::HostRelayConfigured { request_id: r, .. } if *r == req_id),
+            )
+            .await;
+    }
     let mut registered = 0usize;
     for host in hosts {
         if host.host_id == local_host_id {
@@ -708,6 +737,8 @@ async fn register_synced_hosts_into_local_daemon_mesh(
                     request_id: req_id,
                     label,
                     pairing_uri: uri,
+                    ssh_alias: host.ssh_alias.clone(),
+                    remote_daemon_port: host.remote_daemon_port,
                 },
                 Duration::from_secs(5),
                 |w| matches!(w, WireMessage::ConnectedHostsSnapshot { request_id: r, .. } if *r == req_id),
@@ -895,6 +926,7 @@ mod tests {
             remote_daemon_port: Some(6868),
             custom_direct_endpoint: None,
             os_arch: Some("linux/x86_64".into()),
+            bridge_host_ids: Vec::new(),
             updated_at_ms: 99999,
             deleted_at_ms: None,
         };

@@ -866,6 +866,10 @@ impl OhosCoreFacade {
         self.inner.interrupt_agent(host_id, agent_id);
     }
 
+    pub fn interrupt_agent_and_continue(&self, host_id: &str, agent_id: &str) {
+        self.inner.interrupt_agent_and_continue(host_id, agent_id);
+    }
+
     pub fn set_session_mode(&self, host_id: &str, agent_id: &str, mode_str: &str) {
         self.inner
             .set_session_mode(host_id, agent_id, parse_mode_str(mode_str));
@@ -2895,6 +2899,12 @@ mod ohos_napi {
         #[napi]
         pub fn interrupt_agent(&self, host_id: String, agent_id: String) {
             self.facade.interrupt_agent(&host_id, &agent_id);
+        }
+
+        #[napi]
+        pub fn interrupt_agent_and_continue(&self, host_id: String, agent_id: String) {
+            self.facade
+                .interrupt_agent_and_continue(&host_id, &agent_id);
         }
 
         #[napi]

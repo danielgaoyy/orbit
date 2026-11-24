@@ -43,6 +43,10 @@ pub struct StoredConnectedHost {
     pub relay_url: Option<String>,
     #[serde(default)]
     pub pairing_secret: String,
+    #[serde(default)]
+    pub ssh_alias: Option<String>,
+    #[serde(default)]
+    pub remote_daemon_port: Option<u16>,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -201,6 +205,8 @@ pub(crate) fn migrate_orchestration_schema(conn: &rusqlite::Connection) -> Resul
         "pairing_secret",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    crate::ensure_table_column(conn, "connected_hosts", "ssh_alias", "TEXT")?;
+    crate::ensure_table_column(conn, "connected_hosts", "remote_daemon_port", "INTEGER")?;
     conn.execute_batch(
         "
         CREATE UNIQUE INDEX IF NOT EXISTS idx_psub_events_dedupe_uniq
@@ -1097,8 +1103,9 @@ impl OrbitStore {
         conn.execute(
             "INSERT INTO connected_hosts (
                 registration_id, host_id, label, daemon_pubkey_b64,
-                direct_endpoints_json, relay_url, pairing_secret, enabled, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                direct_endpoints_json, relay_url, pairing_secret, ssh_alias, remote_daemon_port,
+                enabled, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(registration_id) DO UPDATE SET
                 host_id = COALESCE(excluded.host_id, connected_hosts.host_id),
                 label = excluded.label,
@@ -1106,6 +1113,8 @@ impl OrbitStore {
                 direct_endpoints_json = excluded.direct_endpoints_json,
                 relay_url = excluded.relay_url,
                 pairing_secret = excluded.pairing_secret,
+                ssh_alias = COALESCE(excluded.ssh_alias, connected_hosts.ssh_alias),
+                remote_daemon_port = COALESCE(excluded.remote_daemon_port, connected_hosts.remote_daemon_port),
                 enabled = excluded.enabled,
                 updated_at = excluded.updated_at",
             params![
@@ -1116,6 +1125,8 @@ impl OrbitStore {
                 endpoints_json,
                 host.relay_url,
                 host.pairing_secret,
+                host.ssh_alias,
+                host.remote_daemon_port.map(i64::from),
                 i32::from(host.enabled),
                 host.created_at.to_rfc3339(),
                 host.updated_at.to_rfc3339(),
@@ -1128,7 +1139,8 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let mut stmt = conn.prepare(
             "SELECT registration_id, host_id, label, daemon_pubkey_b64,
-                    direct_endpoints_json, relay_url, enabled, created_at, updated_at, pairing_secret
+                    direct_endpoints_json, relay_url, enabled, created_at, updated_at, pairing_secret,
+                    ssh_alias, remote_daemon_port
              FROM connected_hosts ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map([], map_connected_host_row)?;
@@ -1142,7 +1154,8 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.query_row(
             "SELECT registration_id, host_id, label, daemon_pubkey_b64,
-                    direct_endpoints_json, relay_url, enabled, created_at, updated_at, pairing_secret
+                    direct_endpoints_json, relay_url, enabled, created_at, updated_at, pairing_secret,
+                    ssh_alias, remote_daemon_port
              FROM connected_hosts WHERE registration_id = ?1",
             params![registration_id],
             map_connected_host_row,
@@ -1158,7 +1171,8 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.query_row(
             "SELECT registration_id, host_id, label, daemon_pubkey_b64,
-                    direct_endpoints_json, relay_url, enabled, created_at, updated_at, pairing_secret
+                    direct_endpoints_json, relay_url, enabled, created_at, updated_at, pairing_secret,
+                    ssh_alias, remote_daemon_port
              FROM connected_hosts WHERE host_id = ?1 LIMIT 1",
             params![host_id],
             map_connected_host_row,
@@ -1587,6 +1601,7 @@ fn map_connected_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCon
     let ep_s: String = row.get(4)?;
     let created_s: String = row.get(7)?;
     let updated_s: String = row.get(8)?;
+    let remote_port_i: Option<i64> = row.get(11)?;
     Ok(StoredConnectedHost {
         registration_id: row.get(0)?,
         host_id: row.get(1)?,
@@ -1595,6 +1610,8 @@ fn map_connected_host_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCon
         direct_endpoints: serde_json::from_str(&ep_s).unwrap_or_default(),
         relay_url: row.get(5)?,
         pairing_secret: row.get(9)?,
+        ssh_alias: row.get(10)?,
+        remote_daemon_port: remote_port_i.and_then(|p| u16::try_from(p).ok()),
         enabled: row.get::<_, i32>(6)? != 0,
         created_at: parse_ts(&created_s),
         updated_at: parse_ts(&updated_s),

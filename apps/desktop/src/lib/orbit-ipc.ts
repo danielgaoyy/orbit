@@ -630,6 +630,7 @@ export interface HostCardView {
   display_name: string;
   hostname: string;
   custom_name: string | null;
+  is_local?: boolean;
   ssh_alias: string | null;
   route_mode: HostRouteMode;
   remote_daemon_port: number;
@@ -704,6 +705,7 @@ export type WorkspaceIsolation = "local" | "worktree";
 export type WorktreeCreateMode = "branch_off" | "checkout_branch" | "checkout_pr";
 export type WorkspaceSetupStatus = "none" | "idle" | "running" | "succeeded" | "failed";
 export type AgentMessageKind = "direct_message" | "finish_notification" | "heartbeat";
+export type AgentMessageDeliveryStatus = "queued" | "dispatched" | "settled" | "dropped";
 export type ProviderSubagentStatus = "running" | "completed" | "failed" | "stopped" | "canceled";
 export type ScheduleKind = "schedule" | "heartbeat";
 export type ScheduleStatus = "active" | "paused" | "completed";
@@ -1178,6 +1180,7 @@ export interface AgentCardView {
   status_label: string;
   is_running: boolean;
   has_background_tasks?: boolean;
+  has_armed_timers?: boolean;
   has_running_subagents?: boolean;
   is_awaiting_permission: boolean;
   parent_agent_id: string | null;
@@ -1217,7 +1220,11 @@ export function isAgentBackgroundWaiting(
     return agent.has_background_tasks;
   }
   const lbl = agent.status_label.trim();
-  return /^running\s*\(.*background task/i.test(lbl) || /^background task$/i.test(lbl);
+  return (
+    /^waiting\b/i.test(lbl) ||
+    /^running\s*\(.*background task/i.test(lbl) ||
+    /^background task$/i.test(lbl)
+  );
 }
 
 /**
@@ -1232,6 +1239,23 @@ export function isAgentForegroundRunning(
 ): boolean {
   if (!agent) return false;
   return Boolean(agent.is_running) && !isAgentBackgroundWaiting(agent);
+}
+
+/**
+ * Returns true when an agent currently has armed background timers/schedules/conditional waits
+ * while otherwise idle (so UI can show a restrained AlarmClock glyph without a spinner).
+ */
+export function isAgentTimerWaiting(
+  agent:
+    | Pick<AgentCardView, "has_armed_timers" | "has_background_tasks" | "status_label">
+    | null
+    | undefined,
+): boolean {
+  if (!agent) return false;
+  if (typeof agent.has_armed_timers === "boolean") {
+    return agent.has_armed_timers;
+  }
+  return isAgentBackgroundWaiting(agent);
 }
 
 export interface QuotaWindow {
@@ -1818,6 +1842,12 @@ export type TimelineItemView =
       event?: string | null;
       text: string;
       permission_context?: PermissionCheckpointRef | null;
+      delivery_status?: AgentMessageDeliveryStatus | null;
+      delivery_turn_id?: string | null;
+      blocking_turn_id?: string | null;
+      queued_at_ms?: number | null;
+      dispatched_at_ms?: number | null;
+      settled_at_ms?: number | null;
       blocks: RichBlockView[];
       timestamp_ms?: number | null;
     };
@@ -2277,6 +2307,8 @@ export interface StageTurnView {
   has_active_item: boolean;
   started_at_ms: number | null;
   completed_at_ms: number | null;
+  latest_activity_ms?: number | null;
+  latest_visible_progress_ms?: number | null;
 }
 
 export type SessionTouchedFileAction = "created" | "edited" | "read";
@@ -3543,6 +3575,11 @@ export const orbitIpc = {
   interruptAgent: async (hostId: string, agentId: string): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("interrupt_agent", { hostId, agentId });
+  },
+
+  interruptAgentAndContinue: async (hostId: string, agentId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("interrupt_agent_and_continue", { hostId, agentId });
   },
 
   setSessionMode: async (
@@ -5381,7 +5418,7 @@ export const orbitIpc = {
   },
 
   getAppVersion: async (): Promise<string> => {
-    if (!isTauriRuntime()) return "0.10.1";
+    if (!isTauriRuntime()) return "0.10.2";
     return invoke<string>("get_app_version");
   },
 

@@ -23,6 +23,7 @@ import {
   type PendingPermissionSummary,
   type StageTurnView,
   type TimelineItemView,
+  isAgentForegroundRunning,
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { computeSubagentTurnsFingerprint, MAX_CACHED_STAGE_VIEWS } from "@/lib/stage-cache";
@@ -179,7 +180,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
   const status: "awaiting_permission" | "running" | "completed" | "canceled" | "failed" = childAgent
     ? childAgent.is_awaiting_permission
       ? "awaiting_permission"
-      : childAgent.is_running || childAgent.has_background_tasks
+      : isAgentForegroundRunning(childAgent)
         ? "running"
         : childStatusLabel.includes("cancel") ||
             childStatusLabel.includes("interrupt") ||

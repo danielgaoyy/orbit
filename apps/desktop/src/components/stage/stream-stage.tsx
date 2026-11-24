@@ -33,6 +33,7 @@ import {
   isAgentForegroundRunning,
   orbitIpc,
 } from "@/lib/orbit-ipc";
+import { useI18n } from "@/lib/i18n";
 import { isAgentInGitRepo } from "@/lib/projects";
 import {
   type ResolvedSubagentItem,
@@ -40,6 +41,7 @@ import {
   areResolvedSubagentsEqual,
   buildSubagentNameMatcher,
 } from "@/lib/subagents";
+import { useDelegationDispatches } from "./use-delegation-dispatches";
 import { computePrependRestoredScrollTop } from "@/lib/stage-pagination";
 import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
 import { cn } from "@/lib/utils";
@@ -154,11 +156,12 @@ const StageHydratingFallback = memo(function StageHydratingFallback({
 });
 
 const NewSessionLaunchpad = memo(function NewSessionLaunchpad() {
+  const { t } = useI18n();
   return (
     <div className="orbit-stage-enter flex h-full w-full flex-col justify-center px-[24px] py-12 pb-[10vh]">
-      <div className="mx-auto w-full max-w-[var(--orbit-stage-max-w,740px)] space-y-6">
+      <div className="mx-auto flex w-full max-w-[var(--orbit-stage-max-w,740px)] flex-col gap-6">
         <h1 className="text-ink-primary px-1 text-center text-[24px] font-medium tracking-[-0.02em]">
-          What would you like to build?
+          {t("composer.heroTitle")}
         </h1>
 
         <OmniComposer variant="hero" />
@@ -276,15 +279,23 @@ const StageBottomViewportOverlay = memo(function StageBottomViewportOverlay({
 
 const StageDockedComposer = memo(function StageDockedComposer({
   scrollUiStore,
+  hasPendingDecisions,
 }: {
   scrollUiStore: StageScrollUiStore;
+  hasPendingDecisions: boolean;
 }) {
   const isOccludingText = useSyncExternalStore(
     scrollUiStore.subscribe,
     () => scrollUiStore.getSnapshot().isOccludingText,
     () => scrollUiStore.getSnapshot().isOccludingText,
   );
-  return <OmniComposer variant="docked" occluding={isOccludingText} />;
+  return (
+    <OmniComposer
+      variant="docked"
+      occluding={isOccludingText}
+      hasPendingDecisions={hasPendingDecisions}
+    />
+  );
 });
 
 const VirtualizedTurnList = memo(function VirtualizedTurnList({
@@ -366,6 +377,8 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
     wasScrolling: false,
   });
   const localVirtualizerRef = useRef<ReactVirtualizer<HTMLDivElement, HTMLDivElement> | null>(null);
+
+  const dispatches = useDelegationDispatches(stageTurns, sessionSubagents, selectedHostId);
 
   const turnsRef = useRef(stageTurns);
   turnsRef.current = stageTurns;
@@ -808,6 +821,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
           >
             <TurnStageSection
               turn={turn}
+              dispatches={dispatches}
               isTurnActive={turnActive}
               isLastTurn={isLast}
               agentStatusLabel={turnActive ? agentStatusLabel : null}
@@ -2314,7 +2328,15 @@ export function StreamStage() {
               questions={pendingQuestions}
               subagentPermissions={subagentPermissions}
             />
-            <StageDockedComposer scrollUiStore={scrollUiStore} />
+            <StageDockedComposer
+              scrollUiStore={scrollUiStore}
+              hasPendingDecisions={
+                pendingPermissions.length +
+                  pendingQuestions.length +
+                  subagentPermissions.length >
+                0
+              }
+            />
           </div>
         </div>
       </div>

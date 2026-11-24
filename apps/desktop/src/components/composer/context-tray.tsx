@@ -1,17 +1,30 @@
 import { memo, useEffect, useState } from "react";
 import {
+  Check,
+  Copy,
   FileDiff,
   FileText,
   Film,
   GitCompareArrows,
   Image as ImageIcon,
-  Loader2,
   Music,
   Quote,
+  Sparkles,
   SquareTerminal,
   X,
 } from "lucide-react";
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog-tabs";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { useI18n } from "@/lib/i18n";
 import { getCachedPromptImage, loadPromptImage } from "@/lib/prompt-image-cache";
 import { formatFileSizeCompact } from "@/lib/session-insights";
 import { symbolKindGlyph } from "@/lib/symbol-mentions";
@@ -29,15 +42,28 @@ interface ContextTrayProps {
   pastes: readonly PastedAttachment[];
 }
 
+interface ImagePreviewState {
+  url: string;
+  filename: string;
+}
+
+interface PastePreviewState {
+  label: string;
+  content: string;
+}
+
 const ComposerImageThumb = memo(function ComposerImageThumb({
   img,
   hostId,
   cwd,
+  onPreview,
 }: {
   img: Extract<ContextMentionItem, { kind: "image" }>;
   hostId: string | null;
   cwd: string;
+  onPreview: (target: ImagePreviewState) => void;
 }) {
+  const { t } = useI18n();
   const effectiveHostId = img.stagedHostId || hostId || "";
   const resolveSyncUrl = (): string | null => {
     if (img.previewUrl) return img.previewUrl;
@@ -84,38 +110,48 @@ const ComposerImageThumb = memo(function ComposerImageThumb({
 
   return (
     <div
-      title={`${img.filename}${sizeHint}${img.uploading ? " · Uploading…" : ""}`}
-      className="orbit-pill-enter group border-border bg-muted/50 relative size-12 shrink-0 overflow-hidden rounded-xl border"
+      title={`${img.filename}${sizeHint}${img.uploading ? ` · ${t("composer.uploadingAttachments")}` : ""}`}
+      className="orbit-pill-enter group border-border-default bg-surface-recessed relative size-12 shrink-0 overflow-hidden rounded-xl border"
     >
       {resolvedUrl ? (
-        <img
-          src={resolvedUrl}
-          alt={img.filename}
-          className="size-full object-cover"
-          onError={() => {
-            setResolvedUrl(null);
-            setLoadFailed(true);
-          }}
-        />
+        <button
+          type="button"
+          aria-label={t("composer.previewImageAria", { name: img.filename })}
+          onClick={() => onPreview({ url: resolvedUrl, filename: img.filename })}
+          className="block size-full cursor-zoom-in outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+        >
+          <img
+            src={resolvedUrl}
+            alt={img.filename}
+            className="size-full object-cover"
+            onError={() => {
+              setResolvedUrl(null);
+              setLoadFailed(true);
+            }}
+          />
+        </button>
       ) : (
-        <div className="text-muted-foreground/70 flex size-full items-center justify-center">
+        <div className="text-ink-muted flex size-full items-center justify-center">
           {loadFailed ? (
             <ImageIcon className="size-4 stroke-[1.6]" />
           ) : (
-            <Loader2 className="size-3.5 animate-spin" />
+            <OrbitSpinner size={14} />
           )}
         </div>
       )}
       {img.uploading && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/45">
-          <Loader2 className="size-4 animate-spin text-white" />
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/45 text-white">
+          <OrbitSpinner size={15} />
         </div>
       )}
       <button
         type="button"
-        onClick={() => orbitActions.removeContextMention(img.id)}
-        aria-label={`Remove ${img.filename}`}
-        className="bg-background/90 text-foreground border-border absolute top-0.5 right-0.5 flex size-4.5 cursor-pointer items-center justify-center rounded-full border opacity-0 shadow-xs transition-opacity group-hover:opacity-100"
+        onClick={(e) => {
+          e.stopPropagation();
+          orbitActions.removeContextMention(img.id);
+        }}
+        aria-label={t("composer.removeAttachmentAria", { name: img.filename })}
+        className="bg-surface-overlay/95 text-ink-primary border-border-default absolute top-0.5 right-0.5 flex size-4.5 cursor-pointer items-center justify-center rounded-full border opacity-0 shadow-xs transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
       >
         <X className="size-2.5" />
       </button>
@@ -141,8 +177,12 @@ export const ContextTray = memo(function ContextTray({
   quotes,
   pastes,
 }: ContextTrayProps) {
+  const { t } = useI18n();
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
+  const [previewImage, setPreviewImage] = useState<ImagePreviewState | null>(null);
+  const [previewPaste, setPreviewPaste] = useState<PastePreviewState | null>(null);
+  const [copiedPaste, setCopiedPaste] = useState(false);
 
   if (contexts.length === 0 && quotes.length === 0 && pastes.length === 0) {
     return null;
@@ -154,93 +194,124 @@ export const ContextTray = memo(function ContextTray({
   const nonImages = contexts.filter((c) => c.kind !== "image");
 
   return (
-    <div className="flex flex-wrap items-center gap-1.5 px-[14px] pt-2.5 pb-0.5">
-      {/* 1. Image Thumbnails (48×48) */}
-      {images.map((img) => (
-        <ComposerImageThumb
-          key={img.id}
-          img={img}
-          hostId={selectedHostId}
-          cwd={selectedCwd || "~"}
-        />
-      ))}
+    <>
+      <div className="flex flex-wrap items-center gap-1.5 px-[14px] pt-2.5 pb-0.5">
+        {/* 1. Image Thumbnails (48×48, clickable to preview) */}
+        {images.map((img) => (
+          <ComposerImageThumb
+            key={img.id}
+            img={img}
+            hostId={selectedHostId}
+            cwd={selectedCwd || "~"}
+            onPreview={setPreviewImage}
+          />
+        ))}
 
-      {/* 2. Structured Context Pills (@file, @diff, @terminal) */}
-      {nonImages.map((item) => {
-        if (item.kind === "file") {
-          const displayTarget = item.filename || item.path || "Attachment";
-          const { basename, dirHint } = splitPathDisplay(
-            item.mediaKind ? displayTarget : item.path || item.filename || "Attachment",
-          );
-          const MediaIcon =
-            item.mediaKind === "pdf"
-              ? FileText
-              : item.mediaKind === "video"
-                ? Film
-                : item.mediaKind === "audio"
-                  ? Music
-                  : resolveSemanticFileIcon(basename);
-          const isPreviewableMedia = Boolean(item.mediaKind);
-          const metaLabelParts: string[] = [];
-          if (item.mediaKind === "pdf" && item.pdfPageCount && item.pdfPageCount > 0) {
-            metaLabelParts.push(
-              item.pdfPageCount === 1 ? "1p" : `${item.pdfPageCount}p`,
+        {/* 2. Structured Context Pills (@file, @diff, @terminal, @symbol) */}
+        {nonImages.map((item) => {
+          if (item.kind === "file") {
+            const displayTarget = item.filename || item.path || "Attachment";
+            const { basename, dirHint } = splitPathDisplay(
+              item.mediaKind ? displayTarget : item.path || item.filename || "Attachment",
             );
-          }
-          if (item.sizeBytes != null && item.sizeBytes > 0) {
-            metaLabelParts.push(formatFileSizeCompact(item.sizeBytes));
-          }
-          const metaSummary = metaLabelParts.join(" · ");
+            const MediaIcon =
+              item.mediaKind === "pdf"
+                ? FileText
+                : item.mediaKind === "video"
+                  ? Film
+                  : item.mediaKind === "audio"
+                    ? Music
+                    : resolveSemanticFileIcon(basename);
+            const isPreviewableMedia = Boolean(item.mediaKind);
+            const metaLabelParts: string[] = [];
+            if (item.mediaKind === "pdf" && item.pdfPageCount && item.pdfPageCount > 0) {
+              metaLabelParts.push(
+                item.pdfPageCount === 1 ? "1p" : `${item.pdfPageCount}p`,
+              );
+            }
+            if (item.sizeBytes != null && item.sizeBytes > 0) {
+              metaLabelParts.push(formatFileSizeCompact(item.sizeBytes));
+            }
+            const metaSummary = metaLabelParts.join(" · ");
 
-          if (isPreviewableMedia && item.mediaKind) {
-            const mediaKind = item.mediaKind;
+            if (isPreviewableMedia && item.mediaKind) {
+              const mediaKind = item.mediaKind;
+              return (
+                <span
+                  key={item.id}
+                  title={
+                    item.uploading
+                      ? t("composer.uploadingAttachments")
+                      : `${basename}${metaSummary ? ` (${metaSummary})` : ""}`
+                  }
+                  className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary hover:bg-accent inline-flex max-w-76 items-center gap-1 rounded-lg border py-0.5 pr-1 pl-2 text-[12px] transition-colors"
+                >
+                  <button
+                    type="button"
+                    onClick={() =>
+                      orbitActions.openMediaPreview({
+                        kind: mediaKind,
+                        filename: basename,
+                        path: item.path || null,
+                        hostId: item.stagedHostId ?? selectedHostId,
+                        cwd: selectedCwd || "~",
+                        localUrl: item.previewUrl ?? null,
+                        mimeType: item.mimeType ?? null,
+                        sizeBytes: item.sizeBytes ?? null,
+                        pdfPageCount: item.pdfPageCount ?? null,
+                      })
+                    }
+                    className="flex min-w-0 cursor-pointer items-center gap-1.5 py-0.5 text-left"
+                  >
+                    {item.uploading ? (
+                      <OrbitSpinner size={12} className="text-ink-muted shrink-0" />
+                    ) : (
+                      <MediaIcon className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
+                    )}
+                    <span className="truncate font-mono font-medium">{basename}</span>
+                    {metaSummary && (
+                      <span className="text-ink-muted tabular-nums shrink-0 text-[11px]">
+                        {metaSummary}
+                      </span>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={t("composer.removeAttachmentAria", { name: basename })}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      orbitActions.removeContextMention(item.id);
+                    }}
+                    className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-[5px] transition-colors"
+                  >
+                    <X className="size-3" />
+                  </button>
+                </span>
+              );
+            }
+
             return (
               <span
                 key={item.id}
-                title={
-                  item.uploading
-                    ? `Uploading ${basename}…`
-                    : `${basename}${metaSummary ? ` (${metaSummary})` : ""} — click to preview`
-                }
-                className="orbit-pill-enter border-border bg-muted/65 text-foreground hover:bg-accent/70 inline-flex max-w-76 items-center gap-1.5 rounded-lg border px-2 py-1 text-[12px] transition-colors"
+                title={item.uploading ? t("composer.uploadingAttachments") : displayTarget}
+                className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary inline-flex max-w-68 items-center gap-1.5 rounded-lg border py-0.5 pr-1 pl-2 text-[12px] transition-colors"
               >
+                {item.uploading ? (
+                  <OrbitSpinner size={12} className="text-ink-muted shrink-0" />
+                ) : (
+                  <MediaIcon className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
+                )}
+                <span className="truncate font-mono font-medium">{basename}</span>
+                {dirHint && (
+                  <span className="text-ink-muted hidden truncate font-mono text-[11px] sm:inline">
+                    {dirHint}
+                  </span>
+                )}
                 <button
                   type="button"
-                  onClick={() =>
-                    orbitActions.openMediaPreview({
-                      kind: mediaKind,
-                      filename: basename,
-                      path: item.path || null,
-                      hostId: item.stagedHostId ?? selectedHostId,
-                      cwd: selectedCwd || "~",
-                      localUrl: item.previewUrl ?? null,
-                      mimeType: item.mimeType ?? null,
-                      sizeBytes: item.sizeBytes ?? null,
-                      pdfPageCount: item.pdfPageCount ?? null,
-                    })
-                  }
-                  className="flex min-w-0 cursor-pointer items-center gap-1.5 text-left"
-                >
-                  {item.uploading ? (
-                    <Loader2 className="text-muted-foreground size-3.5 shrink-0 animate-spin stroke-[1.75]" />
-                  ) : (
-                    <MediaIcon className="text-foreground/70 size-3.5 shrink-0 stroke-[1.75]" />
-                  )}
-                  <span className="truncate font-mono font-medium">{basename}</span>
-                  {metaSummary && (
-                    <span className="text-muted-foreground tabular-nums shrink-0 text-[11px]">
-                      {metaSummary}
-                    </span>
-                  )}
-                </button>
-                <button
-                  type="button"
-                  aria-label={`Remove ${basename}`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    orbitActions.removeContextMention(item.id);
-                  }}
-                  className="text-muted-foreground hover:text-foreground ml-0.5 cursor-pointer rounded-xs"
+                  aria-label={t("composer.removeAttachmentAria", { name: basename })}
+                  onClick={() => orbitActions.removeContextMention(item.id)}
+                  className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-[5px] transition-colors"
                 >
                   <X className="size-3" />
                 </button>
@@ -248,145 +319,224 @@ export const ContextTray = memo(function ContextTray({
             );
           }
 
-          return (
-            <span
-              key={item.id}
-              title={item.uploading ? `Uploading ${basename}…` : displayTarget}
-              className="orbit-pill-enter border-border bg-muted/65 text-foreground inline-flex max-w-68 items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px] transition-colors"
-            >
-              {item.uploading ? (
-                <Loader2 className="text-muted-foreground size-3.5 shrink-0 animate-spin stroke-[1.75]" />
-              ) : (
-                <MediaIcon className="text-foreground/65 size-3.5 shrink-0 stroke-[1.75]" />
-              )}
-              <span className="truncate font-mono font-medium">{basename}</span>
-              {dirHint && (
-                <span className="text-muted-foreground hidden truncate font-mono text-[11px] sm:inline">
-                  {dirHint}
+          if (item.kind === "git_diff") {
+            const DiffIcon = item.staged ? GitCompareArrows : FileDiff;
+            return (
+              <span
+                key={item.id}
+                className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary inline-flex items-center gap-1.5 rounded-lg border py-0.5 pr-1 pl-2 text-[12px]"
+              >
+                <DiffIcon className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
+                <span className="font-medium">{item.label}</span>
+                <button
+                  type="button"
+                  aria-label={t("composer.removeAttachmentAria", { name: item.label })}
+                  onClick={() => orbitActions.removeContextMention(item.id)}
+                  className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-[5px] transition-colors"
+                >
+                  <X className="size-3" />
+                </button>
+              </span>
+            );
+          }
+
+          if (item.kind === "terminal_output") {
+            return (
+              <span
+                key={item.id}
+                className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary inline-flex items-center gap-1.5 rounded-lg border py-0.5 pr-1 pl-2 text-[12px]"
+              >
+                <SquareTerminal className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
+                <span className="font-medium">{item.label}</span>
+                <button
+                  type="button"
+                  aria-label={t("composer.removeAttachmentAria", { name: item.label })}
+                  onClick={() => orbitActions.removeContextMention(item.id)}
+                  className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-[5px] transition-colors"
+                >
+                  <X className="size-3" />
+                </button>
+              </span>
+            );
+          }
+
+          if (item.kind === "code_symbol") {
+            const glyphMeta = symbolKindGlyph(item.symbolKind);
+            return (
+              <span
+                key={item.id}
+                title={item.signature || `${item.symbolName} (${item.path}:L${item.startLine})`}
+                className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary inline-flex max-w-68 items-center gap-1.5 rounded-lg border py-0.5 pr-1 pl-1.5 text-[12px]"
+              >
+                <span className="bg-surface-base text-ink-muted inline-flex size-4 shrink-0 items-center justify-center rounded font-mono text-[10.5px] font-semibold">
+                  {glyphMeta.glyph}
                 </span>
-              )}
-              <button
-                type="button"
-                onClick={() => orbitActions.removeContextMention(item.id)}
-                className="text-muted-foreground hover:text-foreground ml-0.5 cursor-pointer rounded-xs"
-              >
-                <X className="size-3" />
-              </button>
-            </span>
-          );
-        }
-
-        if (item.kind === "git_diff") {
-          const DiffIcon = item.staged ? GitCompareArrows : FileDiff;
-          return (
-            <span
-              key={item.id}
-              className="orbit-pill-enter border-border bg-muted/65 text-foreground inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px]"
-            >
-              <DiffIcon className="text-foreground/65 size-3.5 shrink-0 stroke-[1.75]" />
-              <span className="font-medium">{item.label}</span>
-              <button
-                type="button"
-                onClick={() => orbitActions.removeContextMention(item.id)}
-                className="text-muted-foreground hover:text-foreground ml-0.5 cursor-pointer rounded-xs"
-              >
-                <X className="size-3" />
-              </button>
-            </span>
-          );
-        }
-
-        if (item.kind === "terminal_output") {
-          return (
-            <span
-              key={item.id}
-              className="orbit-pill-enter border-border bg-muted/65 text-foreground inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px]"
-            >
-              <SquareTerminal className="text-foreground/65 size-3.5 shrink-0 stroke-[1.75]" />
-              <span className="font-medium">{item.label}</span>
-              <button
-                type="button"
-                onClick={() => orbitActions.removeContextMention(item.id)}
-                className="text-muted-foreground hover:text-foreground ml-0.5 cursor-pointer rounded-xs"
-              >
-                <X className="size-3" />
-              </button>
-            </span>
-          );
-        }
-
-        if (item.kind === "code_symbol") {
-          const glyphMeta = symbolKindGlyph(item.symbolKind);
-          return (
-            <span
-              key={item.id}
-              title={item.signature || `${item.symbolName} (${item.path}:L${item.startLine})`}
-              className="orbit-pill-enter border-border bg-muted/65 text-foreground inline-flex max-w-68 items-center gap-1.5 rounded-lg border px-2 py-1 text-[12px]"
-            >
-              <span className="bg-background/80 text-muted-foreground inline-flex size-4 shrink-0 items-center justify-center rounded font-mono text-[10.5px] font-semibold">
-                {glyphMeta.glyph}
+                <span className="truncate font-mono font-medium">{item.symbolName}</span>
+                <span className="text-ink-muted shrink-0 font-mono text-[11px]">
+                  :L{item.startLine}
+                </span>
+                <button
+                  type="button"
+                  aria-label={t("composer.removeAttachmentAria", { name: item.symbolName })}
+                  onClick={() => orbitActions.removeContextMention(item.id)}
+                  className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-[5px] transition-colors"
+                >
+                  <X className="size-3" />
+                </button>
               </span>
-              <span className="truncate font-mono font-medium">{item.symbolName}</span>
-              <span className="text-muted-foreground shrink-0 font-mono text-[11px]">
-                :L{item.startLine}
+            );
+          }
+
+          if (item.kind === "skill") {
+            return (
+              <span
+                key={item.id}
+                title={item.description ? `${item.label} — ${item.description}` : item.label}
+                className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary inline-flex max-w-68 items-center gap-1.5 rounded-lg border py-0.5 pr-1 pl-2 text-[12px]"
+              >
+                <Sparkles className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
+                <span className="truncate font-mono font-medium">/{item.slug}</span>
+                <button
+                  type="button"
+                  aria-label={t("composer.removeSkillAria", { slug: item.slug })}
+                  onClick={() => orbitActions.removeContextMention(item.id)}
+                  className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-[5px] transition-colors"
+                >
+                  <X className="size-3" />
+                </button>
               </span>
+            );
+          }
+
+          return null;
+        })}
+
+        {/* 3. Diff Line Quotes */}
+        {quotes.map((q) => {
+          const quoteLabel = `${q.path}${q.lineNumber !== null ? `:${q.lineNumber}` : ""}`;
+          return (
+            <span
+              key={q.id}
+              title={q.code}
+              className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary inline-flex max-w-68 items-center gap-1.5 rounded-lg border py-0.5 pr-1 pl-2 text-[12px]"
+            >
+              <Quote className="text-ink-tertiary size-3 shrink-0" />
+              <span className="truncate font-mono">{quoteLabel}</span>
               <button
                 type="button"
-                onClick={() => orbitActions.removeContextMention(item.id)}
-                className="text-muted-foreground hover:text-foreground ml-0.5 cursor-pointer rounded-xs"
+                aria-label={t("composer.removeAttachmentAria", { name: quoteLabel })}
+                onClick={() => orbitActions.removeDiffQuote(q.id)}
+                className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-[5px] transition-colors"
               >
                 <X className="size-3" />
               </button>
             </span>
           );
-        }
+        })}
 
-        return null;
-      })}
-
-      {/* 3. Diff Line Quotes */}
-      {quotes.map((q) => (
-        <span
-          key={q.id}
-          title={q.code}
-          className="orbit-pill-enter border-border bg-muted/65 text-foreground inline-flex max-w-68 items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px]"
-        >
-          <Quote className="text-foreground/65 size-3 shrink-0" />
-          <span className="truncate font-mono">
-            {q.path}
-            {q.lineNumber !== null ? `:${q.lineNumber}` : ""}
-          </span>
-          <button
-            type="button"
-            onClick={() => orbitActions.removeDiffQuote(q.id)}
-            className="text-muted-foreground hover:text-foreground ml-0.5 cursor-pointer rounded-xs"
-          >
-            <X className="size-3" />
-          </button>
-        </span>
-      ))}
-
-      {/* 4. Collapsed Large Pasted Snippets & Attached Text Files */}
-      {pastes.map((p) => {
-        const PasteIcon = p.filename ? resolveSemanticFileIcon(p.filename) : FileText;
-        return (
-          <span
-            key={p.id}
-            title={`${p.content.slice(0, 280)}${p.content.length > 280 ? "…" : ""}`}
-            className="orbit-pill-enter border-border bg-muted/65 text-foreground inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px]"
-          >
-            <PasteIcon className="text-foreground/65 size-3.5 shrink-0 stroke-[1.75]" />
-            <span className="font-medium">{p.label}</span>
-            <button
-              type="button"
-              onClick={() => orbitActions.removePastedAttachment(p.id)}
-              className="text-muted-foreground hover:text-foreground ml-0.5 cursor-pointer rounded-xs"
+        {/* 4. Collapsed Large Pasted Snippets & Attached Text Files (clickable to inspect) */}
+        {pastes.map((p) => {
+          const PasteIcon = p.filename ? resolveSemanticFileIcon(p.filename) : FileText;
+          return (
+            <span
+              key={p.id}
+              className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary hover:bg-accent inline-flex items-center gap-1 rounded-lg border py-0.5 pr-1 pl-2 text-[12px] transition-colors"
             >
-              <X className="size-3" />
-            </button>
-          </span>
-        );
-      })}
-    </div>
+              <button
+                type="button"
+                aria-label={t("composer.previewPasteAria", { name: p.label })}
+                onClick={() => {
+                  setCopiedPaste(false);
+                  setPreviewPaste({ label: p.label, content: p.content });
+                }}
+                className="flex min-w-0 cursor-pointer items-center gap-1.5 py-0.5 text-left"
+              >
+                <PasteIcon className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
+                <span className="font-medium">{p.label}</span>
+              </button>
+              <button
+                type="button"
+                aria-label={t("composer.removeAttachmentAria", { name: p.label })}
+                onClick={() => orbitActions.removePastedAttachment(p.id)}
+                className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-[5px] transition-colors"
+              >
+                <X className="size-3" />
+              </button>
+            </span>
+          );
+        })}
+      </div>
+
+      {/* Inline Image Lightbox Dialog for attached composer images */}
+      <Dialog open={previewImage !== null} onOpenChange={(open) => !open && setPreviewImage(null)}>
+        <DialogContent className="flex max-h-[86vh] w-auto max-w-[min(90vw,960px)] flex-col gap-2 overflow-hidden p-3">
+          <DialogHeader className="pr-8">
+            <DialogTitle className="truncate font-mono text-[13px] font-medium">
+              {previewImage?.filename ?? ""}
+            </DialogTitle>
+            <DialogDescription className="sr-only">
+              {previewImage?.filename ?? ""}
+            </DialogDescription>
+          </DialogHeader>
+          {previewImage && (
+            <div className="bg-surface-recessed flex min-h-0 flex-1 items-center justify-center overflow-auto rounded-lg p-2">
+              <img
+                src={previewImage.url}
+                alt={previewImage.filename}
+                className="max-h-[72vh] max-w-full rounded object-contain"
+              />
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Inline Text Preview Dialog for collapsed pasted snippets & text files */}
+      <Dialog open={previewPaste !== null} onOpenChange={(open) => !open && setPreviewPaste(null)}>
+        <DialogContent className="flex max-h-[82vh] w-[min(90vw,720px)] flex-col gap-2.5 overflow-hidden p-4">
+          <DialogHeader className="flex flex-row items-center justify-between gap-3 pr-8">
+            <div className="min-w-0">
+              <DialogTitle className="truncate font-mono text-[13px] font-medium">
+                {previewPaste?.label ?? t("composer.pastePreviewTitle")}
+              </DialogTitle>
+              <DialogDescription className="sr-only">
+                {t("composer.pastePreviewTitle")}
+              </DialogDescription>
+            </div>
+            {previewPaste && (
+              <Button
+                type="button"
+                variant="outline"
+                size="xs"
+                onClick={() => {
+                  void navigator.clipboard.writeText(previewPaste.content).then(() => {
+                    setCopiedPaste(true);
+                    window.setTimeout(() => setCopiedPaste(false), 1400);
+                  });
+                }}
+                className="shrink-0 gap-1.5"
+              >
+                {copiedPaste ? (
+                  <Check className="text-signal-success size-3.5" />
+                ) : (
+                  <Copy className="size-3.5" />
+                )}
+                <span>{copiedPaste ? t("common.copied") : t("common.copy")}</span>
+              </Button>
+            )}
+          </DialogHeader>
+          {previewPaste && (
+            <ScrollArea
+              orientation="both"
+              className="border-border-subtle bg-surface-recessed min-h-0 flex-1 rounded-xl border"
+              viewportClassName="selectable-text max-h-[60vh] p-3"
+            >
+              <pre className="text-ink-primary m-0 font-mono text-[12px] leading-[1.55] whitespace-pre-wrap break-words">
+                {previewPaste.content}
+              </pre>
+            </ScrollArea>
+          )}
+        </DialogContent>
+      </Dialog>
+    </>
   );
 });

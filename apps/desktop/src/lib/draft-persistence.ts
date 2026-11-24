@@ -1,4 +1,4 @@
-import type { SlashDirective } from "@/lib/orbit-ipc";
+import { type ComposerInlineDirective, isComposerInlineDirective } from "./slash-commands.ts";
 import type { RichMediaKind } from "@/lib/media-utils";
 
 export const DRAFTS_STORAGE_KEY = "orbit.drafts.v1";
@@ -19,16 +19,6 @@ const VALID_RICH_MEDIA_KINDS: ReadonlySet<RichMediaKind> = new Set<RichMediaKind
   "pdf",
   "audio",
   "video",
-]);
-
-const VALID_SLASH_DIRECTIVES: ReadonlySet<SlashDirective> = new Set<SlashDirective>([
-  "plan",
-  "review",
-  "compact",
-  "orbit",
-  "orbit-handoff",
-  "orbit-committee",
-  "orbit-advisor",
 ]);
 
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -96,6 +86,13 @@ export type PersistedContextItem =
       container?: string | null;
       language: string;
       snippet?: string | null;
+    }
+  | {
+      id: string;
+      kind: "skill";
+      slug: string;
+      label: string;
+      description?: string;
     };
 
 export interface PersistedScopeDraft {
@@ -104,7 +101,7 @@ export interface PersistedScopeDraft {
   pastedAttachments?: PersistedPastedAttachment[];
   diffQuotes?: PersistedDiffQuote[];
   contextItems?: PersistedContextItem[];
-  slashDirective?: SlashDirective;
+  slashDirective?: ComposerInlineDirective;
   sideQuestionDraft?: string;
 }
 
@@ -125,7 +122,7 @@ export interface DraftStateSlices {
   pastedAttachments: Record<string, PersistedPastedAttachment[]>;
   diffQuotes: Record<string, PersistedDiffQuote[]>;
   contextItems?: Record<string, readonly unknown[]>;
-  slashDirectives: Record<string, SlashDirective | null>;
+  slashDirectives: Record<string, ComposerInlineDirective | null>;
   sideQuestionDrafts: Record<string, string>;
 }
 
@@ -267,9 +264,6 @@ function isValidScopeKey(key: unknown): key is string {
   return typeof key === "string" && key.length > 0 && !FORBIDDEN_KEYS.has(key);
 }
 
-function isValidSlashDirective(value: unknown): value is SlashDirective {
-  return typeof value === "string" && VALID_SLASH_DIRECTIVES.has(value as SlashDirective);
-}
 
 function normalizePastedAttachment(
   raw: unknown,
@@ -465,6 +459,25 @@ function normalizeContextItem(
     return item;
   }
 
+  if (raw.kind === "skill") {
+    if (typeof raw.slug !== "string" || raw.slug.trim().length === 0) return null;
+    const slug = truncateUtf8(raw.slug.trim(), 128);
+    const label =
+      typeof raw.label === "string" && raw.label.trim().length > 0
+        ? truncateUtf8(raw.label.trim(), 128)
+        : slug;
+    const item: Extract<PersistedContextItem, { kind: "skill" }> = {
+      id,
+      kind: "skill",
+      slug,
+      label,
+    };
+    if (typeof raw.description === "string" && raw.description.trim().length > 0) {
+      item.description = truncateUtf8(raw.description.trim(), 256);
+    }
+    return item;
+  }
+
   return null;
 }
 
@@ -500,7 +513,7 @@ function capScopeDraftToBudget(
       next.sideQuestionDraft = capped;
     }
   }
-  if (entry.slashDirective && isValidSlashDirective(entry.slashDirective)) {
+  if (entry.slashDirective && isComposerInlineDirective(entry.slashDirective)) {
     next.slashDirective = entry.slashDirective;
   }
   if (entry.pastedAttachments && entry.pastedAttachments.length > 0) {
@@ -811,7 +824,7 @@ export function buildSerializedDraftPayload(
       }
     }
     const directive = slices.slashDirectives[key];
-    if (isValidSlashDirective(directive)) {
+    if (isComposerInlineDirective(directive)) {
       candidate.slashDirective = directive;
     }
     const sideDraft = slices.sideQuestionDrafts[key];
@@ -913,7 +926,7 @@ export function parseAndValidatePersistedDrafts(
     }
 
     if (rawEntry.slashDirective !== undefined && rawEntry.slashDirective !== null) {
-      if (isValidSlashDirective(rawEntry.slashDirective)) {
+      if (isComposerInlineDirective(rawEntry.slashDirective)) {
         candidate.slashDirective = rawEntry.slashDirective;
       } else {
         entryHadInvalidField = true;

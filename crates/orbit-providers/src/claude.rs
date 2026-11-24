@@ -840,6 +840,7 @@ async fn run_claude_actor(
     let mut emitted_text_in_turn = false;
     let mut last_call_prompt_tokens: Option<u64> = None;
     let mut tool_cache: HashMap<String, ToolCallDetail> = HashMap::new();
+    let mut managed_dispatches = HashSet::new();
     let mut pending_perms: HashMap<String, PendingClaudePerm> = HashMap::new();
     let mut queued_prompts: VecDeque<QueuedDriverPrompt> = VecDeque::new();
     let mut pending_interrupt_replacement: Option<QueuedDriverPrompt> = None;
@@ -1729,6 +1730,9 @@ async fn run_claude_actor(
                                                 .and_then(|v| v.as_str())
                                                 .unwrap_or("Tool");
                                             let input = &b["input"];
+                                            if crate::managed_dispatch::is_launch(name) {
+                                                managed_dispatches.insert(call_id.clone());
+                                            }
                                             let detail = map_claude_tool_detail(name, input, None);
                                             let bg_info = if name == "Bash"
                                                 && input
@@ -1817,6 +1821,9 @@ async fn run_claude_actor(
                                                         },
                                                         output_preview: Some(out_text),
                                                     }
+                                                }
+                                                Some(detail) if managed_dispatches.remove(call_id) => {
+                                                    crate::managed_dispatch::detail(&Value::Null, &b["content"], Some(&detail))
                                                 }
                                                 Some(other) => other,
                                                 None => ToolCallDetail::Generic {
@@ -1926,6 +1933,10 @@ async fn run_claude_actor(
                                         || cache_write_tokens > 0
                                     {
                                         let reported_model = select_dominant_claude_model(&val);
+                                        let reported_window = extract_claude_model_context_window(
+                                            &val,
+                                            reported_model.as_deref(),
+                                        );
                                         let _ = evt_tx
                                             .send(DriverEvent::TurnUsage {
                                                 input_tokens,
@@ -1933,6 +1944,7 @@ async fn run_claude_actor(
                                                 cache_read_tokens,
                                                 cache_write_tokens,
                                                 last_call_prompt_tokens: single_call_prompt,
+                                                context_window_tokens: reported_window,
                                                 model: reported_model,
                                             })
                                             .await;
@@ -2143,6 +2155,18 @@ fn select_dominant_claude_model(val: &Value) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn extract_claude_model_context_window(val: &Value, dominant_model: Option<&str>) -> Option<u64> {
+    let map = val.get("modelUsage").and_then(|v| v.as_object())?;
+    let entry = dominant_model
+        .and_then(|m| map.get(m))
+        .or_else(|| map.values().next())?;
+    entry
+        .get("contextWindow")
+        .or_else(|| entry.get("context_window"))
+        .and_then(|v| v.as_u64())
+        .filter(|&w| w > 0)
 }
 
 async fn wait_claude_init_response(
@@ -2404,6 +2428,9 @@ fn map_claude_tool_detail(
                 .and_then(|v| v.as_str())
                 .map(ToOwned::to_owned),
         },
+        name if crate::managed_dispatch::is_launch(name) => {
+            crate::managed_dispatch::detail(input, &Value::Null, None)
+        }
         "Task" | "Agent" => ToolCallDetail::Subagent {
             child_agent_id: None,
             role: input

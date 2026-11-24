@@ -10,54 +10,59 @@ import {
 import {
   ArrowUp,
   AtSign,
-  CornerDownRight,
-  FileSearch,
-  FoldVertical,
-  GripVertical,
-  Image as ImageIcon,
-  Layers,
-  ListTodo,
   Paperclip,
   Plus,
-  Send,
-  Sparkles,
   SquareSlash,
-  Target,
-  Users,
-  X,
 } from "lucide-react";
 import {
   collapseStrippedToken,
+  modeLabel,
   normalizePermissionMode,
 } from "@/components/composer/composer-constants";
-import { ContextOccupancyPill } from "@/components/composer/context-occupancy-pill";
+import { ComposerDirectiveToken } from "@/components/composer/composer-directive-token";
+import { isComposerInlineDirective, resolveComposerSubmission } from "@/lib/slash-commands";
 import { ComposerHeroHeader } from "@/components/composer/composer-hero-header";
 import { ComposerModePicker } from "@/components/composer/composer-mode-picker";
 import { ComposerModelPicker } from "@/components/composer/composer-model-picker";
+import { ComposerQueueStrip } from "@/components/composer/composer-queue-strip";
+import { ContextOccupancyPill } from "@/components/composer/context-occupancy-pill";
 import { ContextTray } from "@/components/composer/context-tray";
 import {
+  MENTION_MENU_LISTBOX_ID,
   MentionMenu,
+  mentionOptionId,
 } from "@/components/composer/mention-menu";
 import {
+  SLASH_MENU_LISTBOX_ID,
   SlashCommandMenu,
   filterSlashCommands,
+  isSlashCommandSessionRequired,
+  slashOptionId,
 } from "@/components/composer/slash-menu";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  SimpleTooltip,
+} from "@/components/ui/overlays";
+import { detectActiveTriggerKind } from "@/lib/composer-input";
+import { translate, useI18n, useLocale } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
-import { useI18n } from "@/lib/i18n";
 import { modSymbol } from "@/lib/keybindings";
 import {
-  mergeMentionCandidates,
-  parseSymbolMentionQuery,
-  resolveDisambiguatedSymbolToken,
-  workspaceSymbolToMentionCandidate,
-} from "@/lib/symbol-mentions";
+  getCatalogForProvider,
+  modelSupportsFastMode,
+  resolveActiveModelSpec,
+} from "@/lib/model-catalog";
 import {
   type ClipboardImagePayload,
-  type GitFileEntry,
   type ManagedSkillRecord,
   type MentionCandidateView,
-  type PromptBadge,
-  type QueuedPromptView,
+  type ProviderKind,
+  type ProviderModelCatalog,
   type SessionMode,
   type SlashCommandView,
   isAgentForegroundRunning,
@@ -66,26 +71,16 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import {
-  getCachedPromptImage,
-  loadPromptImage,
-  lookupRecentSentTurnImage,
-} from "@/lib/prompt-image-cache";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuGroup,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuTrigger,
-  SimpleTooltip,
-} from "@/components/ui/overlays";
-import { ScrollArea } from "@/components/ui/scroll-area";
+  mergeMentionCandidates,
+  parseSymbolMentionQuery,
+  resolveDisambiguatedSymbolToken,
+  workspaceSymbolToMentionCandidate,
+} from "@/lib/symbol-mentions";
 import {
   type ContextMentionItem,
   type DiffQuoteSnippet,
   type InlineMentionTarget,
   type PastedAttachment,
-  type QueuedPromptItem,
   composerScopeKey,
   orbitActions,
   useComposerDraft,
@@ -97,105 +92,14 @@ import { cn } from "@/lib/utils";
 const EMPTY_CONTEXTS: readonly ContextMentionItem[] = [];
 const EMPTY_PASTES: readonly PastedAttachment[] = [];
 const EMPTY_QUOTES: readonly DiffQuoteSnippet[] = [];
-const EMPTY_QUEUED: readonly QueuedPromptItem[] = [];
-const EMPTY_SERVER_QUEUED: readonly QueuedPromptView[] = [];
-const EMPTY_FILES: readonly string[] = [];
-const EMPTY_GIT_FILES: readonly GitFileEntry[] = [];
 const EMPTY_MENTIONS: MentionCandidateView[] = [];
 const EMPTY_MANAGED_SKILLS: readonly ManagedSkillRecord[] = [];
-const MAX_QUEUED_IMAGE_THUMBS = 3;
-
-/**
- * Compact `20×20` inline image thumbnail for queued follow-up rows.
- * Sized strictly inside the `28px` queue row so rows with and without images share identical height.
- */
-const QueuedImageThumb = memo(function QueuedImageThumb({
-  badge,
-  displayText,
-  imageIndex,
-  hostId,
-  agentId,
-  cwd,
-  overflowCount = 0,
-  tooltip,
-}: {
-  badge: PromptBadge;
-  displayText: string;
-  imageIndex: number;
-  hostId: string;
-  agentId: string | null;
-  cwd: string;
-  overflowCount?: number;
-  tooltip: string;
-}) {
-  const recent = useMemo(
-    () =>
-      !badge.path
-        ? lookupRecentSentTurnImage(hostId, agentId, displayText, imageIndex, badge.label)
-        : null,
-    [badge.path, badge.label, displayText, imageIndex, hostId, agentId],
-  );
-  const effectivePath = badge.path?.trim() || recent?.path?.trim() || null;
-
-  const resolveSyncUrl = (): string | null => {
-    if (effectivePath && hostId) {
-      const cached = getCachedPromptImage(hostId, effectivePath);
-      if (cached?.status === "ready") return cached.url;
-    }
-    return recent?.previewUrl ?? null;
-  };
-
-  const [url, setUrl] = useState<string | null>(resolveSyncUrl);
-
-  useEffect(() => {
-    const sync = resolveSyncUrl();
-    if (sync) {
-      setUrl(sync);
-      return;
-    }
-    if (!effectivePath || !hostId) {
-      setUrl(null);
-      return;
-    }
-    let cancelled = false;
-    void loadPromptImage(hostId, cwd || "~", effectivePath).then((entry) => {
-      if (cancelled) return;
-      if (entry.status === "ready") {
-        setUrl(entry.url);
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hostId, agentId, cwd, effectivePath, badge.label]);
-
-  return (
-    <span
-      title={tooltip}
-      className="bg-muted/70 relative inline-flex size-[20px] shrink-0 items-center justify-center overflow-hidden rounded-[5px] border border-black/[0.08] dark:border-white/[0.11]"
-    >
-      {url ? (
-        <img
-          src={url}
-          alt={badge.label}
-          decoding="async"
-          draggable={false}
-          onError={() => setUrl(null)}
-          className="size-full object-cover"
-        />
-      ) : (
-        <ImageIcon className="text-muted-foreground/70 size-3 stroke-[1.7]" />
-      )}
-      {overflowCount > 0 && (
-        <span className="tabular-nums absolute inset-0 flex items-center justify-center bg-black/55 font-mono text-[9.5px] leading-none font-semibold text-white">
-          +{overflowCount}
-        </span>
-      )}
-    </span>
-  );
-});
 const EMPTY_INLINE_MENTIONS: readonly InlineMentionTarget[] = [];
+const EMPTY_CATALOGS: readonly ProviderModelCatalog[] = [];
+
+const BASE_PAD_LEFT = 14;
+const TOKEN_PAD_X = 6;
+const TOKEN_GAP = 4;
 
 const IMAGE_URI_EXT_RE = /\.(png|jpe?g|webp|gif|bmp|svg|avif|ico)(?:[?#].*)?$/i;
 
@@ -232,23 +136,36 @@ function isStandaloneHtmlImageCopy(html: string): boolean {
 export interface OmniComposerProps {
   variant?: "hero" | "docked";
   occluding?: boolean;
+  hasPendingDecisions?: boolean;
 }
 
 export const OmniComposer = memo(function OmniComposer({
   variant = "docked",
   occluding = false,
+  hasPendingDecisions = false,
 }: OmniComposerProps) {
-  const { t } = useI18n();
+  const locale = useLocale();
+  const t = useMemo(() => translate.bind(null, locale), [locale]);
+  const mod = modSymbol();
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
-  const activePathRules = useOrbitSelector((s) =>
+  const activePathRulesCount = useOrbitSelector((s) =>
     s.selectedHostId
-      ? s.pathRulesByScope[`${s.selectedHostId}::${s.selectedWorkspaceCwd || "~"}`]
-      : undefined,
+      ? (s.pathRulesByScope[`${s.selectedHostId}::${s.selectedWorkspaceCwd || "~"}`]?.rules.length ??
+        0)
+      : 0,
   );
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
   const draftMode = useOrbitSelector((s) => s.draftMode);
+  const draftProvider = useOrbitSelector((s) => s.draftProvider);
+  const draftModels = useOrbitSelector((s) => s.draftModels);
+  const draftFastMode = useOrbitSelector((s) => s.draftFastMode);
+  const providerCatalogs = useOrbitSelector((s) =>
+    s.selectedHostId
+      ? (s.hostDetails[s.selectedHostId]?.provider_catalogs ?? EMPTY_CATALOGS)
+      : EMPTY_CATALOGS,
+  );
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const promptHistory = useOrbitSelector((s) => s.promptHistory);
   const slashCommands = useOrbitSelector((s) => s.slashCommands);
@@ -294,49 +211,82 @@ export const OmniComposer = memo(function OmniComposer({
     return skillEntries.length > 0 ? [...visibleBuiltins, ...skillEntries] : visibleBuiltins;
   }, [slashCommands, managedSkills]);
 
-  // Primitive/narrow selectors instead of subscribing to full `HostDetailView`
-  const hasCurrentAgent = useOrbitSelector((s) =>
-    Boolean(
-      !s.isDraftNewSession &&
-        s.selectedHostId &&
-        s.selectedAgentId &&
-        s.hostDetails[s.selectedHostId]?.agents.some((a) => a.agent_id === s.selectedAgentId),
-    ),
-  );
-  const isRunning = useOrbitSelector((s) =>
-    Boolean(
-      !s.isDraftNewSession &&
-        s.selectedHostId &&
-        s.selectedAgentId &&
-        isAgentForegroundRunning(
-          s.hostDetails[s.selectedHostId]?.agents.find((a) => a.agent_id === s.selectedAgentId),
-        ),
-    ),
-  );
-  const isAwaitingPermission = useOrbitSelector((s) =>
-    Boolean(
-      !s.isDraftNewSession &&
-        s.selectedHostId &&
-        s.selectedAgentId &&
-        s.hostDetails[s.selectedHostId]?.agents.find((a) => a.agent_id === s.selectedAgentId)
-          ?.is_awaiting_permission,
-    ),
-  );
-  const isTurnBusy = isRunning || isAwaitingPermission;
-  const activeAgentMode = useOrbitSelector((s) => {
-    if (s.isDraftNewSession || !s.selectedHostId || !s.selectedAgentId) return null;
-    return (
-      s.hostDetails[s.selectedHostId]?.agents.find((a) => a.agent_id === s.selectedAgentId)
-        ?.mode ?? null
+  // Single primitive-serialized selector replaces repeated `.agents.find(...)` scans on host heartbeats
+  const activeAgentMetaKey = useOrbitSelector((s): string => {
+    if (s.isDraftNewSession || !s.selectedHostId || !s.selectedAgentId) return "";
+    const ag = s.hostDetails[s.selectedHostId]?.agents.find(
+      (a) => a.agent_id === s.selectedAgentId,
     );
+    if (!ag) return "";
+    const modeStr = typeof ag.mode === "string" ? ag.mode : `custom:${ag.mode.custom}`;
+    return `1\0${isAgentForegroundRunning(ag) ? "1" : "0"}\0${ag.is_awaiting_permission ? "1" : "0"}\0${modeStr}\0${ag.workspace_id ?? ""}\0${ag.provider}\0${ag.model ?? ""}\0${ag.fast_mode ? "1" : "0"}`;
   });
-  const activeWorkspaceId = useOrbitSelector((s) => {
-    if (s.isDraftNewSession || !s.selectedHostId || !s.selectedAgentId) return null;
-    return (
-      s.hostDetails[s.selectedHostId]?.agents.find((a) => a.agent_id === s.selectedAgentId)
-        ?.workspace_id ?? null
+
+  const {
+    hasCurrentAgent,
+    isForegroundRunning,
+    isTurnBusy,
+    activeAgentMode,
+    activeWorkspaceId,
+    activeAgentProvider,
+    activeAgentModel,
+    activeAgentFastMode,
+  } = useMemo(() => {
+    if (!activeAgentMetaKey) {
+      return {
+        hasCurrentAgent: false,
+        isForegroundRunning: false,
+        isTurnBusy: false,
+        activeAgentMode: null as SessionMode | null,
+        activeWorkspaceId: null as string | null,
+        activeAgentProvider: null as ProviderKind | null,
+        activeAgentModel: null as string | null,
+        activeAgentFastMode: false,
+      };
+    }
+    const [, runningFlag, permFlag, modeRaw, wsId, prov, modelRaw, fastFlag] =
+      activeAgentMetaKey.split("\0");
+    const parsedMode: SessionMode | null = !modeRaw
+      ? null
+      : modeRaw.startsWith("custom:")
+        ? { custom: modeRaw.slice("custom:".length) }
+        : (modeRaw as SessionMode);
+    return {
+      hasCurrentAgent: true,
+      isForegroundRunning: runningFlag === "1",
+      isTurnBusy: runningFlag === "1" || permFlag === "1",
+      activeAgentMode: parsedMode,
+      activeWorkspaceId: wsId || null,
+      activeAgentProvider: (prov || null) as ProviderKind | null,
+      activeAgentModel: modelRaw || null,
+      activeAgentFastMode: fastFlag === "1",
+    };
+  }, [activeAgentMetaKey]);
+
+  const effectiveProvider: ProviderKind =
+    !isDraft && activeAgentProvider ? activeAgentProvider : draftProvider;
+  const effectiveModelRaw: string | null =
+    !isDraft && activeAgentProvider ? activeAgentModel : (draftModels[effectiveProvider] ?? null);
+  const { fastModeSupported, fastModeActive } = useMemo(() => {
+    const cat = getCatalogForProvider(
+      providerCatalogs as ProviderModelCatalog[],
+      effectiveProvider,
     );
-  });
+    const spec = resolveActiveModelSpec(cat, effectiveModelRaw);
+    const supported = modelSupportsFastMode(effectiveProvider, spec);
+    const active = Boolean(
+      supported && (!isDraft && hasCurrentAgent ? activeAgentFastMode : draftFastMode),
+    );
+    return { fastModeSupported: supported, fastModeActive: active };
+  }, [
+    providerCatalogs,
+    effectiveProvider,
+    effectiveModelRaw,
+    isDraft,
+    hasCurrentAgent,
+    activeAgentFastMode,
+    draftFastMode,
+  ]);
 
   const scopeKey = useOrbitSelector(composerScopeKey);
   const draftText = useComposerDraft(scopeKey);
@@ -353,293 +303,138 @@ export const OmniComposer = memo(function OmniComposer({
     (s) => s.pastedAttachments[composerScopeKey(s)] ?? EMPTY_PASTES,
   );
   const quotes = useOrbitSelector((s) => s.diffQuotes[composerScopeKey(s)] ?? EMPTY_QUOTES);
-  const localQueued = useOrbitSelector((s) => s.queuedPrompts[composerScopeKey(s)] ?? EMPTY_QUEUED);
-  const hostSupportsServerQueue = useOrbitSelector((s) =>
-    Boolean(s.selectedHostId && s.hostDetails[s.selectedHostId]?.host.supports_server_queue),
-  );
-  const serverQueued = useOrbitSelector((s) => {
-    if (s.isDraftNewSession || !s.selectedHostId || !s.selectedAgentId) return EMPTY_SERVER_QUEUED;
-    return (
-      s.hostDetails[s.selectedHostId]?.agents.find((a) => a.agent_id === s.selectedAgentId)
-        ?.queued_prompts ?? EMPTY_SERVER_QUEUED
-    );
-  });
-  const queued = useMemo(() => {
-    if (hostSupportsServerQueue) {
-      return serverQueued.map((q) => ({
-        id: q.queue_id,
-        displayText: q.display_text,
-        badges: q.badges ?? [],
-      }));
-    }
-    return localQueued;
-  }, [hostSupportsServerQueue, serverQueued, localQueued]);
 
-  const workspaceFiles = useOrbitSelector((s) =>
+  // Primitive counts (never array refs) so mention re-ranking only runs when counts actually change
+  const workspaceFilesCount = useOrbitSelector((s) =>
     s.selectedHostId && s.selectedWorkspaceCwd
-      ? (s.workspaceFilesCache[`${s.selectedHostId}::${s.selectedWorkspaceCwd}`] ?? EMPTY_FILES)
-      : EMPTY_FILES,
+      ? (s.workspaceFilesCache[`${s.selectedHostId}::${s.selectedWorkspaceCwd}`]?.length ?? 0)
+      : 0,
   );
-  const gitFiles = useOrbitSelector((s) =>
+  const gitFilesCount = useOrbitSelector((s) =>
     s.selectedHostId && s.selectedWorkspaceCwd
-      ? (s.gitReviews[`${s.selectedHostId}::${s.selectedWorkspaceCwd}`]?.status?.files ??
-          EMPTY_GIT_FILES)
-      : EMPTY_GIT_FILES,
+      ? (s.gitReviews[`${s.selectedHostId}::${s.selectedWorkspaceCwd}`]?.status?.files.length ?? 0)
+      : 0,
   );
 
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const mirrorTextareaRef = useRef<HTMLDivElement | null>(null);
-  const lastTextareaHeightRef = useRef<number>(40);
+  const lastMeasuredHeightRef = useRef<number>(40);
   const [composerWidthPx, setComposerWidthPx] = useState(0);
   const [isCompactBar, setIsCompactBar] = useState(false);
   const draftTextRef = useRef<string>(draftText);
   draftTextRef.current = draftText;
-  const directivePrefixRef = useRef<HTMLSpanElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const savedDraftBeforeHistoryRef = useRef<string>("");
   const pasteHandledForCtrlVRef = useRef<boolean>(false);
   const nativeClipboardInFlightRef = useRef<boolean>(false);
 
-  const [cursorOffset, setCursorOffset] = useState<number>(0);
-  const [directiveIndentPx, setDirectiveIndentPx] = useState<number>(0);
-  const goalIme = useImeCompositionGuard();
-  const [goalPopoverOpen, setGoalPopoverOpen] = useState(false);
-  const [goalObjective, setGoalObjective] = useState("");
-  const [goalVerifyCommand, setGoalVerifyCommand] = useState("");
-  const [goalMaxIterations, setGoalMaxIterations] = useState("10");
-  const [goalSubmitting, setGoalSubmitting] = useState(false);
-
-  // Close the inline Goal popover whenever the user switches host or active agent
-  useEffect(() => {
-    setGoalPopoverOpen(false);
-  }, [selectedHostId, selectedAgentId]);
-
-  const submitGoalPopover = useCallback(() => {
-    if (!selectedHostId || !selectedAgentId || !goalObjective.trim() || goalSubmitting) return;
-    setGoalSubmitting(true);
-    const parsedIter = Number.parseInt(goalMaxIterations, 10);
-    const clampedIter = Number.isFinite(parsedIter) ? Math.max(1, Math.min(50, parsedIter)) : 10;
-    void orbitActions
-      .startGoalRun({
-        hostId: selectedHostId,
-        agentId: selectedAgentId,
-        objective: goalObjective.trim(),
-        verifyCommand: goalVerifyCommand.trim() || null,
-        maxIterations: clampedIter,
-      })
-      .then((created) => {
-        if (created) {
-          setGoalPopoverOpen(false);
-          requestAnimationFrame(() => textareaRef.current?.focus());
-        }
-      })
-      .finally(() => setGoalSubmitting(false));
-  }, [selectedHostId, selectedAgentId, goalObjective, goalVerifyCommand, goalMaxIterations, goalSubmitting]);
-  const [queueDrag, setQueueDrag] = useState<{
-    fromIndex: number;
-    overIndex: number;
-    deltaY: number;
-    rowStep: number;
-  } | null>(null);
-  const queueRowRefs = useRef<(HTMLDivElement | null)[]>([]);
-  const queueDragCleanupRef = useRef<(() => void) | null>(null);
-  const queuedSignature = useMemo(() => queued.map((q) => q.id).join("\0"), [queued]);
-
-  useEffect(() => {
-    // Abort any in-flight drag cleanly whenever the queue mutates (e.g. daemon drain/sync) underneath us
-    queueDragCleanupRef.current?.();
-  }, [queuedSignature]);
-
-  useEffect(() => {
-    return () => {
-      queueDragCleanupRef.current?.();
-    };
+  const [cursor, setCursor] = useState({ text: "", offset: 0 });
+  const setCursorOffset = useCallback((offset: number, text: string) => {
+    setCursor((prev) =>
+      prev.offset === offset && prev.text === text ? prev : { text, offset },
+    );
   }, []);
-
-  const handleQueueRowPointerDown = useCallback(
-    (e: React.PointerEvent<HTMLDivElement>, fromIndex: number) => {
-      if (e.button !== 0 || queued.length < 2) return;
-      if ((e.target as HTMLElement | null)?.closest("button")) return;
-
-      const firstRect = queueRowRefs.current[0]?.getBoundingClientRect();
-      const secondRect = queueRowRefs.current[1]?.getBoundingClientRect();
-      const measuredStep =
-        firstRect && secondRect && secondRect.top > firstRect.top
-          ? secondRect.top - firstRect.top
-          : 30;
-      const startY = e.clientY;
-      const count = queued.length;
-      const minDeltaY = -fromIndex * measuredStep;
-      const maxDeltaY = (count - 1 - fromIndex) * measuredStep;
-
-      let active = false;
-      let overIndex = fromIndex;
-
-      const detachListeners = () => {
-        window.removeEventListener("pointermove", onMove);
-        window.removeEventListener("pointerup", onUp);
-        window.removeEventListener("pointercancel", onCancel);
-        window.removeEventListener("keydown", onKeyDown);
-        queueDragCleanupRef.current = null;
-      };
-
-      const cleanup = () => {
-        detachListeners();
-        setQueueDrag(null);
-      };
-
-      const onMove = (ev: PointerEvent) => {
-        const rawDelta = ev.clientY - startY;
-        if (!active) {
-          if (Math.abs(rawDelta) < 4) return;
-          active = true;
-        }
-        const clampedDeltaY = Math.max(minDeltaY, Math.min(maxDeltaY, rawDelta));
-        const slotShift = Math.round(clampedDeltaY / measuredStep);
-        overIndex = Math.max(0, Math.min(count - 1, fromIndex + slotShift));
-        setQueueDrag({
-          fromIndex,
-          overIndex,
-          deltaY: clampedDeltaY,
-          rowStep: measuredStep,
-        });
-      };
-
-      const onUp = () => {
-        const shouldCommit = active && overIndex !== fromIndex;
-        const targetIndex = overIndex;
-        if (shouldCommit) {
-          detachListeners();
-          orbitActions.reorderQueuedPrompts(fromIndex, targetIndex);
-          setQueueDrag(null);
-        } else {
-          cleanup();
-        }
-      };
-
-      const onCancel = () => {
-        cleanup();
-      };
-
-      const onKeyDown = (ev: KeyboardEvent) => {
-        if (ev.key === "Escape") {
-          cleanup();
-        }
-      };
-
-      queueDragCleanupRef.current?.();
-      queueDragCleanupRef.current = cleanup;
-      window.addEventListener("pointermove", onMove);
-      window.addEventListener("pointerup", onUp);
-      window.addEventListener("pointercancel", onCancel);
-      window.addEventListener("keydown", onKeyDown);
-    },
-    [queued.length],
-  );
+  const tokenOverlayRef = useRef<HTMLDivElement>(null);
+  const [tokenIndentPx, setTokenIndentPx] = useState(0);
+  const indent = slashDirective ? tokenIndentPx : 0;
+  const hasDraftText = draftText.length > 0;
+  const inputInset = useMemo(() => ({
+    paddingLeft: BASE_PAD_LEFT + (hasDraftText ? 0 : indent),
+    textIndent: hasDraftText ? indent : 0,
+  }), [hasDraftText, indent]);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [menuHighlightIdx, setMenuHighlightIdx] = useState<number>(0);
   const [dismissedToken, setDismissedToken] = useState<string | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState<boolean>(false);
   const [historyCursor, setHistoryCursor] = useState<number | null>(null);
   const [rankedMentions, setRankedMentions] = useState<MentionCandidateView[]>(EMPTY_MENTIONS);
   const [symbolMentions, setSymbolMentions] = useState<MentionCandidateView[]>(EMPTY_MENTIONS);
+  const [isSearchingSymbols, setIsSearchingSymbols] = useState<boolean>(false);
   const mentionReqSeqRef = useRef<number>(0);
   const symbolReqSeqRef = useRef<number>(0);
+
+  useLayoutEffect(() => {
+    const overlay = tokenOverlayRef.current;
+    if (!overlay) return;
+    const measure = () =>
+      setTokenIndentPx(Math.max(0, overlay.getBoundingClientRect().width - TOKEN_PAD_X + TOKEN_GAP));
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(overlay);
+    return () => observer.disconnect();
+  }, [slashDirective, selectedHostId]);
 
   const activeMode: SessionMode = normalizePermissionMode(
     !isDraft && activeAgentMode ? activeAgentMode : draftMode,
   );
 
-  // Warm workspace file list and path-scoped rules lazily so `@` and `@rule:` mentions feel instantaneous
+  // Warm path-scoped rules lazily.
   useEffect(() => {
     if (!selectedHostId) return;
     const effectiveCwd = selectedCwd || "~";
     const timer = window.setTimeout(() => {
-      if (selectedCwd && selectedCwd !== "~") {
-        void orbitActions.ensureWorkspaceFiles(selectedHostId, selectedCwd);
-      }
       void orbitActions.refreshPathRules(selectedHostId, effectiveCwd);
     }, 180);
     return () => window.clearTimeout(timer);
   }, [selectedHostId, selectedCwd]);
 
   const minTextareaHeight = 40;
-  const maxTextareaHeight = 216;
-
-  useLayoutEffect(() => {
-    if (!slashDirective) {
-      setDirectiveIndentPx(0);
-      return;
-    }
-    const el = directivePrefixRef.current;
-    if (!el) return;
-    const nextIndent = Math.ceil(el.getBoundingClientRect().width + 6);
-    setDirectiveIndentPx((prev) => (prev === nextIndent ? prev : nextIndent));
-  }, [slashDirective]);
+  const maxTextareaHeight = 200;
 
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
-    let lastW = Math.round(el.clientWidth);
-    if (lastW > 0) setComposerWidthPx(lastW);
-    const ro = new ResizeObserver((entries) => {
-      const nextW = Math.round(entries[0]?.contentRect.width ?? 0);
-      if (nextW > 0 && nextW !== lastW) {
-        lastW = nextW;
-        // Always update compact-bar threshold (at most 1 render when crossing 440px)
-        setIsCompactBar(nextW < 440);
-        // Avoid re-rendering the entire composer tree on every sidebar animation frame when empty.
-        if (el.value.length > 0) {
-          setComposerWidthPx(nextW);
-        }
-      }
+    const ro = new ResizeObserver(([entry]) => {
+      const width = entry.borderBoxSize[0]?.inlineSize ?? entry.contentRect.width;
+      setComposerWidthPx(width);
+      setIsCompactBar(width < 440);
     });
-    ro.observe(el);
+    ro.observe(el, { box: "border-box" });
     return () => ro.disconnect();
-  }, []);
+  }, [selectedHostId]);
 
-  // Measure wrapped textarea height from the invisible off-flow `<div>` mirror BEFORE paint (`useLayoutEffect`),
-  // ensuring both incremental typing and large multi-line pastes expand deterministically in WKWebView.
+  // Measure full wrapped textarea height from the off-flow `<div>` mirror BEFORE paint (`useLayoutEffect`).
+  // The outer `scrollContainerRef` owns vertical scrolling (`max-h-[200px] overflow-y-auto`) while `<textarea>`
+  // stays full-height (`overflow-y: hidden`), so the inline directive token and textarea prose scroll together
+  // on a single GPU compositor layer with zero JS scroll lag or trackpad jitter.
   useLayoutEffect(() => {
     const el = textareaRef.current;
-    if (!el) return;
-
-    if (draftText.length === 0 && !slashDirective) {
-      if (
-        lastTextareaHeightRef.current !== minTextareaHeight ||
-        el.style.height !== `${minTextareaHeight}px`
-      ) {
-        lastTextareaHeightRef.current = minTextareaHeight;
-        el.style.height = `${minTextareaHeight}px`;
-      }
-      if (el.style.overflowY !== "hidden") {
-        el.style.overflowY = "hidden";
-      }
-      return;
-    }
-
     const mirror = mirrorTextareaRef.current;
-    if (!mirror) return;
-    let measured = Math.max(mirror.offsetHeight, mirror.scrollHeight);
-    let nextHeight = Math.min(maxTextareaHeight, Math.max(minTextareaHeight, measured));
-    if (lastTextareaHeightRef.current !== nextHeight || el.style.height !== `${nextHeight}px`) {
-      lastTextareaHeightRef.current = nextHeight;
-      el.style.height = `${nextHeight}px`;
-    }
-    // Guard against subtle WKWebView wrapping differences between the off-flow div mirror and
-    // native textarea (e.g. CJK line breaks) so wrapped lines never clip while overflow-y is hidden.
-    if (measured <= maxTextareaHeight && el.scrollHeight > nextHeight + 1) {
-      measured = el.scrollHeight;
-      nextHeight = Math.min(maxTextareaHeight, Math.max(minTextareaHeight, measured));
-      if (lastTextareaHeightRef.current !== nextHeight || el.style.height !== `${nextHeight}px`) {
-        lastTextareaHeightRef.current = nextHeight;
-        el.style.height = `${nextHeight}px`;
+    if (!el || !mirror) return;
+
+    const prevHeight = lastMeasuredHeightRef.current;
+    let nextHeight = minTextareaHeight;
+    if (draftText.length === 0) {
+      if (mirror.textContent) mirror.textContent = "";
+      if (scrollContainerRef.current && scrollContainerRef.current.scrollTop !== 0) {
+        scrollContainerRef.current.scrollTop = 0;
       }
+    } else {
+      mirror.textContent = draftText + "\u200b";
+      const measured = Math.max(mirror.offsetHeight, mirror.scrollHeight);
+      nextHeight = Math.max(minTextareaHeight, measured);
     }
-    const nextOverflow = measured > maxTextareaHeight ? "auto" : "hidden";
-    if (el.style.overflowY !== nextOverflow) {
-      el.style.overflowY = nextOverflow;
+
+    const heightCss = `${nextHeight}px`;
+    if (el.style.height !== heightCss) {
+      el.style.height = heightCss;
     }
-  }, [draftText, scopeKey, slashDirective, directiveIndentPx, composerWidthPx]);
+    lastMeasuredHeightRef.current = nextHeight;
+
+    // When typing appends a new line past `maxTextareaHeight` at the end of the draft, keep the caret in view.
+    const scroller = scrollContainerRef.current;
+    if (
+      scroller &&
+      nextHeight > maxTextareaHeight &&
+      nextHeight > prevHeight &&
+      document.activeElement === el &&
+      el.selectionStart === draftText.length &&
+      el.selectionEnd === draftText.length
+    ) {
+      scroller.scrollTop = scroller.scrollHeight - scroller.clientHeight;
+    }
+  }, [draftText, scopeKey, composerWidthPx, indent, slashDirective, selectedHostId]);
 
   useEffect(() => {
     return orbitActions.onComposerFocusRequest((opts) => {
@@ -666,33 +461,52 @@ export const OmniComposer = memo(function OmniComposer({
     });
   }, []);
 
+  const availableSlashCommands = useMemo(() => {
+    const hasSession = !isDraft && hasCurrentAgent;
+    return effectiveSlashCommands.filter((cmd) => {
+      if (!hasSession && isSlashCommandSessionRequired(cmd)) return false;
+      if (cmd.id === "fast" && !fastModeSupported && !fastModeActive) return false;
+      return true;
+    });
+  }, [effectiveSlashCommands, isDraft, hasCurrentAgent, fastModeSupported, fastModeActive]);
+
+  const cursorOffset = cursor.text === draftText ? cursor.offset : 0;
+  const triggerKind = useMemo(() => detectActiveTriggerKind(draftText, cursorOffset), [draftText, cursorOffset]);
   const slashTrigger = useMemo(() => {
-    if (!draftText.includes("/")) return null;
-    const safeOffset = Math.min(cursorOffset, draftText.length);
-    const before = draftText.slice(0, safeOffset);
-    const match = /(?:^|\s)\/([a-zA-Z0-9_-]*)$/.exec(before);
-    if (!match) return null;
-    const slashIndex = before.lastIndexOf("/");
-    const query = match[1];
+    if (triggerKind !== "slash") return null;
+    const slashIndex = draftText.lastIndexOf("/", cursorOffset - 1);
+    const query = draftText.slice(slashIndex + 1, cursorOffset);
     const tokenKey = `slash:${slashIndex}:${query}`;
     if (dismissedToken === tokenKey) return null;
-    const items = filterSlashCommands(effectiveSlashCommands, query);
+    // An explicitly typed /goal still gives the session-required feedback in draft mode.
+    const commands = query.toLowerCase() === "goal" ? effectiveSlashCommands : availableSlashCommands;
+    const items = filterSlashCommands(commands, query, t);
     if (items.length === 0) return null;
-    return { slashIndex, endIndex: safeOffset, query, tokenKey, items };
-  }, [draftText, cursorOffset, dismissedToken, effectiveSlashCommands]);
+    return { slashIndex, endIndex: cursorOffset, query, tokenKey, items };
+  }, [triggerKind, draftText, cursorOffset, dismissedToken, availableSlashCommands, effectiveSlashCommands, t]);
 
   const mentionTrigger = useMemo(() => {
-    if (slashTrigger || !draftText.includes("@")) return null;
-    const safeOffset = Math.min(cursorOffset, draftText.length);
-    const before = draftText.slice(0, safeOffset);
-    const match = /(?:^|\s)@([^\s@]*)$/.exec(before);
-    if (!match) return null;
-    const atIndex = before.lastIndexOf("@");
-    const query = match[1];
+    if (triggerKind !== "mention") return null;
+    const atIndex = draftText.lastIndexOf("@", cursorOffset - 1);
+    const query = draftText.slice(atIndex + 1, cursorOffset);
     const tokenKey = `at:${atIndex}:${query}`;
     if (dismissedToken === tokenKey) return null;
-    return { atIndex, endIndex: safeOffset, query, tokenKey };
-  }, [slashTrigger, draftText, cursorOffset, dismissedToken]);
+    return { atIndex, endIndex: cursorOffset, query, tokenKey };
+  }, [triggerKind, draftText, cursorOffset, dismissedToken]);
+
+  const trackTriggerCursor = (el: HTMLTextAreaElement) => {
+    const pos = el.selectionStart;
+    if (detectActiveTriggerKind(el.value, pos) || slashTrigger || mentionTrigger) {
+      setCursorOffset(pos, el.value);
+    }
+  };
+
+  const hasMentionTrigger = Boolean(mentionTrigger);
+  useEffect(() => {
+    if (hasMentionTrigger && selectedHostId && selectedCwd && selectedCwd !== "~") {
+      void orbitActions.ensureWorkspaceFiles(selectedHostId, selectedCwd);
+    }
+  }, [hasMentionTrigger, selectedHostId, selectedCwd]);
 
   const parsedSymbolTrigger = useMemo(
     () => (mentionTrigger ? parseSymbolMentionQuery(mentionTrigger.query) : null),
@@ -710,33 +524,41 @@ export const OmniComposer = memo(function OmniComposer({
     const hostId = selectedHostId;
     const cwd = selectedCwd || "~";
     const query = mentionTrigger.query;
-    void orbitIpc
-      .rankMentionCandidates({
-        host_id: hostId,
-        cwd,
-        query,
-        limit: 12,
-        workspace_id: activeWorkspaceId,
-        active_agent_id: isDraft ? null : selectedAgentId,
-      })
-      .then((items) => {
-        if (mentionReqSeqRef.current === reqId) {
-          setRankedMentions(items);
-        }
-      })
-      .catch(() => {
-        if (mentionReqSeqRef.current === reqId) {
-          setRankedMentions(EMPTY_MENTIONS);
-        }
-      });
+    const rank = () => {
+      void orbitIpc
+        .rankMentionCandidates({
+          host_id: hostId,
+          cwd,
+          query,
+          limit: 12,
+          workspace_id: activeWorkspaceId,
+          active_agent_id: isDraft ? null : selectedAgentId,
+        })
+        .then((items) => {
+          if (mentionReqSeqRef.current === reqId) {
+            setRankedMentions(items);
+          }
+        })
+        .catch(() => {
+          if (mentionReqSeqRef.current === reqId) {
+            setRankedMentions(EMPTY_MENTIONS);
+          }
+        });
+    };
+    const timer = query.length ? window.setTimeout(rank, 35) : undefined;
+    if (!query.length) rank();
+    return () => {
+      window.clearTimeout(timer);
+      mentionReqSeqRef.current += 1;
+    };
   }, [
     mentionTrigger,
     parsedSymbolTrigger,
     selectedHostId,
     selectedCwd,
-    workspaceFiles,
-    gitFiles,
-    activePathRules,
+    workspaceFilesCount,
+    gitFilesCount,
+    activePathRulesCount,
     activeWorkspaceId,
     isDraft,
     selectedAgentId,
@@ -746,6 +568,7 @@ export const OmniComposer = memo(function OmniComposer({
   useEffect(() => {
     symbolReqSeqRef.current += 1;
     setSymbolMentions(EMPTY_MENTIONS);
+    setIsSearchingSymbols(false);
   }, [selectedHostId, selectedCwd, scopeKey]);
 
   // Debounced (`120ms`) workspace symbol fuzzy search with stale-response & unmount cancellation guard
@@ -760,6 +583,7 @@ export const OmniComposer = memo(function OmniComposer({
     ) {
       symbolReqSeqRef.current += 1;
       setSymbolMentions(EMPTY_MENTIONS);
+      setIsSearchingSymbols(false);
       return;
     }
 
@@ -769,6 +593,7 @@ export const OmniComposer = memo(function OmniComposer({
     const cwd = selectedCwd;
     const query = parsedSymbolTrigger.query;
     const limit = parsedSymbolTrigger.symbolOnly ? 20 : 8;
+    setIsSearchingSymbols(true);
 
     const timer = window.setTimeout(() => {
       void orbitIpc
@@ -779,10 +604,12 @@ export const OmniComposer = memo(function OmniComposer({
             workspaceSymbolToMentionCandidate(entry, idx),
           );
           setSymbolMentions(mapped);
+          setIsSearchingSymbols(false);
         })
         .catch(() => {
           if (symbolReqSeqRef.current === reqId) {
             setSymbolMentions(EMPTY_MENTIONS);
+            setIsSearchingSymbols(false);
           }
         });
     }, 120);
@@ -803,23 +630,58 @@ export const OmniComposer = memo(function OmniComposer({
     );
   }, [mentionTrigger, rankedMentions, symbolMentions, parsedSymbolTrigger]);
 
+  const hasUploadingAttachment = useMemo(
+    () => contexts.some((c) => (c.kind === "image" || c.kind === "file") && c.uploading),
+    [contexts],
+  );
   const hasSubstantiveInput =
     draftText.trim().length > 0 ||
     contexts.length > 0 ||
     pastes.length > 0 ||
     quotes.length > 0;
+  const localSubmission = resolveComposerSubmission(slashDirective, draftText).kind !== "prompt";
   const hasPayload =
-    hasSubstantiveInput || slashDirective === "review" || slashDirective === "compact";
+    localSubmission || hasSubstantiveInput || slashDirective === "review" || slashDirective === "compact";
+
+  const triggerSubmit = useCallback(
+    (steerImmediately: boolean) => {
+      if (!hasPayload) return;
+      if (localSubmission) {
+        setHistoryCursor(null);
+        void orbitActions.submitComposer();
+        return;
+      }
+      if (isSubmitting) return;
+      setIsSubmitting(true);
+      setHistoryCursor(null);
+      void orbitActions.submitComposer(steerImmediately).finally(() => {
+        setIsSubmitting(false);
+      });
+    },
+    [hasPayload, isSubmitting, localSubmission],
+  );
 
   const handleSelectMode = useCallback(
-    (m: SessionMode) => {
+    (m: SessionMode, announceToast = false) => {
       if (isDraft || !hasCurrentAgent || !selectedHostId || !selectedAgentId) {
         orbitActions.setDraftConfig({ mode: m });
+        if (announceToast) {
+          orbitActions.showToast(t("composer.modeSwitchedToast", { mode: modeLabel(m, t) }));
+        }
       } else {
-        void orbitIpc.setSessionMode(selectedHostId, selectedAgentId, m);
+        void orbitIpc
+          .setSessionMode(selectedHostId, selectedAgentId, m)
+          .then(() => {
+            if (announceToast) {
+              orbitActions.showToast(t("composer.modeSwitchedToast", { mode: modeLabel(m, t) }));
+            }
+          })
+          .catch((err) => {
+            orbitActions.showToast(t("composer.modeSwitchFailed", { error: String(err) }));
+          });
       }
     },
-    [isDraft, hasCurrentAgent, selectedHostId, selectedAgentId],
+    [isDraft, hasCurrentAgent, selectedHostId, selectedAgentId, t],
   );
 
   const executeSlashCommand = (cmd: SlashCommandView) => {
@@ -831,7 +693,7 @@ export const OmniComposer = memo(function OmniComposer({
       : { text: draftText, cursor: draftText.length };
     const stripped = joined.text;
     orbitActions.setComposerDraft(stripped);
-    setCursorOffset(joined.cursor);
+    setCursorOffset(joined.cursor, joined.text);
     setDismissedToken(null);
     setMenuHighlightIdx(0);
 
@@ -840,40 +702,39 @@ export const OmniComposer = memo(function OmniComposer({
         if (!isDraft && hasCurrentAgent && selectedHostId && selectedAgentId) {
           const nextText = stripped ? `/fork ${stripped}` : "/fork ";
           orbitActions.setComposerDraft(nextText);
-          setCursorOffset(nextText.length);
+          setCursorOffset(nextText.length, nextText);
         } else {
-          orbitActions.showToast("Start an active session first to fork");
+          orbitActions.showToast(t("composer.toastSessionRequiredFork"));
           return;
         }
-        break;
-      case "btw":
-        orbitActions.openSideQuestionTab();
-        return;
-      case "plan":
-        orbitActions.setSlashDirective("plan");
         break;
       case "goal":
-        if (!isDraft && hasCurrentAgent && selectedHostId && selectedAgentId) {
-          setGoalObjective(stripped);
-          setGoalVerifyCommand("");
-          setGoalMaxIterations("10");
-          setGoalPopoverOpen(true);
-          orbitActions.setComposerDraft("");
-          return;
+        if (isDraft || !hasCurrentAgent) {
+          orbitActions.showToast(t("composer.toastSessionRequiredGoal"));
+          break;
         }
-        orbitActions.showToast("Start an active session first to run /goal");
-        return;
-      case "auto":
-        handleSelectMode("auto");
+        orbitActions.setSlashDirective(cmd.id);
+        break;
+      case "btw":
+      case "plan":
+      case "review":
+      case "orbit":
+      case "orbit-handoff":
+      case "orbit-committee":
+      case "orbit-advisor":
+        orbitActions.setSlashDirective(cmd.id);
         break;
       case "supervised":
-        handleSelectMode("default");
+        handleSelectMode("default", true);
+        break;
+      case "auto":
+        handleSelectMode("auto", true);
+        break;
+      case "edits":
+        handleSelectMode("accept_edits", true);
         break;
       case "full":
-        handleSelectMode("full_access");
-        break;
-      case "review":
-        orbitActions.setSlashDirective("review");
+        handleSelectMode("full_access", true);
         break;
       case "diff":
         orbitActions.toggleReviewTab();
@@ -888,7 +749,7 @@ export const OmniComposer = memo(function OmniComposer({
         if (!isDraft && hasCurrentAgent) {
           orbitActions.setSlashDirective("compact");
         } else {
-          orbitActions.showToast("Start an active session first to compact context");
+          orbitActions.showToast(t("composer.toastSessionRequiredCompact"));
         }
         break;
       case "export":
@@ -896,23 +757,17 @@ export const OmniComposer = memo(function OmniComposer({
           orbitActions.openExportDialog(selectedHostId, selectedAgentId);
           return;
         }
-        orbitActions.showToast("Start an active session first to export");
-        break;
+        orbitActions.showToast(t("composer.toastSessionRequiredExport"));
+        return;
       case "copy":
         if (!isDraft && hasCurrentAgent && selectedHostId && selectedAgentId) {
           void orbitActions.openCopyCodeBlocksModal(selectedHostId, selectedAgentId);
           return;
         }
-        orbitActions.showToast("Start an active session first to copy");
-        break;
+        orbitActions.showToast(t("composer.toastSessionRequiredCopy"));
+        return;
       case "fast":
         orbitActions.toggleActiveFastMode();
-        break;
-      case "orbit":
-      case "orbit-handoff":
-      case "orbit-committee":
-      case "orbit-advisor":
-        orbitActions.setSlashDirective(cmd.id);
         break;
       case "terminal":
         orbitActions.toggleTerminalTab();
@@ -926,23 +781,14 @@ export const OmniComposer = memo(function OmniComposer({
       default:
         if (cmd.id.startsWith("skill:")) {
           const slug = cmd.id.slice("skill:".length);
-          const directive = `Use skill /${slug} (${cmd.label}): `;
-          const before = stripped.slice(0, joined.cursor);
-          const after = stripped.slice(joined.cursor);
-          const needsLeadingSpace = before.length > 0 && !/\s$/.test(before);
-          const inserted = `${needsLeadingSpace ? " " : ""}${directive}`;
-          const nextText = `${before}${inserted}${after.replace(/^[ \t]+/, "")}`;
-          const nextCursor = before.length + inserted.length;
-          orbitActions.setComposerDraft(nextText);
-          setCursorOffset(nextCursor);
-          requestAnimationFrame(() => {
-            const el = textareaRef.current;
-            if (el) {
-              el.focus();
-              el.setSelectionRange(nextCursor, nextCursor);
-            }
+          orbitActions.addContextMention({
+            id: `skill_${slug}`,
+            kind: "skill",
+            slug,
+            label: cmd.label,
+            description: cmd.description,
           });
-          return;
+          break;
         }
         break;
     }
@@ -951,7 +797,7 @@ export const OmniComposer = memo(function OmniComposer({
       const el = textareaRef.current;
       if (el) {
         el.focus();
-        const pos = Math.min(joined.cursor, el.value.length);
+        const pos = isComposerInlineDirective(cmd.id) ? 0 : Math.min(joined.cursor, el.value.length);
         el.setSelectionRange(pos, pos);
       }
     });
@@ -969,7 +815,7 @@ export const OmniComposer = memo(function OmniComposer({
       const nextDraft = `${beforeAt}${inserted}${trimmedAfter}`;
       const nextPos = beforeAt.length + inserted.length;
       orbitActions.setComposerDraft(nextDraft);
-      setCursorOffset(nextPos);
+      setCursorOffset(nextPos, nextDraft);
       requestAnimationFrame(() => {
         const el = textareaRef.current;
         if (el) {
@@ -1016,8 +862,8 @@ export const OmniComposer = memo(function OmniComposer({
         path: filePath,
       });
       insertInlineToken(token);
-    } else if (candidate.kind === "git_diff") {
-      const staged = candidate.key.includes("staged");
+    } else if (candidate.kind === "git_diff" || candidate.kind === "staged") {
+      const staged = candidate.kind === "staged" || candidate.key.includes("staged");
       const token = candidate.token_label || (staged ? "@staged-diff" : "@working-diff");
       orbitActions.registerInlineMention({
         token,
@@ -1032,7 +878,7 @@ export const OmniComposer = memo(function OmniComposer({
     } else if (candidate.kind === "path_rule") {
       const token = candidate.token_label || candidate.title;
       insertInlineToken(token);
-    } else if (candidate.kind === "terminal_output") {
+    } else if (candidate.kind === "terminal" || candidate.kind === "terminal_output") {
       const snap = orbitActions.captureActiveTerminalTail();
       if (snap) {
         const token = candidate.token_label || "@terminal";
@@ -1047,7 +893,7 @@ export const OmniComposer = memo(function OmniComposer({
       } else {
         const joined = collapseStrippedToken(beforeAt, afterToken);
         orbitActions.setComposerDraft(joined.text);
-        setCursorOffset(joined.cursor);
+        setCursorOffset(joined.cursor, joined.text);
         requestAnimationFrame(() => textareaRef.current?.focus());
       }
     }
@@ -1057,9 +903,6 @@ export const OmniComposer = memo(function OmniComposer({
   };
 
   const triggerAtMentionFromButton = useCallback(() => {
-    if (selectedHostId && selectedCwd && selectedCwd !== "~") {
-      void orbitActions.ensureWorkspaceFiles(selectedHostId, selectedCwd);
-    }
     const curDraft = draftTextRef.current;
     const el = textareaRef.current;
     const pos = el?.selectionStart ?? curDraft.length;
@@ -1072,14 +915,14 @@ export const OmniComposer = memo(function OmniComposer({
     setDismissedToken(null);
     setMenuHighlightIdx(0);
     orbitActions.setComposerDraft(next);
-    setCursorOffset(nextPos);
+    setCursorOffset(nextPos, next);
     requestAnimationFrame(() => {
       if (textareaRef.current) {
         textareaRef.current.focus();
         textareaRef.current.setSelectionRange(nextPos, nextPos);
       }
     });
-  }, [selectedHostId, selectedCwd]);
+  }, [setCursorOffset]);
 
   const triggerSlashActionsFromButton = useCallback(() => {
     const curDraft = draftTextRef.current;
@@ -1094,14 +937,14 @@ export const OmniComposer = memo(function OmniComposer({
     setDismissedToken(null);
     setMenuHighlightIdx(0);
     orbitActions.setComposerDraft(next);
-    setCursorOffset(nextPos);
+    setCursorOffset(nextPos, next);
     requestAnimationFrame(() => {
       if (textareaRef.current) {
         textareaRef.current.focus();
         textareaRef.current.setSelectionRange(nextPos, nextPos);
       }
     });
-  }, []);
+  }, [setCursorOffset]);
 
   const insertPastedTextAtCursor = useCallback((text: string) => {
     if (!text) return;
@@ -1117,14 +960,14 @@ export const OmniComposer = memo(function OmniComposer({
     const next = `${cur.slice(0, start)}${text}${cur.slice(end)}`;
     const nextPos = start + text.length;
     orbitActions.setComposerDraft(next);
-    setCursorOffset(nextPos);
+    setCursorOffset(nextPos, next);
     requestAnimationFrame(() => {
       if (textareaRef.current) {
         textareaRef.current.focus();
         textareaRef.current.setSelectionRange(nextPos, nextPos);
       }
     });
-  }, []);
+  }, [setCursorOffset]);
 
   const tryAttachNativeClipboardImages = useCallback(async (): Promise<boolean> => {
     if (!isTauriRuntime() || isMacDesktop()) return false;
@@ -1168,10 +1011,6 @@ export const OmniComposer = memo(function OmniComposer({
     }
 
     const text = e.clipboardData.getData("text/plain");
-    // On Linux WebKitGTK (CVE-2025-13947 / DataTransfer::allowsFileAccess() == false),
-    // `e.clipboardData.items` & `.files` drop pasted images completely. Fall back to Tauri's
-    // native GTK clipboard reader when pasting raw images, browser "Copy Image", or file-manager
-    // copied image URIs.
     if (isTauriRuntime() && !isMacDesktop()) {
       const uriList = e.clipboardData.getData("text/uri-list");
       const html = e.clipboardData.getData("text/html");
@@ -1211,8 +1050,6 @@ export const OmniComposer = memo(function OmniComposer({
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (ime.shouldIgnoreKeyDown(e)) return;
 
-    // Fallback for Linux WebKitGTK builds where `Ctrl+V` into a plain-text `<textarea>`
-    // with an image-only clipboard suppresses the DOM `paste` event completely.
     if (
       isTauriRuntime() &&
       !isMacDesktop() &&
@@ -1251,13 +1088,7 @@ export const OmniComposer = memo(function OmniComposer({
       if (e.key === " ") {
         const exactCmd = slashTrigger.items.find(
           (c) =>
-            (c.id === "plan" ||
-              c.id === "review" ||
-              c.id === "compact" ||
-              c.id === "orbit" ||
-              c.id === "orbit-handoff" ||
-              c.id === "orbit-committee" ||
-              c.id === "orbit-advisor") &&
+            isComposerInlineDirective(c.id) &&
             c.command.slice(1).toLowerCase() === slashTrigger.query.toLowerCase(),
         );
         if (exactCmd) {
@@ -1307,6 +1138,10 @@ export const OmniComposer = memo(function OmniComposer({
         setDismissedToken(mentionTrigger.tokenKey);
         return;
       }
+    } else if (mentionTrigger && e.key === "Escape") {
+      e.preventDefault();
+      setDismissedToken(mentionTrigger.tokenKey);
+      return;
     }
 
     if (
@@ -1362,22 +1197,89 @@ export const OmniComposer = memo(function OmniComposer({
 
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey) {
       e.preventDefault();
-      setHistoryCursor(null);
-      void orbitActions.submitComposer(isTurnBusy);
+      triggerSubmit(isTurnBusy);
       return;
     }
 
     if (enterToSend) {
       if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault();
-        setHistoryCursor(null);
-        void orbitActions.submitComposer(false);
+        triggerSubmit(false);
         return;
       }
     }
   };
 
+  const handleAttach = useCallback(() => fileInputRef.current?.click(), []);
+  const handleFocusAfterDirective = useCallback(() => {
+    textareaRef.current?.focus();
+    textareaRef.current?.setSelectionRange(0, 0);
+  }, []);
+  const handleSelectModeSilent = useCallback((mode: SessionMode) => handleSelectMode(mode, false), [handleSelectMode]);
+  const handleSubmitClick = useCallback(() => triggerSubmit(false), [triggerSubmit]);
+
   if (!selectedHostId) return null;
+
+  const showMentionMenu =
+    Boolean(mentionTrigger) &&
+    (combinedMentions.length > 0 ||
+      isSearchingSymbols ||
+      Boolean(parsedSymbolTrigger?.symbolOnly && parsedSymbolTrigger.query.length > 0));
+
+  const activeListboxId = slashTrigger
+    ? SLASH_MENU_LISTBOX_ID
+    : showMentionMenu
+      ? MENTION_MENU_LISTBOX_ID
+      : undefined;
+  const activeDescendantId = slashTrigger
+    ? slashOptionId(Math.min(menuHighlightIdx, slashTrigger.items.length - 1))
+    : showMentionMenu && combinedMentions.length > 0
+      ? mentionOptionId(Math.min(menuHighlightIdx, combinedMentions.length - 1))
+      : undefined;
+
+  const showStopButton = isTurnBusy && !hasPayload && Boolean(selectedAgentId);
+  const waitingForUpload = hasUploadingAttachment && !localSubmission;
+  const submitBusy = !localSubmission && (isSubmitting || hasUploadingAttachment);
+  const submitTooltipLabel = waitingForUpload
+    ? t("composer.uploadingAttachments")
+    : isSubmitting && !localSubmission
+      ? t("composer.sendingPrompt")
+      : isTurnBusy && !localSubmission
+        ? t("composer.queueFollowUpHint", { shortcut: `${mod}↵` })
+        : t("common.send");
+  const submitShortcut = submitBusy ? undefined : enterToSend ? "↵" : `${mod}↵`;
+
+  const dynamicPlaceholder = (() => {
+    switch (slashDirective) {
+      case "btw":
+        return t("composer.placeholderBtw");
+      case "goal":
+        return t("composer.placeholderGoal");
+      case "plan":
+        return t("composer.placeholderPlan");
+      case "review":
+        return t("composer.placeholderReview");
+      case "compact":
+        return t("composer.placeholderCompact");
+      case "orbit":
+        return t("composer.placeholderOrbit");
+      case "orbit-handoff":
+        return t("composer.placeholderOrbitHandoff");
+      case "orbit-committee":
+        return t("composer.placeholderOrbitCommittee");
+      case "orbit-advisor":
+        return t("composer.placeholderOrbitAdvisor");
+      default:
+        break;
+    }
+    if (isForegroundRunning) {
+      return t("composer.placeholderRunning", { shortcut: `${mod}↵` });
+    }
+    if (!isDraft && hasCurrentAgent) {
+      return t("composer.placeholderFollowUp");
+    }
+    return t("composer.placeholder");
+  })();
 
   return (
     <div
@@ -1402,197 +1304,10 @@ export const OmniComposer = memo(function OmniComposer({
           }}
         />
 
-        {/* Queued Follow-Up Strip when Agent is Running (fits 5 rows cleanly, scrolls beyond 5 with dedicated scrollbar gutter) */}
-        {queued.length > 0 && (
-          <div className="approval-dock-surface orbit-stage-enter overflow-hidden rounded-[14px] text-[12.5px]">
-            <ScrollArea
-              className="w-full"
-              viewportClassName="max-h-[160px] overscroll-contain px-2 py-1.5"
-              contentClassName="space-y-0.5"
-            >
-              {queued.map((qItem, idx) => {
-              const canDrag = queued.length > 1;
-              const isDragged = queueDrag !== null && queueDrag.fromIndex === idx;
-              let translateY = 0;
-              if (queueDrag) {
-                if (isDragged) {
-                  translateY = queueDrag.deltaY;
-                } else if (
-                  queueDrag.fromIndex < queueDrag.overIndex &&
-                  idx > queueDrag.fromIndex &&
-                  idx <= queueDrag.overIndex
-                ) {
-                  translateY = -queueDrag.rowStep;
-                } else if (
-                  queueDrag.fromIndex > queueDrag.overIndex &&
-                  idx >= queueDrag.overIndex &&
-                  idx < queueDrag.fromIndex
-                ) {
-                  translateY = queueDrag.rowStep;
-                }
-              }
+        {/* Isolated Queued Follow-Up Strip — zero keystroke re-renders */}
+        <ComposerQueueStrip />
 
-              const imageBadges = qItem.badges.filter((b) => b.kind === "image");
-              const otherBadges = qItem.badges.filter((b) => b.kind !== "image");
-              const visibleImages = imageBadges.slice(0, MAX_QUEUED_IMAGE_THUMBS);
-              const extraImageCount = Math.max(0, imageBadges.length - MAX_QUEUED_IMAGE_THUMBS);
-              const visibleOtherBadges = otherBadges.slice(0, 2);
-              const hiddenOtherBadgeCount = Math.max(
-                0,
-                otherBadges.length - visibleOtherBadges.length,
-              );
-              const trimmedDisplayText = qItem.displayText?.trim() ?? "";
-              const hasDisplayText = trimmedDisplayText.length > 0;
-              const imageOnlyLabel =
-                !hasDisplayText && otherBadges.length === 0 && imageBadges.length > 0
-                  ? imageBadges.length === 1
-                    ? t("composer.imageCountOne")
-                    : t("composer.imageCountMany", { count: imageBadges.length })
-                  : "";
-
-              return (
-                <div
-                  key={qItem.id}
-                  ref={(el) => {
-                    queueRowRefs.current[idx] = el;
-                  }}
-                  onPointerDown={canDrag ? (e) => handleQueueRowPointerDown(e, idx) : undefined}
-                  style={
-                    queueDrag
-                      ? { transform: `translate3d(0, ${translateY}px, 0)` }
-                      : undefined
-                  }
-                  className={cn(
-                    "group/qrow flex h-[28px] min-w-0 items-center justify-between gap-2 overflow-hidden rounded-[8px] px-2 select-none",
-                    isDragged
-                      ? "bg-elevated/95 ring-border/75 relative z-10 cursor-grabbing shadow-[0_3px_10px_rgba(0,0,0,0.08)] ring-1 dark:shadow-[0_4px_14px_rgba(0,0,0,0.34)]"
-                      : cn(
-                          queueDrag
-                            ? "transition-transform duration-150 ease-out"
-                            : "transition-colors hover:bg-black/[0.025] dark:hover:bg-white/[0.035]",
-                          canDrag && !queueDrag && "cursor-grab",
-                        ),
-                  )}
-                >
-                  <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
-                    {canDrag ? (
-                      <>
-                        <CornerDownRight
-                          className={cn(
-                            "text-muted-foreground/60 size-3.5 shrink-0 stroke-[1.8]",
-                            isDragged ? "hidden" : "group-hover/qrow:hidden",
-                          )}
-                        />
-                        <GripVertical
-                          className={cn(
-                            "text-muted-foreground/75 size-3.5 shrink-0 stroke-[1.8]",
-                            isDragged ? "block" : "hidden group-hover/qrow:block",
-                          )}
-                        />
-                      </>
-                    ) : (
-                      <CornerDownRight className="text-muted-foreground/60 size-3.5 shrink-0 stroke-[1.8]" />
-                    )}
-                    {visibleImages.length > 0 && (
-                      <div className="flex shrink-0 items-center gap-1">
-                        {visibleImages.map((imgBadge, imgIdx) => {
-                          const isLastWithOverflow =
-                            imgIdx === visibleImages.length - 1 && extraImageCount > 0;
-                          return (
-                            <QueuedImageThumb
-                              key={`qimg-${imgBadge.path ?? imgBadge.label}-${imgIdx}`}
-                              badge={imgBadge}
-                              displayText={trimmedDisplayText}
-                              imageIndex={imgIdx}
-                              hostId={selectedHostId}
-                              agentId={selectedAgentId}
-                              cwd={selectedCwd || "~"}
-                              overflowCount={isLastWithOverflow ? extraImageCount : 0}
-                              tooltip={
-                                isLastWithOverflow
-                                  ? t("composer.imagesAttached", { count: imageBadges.length })
-                                  : imgBadge.label
-                              }
-                            />
-                          );
-                        })}
-                      </div>
-                    )}
-                    {visibleOtherBadges.map((b, bIdx) => (
-                      <span
-                        key={`${b.kind}-${bIdx}`}
-                        title={b.label}
-                        className={cn(
-                          "bg-muted text-foreground/80 min-w-0 shrink truncate rounded px-1.5 py-0.5 font-mono text-[11px]",
-                          hasDisplayText ? "max-w-[110px]" : "max-w-[160px]",
-                        )}
-                      >
-                        {b.label}
-                      </span>
-                    ))}
-                    {hiddenOtherBadgeCount > 0 && (
-                      <span
-                        title={otherBadges.map((b) => b.label).join(", ")}
-                        className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 font-mono text-[10.5px]"
-                      >
-                        +{hiddenOtherBadgeCount}
-                      </span>
-                    )}
-                    {hasDisplayText ? (
-                      <span
-                        title={qItem.displayText}
-                        className="text-foreground/86 min-w-[64px] flex-1 truncate"
-                      >
-                        {qItem.displayText}
-                      </span>
-                    ) : imageOnlyLabel ? (
-                      <span className="text-foreground/82 min-w-[48px] flex-1 truncate">
-                        {imageOnlyLabel}
-                      </span>
-                    ) : null}
-                  </div>
-                  <div
-                    className={cn(
-                      "flex shrink-0 items-center gap-0.5 transition-opacity duration-150",
-                      queueDrag && "pointer-events-none opacity-45",
-                    )}
-                  >
-                    <SimpleTooltip label={t("composer.sendNowTooltip")}>
-                      <button
-                        type="button"
-                        onClick={() => void orbitActions.flushQueuedPromptImmediately(idx, qItem.id)}
-                        className="text-foreground/82 hover:text-foreground inline-flex h-[22px] cursor-pointer items-center rounded-[6px] px-2 text-[11.5px] font-medium transition-colors hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
-                      >
-                        {t("common.send")}
-                      </button>
-                    </SimpleTooltip>
-                    <button
-                      type="button"
-                      aria-label={t("composer.editQueuedAria")}
-                      onClick={() => orbitActions.popQueuedToDraft(idx, qItem.id)}
-                      className="text-muted-foreground hover:text-foreground inline-flex h-[22px] cursor-pointer items-center rounded-[6px] px-2 text-[11.5px] font-medium transition-colors hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
-                    >
-                      {t("common.edit")}
-                    </button>
-                    <SimpleTooltip label={t("composer.remove")}>
-                      <button
-                        type="button"
-                        aria-label={t("composer.removeQueuedAria")}
-                        onClick={() => orbitActions.removeQueuedPrompt(idx, qItem.id)}
-                        className="text-muted-foreground hover:text-foreground inline-flex size-[22px] cursor-pointer items-center justify-center rounded-[6px] transition-colors hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
-                      >
-                        <X className="size-3.5 stroke-[1.8]" />
-                      </button>
-                    </SimpleTooltip>
-                  </div>
-                </div>
-              );
-            })}
-            </ScrollArea>
-          </div>
-        )}
-
-        {/* Relative Anchor for Floating `/` and `@` Menus + Single-Rim Tactile Composer Card */}
+        {/* Relative Anchor for Floating `/` & `@` Menus + Single-Rim Tactile Composer Card */}
         <div
           onDragOver={(e) => {
             e.preventDefault();
@@ -1609,109 +1324,21 @@ export const OmniComposer = memo(function OmniComposer({
           {slashTrigger && (
             <SlashCommandMenu
               items={slashTrigger.items}
+              query={slashTrigger.query}
               activeIndex={Math.min(menuHighlightIdx, slashTrigger.items.length - 1)}
+              activeMode={activeMode}
+              fastModeActive={fastModeActive}
               onHoverIndex={setMenuHighlightIdx}
               onSelect={executeSlashCommand}
             />
           )}
 
-          {goalPopoverOpen && selectedHostId && selectedAgentId && (
-            <div
-              onKeyDown={(e) => {
-                if (goalIme.shouldIgnoreKeyDown(e)) return;
-                if (e.key === "Escape") {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setGoalPopoverOpen(false);
-                  requestAnimationFrame(() => textareaRef.current?.focus());
-                }
-              }}
-              className="bg-popover text-popover-foreground floating-surface orbit-inline-menu-up absolute right-0 bottom-full left-0 z-40 mb-2 rounded-[14px] border border-black/[0.09] p-3 dark:border-white/[0.10]"
-            >
-              <div className="mb-2 flex items-center justify-between gap-2">
-                <div className="flex items-center gap-1.5 text-[12px] font-medium">
-                  <Target className="text-muted-foreground size-3.5 stroke-[1.75]" />
-                  <span>{t("composer.autonomousGoal")}</span>
-                </div>
-                <button
-                  type="button"
-                  aria-label={t("composer.closeGoalConfig")}
-                  onClick={() => {
-                    setGoalPopoverOpen(false);
-                    requestAnimationFrame(() => textareaRef.current?.focus());
-                  }}
-                  className="text-muted-foreground hover:text-foreground inline-flex size-5 cursor-pointer items-center justify-center rounded-md transition-colors"
-                >
-                  <X className="size-3.5" />
-                </button>
-              </div>
-
-              <div className="flex flex-col gap-2">
-                <input
-                  autoFocus
-                  value={goalObjective}
-                  onChange={(e) => setGoalObjective(e.target.value)}
-                  {...goalIme.compositionProps}
-                  onKeyDown={(e) => {
-                    if (goalIme.shouldIgnoreKeyDown(e)) return;
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      submitGoalPopover();
-                    }
-                  }}
-                  placeholder={t("composer.goalObjectivePlaceholder")}
-                  className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/55 focus:border-foreground/30 h-8 w-full rounded-lg border px-2.5 text-[12.5px] outline-none"
-                />
-                <div className="flex items-center gap-2">
-                  <input
-                    value={goalVerifyCommand}
-                    onChange={(e) => setGoalVerifyCommand(e.target.value)}
-                    {...goalIme.compositionProps}
-                    onKeyDown={(e) => {
-                      if (goalIme.shouldIgnoreKeyDown(e)) return;
-                      if (e.key === "Enter" && !e.shiftKey) {
-                        e.preventDefault();
-                        submitGoalPopover();
-                      }
-                    }}
-                    placeholder={t("composer.goalVerifyPlaceholder")}
-                    className="border-border bg-canvas text-foreground placeholder:text-muted-foreground/55 focus:border-foreground/30 h-7 min-w-0 flex-1 rounded-lg border px-2.5 font-mono text-[11.5px] outline-none"
-                  />
-                  <label className="text-muted-foreground flex shrink-0 items-center gap-1.5 text-[11.5px]">
-                    <span>{t("composer.maxIter")}</span>
-                    <input
-                      type="number"
-                      min={1}
-                      max={50}
-                      value={goalMaxIterations}
-                      onChange={(e) => setGoalMaxIterations(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (goalIme.shouldIgnoreKeyDown(e)) return;
-                        if (e.key === "Enter" && !e.shiftKey) {
-                          e.preventDefault();
-                          submitGoalPopover();
-                        }
-                      }}
-                      className="border-border bg-canvas text-foreground focus:border-foreground/30 h-7 w-14 rounded-lg border px-2 text-center font-mono text-[11.5px] outline-none"
-                    />
-                  </label>
-                  <button
-                    type="button"
-                    disabled={!goalObjective.trim() || goalSubmitting}
-                    onClick={submitGoalPopover}
-                    className="bg-foreground text-background hover:opacity-90 h-7 shrink-0 cursor-pointer rounded-lg px-3 text-[12px] font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-45"
-                  >
-                    {t("common.start")}
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {mentionTrigger && combinedMentions.length > 0 && (
+          {showMentionMenu && (
             <MentionMenu
               items={combinedMentions}
-              activeIndex={Math.min(menuHighlightIdx, combinedMentions.length - 1)}
+              activeIndex={Math.min(menuHighlightIdx, Math.max(0, combinedMentions.length - 1))}
+              loading={isSearchingSymbols}
+              showEmpty={Boolean(parsedSymbolTrigger?.symbolOnly && parsedSymbolTrigger.query.length > 0)}
               onHoverIndex={setMenuHighlightIdx}
               onSelect={executeMentionSelect}
             />
@@ -1721,13 +1348,15 @@ export const OmniComposer = memo(function OmniComposer({
 
           <div
             data-occluding={occluding ? "true" : undefined}
+            data-plan={slashDirective === "plan" ? "true" : undefined}
+            data-dock-active={hasPendingDecisions ? "true" : undefined}
             className={cn(
               "composer-surface relative rounded-[20px]",
               isDraggingOver && "ring-primary/25 border-primary ring-2",
             )}
           >
             {isDraggingOver && (
-              <div className="bg-background/85 text-foreground pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-[20px] text-[13px] font-medium backdrop-blur-[2px]">
+              <div className="bg-surface-base/85 text-ink-primary pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-[20px] text-[13px] font-medium backdrop-blur-[2px]">
                 {t("composer.dropToAttach")}
               </div>
             )}
@@ -1735,200 +1364,223 @@ export const OmniComposer = memo(function OmniComposer({
             {/* Unified Context Tray — strictly for uploaded files/images, diff quotes & large pastes */}
             <ContextTray contexts={contexts} quotes={quotes} pastes={pastes} />
 
-            {/* Auto-growing Prose Textarea + Off-Flow Mirror Sizer + Inline Slash Token + Placeholder */}
-            <div className="relative overflow-hidden">
+            {/* Shared Native Scroll Container (`max-h-[200px]`): inline directive token + full-height textarea scroll as one compositor layer */}
+            <div
+              ref={scrollContainerRef}
+              className="orbit-native-scroll relative max-h-[200px] overflow-x-hidden overflow-y-auto rounded-t-[20px]"
+            >
               {slashDirective && (
-                <span
-                  ref={directivePrefixRef}
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    textareaRef.current?.focus();
-                  }}
-                  className="orbit-pill-enter pointer-events-auto absolute top-[12px] left-[14px] z-10 inline-flex h-[22px] cursor-text items-center gap-[5.5px] select-none"
+                <div
+                  ref={tokenOverlayRef}
+                  className="pointer-events-none absolute z-10 flex w-max"
+                  style={{ top: 11, left: BASE_PAD_LEFT - TOKEN_PAD_X }}
                 >
-                  {slashDirective === "plan" ? (
-                    <ListTodo className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
-                  ) : slashDirective === "review" ? (
-                    <FileSearch className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
-                  ) : slashDirective === "orbit" ? (
-                    <Layers className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
-                  ) : slashDirective === "orbit-handoff" ? (
-                    <Send className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
-                  ) : slashDirective === "orbit-committee" ? (
-                    <Users className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
-                  ) : slashDirective === "orbit-advisor" ? (
-                    <Sparkles className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
-                  ) : (
-                    <FoldVertical className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
-                  )}
-                  <span className="text-foreground text-[15px] leading-[22px] font-normal">
-                    {slashDirective}
-                  </span>
-                </span>
+                  <ComposerDirectiveToken directive={slashDirective} onClick={handleFocusAfterDirective} />
+                </div>
               )}
-
-              {!slashDirective && draftText.length === 0 && (
+              {draftText.length === 0 && (
                 <div
                   aria-hidden="true"
-                  className="text-foreground/45 pointer-events-none absolute top-[12px] right-[14px] left-[14px] truncate text-[15px] leading-[22px] select-none"
+                  style={{ left: BASE_PAD_LEFT + indent }}
+                  className="text-ink-faint pointer-events-none absolute top-[12px] right-[14px] truncate text-[15px] leading-[22px] select-none"
                 >
-                  {t("composer.placeholder")}
+                  {dynamicPlaceholder}
                 </div>
               )}
 
               {/* Off-flow div mirror sizer: deterministically measures wrapped height on both typing and large pastes */}
               <div
                 ref={mirrorTextareaRef}
+                style={inputInset}
                 aria-hidden="true"
-                style={
-                  slashDirective && directiveIndentPx > 0
-                    ? { textIndent: `${directiveIndentPx}px` }
-                    : undefined
-                }
-                className="pointer-events-none invisible absolute top-0 right-0 left-0 -z-10 block w-full px-[14px] pt-[12px] pb-[6px] text-[15px] leading-[22px] whitespace-pre-wrap break-words"
-              >
-                {draftText}
-                {"\u200b"}
-              </div>
+                className="pointer-events-none invisible absolute top-0 right-0 left-0 -z-10 block w-full px-[14px] pt-[12px] pb-[6px] text-[15px] leading-[22px] whitespace-pre-wrap break-words transition-none"
+              />
 
               <textarea
                 ref={textareaRef}
+                style={inputInset}
                 value={draftText}
+                data-orbit-composer-input="true"
+                role="combobox"
                 aria-label={t("composer.promptInputAria")}
-                style={
-                  slashDirective && directiveIndentPx > 0
-                    ? { textIndent: `${directiveIndentPx}px` }
-                    : undefined
-                }
+                aria-autocomplete="list"
+                aria-expanded={Boolean(activeListboxId)}
+                aria-controls={activeListboxId}
+                aria-activedescendant={activeDescendantId}
                 onChange={(e) => {
                   const val = e.target.value;
-                  const pos = e.target.selectionStart ?? val.length;
                   setHistoryCursor(null);
                   setDismissedToken(null);
                   setMenuHighlightIdx(0);
-                  if (val.includes("/") || val.includes("@")) {
-                    setCursorOffset(pos);
-                  }
+                  trackTriggerCursor(e.currentTarget);
                   orbitActions.setComposerDraft(val);
-                  if (val.includes("@") && selectedCwd && selectedCwd !== "~") {
-                    void orbitActions.ensureWorkspaceFiles(selectedHostId, selectedCwd);
-                  }
                 }}
-                onSelect={(e) => {
-                  const val = e.currentTarget.value;
-                  if (val.includes("/") || val.includes("@")) {
-                    setCursorOffset(e.currentTarget.selectionStart ?? 0);
-                  }
-                }}
-                onClick={(e) => {
-                  const val = e.currentTarget.value;
-                  if (val.includes("/") || val.includes("@")) {
-                    setCursorOffset(e.currentTarget.selectionStart ?? 0);
-                  }
-                }}
+                onSelect={(e) => trackTriggerCursor(e.currentTarget)}
+                onClick={(e) => trackTriggerCursor(e.currentTarget)}
                 onPaste={handlePaste}
                 onBlur={ime.reset}
                 {...ime.compositionProps}
                 onKeyDown={handleKeyDown}
                 rows={1}
-                className="text-foreground block min-h-[40px] w-full resize-none overflow-y-hidden bg-transparent px-[14px] pt-[12px] pb-[6px] text-[15px] leading-[22px] outline-none"
+                className="text-ink-primary block min-h-[40px] w-full resize-none overflow-y-hidden bg-transparent px-[14px] pt-[12px] pb-[6px] text-[15px] leading-[22px] transition-none outline-none"
               />
             </div>
 
-            {/* Bottom Control Bar (`34px` uniform control rhythm) */}
-            <div className="flex items-center justify-between gap-2 px-2.5 pt-2 pb-2">
-              <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-hidden">
-                {/* 1. `[+]` Add Context Menu (`34×34` -> Files, Mentions, Actions) */}
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <button
-                      type="button"
-                      title={t("composer.addContextTitle")}
-                      className="text-foreground/70 hover:text-foreground inline-flex size-8.5 shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-                    >
-                      <Plus className="size-[18px] stroke-[1.75]" />
-                    </button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent
-                    align="start"
-                    side="top"
-                    finalFocus={false}
-                    className="min-w-[168px]"
-                  >
-                    <DropdownMenuGroup>
-                      <DropdownMenuLabel>{t("composer.addContext")}</DropdownMenuLabel>
-                      <DropdownMenuItem onSelect={() => fileInputRef.current?.click()}>
-                        <span className="flex items-center gap-2 whitespace-nowrap">
-                          <Paperclip className="text-ink-muted size-[13.5px] stroke-[1.75]" />
-                          <span>{t("composer.files")}</span>
-                        </span>
-                      </DropdownMenuItem>
-                      <DropdownMenuItem onSelect={triggerAtMentionFromButton}>
-                        <span className="flex items-center gap-2 whitespace-nowrap">
-                          <AtSign className="text-ink-muted size-[13.5px] stroke-[1.75]" />
-                          <span>{t("composer.mentions")}</span>
-                        </span>
-                      </DropdownMenuItem>
-                      <DropdownMenuItem onSelect={triggerSlashActionsFromButton}>
-                        <span className="flex items-center gap-2 whitespace-nowrap">
-                          <SquareSlash className="text-ink-muted size-[13.5px] stroke-[1.75]" />
-                          <span>{t("composer.actions")}</span>
-                        </span>
-                      </DropdownMenuItem>
-                    </DropdownMenuGroup>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-
-                {/* 2. Isolated Agent + Model + Thinking / Fast Selector */}
-                <ComposerModelPicker />
-              </div>
-
-              {/* Right Cluster: Ambient Context Ring + Access Permissions Selector + `34×34` Primary Action Circle */}
-              <div className="flex shrink-0 items-center gap-1">
-                <ContextOccupancyPill />
-                <ComposerModePicker
-                  mode={activeMode}
-                  onSelectMode={handleSelectMode}
-                  iconOnly={isCompactBar}
-                />
-
-                {isTurnBusy && !hasPayload ? (
-                  <button
-                    type="button"
-                    title={t("composer.stopGeneration")}
-                    onClick={() => {
-                      if (selectedAgentId) {
-                        void orbitIpc.interruptAgent(selectedHostId, selectedAgentId);
-                      }
-                    }}
-                    className="orbit-press bg-surface-recessed hover:bg-accent inline-flex size-8.5 cursor-pointer items-center justify-center rounded-full"
-                  >
-                    <span className="bg-signal-danger size-[11px] rounded-[2.5px]" />
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    disabled={!hasPayload}
-                    title={
-                      isTurnBusy
-                        ? t("composer.queueFollowUp", { shortcut: `${modSymbol()}↵` })
-                        : t("common.send")
-                    }
-                    onClick={() => void orbitActions.submitComposer(false)}
-                    className={cn(
-                      "orbit-press inline-flex size-8.5 cursor-pointer items-center justify-center rounded-full",
-                      hasPayload
-                        ? "bg-action-primary text-action-primary-fg hover:opacity-90"
-                        : "text-ink-muted bg-surface-recessed pointer-events-none opacity-65",
-                    )}
-                  >
-                    <ArrowUp className="size-[17px] stroke-[2.15]" />
-                  </button>
-                )}
-              </div>
-            </div>
+            <ComposerBottomBar
+              hasPayload={hasPayload}
+              submitBusy={submitBusy}
+              showStopButton={showStopButton}
+              submitTooltipLabel={submitTooltipLabel}
+              submitShortcut={submitShortcut}
+              activeMode={activeMode}
+              effectiveProvider={effectiveProvider}
+              isCompactBar={isCompactBar}
+              selectedHostId={selectedHostId}
+              selectedAgentId={selectedAgentId}
+              onAttach={handleAttach}
+              onMention={triggerAtMentionFromButton}
+              onSlash={triggerSlashActionsFromButton}
+              onSelectMode={handleSelectModeSilent}
+              onSubmit={handleSubmitClick}
+            />
           </div>
         </div>
+      </div>
+    </div>
+  );
+});
+
+interface ComposerBottomBarProps {
+  hasPayload: boolean;
+  submitBusy: boolean;
+  showStopButton: boolean;
+  submitTooltipLabel: string;
+  submitShortcut?: string;
+  activeMode: SessionMode;
+  effectiveProvider: ProviderKind;
+  isCompactBar: boolean;
+  selectedHostId: string;
+  selectedAgentId: string | null;
+  onAttach: () => void;
+  onMention: () => void;
+  onSlash: () => void;
+  onSelectMode: (mode: SessionMode) => void;
+  onSubmit: () => void;
+}
+
+const ComposerBottomBar = memo(function ComposerBottomBar({
+  hasPayload, submitBusy, showStopButton, submitTooltipLabel, submitShortcut,
+  activeMode, effectiveProvider, isCompactBar, selectedHostId, selectedAgentId,
+  onAttach, onMention, onSlash, onSelectMode, onSubmit,
+}: ComposerBottomBarProps) {
+  const { t } = useI18n();
+  return (
+    <div className="flex items-center justify-between gap-2 px-2.5 pt-2 pb-2">
+      <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-hidden">
+        {/* 1. `[+]` Add Context Menu (`34×34` -> Files, Mentions, Actions) */}
+        <DropdownMenu>
+          <SimpleTooltip label={t("composer.addContextTitle")} side="top">
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                aria-label={t("composer.addContextTitle")}
+                className="text-ink-secondary hover:text-ink-primary hover:bg-accent inline-flex size-8.5 shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors"
+              >
+                <Plus className="size-[18px] stroke-[1.75]" />
+              </button>
+            </DropdownMenuTrigger>
+          </SimpleTooltip>
+          <DropdownMenuContent
+            align="start"
+            side="top"
+            finalFocus={false}
+            className="min-w-[168px]"
+          >
+            <DropdownMenuGroup>
+              <DropdownMenuItem onSelect={onAttach}>
+                <span className="flex items-center gap-2 whitespace-nowrap">
+                  <Paperclip className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                  <span>{t("composer.files")}</span>
+                </span>
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={onMention}>
+                <span className="flex items-center gap-2 whitespace-nowrap">
+                  <AtSign className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                  <span>{t("composer.mentions")}</span>
+                </span>
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={onSlash}>
+                <span className="flex items-center gap-2 whitespace-nowrap">
+                  <SquareSlash className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                  <span>{t("composer.actions")}</span>
+                </span>
+              </DropdownMenuItem>
+            </DropdownMenuGroup>
+          </DropdownMenuContent>
+        </DropdownMenu>
+
+        {/* 2. Isolated Agent + Model + Thinking / Fast Selector */}
+        <ComposerModelPicker />
+      </div>
+
+      {/* Right Cluster: Ambient Context Ring + Access Permissions + Stationary Single `34×34` Action Circle */}
+      <div className="flex shrink-0 items-center gap-1">
+        <ContextOccupancyPill />
+        <ComposerModePicker
+          mode={activeMode}
+          onSelectMode={onSelectMode}
+          provider={effectiveProvider}
+          iconOnly={isCompactBar}
+        />
+
+        {showStopButton ? (
+          <SimpleTooltip
+            label={t("composer.stopGeneration")}
+            shortcut="Esc Esc"
+            side="top"
+          >
+            <button
+              type="button"
+              aria-label={t("composer.stopGeneration")}
+              onClick={() => {
+                if (selectedAgentId) {
+                  void orbitIpc.interruptAgent(selectedHostId, selectedAgentId);
+                }
+              }}
+              className="orbit-press bg-surface-recessed hover:bg-accent inline-flex size-[34px] shrink-0 cursor-pointer items-center justify-center rounded-full"
+            >
+              <span className="bg-signal-danger size-[11px] rounded-[2.5px]" />
+            </button>
+          </SimpleTooltip>
+        ) : (
+          <SimpleTooltip
+            label={submitTooltipLabel}
+            shortcut={submitShortcut}
+            side="top"
+          >
+            <button
+              type="button"
+              disabled={!hasPayload || submitBusy}
+              aria-busy={submitBusy}
+              aria-label={submitTooltipLabel}
+              onClick={onSubmit}
+              className={cn(
+                "orbit-press inline-flex size-[34px] shrink-0 cursor-pointer items-center justify-center rounded-full",
+                hasPayload && !submitBusy
+                  ? "bg-action-primary-bg text-action-primary-fg hover:bg-action-primary-hover"
+                  : submitBusy
+                    ? "bg-action-primary-bg text-action-primary-fg opacity-80"
+                    : "text-ink-muted bg-surface-recessed pointer-events-none opacity-65",
+              )}
+            >
+              {submitBusy ? (
+                <OrbitSpinner size={15} className="shrink-0" />
+              ) : (
+                <ArrowUp className="size-[17px] stroke-[2.15]" />
+              )}
+            </button>
+          </SimpleTooltip>
+        )}
       </div>
     </div>
   );

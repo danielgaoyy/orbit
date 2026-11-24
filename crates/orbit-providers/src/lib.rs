@@ -10,6 +10,7 @@ pub mod attachments;
 pub mod claude;
 pub mod codex;
 pub mod driver;
+mod managed_dispatch;
 pub mod pi;
 pub mod readiness;
 pub mod shell_snapshot;

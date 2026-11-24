@@ -18,12 +18,11 @@ export const DEFAULT_CUSTOM_THINKING_OPTIONS: ThinkingOptionSpec[] = (
   description: defaultEffortDescription(eff),
 }));
 
-export function conciseThinkingDescription(opt: ThinkingOptionSpec): string {
-  const raw = (opt.description ?? "").trim();
-  if (raw && raw.length <= 34) {
-    return raw;
-  }
-  return defaultEffortDescription(opt.effort);
+export function conciseThinkingDescription(
+  opt: ThinkingOptionSpec,
+  translate: (key: MessageKey) => string = translateGlobal,
+): string {
+  return defaultEffortDescription(opt.effort, translate);
 }
 
 export const PROVIDERS: readonly { id: ProviderKind; label: string; shortLabel: string }[] =

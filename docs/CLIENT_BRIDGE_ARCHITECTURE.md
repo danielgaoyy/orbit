@@ -41,6 +41,8 @@ flowchart TD
   NAPI -->|"Delta Pull & Snapshot"| HarmonyUI["HarmonyOS ArkTS V2 Store"]
 ```
 
+Host detail agent cards expose the optional creation timestamp `created_at_rfc3339` across the three bridges. Desktop uses creation time to associate historical spawn calls with children when the transcript lacks an identity. Activity ordering continues to use `updated_at_rfc3339`.
+
 ### Pull-on-Notify Delta Flow
 
 Bridges emit lightweight invalidation notifications (`CoreNotification`) containing only identifiers (`host_id`, `agent_id`, `cwd`, `slot`) rather than broadcasting full snapshot payloads over FFI on every token delta:

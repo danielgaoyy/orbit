@@ -250,3 +250,19 @@ describe("turn-delegation-split", () => {
     assert.equal(handoffInfo?.label, "Handoff (worktree → local)");
   });
 });
+
+it("promotes a space-normalized dispatch before its managed child arrives", () => {
+  const item: TimelineItemView = {
+    item_type: "tool_call", seq: 1, call_id: "new", status: "running", diff_files: [],
+    summary_title: "Run mcp orbit create agent",
+    detail: { kind: "generic", tool_name: "Run mcp orbit create agent",
+      arguments_json: '{"toolSummary":"Build reviewer","initial_prompt":"Check build"}' },
+  };
+  assert.equal(splitStepGroupChronologically([item]).chunks[0]?.kind, "delegation");
+  assert.deepEqual(extractFallbackDispatchCall(item), {
+    callId: "new", label: "Build reviewer", preview: "Check build", status: "running",
+  });
+  assert.equal(item.detail.kind, "generic");
+  item.detail.arguments_json = "";
+  assert.equal(extractFallbackDispatchCall(item)?.label, "Subagent");
+});

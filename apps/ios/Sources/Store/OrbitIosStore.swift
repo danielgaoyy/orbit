@@ -1591,6 +1591,7 @@ public final class OrbitIosStore: ObservableObject {
             acpAgentId: nil,
             attentionLabel: nil,
             latestSeq: 22,
+            createdAtRfc3339: nil,
             updatedAtRfc3339: "2026-11-22T06:00:00Z",
             isPinned: true,
             seenSeq: 22,
@@ -4955,7 +4956,7 @@ public final class OrbitIosStore: ObservableObject {
     // MARK: - Fleet Daemon Version & One-Click Over-the-Wire Update
 
     public var appShortVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.10.0"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.10.1"
     }
 
     public func isHostProtocolBehind(_ host: FfiHostCard) -> Bool {

@@ -111,7 +111,7 @@ export const ParentSubagentBanner = memo(function ParentSubagentBanner({
 /**
  * Unified timeline row for `agent_message` events (subagent finish reports, inline permission
  * checkpoints, direct agent-to-agent messages, and heartbeat dividers).
- * Shares the exact same visual language & OneWorks 3D Avatar identity as `DelegationMilestoneRow`.
+ * Shares the exact same visual language and animal avatar as `DelegationMilestoneRow`.
  */
 export const AgentMessageCard = memo(function AgentMessageCard({
   hostId,
@@ -157,7 +157,7 @@ export const AgentMessageCard = memo(function AgentMessageCard({
   const cleanBody = useMemo(() => extractCleanAgentMessageBody(item.text), [item.text]);
   const cleanPreview = useMemo(() => formatCleanAgentMessagePreview(cleanBody), [cleanBody]);
 
-  // Resolve the sender's collision-free OneWorks 3D character from sessionSubagents (or stable fallback)
+  // Resolve the sender's assigned animal avatar from sessionSubagents (or stable fallback)
   const senderCharacter = useMemo(() => {
     const matched = sessionSubagents?.find(
       (sa) =>

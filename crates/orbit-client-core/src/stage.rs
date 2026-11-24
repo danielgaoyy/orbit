@@ -3819,9 +3819,9 @@ pub fn derive_session_insights(
                     .iter()
                     .filter(|(_, v)| {
                         v.provider_subagent_id.is_none()
-                            && v.child_agent_id
-                                .as_deref()
-                                .is_none_or(|cid| !host_agent_ids.contains(cid))
+                            && v.child_agent_id.as_deref().is_none_or(|cid| {
+                                !cid.starts_with("ag_") && !host_agent_ids.contains(cid)
+                            })
                             && v.role.trim().eq_ignore_ascii_case(ps_title)
                     })
                     .min_by_key(|(_, v)| v.last_seq)
@@ -4635,6 +4635,7 @@ mod tests {
             archived_at_rfc3339: None,
             labels: HashMap::new(),
             latest_seq: 7,
+            created_at_rfc3339: None,
             updated_at_rfc3339: "2026-11-20T00:00:00Z".into(),
             is_pinned: false,
             seen_seq: 0,
@@ -4808,6 +4809,7 @@ Log: file:///tmp/spoofed.log\n";
             archived_at_rfc3339: archived.map(ToOwned::to_owned),
             labels: HashMap::new(),
             latest_seq: 50,
+            created_at_rfc3339: None,
             updated_at_rfc3339: "2026-11-20T00:00:00Z".into(),
             is_pinned: false,
             seen_seq: 0,
@@ -5053,6 +5055,7 @@ Log: file:///tmp/spoofed.log\n";
             archived_at_rfc3339: None,
             labels: HashMap::new(),
             latest_seq: 50,
+            created_at_rfc3339: None,
             updated_at_rfc3339: "2026-11-20T00:00:00Z".into(),
             is_pinned: false,
             seen_seq: 0,
@@ -5069,6 +5072,19 @@ Log: file:///tmp/spoofed.log\n";
         };
 
         let items = vec![
+            // A remote Orbit child can share a role with a provider-native child.
+            make_tool(
+                0,
+                ToolCallStatus::Completed,
+                "Run mcp_orbit_create_agent",
+                ToolCallDetail::Subagent {
+                    child_agent_id: Some("ag_remote".into()),
+                    role: "AI Video Action Prompting Researcher".into(),
+                    prompt_preview: String::new(),
+                },
+                Vec::new(),
+                900,
+            ),
             // Legacy misclassified `manage_subagents` entry (empty prompt, generic "subagent" role)
             TimelineItemView::ToolCall {
                 seq: 1,
@@ -5191,8 +5207,17 @@ Log: file:///tmp/spoofed.log\n";
         );
 
         // Legacy `manage_subagents` placeholder excluded; both native subagents reconciled & Running
-        assert_eq!(insights.subagents.len(), 2);
-        for sa in &insights.subagents {
+        assert_eq!(insights.subagents.len(), 3);
+        let remote = insights
+            .subagents
+            .iter()
+            .find(|sa| sa.child_agent_id.as_deref() == Some("ag_remote"));
+        assert!(remote.is_some_and(|sa| sa.provider_subagent_id.is_none()));
+        for sa in insights
+            .subagents
+            .iter()
+            .filter(|sa| sa.child_agent_id.as_deref() != Some("ag_remote"))
+        {
             assert_eq!(sa.status, ToolCallStatus::Running);
             assert!(
                 sa.child_agent_id.is_none(),
@@ -5237,6 +5262,7 @@ Log: file:///tmp/spoofed.log\n";
             archived_at_rfc3339: None,
             labels: HashMap::new(),
             latest_seq: 12,
+            created_at_rfc3339: None,
             updated_at_rfc3339: "2026-11-20T00:00:00Z".into(),
             is_pinned: false,
             seen_seq: 10,

@@ -1,3 +1,4 @@
+import type { ComposerInlineDirective } from "@/lib/slash-commands";
 import {
   t,
 } from "@/lib/i18n";
@@ -962,7 +963,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
       hostId?: string,
       cwd?: string,
       prefillPrompt?: string,
-      prefillSlash?: SlashDirective | null,
+      prefillSlash?: ComposerInlineDirective | null,
       workspaceId?: string | null,
     ): void {
       ctx.setPendingDraftCreate(null);

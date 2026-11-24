@@ -16,11 +16,15 @@
 ## 2. Provider 驱动与消息零错位契约（Zero Off-By-One）
 
 - **Native 驱动**（`crates/orbit-providers/src/`）：
-  - `claude.rs`（`stream-json` 控制协议）
+  - `claude.rs`（`stream-json` 控制协议，私钥 MCP 配置写入 `$ORBIT_HOME/runtime/claude-mcp-*.json` `0600`）
   - `codex.rs`（`app-server` JSON-RPC 2.0）
   - `antigravity.rs`（`agy` ACP stdio + 字节偏移 transcript 流）
-  - `pi.rs`（`pi-rpc`）
-- **通用 ACP 生态**：`acp_registry.rs`、`acp_providers.rs`、`acp_generic.rs` 与 `readiness.rs`（34+ ACP Agent 目录及实时 `initialize` 探测）。
+  - `pi.rs`（`pi-rpc`，私钥 MCP 配置写入 `$ORBIT_HOME/runtime/mcp-pi-*.json` `0600`，经环境变量与 `cleanup_paths` 托管，零 `argv` 凭据泄露）
+- **通用 ACP 生态与客户端回调**：`acp_registry.rs`、`acp_providers.rs`、`acp_generic.rs`、`acp_callbacks.rs` 与 `readiness.rs`（34+ ACP Agent 目录，统一通过 `acp_callbacks::AcpCallbackHost` 声明并实现工作区隔离的 `fs/read_text_file`、`fs/write_text_file` 及独立进程组 `terminal/*` 回调，支持 `Drop` 自动清理）。
+- **Daemon 异步隔离、OS 文件监听与 SEP-1865 MCP Apps**：
+  - `crates/orbit-daemon/src/manager.rs` 全部异步路径通过 `with_store` / `try_store`（`tokio::task::spawn_blocking`）将同步 SQLite 读写移出 Tokio worker 线程。
+  - `crates/orbit-daemon/src/workspace_watcher.rs` 基于 `notify` 提供 250ms 防抖、忽略构建/对象目录并限流的文件与 `.git/HEAD`/`index` 监听，自动广播 `WireMessage::WorkspaceFilesChanged` 并失效符号/规则缓存。
+  - `crates/orbit-daemon/src/mcp_servers.rs` 与 `artifacts.rs` 支持 SEP-1865 `ui://` 资源 `resources/read` 自动拉取与严格绑定归属 MCP Server 的 `tools/call`（`WireMessage::ReadMcpResource` / `CallArtifactMcpTool`）。
 - **防轮次错位与跨轮去重不变式**：
   1. 在并发 `steer`（改向）、`interrupt`（打断）或排队消息自动冲刷时，每一条 assistant 响应与 finalize 事件必须严格绑定并校验当前活跃 turn 上下文，严禁下一轮错收到上一轮残留输出（off-by-one lag）。
   2. 延迟到达的跨轮 finalize 消息必须在持久化与 WebSocket 广播路径（`crates/orbit-daemon/src/manager.rs` / `lib.rs`）正确归位或去重。

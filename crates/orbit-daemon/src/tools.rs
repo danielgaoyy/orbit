@@ -2847,6 +2847,8 @@ async fn execute_tool_inner(
                             language,
                             mime_type,
                             resource_uri,
+                            // SECURITY: never allow agent tool calls to spoof MCP server ownership.
+                            mcp_server_name: None,
                             content,
                             summary_note,
                         },
@@ -2879,6 +2881,8 @@ async fn execute_tool_inner(
                         language,
                         mime_type,
                         resource_uri,
+                        // SECURITY: never allow agent tool calls to spoof MCP server ownership.
+                        mcp_server_name: None,
                         content,
                         summary_note,
                     })

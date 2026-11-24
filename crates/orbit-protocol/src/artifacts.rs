@@ -116,6 +116,9 @@ pub struct ArtifactSummary {
     /// Optional SEP-1865 MCP App resource URI (e.g. `ui://dashboard/metrics`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_uri: Option<String>,
+    /// Optional owning external MCP server name/ID for SEP-1865 `resources/read` and `tools/call`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_server_name: Option<String>,
     pub version: u32,
     pub byte_len: usize,
     pub created_at: DateTime<Utc>,
@@ -200,6 +203,7 @@ mod tests {
             language: Some("html".into()),
             mime_type: Some("text/html;profile=mcp-app".into()),
             resource_uri: Some("ui://orbit/metrics".into()),
+            mcp_server_name: Some("metrics".into()),
             version: 2,
             byte_len: 42,
             created_at: now,
@@ -253,8 +257,45 @@ mod tests {
                 language: Some("html".into()),
                 mime_type: Some("text/html;profile=mcp-app".into()),
                 resource_uri: Some("ui://orbit/metrics".into()),
+                mcp_server_name: Some("metrics".into()),
                 content: "<div>Hello MCP App</div>".into(),
                 summary_note: Some("Add chart".into()),
+            },
+            WireMessage::ReadMcpResource {
+                request_id: req_id,
+                artifact_id: "art_abc123".into(),
+                artifact_version: Some(2),
+                uri: "ui://orbit/metrics".into(),
+            },
+            WireMessage::McpResourceResponse {
+                request_id: req_id,
+                server_name: "metrics".into(),
+                uri: "ui://orbit/metrics".into(),
+                content: crate::McpResourceContent {
+                    uri: "ui://orbit/metrics".into(),
+                    mime_type: Some("text/html;profile=mcp-app".into()),
+                    text: Some("<div>Metrics</div>".into()),
+                    blob_base64: None,
+                },
+            },
+            WireMessage::CallArtifactMcpTool {
+                request_id: req_id,
+                artifact_id: "art_abc123".into(),
+                artifact_version: Some(2),
+                tool_name: "refresh_metrics".into(),
+                arguments: serde_json::json!({ "window": "1h" }),
+            },
+            WireMessage::ArtifactMcpToolResponse {
+                request_id: req_id,
+                artifact_id: "art_abc123".into(),
+                tool_name: "refresh_metrics".into(),
+                outcome: crate::McpToolCallOutcome {
+                    ok: true,
+                    is_error: false,
+                    content: vec![serde_json::json!({ "type": "text", "text": "refreshed" })],
+                    structured_content: Some(serde_json::json!({ "count": 42 })),
+                    error: None,
+                },
             },
             WireMessage::ArtifactUpdated {
                 request_id: Some(req_id),

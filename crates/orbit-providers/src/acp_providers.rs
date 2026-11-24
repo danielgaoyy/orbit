@@ -734,13 +734,7 @@ async fn send_acp_initialize(
         "initialize",
         json!({
             "protocolVersion": 1,
-            "clientCapabilities": {
-                "fs": {
-                    "readTextFile": false,
-                    "writeTextFile": false
-                },
-                "terminal": false
-            },
+            "clientCapabilities": crate::acp_callbacks::acp_client_capabilities(),
             "clientInfo": {
                 "name": "orbit",
                 "version": env!("CARGO_PKG_VERSION")
@@ -1328,9 +1322,17 @@ async fn run_acp_actor(
     let mut user_interrupted = false;
     let mut cancelling_active_turn = false;
     let mut cancel_deadline: Option<tokio::time::Instant> = None;
+    let (mut acp_cb_host, mut acp_cb_reply_rx) =
+        crate::acp_callbacks::AcpCallbackHost::new(std::path::PathBuf::from(&cfg.cwd));
 
     loop {
         tokio::select! {
+            Some(reply_line) = acp_cb_reply_rx.recv() => {
+                if shim.write_stdin_line(reply_line).await.is_err() {
+                    finalize_and_emit_unexpected_exit(&mut seg_state, &evt_tx).await;
+                    break;
+                }
+            }
             maybe_cmd = cmd_rx.recv() => {
                 let Some(cmd) = maybe_cmd else { break; };
                 match cmd {
@@ -2254,23 +2256,42 @@ async fn run_acp_actor(
                                 &evt_tx,
                             )
                             .await;
-                        } else if has_id && let Some(unknown_method) = method {
-                            debug!(
-                                agent_id = %cfg.agent_id,
-                                provider = %provider_slug,
-                                method = %unknown_method,
-                                "Replying -32601 to unsupported ACP server->client RPC"
-                            );
-                            let resp = json!({
-                                "jsonrpc": "2.0",
-                                "id": val["id"],
-                                "error": {
-                                    "code": -32601,
-                                    "message": format!("Method not supported by client: {unknown_method}")
+                        } else if has_id
+                            && let Some(unknown_method) = method
+                            && let Some(id_val) = val.get("id").filter(|v| !v.is_null())
+                        {
+                            let params = val.get("params").unwrap_or(&Value::Null);
+                            match acp_cb_host
+                                .handle_request(id_val, unknown_method, params)
+                                .await
+                            {
+                                crate::acp_callbacks::AcpCallbackOutcome::Reply(resp) => {
+                                    if shim.write_stdin_line(resp).await.is_err() {
+                                        finalize_and_emit_unexpected_exit(&mut seg_state, &evt_tx)
+                                            .await;
+                                        break;
+                                    }
                                 }
-                            })
-                            .to_string();
-                            let _ = shim.write_stdin_line(resp).await;
+                                crate::acp_callbacks::AcpCallbackOutcome::Deferred => {}
+                                crate::acp_callbacks::AcpCallbackOutcome::Unsupported => {
+                                    debug!(
+                                        agent_id = %cfg.agent_id,
+                                        provider = %provider_slug,
+                                        method = %unknown_method,
+                                        "Replying -32601 to unsupported ACP server->client RPC"
+                                    );
+                                    let resp = json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id_val,
+                                        "error": {
+                                            "code": -32601,
+                                            "message": format!("Method not supported by client: {unknown_method}")
+                                        }
+                                    })
+                                    .to_string();
+                                    let _ = shim.write_stdin_line(resp).await;
+                                }
+                            }
                         }
                     }
                     ShimFrame::Exited { code } => {

@@ -118,4 +118,4 @@ cd apps/android && gradle assembleDebug --no-daemon
 
 ## License
 
-Dual-licensed under [MIT](LICENSE) or Apache-2.0.
+Dual-licensed under [MIT](LICENSE) or [Apache-2.0](LICENSE-APACHE).

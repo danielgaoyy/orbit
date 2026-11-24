@@ -2143,6 +2143,7 @@ impl From<FfiUpsertArtifactRequest> for UpsertArtifactRequest {
             language: v.language,
             mime_type: v.mime_type,
             resource_uri: v.resource_uri,
+            mcp_server_name: None,
             content: v.content,
             summary_note: v.summary_note,
         }

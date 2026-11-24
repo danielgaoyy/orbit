@@ -3,8 +3,9 @@
 //! Runs Pi's headless JSONL RPC protocol inside a detached `orbit shim` process so
 //! `orbit daemon` restarts never interrupt active Pi coding sessions.
 
-use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -20,15 +21,198 @@ use orbit_shim::{
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use crate::attachments::build_pi_prompt_payload_async;
 use crate::driver::{
-    DriverCommand, DriverEvent, ProviderSessionHandle, QueuedDriverPrompt, SessionLaunchConfig,
-    emit_dropped_queued_prompts, emit_prompt_delivery,
+    DriverCommand, DriverEvent, OrbitMcpLaunchSpec, ProviderSessionHandle, QueuedDriverPrompt,
+    SessionLaunchConfig, emit_dropped_queued_prompts, emit_prompt_delivery,
 };
 
 const BOOT_GET_STATE_TIMEOUT: Duration = Duration::from_secs(15);
 const SHIM_KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const PI_MCP_FILE_PREFIX: &str = "mcp-pi-";
+const PI_MCP_FILE_SUFFIX: &str = ".json";
+
+/// RAII guard for a per-spawn private Pi MCP config file (`0600` on Unix).
+/// Automatically unlinks the file if shim launch fails before ownership transfers
+/// to `orbit-shim` (`ShimSpawnSpec::cleanup_paths`).
+struct PiMcpConfigGuard {
+    path: Option<PathBuf>,
+}
+
+impl PiMcpConfigGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Disarm automatic cleanup once `orbit-shim` owns `cleanup_paths` for the child's lifetime.
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for PiMcpConfigGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn resolve_absolute_runtime_dir(runtime_dir: &Path) -> Result<PathBuf, String> {
+    let abs = if runtime_dir.is_absolute() {
+        runtime_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("failed to resolve current working directory: {e}"))?
+            .join(runtime_dir)
+    };
+    Ok(std::fs::canonicalize(&abs).unwrap_or(abs))
+}
+
+fn sanitize_pi_mcp_agent_id(agent_id: &str) -> String {
+    let cleaned: String = agent_id
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "agent".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn extract_pi_mcp_config_agent_id(file_name: &str) -> Option<&str> {
+    let stem = file_name
+        .strip_prefix(PI_MCP_FILE_PREFIX)?
+        .strip_suffix(PI_MCP_FILE_SUFFIX)?;
+    // Canonical hyphenated UUID is 36 ASCII bytes preceded by '-'.
+    if stem.len() <= 37 {
+        return None;
+    }
+    let sep_idx = stem.len() - 37;
+    if stem.as_bytes().get(sep_idx) != Some(&b'-') {
+        return None;
+    }
+    let uuid_part = &stem[sep_idx + 1..];
+    Uuid::parse_str(uuid_part).ok()?;
+    Some(&stem[..sep_idx])
+}
+
+/// Write a private MCP config JSON file under `<runtime_dir>/mcp-pi-<agent_id>-<uuid>.json`
+/// so the Orbit MCP Bearer token is never exposed on `pi`'s process `argv`.
+///
+/// - On Unix, `<runtime_dir>` is created/verified as a real, current-UID-owned `0700` directory
+///   and the file is opened directly via `create_new(true)` with mode `0600` before writing.
+/// - Always returns an absolute path so relative `--home` flags work regardless of `pi`'s `cwd`.
+fn write_pi_mcp_config_file(
+    runtime_dir: &Path,
+    agent_id: &str,
+    mcp: &OrbitMcpLaunchSpec,
+) -> Result<PiMcpConfigGuard, String> {
+    orbit_shim::ensure_private_dir(runtime_dir)
+        .map_err(|e| format!("failed to prepare private Orbit runtime dir: {e}"))?;
+    let abs_runtime_dir = resolve_absolute_runtime_dir(runtime_dir)?;
+
+    let mcp_json = json!({
+        "mcpServers": {
+            mcp.server_name.clone(): {
+                "type": "http",
+                "url": mcp.http_url,
+                "headers": {
+                    "Authorization": format!("Bearer {}", mcp.bearer_token)
+                }
+            }
+        }
+    })
+    .to_string();
+
+    let safe_id = sanitize_pi_mcp_agent_id(agent_id);
+    let uuid = Uuid::new_v4();
+    let final_path = abs_runtime_dir.join(format!(
+        "{PI_MCP_FILE_PREFIX}{safe_id}-{uuid}{PI_MCP_FILE_SUFFIX}"
+    ));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let mut file = opts
+        .open(&final_path)
+        .map_err(|e| format!("failed to create private pi MCP config file: {e}"))?;
+    let guard = PiMcpConfigGuard::new(final_path);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("failed to enforce 0600 on pi MCP config file: {e}"))?;
+    }
+    file.write_all(mcp_json.as_bytes())
+        .map_err(|e| format!("failed to write private pi MCP config file: {e}"))?;
+    drop(file);
+
+    Ok(guard)
+}
+
+/// Snapshot existing `mcp-pi-<agent_id>-<uuid>.json` files inside `runtime_dir` BEFORE startup
+/// recovery spawns any new agent tasks.
+pub fn snapshot_pi_mcp_config_files(runtime_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(runtime_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if let Some(name_str) = name.to_str()
+            && extract_pi_mcp_config_agent_id(name_str).is_some()
+        {
+            out.push(entry.path());
+        }
+    }
+    out
+}
+
+/// Remove ONLY pre-snapshotted `mcp-pi-<agent_id>-<uuid>.json` candidate files whose agent did
+/// not survive daemon restart (never touching fresh files written by newly launching agents).
+pub fn reap_snapshotted_pi_mcp_configs(
+    candidates: &[PathBuf],
+    surviving_agent_ids: &HashSet<String>,
+) -> usize {
+    let surviving_sanitized: HashSet<String> = surviving_agent_ids
+        .iter()
+        .map(|id| sanitize_pi_mcp_agent_id(id))
+        .collect();
+    let mut removed = 0usize;
+    for path in candidates {
+        let Some(name_str) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if let Some(file_agent_id) = extract_pi_mcp_config_agent_id(name_str)
+            && !surviving_sanitized.contains(file_agent_id)
+            && std::fs::remove_file(path).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
 
 /// Instant fallback model catalog for Pi (no subprocess startup delay).
 pub fn fallback_pi_models() -> ProviderModelCatalog {
@@ -100,7 +284,11 @@ pub fn pi_thinking_level(effort: ReasoningEffort) -> &'static str {
     }
 }
 
-fn build_pi_spawn_spec(cfg: &SessionLaunchConfig, include_resume: bool) -> ShimSpawnSpec {
+fn build_pi_spawn_spec(
+    cfg: &SessionLaunchConfig,
+    include_resume: bool,
+    mcp_config_path: Option<&Path>,
+) -> ShimSpawnSpec {
     let mut args = vec!["--mode".to_string(), "rpc".to_string()];
 
     if include_resume
@@ -143,6 +331,16 @@ fn build_pi_spawn_spec(cfg: &SessionLaunchConfig, include_resume: bool) -> ShimS
     env.insert("NO_COLOR".into(), "1".into());
     crate::shell_snapshot::merge_cached_shell_env_into_map(&mut env);
 
+    let mut cleanup_paths = Vec::new();
+    if let Some(path) = mcp_config_path {
+        let path_str = path.to_string_lossy().to_string();
+        // Expose only the private 0600 file path via environment (never pass secrets in argv
+        // and never inject unverified CLI flags into `pi --mode rpc`).
+        env.insert("ORBIT_MCP_CONFIG".into(), path_str.clone());
+        env.insert("PI_MCP_CONFIG".into(), path_str);
+        cleanup_paths.push(path.to_path_buf());
+    }
+
     ShimSpawnSpec {
         shim_id: format!("pi_{}", cfg.agent_id),
         mode: ShimMode::Stdio,
@@ -150,7 +348,7 @@ fn build_pi_spawn_spec(cfg: &SessionLaunchConfig, include_resume: bool) -> ShimS
         args,
         cwd: cfg.cwd.clone(),
         env,
-        cleanup_paths: Vec::new(),
+        cleanup_paths,
     }
 }
 
@@ -169,10 +367,21 @@ pub async fn spawn_pi_session(cfg: SessionLaunchConfig) -> Result<ProviderSessio
     let (shim, is_reattached) = if let Some(existing) = reattached {
         (existing, true)
     } else {
-        let spec = build_pi_spawn_spec(&cfg, true);
+        let mut mcp_guard = match cfg.mcp_spec {
+            Some(ref mcp) => Some(write_pi_mcp_config_file(
+                &cfg.runtime_dir,
+                &cfg.agent_id,
+                mcp,
+            )?),
+            None => None,
+        };
+        let spec = build_pi_spawn_spec(&cfg, true, mcp_guard.as_ref().and_then(|g| g.path()));
         let fresh = spawn_detached_shim(&cfg.orbit_exe, &cfg.shim_socket, &spec)
             .await
             .map_err(|e| format!("failed to spawn pi shim: {e}"))?;
+        if let Some(ref mut guard) = mcp_guard {
+            guard.disarm();
+        }
         (fresh, false)
     };
 
@@ -759,9 +968,35 @@ async fn run_pi_actor(
                 );
                 kill_and_wait_shim(&mut shim).await;
                 cfg.shim_seq_tracker.store(0, Ordering::Relaxed);
-                let fresh_spec = build_pi_spawn_spec(&cfg, false);
+                let mut fresh_mcp_guard = match cfg.mcp_spec {
+                    Some(ref mcp) => {
+                        match write_pi_mcp_config_file(&cfg.runtime_dir, &cfg.agent_id, mcp) {
+                            Ok(guard) => Some(guard),
+                            Err(e) => {
+                                let _ = evt_tx
+                                    .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                                        message: format!(
+                                            "Pi startup failed: {first_err} (fresh MCP config failed: {e})"
+                                        ),
+                                        recoverable: false,
+                                    }))
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                let fresh_spec = build_pi_spawn_spec(
+                    &cfg,
+                    false,
+                    fresh_mcp_guard.as_ref().and_then(|g| g.path()),
+                );
                 match spawn_detached_shim(&cfg.orbit_exe, &cfg.shim_socket, &fresh_spec).await {
                     Ok(mut fresh_shim) => {
+                        if let Some(ref mut guard) = fresh_mcp_guard {
+                            guard.disarm();
+                        }
                         match boot_pi_get_state(&cfg, &mut fresh_shim, &mut next_cmd_id).await {
                             Ok(boot) => {
                                 shim = fresh_shim;
@@ -2087,7 +2322,7 @@ mod tests {
         cfg.resume_session_id = Some("/tmp/prev.jsonl".into());
         cfg.system_prompt_append = Some("Be concise".into());
 
-        let with_resume = build_pi_spawn_spec(&cfg, true);
+        let with_resume = build_pi_spawn_spec(&cfg, true, None);
         assert_eq!(
             with_resume.args,
             vec![
@@ -2108,7 +2343,7 @@ mod tests {
             Some("1")
         );
 
-        let without_resume = build_pi_spawn_spec(&cfg, false);
+        let without_resume = build_pi_spawn_spec(&cfg, false, None);
         assert!(!without_resume.args.contains(&"--session".to_string()));
 
         let combined = prepend_handoff_context(
@@ -2203,7 +2438,7 @@ done
             &tmp,
             Arc::clone(&seq_tracker),
         );
-        let spec = build_pi_spawn_spec(&cfg, true);
+        let spec = build_pi_spawn_spec(&cfg, true, None);
         let (shim_task, shim_client) = start_inprocess_shim(sock_path.clone(), spec).await;
 
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
@@ -2440,7 +2675,7 @@ done
             &tmp,
             Arc::clone(&seq_tracker_1),
         );
-        let spec = build_pi_spawn_spec(&cfg1, false);
+        let spec = build_pi_spawn_spec(&cfg1, false, None);
         let (shim_task, shim_client_1) = start_inprocess_shim(sock_path.clone(), spec).await;
 
         let (cmd_tx1, cmd_rx1) = mpsc::channel(16);
@@ -2857,5 +3092,126 @@ done
         let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
         let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    fn pi_mcp_config_writes_0600_file_sets_env_and_cleanup_paths_without_argv_secrets_and_reaps_stale()
+     {
+        let root = std::env::temp_dir().join(format!("orbit-pi-mcp-test-{}", Uuid::new_v4()));
+        let runtime_dir = root.join("runtime");
+        let mcp = OrbitMcpLaunchSpec {
+            server_name: "orbit".to_string(),
+            http_url: "http://127.0.0.1:6868/mcp/agents?caller_agent_id=ag_pi_sec".to_string(),
+            bearer_token: "super-secret-pi-token-98765".to_string(),
+            stdio_command: PathBuf::from("/usr/local/bin/orbit"),
+            stdio_args: vec!["mcp".to_string()],
+        };
+
+        let guard = write_pi_mcp_config_file(&runtime_dir, "ag_pi_sec", &mcp)
+            .expect("write private pi MCP config");
+        let cfg_path = guard.path().expect("guard path").to_path_buf();
+        assert!(cfg_path.is_absolute(), "MCP config path must be absolute");
+        assert!(cfg_path.exists());
+        let file_name = cfg_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("file name");
+        assert!(
+            file_name.starts_with("mcp-pi-ag_pi_sec-") && file_name.ends_with(".json"),
+            "unexpected file name: {file_name}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_mode = std::fs::metadata(&cfg_path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(file_mode, 0o600, "pi MCP config must be 0600");
+            let dir_mode = std::fs::metadata(&runtime_dir)
+                .expect("dir metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700, "runtime dir must be 0700");
+        }
+
+        let content: Value = serde_json::from_str(
+            &std::fs::read_to_string(&cfg_path).expect("read written pi MCP json"),
+        )
+        .expect("parse written pi MCP json");
+        assert_eq!(
+            content
+                .pointer("/mcpServers/orbit/url")
+                .and_then(Value::as_str),
+            Some(mcp.http_url.as_str())
+        );
+        assert_eq!(
+            content
+                .pointer("/mcpServers/orbit/headers/Authorization")
+                .and_then(Value::as_str),
+            Some("Bearer super-secret-pi-token-98765")
+        );
+
+        let seq = Arc::new(AtomicU64::new(0));
+        let mut cfg = make_test_cfg(
+            "ag_pi_sec",
+            Path::new("/usr/local/bin/pi"),
+            Path::new("/tmp/pi-sec.sock"),
+            &root,
+            seq,
+        );
+        cfg.mcp_spec = Some(mcp.clone());
+        let spec = build_pi_spawn_spec(&cfg, false, Some(&cfg_path));
+        for arg in &spec.args {
+            assert!(
+                !arg.contains(&mcp.bearer_token) && !arg.contains("Authorization"),
+                "bearer token must never appear in pi argv: {arg}"
+            );
+        }
+        assert_eq!(
+            spec.env.get("ORBIT_MCP_CONFIG").map(String::as_str),
+            Some(cfg_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            spec.env.get("PI_MCP_CONFIG").map(String::as_str),
+            Some(cfg_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(spec.cleanup_paths, vec![cfg_path.clone()]);
+
+        // Dropping an armed guard cleans up the file (simulating spawn failure).
+        drop(guard);
+        assert!(!cfg_path.exists(), "dropping armed guard must unlink file");
+
+        // Disarmed guard leaves file for shim cleanup & startup reaper tests.
+        let mut keep_guard =
+            write_pi_mcp_config_file(&runtime_dir, "ag_alive", &mcp).expect("write alive");
+        let keep_path = keep_guard.path().expect("keep path").to_path_buf();
+        keep_guard.disarm();
+
+        let mut stale_guard =
+            write_pi_mcp_config_file(&runtime_dir, "ag_dead", &mcp).expect("write dead");
+        let stale_path = stale_guard.path().expect("stale path").to_path_buf();
+        stale_guard.disarm();
+
+        let candidates = snapshot_pi_mcp_config_files(&runtime_dir);
+        assert_eq!(candidates.len(), 2);
+
+        // A fresh file written after snapshot for the same dead id must NEVER be reaped.
+        let mut fresh_guard =
+            write_pi_mcp_config_file(&runtime_dir, "ag_dead", &mcp).expect("write fresh");
+        let fresh_path = fresh_guard.path().expect("fresh path").to_path_buf();
+        fresh_guard.disarm();
+
+        let surviving: HashSet<String> = ["ag_alive".to_string()].into_iter().collect();
+        let reaped = reap_snapshotted_pi_mcp_configs(&candidates, &surviving);
+        assert_eq!(reaped, 1);
+        assert!(keep_path.exists());
+        assert!(!stale_path.exists());
+        assert!(fresh_path.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

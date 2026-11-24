@@ -29,6 +29,7 @@ pub struct UpsertArtifactInput {
     pub language: Option<String>,
     pub mime_type: Option<String>,
     pub resource_uri: Option<String>,
+    pub mcp_server_name: Option<String>,
     pub content: String,
     pub summary_note: Option<String>,
 }
@@ -40,18 +41,19 @@ pub(crate) fn migrate_artifacts_schema(conn: &Connection) -> Result<(), StoreErr
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS artifacts (
-            artifact_id  TEXT PRIMARY KEY,
-            workspace_id TEXT NOT NULL,
-            agent_id     TEXT,
-            title        TEXT NOT NULL,
-            kind         TEXT NOT NULL,
-            language     TEXT,
-            mime_type    TEXT,
-            resource_uri TEXT,
-            version      INTEGER NOT NULL DEFAULT 1,
-            byte_len     INTEGER NOT NULL DEFAULT 0,
-            created_at   TEXT NOT NULL,
-            updated_at   TEXT NOT NULL
+            artifact_id     TEXT PRIMARY KEY,
+            workspace_id    TEXT NOT NULL,
+            agent_id        TEXT,
+            title           TEXT NOT NULL,
+            kind            TEXT NOT NULL,
+            language        TEXT,
+            mime_type       TEXT,
+            resource_uri    TEXT,
+            mcp_server_name TEXT,
+            version         INTEGER NOT NULL DEFAULT 1,
+            byte_len        INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_artifacts_workspace_updated
@@ -61,16 +63,38 @@ pub(crate) fn migrate_artifacts_schema(conn: &Connection) -> Result<(), StoreErr
             ON artifacts(agent_id, updated_at DESC);
 
         CREATE TABLE IF NOT EXISTS artifact_revisions (
-            artifact_id  TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
-            version      INTEGER NOT NULL,
-            content      TEXT NOT NULL,
-            summary_note TEXT,
-            byte_len     INTEGER NOT NULL DEFAULT 0,
-            created_at   TEXT NOT NULL,
+            artifact_id     TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+            version         INTEGER NOT NULL,
+            content         TEXT NOT NULL,
+            summary_note    TEXT,
+            byte_len        INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT NOT NULL,
+            mcp_server_name TEXT,
             PRIMARY KEY (artifact_id, version)
         );
         ",
     )?;
+    // Idempotently add `mcp_server_name` on pre-existing DBs without bumping `PRAGMA user_version`.
+    for table in ["artifacts", "artifact_revisions"] {
+        let has_col: bool = {
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            let mut found = false;
+            for name in names {
+                if name? == "mcp_server_name" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_col {
+            conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN mcp_server_name TEXT"),
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -83,10 +107,10 @@ fn parse_rfc3339_utc(raw: &str) -> DateTime<Utc> {
 fn map_artifact_summary_row(row: &Row<'_>) -> rusqlite::Result<ArtifactSummary> {
     let kind_raw: String = row.get(4)?;
     let kind = ArtifactKind::from_slug(&kind_raw).unwrap_or(ArtifactKind::Markdown);
-    let version_i64: i64 = row.get(8)?;
-    let byte_len_i64: i64 = row.get(9)?;
-    let created_raw: String = row.get(10)?;
-    let updated_raw: String = row.get(11)?;
+    let version_i64: i64 = row.get(9)?;
+    let byte_len_i64: i64 = row.get(10)?;
+    let created_raw: String = row.get(11)?;
+    let updated_raw: String = row.get(12)?;
     Ok(ArtifactSummary {
         artifact_id: row.get(0)?,
         workspace_id: row.get(1)?,
@@ -96,6 +120,7 @@ fn map_artifact_summary_row(row: &Row<'_>) -> rusqlite::Result<ArtifactSummary> 
         language: row.get(5)?,
         mime_type: row.get(6)?,
         resource_uri: row.get(7)?,
+        mcp_server_name: row.get(8)?,
         version: version_i64.max(1) as u32,
         byte_len: byte_len_i64.max(0) as usize,
         created_at: parse_rfc3339_utc(&created_raw),
@@ -164,6 +189,7 @@ impl OrbitStore {
         let mime_type = normalize_opt_str(input.mime_type)
             .or_else(|| Some(input.kind.default_mime_type().to_string()));
         let resource_uri = normalize_opt_str(input.resource_uri);
+        let mcp_server_name = normalize_opt_str(input.mcp_server_name);
         let summary_note = normalize_opt_str(input.summary_note);
         let now = Utc::now();
         let now_str = now.to_rfc3339();
@@ -171,6 +197,7 @@ impl OrbitStore {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
+        #[allow(clippy::type_complexity)]
         let existing: Option<(String, String, Option<String>, i64, String)> =
             if let Some(ref aid) = requested_id {
                 tx.query_row(
@@ -184,6 +211,10 @@ impl OrbitStore {
             } else {
                 None
             };
+
+        // Never inherit a previous revision's `mcp_server_name`: each revision owns its own
+        // binding (non-MCP / assistant revisions MUST store `None`).
+        let effective_mcp_server_name = mcp_server_name;
 
         let (artifact_id, effective_agent_id, next_version, created_at) = match existing {
             Some((existing_id, existing_workspace_id, existing_agent, prev_ver, created_raw)) => {
@@ -207,10 +238,11 @@ impl OrbitStore {
                          language = ?4,
                          mime_type = ?5,
                          resource_uri = ?6,
-                         version = ?7,
-                         byte_len = ?8,
-                         updated_at = ?9
-                     WHERE artifact_id = ?10",
+                         mcp_server_name = ?7,
+                         version = ?8,
+                         byte_len = ?9,
+                         updated_at = ?10
+                     WHERE artifact_id = ?11",
                     params![
                         merged_agent,
                         title,
@@ -218,6 +250,7 @@ impl OrbitStore {
                         language,
                         mime_type,
                         resource_uri,
+                        effective_mcp_server_name,
                         i64::from(next_ver),
                         byte_len as i64,
                         now_str,
@@ -239,8 +272,8 @@ impl OrbitStore {
                 tx.execute(
                     "INSERT INTO artifacts (
                         artifact_id, workspace_id, agent_id, title, kind, language,
-                        mime_type, resource_uri, version, byte_len, created_at, updated_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11)",
+                        mime_type, resource_uri, mcp_server_name, version, byte_len, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12)",
                     params![
                         new_id,
                         workspace_id,
@@ -250,6 +283,7 @@ impl OrbitStore {
                         language,
                         mime_type,
                         resource_uri,
+                        effective_mcp_server_name,
                         byte_len as i64,
                         now_str,
                         now_str,
@@ -261,8 +295,8 @@ impl OrbitStore {
 
         tx.execute(
             "INSERT OR REPLACE INTO artifact_revisions (
-                artifact_id, version, content, summary_note, byte_len, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                artifact_id, version, content, summary_note, byte_len, created_at, mcp_server_name
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 artifact_id,
                 i64::from(next_version),
@@ -270,6 +304,7 @@ impl OrbitStore {
                 summary_note,
                 byte_len as i64,
                 now_str,
+                effective_mcp_server_name,
             ],
         )?;
 
@@ -297,6 +332,7 @@ impl OrbitStore {
             language,
             mime_type,
             resource_uri,
+            mcp_server_name: effective_mcp_server_name,
             version: next_version,
             byte_len,
             created_at,
@@ -318,7 +354,7 @@ impl OrbitStore {
             (Some(w), Some(a)) => {
                 let mut stmt = conn.prepare(
                     "SELECT artifact_id, workspace_id, agent_id, title, kind, language,
-                            mime_type, resource_uri, version, byte_len, created_at, updated_at
+                            mime_type, resource_uri, mcp_server_name, version, byte_len, created_at, updated_at
                      FROM artifacts
                      WHERE workspace_id = ?1 AND agent_id = ?2
                      ORDER BY updated_at DESC, artifact_id ASC",
@@ -329,7 +365,7 @@ impl OrbitStore {
             (Some(w), None) => {
                 let mut stmt = conn.prepare(
                     "SELECT artifact_id, workspace_id, agent_id, title, kind, language,
-                            mime_type, resource_uri, version, byte_len, created_at, updated_at
+                            mime_type, resource_uri, mcp_server_name, version, byte_len, created_at, updated_at
                      FROM artifacts
                      WHERE workspace_id = ?1
                      ORDER BY updated_at DESC, artifact_id ASC",
@@ -340,7 +376,7 @@ impl OrbitStore {
             (None, Some(a)) => {
                 let mut stmt = conn.prepare(
                     "SELECT artifact_id, workspace_id, agent_id, title, kind, language,
-                            mime_type, resource_uri, version, byte_len, created_at, updated_at
+                            mime_type, resource_uri, mcp_server_name, version, byte_len, created_at, updated_at
                      FROM artifacts
                      WHERE agent_id = ?1
                      ORDER BY updated_at DESC, artifact_id ASC",
@@ -351,7 +387,7 @@ impl OrbitStore {
             (None, None) => {
                 let mut stmt = conn.prepare(
                     "SELECT artifact_id, workspace_id, agent_id, title, kind, language,
-                            mime_type, resource_uri, version, byte_len, created_at, updated_at
+                            mime_type, resource_uri, mcp_server_name, version, byte_len, created_at, updated_at
                      FROM artifacts
                      ORDER BY updated_at DESC, artifact_id ASC",
                 )?;
@@ -371,7 +407,7 @@ impl OrbitStore {
         let Some(mut summary) = conn
             .query_row(
                 "SELECT artifact_id, workspace_id, agent_id, title, kind, language,
-                        mime_type, resource_uri, version, byte_len, created_at, updated_at
+                        mime_type, resource_uri, mcp_server_name, version, byte_len, created_at, updated_at
                  FROM artifacts
                  WHERE artifact_id = ?1",
                 params![artifact_id],
@@ -405,17 +441,17 @@ impl OrbitStore {
         };
 
         let target_ver = version.unwrap_or(summary.version);
-        let content_row: Option<(String, i64)> = conn
+        let content_row: Option<(String, i64, Option<String>)> = conn
             .query_row(
-                "SELECT content, byte_len
+                "SELECT content, byte_len, mcp_server_name
                  FROM artifact_revisions
                  WHERE artifact_id = ?1 AND version = ?2",
                 params![artifact_id, i64::from(target_ver)],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
 
-        let Some((content, rev_byte_len)) = content_row else {
+        let Some((content, rev_byte_len, rev_mcp_server_name)) = content_row else {
             return Err(StoreError::InvalidArgument(format!(
                 "artifact `{artifact_id}` version {target_ver} not found"
             )));
@@ -423,6 +459,7 @@ impl OrbitStore {
 
         summary.version = target_ver;
         summary.byte_len = rev_byte_len.max(0) as usize;
+        summary.mcp_server_name = rev_mcp_server_name;
 
         Ok(Some(ArtifactDetail {
             summary,
@@ -467,7 +504,7 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.query_row(
             "SELECT artifact_id, workspace_id, agent_id, title, kind, language,
-                    mime_type, resource_uri, version, byte_len, created_at, updated_at
+                    mime_type, resource_uri, mcp_server_name, version, byte_len, created_at, updated_at
              FROM artifacts
              WHERE workspace_id = ?1 AND resource_uri = ?2
              ORDER BY updated_at DESC
@@ -489,7 +526,7 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.query_row(
             "SELECT artifact_id, workspace_id, agent_id, title, kind, language,
-                    mime_type, resource_uri, version, byte_len, created_at, updated_at
+                    mime_type, resource_uri, mcp_server_name, version, byte_len, created_at, updated_at
              FROM artifacts
              WHERE workspace_id = ?1 AND LOWER(title) = LOWER(?2) AND kind = ?3
              ORDER BY updated_at DESC
@@ -540,6 +577,7 @@ mod tests {
                 language: None,
                 mime_type: None,
                 resource_uri: None,
+                mcp_server_name: None,
                 content: "# Spec\nInitial draft".into(),
                 summary_note: Some("Initial".into()),
             })
@@ -559,12 +597,14 @@ mod tests {
                 language: Some("html".into()),
                 mime_type: None,
                 resource_uri: Some("ui://orbit/metrics".into()),
+                mcp_server_name: Some("metrics".into()),
                 content: "<div>chart</div>".into(),
                 summary_note: None,
             })
             .expect("create mcp app");
 
         assert_eq!(created_b.artifact_id, "art_custom_app");
+        assert_eq!(created_b.mcp_server_name.as_deref(), Some("metrics"));
         assert_eq!(
             created_b.mime_type.as_deref(),
             Some("text/html;profile=mcp-app")
@@ -594,6 +634,7 @@ mod tests {
                 language: None,
                 mime_type: None,
                 resource_uri: None,
+                mcp_server_name: None,
                 content: "# Spec\nUpdated body".into(),
                 summary_note: Some("Add details".into()),
             })
@@ -664,6 +705,7 @@ mod tests {
                     language: Some("html".into()),
                     mime_type: None,
                     resource_uri: None,
+                    mcp_server_name: None,
                     content: format!("<div>Revision {i}</div>"),
                     summary_note: Some(format!("rev {i}")),
                 })
@@ -698,6 +740,7 @@ mod tests {
                 language: Some("text".into()),
                 mime_type: None,
                 resource_uri: None,
+                mcp_server_name: None,
                 content: at_cap,
                 summary_note: None,
             })
@@ -716,6 +759,7 @@ mod tests {
                 language: None,
                 mime_type: None,
                 resource_uri: None,
+                mcp_server_name: None,
                 content: over_cap,
                 summary_note: None,
             })
@@ -737,6 +781,7 @@ mod tests {
                 language: None,
                 mime_type: None,
                 resource_uri: None,
+                mcp_server_name: None,
                 content: "original content".into(),
                 summary_note: None,
             })
@@ -754,6 +799,7 @@ mod tests {
                 language: None,
                 mime_type: None,
                 resource_uri: None,
+                mcp_server_name: None,
                 content: "<script>evil()</script>".into(),
                 summary_note: None,
             })
@@ -786,11 +832,69 @@ mod tests {
                     language: None,
                     mime_type: None,
                     resource_uri: None,
+                    mcp_server_name: None,
                     content: "x".into(),
                     summary_note: None,
                 })
                 .expect_err("invalid artifact_id must fail");
             assert!(matches!(err, StoreError::InvalidArgument(_)));
         }
+    }
+
+    #[test]
+    fn artifacts_bind_mcp_server_name_per_revision_and_never_inherit() {
+        let store = OrbitStore::open_in_memory().expect("open store");
+
+        // v1 bound to trusted MCP server `analytics`
+        let v1 = store
+            .upsert_artifact(UpsertArtifactInput {
+                artifact_id: Some("art_rev_bind".into()),
+                workspace_id: "ws_1".into(),
+                agent_id: Some("ag_1".into()),
+                title: "Analytics App".into(),
+                kind: ArtifactKind::McpApp,
+                language: Some("html".into()),
+                mime_type: None,
+                resource_uri: Some("ui://analytics/v1".into()),
+                mcp_server_name: Some("analytics".into()),
+                content: "<div>v1</div>".into(),
+                summary_note: None,
+            })
+            .expect("v1");
+        assert_eq!(v1.mcp_server_name.as_deref(), Some("analytics"));
+
+        // v2 saved without an MCP owner (e.g. assistant edit) MUST clear binding to None
+        let v2 = store
+            .upsert_artifact(UpsertArtifactInput {
+                artifact_id: Some("art_rev_bind".into()),
+                workspace_id: "ws_1".into(),
+                agent_id: Some("ag_1".into()),
+                title: "Analytics App".into(),
+                kind: ArtifactKind::Html,
+                language: Some("html".into()),
+                mime_type: None,
+                resource_uri: Some("ui://analytics/v1".into()),
+                mcp_server_name: None,
+                content: "<div>v2 assistant edit</div>".into(),
+                summary_note: None,
+            })
+            .expect("v2");
+        assert_eq!(v2.version, 2);
+        assert_eq!(
+            v2.mcp_server_name, None,
+            "non-MCP revision must NEVER inherit previous revision's mcp_server_name"
+        );
+
+        let d_latest = store
+            .get_artifact("art_rev_bind", None)
+            .expect("get latest")
+            .expect("exists");
+        assert_eq!(d_latest.summary.mcp_server_name, None);
+
+        let d_v1 = store
+            .get_artifact("art_rev_bind", Some(1))
+            .expect("get v1")
+            .expect("exists");
+        assert_eq!(d_v1.summary.mcp_server_name.as_deref(), Some("analytics"));
     }
 }

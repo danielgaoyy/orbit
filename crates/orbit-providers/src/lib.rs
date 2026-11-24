@@ -2,6 +2,7 @@
 //! OpenCode, Gemini CLI, Cursor Agent, GitHub Copilot, Goose, Pi, Kimi CLI, Cline, Mistral Vibe,
 //! Augment) plus Universal ACP (`acp_generic` + curated 34-agent ACP Registry).
 
+pub mod acp_callbacks;
 pub mod acp_generic;
 pub mod acp_providers;
 pub mod acp_registry;
@@ -367,6 +368,7 @@ pub use driver::{
     DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, PromptOrigin,
     ProviderSessionHandle, SessionLaunchConfig,
 };
+pub use pi::{reap_snapshotted_pi_mcp_configs, snapshot_pi_mcp_config_files};
 pub use readiness::{
     PRIMARY_READINESS_PROVIDERS, ProviderAuthStatus, ProviderReadinessInfo,
     probe_local_provider_readiness,

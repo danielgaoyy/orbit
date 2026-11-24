@@ -1230,6 +1230,18 @@ pub enum WireMessage {
     WorkspaceUpdated {
         workspace: WorkspaceSummary,
     },
+    /// Coalesced OS-native filesystem invalidation pushed when files, Git state, or skills/rules
+    /// change inside an active workspace root.
+    WorkspaceFilesChanged {
+        workspace_id: String,
+        cwd: String,
+        #[serde(default)]
+        changed_paths: Vec<String>,
+        #[serde(default)]
+        git_changed: bool,
+        #[serde(default)]
+        skills_or_rules_changed: bool,
+    },
     WorkspaceSetupProgress {
         progress: WorkspaceSetupProgress,
     },
@@ -2570,6 +2582,8 @@ pub enum WireMessage {
         mime_type: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resource_uri: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mcp_server_name: Option<String>,
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary_note: Option<String>,
@@ -2587,6 +2601,38 @@ pub enum WireMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<Uuid>,
         artifact_id: String,
+    },
+    /// Read a SEP-1865 `ui://` resource strictly scoped to the owning external MCP server and
+    /// persisted workspace of `artifact_id` (and optional historical `artifact_version`).
+    ReadMcpResource {
+        request_id: Uuid,
+        artifact_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact_version: Option<u32>,
+        uri: String,
+    },
+    McpResourceResponse {
+        request_id: Uuid,
+        server_name: String,
+        uri: String,
+        content: McpResourceContent,
+    },
+    /// Invoke a tool on the external MCP server that owns `artifact_id` (and optional `artifact_version`),
+    /// resolved strictly inside the artifact's persisted workspace.
+    CallArtifactMcpTool {
+        request_id: Uuid,
+        artifact_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact_version: Option<u32>,
+        tool_name: String,
+        #[serde(default)]
+        arguments: serde_json::Value,
+    },
+    ArtifactMcpToolResponse {
+        request_id: Uuid,
+        artifact_id: String,
+        tool_name: String,
+        outcome: McpToolCallOutcome,
     },
 
     // Project Instruction Hierarchy Discovery & Atomic Editing

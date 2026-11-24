@@ -84,10 +84,11 @@ use orbit_protocol::{
     GitStashListResult, GitStashMutationResult, GuardianPolicyConfig, HookExecutionRecord,
     HookScope, LifecycleHookRule, LspCodeAction, LspCompletionItem, LspDiagnostic, LspHoverInfo,
     LspLocation, LspReferenceLocation, LspServerStatus, LspSymbolInfo, LspWorkspaceEdit,
-    LspWorkspaceEditResult, ManagedSkillRecord, McpProbeResult, OrchestrationConfig,
-    PermissionRuleRecord, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderSubagentEvent,
-    ReasoningEffort, ResolvePermissionsBatchResult, ScheduleRunRecord, ScheduleTarget, SessionMode,
-    SkillWriteScope, TimerCondition, UpsertPermissionRuleInput, UsageInsightsSnapshot,
+    LspWorkspaceEditResult, ManagedSkillRecord, McpProbeResult, McpResourceContent,
+    McpToolCallOutcome, OrchestrationConfig, PermissionRuleRecord, PromptBadge, ProviderKind,
+    ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ResolvePermissionsBatchResult,
+    ScheduleRunRecord, ScheduleTarget, SessionMode, SkillWriteScope, TimerCondition,
+    UpsertPermissionRuleInput, UsageInsightsSnapshot,
     WorkspaceBoardSnapshot, WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode,
     WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
@@ -1429,6 +1430,35 @@ async fn delete_artifact(
     state
         .core
         .delete_artifact_async(&host_id, &artifact_id)
+        .await
+}
+
+#[tauri::command]
+async fn read_mcp_resource(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    artifact_id: String,
+    artifact_version: Option<u32>,
+    uri: String,
+) -> Result<McpResourceContent, String> {
+    state
+        .core
+        .read_mcp_resource_async(&host_id, &artifact_id, artifact_version, &uri)
+        .await
+}
+
+#[tauri::command]
+async fn call_artifact_mcp_tool(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    artifact_id: String,
+    artifact_version: Option<u32>,
+    tool_name: String,
+    arguments: serde_json::Value,
+) -> Result<McpToolCallOutcome, String> {
+    state
+        .core
+        .call_artifact_mcp_tool_async(&host_id, &artifact_id, artifact_version, &tool_name, arguments)
         .await
 }
 
@@ -4583,6 +4613,8 @@ pub fn run() {
             get_artifact,
             upsert_artifact,
             delete_artifact,
+            read_mcp_resource,
+            call_artifact_mcp_tool,
             list_acp_agents,
             refresh_acp_agents,
             upsert_custom_acp_agent,

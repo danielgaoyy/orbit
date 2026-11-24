@@ -491,7 +491,7 @@ async fn initialize_acp_connection(
         "initialize",
         json!({
             "protocolVersion": 1,
-            "clientCapabilities": {},
+            "clientCapabilities": crate::acp_callbacks::acp_client_capabilities(),
             "clientInfo": {
                 "name": "orbit",
                 "version": env!("CARGO_PKG_VERSION")
@@ -960,9 +960,18 @@ async fn run_acp_actor(
     let mut cancel_deadline: Option<tokio::time::Instant> = None;
     let mut last_dispatched_prompt: Option<QueuedDriverPrompt> = None;
     let mut recovered_missing_session = false;
+    let (mut acp_cb_host, mut acp_cb_reply_rx) =
+        crate::acp_callbacks::AcpCallbackHost::new(std::path::PathBuf::from(&cfg.cwd));
 
     loop {
         tokio::select! {
+            Some(reply_line) = acp_cb_reply_rx.recv() => {
+                if shim.write_stdin_line(reply_line).await.is_err() {
+                    finalize_stream_segments(&mut seg_state, &evt_tx).await;
+                    let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
+                    break;
+                }
+            }
             maybe_cmd = cmd_rx.recv() => {
                 let Some(cmd) = maybe_cmd else { break; };
                 match cmd {
@@ -1941,9 +1950,25 @@ async fn run_acp_actor(
                             && let Some(unknown_method) = method
                             && let Some(id_val) = val.get("id").filter(|v| !v.is_null())
                         {
-                            // Reply JSON-RPC -32601 to any unhandled server->client request so
-                            // ACP agents (e.g. fs/terminal/extension callbacks) never deadlock.
-                            reply_method_not_found(&shim, id_val, unknown_method).await;
+                            let params = val.get("params").unwrap_or(&Value::Null);
+                            match acp_cb_host
+                                .handle_request(id_val, unknown_method, params)
+                                .await
+                            {
+                                crate::acp_callbacks::AcpCallbackOutcome::Reply(resp) => {
+                                    if shim.write_stdin_line(resp).await.is_err() {
+                                        finalize_stream_segments(&mut seg_state, &evt_tx).await;
+                                        let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
+                                        break;
+                                    }
+                                }
+                                crate::acp_callbacks::AcpCallbackOutcome::Deferred => {}
+                                crate::acp_callbacks::AcpCallbackOutcome::Unsupported => {
+                                    // Reply JSON-RPC -32601 to any unhandled server->client request so
+                                    // ACP agents never deadlock.
+                                    reply_method_not_found(&shim, id_val, unknown_method).await;
+                                }
+                            }
                         }
                     }
                     ShimFrame::Exited { code } => {

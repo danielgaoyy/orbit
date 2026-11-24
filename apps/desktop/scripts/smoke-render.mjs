@@ -142,6 +142,21 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
         case "lsp_code_action":
         case "restart_lsp_server":
           return [];
+        case "read_mcp_resource":
+          return {
+            uri: typeof args?.uri === "string" ? args.uri : "ui://smoke/app",
+            mime_type: "text/html;profile=mcp-app",
+            text: "<div>Smoke MCP App</div>",
+            blob_base64: null,
+          };
+        case "call_artifact_mcp_tool":
+          return {
+            ok: true,
+            is_error: false,
+            content: [{ type: "text", text: "ok" }],
+            structured_content: null,
+            error: null,
+          };
         case "lsp_hover":
           return null;
         case "lsp_rename":

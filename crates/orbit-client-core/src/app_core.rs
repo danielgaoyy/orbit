@@ -27,13 +27,14 @@ use orbit_protocol::{
     HostProjectEntry, HostSyncState, ImChannelRecord, ImPlatform, ImThreadBinding, KeepAwakeStatus,
     LifecycleHookRule, LspCodeAction, LspCompletionItem, LspDiagnostic, LspHoverInfo, LspLocation,
     LspReferenceLocation, LspServerStatus, LspSymbolInfo, LspWorkspaceEdit, LspWorkspaceEditResult,
-    ManagedSkillRecord, McpProbeResult, ModelOption, MonitorWatchRecord, OrchestrationConfig,
-    OrchestrationSkillInfo, PathScopedRule, PendingPermissionSummary, PermissionCheckpointRef,
-    PermissionRuleRecord, PlanApprovalAction, PlanApprovalPayload, PromptBadge, ProviderKind,
-    ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
-    PushDeviceRecord, PushPlatform, PushPreferences, QuestionItem, QueuedPromptView,
-    ReasoningEffort, RemoteMessageSearchHit, ResolvePermissionsBatchResult, RuleTriggerMode,
-    ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode, SkillWriteScope,
+    ManagedSkillRecord, McpProbeResult, McpResourceContent, McpToolCallOutcome, ModelOption,
+    MonitorWatchRecord, OrchestrationConfig, OrchestrationSkillInfo, PathScopedRule,
+    PendingPermissionSummary, PermissionCheckpointRef, PermissionRuleRecord, PlanApprovalAction,
+    PlanApprovalPayload, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot,
+    ProviderSubagentDescriptor, ProviderSubagentEvent, PushDeviceRecord, PushPlatform,
+    PushPreferences, QuestionItem, QueuedPromptView, ReasoningEffort, RemoteMessageSearchHit,
+    ResolvePermissionsBatchResult, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec,
+    ScheduleTarget, SessionMode, SkillWriteScope,
     TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelineOutlinePrompt, TimelinePayload,
     TimerCondition, ToolCallDetail, ToolCallStatus, UpsertPermissionRuleInput,
     UsageInsightsSnapshot, WireMessage, WorkflowRunRecord, WorkspaceBoardSnapshot,
@@ -1206,6 +1207,10 @@ struct HostMemoryState {
     pending_artifact_upserts:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ArtifactSummary, String>>>,
     pending_artifact_deletes: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<String, String>>>,
+    pending_mcp_resource_reads:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<McpResourceContent, String>>>,
+    pending_artifact_mcp_tool_calls:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<McpToolCallOutcome, String>>>,
     pending_managed_skills_lists: HashMap<Uuid, PendingManagedSkillsListEntry>,
     background_managed_skills_reqs: HashSet<Uuid>,
     active_managed_skills_cwd: Option<String>,
@@ -1435,6 +1440,8 @@ impl HostMemoryState {
             pending_artifact_reads: HashMap::new(),
             pending_artifact_upserts: HashMap::new(),
             pending_artifact_deletes: HashMap::new(),
+            pending_mcp_resource_reads: HashMap::new(),
+            pending_artifact_mcp_tool_calls: HashMap::new(),
             pending_managed_skills_lists: HashMap::new(),
             background_managed_skills_reqs: HashSet::new(),
             active_managed_skills_cwd: None,
@@ -5879,6 +5886,16 @@ impl OrbitAppCore {
                     notify_fleet = true;
                     notify_host = true;
                 }
+                WireMessage::WorkspaceFilesChanged {
+                    cwd,
+                    skills_or_rules_changed,
+                    ..
+                } => {
+                    notify_git_cwd = Some(cwd);
+                    if skills_or_rules_changed {
+                        notify_host = true;
+                    }
+                }
                 WireMessage::WorkspaceSetupProgress { .. } => {
                     notify_host = true;
                 }
@@ -6359,6 +6376,24 @@ impl OrbitAppCore {
                         let _ = tx.send(Ok(artifact_id));
                     }
                     notify_host = true;
+                }
+                WireMessage::McpResourceResponse {
+                    request_id,
+                    content,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_mcp_resource_reads.remove(&request_id) {
+                        let _ = tx.send(Ok(content));
+                    }
+                }
+                WireMessage::ArtifactMcpToolResponse {
+                    request_id,
+                    outcome,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_artifact_mcp_tool_calls.remove(&request_id) {
+                        let _ = tx.send(Ok(outcome));
+                    }
                 }
                 WireMessage::SchedulesSnapshot { schedules, .. } => {
                     state.schedules = schedules;
@@ -7878,6 +7913,14 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_artifact_deletes.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_mcp_resource_reads.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_artifact_mcp_tool_calls.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -10911,6 +10954,7 @@ impl OrbitAppCore {
                     language: req.language,
                     mime_type: req.mime_type,
                     resource_uri: req.resource_uri,
+                    mcp_server_name: req.mcp_server_name,
                     content: req.content,
                     summary_note: req.summary_note,
                 })
@@ -10952,6 +10996,180 @@ impl OrbitAppCore {
         let core = Arc::clone(self);
         self.runtime
             .block_on(async move { core.upsert_artifact_async(req).await })
+    }
+
+    /// Read a SEP-1865 `ui://` resource strictly bound to `artifact_id` (and optional `artifact_version`)
+    /// resolved inside that artifact's persisted workspace on `host_id`.
+    pub async fn read_mcp_resource_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        artifact_id: &str,
+        artifact_version: Option<u32>,
+        uri: &str,
+    ) -> Result<McpResourceContent, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let owned_artifact = artifact_id.to_string();
+        let owned_uri = uri.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_mcp_resource_reads.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::ReadMcpResource {
+                    request_id: req_id,
+                    artifact_id: owned_artifact,
+                    artifact_version,
+                    uri: owned_uri,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_mcp_resource_reads.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ReadMcpResource: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(content))) => Ok(content),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while reading MCP resource".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_mcp_resource_reads.remove(&req_id);
+                    }
+                    Err("Timed out waiting for MCP resource".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "read_mcp_resource task cancelled".to_string())?
+    }
+
+    /// Invoke a tool strictly scoped to the owning external MCP server and persisted workspace of
+    /// `artifact_id` (and optional `artifact_version`).
+    pub async fn call_artifact_mcp_tool_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        artifact_id: &str,
+        artifact_version: Option<u32>,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<McpToolCallOutcome, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let owned_artifact = artifact_id.to_string();
+        let owned_tool = tool_name.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_artifact_mcp_tool_calls.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::CallArtifactMcpTool {
+                    request_id: req_id,
+                    artifact_id: owned_artifact,
+                    artifact_version,
+                    tool_name: owned_tool,
+                    arguments,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_artifact_mcp_tool_calls.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send CallArtifactMcpTool: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(Ok(result))) => Ok(result),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while calling MCP tool".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_artifact_mcp_tool_calls.remove(&req_id);
+                    }
+                    Err("Timed out waiting for MCP tool response".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "call_artifact_mcp_tool task cancelled".to_string())?
     }
 
     pub async fn delete_artifact_async(
@@ -21995,6 +22213,12 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     for (_, tx) in h.pending_artifact_deletes.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
+    for (_, tx) in h.pending_mcp_resource_reads.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_artifact_mcp_tool_calls.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
     for (_, (_, tx)) in h.pending_managed_skills_lists.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
@@ -29105,6 +29329,7 @@ mod tests {
             language: Some("html".into()),
             mime_type: Some("text/html".into()),
             resource_uri: None,
+            mcp_server_name: None,
             version: 5,
             byte_len: 100,
             created_at: now,
@@ -29119,6 +29344,7 @@ mod tests {
             language: None,
             mime_type: Some("text/markdown".into()),
             resource_uri: None,
+            mcp_server_name: None,
             version: 1,
             byte_len: 50,
             created_at: now,

@@ -51,6 +51,7 @@ pub mod workspace_cluster;
 pub mod workspace_files;
 pub mod workspace_organizer;
 pub mod workspace_runtime;
+pub mod workspace_watcher;
 pub mod worktree_handoff;
 pub mod worktree_pool;
 
@@ -465,6 +466,7 @@ pub struct DaemonRuntime {
     pub triggers: Arc<EventTriggerEngine>,
     pub workflows: Arc<WorkflowEngine>,
     pub symbol_index: Arc<WorkspaceSymbolIndex>,
+    pub workspace_watcher: Arc<crate::workspace_watcher::WorkspaceWatcherManager>,
     pub lsp: Arc<LspManager>,
     pub browser: Arc<BrowserManager>,
     pub hooks: Arc<HooksEngine>,
@@ -655,6 +657,34 @@ impl DaemonRuntime {
             .set_personal_router(personal_router.clone())
             .await;
 
+        let symbol_index = Arc::new(WorkspaceSymbolIndex::with_external_provider(Arc::new(
+            crate::lsp::LspExternalSymbolProvider::new(Arc::clone(&lsp)),
+        )));
+        let sym_for_watch = Arc::clone(&symbol_index);
+        let orch_for_watch = Arc::clone(&orchestrator);
+        let bcast_for_watch = orchestrator.broadcast_tx.clone();
+        let workspace_watcher =
+            crate::workspace_watcher::WorkspaceWatcherManager::new(move |batch| {
+                sym_for_watch.invalidate(&batch.canonical_root);
+                if batch.skills_or_rules_changed {
+                    let orch_bg = Arc::clone(&orch_for_watch);
+                    let ws_id = batch.workspace_id.clone();
+                    tokio::spawn(async move {
+                        orch_bg.invalidate_workspace_rules_cache(&ws_id).await;
+                    });
+                }
+                let _ = bcast_for_watch.send(DaemonBroadcast::WorkspaceFilesChanged {
+                    workspace_id: batch.workspace_id,
+                    cwd: batch.cwd,
+                    changed_paths: batch.changed_paths,
+                    git_changed: batch.git_changed,
+                    skills_or_rules_changed: batch.skills_or_rules_changed,
+                });
+            });
+        orchestrator
+            .set_workspace_watcher(Arc::clone(&workspace_watcher))
+            .await;
+
         Ok(Arc::new(Self {
             host_info,
             keypair,
@@ -677,9 +707,8 @@ impl DaemonRuntime {
             goals,
             triggers,
             workflows,
-            symbol_index: Arc::new(WorkspaceSymbolIndex::with_external_provider(Arc::new(
-                crate::lsp::LspExternalSymbolProvider::new(Arc::clone(&lsp)),
-            ))),
+            symbol_index,
+            workspace_watcher,
             lsp,
             browser,
             hooks,
@@ -722,6 +751,20 @@ impl DaemonRuntime {
         drop(self.idle_cleanup.spawn_background());
         drop(self.lsp.spawn_idle_reaper());
         drop(self.browser.spawn_idle_reaper());
+
+        // 4a. Start OS-native debounced file watching for all active (non-archived) workspace roots
+        if let Ok(active_workspaces) = crate::manager::with_store(&self.store, |s| {
+            s.list_workspaces_filtered(false, true)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|w| (w.workspace_id, PathBuf::from(w.cwd)))
+                .collect::<Vec<_>>()
+        })
+        .await
+        {
+            self.workspace_watcher
+                .watch_active_workspaces(&active_workspaces);
+        }
 
         // 4b. Incrementally backfill legacy daemon `timeline_events` into `timeline_events_fts`
         //     without blocking startup so full-history remote search covers pre-v6 histories.
@@ -2484,6 +2527,19 @@ async fn run_client_session_loop(
                     DaemonBroadcast::WorkspaceUpdated(workspace) => {
                         Some(WireMessage::WorkspaceUpdated { workspace })
                     }
+                    DaemonBroadcast::WorkspaceFilesChanged {
+                        workspace_id,
+                        cwd,
+                        changed_paths,
+                        git_changed,
+                        skills_or_rules_changed,
+                    } => Some(WireMessage::WorkspaceFilesChanged {
+                        workspace_id,
+                        cwd,
+                        changed_paths,
+                        git_changed,
+                        skills_or_rules_changed,
+                    }),
                     DaemonBroadcast::WorkspaceSetupProgress(progress) => {
                         Some(WireMessage::WorkspaceSetupProgress { progress })
                     }
@@ -7107,6 +7163,7 @@ async fn handle_wire_rpc(
             language,
             mime_type,
             resource_uri,
+            mcp_server_name: _,
             content,
             summary_note,
         } => {
@@ -7124,6 +7181,9 @@ async fn handle_wire_rpc(
                         language,
                         mime_type,
                         resource_uri,
+                        // SECURITY: client/user UpsertArtifact RPCs cannot spoof trusted MCP
+                        // server ownership; only daemon-trusted MCP tool extraction binds a server.
+                        mcp_server_name: None,
                         content,
                         summary_note,
                     })
@@ -7136,6 +7196,102 @@ async fn handle_wire_rpc(
                     },
                     Ok(Err(e)) => rpc_err(request_id, "upsert_artifact_failed", e),
                     Err(e) => rpc_err(request_id, "upsert_artifact_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::ReadMcpResource {
+            request_id,
+            artifact_id,
+            artifact_version,
+            uri,
+        } => {
+            let home = runtime.home_dir.clone();
+            let store = Arc::clone(&runtime.store);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                // Strictly resolve the bound MCP server AND workspace cwd from the persisted
+                // artifact revision (never from caller-supplied server_name or active agent cwd).
+                let resolved =
+                    resolve_bound_artifact_mcp_owner(&store, &artifact_id, artifact_version).await;
+                let (owner_server, artifact_ws_cwd) = match resolved {
+                    Ok(pair) => pair,
+                    Err((code, msg)) => {
+                        let _ = tx
+                            .send(SessionFrame::Wire {
+                                msg: rpc_err(request_id, code, msg),
+                                zstd,
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                let reply = match crate::mcp_servers::read_mcp_resource(
+                    &home,
+                    &owner_server,
+                    &uri,
+                    artifact_ws_cwd.as_deref(),
+                )
+                .await
+                {
+                    Ok(content) => WireMessage::McpResourceResponse {
+                        request_id,
+                        server_name: owner_server,
+                        uri,
+                        content,
+                    },
+                    Err(e) => rpc_err(request_id, "read_mcp_resource_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::CallArtifactMcpTool {
+            request_id,
+            artifact_id,
+            artifact_version,
+            tool_name,
+            arguments,
+        } => {
+            let home = runtime.home_dir.clone();
+            let store = Arc::clone(&runtime.store);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                // Strictly resolve the bound MCP server AND workspace cwd from the persisted
+                // artifact revision (never from caller-supplied cwd or active agent cwd).
+                let resolved =
+                    resolve_bound_artifact_mcp_owner(&store, &artifact_id, artifact_version).await;
+                let (owner_server, artifact_ws_cwd) = match resolved {
+                    Ok(pair) => pair,
+                    Err((code, msg)) => {
+                        let _ = tx
+                            .send(SessionFrame::Wire {
+                                msg: rpc_err(request_id, code, msg),
+                                zstd,
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                let reply = match crate::mcp_servers::call_mcp_tool(
+                    &home,
+                    &owner_server,
+                    &tool_name,
+                    arguments,
+                    artifact_ws_cwd.as_deref(),
+                )
+                .await
+                {
+                    Ok(outcome) => WireMessage::ArtifactMcpToolResponse {
+                        request_id,
+                        artifact_id,
+                        tool_name,
+                        outcome,
+                    },
+                    Err(e) => rpc_err(request_id, "call_artifact_mcp_tool_failed", e),
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });
@@ -9371,6 +9527,72 @@ async fn authorize_optional_mcp_cwd(
     Ok(Some(authorized))
 }
 
+/// Strictly resolve the owning MCP server name and persisted workspace `cwd` for a stored
+/// artifact revision (`artifact_id`, optional `artifact_version`).
+///
+/// SECURITY: Never accepts caller-supplied `server_name` or active-agent `cwd`, preventing
+/// cross-project server hijacking when identically named servers exist in multiple repos.
+async fn resolve_bound_artifact_mcp_owner(
+    store: &Arc<OrbitStore>,
+    artifact_id: &str,
+    artifact_version: Option<u32>,
+) -> Result<(String, Option<PathBuf>), (&'static str, String)> {
+    let aid_lookup = artifact_id.trim().to_string();
+    if aid_lookup.is_empty() {
+        return Err((
+            "artifact_not_found",
+            "Artifact ID must not be empty".to_string(),
+        ));
+    }
+    let store_lookup = Arc::clone(store);
+    let lookup_res = tokio::task::spawn_blocking(move || {
+        let detail = store_lookup.get_artifact(&aid_lookup, artifact_version)?;
+        let ws_cwd = detail
+            .as_ref()
+            .and_then(|d| {
+                store_lookup
+                    .get_workspace(&d.summary.workspace_id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|w| PathBuf::from(w.cwd));
+        Ok::<_, orbit_store::StoreError>((detail, ws_cwd))
+    })
+    .await;
+
+    let (detail, ws_cwd) = match lookup_res {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return Err(("artifact_lookup_failed", e.to_string())),
+        Err(e) => return Err(("artifact_lookup_failed", e.to_string())),
+    };
+
+    let Some(detail) = detail else {
+        return Err((
+            "artifact_not_found",
+            format!("Artifact `{artifact_id}` not found"),
+        ));
+    };
+
+    let Some(owner_server) = detail
+        .summary
+        .mcp_server_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+    else {
+        return Err((
+            "artifact_mcp_server_unbound",
+            format!(
+                "Artifact `{artifact_id}` (v{}) is not bound to an owning external MCP server",
+                detail.summary.version
+            ),
+        ));
+    };
+
+    Ok((owner_server, ws_cwd))
+}
+
 /// Authorize an optional Lifecycle Hooks workspace `cwd` against registered/discovered host
 /// workspaces (`None`, `""`, or `"~"` maps to user-global hooks only).
 async fn authorize_optional_hooks_cwd(
@@ -9664,6 +9886,86 @@ mod self_upgrade_tests {
                 .await
                 .is_err()
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn resolve_bound_artifact_mcp_owner_scopes_to_persisted_workspace_and_revision() {
+        let root = std::env::temp_dir().join(format!("orbit_art_owner_{}", Uuid::new_v4()));
+        let ws_a = root.join("ws_a");
+        std::fs::create_dir_all(&ws_a).expect("mkdir ws_a");
+        let store = Arc::new(OrbitStore::open(root.join("orbit.db")).expect("open store"));
+        let now = chrono::Utc::now();
+        store
+            .upsert_workspace(&orbit_protocol::WorkspaceSummary {
+                workspace_id: "ws_a".into(),
+                title: "Workspace A".into(),
+                cwd: ws_a.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                is_curated: false,
+                auto_clustered: false,
+            })
+            .expect("upsert ws_a");
+
+        // v1 bound to `analytics`
+        store
+            .upsert_artifact(orbit_store::UpsertArtifactInput {
+                artifact_id: Some("art_scoped".into()),
+                workspace_id: "ws_a".into(),
+                agent_id: None,
+                title: "Scoped App".into(),
+                kind: orbit_protocol::ArtifactKind::McpApp,
+                language: Some("html".into()),
+                mime_type: None,
+                resource_uri: Some("ui://analytics/v1".into()),
+                mcp_server_name: Some("analytics".into()),
+                content: "<div>v1</div>".into(),
+                summary_note: None,
+            })
+            .expect("v1");
+
+        // v2 edited without MCP owner -> must NOT inherit v1's server binding
+        store
+            .upsert_artifact(orbit_store::UpsertArtifactInput {
+                artifact_id: Some("art_scoped".into()),
+                workspace_id: "ws_a".into(),
+                agent_id: None,
+                title: "Scoped App".into(),
+                kind: orbit_protocol::ArtifactKind::Html,
+                language: Some("html".into()),
+                mime_type: None,
+                resource_uri: Some("ui://analytics/v1".into()),
+                mcp_server_name: None,
+                content: "<div>v2</div>".into(),
+                summary_note: None,
+            })
+            .expect("v2");
+
+        // v1 resolves strictly to `analytics` + persisted `ws_a` cwd
+        let (srv, resolved_cwd) = resolve_bound_artifact_mcp_owner(&store, "art_scoped", Some(1))
+            .await
+            .expect("v1 bound");
+        assert_eq!(srv, "analytics");
+        assert_eq!(resolved_cwd, Some(ws_a.clone()));
+
+        // Latest (v2) is unbound and MUST be rejected with `artifact_mcp_server_unbound`
+        let (code, _) = resolve_bound_artifact_mcp_owner(&store, "art_scoped", None)
+            .await
+            .expect_err("v2 unbound");
+        assert_eq!(code, "artifact_mcp_server_unbound");
 
         let _ = std::fs::remove_dir_all(&root);
     }

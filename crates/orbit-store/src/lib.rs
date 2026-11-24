@@ -861,6 +861,26 @@ impl OrbitStore {
         Ok(item)
     }
 
+    /// Read-only peek of the next FIFO queued prompt for `agent_id` without deleting it.
+    /// Used by cancellable async ingestion paths so aborting mid-await never loses a queued prompt.
+    pub fn peek_next_queued_prompt(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<StoredQueuedPrompt>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.query_row(
+            "SELECT queue_id, agent_id, wire_prompt, display_prompt, badges_json, created_at
+             FROM agent_queued_prompts
+             WHERE agent_id = ?1
+             ORDER BY sort_order ASC, rowid ASC
+             LIMIT 1",
+            params![agent_id],
+            map_stored_queued_prompt_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn pop_next_queued_prompt(
         &self,
         agent_id: &str,
@@ -4733,14 +4753,39 @@ mod tests {
             .expect("some");
         assert_eq!(after_handle.queued_prompts.len(), 2);
 
-        // FIFO pop now gets q3 (new head after reorder)
+        // Read-only peek must NOT delete q3; take_queued_prompt claims it once atomically
+        let peeked = store
+            .peek_next_queued_prompt("ag_q")
+            .expect("peek")
+            .expect("found q3");
+        assert_eq!(peeked.queue_id, "q3");
+        let peeked_again = store
+            .peek_next_queued_prompt("ag_q")
+            .expect("peek again")
+            .expect("still q3");
+        assert_eq!(peeked_again.queue_id, "q3");
+
+        let claimed = store
+            .take_queued_prompt("ag_q", "q3")
+            .expect("take q3")
+            .expect("claimed q3");
+        assert_eq!(claimed.queue_id, "q3");
+        assert!(
+            store
+                .take_queued_prompt("ag_q", "q3")
+                .expect("second take")
+                .is_none(),
+            "second take of same queue_id must be idempotent no-op"
+        );
+
+        // FIFO pop now gets q2 (remaining item)
         let popped = store
             .pop_next_queued_prompt("ag_q")
             .expect("pop")
-            .expect("found q3");
-        assert_eq!(popped.queue_id, "q3");
+            .expect("found q2");
+        assert_eq!(popped.queue_id, "q2");
 
-        // Archiving clears remaining queued prompts (q2)
+        // Archiving clears remaining queued prompts
         store.archive_agent_soft("ag_q").expect("archive");
         let after_archive = store.get_agent("ag_q").expect("get").expect("some");
         assert!(after_archive.queued_prompts.is_empty());

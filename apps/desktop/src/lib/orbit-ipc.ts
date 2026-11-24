@@ -180,6 +180,7 @@ export interface ArtifactSummary {
   language?: string | null;
   mime_type?: string | null;
   resource_uri?: string | null;
+  mcp_server_name?: string | null;
   version: number;
   byte_len: number;
   created_at: string;
@@ -209,8 +210,24 @@ export interface UpsertArtifactRequest {
   language?: string | null;
   mime_type?: string | null;
   resource_uri?: string | null;
+  mcp_server_name?: string | null;
   content: string;
   summary_note?: string | null;
+}
+
+export interface McpResourceContent {
+  uri: string;
+  mime_type?: string | null;
+  text?: string | null;
+  blob_base64?: string | null;
+}
+
+export interface McpToolCallOutcome {
+  ok: boolean;
+  is_error: boolean;
+  content: unknown[];
+  structured_content?: unknown;
+  error?: string | null;
 }
 export type ReasoningEffort =
   | "off"
@@ -4404,6 +4421,42 @@ export const orbitIpc = {
       throw new Error("Desktop runtime unavailable");
     }
     return invoke<string>("delete_artifact", { hostId, artifactId });
+  },
+
+  readMcpResource: async (
+    hostId: string,
+    artifactId: string,
+    artifactVersion: number | null,
+    uri: string,
+  ): Promise<McpResourceContent> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime unavailable");
+    }
+    return invoke<McpResourceContent>("read_mcp_resource", {
+      hostId,
+      artifactId,
+      artifactVersion: artifactVersion ?? null,
+      uri,
+    });
+  },
+
+  callArtifactMcpTool: async (
+    hostId: string,
+    artifactId: string,
+    artifactVersion: number | null,
+    toolName: string,
+    argumentsObj: Record<string, unknown>,
+  ): Promise<McpToolCallOutcome> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime unavailable");
+    }
+    return invoke<McpToolCallOutcome>("call_artifact_mcp_tool", {
+      hostId,
+      artifactId,
+      artifactVersion: artifactVersion ?? null,
+      toolName,
+      arguments: argumentsObj,
+    });
   },
 
   listAcpAgents: async (hostId: string): Promise<AcpAgentAvailability[]> => {

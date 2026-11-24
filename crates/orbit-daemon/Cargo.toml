@@ -35,3 +35,4 @@ rand.workspace = true
 zeroize.workspace = true
 vt100.workspace = true
 reqwest.workspace = true
+notify.workspace = true

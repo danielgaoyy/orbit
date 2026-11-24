@@ -404,6 +404,8 @@ pub struct UpsertArtifactRequest {
     pub mime_type: Option<String>,
     #[serde(default)]
     pub resource_uri: Option<String>,
+    #[serde(default)]
+    pub mcp_server_name: Option<String>,
     pub content: String,
     #[serde(default)]
     pub summary_note: Option<String>,

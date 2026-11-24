@@ -4447,6 +4447,91 @@ async fn cloud_sync_now(state: State<'_, DesktopAppState>) -> Result<CloudSyncRe
 }
 
 #[tauri::command]
+async fn cloud_sync_export_device_link_uri(
+    state: State<'_, DesktopAppState>,
+) -> Result<String, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        core.cloud_sync_export_device_link_uri()
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("cloud sync export device link task error: {e}"))?
+}
+
+#[tauri::command]
+async fn cloud_sync_import_device_link_uri(
+    state: State<'_, DesktopAppState>,
+    uri: String,
+) -> Result<CloudSyncResultView, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        core.cloud_sync_import_device_link_uri(&uri)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("cloud sync import device link task error: {e}"))?
+}
+
+#[tauri::command]
+async fn cloud_sync_set_manual_passphrase_mode(
+    state: State<'_, DesktopAppState>,
+    require_manual: bool,
+) -> Result<CloudSyncStatusView, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        core.cloud_sync_set_manual_passphrase_mode(require_manual)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("cloud sync mode update task error: {e}"))?
+}
+
+#[tauri::command]
+async fn provision_cloudflare_tunnel_relay(
+    state: State<'_, DesktopAppState>,
+    target_host_id: String,
+    ssh_alias: String,
+    relay_port: u16,
+    public_hostname: Option<String>,
+    tunnel_token: Option<String>,
+    apply_to_all_hosts: Option<bool>,
+) -> Result<String, String> {
+    let overview = state.core.fleet_overview();
+    let pubkeys: Vec<String> = overview
+        .hosts
+        .into_iter()
+        .map(|h| h.daemon_pubkey_b64)
+        .collect();
+
+    let relay_url = tauri::async_runtime::spawn_blocking(move || {
+        orbit_client_core::desktop_ops::provision_cloudflare_tunnel_relay_over_ssh(
+            &ssh_alias,
+            relay_port,
+            &pubkeys,
+            public_hostname.as_deref(),
+            tunnel_token.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))??;
+
+    if apply_to_all_hosts.unwrap_or(true) {
+        let _ = state
+            .core
+            .apply_relay_to_fleet(&relay_url)
+            .map_err(|e| e.to_string())?;
+    } else {
+        state
+            .core
+            .update_host_relay(&target_host_id, Some(&relay_url))
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(relay_url)
+}
+
+#[tauri::command]
 fn cloud_sync_trigger_background(state: State<'_, DesktopAppState>) {
     state.core.schedule_cloud_auto_sync(false);
 }
@@ -5193,6 +5278,7 @@ pub fn run() {
             stage_host_attachment_bytes,
             read_clipboard_images,
             provision_ssh_relay,
+            provision_cloudflare_tunnel_relay,
             get_app_version,
             check_app_update,
             perform_app_self_update,
@@ -5207,6 +5293,9 @@ pub fn run() {
             cloud_sync_login_with_token,
             cloud_sync_unlock_with_passphrase,
             cloud_sync_now,
+            cloud_sync_export_device_link_uri,
+            cloud_sync_import_device_link_uri,
+            cloud_sync_set_manual_passphrase_mode,
             cloud_sync_trigger_background,
             cloud_sync_logout,
             cloud_sync_get_preferences,

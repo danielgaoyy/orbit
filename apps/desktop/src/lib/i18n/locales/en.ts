@@ -904,6 +904,26 @@ export const en = {
   "settings.signInGithub": "Sign In with GitHub",
   "settings.oauthDeviceFlow": "GitHub OAuth (Device Flow)",
   "settings.personalAccessToken": "Personal Access Token",
+  "settings.deviceLinkTab": "Device Link",
+  "settings.deviceLinkTabDesc":
+    "Paste an orbit://sync-login URI generated from another Orbit device to link your account, vault key, and fleet relay in one step.",
+  "settings.deviceLinkPlaceholder": "orbit://sync-login?v=1&p=…",
+  "settings.deviceLinkConnect": "Link Device",
+  "settings.linkDeviceQr": "Link Device (QR)",
+  "settings.deviceLinkQrTitle": "1-Scan Device Link",
+  "settings.deviceLinkQrDesc":
+    "Scan with Orbit iOS or copy the link URI to onboard another phone or computer in 1 step — no passphrase or extra GitHub login needed.",
+  "settings.deviceLinkQrHint":
+    "Contains your GitHub session and master vault key. Treat this QR as private.",
+  "settings.copyDeviceLinkUri": "Copy Link URI",
+  "settings.cloudSyncInstantSummary":
+    "Orbit encrypts your fleet & preferences locally with AES-256-GCM inside your private GitHub Secret Gist with Dual-Gist Instant Unlock enabled by default — new devices sync automatically without typing a passphrase.",
+  "settings.cloudSyncAdvancedTitle": "Advanced Security & Passphrase",
+  "settings.cloudSyncInstantBadge": "Instant Auto-Unlock",
+  "settings.cloudSyncManualBadge": "Manual Passphrase",
+  "settings.cloudSyncRequireManualTitle": "Require manual passphrase on new devices",
+  "settings.cloudSyncRequireManualDesc":
+    "Removes the auto-unlock key gist from GitHub so new sign-ins must enter your Argon2id passphrase manually (Device Link QR still works).",
   "settings.copyCodeOpenGithub": "Copy Code & Open GitHub",
   "settings.neverSynced": "Never synced yet",
 
@@ -2073,6 +2093,15 @@ export const en = {
   "securityOps.migrationDryRunLabel": "Dry-run preview ({count} items)",
   "securityOps.migrationResultLabel": "Migration completed ({count} items)",
   "securityOps.migrationExecutedToast": "Imported {count} item(s) from external IDE/CLI.",
+
+  "settings.deployCloudflareShort": "Cloudflare (0-Port)",
+  "settings.deployCfCustomToggle": "Advanced: Use Custom Named Cloudflare Tunnel (Optional)",
+  "settings.deployCfHostnamePlaceholder":
+    "relay.yourdomain.com (leave blank for instant free tunnel)",
+  "settings.deployCfTokenPlaceholder": "Cloudflare Tunnel Token (eyJh…)",
+  "settings.deployCfConfirmTitle": "Expose {alias} via Cloudflare Tunnel?",
+  "settings.deployCfConfirmDesc":
+    "Installs a loopback-only Orbit Relay (127.0.0.1:7878) and cloudflared tunnel on {alias} with zero open inbound firewall ports, then applies it across all {count} hosts.",
 } as const;
 
 export type MessageKey = keyof typeof en;

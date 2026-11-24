@@ -2372,7 +2372,7 @@ async fn execute_tool_inner(
         "list_hosts" => {
             let peers = rt.connected_hosts.list_summaries().await;
             Ok(json!({
-                "self": rt.host_info,
+                "self": rt.effective_host_info().await,
                 "connected_hosts": peers,
             }))
         }

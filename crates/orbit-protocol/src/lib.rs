@@ -536,6 +536,8 @@ pub struct HostInfo {
     pub available_providers: Vec<ProviderKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub direct_endpoints: Vec<String>,
 }
 
 /// Workspace record (either a direct local checkout, isolated git worktree, or multi-agent Mission Workspace).

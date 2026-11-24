@@ -919,9 +919,13 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func cancelWorkflowRun(hostId: String, runId: String) throws  -> FfiWorkflowRunRecord
     
+    func cloudSyncExportDeviceLinkUri() throws  -> String
+    
     func cloudSyncGeneratePassphrase()  -> String
     
     func cloudSyncGetPreferencesJson()  -> String
+    
+    func cloudSyncImportDeviceLinkUri(uri: String) throws  -> FfiCloudSyncResult
     
     func cloudSyncLoginWithToken(token: String) throws  -> FfiCloudSyncStatus
     
@@ -934,6 +938,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     func cloudSyncSetAutoSync(enabled: Bool) throws  -> FfiCloudSyncStatus
     
     func cloudSyncSetGithubClientId(clientId: String?) throws  -> FfiCloudSyncStatus
+    
+    func cloudSyncSetManualPassphraseMode(requireManual: Bool) throws  -> FfiCloudSyncStatus
     
     func cloudSyncStartGithubDeviceFlow(clientIdOverride: String?) throws  -> FfiGitHubDeviceFlowStart
     
@@ -1487,6 +1493,15 @@ open func cancelWorkflowRun(hostId: String, runId: String)throws  -> FfiWorkflow
 })
 }
     
+open func cloudSyncExportDeviceLinkUri()throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_export_device_link_uri(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
 open func cloudSyncGeneratePassphrase() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
         uniffiCallStatus in
@@ -1501,6 +1516,16 @@ open func cloudSyncGetPreferencesJson() -> String  {
         uniffiCallStatus in
     uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_get_preferences_json(
             self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncImportDeviceLinkUri(uri: String)throws  -> FfiCloudSyncResult  {
+    return try  FfiConverterTypeFfiCloudSyncResult_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_import_device_link_uri(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(uri),uniffiCallStatus
     )
 })
 }
@@ -1561,6 +1586,16 @@ open func cloudSyncSetGithubClientId(clientId: String?)throws  -> FfiCloudSyncSt
     uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_set_github_client_id(
             self.uniffiCloneHandle(),
         FfiConverterOptionString.lower(clientId),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncSetManualPassphraseMode(requireManual: Bool)throws  -> FfiCloudSyncStatus  {
+    return try  FfiConverterTypeFfiCloudSyncStatus_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_set_manual_passphrase_mode(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(requireManual),uniffiCallStatus
     )
 })
 }
@@ -4844,6 +4879,7 @@ public struct FfiCloudSyncStatus: Equatable, Hashable {
     public var gistHtmlUrl: String?
     public var remoteVaultExists: Bool
     public var autoSyncEnabled: Bool
+    public var instantUnlockEnabled: Bool
     public var lastSyncedAtMs: Int64?
     public var lastVaultRevision: UInt64
     public var syncedHostCount: UInt32
@@ -4852,7 +4888,7 @@ public struct FfiCloudSyncStatus: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(state: FfiCloudSyncState, provider: String, githubOauthConfigured: Bool, githubClientIdOverride: String?, accountLogin: String?, accountName: String?, accountAvatarUrl: String?, gistId: String?, gistHtmlUrl: String?, remoteVaultExists: Bool, autoSyncEnabled: Bool, lastSyncedAtMs: Int64?, lastVaultRevision: UInt64, syncedHostCount: UInt32, syncedProjectCount: UInt32, lastError: String?) {
+    public init(state: FfiCloudSyncState, provider: String, githubOauthConfigured: Bool, githubClientIdOverride: String?, accountLogin: String?, accountName: String?, accountAvatarUrl: String?, gistId: String?, gistHtmlUrl: String?, remoteVaultExists: Bool, autoSyncEnabled: Bool, instantUnlockEnabled: Bool, lastSyncedAtMs: Int64?, lastVaultRevision: UInt64, syncedHostCount: UInt32, syncedProjectCount: UInt32, lastError: String?) {
         self.state = state
         self.provider = provider
         self.githubOauthConfigured = githubOauthConfigured
@@ -4864,6 +4900,7 @@ public struct FfiCloudSyncStatus: Equatable, Hashable {
         self.gistHtmlUrl = gistHtmlUrl
         self.remoteVaultExists = remoteVaultExists
         self.autoSyncEnabled = autoSyncEnabled
+        self.instantUnlockEnabled = instantUnlockEnabled
         self.lastSyncedAtMs = lastSyncedAtMs
         self.lastVaultRevision = lastVaultRevision
         self.syncedHostCount = syncedHostCount
@@ -4898,6 +4935,7 @@ public struct FfiConverterTypeFfiCloudSyncStatus: FfiConverterRustBuffer {
                 gistHtmlUrl: FfiConverterOptionString.read(from: &buf), 
                 remoteVaultExists: FfiConverterBool.read(from: &buf), 
                 autoSyncEnabled: FfiConverterBool.read(from: &buf), 
+                instantUnlockEnabled: FfiConverterBool.read(from: &buf), 
                 lastSyncedAtMs: FfiConverterOptionInt64.read(from: &buf), 
                 lastVaultRevision: FfiConverterUInt64.read(from: &buf), 
                 syncedHostCount: FfiConverterUInt32.read(from: &buf), 
@@ -4918,6 +4956,7 @@ public struct FfiConverterTypeFfiCloudSyncStatus: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.gistHtmlUrl, into: &buf)
         FfiConverterBool.write(value.remoteVaultExists, into: &buf)
         FfiConverterBool.write(value.autoSyncEnabled, into: &buf)
+        FfiConverterBool.write(value.instantUnlockEnabled, into: &buf)
         FfiConverterOptionInt64.write(value.lastSyncedAtMs, into: &buf)
         FfiConverterUInt64.write(value.lastVaultRevision, into: &buf)
         FfiConverterUInt32.write(value.syncedHostCount, into: &buf)
@@ -20420,10 +20459,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cancel_workflow_run() != 30638) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_export_device_link_uri() != 50707) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_generate_passphrase() != 49340) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_get_preferences_json() != 11716) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_import_device_link_uri() != 18979) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_login_with_token() != 37302) {
@@ -20442,6 +20487,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_github_client_id() != 62078) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_manual_passphrase_mode() != 55160) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_start_github_device_flow() != 41593) {

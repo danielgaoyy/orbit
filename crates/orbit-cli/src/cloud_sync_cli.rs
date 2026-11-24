@@ -4,16 +4,18 @@
 //! Token (`gist` scope) to synchronize Orbit hosts, projects, and settings through an Argon2id +
 //! AES-256-GCM end-to-end encrypted GitHub Secret Gist.
 
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read as _, Write};
 use std::path::Path;
 use std::time::Duration;
 
 use orbit_client_core::cloud_sync::{
-    CloudVaultPayload, DevicePollOutcome, GitHubCloudClient, LocalHostSyncRecord,
-    PersistedCloudSyncConfig, SyncedHostEntry, decrypt_remote_with_cached_key,
-    delete_cli_sync_config, filter_shareable_endpoints, generate_sync_passphrase,
-    load_cli_sync_config, now_unix_ms, push_vault_payload, resolve_github_client_id,
-    save_cli_sync_config, save_sync_config_to_store, unlock_remote_vault_with_passphrase,
+    CloudSyncDeviceLinkPayload, CloudVaultPayload, DevicePollOutcome, GitHubCloudClient,
+    LocalHostSyncRecord, PersistedCloudSyncConfig, SyncedHostEntry, decode_device_link_uri,
+    decrypt_remote_with_cached_key, delete_cli_sync_config, derived_key_from_auto_unlock,
+    encode_device_link_uri, filter_shareable_endpoints, generate_sync_passphrase,
+    load_cli_sync_config, load_fleet_network_from_store, now_unix_ms, push_vault_payload,
+    resolve_github_client_id, save_cli_sync_config, save_fleet_network_to_store,
+    save_sync_config_to_store, unlock_remote_vault_with_passphrase,
 };
 use orbit_client_core::desktop_ops::open_external_url;
 use orbit_crypto::PairingOffer;
@@ -55,6 +57,10 @@ pub struct LoginOptions {
     pub token: Option<String>,
     pub client_id: Option<String>,
     pub passphrase: Option<String>,
+    pub device_link: Option<String>,
+    pub device_link_stdin: bool,
+    pub reauth: bool,
+    pub manual_passphrase: bool,
     pub no_register_host: bool,
     pub sync_mesh: bool,
     pub json_mode: bool,
@@ -63,6 +69,7 @@ pub struct LoginOptions {
 pub struct SyncOptions {
     pub no_register_host: bool,
     pub sync_mesh: bool,
+    pub export_device_link: bool,
     pub json_mode: bool,
 }
 
@@ -77,7 +84,149 @@ pub async fn cmd_login(home_dir: &Path, opts: LoginOptions) -> anyhow::Result<()
         }
     }
 
-    // 1. Obtain GitHub access token (PAT override, OAuth Device Flow, or interactive token fallback)
+    // Fast 1-Scan Device Link path: imports existing GitHub session + vault key directly
+    // without minting a new OAuth token against GitHub's 10-token cap.
+    if opts.device_link_stdin
+        || opts
+            .device_link
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+    {
+        let raw_uri = if opts.device_link_stdin {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            buf.trim().to_string()
+        } else {
+            opts.device_link
+                .clone()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        let payload = decode_device_link_uri(&raw_uri)?;
+        let token = payload.github_access_token.trim().to_string();
+        let user = client.verify_token(&token).await?;
+        let (remote_gist, remote_auto_key) = client
+            .fetch_vault_and_auto_key(
+                &token,
+                payload.gist_id.as_deref().or(cfg.gist_id.as_deref()),
+                payload
+                    .key_gist_id
+                    .as_deref()
+                    .or(cfg.key_gist_id.as_deref()),
+            )
+            .await?;
+
+        let account_changed = cfg.github_login.as_deref() != Some(user.login.as_str());
+        if account_changed {
+            cfg.clear_derived_key();
+            cfg.gist_id = None;
+            cfg.gist_html_url = None;
+            cfg.key_gist_id = None;
+            cfg.last_synced_at_ms = None;
+            cfg.last_vault_revision = 0;
+        }
+        cfg.github_access_token = Some(token);
+        cfg.github_login = Some(user.login.clone());
+        cfg.github_name = user.name.clone();
+        cfg.github_avatar_url = user.avatar_url.clone();
+        cfg.last_error = None;
+        if let Some(ref gist) = remote_gist {
+            cfg.gist_id = Some(gist.gist_id.clone());
+            cfg.gist_html_url = Some(gist.html_url.clone());
+            cfg.remote_vault_exists = true;
+        } else if let Some(ref gid) = payload.gist_id {
+            cfg.gist_id = Some(gid.clone());
+        }
+        if let Some(ref auto_key) = remote_auto_key {
+            cfg.key_gist_id = Some(auto_key.gist_id.clone());
+        } else if let Some(ref kid) = payload.key_gist_id {
+            cfg.key_gist_id = Some(kid.clone());
+        }
+
+        let key = if let Some(ref key_b64) = payload.key_b64 {
+            let (salt, params) = if let Some(ref gist) = remote_gist {
+                (gist.envelope.salt_b64.clone(), gist.envelope.kdf_params)
+            } else {
+                (
+                    payload
+                        .salt_b64
+                        .clone()
+                        .unwrap_or_else(orbit_crypto::generate_vault_salt_b64),
+                    payload.kdf_params.unwrap_or_default(),
+                )
+            };
+            orbit_crypto::DerivedVaultKey::from_b64(key_b64, salt, params)?
+        } else if let Some(ref auto_key) = remote_auto_key {
+            derived_key_from_auto_unlock(auto_key, remote_gist.as_ref())?
+        } else {
+            anyhow::bail!(
+                "Device link URI has no vault key and no auto-unlock key gist exists; sign in with `--token` and `--passphrase`."
+            );
+        };
+        cfg.set_derived_key(&key);
+
+        if let Some(ref relay_url) = payload.relay_url
+            && let Ok(normalized) = orbit_relay_transport::normalize_relay_url(relay_url)
+            && let Ok(store) = OrbitStore::open(home_dir.join("desktop-client.sqlite"))
+        {
+            let mut net = load_fleet_network_from_store(&store).unwrap_or_default();
+            if net.primary_relay_url.is_none() {
+                net.primary_relay_url = Some(normalized.clone());
+                if !net.relay_urls.contains(&normalized) {
+                    net.relay_urls.push(normalized);
+                }
+                net.updated_at_ms = now_unix_ms();
+                let _ = save_fleet_network_to_store(&store, &net);
+            }
+        }
+
+        if !opts.json_mode {
+            eprintln!("[✓] Linked device to GitHub @{} in 1 step.", user.login);
+        }
+
+        let remote_payload = if let Some(ref gist) = remote_gist {
+            Some(decrypt_remote_with_cached_key(&key, gist)?)
+        } else {
+            None
+        };
+        let summary = execute_cli_sync(
+            home_dir,
+            &client,
+            &mut cfg,
+            &key,
+            remote_payload.as_ref(),
+            !opts.no_register_host,
+            opts.sync_mesh,
+        )
+        .await?;
+
+        if opts.json_mode {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "signed_in",
+                    "github_login": cfg.github_login,
+                    "gist_html_url": cfg.gist_html_url,
+                    "registered_this_host": summary.registered_host_id,
+                    "vault_revision": summary.vault_revision,
+                    "hosts": hosts_to_cli_json_views(&summary.active_hosts),
+                    "projects_count": summary.active_projects_count,
+                    "mesh_registered": summary.mesh_registered,
+                }))?
+            );
+        } else {
+            print_sync_summary(&cfg, &summary);
+        }
+        return Ok(());
+    }
+
+    if opts.manual_passphrase {
+        cfg.require_manual_passphrase = true;
+    }
+
+    // 1. Obtain GitHub access token (PAT override, reuse valid local token unless `--reauth`,
+    //    OAuth Device Flow, or interactive token fallback)
     let token = if let Some(tok) = opts
         .token
         .as_deref()
@@ -85,6 +234,21 @@ pub async fn cmd_login(home_dir: &Path, opts: LoginOptions) -> anyhow::Result<()
         .filter(|s| !s.is_empty())
     {
         tok.to_string()
+    } else if !opts.reauth
+        && let Some(existing_tok) = cfg
+            .github_access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        && let Ok(u) = client.verify_token(existing_tok).await
+    {
+        if !opts.json_mode {
+            eprintln!(
+                "[✓] Reusing active GitHub session as @{} (pass --reauth to re-authenticate)",
+                u.login
+            );
+        }
+        existing_tok.to_string()
     } else if let Some(cid) =
         resolve_github_client_id(opts.client_id.as_deref(), cfg.github_client_id.as_deref())
     {
@@ -92,7 +256,7 @@ pub async fn cmd_login(home_dir: &Path, opts: LoginOptions) -> anyhow::Result<()
     } else {
         if !std::io::stdin().is_terminal() {
             anyhow::bail!(
-                "No GitHub OAuth Client ID is configured. Pass `--token <GITHUB_PAT>` (with `gist` scope) or `--client-id <OAUTH_CLIENT_ID>`."
+                "No GitHub OAuth Client ID is configured. Pass `--token <GITHUB_PAT>` (with `gist` scope), `--device-link`, or `--client-id <OAUTH_CLIENT_ID>`."
             );
         }
         eprintln!("=== Orbit Cloud Sync (Zero-Server GitHub E2EE) ===");
@@ -114,8 +278,8 @@ pub async fn cmd_login(home_dir: &Path, opts: LoginOptions) -> anyhow::Result<()
     }
 
     let user = client.verify_token(&token).await?;
-    let remote_gist = client
-        .fetch_vault_gist(&token, cfg.gist_id.as_deref())
+    let (remote_gist, remote_auto_key) = client
+        .fetch_vault_and_auto_key(&token, cfg.gist_id.as_deref(), cfg.key_gist_id.as_deref())
         .await?;
 
     let account_changed = cfg.github_login.as_deref() != Some(user.login.as_str());
@@ -123,6 +287,7 @@ pub async fn cmd_login(home_dir: &Path, opts: LoginOptions) -> anyhow::Result<()
         cfg.clear_derived_key();
         cfg.gist_id = None;
         cfg.gist_html_url = None;
+        cfg.key_gist_id = None;
         cfg.last_synced_at_ms = None;
         cfg.last_vault_revision = 0;
     }
@@ -138,6 +303,9 @@ pub async fn cmd_login(home_dir: &Path, opts: LoginOptions) -> anyhow::Result<()
     } else {
         cfg.remote_vault_exists = false;
     }
+    if let Some(ref auto_key) = remote_auto_key {
+        cfg.key_gist_id = Some(auto_key.gist_id.clone());
+    }
 
     if !opts.json_mode {
         eprintln!(
@@ -150,53 +318,87 @@ pub async fn cmd_login(home_dir: &Path, opts: LoginOptions) -> anyhow::Result<()
         );
     }
 
-    // 2. Obtain Sync Passphrase (decrypt existing remote vault or initialize a brand-new encrypted vault)
+    // 2. Obtain master vault key via Dual-Gist Instant Unlock by default, or passphrase if
+    //    `--manual-passphrase` / `--passphrase` / legacy vault without auto-unlock key.
     let mut generated_recovery: Option<String> = None;
-    let passphrase = if let Some(p) = opts
+    let (key, unlocked_gist, remote_payload) = if let Some(p) = opts
         .passphrase
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        p.to_string()
-    } else if remote_gist.is_some() {
-        if !std::io::stdin().is_terminal() {
-            anyhow::bail!(
-                "Existing encrypted Orbit Vault found on GitHub; pass `--passphrase <PASSPHRASE>` (or `ORBIT_SYNC_PASSPHRASE`)."
-            );
-        }
-        eprintln!("\nExisting encrypted Orbit Cloud Vault found on GitHub.");
-        prompt_secret("Enter your Sync Passphrase to unlock: ")?
-    } else {
-        if !std::io::stdin().is_terminal() {
-            anyhow::bail!(
-                "Pass `--passphrase <PASSPHRASE>` (or `ORBIT_SYNC_PASSPHRASE`) to initialize your encrypted Orbit Vault."
-            );
-        }
-        eprintln!("\nNo existing Orbit Cloud Vault found — creating a new E2EE Secret Gist.");
-        eprintln!(
-            "Your hosts, projects, and settings are encrypted locally with Argon2id + AES-256-GCM before upload."
-        );
-        let entered = prompt_secret(
-            "Create Sync Passphrase (leave blank to auto-generate a Recovery Key): ",
-        )?;
-        if entered.trim().is_empty() {
-            let rec = generate_sync_passphrase();
-            generated_recovery = Some(rec.clone());
-            rec
+        unlock_remote_vault_with_passphrase(&client, &token, cfg.gist_id.as_deref(), p).await?
+    } else if !opts.manual_passphrase && !cfg.require_manual_passphrase {
+        if let Some(ref auto_key) = remote_auto_key
+            && let Ok(key) = derived_key_from_auto_unlock(auto_key, remote_gist.as_ref())
+        {
+            let remote_payload = if let Some(ref gist) = remote_gist {
+                Some(decrypt_remote_with_cached_key(&key, gist)?)
+            } else {
+                None
+            };
+            (key, remote_gist.clone(), remote_payload)
+        } else if remote_gist.is_none() {
+            let key = cfg
+                .derived_key()
+                .unwrap_or_else(orbit_crypto::generate_random_vault_key);
+            let kid = client
+                .save_auto_unlock_key_gist(&token, cfg.key_gist_id.as_deref(), &key)
+                .await?;
+            cfg.key_gist_id = Some(kid);
+            (key, None, None)
+        } else if let Some(ref gist) = remote_gist
+            && let Some(cached) = cfg.derived_key()
+            && cached.matches_envelope(&gist.envelope)
+        {
+            let remote_payload = Some(decrypt_remote_with_cached_key(&cached, gist)?);
+            (cached, remote_gist.clone(), remote_payload)
         } else {
-            let confirm = prompt_secret("Confirm Sync Passphrase: ")?;
-            if entered.trim() != confirm.trim() {
-                anyhow::bail!("Sync Passphrases did not match");
-            }
-            entered
+            let pass = if !std::io::stdin().is_terminal() {
+                anyhow::bail!(
+                    "Existing passphrase-protected Orbit Vault found on GitHub; pass `--passphrase <PASSPHRASE>` (or `ORBIT_SYNC_PASSPHRASE`), or link from an unlocked device via `--device-link`."
+                );
+            } else {
+                eprintln!("\nExisting passphrase-protected Orbit Cloud Vault found on GitHub.");
+                prompt_secret("Enter your Sync Passphrase to unlock: ")?
+            };
+            unlock_remote_vault_with_passphrase(&client, &token, cfg.gist_id.as_deref(), &pass)
+                .await?
         }
-    };
-
-    // 3. Unlock / derive master key & perform initial sync
-    let (key, unlocked_gist, remote_payload) =
+    } else {
+        let passphrase = if remote_gist.is_some() {
+            if !std::io::stdin().is_terminal() {
+                anyhow::bail!(
+                    "Existing encrypted Orbit Vault found on GitHub; pass `--passphrase <PASSPHRASE>` (or `ORBIT_SYNC_PASSPHRASE`)."
+                );
+            }
+            eprintln!("\nExisting encrypted Orbit Cloud Vault found on GitHub.");
+            prompt_secret("Enter your Sync Passphrase to unlock: ")?
+        } else {
+            if !std::io::stdin().is_terminal() {
+                anyhow::bail!(
+                    "Pass `--passphrase <PASSPHRASE>` (or `ORBIT_SYNC_PASSPHRASE`) to initialize your encrypted Orbit Vault."
+                );
+            }
+            eprintln!("\nNo existing Orbit Cloud Vault found — creating a new E2EE Secret Gist.");
+            let entered = prompt_secret(
+                "Create Sync Passphrase (leave blank to auto-generate a Recovery Key): ",
+            )?;
+            if entered.trim().is_empty() {
+                let rec = generate_sync_passphrase();
+                generated_recovery = Some(rec.clone());
+                rec
+            } else {
+                let confirm = prompt_secret("Confirm Sync Passphrase: ")?;
+                if entered.trim() != confirm.trim() {
+                    anyhow::bail!("Sync Passphrases did not match");
+                }
+                entered
+            }
+        };
         unlock_remote_vault_with_passphrase(&client, &token, cfg.gist_id.as_deref(), &passphrase)
-            .await?;
+            .await?
+    };
 
     cfg.set_derived_key(&key);
     if let Some(ref gist) = unlocked_gist {
@@ -256,16 +458,26 @@ pub async fn cmd_sync(home_dir: &Path, opts: SyncOptions) -> anyhow::Result<()> 
         .ok_or_else(|| {
             anyhow::anyhow!("Not signed in to Orbit Cloud Sync. Run `orbit login` first.")
         })?;
-    let key = cfg.derived_key().ok_or_else(|| {
-        anyhow::anyhow!(
-            "Orbit Cloud Vault is locked. Run `orbit login` to unlock with your Sync Passphrase."
-        )
-    })?;
 
     let client = GitHubCloudClient::new();
-    let remote_gist = client
-        .fetch_vault_gist(&token, cfg.gist_id.as_deref())
+    let (remote_gist, remote_auto_key) = client
+        .fetch_vault_and_auto_key(&token, cfg.gist_id.as_deref(), cfg.key_gist_id.as_deref())
         .await?;
+
+    let key = if let Some(cached) = cfg.derived_key() {
+        cached
+    } else if !cfg.require_manual_passphrase
+        && let Some(ref auto_key) = remote_auto_key
+    {
+        let derived = derived_key_from_auto_unlock(auto_key, remote_gist.as_ref())?;
+        cfg.set_derived_key(&derived);
+        cfg.key_gist_id = Some(auto_key.gist_id.clone());
+        derived
+    } else {
+        anyhow::bail!(
+            "Orbit Cloud Vault is locked. Run `orbit login` to unlock with your Sync Passphrase."
+        );
+    };
 
     let remote_payload = if let Some(ref gist) = remote_gist {
         cfg.gist_id = Some(gist.gist_id.clone());
@@ -288,23 +500,53 @@ pub async fn cmd_sync(home_dir: &Path, opts: SyncOptions) -> anyhow::Result<()> 
     )
     .await?;
 
+    let device_link_uri = if opts.export_device_link {
+        let primary_relay_url = OrbitStore::open(home_dir.join("desktop-client.sqlite"))
+            .ok()
+            .and_then(|s| load_fleet_network_from_store(&s))
+            .and_then(|n| n.primary_relay_url);
+        Some(encode_device_link_uri(&CloudSyncDeviceLinkPayload {
+            v: 1,
+            github_access_token: token,
+            key_b64: Some(key.key_b64().to_string()),
+            salt_b64: Some(key.salt_b64),
+            kdf_params: Some(key.kdf_params),
+            gist_id: cfg.gist_id.clone(),
+            key_gist_id: cfg.key_gist_id.clone(),
+            github_login: cfg.github_login.clone(),
+            relay_url: primary_relay_url,
+        })?)
+    } else {
+        None
+    };
+
     if opts.json_mode {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "status": "synced",
-                "github_login": cfg.github_login,
-                "gist_html_url": cfg.gist_html_url,
-                "registered_this_host": summary.registered_host_id,
-                "pushed_remote": summary.pushed_remote,
-                "vault_revision": summary.vault_revision,
-                "hosts": hosts_to_cli_json_views(&summary.active_hosts),
-                "projects_count": summary.active_projects_count,
-                "mesh_registered": summary.mesh_registered,
-            }))?
-        );
+        let mut json = serde_json::json!({
+            "status": "synced",
+            "github_login": cfg.github_login,
+            "gist_html_url": cfg.gist_html_url,
+            "registered_this_host": summary.registered_host_id,
+            "pushed_remote": summary.pushed_remote,
+            "vault_revision": summary.vault_revision,
+            "hosts": hosts_to_cli_json_views(&summary.active_hosts),
+            "projects_count": summary.active_projects_count,
+            "mesh_registered": summary.mesh_registered,
+        });
+        if let Some(ref uri) = device_link_uri
+            && let Some(obj) = json.as_object_mut()
+        {
+            obj.insert(
+                "device_link_uri".into(),
+                serde_json::Value::String(uri.clone()),
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&json)?);
     } else {
         print_sync_summary(&cfg, &summary);
+        if let Some(ref uri) = device_link_uri {
+            println!("\nDevice Link URI (1-scan mobile / CLI linking — keep secret):");
+            println!("  {uri}");
+        }
     }
 
     Ok(())

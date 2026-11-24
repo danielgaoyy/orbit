@@ -639,6 +639,7 @@ export interface CloudSyncStatusView {
   gist_html_url: string | null;
   remote_vault_exists: boolean;
   auto_sync_enabled: boolean;
+  instant_unlock_enabled: boolean;
   last_synced_at_ms: number | null;
   last_vault_revision: number;
   synced_host_count: number;
@@ -6731,6 +6732,17 @@ export const orbitIpc = {
     return invoke<string>("provision_ssh_relay", params);
   },
 
+  provisionCloudflareTunnelRelay: async (params: {
+    targetHostId: string;
+    sshAlias: string;
+    relayPort: number;
+    publicHostname?: string | null;
+    tunnelToken?: string | null;
+    applyToAllHosts?: boolean;
+  }): Promise<string> => {
+    return invoke<string>("provision_cloudflare_tunnel_relay", params);
+  },
+
   getAppVersion: async (): Promise<string> => {
     if (!transport()) return "0.10.4";
     return invoke<string>("get_app_version");
@@ -6791,6 +6803,7 @@ export const orbitIpc = {
         gist_html_url: null,
         remote_vault_exists: false,
         auto_sync_enabled: true,
+        instant_unlock_enabled: true,
         last_synced_at_ms: null,
         last_vault_revision: 0,
         synced_host_count: 0,
@@ -6846,6 +6859,22 @@ export const orbitIpc = {
 
   cloudSyncNow: async (): Promise<CloudSyncResultView> => {
     return invoke<CloudSyncResultView>("cloud_sync_now");
+  },
+
+  cloudSyncExportDeviceLinkUri: async (): Promise<string> => {
+    return invoke<string>("cloud_sync_export_device_link_uri");
+  },
+
+  cloudSyncImportDeviceLinkUri: async (uri: string): Promise<CloudSyncResultView> => {
+    return invoke<CloudSyncResultView>("cloud_sync_import_device_link_uri", { uri });
+  },
+
+  cloudSyncSetManualPassphraseMode: async (
+    requireManual: boolean,
+  ): Promise<CloudSyncStatusView> => {
+    return invoke<CloudSyncStatusView>("cloud_sync_set_manual_passphrase_mode", {
+      requireManual,
+    });
   },
 
   cloudSyncTriggerBackground: async (): Promise<void> => {

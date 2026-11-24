@@ -170,6 +170,20 @@ pub fn generate_vault_salt_b64() -> String {
     URL_SAFE_NO_PAD.encode(salt)
 }
 
+/// Generate a fresh random 256-bit master vault key directly (zero KDF wait).
+/// Used for zero-passphrase Dual-Gist Instant Unlock vaults.
+pub fn generate_random_vault_key() -> DerivedVaultKey {
+    let mut raw = [0u8; KEY_LEN];
+    rand::rng().fill_bytes(&mut raw);
+    let key = DerivedVaultKey {
+        key: Zeroizing::new(raw),
+        salt_b64: generate_vault_salt_b64(),
+        kdf_params: VaultKdfParams::default(),
+    };
+    raw.fill(0);
+    key
+}
+
 /// Generate a human-readable high-entropy Recovery Key (`orbit-XXXX-XXXX-XXXX-XXXX-XXXX`, 100+ bits).
 pub fn generate_recovery_passphrase() -> String {
     // Crockford-inspired unambiguous uppercase alphabet (no 0/O/1/I/L)

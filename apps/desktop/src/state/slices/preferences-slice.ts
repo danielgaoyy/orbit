@@ -495,6 +495,10 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
                 cloudSyncStatus: status,
                 cloudSyncError: null,
               }));
+              if (status.state === "ready") {
+                await ctx.actions.reloadFleetAndHosts();
+                await ctx.actions.hydrateSyncedPreferencesFromCore();
+              }
               notifyToast(
                 status.account_login
                   ? `Signed in to GitHub as @${status.account_login}`
@@ -559,10 +563,69 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
           cloudSyncError: null,
           cloudSyncDeviceFlow: null,
         }));
+        if (status.state === "ready") {
+          await ctx.actions.reloadFleetAndHosts();
+          await ctx.actions.hydrateSyncedPreferencesFromCore();
+        }
         notifyToast(
           status.account_login
             ? `Signed in to GitHub as @${status.account_login}`
             : "Signed in to GitHub",
+        );
+        return true;
+      } catch (err) {
+        setState((s) => ({
+          ...s,
+          cloudSyncBusy: false,
+          cloudSyncError: String(err),
+        }));
+        return false;
+      }
+    },
+
+    async importCloudSyncDeviceLinkUri(uri: string): Promise<boolean> {
+      setState((s) => ({ ...s, cloudSyncBusy: true, cloudSyncError: null }));
+      try {
+        const result = await orbitIpc.cloudSyncImportDeviceLinkUri(uri.trim());
+        const status = await orbitIpc.getCloudSyncStatus();
+        setState((s) => ({
+          ...s,
+          cloudSyncBusy: false,
+          cloudSyncStatus: status,
+          cloudSyncLastResult: result,
+          cloudSyncError: null,
+          cloudSyncDeviceFlow: null,
+        }));
+        await ctx.actions.reloadFleetAndHosts();
+        await ctx.actions.hydrateSyncedPreferencesFromCore();
+        notifyToast(formatCloudSyncToast(result));
+        return true;
+      } catch (err) {
+        const status = await orbitIpc.getCloudSyncStatus().catch(() => getState().cloudSyncStatus);
+        setState((s) => ({
+          ...s,
+          cloudSyncBusy: false,
+          cloudSyncStatus: status,
+          cloudSyncError: String(err),
+        }));
+        return false;
+      }
+    },
+
+    async setCloudSyncManualPassphraseMode(requireManual: boolean): Promise<boolean> {
+      setState((s) => ({ ...s, cloudSyncBusy: true, cloudSyncError: null }));
+      try {
+        const status = await orbitIpc.cloudSyncSetManualPassphraseMode(requireManual);
+        setState((s) => ({
+          ...s,
+          cloudSyncBusy: false,
+          cloudSyncStatus: status,
+          cloudSyncError: null,
+        }));
+        notifyToast(
+          status.instant_unlock_enabled
+            ? "Instant zero-passphrase auto-unlock enabled"
+            : "Manual passphrase mode enabled for new devices",
         );
         return true;
       } catch (err) {

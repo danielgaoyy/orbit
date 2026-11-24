@@ -900,6 +900,26 @@ export const ja: MessageDictionary = {
   "settings.signInGithub": "GitHub でサインイン",
   "settings.oauthDeviceFlow": "GitHub OAuth（デバイスフロー）",
   "settings.personalAccessToken": "パーソナルアクセストークン",
+  "settings.deviceLinkTab": "デバイスリンク",
+  "settings.deviceLinkTabDesc":
+    "別の Orbit デバイスで作成した orbit://sync-login URI を貼り付けると、アカウント・復号キー・リレーを 1 ステップで引き継げます。",
+  "settings.deviceLinkPlaceholder": "orbit://sync-login?v=1&p=…",
+  "settings.deviceLinkConnect": "リンクして接続",
+  "settings.linkDeviceQr": "別デバイスをリンク",
+  "settings.deviceLinkQrTitle": "ワンステップ・デバイスリンク",
+  "settings.deviceLinkQrDesc":
+    "Orbit iOS でスキャンするか URI をコピーすると、パスフレーズや追加の GitHub ログインなしで新しい端末を即座に同期できます。",
+  "settings.deviceLinkQrHint":
+    "この QR には GitHub セッションと暗号鍵が含まれます。他人と共有しないでください。",
+  "settings.copyDeviceLinkUri": "リンク URI をコピー",
+  "settings.cloudSyncInstantSummary":
+    "Orbit はホスト一覧や設定をローカルで AES-256-GCM 暗号化し、非公開の GitHub Secret Gist に保存します。既定でデュアル Gist 自動ロック解除が有効なため、新端末でもパスフレーズ不要で即座に同期できます。",
+  "settings.cloudSyncAdvancedTitle": "高度なセキュリティとパスフレーズ",
+  "settings.cloudSyncInstantBadge": "パスフレーズ不要",
+  "settings.cloudSyncManualBadge": "手動パスフレーズ必須",
+  "settings.cloudSyncRequireManualTitle": "新しいデバイスで手動パスフレーズを必須にする",
+  "settings.cloudSyncRequireManualDesc":
+    "GitHub 上の自動解除キー Gist を削除し、新しいログイン時に Argon2id パスフレーズの入力を必須にします。",
   "settings.copyCodeOpenGithub": "コードをコピーして GitHub を開く",
   "settings.neverSynced": "未同期",
 
@@ -2070,4 +2090,13 @@ export const ja: MessageDictionary = {
   "securityOps.migrationDryRunLabel": "ドライラン結果（{count} 件）",
   "securityOps.migrationResultLabel": "インポート完了（{count} 件）",
   "securityOps.migrationExecutedToast": "外部 IDE/CLI から {count} 件をインポートしました。",
+
+  "settings.deployCloudflareShort": "Cloudflare (0 ポート)",
+  "settings.deployCfCustomToggle": "詳細: カスタム Named Cloudflare Tunnel を使用（任意）",
+  "settings.deployCfHostnamePlaceholder":
+    "relay.yourdomain.com（空欄なら無料の即時トンネルを作成）",
+  "settings.deployCfTokenPlaceholder": "Cloudflare Tunnel Token (eyJh…)",
+  "settings.deployCfConfirmTitle": "{alias} を Cloudflare Tunnel 経由で公開しますか？",
+  "settings.deployCfConfirmDesc":
+    "{alias} にローカル専用リレー (127.0.0.1:7878) と cloudflared トンネルを構築し（インバウンド開放ポート不要）、全 {count} 台へ自動適用します。",
 };

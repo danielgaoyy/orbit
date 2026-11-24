@@ -4,6 +4,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Cloud,
   Copy,
   QrCode,
   Radio,
@@ -47,7 +48,8 @@ import {
 type PendingRelayConfirm =
   | { kind: "clear" }
   | { kind: "share_all"; relayUrl: string }
-  | { kind: "deploy_ssh"; ssh: SshHostItem };
+  | { kind: "deploy_ssh"; ssh: SshHostItem }
+  | { kind: "deploy_cf"; ssh: SshHostItem; publicHostname?: string; tunnelToken?: string };
 
 function redactRelayForDisplay(url: string): string {
   return url
@@ -70,6 +72,9 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
   const [sharingRelay, setSharingRelay] = useState(false);
   const [showSshDeploy, setShowSshDeploy] = useState(false);
   const [deployingSsh, setDeployingSsh] = useState<string | null>(null);
+  const [showCfCustom, setShowCfCustom] = useState(false);
+  const [cfHostname, setCfHostname] = useState("");
+  const [cfTunnelToken, setCfTunnelToken] = useState("");
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const [confirmRemoveOpen, setConfirmRemoveOpen] = useState(false);
   const [relayConfirmOpen, setRelayConfirmOpen] = useState(false);
@@ -152,6 +157,33 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
       setRelayInput(url);
       await orbitActions.reloadFleetAndHosts();
       setRelayStatusMsg(`Active across fleet on ${redactRelayForDisplay(url)}`);
+    } catch (err) {
+      setRelayStatusMsg(String(err));
+      throw err;
+    } finally {
+      setDeployingSsh(null);
+    }
+  };
+
+  const handleDeployCfRelay = async (
+    ssh: SshHostItem,
+    publicHostname?: string,
+    tunnelToken?: string,
+  ) => {
+    setDeployingSsh(ssh.alias);
+    setRelayStatusMsg(`Deploying Zero-Port Cloudflare Tunnel on ${ssh.alias}…`);
+    try {
+      const url = await orbitIpc.provisionCloudflareTunnelRelay({
+        targetHostId: host.host_id,
+        sshAlias: ssh.alias,
+        relayPort: 7878,
+        publicHostname: publicHostname?.trim() || null,
+        tunnelToken: tunnelToken?.trim() || null,
+        applyToAllHosts: true,
+      });
+      setRelayInput(url);
+      await orbitActions.reloadFleetAndHosts();
+      setRelayStatusMsg(`Zero-port Cloudflare Tunnel active across fleet on ${redactRelayForDisplay(url)}`);
     } catch (err) {
       setRelayStatusMsg(String(err));
       throw err;
@@ -472,35 +504,97 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
               </button>
 
               {showSshDeploy && (
-                <div className="orbit-native-scroll border-border divide-border mt-2 max-h-40 divide-y overflow-y-auto overscroll-contain rounded-[10px] border">
-                  {sshHosts.map((s) => (
-                    <div
-                      key={s.alias}
-                      className="flex items-center justify-between gap-2 px-3 py-2 text-[12.5px]"
-                    >
-                      <div className="min-w-0 truncate">
-                        <span className="text-foreground font-medium">{s.alias}</span>
-                        <span className="selectable-text text-muted-foreground ml-2 font-mono text-[11.5px]">
-                          {s.display_target}
-                        </span>
-                      </div>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="xs"
-                        disabled={deployingSsh !== null}
-                        onClick={() => openRelayConfirm({ kind: "deploy_ssh", ssh: s })}
-                        className="shrink-0 gap-1.5 text-[11.5px]"
+                <div className="space-y-2.5 pt-2">
+                  <div className="orbit-native-scroll border-border divide-border max-h-48 divide-y overflow-y-auto overscroll-contain rounded-[10px] border">
+                    {sshHosts.map((s) => (
+                      <div
+                        key={s.alias}
+                        className="flex items-center justify-between gap-2 px-3 py-2 text-[12.5px]"
                       >
-                        {deployingSsh === s.alias ? (
-                          <OrbitSpinner size={12} className="size-3" />
-                        ) : (
-                          <Radio className="size-3" />
-                        )}
-                        <span>Deploy</span>
-                      </Button>
-                    </div>
-                  ))}
+                        <div className="min-w-0 truncate">
+                          <span className="text-foreground font-medium">{s.alias}</span>
+                          <span className="selectable-text text-muted-foreground ml-2 font-mono text-[11.5px]">
+                            {s.display_target}
+                          </span>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-1.5">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="xs"
+                            disabled={deployingSsh !== null}
+                            onClick={() =>
+                              openRelayConfirm({
+                                kind: "deploy_cf",
+                                ssh: s,
+                                publicHostname: cfHostname.trim() || undefined,
+                                tunnelToken: cfTunnelToken.trim() || undefined,
+                              })
+                            }
+                            className="shrink-0 gap-1.5 text-[11.5px]"
+                          >
+                            {deployingSsh === s.alias ? (
+                              <OrbitSpinner size={12} className="size-3" />
+                            ) : (
+                              <Cloud className="size-3" />
+                            )}
+                            <span>{t("settings.deployCloudflareShort")}</span>
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="xs"
+                            disabled={deployingSsh !== null}
+                            onClick={() => openRelayConfirm({ kind: "deploy_ssh", ssh: s })}
+                            className="shrink-0 gap-1.5 text-[11.5px]"
+                          >
+                            {deployingSsh === s.alias ? (
+                              <OrbitSpinner size={12} className="size-3" />
+                            ) : (
+                              <Radio className="size-3" />
+                            )}
+                            <span>Deploy</span>
+                          </Button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="space-y-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowCfCustom((v) => !v)}
+                      className="text-muted-foreground hover:text-foreground inline-flex cursor-pointer items-center gap-1 text-[11.5px] font-medium transition-colors"
+                    >
+                      {showCfCustom ? (
+                        <ChevronDown className="size-3" />
+                      ) : (
+                        <ChevronRight className="size-3" />
+                      )}
+                      <span>{t("settings.deployCfCustomToggle")}</span>
+                    </button>
+
+                    {showCfCustom && (
+                      <div className="grid gap-2 sm:grid-cols-2">
+                        <Input
+                          type="text"
+                          value={cfHostname}
+                          onChange={(e) => setCfHostname(e.target.value)}
+                          {...ime.compositionProps}
+                          placeholder={t("settings.deployCfHostnamePlaceholder")}
+                          className="h-[32px] px-2.5 font-mono text-[12px]"
+                        />
+                        <Input
+                          type="password"
+                          value={cfTunnelToken}
+                          onChange={(e) => setCfTunnelToken(e.target.value)}
+                          {...ime.compositionProps}
+                          placeholder={t("settings.deployCfTokenPlaceholder")}
+                          className="h-[32px] px-2.5 font-mono text-[12px]"
+                        />
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
@@ -562,7 +656,9 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
               ? `Overwrite relay on all ${fleet.hosts.length} hosts?`
               : pendingRelayConfirm?.kind === "deploy_ssh"
                 ? `Deploy relay to ${pendingRelayConfirm.ssh.alias}?`
-                : ""
+                : pendingRelayConfirm?.kind === "deploy_cf"
+                  ? t("settings.deployCfConfirmTitle", { alias: pendingRelayConfirm.ssh.alias })
+                  : ""
         }
         description={
           pendingRelayConfirm?.kind === "clear"
@@ -571,7 +667,12 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
               ? "Replaces the saved relay endpoint across every host in your fleet. Hosts using a different relay will disconnect and reconnect through this URL."
               : pendingRelayConfirm?.kind === "deploy_ssh"
                 ? `Installs and starts an Orbit relay service on port 7878 over SSH, then overwrites the relay endpoint on all ${fleet.hosts.length} ${fleet.hosts.length === 1 ? "host" : "hosts"} in your fleet.`
-                : undefined
+                : pendingRelayConfirm?.kind === "deploy_cf"
+                  ? t("settings.deployCfConfirmDesc", {
+                      alias: pendingRelayConfirm.ssh.alias,
+                      count: fleet.hosts.length,
+                    })
+                  : undefined
         }
         detail={
           pendingRelayConfirm?.kind === "clear" && host.relay_url ? (
@@ -582,7 +683,8 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
             <span className="selectable-text font-mono text-[11.5px] break-all">
               {redactRelayForDisplay(pendingRelayConfirm.relayUrl)}
             </span>
-          ) : pendingRelayConfirm?.kind === "deploy_ssh" ? (
+          ) : pendingRelayConfirm?.kind === "deploy_ssh" ||
+            pendingRelayConfirm?.kind === "deploy_cf" ? (
             <span className="selectable-text font-mono text-[11.5px] break-all">
               {pendingRelayConfirm.ssh.alias} ({pendingRelayConfirm.ssh.display_target})
             </span>
@@ -603,6 +705,12 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
             await handleSaveRelay(true);
           } else if (pendingRelayConfirm.kind === "share_all") {
             await handleShareRelayAllHosts(pendingRelayConfirm.relayUrl);
+          } else if (pendingRelayConfirm.kind === "deploy_cf") {
+            await handleDeployCfRelay(
+              pendingRelayConfirm.ssh,
+              pendingRelayConfirm.publicHostname,
+              pendingRelayConfirm.tunnelToken,
+            );
           } else {
             await handleDeploySshRelay(pendingRelayConfirm.ssh);
           }

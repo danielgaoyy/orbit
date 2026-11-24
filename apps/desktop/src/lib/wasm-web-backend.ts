@@ -904,6 +904,52 @@ export class WasmWebBackend implements OrbitTransportBackend {
           backend_used: reply.backend_used,
         };
       }
+      case "get_fim_config": {
+        const reply = await this.rpc(h, "get_fim_config", {}, 10000);
+        return reply.config;
+      }
+      case "update_fim_config": {
+        const reply = await this.rpc(h, "update_fim_config", { config: a.config }, 10000);
+        return reply.config;
+      }
+      case "predict_inline_edit": {
+        const input = (a.input ?? {}) as Record<string, unknown>;
+        const reply = await this.rpc(
+          h,
+          "predict_inline_edit",
+          {
+            cwd: String(input.cwd ?? ""),
+            file_path: String(input.file_path ?? ""),
+            language: input.language ?? null,
+            prefix: String(input.prefix ?? ""),
+            suffix: String(input.suffix ?? ""),
+            cursor_line: Number(input.cursor_line ?? 1),
+            cursor_col: Number(input.cursor_col ?? 0),
+          },
+          7000,
+        );
+        return {
+          request_id: String(reply.request_id ?? ""),
+          completion: String(reply.completion ?? ""),
+          latency_ms: Number(reply.latency_ms ?? 0),
+          source: String(reply.source ?? "off"),
+        };
+      }
+      case "run_pr_patrol": {
+        const reply = await this.rpc(
+          h,
+          "run_pr_patrol",
+          {
+            cwd: String(a.cwd ?? ""),
+            base_ref: a.baseRef ?? null,
+            head_ref: a.headRef ?? null,
+            pr_number: a.prNumber ?? null,
+            post_github_comments: Boolean(a.postGithubComments),
+          },
+          130000,
+        );
+        return reply.report;
+      }
     }
     throw new Error("This action is unavailable in Orbit Web (" + cmd + ")");
   }

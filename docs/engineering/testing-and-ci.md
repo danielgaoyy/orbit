@@ -22,7 +22,7 @@
      此分片同时验证插件安装/启停/调用/条件 MCP 目录以及本地离线语音控制面端到端流程。
    - `Workspace Sync & Worktree`：`-p orbit-cli --test e2e_workspace_sync_and_worktree`
 3. **跨端构建与烟测任务**：
-   - `desktop-frontend-build`（`Desktop Frontend Typecheck & Build`）：Node unit tests + `npm run build` + `npm run test:smoke`
+   - `desktop-frontend-build`（`Desktop Frontend Typecheck & Build`）：Node unit tests + `npm run build` + `npm run test:smoke` + `apps/docs` Astro Starlight 双语文档站构建校验
    - `tauri-rust-check`（macOS）：Tauri crate fmt / clippy / tests
    - `windows-rust-and-desktop-check`（Windows）：`cargo build -p orbit-cli --bin orbit` + `cargo test --workspace -- --skip live_devbox_ssh_one_click_e2e` + Desktop check
    - `ios-build-and-simulator-smoke`（macOS）：XCFramework + `xcodegen` + 并行唤醒模拟器与单遍 Simulator `xcodebuild test` + Launch 截图烟测

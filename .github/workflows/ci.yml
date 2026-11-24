@@ -160,6 +160,11 @@ jobs:
           node --experimental-strip-types --test "src/**/*.test.ts"
           npm run build
           npm run test:smoke
+      - name: Build Bilingual Showcase & Docs Site (Astro Starlight)
+        working-directory: apps/docs
+        run: |
+          npm ci
+          npm run build
 
   ios-build-and-simulator-smoke:
     name: Native iOS Build & Simulator Launch Smoke Test

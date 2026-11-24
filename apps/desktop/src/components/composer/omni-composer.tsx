@@ -103,6 +103,35 @@ const TOKEN_GAP = 4;
 
 const IMAGE_URI_EXT_RE = /\.(png|jpe?g|webp|gif|bmp|svg|avif|ico)(?:[?#].*)?$/i;
 
+export function resolveComposerEnterAction(
+  e: Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "shiftKey" | "altKey">,
+  enterToSend: boolean,
+  isTurnBusy: boolean,
+): { submit: boolean; steerImmediately: boolean } {
+  if (e.key !== "Enter" || e.altKey) {
+    return { submit: false, steerImmediately: false };
+  }
+  const hasMod = e.metaKey || e.ctrlKey;
+  if (enterToSend) {
+    if (hasMod && !e.shiftKey) {
+      return { submit: true, steerImmediately: isTurnBusy };
+    }
+    if (!hasMod && !e.shiftKey) {
+      return { submit: true, steerImmediately: false };
+    }
+    return { submit: false, steerImmediately: false };
+  }
+  // enterToSend === false: Mod+Enter is the primary Send/Queue shortcut (never force-steer);
+  // Mod+Shift+Enter performs force-steer.
+  if (hasMod && e.shiftKey) {
+    return { submit: true, steerImmediately: true };
+  }
+  if (hasMod && !e.shiftKey) {
+    return { submit: true, steerImmediately: false };
+  }
+  return { submit: false, steerImmediately: false };
+}
+
 function clipboardPayloadToFile(payload: ClipboardImagePayload): File {
   const binary = window.atob(payload.data_b64);
   const bytes = new Uint8Array(binary.length);
@@ -646,19 +675,29 @@ export const OmniComposer = memo(function OmniComposer({
   const triggerSubmit = useCallback(
     (steerImmediately: boolean) => {
       if (!hasPayload) return;
+      const reportSubmitRejection = (err: unknown) => {
+        const detail = err instanceof Error ? err.message : String(err);
+        const trimmed = detail.trim();
+        orbitActions.showToast(
+          trimmed ? `${t("common.actionFailed")} (${trimmed})` : t("common.actionFailed"),
+        );
+      };
       if (localSubmission) {
         setHistoryCursor(null);
-        void orbitActions.submitComposer();
+        void orbitActions.submitComposer().catch(reportSubmitRejection);
         return;
       }
       if (isSubmitting) return;
       setIsSubmitting(true);
       setHistoryCursor(null);
-      void orbitActions.submitComposer(steerImmediately).finally(() => {
-        setIsSubmitting(false);
-      });
+      void orbitActions
+        .submitComposer(steerImmediately)
+        .catch(reportSubmitRejection)
+        .finally(() => {
+          setIsSubmitting(false);
+        });
     },
-    [hasPayload, isSubmitting, localSubmission],
+    [hasPayload, isSubmitting, localSubmission, t],
   );
 
   const handleSelectMode = useCallback(
@@ -1195,18 +1234,11 @@ export const OmniComposer = memo(function OmniComposer({
       }
     }
 
-    if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey) {
+    const enterAction = resolveComposerEnterAction(e, enterToSend, isTurnBusy);
+    if (enterAction.submit) {
       e.preventDefault();
-      triggerSubmit(isTurnBusy);
+      triggerSubmit(enterAction.steerImmediately);
       return;
-    }
-
-    if (enterToSend) {
-      if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
-        e.preventDefault();
-        triggerSubmit(false);
-        return;
-      }
     }
   };
 
@@ -1240,12 +1272,13 @@ export const OmniComposer = memo(function OmniComposer({
   const showStopButton = isTurnBusy && !hasPayload && Boolean(selectedAgentId);
   const waitingForUpload = hasUploadingAttachment && !localSubmission;
   const submitBusy = !localSubmission && (isSubmitting || hasUploadingAttachment);
+  const steerShortcut = enterToSend ? `${mod}↵` : mod === "⌘" ? "⌘⇧↵" : `${mod}Shift+↵`;
   const submitTooltipLabel = waitingForUpload
     ? t("composer.uploadingAttachments")
     : isSubmitting && !localSubmission
       ? t("composer.sendingPrompt")
       : isTurnBusy && !localSubmission
-        ? t("composer.queueFollowUpHint", { shortcut: `${mod}↵` })
+        ? t("composer.queueFollowUpHint", { shortcut: steerShortcut })
         : t("common.send");
   const submitShortcut = submitBusy ? undefined : enterToSend ? "↵" : `${mod}↵`;
 
@@ -1273,7 +1306,7 @@ export const OmniComposer = memo(function OmniComposer({
         break;
     }
     if (isForegroundRunning) {
-      return t("composer.placeholderRunning", { shortcut: `${mod}↵` });
+      return t("composer.placeholderRunning", { shortcut: steerShortcut });
     }
     if (!isDraft && hasCurrentAgent) {
       return t("composer.placeholderFollowUp");
@@ -1352,14 +1385,18 @@ export const OmniComposer = memo(function OmniComposer({
             data-dock-active={hasPendingDecisions ? "true" : undefined}
             className={cn(
               "composer-surface relative rounded-[20px]",
-              isDraggingOver && "ring-primary/25 border-primary ring-2",
+              isDraggingOver && "ring-signal-info/25 border-signal-info ring-2",
             )}
           >
-            {isDraggingOver && (
-              <div className="bg-surface-base/85 text-ink-primary pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-[20px] text-[13px] font-medium backdrop-blur-[2px]">
-                {t("composer.dropToAttach")}
-              </div>
-            )}
+            <div
+              aria-hidden={!isDraggingOver}
+              className={cn(
+                "bg-surface-base/85 text-ink-primary pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-[20px] text-[13px] font-medium backdrop-blur-[2px] transition-opacity duration-[140ms] ease-[var(--ease-out-quart)] select-none",
+                isDraggingOver ? "opacity-100" : "opacity-0",
+              )}
+            >
+              {t("composer.dropToAttach")}
+            </div>
 
             {/* Unified Context Tray — strictly for uploaded files/images, diff quotes & large pastes */}
             <ContextTray contexts={contexts} quotes={quotes} pastes={pastes} />
@@ -1474,6 +1511,15 @@ const ComposerBottomBar = memo(function ComposerBottomBar({
   onAttach, onMention, onSlash, onSelectMode, onSubmit,
 }: ComposerBottomBarProps) {
   const { t } = useI18n();
+  const actionMode: "stop" | "submitting" | "send" = showStopButton
+    ? "stop"
+    : submitBusy
+      ? "submitting"
+      : "send";
+  const actionLabel = showStopButton ? t("composer.stopGeneration") : submitTooltipLabel;
+  const actionShortcut = showStopButton ? "Esc Esc" : submitShortcut;
+  const actionDisabled = !showStopButton && (!hasPayload || submitBusy);
+
   return (
     <div className="flex items-center justify-between gap-2 px-2.5 pt-2 pb-2">
       <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-hidden">
@@ -1523,7 +1569,7 @@ const ComposerBottomBar = memo(function ComposerBottomBar({
         <ComposerModelPicker />
       </div>
 
-      {/* Right Cluster: Ambient Context Ring + Access Permissions + Stationary Single `34×34` Action Circle */}
+      {/* Right Cluster: Ambient Context Ring + Access Permissions + Stationary Single `size-8.5` Action Circle */}
       <div className="flex shrink-0 items-center gap-1">
         <ContextOccupancyPill />
         <ComposerModePicker
@@ -1533,54 +1579,75 @@ const ComposerBottomBar = memo(function ComposerBottomBar({
           iconOnly={isCompactBar}
         />
 
-        {showStopButton ? (
-          <SimpleTooltip
-            label={t("composer.stopGeneration")}
-            shortcut="Esc Esc"
-            side="top"
-          >
-            <button
-              type="button"
-              aria-label={t("composer.stopGeneration")}
-              onClick={() => {
+        <SimpleTooltip
+          label={actionLabel}
+          shortcut={actionShortcut}
+          side="top"
+        >
+          <button
+            type="button"
+            disabled={actionDisabled}
+            aria-busy={!showStopButton && submitBusy}
+            aria-label={actionLabel}
+            onClick={() => {
+              if (showStopButton) {
                 if (selectedAgentId) {
                   void orbitIpc.interruptAgent(selectedHostId, selectedAgentId);
                 }
-              }}
-              className="orbit-press bg-surface-recessed hover:bg-accent inline-flex size-[34px] shrink-0 cursor-pointer items-center justify-center rounded-full"
-            >
-              <span className="bg-signal-danger size-[11px] rounded-[2.5px]" />
-            </button>
-          </SimpleTooltip>
-        ) : (
-          <SimpleTooltip
-            label={submitTooltipLabel}
-            shortcut={submitShortcut}
-            side="top"
-          >
-            <button
-              type="button"
-              disabled={!hasPayload || submitBusy}
-              aria-busy={submitBusy}
-              aria-label={submitTooltipLabel}
-              onClick={onSubmit}
-              className={cn(
-                "orbit-press inline-flex size-[34px] shrink-0 cursor-pointer items-center justify-center rounded-full",
-                hasPayload && !submitBusy
+                return;
+              }
+              onSubmit();
+            }}
+            className={cn(
+              "orbit-press inline-flex size-8.5 shrink-0 cursor-pointer items-center justify-center rounded-full",
+              showStopButton
+                ? "bg-surface-recessed hover:bg-accent"
+                : hasPayload && !submitBusy
                   ? "bg-action-primary-bg text-action-primary-fg hover:bg-action-primary-hover"
                   : submitBusy
                     ? "bg-action-primary-bg text-action-primary-fg opacity-80"
                     : "text-ink-muted bg-surface-recessed pointer-events-none opacity-65",
-              )}
-            >
-              {submitBusy ? (
-                <OrbitSpinner size={15} className="shrink-0" />
-              ) : (
-                <ArrowUp className="size-[17px] stroke-[2.15]" />
-              )}
-            </button>
-          </SimpleTooltip>
-        )}
+            )}
+          >
+            <span className="relative flex size-4 items-center justify-center">
+              <ArrowUp
+                aria-hidden="true"
+                className={cn(
+                  "absolute size-[17px] stroke-[2.15] transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)]",
+                  actionMode === "send"
+                    ? "scale-100 opacity-100"
+                    : "pointer-events-none scale-75 opacity-0",
+                )}
+              />
+              <span
+                aria-hidden="true"
+                className={cn(
+                  "bg-signal-danger absolute size-[11px] rounded-[2.5px] transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)]",
+                  actionMode === "stop"
+                    ? "scale-100 opacity-100"
+                    : "pointer-events-none scale-75 opacity-0",
+                )}
+              />
+              <span
+                aria-hidden="true"
+                className={cn(
+                  "absolute flex items-center justify-center transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)]",
+                  actionMode === "submitting"
+                    ? "scale-100 opacity-100"
+                    : "pointer-events-none scale-75 opacity-0",
+                )}
+              >
+                <OrbitSpinner
+                  size={15}
+                  className={cn(
+                    "shrink-0",
+                    actionMode !== "submitting" && "[animation-play-state:paused]",
+                  )}
+                />
+              </span>
+            </span>
+          </button>
+        </SimpleTooltip>
       </div>
     </div>
   );

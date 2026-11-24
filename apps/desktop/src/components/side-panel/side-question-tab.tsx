@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef } from "react";
-import { AlertTriangle, ArrowUpRight, Loader2, Plus, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowUpRight, Plus, Trash2 } from "lucide-react";
 import { ComposerModePicker } from "@/components/composer/composer-mode-picker";
 import { ComposerModelPicker } from "@/components/composer/composer-model-picker";
 import { ConversationComposer } from "@/components/conversation/conversation-composer";
@@ -9,6 +9,7 @@ import {
   ConversationViewport,
 } from "@/components/conversation/conversation-viewport";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { formatProviderLabel, type SessionMode } from "@/lib/orbit-ipc";
 import {
   type SideQuestionEntry,
@@ -111,7 +112,7 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
                     key={prompt}
                     type="button"
                     onClick={() => void orbitActions.submitSideQuestion(prompt)}
-                    className="border-border/80 bg-elevated/45 text-foreground/80 hover:border-foreground/20 hover:bg-accent/70 hover:text-foreground inline-flex max-w-full cursor-pointer items-center rounded-full border px-3 py-1 text-[12px] transition-colors"
+                    className="border-border/80 bg-elevated/45 text-foreground/80 hover:border-foreground/20 hover:bg-accent/70 hover:text-foreground inline-flex max-w-full cursor-pointer items-center rounded-full border px-3 py-1 text-[13px] leading-[18px] transition-colors"
                   >
                     <span className="truncate">{prompt}</span>
                   </button>
@@ -132,8 +133,8 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
                 {/* Assistant Side Answer (full primary conversation typography) */}
                 <div className="space-y-2">
                   {entry.status === "streaming" && !entry.answer ? (
-                    <div className="text-muted-foreground flex items-center gap-2 py-1 text-[13.5px]">
-                      <Loader2 className="h-[14px] w-[14px] animate-spin" />
+                    <div className="text-ink-tertiary flex items-center gap-2 py-1 text-[13px]">
+                      <OrbitSpinner size={13} className="shrink-0" />
                       <span className="agent-text-shimmer">
                         Thinking with {entry.providerLabel}…
                       </span>
@@ -141,22 +142,22 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
                   ) : (
                     <>
                       {entry.answer && (
-                        <div className="min-w-0 text-[14.5px] leading-[1.68]">
+                        <div className="min-w-0 text-[15px] leading-[1.65]">
                           {entry.blocks.length > 0 ? (
                             <MarkdownBlocksView
                               blocks={entry.blocks}
                               streaming={entry.status === "streaming"}
                             />
                           ) : (
-                            <div className="selectable-text text-foreground/92 leading-[1.68] whitespace-pre-wrap">
+                            <div className="selectable-text text-foreground/92 leading-[1.65] whitespace-pre-wrap">
                               {entry.answer}
                             </div>
                           )}
                         </div>
                       )}
                       {entry.error && (
-                        <div className="border-rose-500/25 bg-rose-500/[0.05] text-foreground/85 flex items-start gap-2 rounded-xl border px-3 py-2 text-[12.5px]">
-                          <AlertTriangle className="mt-0.5 h-[14px] w-[14px] shrink-0 text-rose-500" />
+                        <div className="border-signal-danger-border bg-signal-danger-bg text-ink-primary flex items-start gap-2 rounded-xl border px-3 py-2 text-[13px] leading-[1.45]">
+                          <AlertTriangle className="text-signal-danger mt-0.5 size-3.5 shrink-0" />
                           <span className="selectable-text break-words">{entry.error}</span>
                         </div>
                       )}
@@ -175,10 +176,10 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
                               `Regarding "${entry.question}":\n${entry.answer}`,
                             )
                           }
-                          className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-md px-1.5 py-0.5 text-[11.5px] transition-colors"
+                          className="text-ink-tertiary hover:text-ink-primary hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-[6px] px-1.5 py-0.5 text-[11px] transition-colors"
                         >
                           <span>Send to main chat</span>
-                          <ArrowUpRight className="h-[12px] w-[12px]" />
+                          <ArrowUpRight className="size-3" />
                         </button>
                       }
                     />

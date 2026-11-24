@@ -1,14 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { Archive, ArrowUpRight, RotateCcw, Search, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Input } from "@/components/ui/input";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog-tabs";
 import {
   HostStatusIndicator,
   SettingCard,
@@ -66,7 +60,6 @@ export function ArchivedSection() {
   const [selectedProject, setSelectedProject] = useState<string>("__all__");
   const [confirmDeleteKey, setConfirmDeleteKey] = useState<string | null>(null);
   const [emptyDialogOpen, setEmptyDialogOpen] = useState(false);
-  const [emptying, setEmptying] = useState(false);
 
   const nowMs = useSidebarRelativeClock(true);
   const multiHostMode = fleet.hosts.length > 1;
@@ -170,16 +163,10 @@ export function ArchivedSection() {
   }, [filteredEntries, nowMs]);
 
   const handleEmptyArchive = async () => {
-    if (emptying || allEntries.length === 0) return;
-    setEmptying(true);
-    try {
-      await orbitActions.deleteArchivedThreadsBatch(
-        allEntries.map((item) => ({ hostId: item.hostId, agentId: item.agent.agent_id })),
-      );
-      setEmptyDialogOpen(false);
-    } finally {
-      setEmptying(false);
-    }
+    if (allEntries.length === 0) return;
+    await orbitActions.deleteArchivedThreadsBatch(
+      allEntries.map((item) => ({ hostId: item.hostId, agentId: item.agent.agent_id })),
+    );
   };
 
   return (
@@ -414,53 +401,26 @@ export function ArchivedSection() {
       )}
 
       {/* Empty Archive Confirmation Dialog */}
-      <Dialog
+      <ConfirmDialog
         open={emptyDialogOpen}
-        onOpenChange={(open) => {
-          if (!open && !emptying) setEmptyDialogOpen(false);
-        }}
-      >
-        <DialogContent className="max-w-md gap-4 p-5 select-none">
-          <DialogHeader className="gap-1.5 pr-6">
-            <DialogTitle className="text-[15.5px]">Empty Archive</DialogTitle>
-            <DialogDescription className="text-foreground/80 text-[13.5px] leading-relaxed">
-              Permanently delete{" "}
-              <strong className="text-foreground font-semibold">
-                {allEntries.length === 1
-                  ? "1 archived conversation"
-                  : `${allEntries.length} archived conversations`}
-              </strong>
-              ? This action cannot be undone.
-            </DialogDescription>
-          </DialogHeader>
-
-          <p className="text-muted-foreground text-[12.5px]">
-            Project files on disk will not be affected.
-          </p>
-
-          <div className="flex justify-end gap-2.5 pt-1">
-            <Button
-              type="button"
-              variant="secondary"
-              size="sm"
-              disabled={emptying}
-              onClick={() => setEmptyDialogOpen(false)}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              variant="destructive"
-              size="sm"
-              autoFocus
-              disabled={emptying}
-              onClick={() => void handleEmptyArchive()}
-            >
-              {emptying ? "Deleting…" : "Delete All"}
-            </Button>
-          </div>
-        </DialogContent>
-      </Dialog>
+        onOpenChange={setEmptyDialogOpen}
+        tone="danger"
+        title="Empty Archive"
+        description={
+          <>
+            Permanently delete{" "}
+            <strong className="text-foreground font-semibold">
+              {allEntries.length === 1
+                ? "1 archived conversation"
+                : `${allEntries.length} archived conversations`}
+            </strong>
+            ? This action cannot be undone.
+          </>
+        }
+        detail="Project files on disk will not be affected."
+        confirmLabel="Delete All"
+        onConfirm={handleEmptyArchive}
+      />
     </div>
   );
 }

@@ -43,6 +43,7 @@ export interface OrbitLinkOpener {
       hostId?: string;
       cwd?: string;
       fallbackPath?: string;
+      intent?: "hover" | "press";
     },
   ) => void;
   openBrowser: (url: string) => void;
@@ -512,9 +513,12 @@ export function openOrbitLink(rawHref: string, opts?: OpenOrbitLinkOptions): boo
 }
 
 /**
- * Silently warms the file cache on link hover so clicking opens the side panel instantaneously.
+ * Silently warms the file cache on link hover or pointer-down so clicking opens the side panel instantaneously.
  */
-export function prefetchOrbitLink(rawHref: string, opts?: OpenOrbitLinkOptions): void {
+export function prefetchOrbitLink(
+  rawHref: string,
+  opts?: OpenOrbitLinkOptions & { intent?: "hover" | "press" },
+): void {
   if (!registeredOpener?.prefetchFile) return;
   const target = parseOrbitLinkTarget(rawHref);
   if (!target || target.kind !== "file") return;
@@ -534,5 +538,6 @@ export function prefetchOrbitLink(rawHref: string, opts?: OpenOrbitLinkOptions):
     hostId: opts?.hostId,
     cwd: opts?.cwd,
     fallbackPath,
+    intent: opts?.intent,
   });
 }

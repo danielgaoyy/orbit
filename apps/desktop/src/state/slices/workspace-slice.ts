@@ -16,8 +16,13 @@ import {
   computeEqualizedSidePanelWidth,
 } from "@/lib/workspace-layout";
 import {
+  MAX_CONCURRENT_FILE_PREFETCHES,
+  isHeavyHoverPrefetchPath,
+} from "@/lib/file-prefetch";
+import {
   type ExternalEditorKind,
   type GitReviewView,
+  type WorkspaceFileView,
   formatProviderLabel,
   type ProviderKind,
   type SpawnWorkspacePeerRequest,
@@ -34,7 +39,6 @@ import {
   normalizeEditorText,
   normalizeLineEndingKind,
   sideQuestionScopeKey,
-  upsertLruRecord,
 } from "../store-helpers";
 import type { OrbitStoreContext } from "../store-runtime";
 import type {
@@ -57,11 +61,148 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     setState,
   } = ctx;
 
-  const prefetchInFlightFileKeys = new Set<string>();
+  const inFlightFileReads = new Map<string, Promise<WorkspaceFileView>>();
+  const inFlightPrefetchKeys = new Set<string>();
   const cancelledSideQuestionIds = new Set<string>();
   let nextFileFocusNonce = 1;
 
+  function isUnchangedWorkspaceFileView(
+    prev: WorkspaceFileView,
+    next: WorkspaceFileView,
+  ): boolean {
+    if (
+      prev.resolved_path !== next.resolved_path ||
+      prev.content_kind !== next.content_kind ||
+      prev.size_bytes !== next.size_bytes ||
+      prev.truncated !== next.truncated ||
+      prev.writable !== next.writable ||
+      prev.line_ending !== next.line_ending
+    ) {
+      return false;
+    }
+    if (prev.etag && next.etag) {
+      return prev.etag === next.etag;
+    }
+    return prev.mtime_unix_ms === next.mtime_unix_ms && prev.content === next.content;
+  }
+
+  function startOrJoinFileRead(
+    cKey: string,
+    hostId: string,
+    cwd: string,
+    path: string,
+    forceReload: boolean,
+  ): Promise<WorkspaceFileView> {
+    if (!forceReload) {
+      const existing = inFlightFileReads.get(cKey);
+      if (existing) return existing;
+    }
+    const promise = orbitIpc.readWorkspaceFile(hostId, cwd, path);
+    inFlightFileReads.set(cKey, promise);
+    void promise.finally(() => {
+      if (inFlightFileReads.get(cKey) === promise) {
+        inFlightFileReads.delete(cKey);
+      }
+    });
+    return promise;
+  }
+
+  function commitReadyFileView(
+    s: ReturnType<typeof getState>,
+    cKey: string,
+    data: WorkspaceFileView,
+  ): ReturnType<typeof getState> {
+    const prevEntry = s.fileViewCache[cKey];
+    if (
+      prevEntry?.status === "ready" &&
+      prevEntry.data &&
+      isUnchangedWorkspaceFileView(prevEntry.data, data)
+    ) {
+      if (!prevEntry.stale) {
+        return s;
+      }
+      return {
+        ...s,
+        fileViewCache: {
+          ...s.fileViewCache,
+          [cKey]: { status: "ready", data: prevEntry.data },
+        },
+      };
+    }
+
+    // Maintain a bounded LRU file cache capped by BOTH 20 entries and ~64 MiB total memory
+    // (so repeated 25 MiB PDF/video previews never blow renderer RAM), while never evicting
+    // files with active editor drafts.
+    const nextEntry: FileViewCacheEntry = { status: "ready", data };
+    const pinnedEntries: Array<[string, FileViewCacheEntry]> = [];
+    const evictableEntries: Array<[string, FileViewCacheEntry]> = [];
+    for (const [k, v] of Object.entries(s.fileViewCache)) {
+      if (k === cKey) continue;
+      if (k in s.fileEditorDrafts) {
+        pinnedEntries.push([k, v]);
+      } else {
+        evictableEntries.push([k, v]);
+      }
+    }
+    let totalBytes = estimateFileCacheEntryBytes(nextEntry);
+    for (const [, v] of pinnedEntries) {
+      totalBytes += estimateFileCacheEntryBytes(v);
+    }
+    const maxEvictable = Math.max(0, MAX_FILE_CACHE_ENTRIES - 1 - pinnedEntries.length);
+    const keptReverse: Array<[string, FileViewCacheEntry]> = [];
+    for (let i = evictableEntries.length - 1; i >= 0; i -= 1) {
+      if (keptReverse.length >= maxEvictable) break;
+      const [k, v] = evictableEntries[i];
+      const entryBytes = estimateFileCacheEntryBytes(v);
+      if (totalBytes + entryBytes > MAX_FILE_CACHE_BYTES) continue;
+      totalBytes += entryBytes;
+      keptReverse.push([k, v]);
+    }
+    keptReverse.reverse();
+    const nextCache: Record<string, FileViewCacheEntry> = {};
+    for (const [k, v] of pinnedEntries) {
+      nextCache[k] = v;
+    }
+    for (const [k, v] of keptReverse) {
+      nextCache[k] = v;
+    }
+    nextCache[cKey] = nextEntry;
+
+    // If this file is currently open in Edit mode with no unsaved changes, keep its draft synced with disk
+    let nextDrafts = s.fileEditorDrafts;
+    const existingDraft = s.fileEditorDrafts[cKey];
+    if (existingDraft && !existingDraft.dirty && data.content_kind === "text") {
+      const normalized = normalizeEditorText(data.content);
+      nextDrafts = {
+        ...s.fileEditorDrafts,
+        [cKey]: {
+          ...existingDraft,
+          content: normalized,
+          baseContent: normalized,
+          baseEtag: data.etag ?? null,
+          lineEnding: normalizeLineEndingKind(data.line_ending),
+          conflict: null,
+          saveError: null,
+        },
+      };
+    }
+    return {
+      ...s,
+      fileViewCache: nextCache,
+      fileEditorDrafts: nextDrafts,
+    };
+  }
+
+  async function hydrateSubagentStage(hostId: string, agentId: string): Promise<void> {
+    if (!getState().stages[`${hostId}::${agentId}`]?.turns.length) {
+      void ctx.actions.pullStageDelta(hostId, agentId, true).catch(() => undefined);
+    }
+    await orbitIpc.openAgentTimeline(hostId, agentId);
+    await ctx.actions.pullStageDelta(hostId, agentId, false);
+  }
+
   return {
+    hydrateSubagentStage,
 
 
     // =========================================================================
@@ -69,7 +210,8 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     // =========================================================================
 
     toggleSidePanel(openOverride?: boolean): void {
-      const nextOpen = openOverride ?? !getState().sidePanelOpen;
+      const wasOpen = getState().sidePanelOpen;
+      const nextOpen = openOverride ?? !wasOpen;
 
       setState((s) => {
         let nextSidebarOpen = s.sidebarOpen;
@@ -102,34 +244,20 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       });
 
       const afterToggle = getState();
+      if (nextOpen && !wasOpen) {
+        const tab = afterToggle.sidePanelTabs.find((t) => t.id === afterToggle.activeSidePanelTabId);
+        const hostId = tab?.hostId ?? afterToggle.selectedHostId;
+        if (tab?.kind === "subagent" && tab.childAgentId && hostId) {
+          void hydrateSubagentStage(hostId, tab.childAgentId).catch(() => undefined);
+        }
+      }
       if (nextOpen && afterToggle.selectedHostId && afterToggle.selectedWorkspaceCwd) {
         void ctx.actions.ensureWorkspaceFiles(afterToggle.selectedHostId, afterToggle.selectedWorkspaceCwd);
       }
     },
 
 
-    openSidePanelNewTab(opts?: { skipUnsavedGuard?: boolean }): void {
-      if (!opts?.skipUnsavedGuard) {
-        const activeTab = getState().sidePanelTabs.find((t) => t.id === getState().activeSidePanelTabId);
-        if (getState().sidePanelOpen && activeTab?.kind === "file" && activeTab.filePath) {
-          const activeKey = fileCacheKey(
-            activeTab.hostId ?? getState().selectedHostId ?? "",
-            activeTab.cwd ?? getState().selectedWorkspaceCwd ?? "~",
-            activeTab.filePath,
-          );
-          if (getState().fileEditorDrafts[activeKey]?.dirty) {
-            setState((s) => ({
-              ...s,
-              pendingUnsavedFileAction: {
-                fileKey: activeKey,
-                label: "Open new tab",
-                action: { kind: "new_tab" },
-              },
-            }));
-            return;
-          }
-        }
-      }
+    openSidePanelNewTab(_opts?: { skipUnsavedGuard?: boolean }): void {
       setState((s) => {
         const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
         return {
@@ -183,7 +311,14 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
         for (const k of matchingKeys) {
           if (k !== activeFileKey && !s.fileEditorDrafts[k]?.dirty) {
             bumpFileLoadSeq(k);
-            delete nextCache[k];
+            inFlightFileReads.delete(k);
+            const cur = nextCache[k];
+            if (cur?.status === "ready" && cur.data) {
+              // Keep cached content warm for instant stale-while-revalidate on next open
+              nextCache[k] = { status: "ready", data: cur.data, stale: true };
+            } else {
+              delete nextCache[k];
+            }
           }
         }
         return { ...s, fileViewCache: nextCache };
@@ -204,30 +339,9 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     },
 
 
-    focusSidePanelTab(tabId: string, opts?: { skipUnsavedGuard?: boolean }): void {
+    focusSidePanelTab(tabId: string, _opts?: { skipUnsavedGuard?: boolean }): void {
       const target = getState().sidePanelTabs.find((t) => t.id === tabId);
       if (!target) return;
-      if (!opts?.skipUnsavedGuard && getState().activeSidePanelTabId !== tabId) {
-        const activeTab = getState().sidePanelTabs.find((t) => t.id === getState().activeSidePanelTabId);
-        if (getState().sidePanelOpen && activeTab?.kind === "file" && activeTab.filePath) {
-          const activeKey = fileCacheKey(
-            activeTab.hostId ?? getState().selectedHostId ?? "",
-            activeTab.cwd ?? getState().selectedWorkspaceCwd ?? "~",
-            activeTab.filePath,
-          );
-          if (getState().fileEditorDrafts[activeKey]?.dirty) {
-            setState((s) => ({
-              ...s,
-              pendingUnsavedFileAction: {
-                fileKey: activeKey,
-                label: `Switch to ${target.title}`,
-                action: { kind: "focus_tab", tabId },
-              },
-            }));
-            return;
-          }
-        }
-      }
       setState((s) => {
         const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
         const nextTerminalFocused =
@@ -270,17 +384,8 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
         }
       } else if (target.kind === "subagent") {
         const subHostId = target.hostId ?? afterFocus.selectedHostId;
-        const parentHostId = afterFocus.selectedHostId ?? subHostId;
-        const parentAgentId = target.parentAgentId ?? afterFocus.selectedAgentId;
         if (subHostId && target.childAgentId) {
-          void orbitIpc.openAgentTimeline(subHostId, target.childAgentId);
-          void ctx.actions.pullStageDelta(subHostId, target.childAgentId, false);
-        } else if (parentHostId && parentAgentId && target.providerSubagentId) {
-          void ctx.actions.openProviderSubagentTimeline(
-            parentHostId,
-            parentAgentId,
-            target.providerSubagentId,
-          );
+          void hydrateSubagentStage(subHostId, target.childAgentId).catch(() => undefined);
         }
       }
     },
@@ -491,40 +596,6 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       const tabId = `tab:file:${hostId}::${cwd}::${cleanPath}`;
       const title = basenameFromPath(cleanPath) || cleanPath;
 
-      if (!opts?.skipUnsavedGuard && getState().activeSidePanelTabId !== tabId) {
-        const activeTab = getState().sidePanelTabs.find((t) => t.id === getState().activeSidePanelTabId);
-        if (getState().sidePanelOpen && activeTab?.kind === "file" && activeTab.filePath) {
-          const activeKey = fileCacheKey(
-            activeTab.hostId ?? getState().selectedHostId ?? "",
-            activeTab.cwd ?? getState().selectedWorkspaceCwd ?? "~",
-            activeTab.filePath,
-          );
-          if (getState().fileEditorDrafts[activeKey]?.dirty) {
-            setState((s) => ({
-              ...s,
-              quickOpenFilesOpen: false,
-              pendingUnsavedFileAction: {
-                fileKey: activeKey,
-                label: `Open ${title}`,
-                action: {
-                  kind: "open_file",
-                  rawPath,
-                  opts: {
-                    focusLine: opts?.focusLine,
-                    focusEndLine: opts?.focusEndLine,
-                    hostId: opts?.hostId,
-                    cwd: opts?.cwd,
-                    fallbackPath: opts?.fallbackPath,
-                    initialMode: opts?.initialMode,
-                  },
-                },
-              },
-            }));
-            return;
-          }
-        }
-      }
-
       setState((s) => {
         const existingIdx = s.sidePanelTabs.findIndex((t) => t.id === tabId);
         let nextTabs = s.sidePanelTabs;
@@ -668,50 +739,49 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
 
     prefetchWorkspaceFile(
       rawPath: string,
-      opts?: { hostId?: string; cwd?: string; fallbackPath?: string },
+      opts?: { hostId?: string; cwd?: string; fallbackPath?: string; intent?: "hover" | "press" },
     ): void {
       const hostId = opts?.hostId ?? getState().selectedHostId;
       const cwd = opts?.cwd ?? getState().selectedWorkspaceCwd ?? "~";
       const normalizedCandidate = normalizeWorkspacePathCandidate(rawPath, cwd);
       if (!hostId || !normalizedCandidate) return;
 
+      const intent = opts?.intent ?? "hover";
       const cachedFiles = getState().workspaceFilesCache[`${hostId}::${cwd}`];
       const resolvedFromCache =
         !normalizedCandidate.startsWith("/") && !normalizedCandidate.startsWith("~/")
           ? resolveUniqueWorkspaceFileSuffix(normalizedCandidate, cachedFiles)
           : null;
       const cleanPath = resolvedFromCache ?? normalizedCandidate;
+      if (intent === "hover") {
+        if (isHeavyHoverPrefetchPath(cleanPath)) return;
+        if (inFlightPrefetchKeys.size >= MAX_CONCURRENT_FILE_PREFETCHES) return;
+      }
+
       const cKey = fileCacheKey(hostId, cwd, cleanPath);
       const existing = getState().fileViewCache[cKey];
       if (
         existing?.status === "loading" ||
-        existing?.status === "ready" ||
-        prefetchInFlightFileKeys.has(cKey)
+        (existing?.status === "ready" && !existing.stale) ||
+        inFlightFileReads.has(cKey)
       ) {
         return;
       }
 
-      prefetchInFlightFileKeys.add(cKey);
-      // Warm quietly in background without touching side-panel state or showing loading spinners
-      void orbitIpc
-        .readWorkspaceFile(hostId, cwd, cleanPath)
+      const baseSeq = fileLoadSeqByKey.get(cKey) ?? 0;
+      inFlightPrefetchKeys.add(cKey);
+      // Warm quietly in background without touching side-panel state or showing loading spinners;
+      // clicking mid-prefetch joins this exact in-flight Promise via `inFlightFileReads`.
+      void startOrJoinFileRead(cKey, hostId, cwd, cleanPath, false)
         .then((data) => {
-          if (getState().fileViewCache[cKey]?.status === "ready") return;
-          setState((s) => ({
-            ...s,
-            fileViewCache: upsertLruRecord(
-              s.fileViewCache,
-              cKey,
-              { status: "ready", data },
-              MAX_FILE_CACHE_ENTRIES,
-            ),
-          }));
+          if ((fileLoadSeqByKey.get(cKey) ?? 0) !== baseSeq) return;
+          setState((s) => commitReadyFileView(s, cKey, data));
         })
         .catch(() => {
           // Ignore silent prefetch misses; real click handles fallback path resolution
         })
         .finally(() => {
-          prefetchInFlightFileKeys.delete(cKey);
+          inFlightPrefetchKeys.delete(cKey);
         });
     },
 
@@ -724,87 +794,40 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
     ): Promise<void> {
       const cKey = fileCacheKey(hostId, cwd, path);
       const existing = getState().fileViewCache[cKey];
-      if (!forceReload && (existing?.status === "loading" || existing?.status === "ready")) {
+      if (!forceReload && existing?.status === "ready" && !existing.stale) {
+        return;
+      }
+      if (!forceReload && existing?.status === "loading") {
+        const pending = inFlightFileReads.get(cKey);
+        if (pending) {
+          await pending.catch(() => undefined);
+        }
         return;
       }
 
+      const isSilentRevalidate =
+        !forceReload &&
+        existing?.status === "ready" &&
+        Boolean(existing.data) &&
+        Boolean(existing.stale);
+
       const loadSeq = bumpFileLoadSeq(cKey);
-      setState((s) => ({
-        ...s,
-        fileViewCache: {
-          ...s.fileViewCache,
-          [cKey]: { status: "loading", data: existing?.data },
-        },
-      }));
+      if (!isSilentRevalidate) {
+        setState((s) => ({
+          ...s,
+          fileViewCache: {
+            ...s.fileViewCache,
+            [cKey]: { status: "loading", data: existing?.data },
+          },
+        }));
+      }
 
       try {
-        const data = await orbitIpc.readWorkspaceFile(hostId, cwd, path);
+        const data = await startOrJoinFileRead(cKey, hostId, cwd, path, forceReload);
         if (fileLoadSeqByKey.get(cKey) !== loadSeq) {
           return;
         }
-        setState((s) => {
-          // Maintain a bounded LRU file cache capped by BOTH 20 entries and ~64 MiB total memory
-          // (so repeated 25 MiB PDF/video previews never blow renderer RAM), while never evicting
-          // files with active editor drafts.
-          const nextEntry: FileViewCacheEntry = { status: "ready", data };
-          const pinnedEntries: Array<[string, FileViewCacheEntry]> = [];
-          const evictableEntries: Array<[string, FileViewCacheEntry]> = [];
-          for (const [k, v] of Object.entries(s.fileViewCache)) {
-            if (k === cKey) continue;
-            if (k in s.fileEditorDrafts) {
-              pinnedEntries.push([k, v]);
-            } else {
-              evictableEntries.push([k, v]);
-            }
-          }
-          let totalBytes = estimateFileCacheEntryBytes(nextEntry);
-          for (const [, v] of pinnedEntries) {
-            totalBytes += estimateFileCacheEntryBytes(v);
-          }
-          const maxEvictable = Math.max(0, MAX_FILE_CACHE_ENTRIES - 1 - pinnedEntries.length);
-          const keptReverse: Array<[string, FileViewCacheEntry]> = [];
-          for (let i = evictableEntries.length - 1; i >= 0; i -= 1) {
-            if (keptReverse.length >= maxEvictable) break;
-            const [k, v] = evictableEntries[i];
-            const entryBytes = estimateFileCacheEntryBytes(v);
-            if (totalBytes + entryBytes > MAX_FILE_CACHE_BYTES) continue;
-            totalBytes += entryBytes;
-            keptReverse.push([k, v]);
-          }
-          keptReverse.reverse();
-          const nextCache: Record<string, FileViewCacheEntry> = {};
-          for (const [k, v] of pinnedEntries) {
-            nextCache[k] = v;
-          }
-          for (const [k, v] of keptReverse) {
-            nextCache[k] = v;
-          }
-          nextCache[cKey] = nextEntry;
-
-          // If this file is currently open in Edit mode with no unsaved changes, keep its draft synced with disk
-          let nextDrafts = s.fileEditorDrafts;
-          const existingDraft = s.fileEditorDrafts[cKey];
-          if (existingDraft && !existingDraft.dirty && data.content_kind === "text") {
-            const normalized = normalizeEditorText(data.content);
-            nextDrafts = {
-              ...s.fileEditorDrafts,
-              [cKey]: {
-                ...existingDraft,
-                content: normalized,
-                baseContent: normalized,
-                baseEtag: data.etag ?? null,
-                lineEnding: normalizeLineEndingKind(data.line_ending),
-                conflict: null,
-                saveError: null,
-              },
-            };
-          }
-          return {
-            ...s,
-            fileViewCache: nextCache,
-            fileEditorDrafts: nextDrafts,
-          };
-        });
+        setState((s) => commitReadyFileView(s, cKey, data));
       } catch (err) {
         if (fileLoadSeqByKey.get(cKey) !== loadSeq) {
           return;
@@ -1205,20 +1228,8 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
 
       const act = pending.action;
       switch (act.kind) {
-        case "focus_tab":
-          ctx.actions.focusSidePanelTab(act.tabId, { skipUnsavedGuard: true });
-          break;
         case "close_tab":
           ctx.actions.closeSidePanelTab(act.tabId, { skipUnsavedGuard: true });
-          break;
-        case "open_file":
-          ctx.actions.openFileInSidePanel(act.rawPath, {
-            ...act.opts,
-            skipUnsavedGuard: true,
-          });
-          break;
-        case "new_tab":
-          ctx.actions.openSidePanelNewTab({ skipUnsavedGuard: true });
           break;
         case "switch_to_view":
           ctx.actions.discardFileEditorDraft(act.hostId, act.cwd, act.path);
@@ -1876,13 +1887,15 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       providerSubagentId?: string | null;
       parentAgentId?: string | null;
     }): void {
-      const parentHostId = getState().selectedHostId;
+      const snap = getState();
+      const parentHostId = snap.selectedHostId;
       const targetHostId = params.childHostId ?? parentHostId;
-      const parentAgentId = params.parentAgentId ?? getState().selectedAgentId;
+      const parentAgentId = params.parentAgentId ?? snap.selectedAgentId;
       const hasManagedChild = Boolean(
         targetHostId &&
           params.childAgentId &&
-          getState().hostDetails[targetHostId]?.agents.some((a) => a.agent_id === params.childAgentId),
+          (snap.stages[`${targetHostId}::${params.childAgentId}`]?.turns.length ||
+            snap.hostDetails[targetHostId]?.agents.some((a) => a.agent_id === params.childAgentId)),
       );
       const effectiveChildAgentId = hasManagedChild ? params.childAgentId : null;
       const effectiveProviderSubagentId =
@@ -1913,14 +1926,7 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       });
 
       if (tabHostId && effectiveChildAgentId) {
-        void orbitIpc.openAgentTimeline(tabHostId, effectiveChildAgentId);
-        void ctx.actions.pullStageDelta(tabHostId, effectiveChildAgentId, false);
-      } else if (parentHostId && parentAgentId && effectiveProviderSubagentId) {
-        void ctx.actions.openProviderSubagentTimeline(
-          parentHostId,
-          parentAgentId,
-          effectiveProviderSubagentId,
-        );
+        void hydrateSubagentStage(tabHostId, effectiveChildAgentId).catch(() => undefined);
       }
     },
 

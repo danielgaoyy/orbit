@@ -1,7 +1,6 @@
 import { memo, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
-  ChevronDown,
   ChevronRight,
   Folder,
   FolderOpen,
@@ -248,12 +247,13 @@ const SidebarWorkspaceGroup = memo(function SidebarWorkspaceGroup({
             className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
           >
             <span className="text-ink-muted relative inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
-              <Layers className="size-[13.5px] stroke-[1.7] transition-opacity group-hover/ws:opacity-0" />
-              {wsCollapsed ? (
-                <ChevronRight className="absolute size-[13px] opacity-0 transition-opacity group-hover/ws:opacity-90" />
-              ) : (
-                <ChevronDown className="absolute size-[13px] opacity-0 transition-opacity group-hover/ws:opacity-90" />
-              )}
+              <Layers className="size-[13.5px] stroke-[1.7] transition-opacity duration-150 group-hover/ws:opacity-0" />
+              <ChevronRight
+                className={cn(
+                  "absolute size-[13px] opacity-0 transition-[rotate,opacity] duration-150 ease-[var(--ease-panel)] group-hover/ws:opacity-90",
+                  !wsCollapsed && "rotate-90",
+                )}
+              />
             </span>
             <span className="text-ink-secondary group-hover/ws:text-ink-primary truncate text-[12.5px] font-medium transition-colors">
               {ws.title}
@@ -261,8 +261,10 @@ const SidebarWorkspaceGroup = memo(function SidebarWorkspaceGroup({
             {ws.visiblePeers.length > 0 && (
               <span
                 className={cn(
-                  "text-ink-faint shrink-0 text-[11px] tabular-nums",
-                  wsMenuOpen ? "hidden" : "inline group-hover/ws:hidden",
+                  "text-ink-faint shrink-0 text-[11px] tabular-nums transition-opacity duration-150 ease-[var(--ease-out-quart)]",
+                  wsMenuOpen
+                    ? "opacity-0"
+                    : "opacity-100 group-hover/ws:opacity-0 group-focus-within/ws:opacity-0 [@media(hover:none)]:opacity-0",
                 )}
               >
                 {ws.visiblePeers.length}
@@ -283,8 +285,10 @@ const SidebarWorkspaceGroup = memo(function SidebarWorkspaceGroup({
         {!isRenamingThisWs && (
           <div
             className={cn(
-              "shrink-0 items-center gap-0.5",
-              wsMenuOpen ? "flex" : "hidden group-hover/ws:flex",
+              "flex shrink-0 items-center gap-0.5 transition-opacity duration-150 ease-[var(--ease-out-quart)]",
+              wsMenuOpen
+                ? "pointer-events-auto opacity-100"
+                : "pointer-events-none opacity-0 group-hover/ws:pointer-events-auto group-hover/ws:opacity-100 group-focus-within/ws:pointer-events-auto group-focus-within/ws:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100",
             )}
           >
             <IconButton
@@ -328,75 +332,83 @@ const SidebarWorkspaceGroup = memo(function SidebarWorkspaceGroup({
         )}
       </div>
 
-      {!wsCollapsed && (ws.visiblePeers.length > 0 || !ws.hasActivePeersInGroup) && (
-        <div className="border-border-subtle ml-[27px] space-y-0.5 border-l pl-2">
-          {ws.visiblePeers.length === 0 ? (
-            <div className="text-ink-faint px-2 py-1 text-[11.5px]">{t("sidebar.emptyGroup")}</div>
-          ) : (
-            ws.visiblePeers.map((conv) => {
-              const ag = conv.agent;
-              const tKey = threadScopeKey(proj.host_id, ag.agent_id);
-              const navId = `ws:${ws.workspace_id}:${proj.host_id}:${ag.agent_id}`;
-              const selected =
-                workspacePanel === "conversation" &&
-                !isDraftNewSession &&
-                selectedHostId === proj.host_id &&
-                selectedAgentId === ag.agent_id;
-              const unread = isSidebarConversationUnread(conv, {
-                workspacePanel,
-                isDraftNewSession,
-                selectedHostId,
-                selectedAgentId,
-              });
-              const effectiveTitle = threadCustomTitles[tKey] || ag.title;
+      {(ws.visiblePeers.length > 0 || !ws.hasActivePeersInGroup) && (
+        <div
+          inert={wsCollapsed}
+          data-open={!wsCollapsed ? "true" : "false"}
+          className="orbit-collapse-grid"
+        >
+          <div className="orbit-collapse-inner">
+            <div className="border-border-subtle ml-[27px] space-y-0.5 border-l pl-2">
+              {ws.visiblePeers.length === 0 ? (
+                <div className="text-ink-faint px-2 py-1 text-[11.5px]">{t("sidebar.emptyGroup")}</div>
+              ) : (
+                ws.visiblePeers.map((conv) => {
+                  const ag = conv.agent;
+                  const tKey = threadScopeKey(proj.host_id, ag.agent_id);
+                  const navId = `ws:${ws.workspace_id}:${proj.host_id}:${ag.agent_id}`;
+                  const selected =
+                    workspacePanel === "conversation" &&
+                    !isDraftNewSession &&
+                    selectedHostId === proj.host_id &&
+                    selectedAgentId === ag.agent_id;
+                  const unread = isSidebarConversationUnread(conv, {
+                    workspacePanel,
+                    isDraftNewSession,
+                    selectedHostId,
+                    selectedAgentId,
+                  });
+                  const effectiveTitle = threadCustomTitles[tKey] || ag.title;
 
-              return (
-                <SidebarConversationRow
-                  key={ag.agent_id}
-                  threadKey={tKey}
-                  navId={navId}
-                  host={host}
-                  agent={ag}
-                  projectName={proj.name}
-                  effectiveTitle={effectiveTitle}
-                  isWorktree={conv.is_worktree}
-                  isPinned={false}
-                  isUnread={unread}
-                  hasRunningSubagents={
-                    Boolean(ag.has_running_subagents) || runningParentThreadKeys.has(tKey)
-                  }
-                  selected={selected}
-                  keyboardFocused={keyboardFocusedNavId === navId}
-                  highlightIndices={titleIndicesByThreadKey.get(tKey)}
-                  isChild={false}
-                  inGroupRail
-                  peerHandle={ag.handle}
-                  menuOpen={openConvMenuThreadKey === tKey}
-                  isRenaming={renamingThreadKey === tKey}
-                  dragProjectId={proj.id}
-                  dragScopeKey={ws.threadScopeKey}
-                  dragWorkspaceId={ws.workspace_id}
-                  isDragging={
-                    draggingThread?.hostId === proj.host_id &&
-                    draggingThread?.agentId === ag.agent_id
-                  }
-                  dropIndicator={
-                    threadDropIndicator?.scopeKey === ws.threadScopeKey &&
-                    threadDropIndicator.targetAgentId === ag.agent_id
-                      ? threadDropIndicator.position
-                      : null
-                  }
-                  onRegisterNavRow={onRegisterNavRow}
-                  onRegisterThreadRow={onRegisterThreadRow}
-                  onStartThreadDrag={onStartThreadDrag}
-                  shouldSuppressClick={shouldSuppressThreadClick}
-                  onOpenMenu={onOpenConvMenu}
-                  onStartRename={onStartRenameThread}
-                  onFinishRename={onFinishRenameThread}
-                />
-              );
-            })
-          )}
+                  return (
+                    <SidebarConversationRow
+                      key={ag.agent_id}
+                      threadKey={tKey}
+                      navId={navId}
+                      host={host}
+                      agent={ag}
+                      projectName={proj.name}
+                      effectiveTitle={effectiveTitle}
+                      isWorktree={conv.is_worktree}
+                      isPinned={false}
+                      isUnread={unread}
+                      hasRunningSubagents={
+                        Boolean(ag.has_running_subagents) || runningParentThreadKeys.has(tKey)
+                      }
+                      selected={selected}
+                      keyboardFocused={keyboardFocusedNavId === navId}
+                      highlightIndices={titleIndicesByThreadKey.get(tKey)}
+                      isChild={false}
+                      inGroupRail
+                      peerHandle={ag.handle}
+                      menuOpen={openConvMenuThreadKey === tKey}
+                      isRenaming={renamingThreadKey === tKey}
+                      dragProjectId={proj.id}
+                      dragScopeKey={ws.threadScopeKey}
+                      dragWorkspaceId={ws.workspace_id}
+                      isDragging={
+                        draggingThread?.hostId === proj.host_id &&
+                        draggingThread?.agentId === ag.agent_id
+                      }
+                      dropIndicator={
+                        threadDropIndicator?.scopeKey === ws.threadScopeKey &&
+                        threadDropIndicator.targetAgentId === ag.agent_id
+                          ? threadDropIndicator.position
+                          : null
+                      }
+                      onRegisterNavRow={onRegisterNavRow}
+                      onRegisterThreadRow={onRegisterThreadRow}
+                      onStartThreadDrag={onStartThreadDrag}
+                      shouldSuppressClick={shouldSuppressThreadClick}
+                      onOpenMenu={onOpenConvMenu}
+                      onStartRename={onStartRenameThread}
+                      onFinishRename={onFinishRenameThread}
+                    />
+                  );
+                })
+              )}
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -734,10 +746,13 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
   return (
     <div
       ref={(el) => onRegisterProjectRow(proj.id, el)}
-      className={cn("relative space-y-0.5 transition-opacity", isDraggingThis && "opacity-45")}
+      className={cn(
+        "relative space-y-0.5 transition-opacity duration-150",
+        isDraggingThis && "opacity-45",
+      )}
     >
       {showDropBefore && (
-        <div className="bg-primary pointer-events-none absolute -top-1 right-1 left-1 z-20 h-[2px] rounded-full" />
+        <div className="bg-signal-info pointer-events-none absolute -top-1 right-1 left-1 z-20 h-[2px] animate-[orbit-stage-in_110ms_var(--ease-out-quart)] rounded-full" />
       )}
 
       {/* Project Header Row (`30px`, pointer-draggable to reorder) */}
@@ -802,15 +817,16 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
           >
             <span className="text-ink-muted relative inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
               {collapsed ? (
-                <Folder className="size-[15px] stroke-[1.75] transition-opacity group-hover/proj:opacity-0" />
+                <Folder className="size-[15px] stroke-[1.75] transition-opacity duration-150 group-hover/proj:opacity-0" />
               ) : (
-                <FolderOpen className="size-[15px] stroke-[1.75] transition-opacity group-hover/proj:opacity-0" />
+                <FolderOpen className="size-[15px] stroke-[1.75] transition-opacity duration-150 group-hover/proj:opacity-0" />
               )}
-              {collapsed ? (
-                <ChevronRight className="absolute size-[13.5px] opacity-0 transition-opacity group-hover/proj:opacity-90" />
-              ) : (
-                <ChevronDown className="absolute size-[13.5px] opacity-0 transition-opacity group-hover/proj:opacity-90" />
-              )}
+              <ChevronRight
+                className={cn(
+                  "absolute size-[13.5px] opacity-0 transition-[rotate,opacity] duration-150 ease-[var(--ease-panel)] group-hover/proj:opacity-90",
+                  !collapsed && "rotate-90",
+                )}
+              />
             </span>
 
             <span className="truncate text-[13px] font-medium">{proj.name}</span>
@@ -824,7 +840,7 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
           </button>
         )}
 
-        {/* Right Slot: Organizing stays hover-readable; resting status/count swaps to `⋯` + `+` */}
+        {/* Right Slot: Organizing stays hover-readable; resting status/count crossfades to `⋯` + `+` */}
         {!isRenamingProject && (
           <div className="flex shrink-0 items-center justify-end gap-1">
             {isProjectOrganizing && (
@@ -841,81 +857,89 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
               </SimpleTooltip>
             )}
 
-            {!isProjectOrganizing &&
-              (isHostDisconnected ? (
+            <div className="grid shrink-0 items-center justify-items-end">
+              {!isProjectOrganizing &&
+                (isHostDisconnected ||
+                  hasCollapsedApproval ||
+                  hasCollapsedRunning ||
+                  hasCollapsedUnread ||
+                  (collapsed && visibleConversations.length > 0)) && (
+                  <div
+                    className={cn(
+                      "col-start-1 row-start-1 flex items-center transition-opacity duration-150 ease-[var(--ease-out-quart)]",
+                      projMenuOpen
+                        ? "pointer-events-none opacity-0"
+                        : "opacity-100 group-hover/proj:pointer-events-none group-hover/proj:opacity-0 group-focus-within/proj:pointer-events-none group-focus-within/proj:opacity-0 [@media(hover:none)]:pointer-events-none [@media(hover:none)]:opacity-0",
+                    )}
+                  >
+                    {isHostDisconnected ? (
+                      <IconButton
+                        size="xs"
+                        data-proj-action="true"
+                        tooltip={t("sidebar.offlineReconnect", { host: host.display_name })}
+                        onClick={() => {
+                          void orbitIpc.connectHost(host.host_id);
+                          void orbitIpc.refreshHost(host.host_id);
+                        }}
+                      >
+                        <RefreshCw className="size-[12.5px]" />
+                      </IconButton>
+                    ) : hasCollapsedApproval || hasCollapsedRunning || hasCollapsedUnread ? (
+                      <span className="inline-flex h-[22px] w-[22px] items-center justify-center">
+                        {hasCollapsedApproval ? (
+                          <span className="bg-signal-warning size-[6px] rounded-full" />
+                        ) : hasCollapsedRunning ? (
+                          <OrbitSpinner size={13} className="text-ink-secondary" />
+                        ) : (
+                          <span className="bg-signal-info size-[6px] rounded-full" />
+                        )}
+                      </span>
+                    ) : (
+                      <span className="text-ink-faint pr-1 text-[11px] tabular-nums">
+                        {visibleConversations.length}
+                      </span>
+                    )}
+                  </div>
+                )}
+
+              <div
+                className={cn(
+                  "col-start-1 row-start-1 flex items-center gap-0.5 transition-opacity duration-150 ease-[var(--ease-out-quart)]",
+                  projMenuOpen
+                    ? "pointer-events-auto opacity-100"
+                    : "pointer-events-none opacity-0 group-hover/proj:pointer-events-auto group-hover/proj:opacity-100 group-focus-within/proj:pointer-events-auto group-focus-within/proj:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100",
+                )}
+              >
                 <IconButton
                   size="xs"
                   data-proj-action="true"
-                  tooltip={t("sidebar.offlineReconnect", { host: host.display_name })}
-                  onClick={() => {
-                    void orbitIpc.connectHost(host.host_id);
-                    void orbitIpc.refreshHost(host.host_id);
+                  aria-label={t("sidebar.projectOptions", { project: proj.name })}
+                  onClick={(e) => {
+                    const r = e.currentTarget.getBoundingClientRect();
+                    onOpenProjMenu({
+                      project: proj,
+                      host,
+                      anchor: {
+                        left: r.left,
+                        top: r.top,
+                        width: r.width,
+                        height: r.height,
+                      },
+                    });
                   }}
-                  className={cn(projMenuOpen ? "hidden" : "inline-flex group-hover/proj:hidden")}
                 >
-                  <RefreshCw className="size-[12.5px]" />
+                  <MoreHorizontal className="size-[13.5px]" />
                 </IconButton>
-              ) : hasCollapsedApproval || hasCollapsedRunning || hasCollapsedUnread ? (
-                <span
-                  className={cn(
-                    "h-[22px] w-[22px] items-center justify-center",
-                    projMenuOpen ? "hidden" : "inline-flex group-hover/proj:hidden",
-                  )}
-                >
-                  {hasCollapsedApproval ? (
-                    <span className="bg-signal-warning size-[6px] rounded-full" />
-                  ) : hasCollapsedRunning ? (
-                    <OrbitSpinner size={13} className="text-ink-secondary" />
-                  ) : (
-                    <span className="bg-signal-info size-[6px] rounded-full" />
-                  )}
-                </span>
-              ) : collapsed && visibleConversations.length > 0 ? (
-                <span
-                  className={cn(
-                    "text-ink-faint pr-1 text-[11px] tabular-nums",
-                    projMenuOpen ? "hidden" : "inline-flex group-hover/proj:hidden",
-                  )}
-                >
-                  {visibleConversations.length}
-                </span>
-              ) : null)}
 
-            <div
-              className={cn(
-                "items-center gap-0.5",
-                projMenuOpen ? "inline-flex" : "hidden group-hover/proj:inline-flex",
-              )}
-            >
-              <IconButton
-                size="xs"
-                data-proj-action="true"
-                aria-label={t("sidebar.projectOptions", { project: proj.name })}
-                onClick={(e) => {
-                  const r = e.currentTarget.getBoundingClientRect();
-                  onOpenProjMenu({
-                    project: proj,
-                    host,
-                    anchor: {
-                      left: r.left,
-                      top: r.top,
-                      width: r.width,
-                      height: r.height,
-                    },
-                  });
-                }}
-              >
-                <MoreHorizontal className="size-[13.5px]" />
-              </IconButton>
-
-              <IconButton
-                size="xs"
-                data-proj-action="true"
-                tooltip={t("sidebar.newConversationInTarget", { name: proj.name })}
-                onClick={() => orbitActions.startNewThreadDraft(proj.host_id, proj.primary_cwd)}
-              >
-                <Plus className="size-[14px] stroke-[1.85]" />
-              </IconButton>
+                <IconButton
+                  size="xs"
+                  data-proj-action="true"
+                  tooltip={t("sidebar.newConversationInTarget", { name: proj.name })}
+                  onClick={() => orbitActions.startNewThreadDraft(proj.host_id, proj.primary_cwd)}
+                >
+                  <Plus className="size-[14px] stroke-[1.85]" />
+                </IconButton>
+              </div>
             </div>
           </div>
         )}
@@ -1073,7 +1097,7 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
       </div>
 
       {showDropAfter && (
-        <div className="bg-primary pointer-events-none absolute right-1 -bottom-1 left-1 z-20 h-[2px] rounded-full" />
+        <div className="bg-signal-info pointer-events-none absolute right-1 -bottom-1 left-1 z-20 h-[2px] animate-[orbit-stage-in_110ms_var(--ease-out-quart)] rounded-full" />
       )}
     </div>
   );

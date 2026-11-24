@@ -70,7 +70,11 @@ function layer(name: string, paths: readonly AvatarPath[], children?: ReactNode)
 
 const Portrait = memo(function Portrait({ character }: { character: SubagentCharacterSpec }) {
   return (
-    <svg viewBox="0 0 64 64" aria-hidden="true" className="orbit-avatar-frame block size-full">
+    <svg
+      viewBox="0 0 64 64"
+      aria-hidden="true"
+      className="orbit-avatar-frame block size-full transition-[box-shadow,opacity,filter] duration-[180ms] ease-[var(--ease-out-expo)] motion-reduce:transition-none"
+    >
       <g className="orbit-av-rig">
         {layer("back", character.back)}
         {layer("head", character.head)}
@@ -120,7 +124,7 @@ export const SubagentAvatar = memo(function SubagentAvatar({
           strokeWidth={3}
           style={{ right: -2, bottom: -2, padding: 1.5 }}
           className={cn(
-            "ring-surface-base absolute rounded-full text-white ring-[1.5px]",
+            "orbit-pill-enter ring-surface-base absolute rounded-full text-white ring-[1.5px]",
             status === "completed" ? "bg-signal-success" : status === "failed" ? "bg-signal-danger" : "bg-ink-muted",
           )}
         />

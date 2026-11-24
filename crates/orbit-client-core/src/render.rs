@@ -427,6 +427,32 @@ pub(crate) fn code_highlight_cache_contains(lang: &str, code: &str) -> bool {
     })
 }
 
+/// Highlight only the first `max_highlighted_lines` lines with `syntect` without materializing
+/// plain fallback wrappers for trailing lines. Ideal for virtualized viewers that render
+/// off-screen lines directly from raw content and lazily highlight deeper chunks on scroll.
+pub fn highlight_code_lines_prefix(
+    language: &str,
+    code: &str,
+    max_highlighted_lines: usize,
+) -> Vec<HighlightedLineView> {
+    if max_highlighted_lines == 0 || code.is_empty() {
+        return Vec::new();
+    }
+    let mut lines_seen = 0usize;
+    let mut end_byte = code.len();
+    for (idx, b) in code.bytes().enumerate() {
+        if b == b'\n' {
+            lines_seen += 1;
+            if lines_seen >= max_highlighted_lines {
+                end_byte = idx + 1;
+                break;
+            }
+        }
+    }
+    let prefix = code.get(..end_byte).unwrap_or(code);
+    highlight_code_lines_capped(language, prefix, max_highlighted_lines)
+}
+
 /// Highlight up to `max_highlighted_lines` with `syntect`, emitting fast plain-styled lines beyond the cap.
 pub fn highlight_code_lines_capped(
     language: &str,
@@ -2200,6 +2226,27 @@ diff --git a/src/lib.rs b/src/lib.rs
             let _ = highlight_code_lines_capped("rust", &s, 50);
         }
         assert!(code_highlight_cache_len() <= CODE_HIGHLIGHT_CACHE_CAP);
+    }
+
+    #[test]
+    fn highlight_code_lines_prefix_bounds_output_without_plain_tail() {
+        let mut big = String::new();
+        for idx in 1..=400 {
+            big.push_str(&format!("pub fn f_{idx}() -> usize {{ {idx} }}\n"));
+        }
+        let prefix = highlight_code_lines_prefix("rust", &big, 120);
+        assert_eq!(prefix.len(), 120);
+        assert_eq!(prefix[0].line_number, 1);
+        assert_eq!(prefix[119].line_number, 120);
+        assert!(
+            prefix[0].tokens.len() > 1,
+            "first line should be syntax highlighted"
+        );
+
+        let short = highlight_code_lines_prefix("rust", "let a = 1;\nlet b = 2;", 250);
+        assert_eq!(short.len(), 2);
+        assert!(highlight_code_lines_prefix("rust", "", 250).is_empty());
+        assert!(highlight_code_lines_prefix("rust", "let a = 1;", 0).is_empty());
     }
 
     #[test]

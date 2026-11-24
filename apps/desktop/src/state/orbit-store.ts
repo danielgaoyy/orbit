@@ -797,15 +797,15 @@ function subscribeCoreEvents(): Promise<void> {
           !snap.isDraftNewSession &&
           ev.host_id === snap.selectedHostId &&
           ev.agent_id === snap.selectedAgentId;
-        const isOpenPeerTab =
+        const isOpenTimelineTab =
           snap.sidePanelOpen &&
           snap.sidePanelTabs.some(
             (t) =>
-              t.kind === "peer" &&
-              t.hostId === ev.host_id &&
-              t.peerAgentId === ev.agent_id,
+              (t.hostId ?? snap.selectedHostId) === ev.host_id &&
+              ((t.kind === "peer" && t.peerAgentId === ev.agent_id) ||
+                (t.kind === "subagent" && t.childAgentId === ev.agent_id)),
           );
-        if (isMainStage || isOpenPeerTab) {
+        if (isMainStage || isOpenTimelineTab) {
           void orbitActions.pullStageDelta(ev.host_id, ev.agent_id);
         }
         if (isMainStage && snap.selectedWorkspaceCwd) {

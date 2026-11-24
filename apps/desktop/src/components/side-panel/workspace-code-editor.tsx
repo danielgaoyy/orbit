@@ -270,7 +270,7 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor({
   // Adaptive debounced Rust `syntect` re-highlighting while typing
   useEffect(() => {
     const seq = ++highlightSeqRef.current;
-    if (value === initialContent && initialHighlightedLines.length > 0) {
+    if (value === initialContent && initialHighlightedLines.length >= rawLines.length) {
       return;
     }
     if (value.length > MAX_LIVE_HIGHLIGHT_BYTES) {
@@ -628,7 +628,7 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor({
               }
             }}
             onSelect={(e) => refreshCursor(e.currentTarget)}
-            className="caret-foreground selection:bg-primary/25 selectable-text absolute inset-0 h-full w-full resize-none overflow-auto bg-transparent px-3 py-2.5 font-mono text-[12px] leading-[20px] whitespace-pre text-transparent outline-none"
+            className="caret-foreground selection:bg-signal-info/25 selectable-text absolute inset-0 h-full w-full resize-none overflow-auto bg-transparent px-3 py-2.5 font-mono text-[12px] leading-[20px] whitespace-pre text-transparent outline-none"
           />
         </div>
       </div>

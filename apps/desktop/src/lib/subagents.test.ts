@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { AgentCardView, HostDetailView, SessionSubagentEntryView } from "./orbit-ipc.ts";
 import {
   type ResolvedSubagentItem,
   filterVisibleSubagents,
   resolveToolCallSubagent,
   resolveDelegationDispatches,
+  resolveSessionSubagents,
   isSubagentActiveStatus,
 } from "./subagents.ts";
 
@@ -100,6 +102,114 @@ describe("filterVisibleSubagents", () => {
   });
 });
 
+describe("managed child lifecycle", () => {
+  const created = Date.parse("2026-11-23T12:00:00Z");
+  function card(state: string, overrides: Partial<AgentCardView> = {}): AgentCardView {
+    return {
+      agent_id: "ag_review", parent_agent_id: "parent", title: "Security Reviewer",
+      status: { state }, status_label: "", is_running: false, is_awaiting_permission: false,
+      created_at_rfc3339: new Date(created).toISOString(), latest_seq: 1,
+      updated_at_rfc3339: new Date(created).toISOString(), ...overrides,
+    } as AgentCardView;
+  }
+  const launch: SessionSubagentEntryView = {
+    id: "launch", role: " @Security_REVIEWER ", prompt_preview: "Check permissions",
+    status: "completed", child_agent_id: null, last_seq: 2,
+  };
+  function resolve(host: string, agents: AgentCardView[], insights: SessionSubagentEntryView[] = []) {
+    return resolveSessionSubagents({
+      hostId: host, agentId: "parent", fleetHosts: [], insightsSubagents: insights,
+      hostDetails: { [host]: { host: { host_id: host }, agents } as HostDetailView },
+    });
+  }
+
+  it("reconciles a completed launch and the projected card into one live child in either order", () => {
+    const synthetic = { ...launch, id: "ag_review", child_agent_id: "ag_review", prompt_preview: "Working" };
+    for (const insights of [[launch], [synthetic, launch], [launch, synthetic]]) {
+      const result = resolve("local", [card("initializing")], insights);
+      assert.deepEqual(result.map(({ key, callId, status, promptPreview }) => ({ key, callId, status, promptPreview })), [
+        { key: "managed:local:ag_review", callId: "launch", status: "running", promptPreview: "Check permissions" },
+      ]);
+      for (const summary_title of ["Subagent · Security Reviewer", "Run mcp_orbit_create_agent"]) {
+        const row = resolveToolCallSubagent({
+          item_type: "tool_call", seq: 2, call_id: "launch", summary_title, status: "completed", diff_files: [],
+          detail: { kind: "subagent", role: launch.role, prompt_preview: launch.prompt_preview, child_agent_id: null },
+        }, result);
+        assert.equal(row?.linked, true);
+        assert.equal(row.subagent.childAgentId, "ag_review");
+        assert.equal(row.subagent.status, "running");
+      }
+    }
+  });
+
+  it("keeps explicit identities reserved and rejects generic or ambiguous title-only matches", () => {
+    const reserved = { ...launch, id: "exact", child_agent_id: "ag_review" };
+    for (const insights of [[launch, reserved], [reserved, launch]]) {
+      const items = resolve("local", [card("running")], insights);
+      assert.equal(items.find((sa) => sa.isManaged)?.callId, "exact");
+      assert.equal(items.find((sa) => sa.callId === "launch")?.isManaged, false);
+    }
+    for (const [agents, insights] of [
+      [[card("running"), card("idle", { agent_id: "ag_other" })], [launch]],
+      [[card("running")], [launch, { ...launch, id: "second-launch" }]],
+      [[card("running", { title: "Worker" })], [{ ...launch, role: "worker" }]],
+      [[card("running")], [{ ...launch, provider_subagent_id: "native" }]],
+      [[card("running")], [{ ...launch, status: "failed" }]],
+    ] as const) {
+      assert.equal(resolve("local", [...agents], [...insights]).find((sa) => sa.callId === "launch")?.isManaged, false);
+    }
+  });
+
+  it("releases a title-inferred call ID when a separate timeline launch explicitly identifies that child", () => {
+    const roster = resolve("conflict", [card("running"), card("running", { agent_id: "ag_other", title: "Renamed" })], [launch]);
+    const inferred = { item_type: "tool_call" as const, seq: 2, call_id: launch.id,
+      status: "completed" as const, timestamp_ms: created, summary_title: "create_agent", diff_files: [],
+      detail: { kind: "subagent" as const, role: launch.role, child_agent_id: null, prompt_preview: "Review" } };
+    const exact = { ...inferred, call_id: "later", seq: 3,
+      detail: { kind: "generic" as const, tool_name: "create_agent", arguments_json: '{"agent_id":"ag_review"}' } };
+    for (const items of [[inferred, exact], [exact, inferred]]) {
+      const matches = resolveDelegationDispatches(items, roster);
+      assert.equal(matches.get(exact)?.subagent.childAgentId, "ag_review");
+      assert.equal(matches.get(inferred)?.subagent.childAgentId, "ag_other");
+    }
+  });
+
+  it("uses the structured state and retains lifecycle flags and legacy labels", () => {
+    for (const [state, expected] of [
+      ["initializing", "running"], ["running", "running"], ["autonomous_wakeup", "running"],
+      ["awaiting_permission", "awaiting_permission"], ["error", "failed"], ["closed", "canceled"], ["idle", "completed"],
+    ]) assert.equal(resolve("states", [card(state)])[0].status, expected, state);
+    for (const [overrides, expected] of [
+      [{ is_running: true, is_awaiting_permission: true }, "awaiting_permission"],
+      [{ has_background_tasks: true }, "running"], [{ is_running: true }, "running"],
+      [{ status_label: "Closed" }, "canceled"], [{ status_label: "Stopped" }, "canceled"],
+      [{ status_label: "Interrupted" }, "canceled"], [{ status_label: "Canceled" }, "canceled"],
+      [{ status_label: "Launch failed" }, "failed"], [{ status_label: "Error" }, "failed"],
+    ] as const) assert.equal(resolve("legacy", [card("", overrides)])[0].status, expected);
+    assert.equal(resolve("states", [card("running", { archived_at_rfc3339: new Date(created).toISOString() })])[0].status, "running");
+  });
+
+  it("resets each observed restart once and preserves the clock across tokens, permission waits and snapshot replays", (t) => {
+    let now = created + 25 * 60_000;
+    t.mock.method(Date, "now", () => now);
+    const snapshot = (state: string) => [card(state, { updated_at_rfc3339: new Date(now).toISOString() })];
+    const first = snapshot("initializing");
+    const start = (agents: AgentCardView[]) => resolve("elapsed", agents)[0].activeStartedAtMs;
+    assert.equal(start(first), created);
+    assert.equal(start(snapshot("running")), created);
+    for (const state of ["idle", "closed", "error"]) {
+      assert.equal(start(snapshot(state)), null);
+      const restarted = now += 5000;
+      assert.equal(start(snapshot("running")), restarted);
+      now += 15_000;
+      assert.equal(start(snapshot("awaiting_permission")), restarted);
+      assert.equal(start(first), created);
+      assert.equal(start(snapshot("running")), restarted);
+      assert.equal(resolve("other-host", snapshot("running"))[0].activeStartedAtMs, created);
+    }
+  });
+});
+
 describe("Orbit managed dispatch resolution", () => {
   const reviewer = makeSubagent({
     title: "Security Reviewer", handle: "security", childAgentId: "ag_review",
@@ -155,6 +265,23 @@ describe("Orbit managed dispatch resolution", () => {
       for (const status of ["running", "completed", "failed", "denied"] as const) {
         assert.equal(resolveToolCallSubagent({ ...item, status }, [])?.subagent.status,
           status === "failed" || status === "denied" ? "failed" : "running");
+      }
+    }
+  });
+
+  it("bypasses a same-call ghost for a managed launch with no child ID, then links the arriving card by time", () => {
+    const ghost = makeSubagent({ key: "insight:launch", callId: "launch", title: "Worker", providerSubagentId: null });
+    const live = { ...reviewer, key: "managed:host-b:ag_review", createdAtMs: reviewer.sortOrder + 500, status: "running" as const };
+    for (const name of ["Run mcp_orbit_create_agent", "mcp__orbit__spawn_workspace_peer"]) {
+      const item = { ...call(name), detail: { kind: "subagent" as const, role: "Worker", prompt_preview: "Review", child_agent_id: null } };
+      const pending = resolveToolCallSubagent(item, [ghost]);
+      assert.equal(pending?.linked, false);
+      assert.equal(pending.subagent.status, "running");
+      for (const cards of [[live, ghost], [ghost, live]]) {
+        const matched = resolveToolCallSubagent(item, cards);
+        assert.equal(matched?.linked, true);
+        assert.equal(matched.subagent.childAgentId, live.childAgentId);
+        assert.equal(matched.subagent.status, "running");
       }
     }
   });

@@ -52,6 +52,18 @@ Bridges emit lightweight invalidation notifications (`CoreNotification`) contain
 3. The platform bridge forwards a typed notification (`stage_updated`, `fleet_updated`, `host_updated`, `git_updated`, `files_updated`, `terminal_updated`, etc.).
 4. The client store calls the corresponding incremental pull API (`agent_stage_delta`, `fleet_sidebar_request`, `git_review`, `terminal_screen_slot`) using its last applied `revision`, avoiding full-timeline re-serialization.
 
+### Session plan projection
+
+`SessionInsightsView.plan_steps` is an ordered list scoped to the stage's host and agent. Each row carries `id`, `title`, `status`, optional `active_form` and the last contributing timeline sequence `updated_seq`. The five status values are `pending`, `in_progress`, `completed`, `skipped` and `failed`. An omitted list in a full insights payload represents an empty plan. On an incremental delta with `aux_unchanged`, Desktop reuses the previous insights. Earlier timeline pages can supply missing plan events when the projection is recomputed.
+
+Rust replays supported plan tool snapshots and ACP checklist notices. Task creation appends a row and task updates apply by ID, including deletion. A new prompt retains the current plan until a valid replacement or creation arrives. Updates can finish an earlier turn's tasks. Empty snapshots and deletion of the last row clear the shelf. Malformed snapshots and failed or denied tool calls leave the prior plan in place.
+
+Desktop Tauri and HarmonyOS N-API serialize the core stage DTO. Desktop renders the plan above its composer and reconciles the foreground indicator locally. The current Swift and Kotlin UniFFI insights records expose a subset of the DTO. Exposing the plan on those clients requires adding the record fields and regenerating both bindings.
+
+### Full-history outline anchor projection
+
+`TimelineCatchup.outline_prompts` and `SessionInsightsView.outline_prompts` project every non-compaction user prompt `(seq, preview)` across the entire session history independent of tail-first message pagination, using the existing SQLite `(agent_id, seq)` index without loading off-page event payloads. On incremental deltas with `aux_unchanged`, Desktop preserves reference stability and avoids reparsing prompts on streaming token deltas. Desktop's `ChatOutlineRail` displays up to 17 individual prompt ticks before folding earlier prompts into a popover and auto-paginates when jumping to an unloaded historical anchor (`jumpingToSeq`). Older daemons that omit `outline_prompts` fall back cleanly to loaded turns.
+
 ---
 
 ## 3. Client Bridge Protocol v2 Surface

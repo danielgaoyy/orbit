@@ -517,7 +517,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
       </div>
 
       {/* 2. Top Global Navigation: Quiet borderless nav rows (`New Conversation`, `Automations`, `Personal Router`) */}
-      <div className="space-y-0.5 px-2 pt-0.5 pb-2.5">
+      <div className="border-border-subtle/75 space-y-0.5 border-b px-2 pt-0.5 pb-2.5">
         {(() => {
           const isNewConversationActive =
             workspacePanel === "conversation" && isDraftNewSession;
@@ -648,67 +648,73 @@ export const FleetSidebar = memo(function FleetSidebar() {
         })()}
       </div>
 
-      {/* 2B. On-Demand Sidebar Filter Bar (0px at rest; expands above ALL list sections via Titlebar `🔍` or `⌘F`) */}
-      {showFilterBar && (
-        <div className="orbit-stage-enter border-border-subtle/75 border-t px-2 pt-2.5 pb-1.5">
-          <div className="group/filter bg-surface-recessed focus-within:border-border-strong focus-within:bg-surface-raised flex h-[28px] items-center gap-2 rounded-[7px] border border-transparent px-2 transition-colors">
-            <Search className="text-ink-faint group-focus-within/filter:text-ink-secondary size-[13px] shrink-0 stroke-[1.85] transition-colors" />
-            <input
-              ref={filterInputRef}
-              type="text"
-              value={filterQuery}
-              onFocus={(e) => {
-                const prev = e.relatedTarget as HTMLElement | null;
-                if (prev && prev !== filterInputRef.current) {
-                  previousFocusRef.current = prev;
-                }
-                setIsFilterFocused(true);
-              }}
-              onBlur={() => {
-                setIsFilterFocused(false);
-                setKeyboardFocusedNavId(null);
-                if (filterQuery.trim().length === 0) {
-                  setFilterOpen(false);
-                }
-              }}
-              onChange={(e) => setFilterQuery(e.target.value)}
-              {...ime.compositionProps}
-              onKeyDown={handleFilterKeyDown}
-              placeholder={t("sidebar.filterThreadsPlaceholder")}
-              aria-label={t("sidebar.filterThreadsAria")}
-              className="text-ink-primary placeholder:text-ink-faint min-w-0 flex-1 bg-transparent text-[12.5px] select-text focus:outline-none"
-            />
-            {isFilteringThreads && (
-              <span className="text-ink-faint shrink-0 font-mono text-[10.5px] tabular-nums">
-                {visibleNavItems.length}
-              </span>
-            )}
-            <button
-              type="button"
-              aria-label={t("sidebar.clearThreadFilter")}
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => {
-                if (filterQuery.length > 0) {
-                  setFilterQuery("");
+      {/* 2B. On-Demand Sidebar Filter Bar (0px at rest; smoothly glides open above ALL list sections via Titlebar `🔍` or `⌘F`) */}
+      <div
+        inert={!showFilterBar}
+        data-open={showFilterBar ? "true" : "false"}
+        className="orbit-collapse-grid shrink-0"
+      >
+        <div className="orbit-collapse-inner">
+          <div className="px-2 pt-2.5 pb-0.5">
+            <div className="group/filter bg-surface-recessed focus-within:border-border-strong focus-within:bg-surface-raised flex h-[28px] items-center gap-2 rounded-[7px] border border-transparent px-2 transition-colors">
+              <Search className="text-ink-faint group-focus-within/filter:text-ink-secondary size-[13px] shrink-0 stroke-[1.85] transition-colors" />
+              <input
+                ref={filterInputRef}
+                type="text"
+                value={filterQuery}
+                onFocus={(e) => {
+                  const prev = e.relatedTarget as HTMLElement | null;
+                  if (prev && prev !== filterInputRef.current) {
+                    previousFocusRef.current = prev;
+                  }
+                  setIsFilterFocused(true);
+                }}
+                onBlur={() => {
+                  setIsFilterFocused(false);
                   setKeyboardFocusedNavId(null);
-                  filterInputRef.current?.focus({ preventScroll: true });
-                } else {
-                  setFilterOpen(false);
-                }
-              }}
-              className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex h-[18px] w-[18px] shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors"
-            >
-              <X className="size-[11.5px]" />
-            </button>
+                  if (filterQuery.trim().length === 0) {
+                    setFilterOpen(false);
+                  }
+                }}
+                onChange={(e) => setFilterQuery(e.target.value)}
+                {...ime.compositionProps}
+                onKeyDown={handleFilterKeyDown}
+                placeholder={t("sidebar.filterThreadsPlaceholder")}
+                aria-label={t("sidebar.filterThreadsAria")}
+                className="text-ink-primary placeholder:text-ink-faint min-w-0 flex-1 bg-transparent text-[12.5px] select-text focus:outline-none"
+              />
+              {isFilteringThreads && (
+                <span className="text-ink-faint shrink-0 font-mono text-[10.5px] tabular-nums">
+                  {visibleNavItems.length}
+                </span>
+              )}
+              <button
+                type="button"
+                aria-label={t("sidebar.clearThreadFilter")}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => {
+                  if (filterQuery.length > 0) {
+                    setFilterQuery("");
+                    setKeyboardFocusedNavId(null);
+                    filterInputRef.current?.focus({ preventScroll: true });
+                  } else {
+                    setFilterOpen(false);
+                  }
+                }}
+                className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex h-[18px] w-[18px] shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors"
+              >
+                <X className="size-[11.5px]" />
+              </button>
+            </div>
           </div>
         </div>
-      )}
+      </div>
 
       {/* 3. Scrollable Mission-Control Body */}
       <ScrollArea
         viewportRef={scrollViewportRef}
-        className={cn("min-h-0 flex-1", !showFilterBar && "border-border-subtle/75 border-t")}
-        viewportClassName={cn("px-2 pb-2", showFilterBar ? "pt-1.5" : "pt-2.5")}
+        className="min-h-0 flex-1"
+        viewportClassName="px-2 pt-2.5 pb-2"
       >
         <div className="space-y-3.5">
           {/* 3A. Conditional `Needs Attention` Section — Full `SidebarConversationRow`, 0px When Clear */}
@@ -1287,7 +1293,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
       {draggingThread && (
         <div
           ref={floatingPreviewRef}
-          className="floating-surface text-ink-primary pointer-events-none fixed top-0 left-0 z-50 max-w-[210px] truncate rounded-[8px] border px-2.5 py-1 text-[12.5px] font-medium will-change-transform"
+          className="floating-surface text-ink-primary pointer-events-none fixed top-0 left-0 z-50 max-w-[210px] truncate rounded-[8px] border px-2.5 py-1 text-[12.5px] font-medium opacity-0 transition-opacity duration-[110ms] ease-[var(--ease-out-quart)] will-change-transform"
         >
           {draggingThread.title}
         </div>

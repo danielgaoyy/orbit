@@ -1,29 +1,92 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUpRight } from "lucide-react";
+import { memo, useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import {
   ConversationViewport,
   useViewportAnchorHold,
 } from "@/components/conversation/conversation-viewport";
+import { DecisionDock } from "@/components/stage/stage-approval-dock";
 import {
   PromptImageLightbox,
   type PromptImagePreviewTarget,
   TurnStageSection,
 } from "@/components/stage/stream-stage";
 import { useDelegationDispatches } from "@/components/stage/use-delegation-dispatches";
-import { selectSessionSubagents } from "@/state/selectors/session-selectors";
+import {
+  createStageSessionSelector,
+  getTurnFooter,
+  getTurnTopGapPx,
+} from "@/components/stage/stage-helpers";
+import { Button } from "@/components/ui/button";
 import { ContextBanner } from "@/components/ui/context-banner";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { SubagentAvatar } from "@/components/ui/subagent-avatar";
-import { type SessionSubagentEntryView, type StageTurnView, orbitIpc } from "@/lib/orbit-ipc";
-import { computeSubagentTurnsFingerprint } from "@/lib/stage-cache";
+import {
+  type PendingPermissionSummary,
+  type StageTurnView,
+  type TimelineItemView,
+  orbitIpc,
+} from "@/lib/orbit-ipc";
+import { computeSubagentTurnsFingerprint, MAX_CACHED_STAGE_VIEWS } from "@/lib/stage-cache";
 import {
   type ResolvedSubagentItem,
   buildSubagentNameMatcher,
 } from "@/lib/subagents";
+import { useI18n } from "@/lib/i18n";
+import type {
+  PendingPermissionTimelineItem,
+  PendingQuestionTimelineItem,
+  UnifiedPendingSubagentPermission,
+} from "@/state/selectors/session-selectors";
+import { upsertLruRecord } from "@/state/store-helpers";
 import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
 const NOOP_REWIND = () => {};
-const EMPTY_STAGE_SUBAGENTS: readonly SessionSubagentEntryView[] = [];
+const EMPTY_TURNS: StageTurnView[] = [];
+const EMPTY_HOST_PERMS: readonly PendingPermissionSummary[] = [];
+const EMPTY_QUESTIONS: readonly PendingQuestionTimelineItem[] = [];
+const EMPTY_SUBAGENT_PERMS: readonly UnifiedPendingSubagentPermission[] = [];
+let providerTurnCache: Record<string, StageTurnView[]> = {};
+const HYDRATION_TIMEOUT_MS = 1500;
+
+export function mergeAgentPendingPermissions(
+  agentId: string | null | undefined,
+  stagePendingPermissions: readonly PendingPermissionTimelineItem[],
+  stageRawPermissions: readonly TimelineItemView[] | undefined,
+  hostPendingPermissions: readonly PendingPermissionSummary[] | undefined,
+): readonly PendingPermissionTimelineItem[] {
+  if (!agentId || !hostPendingPermissions || hostPendingPermissions.length === 0) {
+    return stagePendingPermissions;
+  }
+  const knownIds = new Set<string>();
+  for (const item of stagePendingPermissions) {
+    knownIds.add(item.request_id);
+  }
+  if (stageRawPermissions) {
+    for (const item of stageRawPermissions) {
+      if (item.item_type === "permission_request" && item.resolved_decision !== null) {
+        knownIds.add(item.request_id);
+      }
+    }
+  }
+  let extras: PendingPermissionTimelineItem[] | null = null;
+  for (const perm of hostPendingPermissions) {
+    if (perm.agent_id !== agentId || knownIds.has(perm.request_id)) continue;
+    knownIds.add(perm.request_id);
+    const ts = Date.parse(perm.created_at);
+    extras ??= [...stagePendingPermissions];
+    extras.push({
+      item_type: "permission_request",
+      seq: Number.isFinite(ts) ? ts : 0,
+      request_id: perm.request_id,
+      title: perm.title,
+      detail: perm.detail,
+      allowed_decisions: perm.allowed_decisions,
+      resolved_decision: null,
+      guardian_assessment: perm.guardian_assessment ?? null,
+      timestamp_ms: Number.isFinite(ts) ? ts : null,
+    });
+  }
+  return extras ?? stagePendingPermissions;
+}
 
 interface ThinkingTimingRecord {
   startedAtMs: number;
@@ -51,81 +114,20 @@ function buildSubagentTurnThinkingSignature(
   return sig;
 }
 
-function buildFallbackPromptTurn(callId: string, text: string): StageTurnView {
-  return {
-    key: `subagent-fallback-${callId}`,
-    turn_index: 0,
-    anchor_seq: 0,
-    user_prompt: {
-      item_type: "user_prompt",
-      seq: 0,
-      message_id: `subagent-prompt-${callId}`,
-      text,
-      badges: [],
-      blocks: [
-        {
-          kind: "paragraph",
-          spans: [
-            {
-              text,
-              bold: false,
-              italic: false,
-              strikethrough: false,
-              inline_code: false,
-              link_url: null,
-            },
-          ],
-        },
-      ],
-      timestamp_ms: null,
-    },
-    agent_message: null,
-    is_compaction_command: false,
-    folded_steps: [],
-    work_counts: {
-      edited_file_count: 0,
-      created_file_count: 0,
-      command_count: 0,
-      read_file_count: 0,
-      search_count: 0,
-      subagent_count: 0,
-      mcp_server_count: 0,
-      other_tool_count: 0,
-      thought_count: 0,
-      narration_count: 0,
-      action_steps: 0,
-      total_steps: 0,
-      failed_count: 0,
-      denied_count: 0,
-      unrecovered_failure_count: 0,
-      additions: 0,
-      deletions: 0,
-    },
-    work_summary_label: "",
-    work_summary_live_label: "",
-    work_summary_live_detail: null,
-    work_summary_includes_failure: false,
-    thought_duration_ms: null,
-    work_duration_ms: null,
-    turn_duration_ms: null,
-    terminal_reply: null,
-    last_assistant_reply: null,
-    notices: [],
-    compactions: [],
-    live_segments: [],
-    turn_diffs: [],
-    has_error: false,
-    has_unrecovered_error: false,
-    has_active_item: false,
-    started_at_ms: null,
-    completed_at_ms: null,
-  };
+function hasProviderContent(turns: StageTurnView[]): boolean {
+  return turns.some((turn) =>
+    turn.live_segments.length > 0 || turn.folded_steps.length > 0 ||
+    turn.terminal_reply !== null || turn.agent_message !== null || turn.notices.length > 0 ||
+    turn.compactions.length > 0 || turn.turn_diffs.length > 0,
+  );
 }
 
 export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTab }) {
-  const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
+  const { t } = useI18n();
   const hostId = useOrbitSelector((s) => tab.hostId ?? s.selectedHostId);
-  const parentHostId = selectedHostId ?? hostId;
+  const isManaged = Boolean(hostId && tab.childAgentId);
+  const parentHostId = useOrbitSelector((s) => isManaged ? (s.selectedHostId ?? hostId) : hostId);
+  const providerId = isManaged ? null : tab.providerSubagentId;
   const coalesceExploration = useOrbitSelector((s) => s.coalesceExploration);
   const remoteHostName = useOrbitSelector((s) => {
     if (!tab.hostId || !s.selectedHostId || tab.hostId === s.selectedHostId) return null;
@@ -138,27 +140,15 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
   const cwd = useOrbitSelector((s) => tab.cwd ?? s.selectedWorkspaceCwd);
   const parentAgentId = useOrbitSelector((s) => tab.parentAgentId ?? s.selectedAgentId);
   const parentHostRevision = useOrbitSelector((s) =>
-    parentHostId ? (s.hostDetails[parentHostId]?.revision ?? 0) : 0,
+    providerId && parentHostId ? (s.hostDetails[parentHostId]?.revision ?? 0) : 0,
   );
-  const isNetworkOffline = useOrbitSelector((s) =>
-    hostId
-      ? s.fleet.hosts.find((h) => h.host_id === hostId)?.connection_state === "disconnected"
-      : false,
+  const connectionState = useOrbitSelector((s) => hostId
+    ? s.fleet.hosts.find((host) => host.host_id === hostId)?.connection_state ??
+      s.hostDetails[hostId]?.host.connection_state
+    : null,
   );
-  const parentHostConnected = useOrbitSelector((s) => {
-    if (!parentHostId) return false;
-    const conn =
-      s.fleet.hosts.find((h) => h.host_id === parentHostId)?.connection_state ??
-      s.hostDetails[parentHostId]?.host.connection_state;
-    return conn === "online_direct" || conn === "online_relay";
-  });
-  const managedHostConnected = useOrbitSelector((s) => {
-    if (!hostId) return false;
-    const conn =
-      s.fleet.hosts.find((h) => h.host_id === hostId)?.connection_state ??
-      s.hostDetails[hostId]?.host.connection_state;
-    return conn === "online_direct" || conn === "online_relay";
-  });
+  const isNetworkOffline = connectionState === "disconnected";
+  const hostConnected = connectionState === "online_direct" || connectionState === "online_relay";
   const childAgent = useOrbitSelector((s) =>
     hostId && tab.childAgentId
       ? (s.hostDetails[hostId]?.agents.find((a) => a.agent_id === tab.childAgentId) ?? null)
@@ -169,10 +159,13 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
       ? (s.stages[`${hostId}::${tab.childAgentId}`] ?? null)
       : null,
   );
+  const hostPendingPermissions = useOrbitSelector((s) =>
+    hostId ? (s.hostDetails[hostId]?.pending_permissions ?? EMPTY_HOST_PERMS) : EMPTY_HOST_PERMS,
+  );
   const providerSubagent = useOrbitSelector((s) =>
-    parentHostId && parentAgentId && tab.providerSubagentId
+    parentHostId && parentAgentId && providerId
       ? (s.hostDetails[parentHostId]?.provider_subagents?.[parentAgentId]?.find(
-          (ps) => ps.subagent_id === tab.providerSubagentId,
+          (ps) => ps.subagent_id === providerId,
         ) ?? null)
       : null,
   );
@@ -182,7 +175,6 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
     return parentStage?.insights.subagents.find((sa) => sa.id === tab.subagentCallId) ?? null;
   });
 
-  const isManaged = Boolean(hostId && tab.childAgentId && childAgent);
   const childStatusLabel = childAgent?.status_label.toLowerCase() ?? "";
   const status: "awaiting_permission" | "running" | "completed" | "canceled" | "failed" = childAgent
     ? childAgent.is_awaiting_permission
@@ -211,16 +203,20 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
           : "completed";
 
   const resolvedPrompt = tab.subagentPrompt || providerSubagent?.subtitle || "";
-  const [providerTurns, setProviderTurns] = useState<StageTurnView[]>([]);
-  const providerTurnsRef = useRef<StageTurnView[]>(providerTurns);
-  providerTurnsRef.current = providerTurns;
-  const refetchMissGuardRef = useRef<string | null>(null);
-  const lastFingerprintRef = useRef<string>("");
-  const prevProviderSubKeyRef = useRef<string | null>(null);
-  const wasParentHostConnectedRef = useRef<boolean>(parentHostConnected);
-  const wasManagedHostConnectedRef = useRef<boolean>(managedHostConnected);
+  const providerKey = providerId && parentHostId && parentAgentId
+    ? JSON.stringify([parentHostId, parentAgentId, providerId])
+    : null;
+  const [providerSnapshot, setProviderSnapshot] = useState<{ key: string; turns: StageTurnView[] } | null>(null);
+  const cachedProviderTurns = providerKey ? providerTurnCache[providerKey] : undefined;
+  const providerTurns = providerSnapshot?.key === providerKey
+    ? providerSnapshot.turns
+    : cachedProviderTurns ?? EMPTY_TURNS;
+  const refreshProvider = useRef<(() => void) | null>(null);
+  const readProviderTurns = useEffectEvent((host: string, parent: string, child: string) =>
+    orbitIpc.getProviderSubagentTurns(host, parent, child, resolvedPrompt),
+  );
+  const wasHostConnected = useRef(hostConnected);
   const isActiveTab = useOrbitSelector((s) => s.sidePanelOpen && s.activeSidePanelTabId === tab.id);
-  const wasActiveTabRef = useRef<boolean>(isActiveTab);
   const thinkingTimingsRef = useRef<Record<string, ThinkingTimingRecord>>({});
   const [, setThinkingTick] = useState(0);
   const viewportRef = useRef<HTMLDivElement | null>(null);
@@ -234,145 +230,147 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
     return thinkingTimingsRef.current[thinkKey]?.durationMs ?? null;
   }, []);
 
-  // Ensure daemon hydrates & subscribes the provider subagent timeline on open, tab activation, or WS reconnect
+  // Coalesce revisions during IPC, but always project once after the subscription opens.
   useEffect(() => {
-    const subKey =
-      parentHostId && parentAgentId && tab.providerSubagentId
-        ? `${parentHostId}::${parentAgentId}::${tab.providerSubagentId}`
-        : null;
-    const targetChanged = prevProviderSubKeyRef.current !== subKey;
-    const reconnected = parentHostConnected && !wasParentHostConnectedRef.current;
-    const reactivated = isActiveTab && !wasActiveTabRef.current;
-    prevProviderSubKeyRef.current = subKey;
-    wasParentHostConnectedRef.current = parentHostConnected;
-    wasActiveTabRef.current = isActiveTab;
-
-    if (!parentHostId || !parentAgentId || !tab.providerSubagentId) return;
-    if (targetChanged || reconnected || reactivated) {
-      refetchMissGuardRef.current = null;
-      void orbitActions.openProviderSubagentTimeline(
-        parentHostId,
-        parentAgentId,
-        tab.providerSubagentId,
-      );
-    }
-  }, [parentHostId, parentAgentId, tab.providerSubagentId, parentHostConnected, isActiveTab]);
-
-  // Also re-subscribe managed child timeline on host WS reconnect while the tab is open
-  useEffect(() => {
-    const reconnected = managedHostConnected && !wasManagedHostConnectedRef.current;
-    wasManagedHostConnectedRef.current = managedHostConnected;
-    if (!reconnected || !hostId || !tab.childAgentId) return;
-    void orbitIpc.openAgentTimeline(hostId, tab.childAgentId);
-    void orbitActions.pullStageDelta(hostId, tab.childAgentId, true);
-  }, [managedHostConnected, hostId, tab.childAgentId]);
-
-  // Project provider subagent events through the exact same Rust stage pipeline reactively
-  // whenever `parentHostRevision` ticks (Catchup / Live events bump host revision immediately).
-  useEffect(() => {
-    if (!parentHostId || !parentAgentId || !tab.providerSubagentId) {
-      setProviderTurns([]);
-      lastFingerprintRef.current = "";
-      return;
-    }
-    const subId = tab.providerSubagentId;
-    const subKey = `${parentHostId}::${parentAgentId}::${subId}`;
+    if (!isActiveTab || !parentHostId || !parentAgentId || !providerId || !providerKey) return;
+    const subscribe = () => orbitActions.openProviderSubagentTimeline(parentHostId, parentAgentId, providerId);
+    const opened = isNetworkOffline ? Promise.resolve() : subscribe().catch(() => undefined);
     let cancelled = false;
-    const hasSubstantiveContent = (turns: StageTurnView[]): boolean =>
-      turns.some(
-        (t) =>
-          t.live_segments.length > 0 ||
-          t.folded_steps.length > 0 ||
-          t.terminal_reply !== null ||
-          t.notices.length > 0,
-      );
-    const syncTurns = async () => {
+    let reading = false;
+    let queued = false;
+    let retried = false;
+
+    const sync = async () => {
+      if (reading) {
+        queued = true;
+        return;
+      }
+      reading = true;
       try {
-        const turns = await orbitIpc.getProviderSubagentTurns(
-          parentHostId,
-          parentAgentId,
-          subId,
-          resolvedPrompt,
-        );
-        if (cancelled) return;
-        const incomingHasContent = hasSubstantiveContent(turns);
-        if (incomingHasContent) {
-          refetchMissGuardRef.current = null;
-        } else if (hasSubstantiveContent(providerTurnsRef.current)) {
-          // Guard against transient cache miss / eviction wiping an actively viewed transcript:
-          // trigger one automatic re-subscribe recovery and preserve existing rendered turns.
-          if (refetchMissGuardRef.current !== subKey) {
-            refetchMissGuardRef.current = subKey;
-            void orbitActions.openProviderSubagentTimeline(parentHostId, parentAgentId, subId);
+        await opened;
+        while (!cancelled) {
+          queued = false;
+          const turns = await readProviderTurns(parentHostId, parentAgentId, providerId);
+          if (cancelled) return;
+          const cached = providerTurnCache[providerKey];
+          if (cached && hasProviderContent(cached) && !hasProviderContent(turns)) {
+            // Preserve the last transcript during a transient Core cache miss.
+            if (retried || isNetworkOffline) return;
+            retried = true;
+            await subscribe();
+            continue;
           }
-          return;
+          retried = false;
+          const unchanged = cached &&
+            computeSubagentTurnsFingerprint(cached) === computeSubagentTurnsFingerprint(turns);
+          const next = unchanged ? cached : turns;
+          if (!unchanged) {
+            providerTurnCache = upsertLruRecord(providerTurnCache, providerKey, next, MAX_CACHED_STAGE_VIEWS);
+          }
+          setProviderSnapshot((prev) =>
+            prev?.key === providerKey && prev.turns === next ? prev : { key: providerKey, turns: next },
+          );
+          if (!queued) return;
         }
-        const fp = computeSubagentTurnsFingerprint(turns);
-        if (fp !== lastFingerprintRef.current || turns.length !== providerTurnsRef.current.length) {
-          lastFingerprintRef.current = fp;
-          setProviderTurns(turns);
-        }
-      } catch {
-        // ignore transient IPC error
+      } finally {
+        reading = false;
       }
     };
-    void syncTurns();
+    refreshProvider.current = () => { void sync().catch(() => undefined); };
+    refreshProvider.current();
     return () => {
       cancelled = true;
+      refreshProvider.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    parentHostId,
-    parentAgentId,
-    tab.providerSubagentId,
-    parentHostRevision,
-    status,
-    providerSubagent?.updated_at,
-    resolvedPrompt,
-  ]);
+  }, [isActiveTab, parentHostId, parentAgentId, providerId, providerKey, hostConnected, isNetworkOffline, tab]);
 
-  const handleOpenThread = useCallback(() => {
-    if (hostId && tab.childAgentId) {
-      orbitActions.selectAgent(hostId, tab.childAgentId);
-    }
-  }, [hostId, tab.childAgentId]);
+  useEffect(() => {
+    refreshProvider.current?.();
+  }, [parentHostRevision, providerSubagent?.updated_at, status, resolvedPrompt]);
 
-  const displayTurns = useMemo<StageTurnView[]>(() => {
-    if (childStage && childStage.turns.length > 0) {
-      return childStage.turns;
+  useEffect(() => {
+    const reconnected = hostConnected && !wasHostConnected.current;
+    wasHostConnected.current = hostConnected;
+    if (reconnected && hostId && tab.childAgentId) {
+      void orbitActions.hydrateSubagentStage(hostId, tab.childAgentId).catch(() => undefined);
     }
-    if (providerTurns.length > 0) {
-      return providerTurns;
-    }
-    if (resolvedPrompt.trim()) {
-      return [buildFallbackPromptTurn(tab.subagentCallId || tab.id, resolvedPrompt.trim())];
-    }
-    return [];
-  }, [childStage, providerTurns, resolvedPrompt, tab.id, tab.subagentCallId]);
+  }, [hostConnected, hostId, tab.childAgentId]);
+
+  // Core can project just the descriptor's synthetic prompt before any events arrive.
+  const solePrompt = providerTurns.length === 1 ? providerTurns[0].user_prompt : null;
+  const projectedPromptOnly = solePrompt?.item_type === "user_prompt" && solePrompt.seq === 0 &&
+    solePrompt.message_id === `sub_prompt_${providerId}` && !hasProviderContent(providerTurns);
+  const emptyPrompt = projectedPromptOnly ? solePrompt.text : resolvedPrompt;
+  const displayTurns = isManaged
+    ? childStage?.turns ?? EMPTY_TURNS
+    : projectedPromptOnly ? EMPTY_TURNS : providerTurns;
+  const timelineKey = isManaged ? JSON.stringify([hostId, tab.childAgentId]) : providerKey;
+  const [expiredKey, setExpiredKey] = useState<string | null>(null);
+  const hydrating = Boolean(
+    timelineKey && !displayTurns.length && expiredKey !== timelineKey &&
+    providerSnapshot?.key !== timelineKey,
+  );
+  useEffect(() => {
+    if (!hydrating) return;
+    const timer = window.setTimeout(() => setExpiredKey(timelineKey), HYDRATION_TIMEOUT_MS);
+    return () => window.clearTimeout(timer);
+  }, [hydrating, timelineKey]);
 
   const displayTurnsFingerprint = useMemo(
     () => computeSubagentTurnsFingerprint(displayTurns),
     [displayTurns],
   );
-  const contentVersion = `${childStage?.revision ?? 0}:${parentHostRevision}:${displayTurnsFingerprint}`;
+  const contentVersion = `${childStage?.revision ?? 0}:${displayTurnsFingerprint}`;
   const effectiveAgentId = tab.childAgentId ?? tab.providerSubagentId ?? parentAgentId ?? "";
   const effectiveHostId = isManaged ? (hostId ?? "") : (parentHostId ?? "");
-  const hostDetails = useOrbitSelector((s) => s.hostDetails);
-  const fleet = useOrbitSelector((s) => s.fleet);
-  const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
-  const parentStageSubagents = useOrbitSelector((s) =>
-    parentHostId && parentAgentId
-      ? (s.stages[`${parentHostId}::${parentAgentId}`]?.insights.subagents ?? EMPTY_STAGE_SUBAGENTS)
-      : EMPTY_STAGE_SUBAGENTS,
+  const selectChildren = useMemo(
+    () => createStageSessionSelector(effectiveHostId, effectiveAgentId),
+    [effectiveHostId, effectiveAgentId],
   );
-
-  const childInsights = childStage?.insights.subagents ?? EMPTY_STAGE_SUBAGENTS;
-  const children = useMemo(() => selectSessionSubagents(
-    { hostDetails, fleet, archivedSubagents }, effectiveHostId, effectiveAgentId, childInsights,
-  ).all, [hostDetails, fleet, archivedSubagents, effectiveHostId, effectiveAgentId, childInsights]);
-  const siblings = useMemo(() => selectSessionSubagents(
-    { hostDetails, fleet, archivedSubagents }, parentHostId, parentAgentId, parentStageSubagents,
-  ).all, [hostDetails, fleet, archivedSubagents, parentHostId, parentAgentId, parentStageSubagents]);
+  const selectSiblings = useMemo(
+    () => createStageSessionSelector(parentHostId, parentAgentId),
+    [parentHostId, parentAgentId],
+  );
+  const { subagents: children, decisions: childDecisions } = useOrbitSelector(selectChildren);
+  const { subagents: siblings, decisions: parentDecisions } = useOrbitSelector(selectSiblings);
+  const effectiveCwd = childAgent?.cwd || cwd || "";
+  const pendingPermissions = useMemo(
+    () =>
+      isManaged
+        ? mergeAgentPendingPermissions(
+            tab.childAgentId,
+            childDecisions.parentPermissions,
+            childStage?.pending_permissions,
+            hostPendingPermissions,
+          )
+        : childDecisions.parentPermissions,
+    [
+      isManaged,
+      tab.childAgentId,
+      childDecisions.parentPermissions,
+      childStage?.pending_permissions,
+      hostPendingPermissions,
+    ],
+  );
+  const pendingQuestions = isManaged ? childDecisions.parentQuestions : EMPTY_QUESTIONS;
+  const nestedSubagentPermissions = isManaged ? childDecisions.subagentPermissions : EMPTY_SUBAGENT_PERMS;
+  const hasManagedDecisions = Boolean(
+    isManaged &&
+      hostId &&
+      tab.childAgentId &&
+      (pendingPermissions.length > 0 ||
+        pendingQuestions.length > 0 ||
+        nestedSubagentPermissions.length > 0),
+  );
+  const isActiveProviderSubagent =
+    !isManaged && (status === "running" || status === "awaiting_permission");
+  const showParentFallbackDock = Boolean(
+    isActiveProviderSubagent &&
+      parentHostId &&
+      parentAgentId &&
+      (parentDecisions.parentPermissions.length > 0 ||
+        parentDecisions.parentQuestions.length > 0),
+  );
   const currentPeer = siblings.find((sa) =>
     (tab.childAgentId && sa.childAgentId === tab.childAgentId) ||
     (tab.providerSubagentId && sa.providerSubagentId === tab.providerSubagentId) ||
@@ -392,10 +390,6 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
 
   const handleOpenNestedSubagent = useCallback(
     (sa: ResolvedSubagentItem) => {
-      if (sa.status === "awaiting_permission" && sa.isManaged && sa.childAgentId) {
-        orbitActions.selectAgent(sa.childHostId, sa.childAgentId);
-        return;
-      }
       orbitActions.openSubagentTab({
         callId: sa.callId,
         role: sa.title,
@@ -403,7 +397,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
         childAgentId: sa.childAgentId,
         childHostId: sa.childHostId || undefined,
         providerSubagentId: sa.providerSubagentId,
-        parentAgentId: effectiveAgentId || parentAgentId || undefined,
+        parentAgentId: parentAgentId || effectiveAgentId || undefined,
       });
     },
     [effectiveAgentId, parentAgentId],
@@ -479,17 +473,29 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
 
   const viewportResetKey = `${tab.id}:${tab.childAgentId ?? tab.providerSubagentId ?? tab.subagentCallId ?? ""}`;
 
-  // Status & Archive already live in Overview; render a minimal 1-line bar ONLY when an approval
-  // decision is needed or to quietly identify a cross-host subagent. Zero header bar otherwise.
-  const needsApproval = Boolean(isManaged && hostId && tab.childAgentId && status === "awaiting_permission");
-  const showInlineContextBar = needsApproval || Boolean(remoteHostName);
+  // Show an actionable fallback banner ONLY when awaiting approval without a live DecisionDock payload
+  // (e.g. cold hydration or provider-only subagent whose gate lives on the parent), or to identify a cross-host subagent.
+  const showApprovalFallbackBanner =
+    status === "awaiting_permission" && !hasManagedDecisions && !showParentFallbackDock;
+  const showInlineContextBar = showApprovalFallbackBanner || Boolean(remoteHostName);
+
+  const handleFallbackApprovalAction = useCallback(() => {
+    if (isManaged && hostId && tab.childAgentId) {
+      void orbitActions.hydrateSubagentStage(hostId, tab.childAgentId).catch(() => undefined);
+      void orbitIpc.refreshPendingPermissions(hostId).catch(() => undefined);
+      return;
+    }
+    if (parentHostId && parentAgentId) {
+      orbitActions.selectAgent(parentHostId, parentAgentId);
+    }
+  }, [isManaged, hostId, tab.childAgentId, parentHostId, parentAgentId]);
 
   return (
     <div className="orbit-stage-enter bg-surface-base flex min-h-0 flex-1 flex-col overflow-hidden">
       {showInlineContextBar && (
         <ContextBanner
           variant="strip"
-          tone={needsApproval ? "warning" : "neutral"}
+          tone={showApprovalFallbackBanner ? "warning" : "neutral"}
           icon={
             <SubagentAvatar
               character={currentPeer?.character}
@@ -499,20 +505,22 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
             />
           }
           actions={
-            needsApproval ? (
-              <button
+            showApprovalFallbackBanner ? (
+              <Button
                 type="button"
-                onClick={handleOpenThread}
-                className="text-signal-warning hover:bg-signal-warning-bg inline-flex h-[22px] shrink-0 cursor-pointer items-center gap-1 rounded-[6px] px-2 text-[11px] font-medium transition-colors"
+                variant="outline"
+                size="xs"
+                onClick={handleFallbackApprovalAction}
               >
-                <span>Review</span>
-                <ArrowUpRight className="size-3" />
-              </button>
+                {isManaged ? t("common.refresh") : t("approval.inspectSubagent")}
+              </Button>
             ) : undefined
           }
         >
           <span className="inline-flex items-center gap-2">
-            {needsApproval && <span className="font-medium">Approval required</span>}
+            {showApprovalFallbackBanner && (
+              <span className="font-medium">{t("overview.subagentApprovalRequired")}</span>
+            )}
             {remoteHostName && (
               <span className="bg-surface-recessed text-ink-tertiary border-border-subtle inline-flex max-w-[180px] items-center truncate rounded-[6px] border px-1.5 py-0.5 text-[11px] leading-none">
                 {remoteHostName}
@@ -530,51 +538,70 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
         contentVersion={contentVersion}
         viewportRef={viewportRef}
         stickToBottomRef={stickToBottomRef}
-        viewportClassName="px-6 pt-6 pb-11"
+        viewportClassName="px-6 pt-6 pb-[24px]"
       >
         <div className="orbit-stage-enter mx-auto w-full min-w-0 max-w-[740px]">
           {displayTurns.length > 0 ? (
-            <div className="space-y-[32px]">
-              {displayTurns.map((turn, idx) => {
-                const isLastTurn = idx === displayTurns.length - 1;
-                const isTurnActive = isLastTurn && status === "running";
-                const liveLabel = isLastTurn
-                  ? isManaged
-                    ? (childAgent?.status_label ?? null)
-                    : status === "running"
-                      ? "Working..."
-                      : null
-                  : null;
-                const thinkingSignature = buildSubagentTurnThinkingSignature(
-                  turn,
-                  effectiveAgentId,
-                  thinkingTimingsRef.current,
-                );
-                return (
-                  <TurnStageSection
-                    key={turn.key}
-                    turn={turn}
-                    dispatches={dispatches}
-                    isTurnActive={isTurnActive}
-                    agentStatusLabel={liveLabel}
-                    isNetworkOffline={isNetworkOffline}
-                    autoFoldCompleted={coalesceExploration}
-                    hostId={effectiveHostId}
-                    cwd={cwd}
-                    agentId={effectiveAgentId}
-                    thinkingSignature={thinkingSignature}
-                    getThinkingDurationMs={getThinkingDurationMs}
-                    holdViewport={holdViewport}
-                    onRequestRewind={NOOP_REWIND}
-                    onPreviewImage={setImagePreviewTarget}
-                    sessionSubagents={subagentSessionSubagents}
-                    sessionSubagentMatcher={subagentNameMatcher}
-                    onOpenSubagent={handleOpenNestedSubagent}
-                    parentMessageLabel="Sent to parent"
-                  />
-                );
-              })}
+            <div>
+              {(() => {
+                let previousHasFooter: boolean | undefined;
+                return displayTurns.map((turn, idx) => {
+                  const isLastTurn = idx === displayTurns.length - 1;
+                  const isTurnActive = isLastTurn && status === "running";
+                  const topGapPx = getTurnTopGapPx(turn, previousHasFooter);
+                  previousHasFooter =
+                    getTurnFooter(turn, {
+                      isActive: isTurnActive,
+                      isLastTurn,
+                      canFork: false,
+                    }) !== null;
+                  const liveLabel = isLastTurn
+                    ? isManaged
+                      ? (childAgent?.status_label ?? null)
+                      : status === "running"
+                        ? "Working..."
+                        : null
+                    : null;
+                  const thinkingSignature = buildSubagentTurnThinkingSignature(
+                    turn,
+                    effectiveAgentId,
+                    thinkingTimingsRef.current,
+                  );
+                  return (
+                    <div key={turn.key} style={topGapPx > 0 ? { paddingTop: topGapPx } : undefined}>
+                      <TurnStageSection
+                        turn={turn}
+                        dispatches={dispatches}
+                        isTurnActive={isTurnActive}
+                        isLastTurn={isLastTurn}
+                        agentStatusLabel={liveLabel}
+                        isNetworkOffline={isNetworkOffline}
+                        autoFoldCompleted={coalesceExploration}
+                        hostId={effectiveHostId}
+                        cwd={cwd}
+                        agentId={effectiveAgentId}
+                        thinkingSignature={thinkingSignature}
+                        getThinkingDurationMs={getThinkingDurationMs}
+                        holdViewport={holdViewport}
+                        onRequestRewind={NOOP_REWIND}
+                        onPreviewImage={setImagePreviewTarget}
+                        sessionSubagents={subagentSessionSubagents}
+                        sessionSubagentMatcher={subagentNameMatcher}
+                        onOpenSubagent={handleOpenNestedSubagent}
+                        parentMessageLabel="Sent to parent"
+                      />
+                    </div>
+                  );
+                });
+              })()}
             </div>
+          ) : hydrating ? (
+            <div role="status" className="text-ink-muted flex items-center justify-center gap-2 py-6 text-[13px]">
+              <OrbitSpinner size={14} />
+              {t("common.syncing")}
+            </div>
+          ) : emptyPrompt.trim() ? (
+            <p className="selectable-text text-ink-secondary text-[13px] leading-[1.55] whitespace-pre-wrap break-words">{emptyPrompt}</p>
           ) : (
             <div className="text-muted-foreground flex flex-col items-center justify-center gap-2.5 py-20 text-center text-[13px]">
               {status === "running" && <OrbitSpinner size={16} className="text-foreground/65" />}
@@ -589,6 +616,33 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
           )}
         </div>
       </ConversationViewport>
+
+      {hasManagedDecisions && hostId && tab.childAgentId ? (
+        <div className="bg-surface-base relative z-20 shrink-0 pt-2">
+          <DecisionDock
+            hostId={hostId}
+            agentId={tab.childAgentId}
+            cwd={effectiveCwd}
+            permissions={pendingPermissions}
+            questions={pendingQuestions}
+            subagentPermissions={nestedSubagentPermissions}
+            registerGlobalShortcuts={false}
+            compact
+          />
+        </div>
+      ) : showParentFallbackDock && parentHostId && parentAgentId ? (
+        <div className="bg-surface-base relative z-20 shrink-0 pt-2">
+          <DecisionDock
+            hostId={parentHostId}
+            agentId={parentAgentId}
+            cwd={effectiveCwd}
+            permissions={parentDecisions.parentPermissions}
+            questions={parentDecisions.parentQuestions}
+            registerGlobalShortcuts={false}
+            compact
+          />
+        </div>
+      ) : null}
 
       <PromptImageLightbox
         target={imagePreviewTarget}

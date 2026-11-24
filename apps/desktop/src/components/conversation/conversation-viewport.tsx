@@ -2,73 +2,161 @@ import {
   memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type MutableRefObject,
   type ReactNode,
   type RefObject,
 } from "react";
-import { ArrowDown, Check, ChevronDown, ChevronUp, Copy } from "lucide-react";
+import { ArrowDown, Check, Copy } from "lucide-react";
 import { MarkdownLinkProvider } from "@/components/markdown-blocks";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  computeDisclosureRevealDelta,
+  computeStageScrollState,
+  STAGE_STICKY_REENGAGE_THRESHOLD_PX,
+  USER_PROMPT_PREVIEW_MAX_PX,
+  type ViewportAnchorHoldFn,
+} from "@/components/stage/stage-helpers";
 import { cn } from "@/lib/utils";
 
-/**
- * Anchor-preserving viewport hold matching `StreamStage`:
- * Keeps a clicked disclosure trigger or prompt bubble stationary when expanding/collapsing,
- * pauses `stickToBottomRef` during the toggle so live streaming never yanks the viewport away,
- * and smoothly nudges newly expanded details near the bottom edge into view.
- */
+interface ViewportTracking {
+  holdActiveRef: RefObject<boolean>;
+  syncScrollMetrics: () => void;
+  holdViewport: ViewportAnchorHoldFn;
+  cancelHold?: () => void;
+}
+
+// A side panel owns the disclosure callback while its child owns the scroll element.
+// Register the current viewport so both observe the same hold, including on session changes.
+const trackedViewports = new WeakMap<HTMLElement, ViewportTracking>();
+
+// Rows rendered through a legacy parent still have access to their viewport owner.
+export const holdNearestViewport: ViewportAnchorHoldFn = (trigger, apply, edge, options) => {
+  const scroller = trigger?.closest<HTMLElement>('[data-slot="scroll-area-viewport"]');
+  const owner = scroller ? trackedViewports.get(scroller) : undefined;
+  if (owner) owner.holdViewport(trigger, apply, edge, options);
+  else apply();
+};
+
+export function useViewportTracking(
+  viewportRef: RefObject<HTMLDivElement | null>,
+  stickToBottomRef: RefObject<boolean>,
+  holdActiveRef: RefObject<boolean>,
+  syncScrollMetrics: () => void,
+  resetKey?: string | null,
+) {
+  const holdViewport = useViewportAnchorHold(viewportRef, stickToBottomRef);
+  useLayoutEffect(() => {
+    const el = viewportRef.current;
+    if (!el) return;
+    const tracking: ViewportTracking = { holdViewport, holdActiveRef, syncScrollMetrics };
+    trackedViewports.set(el, tracking);
+    return () => {
+      tracking.cancelHold?.();
+      trackedViewports.delete(el);
+    };
+  }, [viewportRef, holdViewport, holdActiveRef, syncScrollMetrics, resetKey]);
+
+  const cancelHold = useCallback(() => {
+    const el = viewportRef.current;
+    if (el) trackedViewports.get(el)?.cancelHold?.();
+  }, [viewportRef]);
+  return { holdViewport, cancelHold };
+}
+
 export function useViewportAnchorHold(
   viewportRef: RefObject<HTMLDivElement | null>,
   stickToBottomRef?: MutableRefObject<boolean>,
-) {
-  return useCallback(
-    (triggerEl: HTMLElement | null, apply: () => void, edge: "top" | "bottom" = "top") => {
-      const scroller = viewportRef.current;
-      if (!scroller || !triggerEl) {
-        apply();
+): ViewportAnchorHoldFn {
+  const pending = useRef<(() => void) | undefined>(undefined);
+  useLayoutEffect(() => () => pending.current?.(), []);
+  return useCallback<ViewportAnchorHoldFn>((triggerEl, apply, edge = "top", options) => {
+    pending.current?.();
+    const scroller = viewportRef.current;
+    if (!scroller || !triggerEl) {
+      apply();
+      return;
+    }
+    const tracking = trackedViewports.get(scroller);
+    tracking?.cancelHold?.();
+    const container = triggerEl.closest<HTMLElement>(
+      '[data-slot="trace-collapsible"], [data-slot="collapsible"], [data-orbit-disclosure-root]',
+    ) ?? triggerEl.parentElement ?? triggerEl;
+    const beforeContainerHeight = container.getBoundingClientRect().height;
+    const beforeAnchor = triggerEl.getBoundingClientRect()[edge];
+    const wasPinnedBottom = stickToBottomRef?.current;
+    let expanding = options?.intent === "expand";
+    let frame = 0;
+    let timer = 0;
+    let revealTarget: number | undefined;
+
+    const cleanup = () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timer);
+      scroller.removeEventListener("scrollend", onScrollEnd);
+      pending.current = undefined;
+      if (tracking) {
+        tracking.cancelHold = undefined;
+        tracking.holdActiveRef.current = false;
+      }
+    };
+    const settle = () => {
+      if (scroller === viewportRef.current && scroller.isConnected) {
+        const gap = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+        if (stickToBottomRef) {
+          stickToBottomRef.current = (wasPinnedBottom === true && !expanding) || gap <= STAGE_STICKY_REENGAGE_THRESHOLD_PX;
+        }
+        // Consume the hold's own movement before accepting user scroll deltas again.
+        tracking?.syncScrollMetrics();
+      }
+      cleanup();
+    };
+    const onScrollEnd = (event: Event) => {
+      if (event.target === scroller && revealTarget !== undefined &&
+          Math.abs(scroller.scrollTop - revealTarget) <= 1) settle();
+    };
+    const cancel = () => {
+      cleanup();
+      if (revealTarget !== undefined) {
+        scroller.scrollTo({ top: scroller.scrollTop, behavior: "instant" });
+      }
+    };
+    pending.current = cancel;
+    if (tracking) {
+      tracking.cancelHold = cancel;
+      tracking.holdActiveRef.current = true;
+    }
+    if (stickToBottomRef) stickToBottomRef.current = false;
+    apply();
+
+    frame = window.requestAnimationFrame(() => {
+      if (scroller !== viewportRef.current || !triggerEl.isConnected) {
+        cleanup();
         return;
       }
-      const beforeRect = triggerEl.getBoundingClientRect();
-      const beforeAnchor = edge === "bottom" ? beforeRect.bottom : beforeRect.top;
-      const wasPinnedBottom = stickToBottomRef?.current ?? false;
-      if (stickToBottomRef) {
-        stickToBottomRef.current = false;
-      }
-
-      apply();
-
-      window.requestAnimationFrame(() => {
-        const curScroller = viewportRef.current;
-        if (!curScroller || !triggerEl.isConnected) return;
-        const afterRect = triggerEl.getBoundingClientRect();
-        const afterAnchor = edge === "bottom" ? afterRect.bottom : afterRect.top;
-        const delta = afterAnchor - beforeAnchor;
-        if (Math.abs(delta) > 1) {
-          curScroller.scrollTop += delta;
-        }
-        const parentWrapper = triggerEl.parentElement;
-        if (parentWrapper) {
-          const wrapperRect = parentWrapper.getBoundingClientRect();
-          const scrollerRect = curScroller.getBoundingClientRect();
-          const overflowBelow = wrapperRect.bottom - scrollerRect.bottom;
-          if (overflowBelow > 8 && wrapperRect.height < scrollerRect.height * 0.75) {
-            curScroller.scrollBy({
-              top: Math.min(overflowBelow + 12, 220),
-              behavior: "smooth",
-            });
-          }
-        }
-        if (wasPinnedBottom && stickToBottomRef) {
-          const dist =
-            curScroller.scrollHeight - curScroller.scrollTop - curScroller.clientHeight;
-          stickToBottomRef.current = dist < 48;
-        }
+      const delta = triggerEl.getBoundingClientRect()[edge] - beforeAnchor;
+      if (Math.abs(delta) > 1) scroller.scrollTop += delta;
+      const containerRect = container.getBoundingClientRect();
+      expanding = options?.intent ? options.intent === "expand" : containerRect.height > beforeContainerHeight + 2;
+      const nudge = computeDisclosureRevealDelta({
+        intent: options?.intent,
+        beforeContainerHeight,
+        containerRect,
+        scrollerRect: scroller.getBoundingClientRect(),
+        triggerRect: triggerEl.getBoundingClientRect(),
       });
-    },
-    [viewportRef, stickToBottomRef],
-  );
+      if (nudge <= 1) {
+        settle();
+        return;
+      }
+      revealTarget = Math.min(scroller.scrollTop + nudge, scroller.scrollHeight - scroller.clientHeight);
+      scroller.addEventListener("scrollend", onScrollEnd);
+      timer = window.setTimeout(settle, 380);
+      scroller.scrollBy({ top: nudge, behavior: "smooth" });
+    });
+  }, [viewportRef, stickToBottomRef]);
 }
 
 /**
@@ -104,57 +192,102 @@ export const ConversationViewport = memo(function ConversationViewport({
   const internalStickToBottomRef = useRef(true);
   const stickToBottomRef = externalStickToBottomRef ?? internalStickToBottomRef;
   const [showJumpLatest, setShowJumpLatest] = useState(false);
+  const [jumpPillMounted, setJumpPillMounted] = useState(false);
+  const [jumpPillVisible, setJumpPillVisible] = useState(false);
 
-  const checkNearBottom = useCallback((el: HTMLDivElement): boolean => {
-    const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
-    return gap <= 48;
-  }, []);
+  useEffect(() => {
+    if (showJumpLatest) {
+      setJumpPillMounted(true);
+      const raf = window.requestAnimationFrame(() => {
+        setJumpPillVisible(true);
+      });
+      return () => window.cancelAnimationFrame(raf);
+    }
+    if (!jumpPillMounted) return;
+    setJumpPillVisible(false);
+    const reduced =
+      typeof window !== "undefined" &&
+      Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
+    if (reduced) {
+      setJumpPillMounted(false);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setJumpPillMounted(false);
+    }, 125);
+    return () => window.clearTimeout(timer);
+  }, [showJumpLatest, jumpPillMounted]);
+
+  const holdActiveRef = useRef(false);
+  const lastScrollTopRef = useRef(0);
+  const lastClientHeightRef = useRef(0);
+  const handleScroll = useCallback(() => {
+    const el = viewportRef.current;
+    if (!el) return;
+    const currentTop = el.scrollTop;
+    const currentClientHeight = el.clientHeight;
+    const prevClientHeight = lastClientHeightRef.current || currentClientHeight;
+    lastClientHeightRef.current = currentClientHeight;
+    const distanceFromBottom = Math.max(0, el.scrollHeight - currentTop - currentClientHeight);
+    const clampedAtBottom = currentClientHeight > prevClientHeight && distanceFromBottom <= 2;
+    const state = computeStageScrollState({
+      previousTop: clampedAtBottom ? currentTop : lastScrollTopRef.current,
+      currentTop,
+      distanceFromBottom,
+      stickToBottom: stickToBottomRef.current,
+      holdActive: holdActiveRef.current,
+    });
+    lastScrollTopRef.current = currentTop;
+    stickToBottomRef.current = state.stickToBottom;
+    setShowJumpLatest(state.showJumpLatest);
+  }, [stickToBottomRef, viewportRef]);
+  const { cancelHold } = useViewportTracking(viewportRef, stickToBottomRef, holdActiveRef, handleScroll, resetKey);
+
+  useLayoutEffect(() => {
+    const el = viewportRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let prevCh = el.clientHeight;
+    lastClientHeightRef.current = prevCh;
+    const ro = new ResizeObserver(() => {
+      const ch = el.clientHeight;
+      const shrankBy = prevCh - ch;
+      prevCh = ch;
+      if (shrankBy > 0.5 && stickToBottomRef.current && !holdActiveRef.current) {
+        el.scrollTop += shrankBy;
+        lastScrollTopRef.current = el.scrollTop;
+      }
+      handleScroll();
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [viewportRef, stickToBottomRef, handleScroll, resetKey]);
 
   const scrollToLatest = useCallback((smooth = false) => {
     const el = viewportRef.current;
     if (!el) return;
+    cancelHold();
     stickToBottomRef.current = true;
     setShowJumpLatest(false);
-    el.scrollTo({
-      top: el.scrollHeight,
-      behavior: smooth ? "smooth" : "auto",
-    });
-  }, []);
+    el.scrollTo({ top: el.scrollHeight, behavior: smooth ? "smooth" : "instant" });
+    lastScrollTopRef.current = el.scrollTop;
+  }, [cancelHold, stickToBottomRef, viewportRef]);
+
+  useLayoutEffect(() => {
+    scrollToLatest();
+  }, [resetKey, scrollToLatest]);
 
   useEffect(() => {
-    stickToBottomRef.current = true;
-    setShowJumpLatest(false);
-    requestAnimationFrame(() => {
-      const el = viewportRef.current;
-      if (el) el.scrollTop = el.scrollHeight;
-    });
-  }, [resetKey]);
-
-  useEffect(() => {
-    if (!stickToBottomRef.current) return;
-    const el = viewportRef.current;
-    if (!el) return;
     const raf = requestAnimationFrame(() => {
-      if (stickToBottomRef.current && viewportRef.current) {
-        viewportRef.current.scrollTop = viewportRef.current.scrollHeight;
-      }
+      if (stickToBottomRef.current && !holdActiveRef.current) scrollToLatest();
+      else handleScroll();
     });
     return () => cancelAnimationFrame(raf);
-  }, [contentVersion]);
+  }, [contentVersion, handleScroll, scrollToLatest]);
 
-  const handleScroll = useCallback(() => {
-    const el = viewportRef.current;
-    if (!el) return;
-    const nearBottom = checkNearBottom(el);
-    stickToBottomRef.current = nearBottom;
-    setShowJumpLatest(!nearBottom && el.scrollHeight > el.clientHeight + 80);
-  }, [checkNearBottom]);
-
-  const handleWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
-    if (e.deltaY < -2) {
-      stickToBottomRef.current = false;
-    }
-  }, []);
+  const interruptFollow = () => {
+    cancelHold();
+    stickToBottomRef.current = false;
+  };
 
   return (
     <div className={cn("bg-canvas relative flex min-h-0 flex-1 flex-col overflow-hidden", className)}>
@@ -165,20 +298,44 @@ export const ConversationViewport = memo(function ConversationViewport({
           viewportClassName={cn("px-4 py-4", viewportClassName)}
           contentClassName={contentClassName}
           onViewportScroll={handleScroll}
-          onWheel={handleWheel}
+          onWheel={(event) => {
+            if (event.deltaY < 0) interruptFollow();
+            else if (event.deltaY > 0) cancelHold();
+          }}
+          onTouchStart={interruptFollow}
+          onTouchMove={interruptFollow}
+          onPointerDown={(event) => {
+            const el = viewportRef.current;
+            if (el && event.target === el && event.clientX >= el.getBoundingClientRect().right - 20) interruptFollow();
+          }}
+          onKeyDown={(event) => {
+            if (["ArrowUp", "PageUp", "Home"].includes(event.key)) interruptFollow();
+          }}
         >
           {children}
         </ScrollArea>
       </MarkdownLinkProvider>
 
-      {showJumpLatest && (
-        <div className="pointer-events-none absolute inset-x-0 bottom-3 z-10 flex justify-center">
+      {jumpPillMounted && (
+        <div
+          className={cn(
+            "pointer-events-none absolute inset-x-0 bottom-3 z-10 flex justify-center transition-[opacity,scale,translate]",
+            jumpPillVisible
+              ? "translate-y-0 scale-100 opacity-100 duration-[160ms] ease-[var(--ease-out-expo)]"
+              : "translate-y-1.5 scale-95 opacity-0 duration-[115ms] ease-[var(--ease-exit)]",
+          )}
+        >
           <button
             type="button"
+            aria-hidden={!jumpPillVisible}
+            tabIndex={jumpPillVisible ? 0 : -1}
             onClick={() => scrollToLatest(true)}
-            className="pointer-events-auto border-border bg-elevated/95 text-foreground hover:bg-accent inline-flex cursor-pointer items-center gap-1.5 rounded-full border px-3 py-1 text-[11.5px] font-medium shadow-md backdrop-blur-sm transition-colors"
+            className={cn(
+              "orbit-press floating-surface border-border-default bg-surface-raised text-ink-primary hover:border-border-strong hover:bg-accent inline-flex cursor-pointer items-center gap-1.5 rounded-full border px-3 py-1 text-[11px] font-medium",
+              jumpPillVisible ? "pointer-events-auto" : "pointer-events-none",
+            )}
           >
-            <ArrowDown className="h-[12px] w-[12px]" />
+            <ArrowDown className="size-3" />
             <span>Jump to latest</span>
           </button>
         </div>
@@ -188,8 +345,9 @@ export const ConversationViewport = memo(function ConversationViewport({
 });
 
 /**
- * Shared user message bubble matching the main conversation aesthetic with
- * automatic collapse/expand for long pasted prompts.
+ * Shared user message bubble matching `UserPromptBubble` parity:
+ * bottom fade preview when overflowing, click anywhere on the bubble to expand,
+ * and click anywhere outside the bubble (including left blank gutter) to collapse.
  */
 export const ConversationUserBubble = memo(function ConversationUserBubble({
   text,
@@ -198,37 +356,97 @@ export const ConversationUserBubble = memo(function ConversationUserBubble({
   text: string;
   compact?: boolean;
 }) {
-  const lineCount = text.split("\n").length;
-  const isLong = text.length > 360 || lineCount > 7;
   const [expanded, setExpanded] = useState(false);
+  const [overflowing, setOverflowing] = useState(false);
+  const bubbleRef = useRef<HTMLDivElement | null>(null);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+
+  useLayoutEffect(() => {
+    const el = bodyRef.current;
+    if (!el) return;
+    const measure = () => {
+      const next = el.scrollHeight > USER_PROMPT_PREVIEW_MAX_PX + 10;
+      setOverflowing((prev) => (prev === next ? prev : next));
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [text]);
+
+  useEffect(() => {
+    if (!expanded) return;
+    const handleClickOutside = (event: MouseEvent) => {
+      if (!(event.target instanceof Element)) return;
+      if (bubbleRef.current?.contains(event.target)) return;
+      if (event.target.closest('[data-slot="dialog-content"], .orbit-dialog-overlay')) return;
+      const sel = window.getSelection();
+      if (
+        sel &&
+        !sel.isCollapsed &&
+        sel.toString().trim().length > 0 &&
+        bubbleRef.current &&
+        sel.anchorNode &&
+        bubbleRef.current.contains(sel.anchorNode)
+      ) {
+        return;
+      }
+      holdNearestViewport(bubbleRef.current, () => setExpanded(false), "top", {
+        intent: "collapse",
+      });
+    };
+    document.addEventListener("click", handleClickOutside);
+    return () => document.removeEventListener("click", handleClickOutside);
+  }, [expanded]);
+
+  const handleBubbleClick = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (!overflowing || expanded) return;
+    const target = event.target as HTMLElement | null;
+    if (target?.closest("a, button")) return;
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) return;
+    holdNearestViewport(bubbleRef.current, () => setExpanded(true), "top", {
+      intent: "expand",
+    });
+  };
 
   return (
     <div className="flex justify-end">
       <div
+        ref={bubbleRef}
+        data-orbit-disclosure-root=""
+        onClick={handleBubbleClick}
         className={cn(
-          "prompt-bubble-surface selectable-text text-foreground max-w-[90%] rounded-2xl rounded-tr-md leading-relaxed whitespace-pre-wrap break-words",
-          compact ? "px-3.5 py-2 text-[12.5px]" : "px-4 py-2.5 text-[13.5px]",
+          "prompt-bubble-surface selectable-text text-foreground relative max-w-[90%] overflow-hidden rounded-[20px] whitespace-pre-wrap break-words",
+          compact
+            ? "px-3.5 py-2 text-[13px] leading-[1.5]"
+            : "px-4 py-2.5 text-[15px] leading-[1.65]",
+          overflowing && !expanded && "cursor-pointer",
         )}
       >
-        <div className={cn(isLong && !expanded && "line-clamp-6")}>{text}</div>
-        {isLong && (
-          <button
-            type="button"
-            onClick={() => setExpanded((v) => !v)}
-            className="text-muted-foreground hover:text-foreground mt-1 inline-flex cursor-pointer items-center gap-1 text-[11px] font-medium"
-          >
-            {expanded ? (
-              <>
-                <ChevronUp className="h-3 w-3" />
-                <span>Show less</span>
-              </>
-            ) : (
-              <>
-                <ChevronDown className="h-3 w-3" />
-                <span>Show full message</span>
-              </>
+        <div
+          ref={bodyRef}
+          style={
+            !expanded && overflowing
+              ? { maxHeight: `${USER_PROMPT_PREVIEW_MAX_PX}px`, overflow: "hidden" }
+              : undefined
+          }
+        >
+          {text}
+        </div>
+        {overflowing && (
+          <div
+            aria-hidden="true"
+            className={cn(
+              "pointer-events-none absolute inset-x-0 bottom-0 h-14 rounded-b-[19px] transition-opacity duration-150 ease-[var(--ease-out-quart)]",
+              expanded ? "opacity-0" : "opacity-100",
             )}
-          </button>
+            style={{
+              background:
+                "linear-gradient(to top, var(--surface-raised) 14%, color-mix(in oklab, var(--surface-raised) 82%, transparent) 52%, transparent 100%)",
+            }}
+          />
         )}
       </div>
     </div>
@@ -248,11 +466,27 @@ export const ConversationMessageFooter = memo(function ConversationMessageFooter
   rightSlot?: ReactNode;
 }) {
   const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+        copyTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const handleCopy = () => {
     void navigator.clipboard.writeText(copyText).then(() => {
       setCopied(true);
-      window.setTimeout(() => setCopied(false), 1400);
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+      copyTimerRef.current = window.setTimeout(() => {
+        copyTimerRef.current = null;
+        setCopied(false);
+      }, 1400);
     });
   };
 
@@ -263,13 +497,20 @@ export const ConversationMessageFooter = memo(function ConversationMessageFooter
           type="button"
           title="Copy response"
           onClick={handleCopy}
-          className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-md transition-colors"
+          className="orbit-press text-muted-foreground hover:text-foreground hover:bg-accent relative inline-flex size-[22px] cursor-pointer items-center justify-center rounded-md"
         >
-          {copied ? (
-            <Check className="h-[12px] w-[12px] text-emerald-500" />
-          ) : (
-            <Copy className="h-[12px] w-[12px]" />
-          )}
+          <Copy
+            className={cn(
+              "size-[12px] transition-[opacity,scale,rotate] duration-150 ease-[var(--ease-out-expo)]",
+              copied ? "scale-50 -rotate-12 opacity-0" : "scale-100 rotate-0 opacity-100",
+            )}
+          />
+          <Check
+            className={cn(
+              "text-signal-success absolute size-[12px] transition-[opacity,scale,rotate] duration-150 ease-[var(--ease-out-expo)]",
+              copied ? "scale-100 rotate-0 opacity-100" : "scale-50 rotate-12 opacity-0",
+            )}
+          />
         </button>
         {metaLabel && (
           <span className="text-muted-foreground/75 truncate text-[11px]">{metaLabel}</span>

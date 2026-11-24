@@ -20,6 +20,8 @@ export interface ResolvedSubagentItem {
   key: string;
   /** Call ID passed to openSubagentTab */
   callId: string;
+  /** A title-inferred dispatch must yield to another launch with an explicit child ID. */
+  callIdInferred?: boolean;
   handle?: string | null;
   /** Human-readable role or thread title */
   title: string;
@@ -41,6 +43,8 @@ export interface ResolvedSubagentItem {
   providerSubagentId: string | null;
   /** Managed card creation time, or zero when unavailable. */
   createdAtMs: number;
+  /** Start of the currently observed run, including a restart after settlement. */
+  activeStartedAtMs?: number | null;
   /** Sort tie-breaker (higher = more recent) */
   sortOrder: number;
 }
@@ -53,20 +57,15 @@ const STATUS_PRIORITY: Record<ResolvedSubagentStatus, number> = {
   completed: 4,
 };
 
-function mapManagedStatus(agent: AgentCardView): ResolvedSubagentStatus {
-  if (agent.is_awaiting_permission) return "awaiting_permission";
-  if (agent.is_running || agent.has_background_tasks) return "running";
-  const lowerLabel = agent.status_label.toLowerCase();
-  if (
-    lowerLabel.includes("cancel") ||
-    lowerLabel.includes("interrupt") ||
-    lowerLabel.includes("stopped")
-  ) {
-    return "canceled";
-  }
-  if (lowerLabel.includes("error") || lowerLabel.includes("fail")) {
-    return "failed";
-  }
+// Rust serializes AgentStatus on AgentCardView. Older desktop snapshots only have the flags/label.
+function mapManagedStatus(agent: AgentCardView & { status?: { state: string } }): ResolvedSubagentStatus {
+  const state = agent.status?.state;
+  if (agent.is_awaiting_permission || state === "awaiting_permission") return "awaiting_permission";
+  if (agent.is_running || agent.has_background_tasks ||
+      state === "initializing" || state === "running" || state === "autonomous_wakeup") return "running";
+  const lowerLabel = agent.status_label?.toLowerCase() ?? "";
+  if (state === "error" || /error|fail/.test(lowerLabel)) return "failed";
+  if (state === "closed" || /cancel|interrupt|stopped|closed/.test(lowerLabel)) return "canceled";
   return "completed";
 }
 
@@ -89,6 +88,45 @@ function parseTimestampMs(rfc3339: string | null | undefined): number {
   if (!rfc3339) return 0;
   const parsed = Date.parse(rfc3339);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+type ManagedRun = Pick<ResolvedSubagentItem, "status" | "activeStartedAtMs">;
+type ManagedRuns = Map<string, ManagedRun>;
+const runsByHost = new Map<string, {
+  latest: ManagedRuns;
+  snapshots: WeakMap<readonly AgentCardView[], ManagedRuns>;
+}>();
+
+// Track transitions on fleet snapshots so scrolling a dispatch offscreen doesn't reset its clock.
+// A replay of a snapshot by another selector must return the same run and start time.
+function managedRuns(hostId: string, agents: readonly AgentCardView[]): ManagedRuns {
+  let history = runsByHost.get(hostId);
+  if (!history) {
+    history = { latest: new Map(), snapshots: new WeakMap() };
+    runsByHost.set(hostId, history);
+  }
+  const cached = history.snapshots.get(agents);
+  if (cached) return cached;
+
+  const runs: ManagedRuns = new Map();
+  for (const agent of agents) {
+    const status = mapManagedStatus(agent);
+    let activeStartedAtMs = null;
+    if (isSubagentActiveStatus(status)) {
+      const previous = history.latest.get(agent.agent_id);
+      activeStartedAtMs = previous && !isSubagentActiveStatus(previous.status)
+        ? Date.now()
+        : previous?.activeStartedAtMs ?? (parseTimestampMs(agent.created_at_rfc3339) || null);
+    }
+    runs.set(agent.agent_id, { status, activeStartedAtMs });
+  }
+  history.latest = runs;
+  history.snapshots.set(agents, runs);
+  return runs;
+}
+
+function normalizeSubagentName(value: string): string {
+  return value.trim().toLowerCase().replace(/^@/, "").replace(/[-_\s]+/g, " ").trim();
 }
 
 /**
@@ -121,20 +159,22 @@ export function resolveSessionSubagents(params: {
   // 1. Index all Orbit managed children (across all hosts) and archived agent IDs
   const managedById = new Map<
     string,
-    { childHostId: string; remoteHostName: string | null; agent: AgentCardView }
+    { childHostId: string; remoteHostName: string | null; agent: AgentCardView; run: ManagedRun }
   >();
   const archivedManagedIds = new Set<string>();
 
   // Workspace peers have no parent pointer. Their dispatch result identifies them.
   const dispatchedIds = new Set(insightsSubagents.map((sa) => sa.child_agent_id));
   for (const [hid, detail] of Object.entries(hostDetails)) {
+    const runs = managedRuns(hid, detail.agents);
     for (const ag of detail.agents) {
       const matchesParent =
         ag.parent_agent_id === agentId &&
         (!ag.parent_host_id || ag.parent_host_id === hostId);
       if (!matchesParent && !(ag.agent_id.startsWith("ag_") && dispatchedIds.has(ag.agent_id))) continue;
 
-      if (ag.archived_at_rfc3339 && !ag.is_running && !ag.is_awaiting_permission) {
+      const run = runs.get(ag.agent_id)!;
+      if (ag.archived_at_rfc3339 && !isSubagentActiveStatus(run.status)) {
         archivedManagedIds.add(ag.agent_id);
         continue;
       }
@@ -143,6 +183,7 @@ export function resolveSessionSubagents(params: {
         childHostId: hid,
         remoteHostName: hid !== hostId ? (hostNameById.get(hid) ?? hid) : null,
         agent: ag,
+        run,
       });
     }
   }
@@ -154,39 +195,44 @@ export function resolveSessionSubagents(params: {
     providerById.set(ps.subagent_id, ps);
   }
 
-  const consumedManagedIds = new Set<string>();
+  // Core may emit both a dispatch insight and a synthetic card insight (id === child_agent_id).
+  // Reserve real ID-bearing calls first. Match a missing ID only for one launch and one free card.
+  const managedInsights = new Map<string, SessionSubagentEntryView>();
+  const launchesByTitle = new Map<string, SessionSubagentEntryView | null>();
+  for (const sa of insightsSubagents) {
+    if (sa.child_agent_id) {
+      if (!managedInsights.has(sa.child_agent_id) || sa.id !== sa.child_agent_id) {
+        managedInsights.set(sa.child_agent_id, sa);
+      }
+    } else if (!sa.provider_subagent_id && (sa.status === "running" || sa.status === "completed")) {
+      const title = normalizeSubagentName(sa.role);
+      if (title && !GENERIC_SUBAGENT_TITLES.has(title)) {
+        launchesByTitle.set(title, launchesByTitle.has(title) ? null : sa);
+      }
+    }
+  }
+  const cardsByTitle = new Map<string, string | null>();
+  for (const [id, { agent }] of managedById) {
+    const insight = managedInsights.get(id);
+    if (insight && insight.id !== id) continue;
+    const title = normalizeSubagentName(agent.title);
+    if (launchesByTitle.get(title)) cardsByTitle.set(title, cardsByTitle.has(title) ? null : id);
+  }
+  const reconciled = new Set<SessionSubagentEntryView>();
+  for (const [title, id] of cardsByTitle) {
+    const launch = launchesByTitle.get(title);
+    if (id && launch) {
+      managedInsights.set(id, launch);
+      reconciled.add(launch);
+    }
+  }
   const consumedProviderIds = new Set<string>();
   const out: ResolvedSubagentItem[] = [];
 
   // 3. Walk Rust-projected insights first to preserve timeline prompt previews & call IDs
   for (const sa of insightsSubagents) {
-    if (sa.child_agent_id && archivedManagedIds.has(sa.child_agent_id)) {
-      continue;
-    }
-
-    const managed = sa.child_agent_id ? managedById.get(sa.child_agent_id) : undefined;
-    if (managed) {
-      consumedManagedIds.add(managed.agent.agent_id);
-      out.push({
-        key: `managed:${managed.childHostId}:${managed.agent.agent_id}`,
-        callId: sa.id,
-        handle: managed.agent.handle,
-        title: managed.agent.title || sa.role || "Subagent",
-        promptPreview: sa.prompt_preview || managed.agent.status_label || "",
-        status: mapManagedStatus(managed.agent),
-        isManaged: true,
-        childHostId: managed.childHostId,
-        remoteHostName: managed.remoteHostName,
-        childAgentId: managed.agent.agent_id,
-        childProvider: managed.agent.provider,
-        providerSubagentId: null,
-        createdAtMs: parseTimestampMs(managed.agent.created_at_rfc3339),
-        sortOrder: Math.max(
-          sa.last_seq,
-          managed.agent.latest_seq,
-          parseTimestampMs(managed.agent.updated_at_rfc3339),
-        ),
-      });
+    if (reconciled.has(sa) || (sa.child_agent_id &&
+        (archivedManagedIds.has(sa.child_agent_id) || managedById.has(sa.child_agent_id)))) {
       continue;
     }
 
@@ -231,16 +277,17 @@ export function resolveSessionSubagents(params: {
     });
   }
 
-  // 4. Append unconsumed Orbit managed children (cross-host or freshly spawned before stage delta)
+  // 4. Emit each managed child once with its timeline call ID and prompt when available.
   for (const [childId, entry] of managedById) {
-    if (consumedManagedIds.has(childId)) continue;
+    const insight = managedInsights.get(childId);
     out.push({
       key: `managed:${entry.childHostId}:${childId}`,
-      callId: childId,
+      callId: insight?.id ?? childId,
+      callIdInferred: insight !== undefined && reconciled.has(insight),
       handle: entry.agent.handle,
-      title: entry.agent.title || "Subagent",
-      promptPreview: entry.agent.status_label || "",
-      status: mapManagedStatus(entry.agent),
+      title: entry.agent.title || insight?.role || "Subagent",
+      promptPreview: insight?.prompt_preview || entry.agent.status_label || "",
+      ...entry.run,
       isManaged: true,
       childHostId: entry.childHostId,
       remoteHostName: entry.remoteHostName,
@@ -249,6 +296,7 @@ export function resolveSessionSubagents(params: {
       providerSubagentId: null,
       createdAtMs: parseTimestampMs(entry.agent.created_at_rfc3339),
       sortOrder: Math.max(
+        insight?.last_seq ?? 0,
         entry.agent.latest_seq,
         parseTimestampMs(entry.agent.updated_at_rfc3339),
       ),
@@ -373,8 +421,10 @@ export function areResolvedSubagentsEqual(
     if (
       x.key !== y.key ||
       x.callId !== y.callId ||
+      x.callIdInferred !== y.callIdInferred ||
       x.handle !== y.handle ||
       x.createdAtMs !== y.createdAtMs ||
+      x.activeStartedAtMs !== y.activeStartedAtMs ||
       x.sortOrder !== y.sortOrder ||
       x.title !== y.title ||
       x.status !== y.status ||
@@ -389,9 +439,9 @@ export function areResolvedSubagentsEqual(
   return true;
 }
 
-function isManagedDispatchTool(name: string): boolean {
-  const clean = name.trim().toLowerCase().replace(/^run\s+/, "").replace(/[_\s]+/g, " ");
-  return /^(?:mcp orbit |orbit[/:.])?(?:create agent|spawn workspace peer)$/.test(clean);
+function isManagedDispatchTool(name: string | undefined): boolean {
+  const clean = name?.trim().toLowerCase().replace(/^run\s+/, "").replace(/[_\s/:.]+/g, " ");
+  return /^(?:(?:mcp )?orbit )?(?:create agent|spawn workspace peer)$/.test(clean ?? "");
 }
 
 export function classifyGenericSubagentTool(toolName: string): "dispatch" | "message" | null {
@@ -497,16 +547,16 @@ function resolveExactToolCall(
     );
   };
 
-  const normalize = (value: string) =>
-    value.trim().toLowerCase().replace(/^@/, "").replace(/[-_\s]+/g, " ");
   const matchByTitle = (title: string, candidates = subagents) => {
-    const normal = normalize(title);
+    const normal = normalizeSubagentName(title);
     if (!matchNames || !normal || normal === "subagent") return undefined;
     const matches = candidates.filter((sa) =>
-      normalize(sa.title) === normal || normalize(sa.handle ?? "") === normal,
+      normalizeSubagentName(sa.title) === normal || normalizeSubagentName(sa.handle ?? "") === normal,
     );
     return matches.length === 1 ? matches[0] : undefined;
   };
+  const matchByCall = (candidates: readonly ResolvedSubagentItem[]) =>
+    candidates.find((sa) => sa.callId === item.call_id && (matchNames || !sa.callIdInferred));
 
   let title: string;
   let prompt: string;
@@ -517,14 +567,23 @@ function resolveExactToolCall(
     title = item.detail.role.trim();
     prompt = item.detail.prompt_preview;
     childId = item.detail.child_agent_id;
-    if (!childId && !prompt.trim() && title.toLowerCase() === "subagent" && item.status !== "running") {
+    managed = Boolean(childId?.startsWith("ag_")) || isManagedDispatchTool(item.summary_title);
+    if (!managed && !childId && !prompt.trim() && title.toLowerCase() === "subagent" && item.status !== "running") {
       return null;
     }
-    managed = Boolean(childId?.startsWith("ag_"));
-    matched = managed
-      ? subagents.find((sa) => sa.childAgentId === childId)
-      : matchById(childId) ?? subagents.find((sa) => sa.callId === item.call_id);
-    if (!matched && !childId) matched = matchByTitle(title);
+    if (childId) {
+      matched = managed ? subagents.find((sa) => sa.isManaged && sa.childAgentId === childId) : matchById(childId);
+    } else {
+      const cards = subagents.filter((sa) =>
+        sa.isManaged || (!managed && (sa.childAgentId || sa.providerSubagentId)),
+      );
+      matched = matchByCall(cards);
+      if (!matched && (item.status === "running" || item.status === "completed") &&
+          !GENERIC_SUBAGENT_TITLES.has(normalizeSubagentName(title))) {
+        matched = matchByTitle(title, cards);
+      }
+    }
+    if (!managed && !matched) matched = matchByCall(subagents);
   } else if (item.detail.kind === "generic") {
     const name = item.detail.tool_name;
     const action = classifyGenericSubagentTool(name);
@@ -551,7 +610,7 @@ function resolveExactToolCall(
     if (targetId) {
       matched = managed ? candidates.find((sa) => sa.childAgentId === targetId) : matchById(targetId);
     } else {
-      matched = candidates.find((sa) => sa.callId === item.call_id) ?? matchByTitle(title, candidates);
+      matched = matchByCall(candidates) ?? matchByTitle(title, candidates);
       if (!matched && typeof args?.handle === "string") {
         matched = matchByTitle(args.handle, candidates);
       }

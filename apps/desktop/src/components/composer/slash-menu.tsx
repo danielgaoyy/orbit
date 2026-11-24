@@ -192,7 +192,7 @@ export function SlashCommandMenu({
               {groupHeader && (
                 <div
                   className={cn(
-                    "text-ink-faint px-2.5 pt-1 pb-1 text-[10.5px] font-medium tracking-[0.04em] uppercase select-none",
+                    "text-ink-faint px-2.5 pt-1 pb-1 text-[11px] font-medium tracking-[0.04em] uppercase select-none",
                     idx > 0 && "border-border-subtle mt-1 border-t pt-2",
                   )}
                 >
@@ -212,7 +212,7 @@ export function SlashCommandMenu({
                   onSelect(cmd);
                 }}
                 className={cn(
-                  "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors",
+                  "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
                   active
                     ? "bg-accent text-ink-primary"
                     : "text-ink-secondary hover:bg-accent/60 hover:text-ink-primary",
@@ -229,26 +229,26 @@ export function SlashCommandMenu({
                     <span className="text-ink-primary shrink-0 font-mono text-[13px] font-medium">
                       {cmd.command}
                     </span>
-                    <span className="text-ink-muted truncate text-[12px]">
+                    <span className="text-ink-muted truncate text-[11px]">
                       {localizedDesc}
                     </span>
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-1.5">
                   {modeActive && (
-                    <span className="text-ink-primary inline-flex items-center gap-1 text-[10.5px] font-medium">
+                    <span className="text-ink-primary inline-flex items-center gap-1 text-[11px] font-medium">
                       <Check className="size-3.5 stroke-[2]" />
                     </span>
                   )}
                   {isFastCmd && fastModeActive && (
-                    <span className="bg-signal-info-bg text-signal-info rounded px-1.5 py-0.5 text-[10px] font-medium">
+                    <span className="bg-signal-info-bg text-signal-info rounded px-1.5 py-0.5 text-[11px] font-medium">
                       {t("composer.slashStateOn")}
                     </span>
                   )}
                   {shortcut ? (
                     <ShortcutKbd keys={shortcut} className="shrink-0" />
                   ) : cmd.icon_key === "skill" ? (
-                    <span className="bg-surface-recessed text-ink-muted shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium">
+                    <span className="bg-surface-recessed text-ink-muted shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium">
                       {t("composer.slashBadgeSkill")}
                     </span>
                   ) : null}

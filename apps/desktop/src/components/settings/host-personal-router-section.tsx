@@ -129,32 +129,44 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
   };
 
   const handleSelectPrimaryHost = async (target: RouterHostCapabilities) => {
+    const isPrimary = primarySelection?.host_id === target.host_id;
+    if (isPrimary && target.active_router_agent_id) {
+      orbitActions.selectAgent(target.host_id, target.active_router_agent_id);
+      orbitActions.closeSettings();
+      return;
+    }
+
     setActivatingHostId(target.host_id);
     setError(null);
     try {
-      const provider: ProviderKind = target.hermes_installed
-        ? "acp"
-        : (target.available_providers[0] ?? "claude_code");
-      const acpId = target.hermes_installed ? "hermes" : null;
-      const snap = await orbitIpc.configurePersonalRouter(
-        target.host_id,
-        {
-          enabled: true,
-          router_agent_id: target.active_router_agent_id ?? null,
-          provider,
-          acp_agent_id: acpId,
-          model: null,
-          effort: null,
-          cwd: null,
-          scope: "global_fleet",
-          pre_review_mode: "medium_risk_only",
-          share_host_hermes_memory: true,
-          soul_prompt_override: null,
-          external_webhook_url: null,
-          has_external_webhook_secret: false,
-        },
-        true,
-      );
+      const existingSnap = await orbitIpc.getPersonalRouterStatus(target.host_id);
+      const existing = existingSnap.config;
+      if (isPrimary && existing.enabled && existingSnap.router_agent?.agent_id) {
+        orbitActions.selectAgent(target.host_id, existingSnap.router_agent.agent_id);
+        orbitActions.closeSettings();
+        return;
+      }
+
+      const useFallbackProvider =
+        !target.hermes_installed &&
+        !existing.enabled &&
+        !existing.router_agent_id &&
+        existing.provider === "acp" &&
+        (existing.acp_agent_id ?? "hermes") === "hermes";
+      const provider: ProviderKind = useFallbackProvider
+        ? (target.available_providers[0] ?? "claude_code")
+        : existing.provider;
+      const acpAgentId = useFallbackProvider ? null : (existing.acp_agent_id ?? null);
+
+      const nextCfg: PersonalRouterConfig = {
+        ...existing,
+        enabled: true,
+        router_agent_id: existing.router_agent_id ?? target.active_router_agent_id ?? null,
+        provider,
+        acp_agent_id: acpAgentId,
+      };
+
+      const snap = await orbitIpc.configurePersonalRouter(target.host_id, nextCfg, true);
       const nextPrimary = await orbitIpc.setPrimaryRouterSelection({
         host_id: target.host_id,
         agent_id: snap.router_agent?.agent_id ?? target.active_router_agent_id ?? null,
@@ -323,7 +335,9 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
                   {isBusy
                     ? "Activating..."
                     : isPrimary
-                      ? "Open Primary Router"
+                      ? h.active_router_agent_id
+                        ? "Open Primary Router"
+                        : "Activate Primary Router"
                       : h.hermes_installed
                         ? "Set as Primary (Hermes)"
                         : "Set as Primary"}

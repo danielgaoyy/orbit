@@ -469,7 +469,7 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
             className="w-[292px] p-1.5 select-none"
           >
             <div className="flex items-center justify-between gap-2 px-2.5 pt-1 pb-1.5">
-              <span className="text-ink-muted text-[11.5px] font-medium">
+              <span className="text-ink-muted text-[11px] font-medium">
                 {t("composer.heroProjects")}
               </span>
               {multiHost && (
@@ -527,14 +527,14 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
                       }
                     }}
                     placeholder={t("composer.heroFilterProjects")}
-                    className="text-ink-primary placeholder:text-ink-faint min-w-0 flex-1 bg-transparent text-[12px] outline-none"
+                    className="text-ink-primary placeholder:text-ink-faint min-w-0 flex-1 bg-transparent text-[13px] outline-none"
                   />
                 </div>
               </div>
             )}
 
             {filteredHeroProjects.length === 0 ? (
-              <div className="text-ink-muted px-2.5 py-3 text-center text-[12px]">
+              <div className="text-ink-muted px-2.5 py-3 text-center text-[13px]">
                 {t("composer.heroNoMatchingProjects")}
               </div>
             ) : (
@@ -794,7 +794,7 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
                     {rootRepoBranch ? (
                       <span
                         title={rootRepoBranch}
-                        className="text-ink-muted flex min-w-0 items-center gap-1 text-[11.5px] leading-snug"
+                        className="text-ink-muted flex min-w-0 items-center gap-1 text-[11px] leading-snug"
                       >
                         <span className="shrink-0">{t("composer.heroEditDirectlyOn")}</span>
                         <span className="text-ink-secondary min-w-0 truncate font-mono text-[11px]">
@@ -802,7 +802,7 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
                         </span>
                       </span>
                     ) : (
-                      <span className="text-ink-muted text-[11.5px] leading-snug">
+                      <span className="text-ink-muted text-[11px] leading-snug">
                         {t("composer.heroWorkDirectlyInFolder")}
                       </span>
                     )}
@@ -840,7 +840,7 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
                       {rootRepoBranch ? (
                         <span
                           title={t("composer.heroWorktreeBranchTooltip", { branch: rootRepoBranch })}
-                          className="text-ink-muted flex min-w-0 items-center gap-1 text-[11.5px] leading-snug"
+                          className="text-ink-muted flex min-w-0 items-center gap-1 text-[11px] leading-snug"
                         >
                           <span className="shrink-0">{t("composer.heroNewBranchFrom")}</span>
                           <span className="text-ink-secondary min-w-0 truncate font-mono text-[11px]">
@@ -848,7 +848,7 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
                           </span>
                         </span>
                       ) : (
-                        <span className="text-ink-muted text-[11.5px] leading-snug">
+                        <span className="text-ink-muted text-[11px] leading-snug">
                           {t("composer.heroIsolatedWorktreeDesc")}
                         </span>
                       )}
@@ -894,7 +894,7 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
                               )}
                             />
                             <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                              <span className="text-ink-primary truncate text-[12.5px] leading-tight font-medium">
+                              <span className="text-ink-primary truncate text-[13px] leading-tight font-medium">
                                 {repo.relative_path || repo.name}
                               </span>
                               {repo.git_branch && (

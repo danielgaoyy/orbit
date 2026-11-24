@@ -59,6 +59,27 @@ describe("subagent animal portraits", () => {
     assert.equal(silhouettes.size, ids.length);
   });
 
+  it("fuses all centerline-spanning shapes into a single continuous contour with no x=32 split seam", () => {
+    for (const { id, back, head, face } of roster) {
+      for (const layer of [back, head, face]) {
+        for (const { d } of layer) {
+          const subpaths = d.match(/M[^M]+/g) ?? [];
+          if (subpaths.length === 2) {
+            const startsOnCenterline = subpaths.every((sp) => /^M32(?:\.0+)?\s/.test(sp));
+            assert.equal(
+              startsOnCenterline,
+              false,
+              `${id}: mirrored path splits along x=32 centerline (${d})`,
+            );
+          }
+        }
+      }
+      // Every animal's base head silhouette must be a single closed contour (no centerline seam).
+      const headSilhouette = head[0]!.d;
+      assert.equal(headSilhouette.match(/M/g)?.length, 1, `${id}: head silhouette has multiple subpaths`);
+    }
+  });
+
   it("keeps standalone seed assignments compatible, including whitespace and the fallback", () => {
     assert.equal(hashSubagentAvatarSeed("hello"), 0x4f9f2cab);
     assert.equal(resolveSubagentCharacter("hello").id, "giant-panda");

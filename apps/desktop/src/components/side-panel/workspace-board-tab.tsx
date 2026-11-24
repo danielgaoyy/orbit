@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowUpRight,
@@ -23,6 +23,7 @@ import {
   Target,
   Users,
 } from "lucide-react";
+import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import {
   type RichBlockView,
@@ -293,13 +294,42 @@ function EventIcon({ kind }: { kind: WorkspaceEventRecord["kind"] }) {
   }
 }
 
+export interface BoardDraftSyncInput {
+  prevScopeKey: string;
+  nextScopeKey: string;
+  prevServerContent: string;
+  nextServerContent: string;
+  currentDraft: string;
+}
+
+export function reconcileBoardDraft(input: BoardDraftSyncInput): {
+  nextDraft: string;
+  shouldExitEdit: boolean;
+} {
+  if (input.prevScopeKey !== input.nextScopeKey) {
+    return { nextDraft: input.nextServerContent, shouldExitEdit: true };
+  }
+  if (input.prevServerContent === input.nextServerContent) {
+    return { nextDraft: input.currentDraft, shouldExitEdit: false };
+  }
+  const wasDirty = input.currentDraft !== input.prevServerContent;
+  return {
+    nextDraft: wasDirty ? input.currentDraft : input.nextServerContent,
+    shouldExitEdit: false,
+  };
+}
+
 export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
   tab,
+  visible = true,
 }: {
   tab: SidePanelTab;
+  visible?: boolean;
 }) {
+  const { t } = useI18n();
   const hostId = tab.hostId ?? "";
   const workspaceId = tab.workspaceId ?? "";
+  const scopeKey = `${hostId}::${workspaceId}`;
   const hostDetail = useOrbitSelector((s) => (hostId ? (s.hostDetails[hostId] ?? null) : null));
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
 
@@ -308,6 +338,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
     [hostDetail, workspaceId],
   );
   const board = hostDetail?.workspace_boards?.[workspaceId] ?? null;
+  const serverContent = board?.content ?? "";
   const events = useMemo(
     () => [...(hostDetail?.workspace_events?.[workspaceId] ?? [])].reverse(),
     [hostDetail, workspaceId],
@@ -326,8 +357,12 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
   );
 
   const [editingBoard, setEditingBoard] = useState(false);
-  const [boardDraft, setBoardDraft] = useState(board?.content ?? "");
+  const [boardDraft, setBoardDraft] = useState(serverContent);
   const [savingBoard, setSavingBoard] = useState(false);
+  const lastSyncedBoardRef = useRef<{ scopeKey: string; serverContent: string }>({
+    scopeKey,
+    serverContent,
+  });
   const [goalDraft, setGoalDraft] = useState(workspace?.mission_goal ?? "");
   const [editingGoal, setEditingGoal] = useState(false);
   const [titleDraft, setTitleDraft] = useState(workspace?.title ?? "");
@@ -337,9 +372,12 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
   const [activityExpanded, setActivityExpanded] = useState(false);
   const [sectionBlocks, setSectionBlocks] = useState<Record<string, RichBlockView[]>>({});
 
+  const isBoardDirty = boardDraft !== serverContent;
+  const previewSource = isBoardDirty ? boardDraft : serverContent;
+
   const parsedDoc = useMemo(
-    () => parseBoardMarkdown(board?.content ?? ""),
-    [board?.content],
+    () => parseBoardMarkdown(previewSource),
+    [previewSource],
   );
 
   const rootCwd = workspace?.project_root || workspace?.source_cwd || workspace?.cwd || "";
@@ -383,10 +421,28 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
   }, [hostId, workspaceId]);
 
   useEffect(() => {
-    if (!editingBoard) {
-      setBoardDraft(board?.content ?? "");
+    const prev = lastSyncedBoardRef.current;
+    if (prev.scopeKey === scopeKey && prev.serverContent === serverContent) {
+      return;
     }
-  }, [board?.content, editingBoard]);
+    lastSyncedBoardRef.current = { scopeKey, serverContent };
+    if (prev.scopeKey !== scopeKey) {
+      setBoardDraft(serverContent);
+      setEditingBoard(false);
+      setEditingGoal(false);
+      setEditingTitle(false);
+      return;
+    }
+    setBoardDraft((currentDraft) =>
+      reconcileBoardDraft({
+        prevScopeKey: prev.scopeKey,
+        nextScopeKey: scopeKey,
+        prevServerContent: prev.serverContent,
+        nextServerContent: serverContent,
+        currentDraft,
+      }).nextDraft,
+    );
+  }, [scopeKey, serverContent]);
 
   useEffect(() => {
     if (!editingGoal) {
@@ -395,6 +451,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
   }, [workspace?.mission_goal, parsedDoc.extractedGoal, editingGoal]);
 
   useEffect(() => {
+    if (!visible || editingBoard) return;
     if (parsedDoc.sections.length === 0) {
       setSectionBlocks({});
       return;
@@ -417,7 +474,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
     return () => {
       cancelled = true;
     };
-  }, [parsedDoc.sections]);
+  }, [visible, editingBoard, parsedDoc.sections]);
 
   useEffect(() => {
     if (!editingTitle) {
@@ -427,13 +484,24 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
 
   const handleSaveBoard = async () => {
     if (!hostId || !workspaceId || savingBoard) return;
+    const savedContent = boardDraft;
     setSavingBoard(true);
     try {
-      await orbitActions.updateWorkspaceBoard(hostId, workspaceId, boardDraft, null);
+      await orbitActions.updateWorkspaceBoard(hostId, workspaceId, savedContent, null);
       setEditingBoard(false);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message.trim() : String(err).trim();
+      orbitActions.showToast(
+        detail ? t("store.failedUpdateGroup", { detail }) : t("common.actionFailed"),
+      );
     } finally {
       setSavingBoard(false);
     }
+  };
+
+  const handleDiscardBoard = () => {
+    setBoardDraft(serverContent);
+    setEditingBoard(false);
   };
 
   const handleSaveTitle = async () => {
@@ -456,7 +524,12 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
   const effectiveGoal = workspace?.mission_goal?.trim() || parsedDoc.extractedGoal || "";
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+    <div
+      className={cn(
+        "flex min-h-0 flex-1 flex-col overflow-hidden",
+        !visible && "hidden",
+      )}
+    >
       {/* Header */}
       <div className="border-border/70 flex items-center justify-between gap-2 border-b px-4 py-2.5">
         <div className="min-w-0 flex-1">
@@ -519,18 +592,24 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
           <button
             type="button"
             onClick={() => setEditingBoard((v) => !v)}
-            className="border-border hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md border px-2 text-[12px]"
+            className="border-border hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-md border px-2 text-[12px]"
           >
             {editingBoard ? (
               <>
                 <Eye className="h-[12px] w-[12px]" />
-                <span>Preview</span>
+                <span>{t("sidePanel.preview")}</span>
               </>
             ) : (
               <>
                 <Edit3 className="h-[12px] w-[12px]" />
                 <span>Edit notes</span>
               </>
+            )}
+            {isBoardDirty && (
+              <span
+                title={t("sidePanel.unsavedChanges")}
+                className="bg-signal-warning size-1.5 shrink-0 rounded-full"
+              />
             )}
           </button>
         </div>
@@ -702,17 +781,56 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
 
         {/* 4. Shared Notes */}
         <section className="space-y-2">
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between gap-2">
             <span className="text-muted-foreground flex items-center gap-1.5 text-[11.5px] font-medium">
               <FileText className="h-[12.5px] w-[12.5px]" />
               <span>Shared notes</span>
+              {isBoardDirty && (
+                <span className="bg-signal-warning-bg border-signal-warning-border text-signal-warning inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10.5px] leading-none font-medium">
+                  <span className="bg-signal-warning size-1.5 rounded-full" />
+                  <span>{t("sidePanel.unsavedChanges")}</span>
+                </span>
+              )}
             </span>
-            {board?.updated_by && !editingBoard && parsedDoc.sections.length > 0 && (
+            {board?.updated_by && !editingBoard && !isBoardDirty && parsedDoc.sections.length > 0 && (
               <span className="text-muted-foreground/70 text-[11px]">
                 Updated by {board.updated_by}
               </span>
             )}
           </div>
+
+          {!editingBoard && isBoardDirty && (
+            <div className="border-signal-warning-border bg-signal-warning-bg flex items-center justify-between gap-2 rounded-xl border px-3 py-2">
+              <span className="text-ink-primary flex min-w-0 items-center gap-1.5 text-[12px] font-medium">
+                <span className="bg-signal-warning size-1.5 shrink-0 rounded-full" />
+                <span className="truncate">{t("sidePanel.unsavedChanges")}</span>
+              </span>
+              <div className="flex shrink-0 items-center gap-1.5">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="xs"
+                  disabled={savingBoard}
+                  onClick={handleDiscardBoard}
+                >
+                  {t("review.discard")}
+                </Button>
+                <Button
+                  type="button"
+                  size="xs"
+                  disabled={savingBoard}
+                  onClick={() => void handleSaveBoard()}
+                >
+                  {savingBoard ? (
+                    <Loader2 className="h-[11px] w-[11px] animate-spin" />
+                  ) : (
+                    <Save className="h-[11px] w-[11px]" />
+                  )}
+                  <span>{t("peerStrip.save")}</span>
+                </Button>
+              </div>
+            </div>
+          )}
 
           {editingBoard ? (
             <div className="space-y-2">
@@ -728,17 +846,15 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                   type="button"
                   variant="outline"
                   size="sm"
-                  onClick={() => {
-                    setBoardDraft(board?.content ?? "");
-                    setEditingBoard(false);
-                  }}
+                  disabled={savingBoard}
+                  onClick={handleDiscardBoard}
                 >
-                  Cancel
+                  {isBoardDirty ? t("review.discard") : t("common.cancel")}
                 </Button>
                 <Button
                   type="button"
                   size="sm"
-                  disabled={savingBoard}
+                  disabled={savingBoard || !isBoardDirty}
                   onClick={() => void handleSaveBoard()}
                 >
                   {savingBoard ? (
@@ -746,7 +862,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                   ) : (
                     <Save className="h-[12px] w-[12px]" />
                   )}
-                  <span>Save</span>
+                  <span>{t("peerStrip.save")}</span>
                 </Button>
               </div>
             </div>

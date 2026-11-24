@@ -920,7 +920,7 @@ export const BrowserTab = memo(function BrowserTab({
                 >
                   {overlayState?.statusLabel && (
                     <div className="bg-elevated/95 border-border floating-surface text-foreground inline-flex items-center gap-2 rounded-full border px-3 py-1 text-[12px] font-medium">
-                      <span className="bg-primary h-2 w-2 animate-pulse rounded-full" />
+                      <span className="bg-signal-info h-2 w-2 animate-pulse rounded-full" />
                       <span>{overlayState.statusLabel}</span>
                     </div>
                   )}

@@ -81,6 +81,7 @@ export const MediaPlayer = memo(function MediaPlayer({
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
   const [justCited, setJustCited] = useState(false);
+  const [scrubbing, setScrubbing] = useState(false);
 
   const displayName = basenameOfPath(filename || path || (kind === "video" ? "video" : "audio"));
   const effectiveMime = mimeType || defaultMimeForMedia(displayName, kind);
@@ -90,6 +91,7 @@ export const MediaPlayer = memo(function MediaPlayer({
     setCurrentTime(0);
     setDuration(0);
     setMediaError(null);
+    setScrubbing(false);
 
     if (sourceUrl || !base64Content || truncated) {
       setOwnedBlobUrl(null);
@@ -163,6 +165,17 @@ export const MediaPlayer = memo(function MediaPlayer({
     };
   }, []);
 
+  useEffect(() => {
+    if (!scrubbing) return;
+    const stopScrubbing = () => setScrubbing(false);
+    window.addEventListener("pointerup", stopScrubbing);
+    window.addEventListener("pointercancel", stopScrubbing);
+    return () => {
+      window.removeEventListener("pointerup", stopScrubbing);
+      window.removeEventListener("pointercancel", stopScrubbing);
+    };
+  }, [scrubbing]);
+
   const handleCite = () => {
     const citation = formatTimestampCitation(displayName, currentTime);
     if (onCiteTimestamp) {
@@ -194,7 +207,7 @@ export const MediaPlayer = memo(function MediaPlayer({
     downloadBlobUrl(activeUrl, displayName);
   };
 
-  const progressPct = duration > 0 ? Math.min(100, Math.max(0, (currentTime / duration) * 100)) : 0;
+  const progressRatio = duration > 0 ? Math.min(1, Math.max(0, currentTime / duration)) : 0;
   const KindIcon = kind === "video" ? Film : Music;
 
   return (
@@ -404,8 +417,13 @@ export const MediaPlayer = memo(function MediaPlayer({
               <div className="focus-within:ring-foreground/30 relative flex flex-1 items-center rounded-full focus-within:ring-2">
                 <div className="bg-muted h-1.5 w-full overflow-hidden rounded-full">
                   <div
-                    className="bg-foreground/75 h-full rounded-full transition-[width] duration-75"
-                    style={{ width: `${progressPct}%` }}
+                    className={cn(
+                      "bg-foreground/75 h-full w-full origin-left rounded-full",
+                      scrubbing
+                        ? "transition-none"
+                        : "transition-transform duration-75 ease-linear",
+                    )}
+                    style={{ transform: `scaleX(${progressRatio})` }}
                   />
                 </div>
                 <input
@@ -415,6 +433,10 @@ export const MediaPlayer = memo(function MediaPlayer({
                   max={duration > 0 ? duration : 0}
                   step={0.1}
                   value={Math.min(currentTime, duration || 0)}
+                  onPointerDown={() => setScrubbing(true)}
+                  onPointerUp={() => setScrubbing(false)}
+                  onPointerCancel={() => setScrubbing(false)}
+                  onBlur={() => setScrubbing(false)}
                   onChange={handleSeek}
                   className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
                 />

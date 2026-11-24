@@ -672,7 +672,7 @@ export function XtermPane({
             className={cn(
               "inline-flex h-5 cursor-pointer items-center justify-center rounded px-1 font-mono text-[10.5px] font-medium transition-colors",
               caseSensitive
-                ? "bg-primary/15 text-primary"
+                ? "bg-signal-info/15 text-signal-info"
                 : "text-muted-foreground hover:bg-accent hover:text-foreground",
             )}
           >
@@ -692,7 +692,7 @@ export function XtermPane({
             className={cn(
               "inline-flex h-5 cursor-pointer items-center justify-center rounded px-1 font-mono text-[10.5px] font-medium transition-colors",
               useRegex
-                ? "bg-primary/15 text-primary"
+                ? "bg-signal-info/15 text-signal-info"
                 : "text-muted-foreground hover:bg-accent hover:text-foreground",
             )}
           >

@@ -30,9 +30,139 @@ function paint(fill: string, d: string): AvatarPath {
   return { fill, d };
 }
 
-/** Reflect absolute (x, y) pairs about the centerline. Mirroring into the same
- * filled path keeps paired ears and markings to one SVG node per color. */
+type Point = readonly [x: number, y: number];
+type Segment =
+  | { readonly kind: "L"; readonly start: Point; readonly end: Point }
+  | { readonly kind: "Q"; readonly start: Point; readonly c: Point; readonly end: Point }
+  | { readonly kind: "C"; readonly start: Point; readonly c1: Point; readonly c2: Point; readonly end: Point };
+
+function formatCoord(n: number): string {
+  return Number.isInteger(n) ? String(n) : String(Number(n.toFixed(3)));
+}
+
+function mirrorPoint([x, y]: Point): string {
+  return `${formatCoord(64 - x)} ${formatCoord(y)}`;
+}
+
+/**
+ * When a single subpath starts and ends on the centerline (`x = 32`), join its mirrored half
+ * in reverse so the shape becomes ONE continuous closed contour with zero interior seam at
+ * `x = 32` (eliminating anti-aliasing subpixel cracks during CSS transform animations).
+ */
+function fuseCenterlineSymmetric(d: string): string | null {
+  const trimmed = d.trim();
+  const body = trimmed.endsWith("Z") ? trimmed.slice(0, -1) : trimmed;
+  if (body.includes("Z") || body.indexOf("M", 1) !== -1) return null;
+
+  const segments: Segment[] = [];
+  let start: Point | null = null;
+  let cur: Point = [0, 0];
+  let prevCubicCtrl: Point | null = null;
+  let prevQuadCtrl: Point | null = null;
+
+  for (const [, cmd, rawArgs] of body.matchAll(/([A-Z])([^A-Z]*)/g)) {
+    const nums = rawArgs.trim() ? rawArgs.trim().split(/\s+/).map(Number) : [];
+    switch (cmd) {
+      case "M":
+        cur = [nums[0]!, nums[1]!];
+        start = cur;
+        prevCubicCtrl = null;
+        prevQuadCtrl = null;
+        break;
+      case "L": {
+        const end: Point = [nums[0]!, nums[1]!];
+        segments.push({ kind: "L", start: cur, end });
+        cur = end;
+        prevCubicCtrl = null;
+        prevQuadCtrl = null;
+        break;
+      }
+      case "H": {
+        const end: Point = [nums[0]!, cur[1]];
+        segments.push({ kind: "L", start: cur, end });
+        cur = end;
+        prevCubicCtrl = null;
+        prevQuadCtrl = null;
+        break;
+      }
+      case "V": {
+        const end: Point = [cur[0], nums[0]!];
+        segments.push({ kind: "L", start: cur, end });
+        cur = end;
+        prevCubicCtrl = null;
+        prevQuadCtrl = null;
+        break;
+      }
+      case "Q": {
+        const c: Point = [nums[0]!, nums[1]!];
+        const end: Point = [nums[2]!, nums[3]!];
+        segments.push({ kind: "Q", start: cur, c, end });
+        cur = end;
+        prevQuadCtrl = c;
+        prevCubicCtrl = null;
+        break;
+      }
+      case "T": {
+        const c: Point = prevQuadCtrl
+          ? [2 * cur[0] - prevQuadCtrl[0], 2 * cur[1] - prevQuadCtrl[1]]
+          : cur;
+        const end: Point = [nums[0]!, nums[1]!];
+        segments.push({ kind: "Q", start: cur, c, end });
+        cur = end;
+        prevQuadCtrl = c;
+        prevCubicCtrl = null;
+        break;
+      }
+      case "C": {
+        const c1: Point = [nums[0]!, nums[1]!];
+        const c2: Point = [nums[2]!, nums[3]!];
+        const end: Point = [nums[4]!, nums[5]!];
+        segments.push({ kind: "C", start: cur, c1, c2, end });
+        cur = end;
+        prevCubicCtrl = c2;
+        prevQuadCtrl = null;
+        break;
+      }
+      case "S": {
+        const c1: Point = prevCubicCtrl
+          ? [2 * cur[0] - prevCubicCtrl[0], 2 * cur[1] - prevCubicCtrl[1]]
+          : cur;
+        const c2: Point = [nums[0]!, nums[1]!];
+        const end: Point = [nums[2]!, nums[3]!];
+        segments.push({ kind: "C", start: cur, c1, c2, end });
+        cur = end;
+        prevCubicCtrl = c2;
+        prevQuadCtrl = null;
+        break;
+      }
+      default:
+        return null;
+    }
+  }
+
+  if (!start || segments.length === 0 || start[0] !== 32 || cur[0] !== 32) {
+    return null;
+  }
+
+  let mirroredBack = "";
+  for (let i = segments.length - 1; i >= 0; i -= 1) {
+    const seg = segments[i]!;
+    if (seg.kind === "L") {
+      mirroredBack += `L${mirrorPoint(seg.start)}`;
+    } else if (seg.kind === "Q") {
+      mirroredBack += `Q${mirrorPoint(seg.c)} ${mirrorPoint(seg.start)}`;
+    } else {
+      mirroredBack += `C${mirrorPoint(seg.c2)} ${mirrorPoint(seg.c1)} ${mirrorPoint(seg.start)}`;
+    }
+  }
+  return `${body}${mirroredBack}Z`;
+}
+
+/** Reflect absolute (x, y) pairs about the centerline. Centerline-spanning shapes are fused
+ * into a single continuous closed path so animations never reveal an anti-aliased seam at x=32. */
 function mirrored(d: string): string {
+  const fused = fuseCenterlineSymmetric(d);
+  if (fused) return fused;
   return d + d.replace(/(-?[\d.]+) (-?[\d.]+)/g, (_, x, y) => `${64 - Number(x)} ${y}`);
 }
 
@@ -40,9 +170,9 @@ function pair(fill: string, d: string): AvatarPath {
   return paint(fill, mirrored(d));
 }
 
-/** A half profile starts and ends on x=32. Its two closed halves share one fill. */
+/** A half profile starts and ends on x=32; fused into one continuous closed contour. */
 function symmetric(profile: string): string {
-  return mirrored(profile + "Z");
+  return mirrored(profile);
 }
 
 function oval(x: number, y: number, rx: number, ry: number): string {
@@ -137,7 +267,7 @@ export const SUBAGENT_AVATAR_ROSTER: readonly SubagentCharacterSpec[] = [
     ears(pointed, "#BD804F", "#E6AA87"), coat(round, "#D79B5F", bib, brows)),
   animal("orange-tabby", clay,
     ears(kitten, rust, rose), coat(round, "#E9A45F", pads,
-      pair("#9C5533", "M22 18L26 20L28 25L32 22L32 26L25 29Z")),
+      paint("#9C5533", symmetric("M32 22L28 25L26 20L22 18L25 29L32 26"))),
     whiskered),
   animal("giant-panda", sage,
     ears(roundEar(18, 20, 9, 9), ink, "#514650"),

@@ -198,9 +198,32 @@ export function sliceRichBlocks(blocks: RichBlockView[], budget: number): RichBl
   return out;
 }
 
+export function prefersReducedMotion(): boolean {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+    return false;
+  }
+  return Boolean(window.matchMedia("(prefers-reduced-motion: reduce)")?.matches);
+}
+
+export function isDocumentHidden(): boolean {
+  return typeof document !== "undefined" && Boolean(document.hidden);
+}
+
+export function shouldPaceTextReveal(streaming: boolean): boolean {
+  if (!streaming) return false;
+  if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
+    return false;
+  }
+  if (prefersReducedMotion() || isDocumentHidden()) {
+    return false;
+  }
+  return true;
+}
+
 /**
  * Paces lumpy network/daemon streaming deltas over a smooth 150ms 60Hz horizon
  * while rendering historical or already-completed messages 100% immediately on first paint.
+ * Short-circuits immediately under `prefers-reduced-motion: reduce` or hidden tabs with zero rAF CPU.
  * Optional `resetKey` resets revealed progress when advancing to a newly streamed tail block.
  */
 export function usePacedRichBlocks(
@@ -217,13 +240,14 @@ export function usePacedRichBlocks(
   const prevFrameMsRef = useRef<number | null>(null);
 
   targetRef.current = targetChars;
+  const pacingEnabled = shouldPaceTextReveal(streaming);
 
   useEffect(() => {
     const keyChanged = prevResetKeyRef.current !== resetKey;
     prevResetKeyRef.current = resetKey;
 
-    if (!streaming) {
-      if (rafIdRef.current !== 0) {
+    if (!pacingEnabled) {
+      if (rafIdRef.current !== 0 && typeof window !== "undefined") {
         window.cancelAnimationFrame(rafIdRef.current);
         rafIdRef.current = 0;
       }
@@ -248,6 +272,15 @@ export function usePacedRichBlocks(
     prevFrameMsRef.current = null;
 
     const stepFrame = (nowMs: number) => {
+      if (prefersReducedMotion() || isDocumentHidden()) {
+        rafIdRef.current = 0;
+        prevFrameMsRef.current = null;
+        const target = targetRef.current;
+        revealedRef.current = target;
+        setRevealedChars((prev) => (prev === target ? prev : target));
+        return;
+      }
+
       const prevMs = prevFrameMsRef.current;
       const elapsed =
         prevMs === null ? FRAME_INTERVAL_MS : Math.min(MAX_ELAPSED_MS, nowMs - prevMs);
@@ -274,11 +307,56 @@ export function usePacedRichBlocks(
     };
 
     rafIdRef.current = window.requestAnimationFrame(stepFrame);
-  }, [streaming, targetChars, resetKey]);
+  }, [pacingEnabled, targetChars, resetKey]);
+
+  useEffect(() => {
+    if (!streaming) return;
+
+    const catchUpAndPause = () => {
+      if (rafIdRef.current !== 0 && typeof window !== "undefined") {
+        window.cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = 0;
+      }
+      prevFrameMsRef.current = null;
+      const target = targetRef.current;
+      revealedRef.current = target;
+      setRevealedChars((prev) => (prev === target ? prev : target));
+    };
+
+    const onVisibilityChange = () => {
+      if (isDocumentHidden()) {
+        catchUpAndPause();
+      }
+    };
+
+    const onReducedMotionChange = () => {
+      if (prefersReducedMotion()) {
+        catchUpAndPause();
+      }
+    };
+
+    const hasDoc = typeof document !== "undefined";
+    if (hasDoc) {
+      document.addEventListener("visibilitychange", onVisibilityChange);
+    }
+
+    const mql =
+      typeof window !== "undefined" && typeof window.matchMedia === "function"
+        ? window.matchMedia("(prefers-reduced-motion: reduce)")
+        : null;
+    mql?.addEventListener?.("change", onReducedMotionChange);
+
+    return () => {
+      if (hasDoc) {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      }
+      mql?.removeEventListener?.("change", onReducedMotionChange);
+    };
+  }, [streaming]);
 
   useEffect(() => {
     return () => {
-      if (rafIdRef.current !== 0) {
+      if (rafIdRef.current !== 0 && typeof window !== "undefined") {
         window.cancelAnimationFrame(rafIdRef.current);
         rafIdRef.current = 0;
       }
@@ -286,7 +364,10 @@ export function usePacedRichBlocks(
   }, []);
 
   return useMemo(
-    () => (streaming && revealedChars < targetChars ? sliceRichBlocks(blocks, revealedChars) : blocks),
-    [blocks, streaming, revealedChars, targetChars],
+    () =>
+      pacingEnabled && revealedChars < targetChars
+        ? sliceRichBlocks(blocks, revealedChars)
+        : blocks,
+    [blocks, pacingEnabled, revealedChars, targetChars],
   );
 }

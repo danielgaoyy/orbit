@@ -40,6 +40,13 @@ import { orbitIpc, isMacDesktop } from "@/lib/orbit-ipc";
 import { type ToastAction, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)").matches)
+  );
+}
+
 export default function App() {
   const detachedTerminal = useMemo(
     () =>
@@ -72,10 +79,13 @@ function MainDesktopApp() {
   const [settingsMounted, setSettingsMounted] = useState(isSettingsOpen);
   const [settingsClosing, setSettingsClosing] = useState(false);
 
-  // Presence state for smooth Toast enter & exit
+  // Presence state for smooth Toast enter & exit (monotonic revision key re-triggers enter on replacement)
   const [renderedToast, setRenderedToast] = useState<string | null>(toastNotice);
   const [renderedToastAction, setRenderedToastAction] = useState<ToastAction | null>(toastAction);
   const [toastExiting, setToastExiting] = useState(false);
+  const [toastRevision, setToastRevision] = useState(0);
+  const renderedToastRef = useRef<string | null>(renderedToast);
+  renderedToastRef.current = renderedToast;
 
   useGlobalErgonomicKeybindings();
 
@@ -216,6 +226,11 @@ function MainDesktopApp() {
       return;
     }
     if (settingsMounted) {
+      if (prefersReducedMotion()) {
+        setSettingsMounted(false);
+        setSettingsClosing(false);
+        return;
+      }
       setSettingsClosing(true);
       const id = window.setTimeout(() => {
         setSettingsMounted(false);
@@ -254,9 +269,16 @@ function MainDesktopApp() {
       setRenderedToast(toastNotice);
       setRenderedToastAction(toastAction);
       setToastExiting(false);
+      setToastRevision((r) => r + 1);
       return;
     }
-    if (renderedToast) {
+    if (renderedToastRef.current) {
+      if (prefersReducedMotion()) {
+        setRenderedToast(null);
+        setRenderedToastAction(null);
+        setToastExiting(false);
+        return;
+      }
       setToastExiting(true);
       const id = window.setTimeout(() => {
         setRenderedToast(null);
@@ -265,7 +287,7 @@ function MainDesktopApp() {
       }, 170);
       return () => window.clearTimeout(id);
     }
-  }, [toastNotice, toastAction, renderedToast]);
+  }, [toastNotice, toastAction]);
 
   return (
     <TooltipProvider>
@@ -298,6 +320,7 @@ function MainDesktopApp() {
 
         {/* Restrained Ephemeral Status Toast with Smooth Enter/Exit, Actions & Undo Archive */}
         <ToastViewport
+          key={toastRevision}
           message={renderedToast}
           action={renderedToastAction}
           undoEntry={lastArchivedUndo}

@@ -97,7 +97,7 @@ const TimerCountdownLabel = memo(function TimerCountdownLabel({
 }) {
   const nowMs = useLiveSecondClock(true);
   return (
-    <span className="text-ink-primary shrink-0 font-mono text-[11px] font-medium tabular-nums">
+    <span className="text-ink-primary shrink-0 font-mono text-[13px] font-medium tabular-nums">
       {formatTimerCountdown(fireAtMs, nowMs)}
     </span>
   );
@@ -147,7 +147,7 @@ export const OverviewGoalRow = memo(function OverviewGoalRow({
           />
         </span>
         <div className="min-w-0 flex-1">
-          <div className="text-ink-primary truncate text-[12px] leading-[16px] font-medium">
+          <div className="text-ink-primary truncate text-[13px] leading-[18px] font-medium">
             {goal.objective}
           </div>
           <div className="text-ink-tertiary flex items-center gap-1.5 text-[11px] leading-[15px]">
@@ -170,7 +170,7 @@ export const OverviewGoalRow = memo(function OverviewGoalRow({
         </div>
       </div>
 
-      <div className="bg-[var(--overview-surface,var(--surface-raised))]/95 border-border-subtle pointer-events-none absolute top-1/2 right-1.5 flex -translate-y-1/2 items-center gap-0.5 rounded-[7px] border p-0.5 opacity-0 shadow-xs backdrop-blur-[6px] transition-opacity duration-150 group-focus-within/goalrow:pointer-events-auto group-focus-within/goalrow:opacity-100 group-hover/goalrow:pointer-events-auto group-hover/goalrow:opacity-100">
+      <div className="bg-[var(--overview-surface,var(--surface-raised))] border-border-subtle pointer-events-none absolute top-1/2 right-1.5 flex -translate-y-1/2 items-center gap-0.5 rounded-[7px] border p-0.5 opacity-0 shadow-xs transition-opacity duration-150 motion-reduce:transition-none group-focus-within/goalrow:pointer-events-auto group-focus-within/goalrow:opacity-100 group-hover/goalrow:pointer-events-auto group-hover/goalrow:opacity-100">
         {!isVerifying && (
           <IconButton
             size="xs"
@@ -219,13 +219,13 @@ export const ArmedTimerRow = memo(function ArmedTimerRow({
       title={timer.prompt}
       className="group/timerrow hover:bg-accent/70 relative flex h-[30px] w-full items-center gap-1.5 rounded-[8px] px-2 transition-colors"
     >
-      <div className="flex min-w-0 flex-1 items-center gap-1.5 text-[12px]">
+      <div className="flex min-w-0 flex-1 items-center gap-1.5 text-[13px]">
         <Timer className="text-signal-info size-[13px] shrink-0 stroke-[1.8]" />
         <TimerCountdownLabel fireAtMs={timer.fire_at_ms} />
         <span className="text-ink-muted shrink-0">·</span>
         <span className="text-ink-tertiary truncate text-[11px]">{conditionLabel}</span>
       </div>
-      <div className="bg-[var(--overview-surface,var(--surface-raised))]/95 border-border-subtle pointer-events-none absolute top-1/2 right-1.5 flex -translate-y-1/2 items-center gap-0.5 rounded-[7px] border p-0.5 opacity-0 shadow-xs backdrop-blur-[6px] transition-opacity duration-150 group-focus-within/timerrow:pointer-events-auto group-focus-within/timerrow:opacity-100 group-hover/timerrow:pointer-events-auto group-hover/timerrow:opacity-100">
+      <div className="bg-[var(--overview-surface,var(--surface-raised))] border-border-subtle pointer-events-none absolute top-1/2 right-1.5 flex -translate-y-1/2 items-center gap-0.5 rounded-[7px] border p-0.5 opacity-0 shadow-xs transition-opacity duration-150 motion-reduce:transition-none group-focus-within/timerrow:pointer-events-auto group-focus-within/timerrow:opacity-100 group-hover/timerrow:pointer-events-auto group-hover/timerrow:opacity-100">
         <IconButton
           size="xs"
           tooltip={t("overview.runTimerNow")}
@@ -317,7 +317,7 @@ export const OverviewBackgroundTaskRow = memo(function OverviewBackgroundTaskRow
               <Clock className="text-ink-muted size-[13px] stroke-[1.7]" />
             )}
           </span>
-          <span className="text-ink-primary min-w-0 flex-1 truncate text-[12px] leading-[18px]">
+          <span className="text-ink-primary min-w-0 flex-1 truncate text-[13px] leading-[18px]">
             {task.title}
           </span>
         </button>
@@ -342,7 +342,7 @@ export const OverviewBackgroundTaskRow = memo(function OverviewBackgroundTaskRow
         {hasLogAction && (
           <div
             className={cn(
-              "bg-[var(--overview-surface,var(--surface-raised))]/95 border-border-subtle absolute top-1/2 right-1.5 flex -translate-y-1/2 items-center rounded-[7px] border p-0.5 shadow-xs backdrop-blur-[6px] transition-opacity duration-150",
+              "bg-[var(--overview-surface,var(--surface-raised))] border-border-subtle absolute top-1/2 right-1.5 flex -translate-y-1/2 items-center rounded-[7px] border p-0.5 shadow-xs transition-opacity duration-150 motion-reduce:transition-none",
               isExpanded
                 ? "pointer-events-auto opacity-100"
                 : "pointer-events-none opacity-0 group-focus-within/bgtask:pointer-events-auto group-focus-within/bgtask:opacity-100 group-hover/bgtask:pointer-events-auto group-hover/bgtask:opacity-100",
@@ -366,19 +366,28 @@ export const OverviewBackgroundTaskRow = memo(function OverviewBackgroundTaskRow
         )}
       </div>
 
-      {hasDetails && isExpanded && (
-        <div className="selectable-text flex flex-col gap-1.5 px-2.5 pt-0.5 pb-2 font-mono text-[11px] leading-relaxed">
-          {task.command && (
-            <div className="text-ink-secondary break-all whitespace-pre-wrap">
-              <span className="text-ink-muted select-none">$ </span>
-              {task.command}
+      {hasDetails && (
+        <div
+          className="orbit-collapse-grid"
+          data-open={isExpanded ? "true" : "false"}
+          aria-hidden={!isExpanded}
+          inert={!isExpanded}
+        >
+          <div className="orbit-collapse-inner">
+            <div className="selectable-text flex flex-col gap-1.5 px-2.5 pt-0.5 pb-2 font-mono text-[11px] leading-relaxed">
+              {task.command && (
+                <div className="text-ink-secondary break-all whitespace-pre-wrap">
+                  <span className="text-ink-muted select-none">$ </span>
+                  {task.command}
+                </div>
+              )}
+              {cleanPreview && (
+                <pre className="text-ink-tertiary max-h-[88px] overflow-hidden break-words whitespace-pre-wrap">
+                  {cleanPreview.slice(0, 320)}
+                </pre>
+              )}
             </div>
-          )}
-          {cleanPreview && (
-            <pre className="text-ink-tertiary max-h-[88px] overflow-hidden break-words whitespace-pre-wrap">
-              {cleanPreview.slice(0, 320)}
-            </pre>
-          )}
+          </div>
         </div>
       )}
     </div>
@@ -437,61 +446,62 @@ export const OverviewSection = memo(function OverviewSection({
         </CollapsibleTrigger>
 
         <div className="flex shrink-0 items-center gap-1">
-          {headerAction && (
-            <div
-              className={cn(
-                "items-center",
-                headerActionVisibility === "always"
-                  ? "flex"
-                  : "hidden group-focus-within/sechead:flex group-hover/sechead:flex",
+          {hoverReplacesMeta ? (
+            <div className="grid items-center justify-items-end">
+              {(trailingMeta || (collapsed && (hasAlert || isRunning))) && (
+                <div className="col-start-1 row-start-1 flex items-center gap-1 transition-opacity duration-150 motion-reduce:transition-none group-focus-within/sechead:pointer-events-none group-focus-within/sechead:opacity-0 group-hover/sechead:pointer-events-none group-hover/sechead:opacity-0 [@media(hover:none)]:pointer-events-none [@media(hover:none)]:opacity-0">
+                  {trailingMeta && <span className="flex items-center">{trailingMeta}</span>}
+                  {collapsed && (hasAlert || isRunning) && (
+                    <span className="flex items-center">
+                      {hasAlert ? (
+                        <span className="bg-signal-warning size-[6px] shrink-0 rounded-full" />
+                      ) : runningTone === "emerald" ? (
+                        <span className="bg-signal-success size-[6px] shrink-0 rounded-full" />
+                      ) : runningTone === "info" ? (
+                        <span className="bg-signal-info size-[6px] shrink-0 rounded-full" />
+                      ) : (
+                        <OrbitSpinner size={12} className="text-ink-secondary" />
+                      )}
+                    </span>
+                  )}
+                </div>
               )}
-            >
-              {headerAction}
+              <div className="pointer-events-none col-start-1 row-start-1 flex items-center opacity-0 transition-opacity duration-150 motion-reduce:transition-none group-focus-within/sechead:pointer-events-auto group-focus-within/sechead:opacity-100 group-hover/sechead:pointer-events-auto group-hover/sechead:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100">
+                {headerAction}
+              </div>
             </div>
-          )}
-          {trailingMeta && (
-            <span
-              className={cn(
-                "flex items-center",
-                hoverReplacesMeta &&
-                  "group-focus-within/sechead:hidden group-hover/sechead:hidden",
+          ) : (
+            <>
+              {headerAction && <div className="flex items-center">{headerAction}</div>}
+              {trailingMeta && <span className="flex items-center">{trailingMeta}</span>}
+              {collapsed && (hasAlert || isRunning) && (
+                <span className="flex items-center">
+                  {hasAlert ? (
+                    <span className="bg-signal-warning size-[6px] shrink-0 rounded-full" />
+                  ) : runningTone === "emerald" ? (
+                    <span className="bg-signal-success size-[6px] shrink-0 rounded-full" />
+                  ) : runningTone === "info" ? (
+                    <span className="bg-signal-info size-[6px] shrink-0 rounded-full" />
+                  ) : (
+                    <OrbitSpinner size={12} className="text-ink-secondary" />
+                  )}
+                </span>
               )}
-            >
-              {trailingMeta}
-            </span>
-          )}
-          {collapsed && (hasAlert || isRunning) && (
-            <span
-              className={cn(
-                "flex items-center",
-                hoverReplacesMeta &&
-                  "group-focus-within/sechead:hidden group-hover/sechead:hidden",
-              )}
-            >
-              {hasAlert ? (
-                <span className="bg-signal-warning size-[6px] shrink-0 rounded-full" />
-              ) : runningTone === "emerald" ? (
-                <span className="bg-signal-success size-[6px] shrink-0 rounded-full" />
-              ) : runningTone === "info" ? (
-                <span className="bg-signal-info size-[6px] shrink-0 rounded-full" />
-              ) : (
-                <OrbitSpinner size={12} className="text-ink-secondary" />
-              )}
-            </span>
+            </>
           )}
           <CollapsibleTrigger
             aria-label={t("overview.toggleSection", { label })}
             className="group/trigger text-ink-muted inline-flex size-[20px] cursor-pointer items-center justify-center rounded-[6px] outline-none"
           >
-            <ChevronRight className="size-3 shrink-0 transition-transform duration-200 ease-[var(--ease-panel)] group-data-[panel-open]/trigger:rotate-90" />
+            <ChevronRight className="size-3 shrink-0 transition-transform duration-[180ms] ease-[var(--ease-panel)] motion-reduce:transition-none group-data-[panel-open]/trigger:rotate-90" />
           </CollapsibleTrigger>
         </div>
       </div>
 
       <CollapsibleContent>
         <div className="pt-1">{children}</div>
+        {footer}
       </CollapsibleContent>
-      {!collapsed && footer}
     </Collapsible>
   );
 });
@@ -510,7 +520,7 @@ export const OverviewExpandFooter = memo(function OverviewExpandFooter({
     <div
       className={cn(
         expanded
-          ? "bg-[var(--overview-surface,var(--surface-raised))]/95 sticky bottom-0 z-[2] -mx-2 pt-1 pr-2 pb-2 pl-4 backdrop-blur-[6px]"
+          ? "bg-[var(--overview-surface,var(--surface-raised))] border-border-subtle sticky bottom-0 z-[2] border-t pt-1 pr-2 pb-2 pl-2"
           : "pt-0.5 pb-1.5 pl-2",
       )}
     >
@@ -550,11 +560,11 @@ export const OverviewPullRequestRow = memo(function OverviewPullRequestRow({
       >
         <span className="flex min-w-0 items-baseline gap-1.5">
           {pr.number > 0 && (
-            <span className="text-ink-primary shrink-0 font-mono text-[11.5px] font-medium tabular-nums">
+            <span className="text-ink-primary shrink-0 font-mono text-[11px] font-medium tabular-nums">
               #{pr.number}
             </span>
           )}
-          <span className="text-ink-secondary group-hover/prrow:text-ink-primary min-w-0 truncate text-[12px] transition-colors">
+          <span className="text-ink-secondary group-hover/prrow:text-ink-primary min-w-0 truncate text-[13px] transition-colors">
             {displayTitle}
           </span>
         </span>
@@ -586,7 +596,7 @@ export const OverviewSideQuestionRow = memo(function OverviewSideQuestionRow({
         )
       }
     >
-      <span className="text-[12px]">{entry.question}</span>
+      <span className="text-[13px]">{entry.question}</span>
     </ListRow>
   );
 });
@@ -625,13 +635,13 @@ export const OverviewArtifactRow = memo(function OverviewArtifactRow({
       leading={leadingIcon}
       trailing={
         artifact.version > 0 ? (
-          <span className="text-ink-muted font-mono text-[10.5px] tabular-nums">
+          <span className="text-ink-muted font-mono text-[11px] tabular-nums">
             v{artifact.version}
           </span>
         ) : undefined
       }
     >
-      <span className="text-[12px]">{artifact.title}</span>
+      <span className="text-[13px]">{artifact.title}</span>
     </ListRow>
   );
 });
@@ -647,52 +657,33 @@ export const OverviewLinkRow = memo(function OverviewLinkRow({
   const isLocal = item.kind === "local";
 
   return (
-    <div className="group/linkrow relative">
-      <ListRow
-        density="compact"
-        selected={selected}
-        title={isLocal ? `${t("overview.localPreview")} · ${item.url}` : item.url}
-        onClick={() => {
-          if (isLocal) {
-            orbitActions.openBrowserTab(item.url);
-          } else {
-            void orbitIpc.openExternalBrowserUrl(item.url);
-          }
-        }}
-        leading={
-          isLocal ? (
-            <Globe className="size-[13.5px] stroke-[1.75]" />
-          ) : (
-            <Link2 className="size-[13.5px] stroke-[1.7]" />
-          )
+    <ListRow
+      density="compact"
+      selected={selected}
+      title={isLocal ? `${t("overview.localPreview")} · ${item.url}` : item.url}
+      onClick={() => {
+        if (isLocal) {
+          orbitActions.openBrowserTab(item.url);
+        } else {
+          void orbitIpc.openExternalBrowserUrl(item.url);
         }
-        trailing={
-          !isLocal ? (
-            <ExternalLink className="text-ink-muted group-hover/linkrow:text-ink-primary size-3 shrink-0 opacity-0 transition-opacity duration-150 group-focus-within/linkrow:opacity-100 group-hover/linkrow:opacity-100" />
-          ) : undefined
-        }
+      }}
+      leading={
+        isLocal ? (
+          <Globe className="size-[13.5px] stroke-[1.75]" />
+        ) : (
+          <Link2 className="size-[13.5px] stroke-[1.7]" />
+        )
+      }
+    >
+      <span
+        className={cn(
+          "block truncate text-[13px]",
+          isLocal && "font-mono",
+        )}
       >
-        <span
-          className={cn(
-            "block truncate text-[12px]",
-            isLocal && "font-mono text-[11.5px]",
-          )}
-        >
-          {item.label}
-        </span>
-      </ListRow>
-
-      {isLocal && (
-        <div className="bg-[var(--overview-surface,var(--surface-raised))]/95 border-border-subtle pointer-events-none absolute top-1/2 right-1.5 flex -translate-y-1/2 items-center rounded-[7px] border p-0.5 opacity-0 shadow-xs backdrop-blur-[6px] transition-opacity duration-150 group-focus-within/linkrow:pointer-events-auto group-focus-within/linkrow:opacity-100 group-hover/linkrow:pointer-events-auto group-hover/linkrow:opacity-100">
-          <IconButton
-            size="xs"
-            tooltip={t("overview.openExternally")}
-            onClick={() => void orbitIpc.openExternalBrowserUrl(item.url)}
-          >
-            <ExternalLink className="size-3" />
-          </IconButton>
-        </div>
-      )}
-    </div>
+        {item.label}
+      </span>
+    </ListRow>
   );
 });

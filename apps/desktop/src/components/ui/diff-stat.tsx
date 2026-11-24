@@ -22,9 +22,9 @@ export const DiffStat = memo(function DiffStat({
 
   return (
     <span
+      data-size={size}
       className={cn(
-        "tabular-nums inline-flex shrink-0 items-center gap-1 font-mono font-medium",
-        size === "xs" ? "text-[11px]" : "text-[11px]",
+        "tabular-nums inline-flex shrink-0 items-center gap-1 font-mono text-[11px] font-medium",
         className,
       )}
     >

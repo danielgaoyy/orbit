@@ -28,6 +28,7 @@ export const ToastViewport = memo(function ToastViewport({
       className={cn(
         "floating-surface text-ink-primary fixed right-4 bottom-4 z-50 flex items-center gap-2.5 rounded-[12px] border px-3.5 py-2 text-[13px]",
         isInteractive ? "pointer-events-auto" : "pointer-events-none",
+        exiting && "pointer-events-none",
         exiting ? "orbit-toast-exit" : "orbit-toast-enter",
       )}
     >

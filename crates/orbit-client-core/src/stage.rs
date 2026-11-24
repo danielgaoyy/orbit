@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use orbit_protocol::{
     AgentMessageKind, GitStatusSnapshot, ProviderSubagentDescriptor, ProviderSubagentStatus,
-    ToolCallDetail, ToolCallStatus,
+    TimelineOutlinePrompt, ToolCallDetail, ToolCallStatus,
 };
 use serde::{Deserialize, Serialize};
 
@@ -264,8 +264,32 @@ pub struct SessionLinkView {
     pub last_seq: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPlanStepStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Skipped,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPlanStepView {
+    pub id: String,
+    pub title: String,
+    pub status: SessionPlanStepStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_form: Option<String>,
+    pub updated_seq: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInsightsView {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outline_prompts: Vec<SessionOutlinePromptView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan_steps: Vec<SessionPlanStepView>,
     pub touched_files: Vec<SessionTouchedFileView>,
     pub background_tasks: Vec<SessionBackgroundTaskView>,
     pub subagents: Vec<SessionSubagentEntryView>,
@@ -274,6 +298,34 @@ pub struct SessionInsightsView {
     pub pull_requests: Vec<SessionPullRequestView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detected_links: Vec<SessionLinkView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionOutlinePromptView {
+    pub seq: u64,
+    pub preview: String,
+}
+
+impl From<TimelineOutlinePrompt> for SessionOutlinePromptView {
+    fn from(prompt: TimelineOutlinePrompt) -> Self {
+        Self {
+            seq: prompt.seq,
+            preview: prompt.preview,
+        }
+    }
+}
+
+impl SessionInsightsView {
+    pub(crate) fn merge_outline(&mut self, full: &[TimelineOutlinePrompt]) {
+        if full.is_empty() {
+            return;
+        }
+        // The catchup snapshot is authoritative for overlaps with a cached replica page.
+        let loaded = std::mem::take(&mut self.outline_prompts);
+        self.outline_prompts = full.iter().cloned().map(Into::into).chain(loaded).collect();
+        self.outline_prompts.sort_by_key(|prompt| prompt.seq);
+        self.outline_prompts.dedup_by_key(|prompt| prompt.seq);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -865,7 +917,9 @@ pub fn describe_tool_detail(
         } => {
             let parsed = parse_generic_tool_name(tool_name);
             let raw_title = summary_title.trim();
-            let target = if !raw_title.is_empty()
+            let is_plan = PlanTool::named(tool_name).is_some();
+            let target = if !is_plan
+                && !raw_title.is_empty()
                 && !raw_title.eq_ignore_ascii_case(tool_name.trim())
                 && !raw_title.eq_ignore_ascii_case(&parsed.display_label)
             {
@@ -873,7 +927,9 @@ pub fn describe_tool_detail(
             } else {
                 String::new()
             };
-            let verb = if is_denied {
+            let verb = if is_plan {
+                plan_action_label(status).to_owned()
+            } else if is_denied {
                 format!("Declined {}", parsed.display_label)
             } else if is_failed {
                 format!("{} failed", parsed.display_label)
@@ -1025,6 +1081,8 @@ pub fn summarize_work_items(
     let mut subagent_count: u32 = 0;
     let mut mcp_servers: Vec<String> = Vec::new();
     let mut mcp_call_count: u32 = 0;
+    let mut plan_call_count = 0;
+    let mut last_plan_status = None;
     let mut other_tool_count: u32 = 0;
 
     let mut first_seen: HashMap<&'static str, usize> = HashMap::new();
@@ -1088,6 +1146,12 @@ pub fn summarize_work_items(
                 subagent_count += 1;
             }
             ToolCallDetail::Generic { tool_name, .. } => {
+                if PlanTool::named(tool_name).is_some() {
+                    mark_seen("plan");
+                    plan_call_count += 1;
+                    last_plan_status = Some(tc.status);
+                    continue;
+                }
                 let parsed = parse_generic_tool_name(tool_name);
                 if let Some(server) = parsed.server_name {
                     mark_seen("mcp");
@@ -1311,6 +1375,15 @@ pub fn summarize_work_items(
             });
         }
 
+        if let Some(status) = last_plan_status {
+            buckets.push(Bucket {
+                label: plan_action_label(status).to_owned(),
+                tier: 5,
+                raw_call_count: plan_call_count,
+                first_order: first_seen.get("plan").copied().unwrap_or(0),
+            });
+        }
+
         buckets.sort_by(|a, b| {
             a.tier
                 .cmp(&b.tier)
@@ -1377,6 +1450,20 @@ pub struct SlicedStageTurns {
     pub turn_item_starts: Vec<usize>,
 }
 
+fn starts_stage_turn(item: &TimelineItemView, has_open_turn: bool) -> bool {
+    match item {
+        TimelineItemView::UserPrompt { .. } => true,
+        TimelineItemView::AgentMessage { kind, .. } => {
+            !has_open_turn
+                || !matches!(
+                    kind,
+                    AgentMessageKind::FinishNotification | AgentMessageKind::Heartbeat
+                )
+        }
+        _ => false,
+    }
+}
+
 /// Builds semantic turns starting at `start_item_idx` (and `start_turn_index`),
 /// allowing `OrbitAppCore` to recompute only the active tail when streaming deltas arrive.
 pub fn process_timeline_turns_slice(
@@ -1430,18 +1517,7 @@ pub fn process_timeline_turns_slice(
             continue;
         }
 
-        let starts_new_turn = match &item {
-            TimelineItemView::UserPrompt { .. } => true,
-            TimelineItemView::AgentMessage { kind, .. } => {
-                !(has_open_turn
-                    && matches!(
-                        kind,
-                        AgentMessageKind::FinishNotification | AgentMessageKind::Heartbeat
-                    ))
-            }
-            _ => false,
-        };
-        if starts_new_turn {
+        if starts_stage_turn(&item, has_open_turn) {
             flush_turn(
                 &mut turns,
                 &mut turn_item_starts,
@@ -1635,12 +1711,7 @@ fn finalize_turn(
 
     let is_compaction_command = match &user_prompt {
         Some(TimelineItemView::UserPrompt { text, badges, .. }) => {
-            let trimmed = text.trim();
-            is_compact_slash_text(trimmed)
-                || (trimmed.is_empty()
-                    && badges
-                        .iter()
-                        .any(|b| b.kind == "slash" && b.label == "/compact"))
+            orbit_protocol::is_compaction_command(text, badges)
         }
         _ => false,
     };
@@ -2111,6 +2182,9 @@ fn summarize_single_tool_call(
         }
         ToolCallDetail::Subagent { .. } => with_failed("Ran an agent".to_string()),
         ToolCallDetail::Generic { tool_name, .. } => {
+            if PlanTool::named(tool_name).is_some() {
+                return (plan_action_label(status).to_owned(), failed);
+            }
             let parsed = parse_generic_tool_name(tool_name);
             if let Some(server) = parsed.server_name {
                 with_failed(format!("Used {server} integration"))
@@ -2141,6 +2215,7 @@ fn build_live_step_status(item: Option<&TimelineItemView>) -> (String, Option<St
         TimelineItemView::ToolCall {
             summary_title,
             detail,
+            status,
             ..
         } => match detail {
             ToolCallDetail::FileRead { path, .. } => {
@@ -2208,6 +2283,9 @@ fn build_live_step_status(item: Option<&TimelineItemView>) -> (String, Option<St
                 (label, None)
             }
             ToolCallDetail::Generic { tool_name, .. } => {
+                if PlanTool::named(tool_name).is_some() {
+                    return (plan_action_label(*status).to_owned(), None);
+                }
                 let parsed = parse_generic_tool_name(tool_name);
                 let label = if let Some(server) = parsed.server_name {
                     format!("Using {server}…")
@@ -3422,6 +3500,296 @@ fn resolve_subagent_display_role(raw_role: &str, prompt_or_subtitle: Option<&str
     "Subagent".to_string()
 }
 
+#[derive(Clone, Copy)]
+enum PlanTool {
+    UpdateSteps,
+    UpdatePlan,
+    TodoWrite,
+    TaskCreate,
+    TaskUpdate,
+}
+
+fn plan_action_label(status: ToolCallStatus) -> &'static str {
+    match status {
+        ToolCallStatus::Running => "Updating plan…",
+        ToolCallStatus::Completed => "Updated plan",
+        ToolCallStatus::Failed => "Plan update failed",
+        ToolCallStatus::Denied => "Declined plan update",
+    }
+}
+
+impl PlanTool {
+    fn named(name: &str) -> Option<Self> {
+        let lower = name.trim().to_ascii_lowercase();
+        // Codex uses "server/tool", while Claude and ACP also expose MCP tool names.
+        let mut name = lower
+            .split_once('/')
+            .map_or(lower.as_str(), |(_, tool)| tool);
+        loop {
+            if let Some(inner) = name
+                .strip_prefix("run ")
+                .or_else(|| name.strip_prefix("default_api:"))
+            {
+                name = inner.trim_start();
+            } else if let Some(inner) = name.strip_prefix("mcp__") {
+                name = inner.rsplit("__").next().unwrap_or(inner).trim_start();
+            } else {
+                break;
+            }
+        }
+        match name {
+            "update_steps" => Some(Self::UpdateSteps),
+            "update_plan" => Some(Self::UpdatePlan),
+            "todowrite" | "todo_write" => Some(Self::TodoWrite),
+            "taskcreate" | "task_create" => Some(Self::TaskCreate),
+            "taskupdate" | "task_update" => Some(Self::TaskUpdate),
+            _ => None,
+        }
+    }
+}
+
+impl SessionPlanStepStatus {
+    fn from_provider(value: &str) -> Self {
+        match value.trim() {
+            "done" | "completed" => Self::Completed,
+            "in_progress" | "inProgress" | "running" => Self::InProgress,
+            "skipped" | "cancelled" | "canceled" => Self::Skipped,
+            "failed" | "error" => Self::Failed,
+            _ => Self::Pending,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SessionPlan {
+    steps: Vec<SessionPlanStepView>,
+    new_turn: bool,
+    // Native Claude task numbers span turns and are not reused after deletion.
+    last_task_number: u64,
+    create_calls: HashSet<String>,
+}
+
+fn plan_text(value: &serde_json::Value) -> Option<&str> {
+    value.as_str().map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn created_task_id(preview: &serde_json::Value) -> Option<String> {
+    // Some captured tool envelopes retain the structured result or its text preview.
+    // Current Claude Generic events normally retain only the tool input.
+    let decoded;
+    let result = if let Some(text) = preview.as_str() {
+        if let Some((id, rest)) = text
+            .trim()
+            .strip_prefix("Task #")
+            .and_then(|rest| rest.split_once(' '))
+            && rest.starts_with("created")
+            && !id.is_empty()
+        {
+            return Some(id.to_owned());
+        }
+        decoded = serde_json::from_str(text).ok()?;
+        &decoded
+    } else {
+        preview
+    };
+    result
+        .pointer("/task/id")
+        .and_then(plan_text)
+        .map(str::to_owned)
+}
+
+impl SessionPlan {
+    fn observe(&mut self, item: &TimelineItemView, has_open_turn: bool) {
+        if starts_stage_turn(item, has_open_turn) {
+            self.new_turn = true;
+            self.create_calls.clear();
+            return;
+        }
+        match item {
+            TimelineItemView::ToolCall {
+                seq,
+                call_id,
+                status: ToolCallStatus::Running | ToolCallStatus::Completed,
+                detail:
+                    ToolCallDetail::Generic {
+                        tool_name,
+                        arguments_json,
+                    },
+                ..
+            } => {
+                if let Some(tool) = PlanTool::named(tool_name)
+                    && let Ok(args) = serde_json::from_str(arguments_json)
+                {
+                    self.apply_tool(tool, &args, call_id, *seq);
+                }
+            }
+            TimelineItemView::Notice { seq, message, .. } => {
+                if let Some(rows) = acp_plan_steps(message, *seq) {
+                    self.replace_snapshot(rows);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_tool(&mut self, tool: PlanTool, args: &serde_json::Value, call_id: &str, seq: u64) {
+        let (list_key, title_key) = match tool {
+            PlanTool::UpdateSteps => ("steps", "title"),
+            PlanTool::UpdatePlan => ("plan", "step"),
+            PlanTool::TodoWrite => ("todos", "content"),
+            PlanTool::TaskCreate => return self.create_task(args, call_id, seq),
+            PlanTool::TaskUpdate => return self.update_task(args, seq),
+        };
+        if let Some(entries) = args[list_key].as_array() {
+            let rows = entries
+                .iter()
+                .map(|row| {
+                    Some(SessionPlanStepView {
+                        id: plan_text(&row["id"]).unwrap_or_default().to_owned(),
+                        title: plan_text(&row[title_key])?.to_owned(),
+                        status: SessionPlanStepStatus::from_provider(
+                            row["status"].as_str().unwrap_or_default(),
+                        ),
+                        active_form: plan_text(&row["activeForm"]).map(str::to_owned),
+                        updated_seq: seq,
+                    })
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(rows) = rows {
+                self.replace_snapshot(rows);
+            }
+        }
+    }
+
+    fn create_task(&mut self, args: &serde_json::Value, call_id: &str, seq: u64) {
+        let Some(title) = plan_text(&args["subject"]) else {
+            return;
+        };
+        if !call_id.is_empty() && !self.create_calls.insert(call_id.to_owned()) {
+            return;
+        }
+        if self.new_turn {
+            self.steps.clear();
+            self.new_turn = false;
+        }
+        let id = created_task_id(&args["output_preview"]).unwrap_or_else(|| {
+            loop {
+                let Some(next) = self.last_task_number.checked_add(1) else {
+                    return call_id.to_owned();
+                };
+                self.last_task_number = next;
+                let id = next.to_string();
+                if !self.steps.iter().any(|step| step.id == id) {
+                    return id;
+                }
+            }
+        });
+        if let Ok(number) = id.parse::<u64>() {
+            self.last_task_number = self.last_task_number.max(number);
+        }
+        if !self.steps.iter().any(|step| step.id == id) {
+            self.steps.push(SessionPlanStepView {
+                id,
+                title: title.to_owned(),
+                active_form: plan_text(&args["activeForm"]).map(str::to_owned),
+                status: SessionPlanStepStatus::Pending,
+                updated_seq: seq,
+            });
+        }
+    }
+
+    fn update_task(&mut self, args: &serde_json::Value, seq: u64) {
+        let Some(id) = plan_text(&args["taskId"]) else {
+            return;
+        };
+        let Some(index) = self.steps.iter().position(|step| step.id == id) else {
+            return;
+        };
+        let status = plan_text(&args["status"]);
+        if status == Some("deleted") {
+            self.steps.remove(index);
+            return;
+        }
+        let step = &mut self.steps[index];
+        let subject = plan_text(&args["subject"]);
+        let active_form = args["activeForm"].as_str();
+        if status.is_none() && subject.is_none() && active_form.is_none() {
+            return;
+        }
+        if let Some(status) = status {
+            step.status = SessionPlanStepStatus::from_provider(status);
+        }
+        if let Some(title) = subject {
+            step.title = title.to_owned();
+        }
+        if active_form.is_some() {
+            step.active_form = plan_text(&args["activeForm"]).map(str::to_owned);
+        }
+        step.updated_seq = seq;
+    }
+
+    fn replace_snapshot(&mut self, mut steps: Vec<SessionPlanStepView>) {
+        // Snapshot tools without IDs can reorder their steps. Match by title and
+        // occurrence within this turn, allocating compact IDs only for new rows.
+        let mut previous = HashMap::<&str, Vec<&String>>::new();
+        if !self.new_turn {
+            for step in self.steps.iter().rev() {
+                previous.entry(&step.title).or_default().push(&step.id);
+            }
+        }
+        let mut ids = HashSet::new();
+        for (index, step) in steps.iter_mut().enumerate() {
+            if step.id.is_empty() {
+                step.id = previous
+                    .get_mut(step.title.as_str())
+                    .and_then(Vec::pop)
+                    .cloned()
+                    .unwrap_or_else(|| format!("plan-{}-{index}", step.updated_seq));
+            }
+            if !ids.insert(step.id.as_str()) {
+                return;
+            }
+        }
+        self.steps = steps;
+        self.new_turn = false;
+    }
+}
+
+fn acp_plan_steps(message: &str, seq: u64) -> Option<Vec<SessionPlanStepView>> {
+    let mut steps: Vec<SessionPlanStepView> = Vec::new();
+    for line in message.strip_prefix("Plan:\n")?.lines() {
+        let entry = line.split_once("] ").and_then(|(marker, title)| {
+            let status = match marker {
+                "[x" => SessionPlanStepStatus::Completed,
+                "[~" => SessionPlanStepStatus::InProgress,
+                "[ " => SessionPlanStepStatus::Pending,
+                "[-" => SessionPlanStepStatus::Skipped,
+                "[!" => SessionPlanStepStatus::Failed,
+                _ => return None,
+            };
+            Some((status, title.trim()))
+        });
+        if let Some((status, title)) = entry {
+            if title.is_empty() {
+                return None;
+            }
+            steps.push(SessionPlanStepView {
+                id: String::new(),
+                title: title.to_owned(),
+                status,
+                active_form: None,
+                updated_seq: seq,
+            });
+        } else {
+            // ACP content can span lines. The adapters prefix only the first line.
+            let step = steps.last_mut()?;
+            step.title.push('\n');
+            step.title.push_str(line);
+        }
+    }
+    Some(steps)
+}
+
 /// Derive compact, deduplicated session inventory (touched files, genuinely asynchronous active
 /// background tasks, subagents, and detected localhost preview URLs) from the active timeline &
 /// host state.
@@ -3432,6 +3800,8 @@ pub fn derive_session_insights(
     host_agents: &[AgentCardView],
     provider_subagents: &[ProviderSubagentDescriptor],
 ) -> SessionInsightsView {
+    let mut plan = SessionPlan::default();
+    let mut outline_prompts = Vec::new();
     let mut file_map: HashMap<String, SessionTouchedFileView> = HashMap::new();
     let mut bg_task_order: Vec<String> = Vec::new();
     let mut bg_task_map: HashMap<String, SessionBackgroundTaskView> = HashMap::new();
@@ -3442,10 +3812,19 @@ pub fn derive_session_insights(
 
     let agent_has_live_work = current_agent.is_some_and(|a| a.is_running || a.has_background_tasks);
 
-    for item in items {
+    for (index, item) in items.iter().enumerate() {
+        plan.observe(item, index > 0);
         match item {
-            TimelineItemView::UserPrompt { seq, text, .. } => {
+            TimelineItemView::UserPrompt {
+                seq, text, badges, ..
+            } => {
                 collect_prose_urls(text, *seq, &mut pr_map, &mut link_map);
+                if *seq > 0
+                    && let Some(prompt) =
+                        TimelineOutlinePrompt::from_user_prompt(*seq, text, badges)
+                {
+                    outline_prompts.push(SessionOutlinePromptView::from(prompt));
+                }
             }
             TimelineItemView::AssistantMessage { seq, text, .. } => {
                 collect_local_urls(text, &mut detected_local_urls);
@@ -3890,7 +4269,11 @@ pub fn derive_session_insights(
     detected_links.sort_by(|a, b| b.last_seq.cmp(&a.last_seq).then_with(|| a.url.cmp(&b.url)));
     detected_links.truncate(16);
 
+    outline_prompts.sort_by_key(|prompt| prompt.seq);
+    outline_prompts.dedup_by_key(|prompt| prompt.seq);
     SessionInsightsView {
+        outline_prompts,
+        plan_steps: plan.steps,
         touched_files,
         background_tasks,
         subagents,
@@ -4163,18 +4546,6 @@ fn contains_ascii_case_insensitive(haystack: &str, needle_lower: &str) -> bool {
     haystack.to_ascii_lowercase().contains(needle_lower)
 }
 
-fn is_compact_slash_text(trimmed: &str) -> bool {
-    if !starts_with_ignore_ascii_case(trimmed, "/compact") {
-        return false;
-    }
-    let rem = &trimmed["/compact".len()..];
-    rem.is_empty()
-        || rem
-            .chars()
-            .next()
-            .is_some_and(|c| !c.is_alphanumeric() && c != '_')
-}
-
 fn contains_word(haystack: &str, phrase: &str) -> bool {
     let mut offset = 0;
     while let Some(pos) = haystack[offset..].find(phrase) {
@@ -4233,6 +4604,322 @@ mod tests {
             diff_files,
             timestamp_ms: Some(ts),
         }
+    }
+
+    #[test]
+    fn plan_snapshots_replace_atomically_and_keep_ids_when_reordered() {
+        use SessionPlanStepStatus::*;
+        let agy = plan_tool(
+            1,
+            "Run default_api: update_steps",
+            r#"{"steps":[
+            {"title":"A","status":"done"},{"title":"B","status":"running"},
+            {"title":"C","status":"canceled"},{"title":"D","status":"error"},
+            {"title":"E","status":"unknown"},{"title":"A","status":"pending"}]}"#,
+        );
+        let first = plan_steps(std::slice::from_ref(&agy));
+        assert_eq!(
+            first.iter().map(|s| s.status).collect::<Vec<_>>(),
+            [Completed, InProgress, Skipped, Failed, Pending, Pending]
+        );
+        assert_ne!(first[0].id, first[5].id);
+
+        let codex = plan_tool(
+            2,
+            "codex/update_plan",
+            r#"{"explanation":"reordered","plan":[{"step":"B","status":"completed"},{"step":"A","status":"in_progress"}]}"#,
+        );
+        let items = [agy, codex];
+        let second = plan_steps(&items);
+        assert_eq!(second.len(), 2);
+        assert_eq!((&second[0].id, second[0].status), (&first[1].id, Completed));
+        assert_eq!(
+            (&second[1].id, second[1].status),
+            (&first[0].id, InProgress)
+        );
+        assert!(second.iter().all(|s| s.updated_seq == 2));
+    }
+
+    fn plan_tool(seq: u64, name: &str, args: &str) -> TimelineItemView {
+        make_tool(
+            seq,
+            ToolCallStatus::Completed,
+            name,
+            ToolCallDetail::Generic {
+                tool_name: name.to_owned(),
+                arguments_json: args.to_owned(),
+            },
+            Vec::new(),
+            0,
+        )
+    }
+
+    fn plan_notice(seq: u64, message: &str) -> TimelineItemView {
+        TimelineItemView::Notice {
+            seq,
+            level: "info".into(),
+            message: message.to_owned(),
+            timestamp_ms: None,
+        }
+    }
+
+    fn plan_prompt(seq: u64) -> TimelineItemView {
+        TimelineItemView::UserPrompt {
+            seq,
+            message_id: format!("prompt-{seq}"),
+            text: String::new(),
+            badges: Vec::new(),
+            blocks: Vec::new(),
+            timestamp_ms: None,
+        }
+    }
+
+    fn plan_steps(items: &[TimelineItemView]) -> Vec<SessionPlanStepView> {
+        derive_session_insights(items, None, None, &[], &[]).plan_steps
+    }
+
+    #[test]
+    fn plan_todowrite_and_acp_replay_exact_notice_markers() {
+        use SessionPlanStepStatus::*;
+        let mut items = vec![plan_tool(
+            1,
+            "todo_write",
+            r#"{"todos":[{"content":" Build ","id":"abc","status":"in_progress","activeForm":"Building"}]}"#,
+        )];
+        assert_eq!(
+            plan_steps(&items),
+            [SessionPlanStepView {
+                title: "Build".into(),
+                id: "abc".into(),
+                status: InProgress,
+                active_form: Some("Building".into()),
+                updated_seq: 1,
+            }]
+        );
+        items.push(plan_notice(
+            2,
+            "Plan:\n[x] Shipped\n[~] Verify\non device\n[ ] Await review\n[-] Skip\n[!] Retry",
+        ));
+        let steps = plan_steps(&items);
+        assert_eq!(
+            steps
+                .iter()
+                .map(|s| (s.title.as_str(), s.status))
+                .collect::<Vec<_>>(),
+            [
+                ("Shipped", Completed),
+                ("Verify\non device", InProgress),
+                ("Await review", Pending),
+                ("Skip", Skipped),
+                ("Retry", Failed)
+            ]
+        );
+        assert!(
+            steps
+                .iter()
+                .all(|s| s.active_form.is_none() && s.updated_seq == 2)
+        );
+        items.push(plan_notice(3, "Plan:\n"));
+        assert!(plan_steps(&items).is_empty());
+    }
+
+    #[test]
+    fn plan_task_updates_patch_delete_and_preserve_sequential_ids() {
+        let mut items = vec![
+            plan_tool(
+                1,
+                "TaskCreate",
+                r#"{"subject":"Compile","description":"test","activeForm":"Compiling"}"#,
+            ),
+            plan_tool(2, "TaskCreate", r#"{"subject":"Test"}"#),
+            plan_tool(3, "TaskUpdate", r#"{"taskId":"1","status":"in_progress"}"#),
+            plan_tool(
+                4,
+                "TaskUpdate",
+                r#"{"taskId":"1","subject":"Rebuild","activeForm":"Rebuilding"}"#,
+            ),
+            plan_tool(5, "TaskUpdate", r#"{"taskId":"2","status":"deleted"}"#),
+            plan_tool(6, "TaskUpdate", r#"{"taskId":"missing","status":"failed"}"#),
+            plan_tool(7, "TaskList", "{}"),
+        ];
+        let steps = plan_steps(&items);
+        assert_eq!(
+            steps,
+            [SessionPlanStepView {
+                id: "1".into(),
+                title: "Rebuild".into(),
+                active_form: Some("Rebuilding".into()),
+                status: SessionPlanStepStatus::InProgress,
+                updated_seq: 4,
+            }]
+        );
+        let third = plan_tool(8, "TaskCreate", r#"{"subject":"Ship"}"#);
+        items.extend([third.clone(), third]);
+        let steps = plan_steps(&items);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[1].id, "3");
+        assert_eq!(steps[1].status, SessionPlanStepStatus::Pending);
+        items.push(plan_tool(
+            9,
+            "TaskUpdate",
+            r#"{"taskId":"1","status":"deleted"}"#,
+        ));
+        items.push(plan_tool(
+            10,
+            "TaskUpdate",
+            r#"{"taskId":"3","status":"deleted"}"#,
+        ));
+        assert!(plan_steps(&items).is_empty());
+    }
+
+    #[test]
+    fn plan_task_create_uses_available_result_id_before_falling_back() {
+        let items = [
+            plan_tool(
+                1,
+                "TaskCreate",
+                r#"{"subject":"A","output_preview":"Task #17 created successfully: A"}"#,
+            ),
+            plan_tool(
+                2,
+                "TaskCreate",
+                r#"{"subject":"B","output_preview":"{\"task\":{\"id\":\"abc\"}}"}"#,
+            ),
+            plan_tool(
+                3,
+                "TaskCreate",
+                r#"{"subject":"C","output_preview":{"task":{"id":"21"}}}"#,
+            ),
+            plan_tool(
+                4,
+                "TaskCreate",
+                r#"{"subject":"Ticket #99","output_preview":"unrelated #99"}"#,
+            ),
+            plan_tool(5, "TaskUpdate", r#"{"taskId":"abc","status":"completed"}"#),
+        ];
+        let steps = plan_steps(&items);
+        assert_eq!(
+            steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["17", "abc", "21", "22"]
+        );
+        assert_eq!(steps[1].status, SessionPlanStepStatus::Completed);
+    }
+
+    #[test]
+    fn plan_survives_turn_boundary_until_a_new_plan_is_created() {
+        let mut items = vec![
+            plan_prompt(1),
+            plan_tool(2, "TaskCreate", r#"{"subject":"Old"}"#),
+            plan_prompt(3),
+            plan_tool(4, "TaskUpdate", r#"{"taskId":"1","status":"completed"}"#),
+        ];
+        assert_eq!(
+            plan_steps(&items)[0].status,
+            SessionPlanStepStatus::Completed
+        );
+        items.push(plan_tool(5, "TaskCreate", r#"{"subject":"New"}"#));
+        let steps = plan_steps(&items);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            (steps[0].id.as_str(), steps[0].title.as_str()),
+            ("2", "New")
+        );
+        items.push(plan_prompt(6));
+        items.push(plan_notice(7, "Plan:\n[~] From ACP"));
+        let steps = plan_steps(&items);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].title, "From ACP");
+    }
+
+    #[test]
+    fn plan_rejects_partial_malformed_denied_and_unrelated_updates() {
+        let mut items = vec![plan_notice(1, "Plan:\n[~] Keep")];
+        let original = plan_steps(&items);
+        let mut failed = plan_tool(2, "update_plan", r#"{"plan":[]}"#);
+        if let TimelineItemView::ToolCall { status, .. } = &mut failed {
+            *status = ToolCallStatus::Failed;
+        }
+        let mut denied = plan_tool(3, "TodoWrite", r#"{"todos":[]}"#);
+        if let TimelineItemView::ToolCall { status, .. } = &mut denied {
+            *status = ToolCallStatus::Denied;
+        }
+        items.extend([
+            failed,
+            denied,
+            plan_prompt(4),
+            plan_tool(5, "update_steps", r#"{"steps":[{"title":"partial"}"#),
+            plan_tool(6, "TodoWrite", r#"{"todos":[{"content":"valid"},{}]}"#),
+            plan_tool(7, "TaskCreate", r#"{"description":"missing subject"}"#),
+            plan_tool(8, "TodoWrite", r#"{"todos":null}"#),
+            plan_tool(
+                9,
+                "TodoWrite",
+                r#"{"todos":[{"id":"dup","content":"A"},{"id":"dup","content":"B"}]}"#,
+            ),
+            plan_tool(10, "pretend_update_plan", r#"{"plan":[]}"#),
+            plan_notice(11, "prefix Plan:\n[ ] ignore"),
+            plan_notice(12, "Plan:\nmalformed"),
+        ]);
+        assert_eq!(plan_steps(&items), original);
+        items.push(plan_tool(13, "mcp__agent__update_plan", r#"{"plan":[]}"#));
+        assert!(plan_steps(&items).is_empty());
+    }
+
+    #[test]
+    fn plan_work_steps_have_quiet_labels_and_keep_failures_visible() {
+        let mut items = Vec::new();
+        for name in [
+            "Run update_steps",
+            "mcp__agent__update_plan",
+            "TodoWrite",
+            "TaskCreate",
+            "TaskUpdate",
+        ] {
+            let item = plan_tool(1, name, "{}");
+            let summary = summarize_work_items(std::slice::from_ref(&item), None);
+            assert_eq!(summary.label, "Updated plan");
+            let descriptor = describe_tool_step(&item, None).expect("tool descriptor");
+            assert_eq!(descriptor.verb, "Updated plan");
+            assert!(descriptor.target.is_empty());
+            items.push(item);
+        }
+        assert_eq!(summarize_work_items(&items, None).label, "Updated plan");
+        let mut item = plan_tool(1, "TaskUpdate", "{}");
+        for (next, label) in [
+            (ToolCallStatus::Running, "Updating plan…"),
+            (ToolCallStatus::Failed, "Plan update failed"),
+        ] {
+            if let TimelineItemView::ToolCall { status, .. } = &mut item {
+                *status = next;
+            }
+            let summary = summarize_work_items(std::slice::from_ref(&item), None);
+            assert_eq!(summary.live_label, label);
+            assert_eq!(summary.label, label);
+            assert_eq!(
+                summary.label_includes_failure,
+                next == ToolCallStatus::Failed
+            );
+        }
+    }
+
+    #[test]
+    fn plan_json_accepts_legacy_snapshots_and_omits_empty_fields() {
+        let legacy = serde_json::to_value(SessionInsightsView::default()).expect("legacy insights");
+        assert!(legacy.get("plan_steps").is_none());
+        let saved: SessionInsightsView =
+            serde_json::from_value(legacy).expect("compatible insights");
+        assert!(saved.plan_steps.is_empty());
+        let views =
+            derive_session_insights(&[plan_notice(9, "Plan:\n[~] Build")], None, None, &[], &[]);
+        let json = serde_json::to_value(&views).expect("insights with plan");
+        let first = &json["plan_steps"][0];
+        assert_eq!(first["status"], "in_progress");
+        assert_eq!(first["updated_seq"], 9);
+        assert!(first.get("active_form").is_none());
+        assert_eq!(
+            serde_json::from_value::<SessionInsightsView>(json).expect("read"),
+            views
+        );
     }
 
     #[test]

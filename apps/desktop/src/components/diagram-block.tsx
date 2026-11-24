@@ -7,7 +7,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { createPortal } from "react-dom";
 import {
   Check,
   Code2,
@@ -24,6 +23,7 @@ import {
   ZoomOut,
 } from "lucide-react";
 import { HighlightedCodeBlock } from "@/components/markdown-blocks";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog-tabs";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   type DiagramKind,
@@ -92,6 +92,7 @@ function DiagramKindIcon({ kind }: { kind: DiagramKind }) {
 }
 
 const DiagramLightbox = memo(function DiagramLightbox({
+  open,
   title,
   svg,
   naturalWidth,
@@ -99,6 +100,7 @@ const DiagramLightbox = memo(function DiagramLightbox({
   kind,
   onClose,
 }: {
+  open: boolean;
   title: string;
   svg: string;
   naturalWidth: number;
@@ -110,7 +112,7 @@ const DiagramLightbox = memo(function DiagramLightbox({
   const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [copiedMode, setCopiedMode] = useState<"none" | "svg" | "source">("none");
   const copyTimerRef = useRef<number | null>(null);
-  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const [viewportEl, setViewportEl] = useState<HTMLDivElement | null>(null);
   const zoomRef = useRef(zoom);
   zoomRef.current = zoom;
 
@@ -149,11 +151,14 @@ const DiagramLightbox = memo(function DiagramLightbox({
   }, []);
 
   useEffect(() => {
+    if (!open) return;
+    resetView();
+  }, [open, resetView]);
+
+  useEffect(() => {
+    if (!open) return;
     const onKeyDown = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") {
-        ev.preventDefault();
-        onClose();
-      } else if (ev.key === "+" || ev.key === "=") {
+      if (ev.key === "+" || ev.key === "=") {
         ev.preventDefault();
         setZoom((z) => clampZoom(z * 1.18, MIN_LIGHTBOX_ZOOM, MAX_LIGHTBOX_ZOOM));
       } else if (ev.key === "-") {
@@ -166,12 +171,11 @@ const DiagramLightbox = memo(function DiagramLightbox({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose, resetView]);
+  }, [open, resetView]);
 
   // Native non-passive wheel listener for smooth multiplicative trackpad pinch & wheel zoom
   useEffect(() => {
-    const el = viewportRef.current;
-    if (!el) return;
+    if (!viewportEl) return;
     const onWheel = (ev: WheelEvent) => {
       ev.preventDefault();
       // Trackpad pinch (`ctrlKey`) uses finer sensitivity than standard mouse wheel ticks
@@ -179,9 +183,9 @@ const DiagramLightbox = memo(function DiagramLightbox({
       const factor = Math.exp(-ev.deltaY * sensitivity);
       setZoom((z) => clampZoom(z * factor, MIN_LIGHTBOX_ZOOM, MAX_LIGHTBOX_ZOOM));
     };
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel);
-  }, []);
+    viewportEl.addEventListener("wheel", onWheel, { passive: false });
+    return () => viewportEl.removeEventListener("wheel", onWheel);
+  }, [viewportEl]);
 
   const handlePointerDown = useCallback(
     (ev: ReactPointerEvent<HTMLDivElement>) => {
@@ -273,137 +277,133 @@ const DiagramLightbox = memo(function DiagramLightbox({
     [svg, rawSource],
   );
 
-  return createPortal(
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-label={title}
-      className="fixed inset-0 z-50 flex flex-col bg-black/70 backdrop-blur-sm"
-      onClick={(ev) => {
-        if (ev.target === ev.currentTarget) onClose();
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) onClose();
       }}
     >
-      <div className="flex shrink-0 items-center justify-between border-b border-white/[0.08] bg-zinc-950/90 px-4 py-2 text-zinc-100 select-none">
-        <div className="flex items-center gap-2 text-[12.5px] font-medium text-zinc-200">
-          <DiagramKindIcon kind={kind} />
-          <span>{title}</span>
-        </div>
-        <div className="flex items-center gap-1">
-          <button
-            type="button"
-            onClick={() =>
-              setZoom((z) => clampZoom(z / 1.18, MIN_LIGHTBOX_ZOOM, MAX_LIGHTBOX_ZOOM))
-            }
-            className="orbit-press inline-flex size-7 cursor-pointer items-center justify-center rounded-md text-zinc-400 hover:bg-white/10 hover:text-white"
-            title="Zoom out (-)"
-          >
-            <ZoomOut className="size-3.5" />
-          </button>
-          <button
-            type="button"
-            onClick={resetView}
-            title="Reset zoom (0)"
-            className="tabular-nums orbit-press min-w-[44px] cursor-pointer rounded-md px-1.5 py-1 text-center font-mono text-[11px] text-zinc-300 hover:bg-white/10 hover:text-white"
-          >
-            {Math.round(zoom * 100)}%
-          </button>
-          <button
-            type="button"
-            onClick={() =>
-              setZoom((z) => clampZoom(z * 1.18, MIN_LIGHTBOX_ZOOM, MAX_LIGHTBOX_ZOOM))
-            }
-            className="orbit-press inline-flex size-7 cursor-pointer items-center justify-center rounded-md text-zinc-400 hover:bg-white/10 hover:text-white"
-            title="Zoom in (+)"
-          >
-            <ZoomIn className="size-3.5" />
-          </button>
-          <button
-            type="button"
-            onClick={resetView}
-            className="orbit-press inline-flex size-7 cursor-pointer items-center justify-center rounded-md text-zinc-400 hover:bg-white/10 hover:text-white"
-            title="Reset view (0)"
-          >
-            <RotateCcw className="size-3.5" />
-          </button>
-          <div className="mx-1.5 h-3.5 w-px bg-white/12" />
-          <button
-            type="button"
-            onClick={() => void handleCopy("svg")}
-            className="orbit-press inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-md px-2 text-[11.5px] text-zinc-300 hover:bg-white/10 hover:text-white"
-            title="Copy SVG"
-          >
-            {copiedMode === "svg" ? (
-              <Check className="size-3.5 text-emerald-400" />
-            ) : (
-              <Copy className="size-3.5" />
-            )}
-            <span>{copiedMode === "svg" ? "Copied" : "SVG"}</span>
-          </button>
-          <button
-            type="button"
-            onClick={handleDownloadSvg}
-            className="orbit-press inline-flex size-7 cursor-pointer items-center justify-center rounded-md text-zinc-400 hover:bg-white/10 hover:text-white"
-            title="Download SVG"
-          >
-            <Download className="size-3.5" />
-          </button>
-          <button
-            type="button"
-            onClick={() => void handleCopy("source")}
-            className="orbit-press inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-md px-2 text-[11.5px] text-zinc-300 hover:bg-white/10 hover:text-white"
-            title="Copy source"
-          >
-            {copiedMode === "source" ? (
-              <Check className="size-3.5 text-emerald-400" />
-            ) : (
-              <Code2 className="size-3.5" />
-            )}
-            <span>{copiedMode === "source" ? "Copied" : "Source"}</span>
-          </button>
-          <button
-            type="button"
-            onClick={onClose}
-            className="orbit-press ml-1 inline-flex size-7 cursor-pointer items-center justify-center rounded-md text-zinc-400 hover:bg-white/10 hover:text-white"
-            title="Close (Esc)"
-          >
-            <X className="size-4" />
-          </button>
-        </div>
-      </div>
-
-      <div
-        ref={viewportRef}
-        className="flex min-h-0 flex-1 cursor-grab touch-none items-center justify-center overflow-hidden p-8 active:cursor-grabbing"
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
-        onPointerCancel={handlePointerUp}
-        onDoubleClick={() => {
-          if (zoom !== 1 || pan.x !== 0 || pan.y !== 0) {
-            resetView();
-          } else {
-            setZoom(1.6);
-          }
-        }}
-        onClick={(ev) => {
-          if (ev.target === ev.currentTarget && !dragRef.current.moved) {
-            onClose();
-          }
-        }}
+      <DialogContent
+        showCloseButton={false}
+        className="bg-surface-base border-border-default flex h-[min(88vh,920px)] w-[min(94vw,1280px)] max-w-none flex-col gap-0 overflow-hidden rounded-[16px] border p-0"
       >
+        <div className="border-border-subtle bg-surface-recessed/75 text-ink-primary flex shrink-0 items-center justify-between border-b px-4 py-2 select-none">
+          <DialogTitle className="text-ink-primary flex items-center gap-2 text-[13px] font-medium">
+            <DiagramKindIcon kind={kind} />
+            <span>{title}</span>
+          </DialogTitle>
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() =>
+                setZoom((z) => clampZoom(z / 1.18, MIN_LIGHTBOX_ZOOM, MAX_LIGHTBOX_ZOOM))
+              }
+              className="orbit-press text-ink-muted hover:bg-accent hover:text-ink-primary inline-flex size-7 cursor-pointer items-center justify-center rounded-md"
+              title="Zoom out (-)"
+            >
+              <ZoomOut className="size-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={resetView}
+              title="Reset zoom (0)"
+              className="tabular-nums orbit-press text-ink-secondary hover:bg-accent hover:text-ink-primary min-w-[44px] cursor-pointer rounded-md px-1.5 py-1 text-center font-mono text-[11px]"
+            >
+              {Math.round(zoom * 100)}%
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                setZoom((z) => clampZoom(z * 1.18, MIN_LIGHTBOX_ZOOM, MAX_LIGHTBOX_ZOOM))
+              }
+              className="orbit-press text-ink-muted hover:bg-accent hover:text-ink-primary inline-flex size-7 cursor-pointer items-center justify-center rounded-md"
+              title="Zoom in (+)"
+            >
+              <ZoomIn className="size-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={resetView}
+              className="orbit-press text-ink-muted hover:bg-accent hover:text-ink-primary inline-flex size-7 cursor-pointer items-center justify-center rounded-md"
+              title="Reset view (0)"
+            >
+              <RotateCcw className="size-3.5" />
+            </button>
+            <div className="bg-border-subtle mx-1.5 h-3.5 w-px" />
+            <button
+              type="button"
+              onClick={() => void handleCopy("svg")}
+              className="orbit-press text-ink-secondary hover:bg-accent hover:text-ink-primary inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-md px-2 text-[11.5px]"
+              title="Copy SVG"
+            >
+              {copiedMode === "svg" ? (
+                <Check className="text-signal-success size-3.5" />
+              ) : (
+                <Copy className="size-3.5" />
+              )}
+              <span>{copiedMode === "svg" ? "Copied" : "SVG"}</span>
+            </button>
+            <button
+              type="button"
+              onClick={handleDownloadSvg}
+              className="orbit-press text-ink-muted hover:bg-accent hover:text-ink-primary inline-flex size-7 cursor-pointer items-center justify-center rounded-md"
+              title="Download SVG"
+            >
+              <Download className="size-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleCopy("source")}
+              className="orbit-press text-ink-secondary hover:bg-accent hover:text-ink-primary inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-md px-2 text-[11.5px]"
+              title="Copy source"
+            >
+              {copiedMode === "source" ? (
+                <Check className="text-signal-success size-3.5" />
+              ) : (
+                <Code2 className="size-3.5" />
+              )}
+              <span>{copiedMode === "source" ? "Copied" : "Source"}</span>
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              className="orbit-press text-ink-muted hover:bg-accent hover:text-ink-primary ml-1 inline-flex size-7 cursor-pointer items-center justify-center rounded-md"
+              title="Close (Esc)"
+            >
+              <X className="size-4" />
+            </button>
+          </div>
+        </div>
+
         <div
-          className="border-border bg-card rounded-2xl border p-6 shadow-2xl select-none [&>svg]:block [&>svg]:h-auto [&>svg]:max-w-none"
-          style={{
-            minWidth: Math.min(Math.max(naturalWidth, 320), 960),
-            transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
-            transformOrigin: "center center",
-            willChange: "transform",
+          ref={setViewportEl}
+          className="bg-surface-recessed/45 flex min-h-0 flex-1 cursor-grab touch-none items-center justify-center overflow-hidden p-8 active:cursor-grabbing"
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerUp}
+          onDoubleClick={() => {
+            if (zoom !== 1 || pan.x !== 0 || pan.y !== 0) {
+              resetView();
+            } else {
+              setZoom(1.6);
+            }
           }}
-          dangerouslySetInnerHTML={{ __html: svg }}
-        />
-      </div>
-    </div>,
-    document.body,
+        >
+          <div
+            className="border-border-subtle bg-surface-raised rounded-2xl border p-6 shadow-md select-none [&>svg]:block [&>svg]:h-auto [&>svg]:max-w-none"
+            style={{
+              minWidth: Math.min(Math.max(naturalWidth, 320), 960),
+              transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
+              transformOrigin: "center center",
+              willChange: "transform",
+            }}
+            dangerouslySetInnerHTML={{ __html: svg }}
+          />
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 });
 
@@ -662,8 +662,9 @@ export const DiagramBlock = memo(
           </div>
         )}
 
-        {lightboxOpen && rendered?.svg && (
+        {rendered?.svg && (
           <DiagramLightbox
+            open={lightboxOpen}
             title={headerTitle}
             svg={rendered.svg}
             naturalWidth={rendered.width}

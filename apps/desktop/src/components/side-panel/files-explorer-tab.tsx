@@ -15,6 +15,11 @@ import {
 } from "lucide-react";
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  cancelHoverPrefetch,
+  scheduleHoverPrefetch,
+  shouldPrefetchOnPointerDown,
+} from "@/lib/file-prefetch";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { useI18n } from "@/lib/i18n";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
@@ -548,9 +553,24 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
             <>
               <button
                 type="button"
-                onClick={() =>
-                  hostId && orbitActions.openFileInSidePanel(node.path, { hostId, cwd })
-                }
+                onMouseEnter={() => {
+                  if (hostId) {
+                    scheduleHoverPrefetch(() =>
+                      orbitActions.prefetchWorkspaceFile(node.path, { hostId, cwd, intent: "hover" }),
+                    );
+                  }
+                }}
+                onMouseLeave={cancelHoverPrefetch}
+                onPointerDown={(e) => {
+                  if (hostId && shouldPrefetchOnPointerDown(e)) {
+                    cancelHoverPrefetch();
+                    orbitActions.prefetchWorkspaceFile(node.path, { hostId, cwd, intent: "press" });
+                  }
+                }}
+                onClick={() => {
+                  cancelHoverPrefetch();
+                  if (hostId) orbitActions.openFileInSidePanel(node.path, { hostId, cwd });
+                }}
                 className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
               >
                 <Icon className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
@@ -833,9 +853,32 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
                   <button
                     key={filePath}
                     type="button"
-                    onClick={() =>
-                      hostId && orbitActions.openFileInSidePanel(filePath, { hostId, cwd })
-                    }
+                    onMouseEnter={() => {
+                      if (hostId) {
+                        scheduleHoverPrefetch(() =>
+                          orbitActions.prefetchWorkspaceFile(filePath, {
+                            hostId,
+                            cwd,
+                            intent: "hover",
+                          }),
+                        );
+                      }
+                    }}
+                    onMouseLeave={cancelHoverPrefetch}
+                    onPointerDown={(e) => {
+                      if (hostId && shouldPrefetchOnPointerDown(e)) {
+                        cancelHoverPrefetch();
+                        orbitActions.prefetchWorkspaceFile(filePath, {
+                          hostId,
+                          cwd,
+                          intent: "press",
+                        });
+                      }
+                    }}
+                    onClick={() => {
+                      cancelHoverPrefetch();
+                      if (hostId) orbitActions.openFileInSidePanel(filePath, { hostId, cwd });
+                    }}
                     className="hover:bg-accent/60 text-foreground/85 hover:text-foreground flex w-full cursor-pointer items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-[12px] transition-colors"
                   >
                     <span className="flex min-w-0 items-center gap-2">

@@ -41,15 +41,7 @@ import {
 } from "@/lib/orbit-ipc";
 import { isAgentInGitRepo, isLocalHostCard, normalizeProjectPath } from "@/lib/projects";
 import { useI18n } from "@/lib/i18n";
-import { Button } from "@/components/ui/button";
-import { OrbitSpinner } from "@/components/ui/orbit-spinner";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog-tabs";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -779,7 +771,6 @@ export function DeleteConversationDialog({
   onClose: () => void;
 }) {
   const { t } = useI18n();
-  const [deleting, setDeleting] = useState(false);
 
   const isRunning = Boolean(
     target &&
@@ -789,72 +780,36 @@ export function DeleteConversationDialog({
   );
 
   const handleConfirm = async () => {
-    if (!target || deleting) return;
-    setDeleting(true);
+    if (!target) return;
     try {
       await orbitActions.deleteThreadPermanently(target.host.host_id, target.agent.agent_id);
-      onClose();
-    } catch {
+    } catch (err) {
       orbitActions.showToast(t("sidebar.failedDeleteConversation"));
-    } finally {
-      setDeleting(false);
+      throw err;
     }
   };
 
   return (
-    <Dialog
+    <ConfirmDialog
       open={Boolean(target)}
       onOpenChange={(open) => {
-        if (!open && !deleting) onClose();
+        if (!open) onClose();
       }}
-    >
-      <DialogContent className="max-w-md gap-4 p-5 select-none">
-        <DialogHeader className="gap-1.5 pr-6">
-          <DialogTitle className="text-[15.5px]">
-            {t("sidebar.deleteConversationTitle")}
-          </DialogTitle>
-          <DialogDescription className="text-ink-secondary text-[13px] leading-relaxed">
-            {t("sidebar.deleteConversationConfirm", { title: target?.title ?? "" })}
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="space-y-2 text-[12.5px] leading-relaxed">
+      tone="danger"
+      title={t("sidebar.deleteConversationTitle")}
+      description={t("sidebar.deleteConversationConfirm", { title: target?.title ?? "" })}
+      detail={
+        <div className="flex flex-col gap-1.5">
           {isRunning && (
             <p className="text-signal-warning">{t("sidebar.deleteConversationRunningWarn")}</p>
           )}
           <p className="text-ink-muted">{t("sidebar.filesOnDiskUntouched")}</p>
         </div>
-
-        <div className="flex justify-end gap-2 pt-1">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={deleting}
-            onClick={onClose}
-          >
-            {t("common.cancel")}
-          </Button>
-          <Button
-            type="button"
-            variant="destructive"
-            size="sm"
-            autoFocus
-            disabled={deleting}
-            onClick={() => void handleConfirm()}
-          >
-            {deleting ? (
-              <>
-                <OrbitSpinner size={13} />
-                <span>{t("sidebar.deleting")}</span>
-              </>
-            ) : (
-              t("common.delete")
-            )}
-          </Button>
-        </div>
-      </DialogContent>
-    </Dialog>
+      }
+      confirmLabel={t("common.delete")}
+      cancelLabel={t("common.cancel")}
+      onConfirm={handleConfirm}
+    />
   );
 }
 
@@ -868,7 +823,6 @@ export function DeleteProjectDialog({
   onClose: () => void;
 }) {
   const { t } = useI18n();
-  const [deleting, setDeleting] = useState(false);
 
   let activeCount = 0;
   let archivedCount = 0;
@@ -897,34 +851,21 @@ export function DeleteProjectDialog({
   const conversationSummary = formatConversationDeleteSummary(activeCount, archivedCount, t);
 
   const handleConfirm = async () => {
-    if (!project || deleting) return;
-    setDeleting(true);
-    try {
-      await orbitActions.deleteProject(project);
-      onClose();
-    } catch {
-      // Error toast is already surfaced by `orbitActions.deleteProject`.
-    } finally {
-      setDeleting(false);
-    }
+    if (!project) return;
+    await orbitActions.deleteProject(project);
   };
 
   return (
-    <Dialog
+    <ConfirmDialog
       open={Boolean(project)}
       onOpenChange={(open) => {
-        if (!open && !deleting) onClose();
+        if (!open) onClose();
       }}
-    >
-      <DialogContent className="max-w-md gap-4 p-5 select-none">
-        <DialogHeader className="gap-1.5 pr-6">
-          <DialogTitle className="text-[15.5px]">{t("sidebar.deleteProjectTitle")}</DialogTitle>
-          <DialogDescription className="text-ink-secondary text-[13px] leading-relaxed">
-            {t("sidebar.deleteProjectConfirm", { project: project?.name ?? "" })}
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="space-y-2 text-[12.5px] leading-relaxed">
+      tone="danger"
+      title={t("sidebar.deleteProjectTitle")}
+      description={t("sidebar.deleteProjectConfirm", { project: project?.name ?? "" })}
+      detail={
+        <div className="flex flex-col gap-1.5">
           {conversationSummary && (
             <p className="text-ink-secondary">
               {t("sidebar.deleteProjectSummary", { summary: conversationSummary })}
@@ -939,39 +880,38 @@ export function DeleteProjectDialog({
           )}
           <p className="text-ink-muted">{t("sidebar.filesOnDiskUntouched")}</p>
         </div>
-
-        <div className="flex justify-end gap-2 pt-1">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={deleting}
-            onClick={onClose}
-          >
-            {t("common.cancel")}
-          </Button>
-          <Button
-            type="button"
-            variant="destructive"
-            size="sm"
-            autoFocus
-            disabled={deleting}
-            onClick={() => void handleConfirm()}
-          >
-            {deleting ? (
-              <>
-                <OrbitSpinner size={13} />
-                <span>{t("sidebar.deleting")}</span>
-              </>
-            ) : (
-              t("common.delete")
-            )}
-          </Button>
-        </div>
-      </DialogContent>
-    </Dialog>
+      }
+      confirmLabel={t("common.delete")}
+      cancelLabel={t("common.cancel")}
+      onConfirm={handleConfirm}
+    />
   );
 }
+
+type PendingWorkspaceConfirm =
+  | {
+      kind: "archive_all";
+      hostId: string;
+      workspaceId: string;
+      workspaceTitle: string;
+      threadCount: number;
+      runningCount: number;
+    }
+  | {
+      kind: "merge";
+      hostId: string;
+      sourceWorkspaceId: string;
+      sourceTitle: string;
+      targetWorkspaceId: string;
+      targetTitle: string;
+      threadCount: number;
+    }
+  | {
+      kind: "delete";
+      hostId: string;
+      workspaceId: string;
+      workspaceTitle: string;
+    };
 
 /**
  * Shared Context Menu for Curated Mission Workspaces in `FleetSidebar`.
@@ -986,6 +926,7 @@ export function SharedWorkspaceMenu({
   onStartRenameWorkspace: (workspaceId: string) => void;
 }) {
   const { t } = useI18n();
+  const [pendingConfirm, setPendingConfirm] = useState<PendingWorkspaceConfirm | null>(null);
   const hostDetail = useOrbitSelector((s) =>
     target ? (s.hostDetails[target.project.host_id] ?? null) : null,
   );
@@ -996,197 +937,322 @@ export function SharedWorkspaceMenu({
         ) ?? null)
       : null,
   );
-  if (!target) return null;
-  const { workspace: ws, project: proj, anchor } = target;
+
+  const ws = target?.workspace ?? null;
+  const proj = target?.project ?? null;
+  const anchor = target?.anchor ?? null;
   const isWorktreeWs = Boolean(wsSummary?.is_worktree);
-  const canHandoff = isWorktreeWs || Boolean(proj.is_git_repo);
-  const siblingWorkspaces = (proj.workspaces ?? []).filter(
-    (w) => w.workspace_id !== ws.workspace_id && w.is_curated !== false,
-  );
-  const activeThreadCount = hostDetail
-    ? hostDetail.agents.filter(
-        (a) =>
-          a.workspace_id === ws.workspace_id &&
-          !a.archived_at_rfc3339 &&
-          !a.background &&
-          !a.parent_agent_id,
-      ).length
-    : ws.conversations.length || ws.peer_count;
+  const canHandoff = isWorktreeWs || Boolean(proj?.is_git_repo);
+  const siblingWorkspaces =
+    ws && proj
+      ? (proj.workspaces ?? []).filter(
+          (w) => w.workspace_id !== ws.workspace_id && w.is_curated !== false,
+        )
+      : [];
+  const activeThreads = ws
+    ? hostDetail
+      ? hostDetail.agents.filter(
+          (a) =>
+            a.workspace_id === ws.workspace_id &&
+            !a.archived_at_rfc3339 &&
+            !a.background &&
+            !a.parent_agent_id,
+        )
+      : ws.conversations.map((c) => c.agent)
+    : [];
+  const activeThreadCount = ws ? activeThreads.length || ws.peer_count : 0;
+  const runningThreadCount = activeThreads.filter(
+    (a) =>
+      isAgentForegroundRunning(a) ||
+      isAgentBackgroundWaiting(a) ||
+      a.is_awaiting_permission,
+  ).length;
   const hasThreads = activeThreadCount > 0;
 
+  const confirmTitle = !pendingConfirm
+    ? ""
+    : pendingConfirm.kind === "archive_all"
+      ? t("sidebar.archiveGroupTitle")
+      : pendingConfirm.kind === "merge"
+        ? t("sidebar.mergeGroupTitle")
+        : t("sidebar.deleteGroupTitle");
+
+  const confirmDescription = !pendingConfirm
+    ? undefined
+    : pendingConfirm.kind === "archive_all"
+      ? t("sidebar.archiveGroupConfirm", { title: pendingConfirm.workspaceTitle })
+      : pendingConfirm.kind === "merge"
+        ? t("sidebar.mergeGroupConfirm", {
+            source: pendingConfirm.sourceTitle,
+            target: pendingConfirm.targetTitle,
+          })
+        : t("sidebar.deleteGroupConfirm", { title: pendingConfirm.workspaceTitle });
+
+  const confirmDetail = !pendingConfirm ? undefined : (
+    <div className="flex flex-col gap-1.5">
+      {pendingConfirm.kind === "archive_all" && pendingConfirm.threadCount > 0 && (
+        <p className="text-ink-secondary">
+          {pendingConfirm.threadCount === 1
+            ? t("sidebar.deleteProjectActiveOne")
+            : t("sidebar.deleteProjectActiveMany", { count: pendingConfirm.threadCount })}
+        </p>
+      )}
+      {pendingConfirm.kind === "archive_all" && pendingConfirm.runningCount > 0 && (
+        <p className="text-signal-warning">
+          {pendingConfirm.runningCount === 1
+            ? t("sidebar.deleteProjectRunningOne")
+            : t("sidebar.deleteProjectRunningMany", { count: pendingConfirm.runningCount })}
+        </p>
+      )}
+      {pendingConfirm.kind === "merge" && pendingConfirm.threadCount > 0 && (
+        <p className="text-ink-secondary">
+          {pendingConfirm.threadCount === 1
+            ? t("sidebar.deleteProjectActiveOne")
+            : t("sidebar.deleteProjectActiveMany", { count: pendingConfirm.threadCount })}
+        </p>
+      )}
+      <p className="text-ink-muted">{t("sidebar.filesOnDiskUntouched")}</p>
+    </div>
+  );
+
+  const confirmActionLabel = !pendingConfirm
+    ? t("common.confirm")
+    : pendingConfirm.kind === "archive_all"
+      ? t("sidebar.archiveAll")
+      : pendingConfirm.kind === "merge"
+        ? t("sidebar.mergeInto")
+        : t("common.delete");
+
   return (
-    <DropdownMenu
-      key={`${ws.workspace_id}:${anchor.left}:${anchor.top}`}
-      open
-      onOpenChange={(open) => {
-        if (!open) onClose();
-      }}
-    >
-      <DropdownMenuTrigger asChild>
-        <span
-          aria-hidden="true"
-          style={{
-            position: "fixed",
-            left: `${anchor.left}px`,
-            top: `${anchor.top}px`,
-            width: `${anchor.width}px`,
-            height: `${anchor.height}px`,
-            pointerEvents: "none",
+    <>
+      {ws && proj && anchor && (
+        <DropdownMenu
+          key={`${ws.workspace_id}:${anchor.left}:${anchor.top}`}
+          open
+          onOpenChange={(open) => {
+            if (!open) onClose();
           }}
-        />
-      </DropdownMenuTrigger>
+        >
+          <DropdownMenuTrigger asChild>
+            <span
+              aria-hidden="true"
+              style={{
+                position: "fixed",
+                left: `${anchor.left}px`,
+                top: `${anchor.top}px`,
+                width: `${anchor.width}px`,
+                height: `${anchor.height}px`,
+                pointerEvents: "none",
+              }}
+            />
+          </DropdownMenuTrigger>
 
-      <DropdownMenuContent align="start" sideOffset={4} finalFocus={false}>
-        <DropdownMenuGroup>
-          <DropdownMenuItem
-            onSelect={() => {
-              onClose();
-              orbitActions.startNewThreadDraft(
-                proj.host_id,
-                ws.cwd || proj.primary_cwd,
-                undefined,
-                undefined,
-                ws.workspace_id,
-              );
-            }}
-          >
-            <span className="flex items-center gap-2 whitespace-nowrap">
-              <Plus className="text-ink-muted size-[13.5px] stroke-[1.75]" />
-              <span>{t("sidebar.groupNewConversation")}</span>
-            </span>
-          </DropdownMenuItem>
-
-          <DropdownMenuItem
-            onSelect={() => {
-              onClose();
-              window.requestAnimationFrame(() => onStartRenameWorkspace(ws.workspace_id));
-            }}
-          >
-            <span className="flex items-center gap-2 whitespace-nowrap">
-              <Pencil className="text-ink-muted size-[13.5px] stroke-[1.75]" />
-              <span>{t("common.rename")}</span>
-            </span>
-          </DropdownMenuItem>
-
-          <DropdownMenuItem
-            onSelect={() => {
-              onClose();
-              orbitActions.openWorkspaceBoardTab(proj.host_id, ws.workspace_id, ws.title);
-            }}
-          >
-            <span className="flex items-center gap-2 whitespace-nowrap">
-              <FileText className="text-ink-muted size-[13.5px] stroke-[1.75]" />
-              <span>{t("sidebar.groupNotes")}</span>
-            </span>
-          </DropdownMenuItem>
-        </DropdownMenuGroup>
-
-        {(canHandoff || siblingWorkspaces.length > 0) && (
-          <>
-            <DropdownMenuSeparator />
+          <DropdownMenuContent align="start" sideOffset={4} finalFocus={false}>
             <DropdownMenuGroup>
-              {canHandoff && (
+              <DropdownMenuItem
+                onSelect={() => {
+                  onClose();
+                  orbitActions.startNewThreadDraft(
+                    proj.host_id,
+                    ws.cwd || proj.primary_cwd,
+                    undefined,
+                    undefined,
+                    ws.workspace_id,
+                  );
+                }}
+              >
+                <span className="flex items-center gap-2 whitespace-nowrap">
+                  <Plus className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                  <span>{t("sidebar.groupNewConversation")}</span>
+                </span>
+              </DropdownMenuItem>
+
+              <DropdownMenuItem
+                onSelect={() => {
+                  onClose();
+                  window.requestAnimationFrame(() => onStartRenameWorkspace(ws.workspace_id));
+                }}
+              >
+                <span className="flex items-center gap-2 whitespace-nowrap">
+                  <Pencil className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                  <span>{t("common.rename")}</span>
+                </span>
+              </DropdownMenuItem>
+
+              <DropdownMenuItem
+                onSelect={() => {
+                  onClose();
+                  orbitActions.openWorkspaceBoardTab(proj.host_id, ws.workspace_id, ws.title);
+                }}
+              >
+                <span className="flex items-center gap-2 whitespace-nowrap">
+                  <FileText className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                  <span>{t("sidebar.groupNotes")}</span>
+                </span>
+              </DropdownMenuItem>
+            </DropdownMenuGroup>
+
+            {(canHandoff || siblingWorkspaces.length > 0) && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuGroup>
+                  {canHandoff && (
+                    <DropdownMenuItem
+                      onSelect={() => {
+                        onClose();
+                        orbitActions.openWorktreeHandoffDialog({
+                          hostId: proj.host_id,
+                          workspaceId: ws.workspace_id,
+                          direction: isWorktreeWs ? "worktree_to_local" : "local_to_worktree",
+                          defaultMode: isWorktreeWs ? "apply" : "move",
+                          sourceCwd: wsSummary?.cwd || ws.cwd || proj.primary_cwd,
+                        });
+                      }}
+                    >
+                      <span className="flex items-center gap-2 whitespace-nowrap">
+                        <ArrowLeftRight className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                        <span>
+                          {isWorktreeWs ? t("topbar.applyToLocal") : t("sidebar.moveToWorktree")}
+                        </span>
+                      </span>
+                    </DropdownMenuItem>
+                  )}
+
+                  {siblingWorkspaces.length > 0 && (
+                    <DropdownMenuSub>
+                      <DropdownMenuSubTrigger>
+                        <span className="flex items-center gap-2 whitespace-nowrap">
+                          <GitMerge className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                          <span>{t("sidebar.mergeInto")}</span>
+                        </span>
+                      </DropdownMenuSubTrigger>
+                      <DropdownMenuSubContent>
+                        <DropdownMenuGroup>
+                          {siblingWorkspaces.slice(0, 8).map((other) => (
+                            <DropdownMenuItem
+                              key={other.workspace_id}
+                              onSelect={() => {
+                                onClose();
+                                setPendingConfirm({
+                                  kind: "merge",
+                                  hostId: proj.host_id,
+                                  sourceWorkspaceId: ws.workspace_id,
+                                  sourceTitle: ws.title,
+                                  targetWorkspaceId: other.workspace_id,
+                                  targetTitle: other.title,
+                                  threadCount: activeThreadCount,
+                                });
+                              }}
+                            >
+                              <span className="flex min-w-0 items-center gap-2">
+                                <Layers className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                                <span className="truncate">{other.title}</span>
+                              </span>
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuGroup>
+                      </DropdownMenuSubContent>
+                    </DropdownMenuSub>
+                  )}
+                </DropdownMenuGroup>
+              </>
+            )}
+
+            <DropdownMenuSeparator />
+
+            <DropdownMenuGroup>
+              {hasThreads ? (
+                <>
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      void orbitActions.archiveWorkspace(proj.host_id, ws.workspace_id, true);
+                    }}
+                  >
+                    <span className="flex items-center gap-2 whitespace-nowrap">
+                      <Inbox className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                      <span>{t("sidebar.ungroup")}</span>
+                    </span>
+                  </DropdownMenuItem>
+
+                  <DropdownMenuItem
+                    variant="destructive"
+                    onSelect={() => {
+                      onClose();
+                      setPendingConfirm({
+                        kind: "archive_all",
+                        hostId: proj.host_id,
+                        workspaceId: ws.workspace_id,
+                        workspaceTitle: ws.title,
+                        threadCount: activeThreadCount,
+                        runningCount: runningThreadCount,
+                      });
+                    }}
+                  >
+                    <span className="flex items-center gap-2 whitespace-nowrap">
+                      <Archive className="size-[13.5px] stroke-[1.75]" />
+                      <span>{t("sidebar.archiveAll")}</span>
+                    </span>
+                  </DropdownMenuItem>
+                </>
+              ) : (
                 <DropdownMenuItem
+                  variant="destructive"
                   onSelect={() => {
                     onClose();
-                    orbitActions.openWorktreeHandoffDialog({
+                    setPendingConfirm({
+                      kind: "delete",
                       hostId: proj.host_id,
                       workspaceId: ws.workspace_id,
-                      direction: isWorktreeWs ? "worktree_to_local" : "local_to_worktree",
-                      defaultMode: isWorktreeWs ? "apply" : "move",
-                      sourceCwd: wsSummary?.cwd || ws.cwd || proj.primary_cwd,
+                      workspaceTitle: ws.title,
                     });
                   }}
                 >
                   <span className="flex items-center gap-2 whitespace-nowrap">
-                    <ArrowLeftRight className="text-ink-muted size-[13.5px] stroke-[1.75]" />
-                    <span>
-                      {isWorktreeWs ? t("topbar.applyToLocal") : t("sidebar.moveToWorktree")}
-                    </span>
+                    <Trash2 className="size-[13.5px] stroke-[1.75]" />
+                    <span>{t("common.delete")}</span>
                   </span>
                 </DropdownMenuItem>
               )}
-
-              {siblingWorkspaces.length > 0 && (
-                <DropdownMenuSub>
-                  <DropdownMenuSubTrigger>
-                    <span className="flex items-center gap-2 whitespace-nowrap">
-                      <GitMerge className="text-ink-muted size-[13.5px] stroke-[1.75]" />
-                      <span>{t("sidebar.mergeInto")}</span>
-                    </span>
-                  </DropdownMenuSubTrigger>
-                  <DropdownMenuSubContent>
-                    <DropdownMenuGroup>
-                      {siblingWorkspaces.slice(0, 8).map((other) => (
-                        <DropdownMenuItem
-                          key={other.workspace_id}
-                          onSelect={() => {
-                            void orbitActions.mergeWorkspaces(
-                              proj.host_id,
-                              ws.workspace_id,
-                              other.workspace_id,
-                            );
-                          }}
-                        >
-                          <span className="flex min-w-0 items-center gap-2">
-                            <Layers className="text-ink-muted size-[13.5px] stroke-[1.75]" />
-                            <span className="truncate">{other.title}</span>
-                          </span>
-                        </DropdownMenuItem>
-                      ))}
-                    </DropdownMenuGroup>
-                  </DropdownMenuSubContent>
-                </DropdownMenuSub>
-              )}
             </DropdownMenuGroup>
-          </>
-        )}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      )}
 
-        <DropdownMenuSeparator />
-
-        <DropdownMenuGroup>
-          {hasThreads ? (
-            <>
-              <DropdownMenuItem
-                onSelect={() => {
-                  void orbitActions.archiveWorkspace(proj.host_id, ws.workspace_id, true);
-                }}
-              >
-                <span className="flex items-center gap-2 whitespace-nowrap">
-                  <Inbox className="text-ink-muted size-[13.5px] stroke-[1.75]" />
-                  <span>{t("sidebar.ungroup")}</span>
-                </span>
-              </DropdownMenuItem>
-
-              <DropdownMenuItem
-                variant="destructive"
-                onSelect={() => {
-                  void orbitActions.archiveWorkspace(proj.host_id, ws.workspace_id, false);
-                }}
-              >
-                <span className="flex items-center gap-2 whitespace-nowrap">
-                  <Archive className="size-[13.5px] stroke-[1.75]" />
-                  <span>{t("sidebar.archiveAll")}</span>
-                </span>
-              </DropdownMenuItem>
-            </>
-          ) : (
-            <DropdownMenuItem
-              variant="destructive"
-              onSelect={() => {
-                void orbitActions.archiveWorkspace(proj.host_id, ws.workspace_id, true, {
-                  emptyDelete: true,
-                });
-              }}
-            >
-              <span className="flex items-center gap-2 whitespace-nowrap">
-                <Trash2 className="size-[13.5px] stroke-[1.75]" />
-                <span>{t("common.delete")}</span>
-              </span>
-            </DropdownMenuItem>
-          )}
-        </DropdownMenuGroup>
-      </DropdownMenuContent>
-    </DropdownMenu>
+      <ConfirmDialog
+        open={pendingConfirm !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingConfirm(null);
+        }}
+        tone="danger"
+        title={confirmTitle}
+        description={confirmDescription}
+        detail={confirmDetail}
+        confirmLabel={confirmActionLabel}
+        cancelLabel={t("common.cancel")}
+        onConfirm={async () => {
+          if (!pendingConfirm) return;
+          if (pendingConfirm.kind === "archive_all") {
+            await orbitActions.archiveWorkspace(
+              pendingConfirm.hostId,
+              pendingConfirm.workspaceId,
+              false,
+            );
+          } else if (pendingConfirm.kind === "merge") {
+            await orbitActions.mergeWorkspaces(
+              pendingConfirm.hostId,
+              pendingConfirm.sourceWorkspaceId,
+              pendingConfirm.targetWorkspaceId,
+            );
+          } else {
+            await orbitActions.archiveWorkspace(
+              pendingConfirm.hostId,
+              pendingConfirm.workspaceId,
+              true,
+              { emptyDelete: true },
+            );
+          }
+        }}
+      />
+    </>
   );
 }

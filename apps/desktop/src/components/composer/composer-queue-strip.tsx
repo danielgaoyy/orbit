@@ -1,18 +1,13 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CornerDownRight,
-  FileSearch,
-  FoldVertical,
   GripVertical,
   Image as ImageIcon,
-  Layers,
-  ListTodo,
-  Send,
   Sparkles,
-  Users,
   X,
   type LucideIcon,
 } from "lucide-react";
+import { InlineDirectiveToken } from "@/components/composer/composer-directive-token";
 import { SimpleTooltip } from "@/components/ui/overlays";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useI18n } from "@/lib/i18n";
@@ -36,26 +31,6 @@ const MAX_QUEUED_IMAGE_THUMBS = 3;
 
 function resolveQueuedBadgeIcon(badge: PromptBadge): LucideIcon | null {
   if (badge.kind === "skill") return Sparkles;
-  if (badge.kind === "slash") {
-    switch (badge.label) {
-      case "/plan":
-        return ListTodo;
-      case "/review":
-        return FileSearch;
-      case "/compact":
-        return FoldVertical;
-      case "/orbit":
-        return Layers;
-      case "/orbit-handoff":
-        return Send;
-      case "/orbit-committee":
-        return Users;
-      case "/orbit-advisor":
-        return Sparkles;
-      default:
-        return Sparkles;
-    }
-  }
   return null;
 }
 
@@ -142,7 +117,7 @@ const QueuedImageThumb = memo(function QueuedImageThumb({
         <ImageIcon className="text-ink-muted size-3 stroke-[1.7]" />
       )}
       {overflowCount > 0 && (
-        <span className="tabular-nums absolute inset-0 flex items-center justify-center bg-black/55 font-mono text-[9.5px] leading-none font-semibold text-white">
+        <span className="tabular-nums absolute inset-0 flex items-center justify-center bg-black/55 font-mono text-[11px] leading-none font-semibold text-white">
           +{overflowCount}
         </span>
       )}
@@ -183,6 +158,7 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
   }, [hostSupportsServerQueue, serverQueued, localQueued]);
 
   const [queueDrag, setQueueDrag] = useState<{
+    phase: "dragging" | "settling";
     fromIndex: number;
     overIndex: number;
     deltaY: number;
@@ -190,6 +166,8 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
   } | null>(null);
   const queueRowRefs = useRef<(HTMLDivElement | null)[]>([]);
   const queueDragCleanupRef = useRef<(() => void) | null>(null);
+  const settleFinishRef = useRef<(() => void) | null>(null);
+  const settleTimerRef = useRef<number | null>(null);
   const queuedSignature = useMemo(() => queued.map((q) => q.id).join("\0"), [queued]);
 
   useEffect(() => {
@@ -207,6 +185,11 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
       if (e.button !== 0 || queued.length < 2) return;
       if ((e.target as HTMLElement | null)?.closest("button")) return;
 
+      // Flush any in-flight settle cleanly before starting a new drag.
+      if (settleFinishRef.current) {
+        settleFinishRef.current();
+      }
+
       const firstRect = queueRowRefs.current[0]?.getBoundingClientRect();
       const secondRect = queueRowRefs.current[1]?.getBoundingClientRect();
       const measuredStep =
@@ -220,18 +203,70 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
 
       let active = false;
       let overIndex = fromIndex;
+      let latestDeltaY = 0;
+
+      const clearSettleTimer = () => {
+        if (settleTimerRef.current !== null) {
+          window.clearTimeout(settleTimerRef.current);
+          settleTimerRef.current = null;
+        }
+        settleFinishRef.current = null;
+      };
 
       const detachListeners = () => {
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onUp);
         window.removeEventListener("pointercancel", onCancel);
         window.removeEventListener("keydown", onKeyDown);
-        queueDragCleanupRef.current = null;
       };
 
       const cleanup = () => {
         detachListeners();
+        clearSettleTimer();
+        queueDragCleanupRef.current = null;
         setQueueDrag(null);
+      };
+
+      const startSettle = (targetOverIndex: number, shouldCommit: boolean) => {
+        detachListeners();
+        const targetDeltaY = (targetOverIndex - fromIndex) * measuredStep;
+        const reducedMotion =
+          typeof window !== "undefined" &&
+          window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+
+        let finished = false;
+        const finalize = () => {
+          if (finished) return;
+          finished = true;
+          clearSettleTimer();
+          queueDragCleanupRef.current = null;
+          if (shouldCommit) {
+            orbitActions.reorderQueuedPrompts(fromIndex, targetOverIndex);
+          }
+          setQueueDrag(null);
+        };
+
+        if (reducedMotion || Math.abs(latestDeltaY - targetDeltaY) < 0.5) {
+          finalize();
+          return;
+        }
+
+        settleFinishRef.current = finalize;
+        queueDragCleanupRef.current = () => {
+          if (finished) return;
+          finished = true;
+          clearSettleTimer();
+          queueDragCleanupRef.current = null;
+          setQueueDrag(null);
+        };
+        setQueueDrag({
+          phase: "settling",
+          fromIndex,
+          overIndex: targetOverIndex,
+          deltaY: targetDeltaY,
+          rowStep: measuredStep,
+        });
+        settleTimerRef.current = window.setTimeout(finalize, 160);
       };
 
       const onMove = (ev: PointerEvent) => {
@@ -241,9 +276,11 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
           active = true;
         }
         const clampedDeltaY = Math.max(minDeltaY, Math.min(maxDeltaY, rawDelta));
+        latestDeltaY = clampedDeltaY;
         const slotShift = Math.round(clampedDeltaY / measuredStep);
         overIndex = Math.max(0, Math.min(count - 1, fromIndex + slotShift));
         setQueueDrag({
+          phase: "dragging",
           fromIndex,
           overIndex,
           deltaY: clampedDeltaY,
@@ -252,20 +289,28 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
       };
 
       const onUp = () => {
-        const shouldCommit = active && overIndex !== fromIndex;
-        const targetIndex = overIndex;
-        if (shouldCommit) {
-          detachListeners();
-          orbitActions.reorderQueuedPrompts(fromIndex, targetIndex);
-          setQueueDrag(null);
-        } else {
+        if (!active) {
           cleanup();
+          return;
         }
+        startSettle(overIndex, overIndex !== fromIndex);
       };
 
-      const onCancel = () => cleanup();
+      const onCancel = () => {
+        if (!active) {
+          cleanup();
+          return;
+        }
+        startSettle(fromIndex, false);
+      };
       const onKeyDown = (ev: KeyboardEvent) => {
-        if (ev.key === "Escape") cleanup();
+        if (ev.key === "Escape") {
+          if (!active) {
+            cleanup();
+          } else {
+            startSettle(fromIndex, false);
+          }
+        }
       };
 
       queueDragCleanupRef.current?.();
@@ -281,7 +326,7 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
   if (!selectedHostId || queued.length === 0) return null;
 
   return (
-    <div className="composer-queue-surface orbit-stage-enter overflow-hidden rounded-2xl text-[12.5px]">
+    <div className="composer-queue-surface orbit-stage-enter overflow-hidden rounded-2xl text-[13px]">
       <ScrollArea
         className="w-full"
         viewportClassName="max-h-[156px] overscroll-contain px-2 py-1.5"
@@ -334,16 +379,30 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
                 queueRowRefs.current[idx] = el;
               }}
               onPointerDown={canDrag ? (e) => handleQueueRowPointerDown(e, idx) : undefined}
+              onTransitionEnd={
+                isDragged && queueDrag.phase === "settling"
+                  ? (e) => {
+                      if (e.target === e.currentTarget && e.propertyName === "transform") {
+                        settleFinishRef.current?.();
+                      }
+                    }
+                  : undefined
+              }
               style={
                 queueDrag ? { transform: `translate3d(0, ${translateY}px, 0)` } : undefined
               }
               className={cn(
                 "group/qrow flex h-[28px] min-w-0 items-center justify-between gap-2 overflow-hidden rounded-[8px] px-2 select-none",
                 isDragged
-                  ? "bg-surface-overlay ring-border-strong relative z-10 cursor-grabbing shadow-md ring-1"
+                  ? cn(
+                      "bg-surface-overlay ring-border-strong relative z-10 shadow-md ring-1",
+                      queueDrag.phase === "settling"
+                        ? "transition-[transform,box-shadow] duration-[140ms] ease-[var(--ease-out-expo)]"
+                        : "cursor-grabbing",
+                    )
                   : cn(
                       queueDrag
-                        ? "transition-transform duration-150 ease-out"
+                        ? "transition-transform duration-150 ease-[var(--ease-out-expo)]"
                         : "hover:bg-accent/65 transition-colors",
                       canDrag && !queueDrag && "cursor-grab",
                     ),
@@ -351,20 +410,22 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
             >
               <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
                 {canDrag ? (
-                  <>
+                  <span className="relative inline-flex size-3.5 shrink-0 items-center justify-center">
                     <CornerDownRight
+                      aria-hidden="true"
                       className={cn(
-                        "text-ink-faint size-3.5 shrink-0 stroke-[1.8]",
-                        isDragged ? "hidden" : "group-hover/qrow:hidden",
+                        "text-ink-faint size-3.5 stroke-[1.8] transition-opacity duration-150",
+                        isDragged ? "opacity-0" : "opacity-100 group-hover/qrow:opacity-0",
                       )}
                     />
                     <GripVertical
+                      aria-hidden="true"
                       className={cn(
-                        "text-ink-muted size-3.5 shrink-0 stroke-[1.8]",
-                        isDragged ? "block" : "hidden group-hover/qrow:block",
+                        "text-ink-muted absolute inset-0 size-3.5 stroke-[1.8] transition-opacity duration-150",
+                        isDragged ? "opacity-100" : "opacity-0 group-hover/qrow:opacity-100",
                       )}
                     />
-                  </>
+                  </span>
                 ) : (
                   <CornerDownRight className="text-ink-faint size-3.5 shrink-0 stroke-[1.8]" />
                 )}
@@ -394,6 +455,17 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
                   </div>
                 )}
                 {visibleOtherBadges.map((b, bIdx) => {
+                  if (b.kind === "slash") {
+                    return (
+                      <InlineDirectiveToken
+                        key={`${b.kind}-${bIdx}`}
+                        directive={b.label}
+                        size="compact"
+                        showTitle
+                        className="shrink-0"
+                      />
+                    );
+                  }
                   const BadgeIcon = resolveQueuedBadgeIcon(b);
                   return (
                     <span
@@ -412,7 +484,7 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
                 {hiddenOtherBadgeCount > 0 && (
                   <span
                     title={otherBadges.map((b) => b.label).join(", ")}
-                    className="bg-surface-recessed text-ink-muted shrink-0 rounded px-1.5 py-0.5 font-mono text-[10.5px]"
+                    className="bg-surface-recessed text-ink-muted shrink-0 rounded px-1.5 py-0.5 font-mono text-[11px]"
                   >
                     +{hiddenOtherBadgeCount}
                   </span>
@@ -441,7 +513,7 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
                   <button
                     type="button"
                     onClick={() => void orbitActions.flushQueuedPromptImmediately(idx, qItem.id)}
-                    className="text-ink-secondary hover:text-ink-primary hover:bg-accent inline-flex h-[22px] cursor-pointer items-center rounded-[6px] px-2 text-[11.5px] font-medium transition-colors"
+                    className="text-ink-secondary hover:text-ink-primary hover:bg-accent inline-flex h-[22px] cursor-pointer items-center rounded-[6px] px-2 text-[11px] font-medium transition-colors"
                   >
                     {t("composer.steerAction")}
                   </button>
@@ -451,7 +523,7 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
                     type="button"
                     aria-label={t("composer.editQueuedAria")}
                     onClick={() => orbitActions.popQueuedToDraft(idx, qItem.id)}
-                    className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex h-[22px] cursor-pointer items-center rounded-[6px] px-2 text-[11.5px] font-medium transition-colors"
+                    className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex h-[22px] cursor-pointer items-center rounded-[6px] px-2 text-[11px] font-medium transition-colors"
                   >
                     {t("common.edit")}
                   </button>

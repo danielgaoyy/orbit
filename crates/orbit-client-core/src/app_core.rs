@@ -29,11 +29,11 @@ use orbit_protocol::{
     ProviderSubagentDescriptor, ProviderSubagentEvent, PushDeviceRecord, PushPlatform,
     PushPreferences, QuestionItem, QueuedPromptView, ReasoningEffort, RuleTriggerMode,
     ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode, SkillWriteScope,
-    TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelinePayload, TimerCondition,
-    ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot, WireMessage, WorkflowRunRecord,
-    WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord,
-    WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary,
-    WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelineOutlinePrompt, TimelinePayload,
+    TimerCondition, ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot, WireMessage,
+    WorkflowRunRecord, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind,
+    WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo,
+    WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -74,8 +74,8 @@ use crate::desktop_ops::{
 };
 use crate::render::{
     DiffFileView, HighlightedLineView, RichBlockView, TerminalGridEmulator, TerminalScreenView,
-    detect_language_for_path, highlight_code_lines_capped, parse_markdown_blocks,
-    parse_unified_diff, parse_unified_diff_capped,
+    detect_language_for_path, highlight_code_lines_capped, highlight_code_lines_prefix,
+    parse_markdown_blocks, parse_unified_diff, parse_unified_diff_capped,
 };
 use crate::stage::{self, SessionInsightsView, StageTurnView};
 use crate::{
@@ -1161,6 +1161,8 @@ struct HostMemoryState {
     workspaces: Vec<WorkspaceSummary>,
     agents: HashMap<String, AgentSummary>,
     timelines: HashMap<String, Vec<TimelineEvent>>,
+    full_outline_prompts: HashMap<String, Vec<TimelineOutlinePrompt>>,
+    pending_epoch_outline_fallback: HashMap<String, Vec<TimelineOutlinePrompt>>,
     stage_cache: HashMap<String, CachedAgentStage>,
     stage_access_order: VecDeque<String>,
     stage_dirty: HashMap<String, StageDirtyState>,
@@ -1321,6 +1323,8 @@ impl HostMemoryState {
             workspaces: Vec::new(),
             agents: HashMap::new(),
             timelines: HashMap::new(),
+            full_outline_prompts: HashMap::new(),
+            pending_epoch_outline_fallback: HashMap::new(),
             stage_cache: HashMap::new(),
             stage_access_order: VecDeque::new(),
             stage_dirty: HashMap::new(),
@@ -1368,6 +1372,103 @@ impl HostMemoryState {
             goal_runs: Vec::new(),
             monitor_watches: Vec::new(),
             workflow_runs: Vec::new(),
+        }
+    }
+
+    fn observe_outline_prompt(&mut self, event: &TimelineEvent) -> bool {
+        let TimelinePayload::UserPrompt { text, badges, .. } = &event.payload else {
+            return false;
+        };
+        if event.seq == 0 {
+            return false;
+        }
+        let prompts = self
+            .full_outline_prompts
+            .entry(event.agent_id.clone())
+            .or_default();
+        let position = prompts.binary_search_by_key(&event.seq, |prompt| prompt.seq);
+        match (
+            position,
+            TimelineOutlinePrompt::from_user_prompt(event.seq, text, badges),
+        ) {
+            (Ok(i), Some(prompt)) => {
+                if prompts[i] != prompt {
+                    prompts[i] = prompt;
+                    true
+                } else {
+                    false
+                }
+            }
+            (Err(i), Some(prompt)) => {
+                prompts.insert(i, prompt);
+                true
+            }
+            (Ok(i), None) => {
+                prompts.remove(i);
+                true
+            }
+            (Err(_), None) => false,
+        }
+    }
+
+    fn merge_outline_prompts(
+        &mut self,
+        agent_id: &str,
+        incoming: &[TimelineOutlinePrompt],
+    ) -> bool {
+        if incoming.is_empty() {
+            return false;
+        }
+        let prompts = self
+            .full_outline_prompts
+            .entry(agent_id.to_string())
+            .or_default();
+        let mut changed = false;
+        for prompt in incoming {
+            if prompt.seq == 0 {
+                continue;
+            }
+            match prompts.binary_search_by_key(&prompt.seq, |p| p.seq) {
+                Ok(i) => {
+                    if prompts[i] != *prompt {
+                        prompts[i] = prompt.clone();
+                        changed = true;
+                    }
+                }
+                Err(i) => {
+                    prompts.insert(i, prompt.clone());
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    fn stash_epoch_outline_fallback(&mut self, agent_id: &str, max_seq: u64) {
+        let mut combined = self
+            .pending_epoch_outline_fallback
+            .remove(agent_id)
+            .unwrap_or_default();
+        if let Some(existing) = self.full_outline_prompts.remove(agent_id) {
+            combined.extend(existing);
+        }
+        if let Some(events) = self.timelines.get(agent_id) {
+            for ev in events {
+                if ev.seq > 0
+                    && let TimelinePayload::UserPrompt { text, badges, .. } = &ev.payload
+                    && let Some(prompt) =
+                        TimelineOutlinePrompt::from_user_prompt(ev.seq, text, badges)
+                {
+                    combined.push(prompt);
+                }
+            }
+        }
+        combined.retain(|p| p.seq > 0 && p.seq <= max_seq);
+        combined.sort_by_key(|p| p.seq);
+        combined.dedup_by_key(|p| p.seq);
+        if !combined.is_empty() {
+            self.pending_epoch_outline_fallback
+                .insert(agent_id.to_string(), combined);
         }
     }
 
@@ -2081,6 +2182,9 @@ impl OrbitAppCore {
             && !cached.is_empty()
         {
             let remote_has_older = self.store.get_replica_has_older(agent_id).unwrap_or(false);
+            if let Ok(replica_outline) = self.store.fetch_replica_outline_prompts(agent_id) {
+                host_state.merge_outline_prompts(agent_id, &replica_outline);
+            }
             let mut coalesced = Vec::with_capacity(cached.len());
             for ev in cached {
                 coalesce_or_push_timeline(&mut coalesced, ev);
@@ -2165,6 +2269,11 @@ impl OrbitAppCore {
                         .unwrap_or(0)
                 });
 
+            let full_outline = host_state
+                .full_outline_prompts
+                .get(agent_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             let dirty_state = dirty.unwrap_or(StageDirtyState {
                 dirty_from_event_idx: Some(0),
                 force_full: true,
@@ -2175,7 +2284,9 @@ impl OrbitAppCore {
 
             let force_full = needs_build
                 || dirty_state.force_full
-                || dirty_state.dirty_from_event_idx == Some(0)
+                // A tail page can start on a streaming reply. Its first-row text edits can
+                // replace turns from zero while retaining the cached full-history insights.
+                || (dirty_state.aux_dirty && dirty_state.dirty_from_event_idx == Some(0))
                 || host_state
                     .stage_cache
                     .get(agent_id)
@@ -2218,7 +2329,7 @@ impl OrbitAppCore {
                     .get(agent_id)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
-                let (pending_permissions, pending_questions, session_turn_diffs, insights) =
+                let (pending_permissions, pending_questions, session_turn_diffs, mut insights) =
                     stage::collect_stage_auxiliary_state(
                         &items,
                         cwd,
@@ -2227,6 +2338,7 @@ impl OrbitAppCore {
                         provider_subagents,
                     );
 
+                insights.merge_outline(full_outline);
                 host_state.stage_cache.insert(
                     agent_id.to_string(),
                     CachedAgentStage {
@@ -2310,7 +2422,7 @@ impl OrbitAppCore {
                         .get(agent_id)
                         .map(Vec::as_slice)
                         .unwrap_or(&[]);
-                    let (pending_permissions, pending_questions, session_turn_diffs, insights) =
+                    let (pending_permissions, pending_questions, session_turn_diffs, mut insights) =
                         stage::collect_stage_auxiliary_state(
                             &cached.items,
                             cwd,
@@ -2318,6 +2430,7 @@ impl OrbitAppCore {
                             &host_agent_cards,
                             provider_subagents,
                         );
+                    insights.merge_outline(full_outline);
                     cached.pending_permissions = pending_permissions;
                     cached.pending_questions = pending_questions;
                     cached.session_turn_diffs = session_turn_diffs;
@@ -2329,13 +2442,14 @@ impl OrbitAppCore {
                         .get(agent_id)
                         .map(Vec::as_slice)
                         .unwrap_or(&[]);
-                    let next_insights = stage::derive_session_insights(
+                    let mut next_insights = stage::derive_session_insights(
                         &cached.items,
                         cwd,
                         current_agent_card.as_ref(),
                         &host_agent_cards,
                         provider_subagents,
                     );
+                    next_insights.merge_outline(full_outline);
                     if next_insights != cached.insights {
                         cached.insights = next_insights;
                         cached.aux_revision = cached.aux_revision.saturating_add(1);
@@ -4824,13 +4938,12 @@ impl OrbitAppCore {
                     .await;
 
                 for (agent_id, since_seq) in resub_timelines {
-                    let tail_limit = (since_seq == 0).then_some(300);
                     let _ = handle
                         .send_wire(WireMessage::SubscribeTimeline {
                             request_id: Uuid::new_v4(),
                             agent_id,
                             since_seq,
-                            tail_limit,
+                            tail_limit: Some(300),
                         })
                         .await;
                 }
@@ -4884,6 +4997,8 @@ impl OrbitAppCore {
                         h.agents.clear();
                         h.discovered_projects.clear();
                         h.timelines.clear();
+                        h.full_outline_prompts.clear();
+                        h.pending_epoch_outline_fallback.clear();
                         h.timeline_has_older.clear();
                         h.timeline_loading_older.clear();
                         h.pending_tail_catchups.clear();
@@ -5189,21 +5304,33 @@ impl OrbitAppCore {
                             .and_then(|evs| evs.iter().map(|e| e.seq).max())
                             .unwrap_or(0);
                         let epoch_advanced = prev.is_some_and(|(ep, _)| a.timeline_epoch > ep);
-                        let seq_regressed = local_max_seq > 0 && a.latest_seq < local_max_seq;
+                        let seq_regressed = (is_initial_hydration || prev.is_none())
+                            && local_max_seq > 0
+                            && a.latest_seq < local_max_seq;
                         if epoch_advanced || seq_regressed {
+                            state.stash_epoch_outline_fallback(&ag_id, a.latest_seq);
                             let had_mem = state.timelines.remove(&ag_id).is_some();
                             state.caught_up_agents.remove(&ag_id);
                             state.timeline_has_older.remove(&ag_id);
                             state.timeline_loading_older.remove(&ag_id);
                             state.pending_tail_catchups.remove(&ag_id);
-                            state.stage_cache.remove(&ag_id);
                             state.mark_stage_dirty(&ag_id, 0, true);
                             state.rewound_agents.insert(ag_id.clone());
                             stale_replica_agents.push((ag_id.clone(), had_mem));
                             push_notify_timeline(ag_id.clone());
-                        } else if state.stage_cache.contains_key(&ag_id) {
-                            state.mark_stage_meta_dirty(&ag_id);
-                            push_notify_timeline(ag_id.clone());
+                        } else {
+                            if let Some((prev_ep, _)) = prev
+                                && a.timeline_epoch < prev_ep
+                            {
+                                a.timeline_epoch = prev_ep;
+                            }
+                            if local_max_seq > a.latest_seq {
+                                a.latest_seq = local_max_seq;
+                            }
+                            if state.stage_cache.contains_key(&ag_id) {
+                                state.mark_stage_meta_dirty(&ag_id);
+                                push_notify_timeline(ag_id.clone());
+                            }
                         }
                         if is_initial_hydration && a.latest_seq > 0 {
                             let seed_seq = if a.read_seq == 0 && a.attention == AttentionState::None
@@ -5231,6 +5358,8 @@ impl OrbitAppCore {
                     let ag_id = agent.agent_id.clone();
                     if let Some(opt_id) = state.optimistic_by_req_id.remove(&request_id) {
                         state.agents.remove(&opt_id);
+                        state.full_outline_prompts.remove(&opt_id);
+                        state.pending_epoch_outline_fallback.remove(&opt_id);
                         if let Some(opt_tl) = state.timelines.remove(&opt_id)
                             && !state.timelines.contains_key(&ag_id)
                         {
@@ -5366,19 +5495,31 @@ impl OrbitAppCore {
                         .and_then(|evs| evs.iter().map(|e| e.seq).max())
                         .unwrap_or(0);
                     let epoch_advanced = prev_epoch.is_some_and(|ep| agent.timeline_epoch > ep);
-                    let seq_regressed = local_max_seq > 0 && agent.latest_seq < local_max_seq;
+                    let seq_regressed = prev_epoch.is_none()
+                        && local_max_seq > 0
+                        && agent.latest_seq < local_max_seq;
                     if epoch_advanced || seq_regressed {
+                        state.stash_epoch_outline_fallback(&ag_id, agent.latest_seq);
                         let had_mem = state.timelines.remove(&ag_id).is_some();
                         state.caught_up_agents.remove(&ag_id);
                         state.timeline_has_older.remove(&ag_id);
                         state.timeline_loading_older.remove(&ag_id);
                         state.pending_tail_catchups.remove(&ag_id);
-                        state.stage_cache.remove(&ag_id);
                         state.mark_stage_dirty(&ag_id, 0, true);
                         state.rewound_agents.insert(ag_id.clone());
                         stale_replica_agents.push((ag_id.clone(), had_mem));
-                    } else if !stage_fields_unchanged {
-                        state.mark_stage_meta_dirty(&ag_id);
+                    } else {
+                        if let Some(prev_ep) = prev_epoch
+                            && agent.timeline_epoch < prev_ep
+                        {
+                            agent.timeline_epoch = prev_ep;
+                        }
+                        if local_max_seq > agent.latest_seq {
+                            agent.latest_seq = local_max_seq;
+                        }
+                        if !stage_fields_unchanged {
+                            state.mark_stage_meta_dirty(&ag_id);
+                        }
                     }
                     if !stage_fields_unchanged {
                         if let Some(ref parent_id) = agent.parent_agent_id {
@@ -5419,6 +5560,8 @@ impl OrbitAppCore {
                         .and_then(|a| a.parent_agent_id.clone());
                     state.agents.remove(&agent_id);
                     state.timelines.remove(&agent_id);
+                    state.full_outline_prompts.remove(&agent_id);
+                    state.pending_epoch_outline_fallback.remove(&agent_id);
                     state.timeline_has_older.remove(&agent_id);
                     state.timeline_loading_older.remove(&agent_id);
                     state.pending_tail_catchups.remove(&agent_id);
@@ -5862,7 +6005,7 @@ impl OrbitAppCore {
                     restored_files,
                     restored_prompt,
                     notice,
-                    ..
+                    to_before_seq,
                 } => {
                     let ag_id = agent.agent_id.clone();
                     rewound_seen_reset = Some((ag_id.clone(), agent.latest_seq));
@@ -5890,6 +6033,15 @@ impl OrbitAppCore {
                     ordered.sort_by_key(|e| e.seq);
                     let last_seq = ordered.last().map(|e| e.seq).unwrap_or(0);
                     let is_complete = last_seq >= agent.latest_seq;
+                    state.pending_epoch_outline_fallback.remove(&ag_id);
+                    if let Some(prompts) = state.full_outline_prompts.get_mut(&ag_id) {
+                        prompts.truncate(prompts.partition_point(|prompt| {
+                            prompt.seq < to_before_seq && prompt.seq <= agent.latest_seq
+                        }));
+                    }
+                    for event in &ordered {
+                        state.observe_outline_prompt(event);
+                    }
                     state.timelines.insert(ag_id.clone(), ordered.clone());
                     if is_complete {
                         state.caught_up_agents.insert(ag_id.clone());
@@ -5900,7 +6052,6 @@ impl OrbitAppCore {
                     state.timeline_loading_older.remove(&ag_id);
                     state.pending_tail_catchups.remove(&ag_id);
                     persist_has_older = Some((ag_id.clone(), false));
-                    state.stage_cache.remove(&ag_id);
                     state.mark_stage_dirty(&ag_id, 0, true);
                     state.rewound_agents.insert(ag_id.clone());
                     state.agents.insert(ag_id.clone(), agent.clone());
@@ -5927,8 +6078,57 @@ impl OrbitAppCore {
                     events,
                     has_more,
                     has_older_history,
+                    mut outline_prompts,
                     ..
                 } => {
+                    let epoch_fallback = state.pending_epoch_outline_fallback.remove(&agent_id);
+                    let min_incoming_pos_seq =
+                        events.iter().filter(|e| e.seq > 0).map(|e| e.seq).min();
+                    let max_incoming_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
+                    if !outline_prompts.is_empty() {
+                        outline_prompts.sort_by_key(|prompt| prompt.seq);
+                        outline_prompts.dedup_by_key(|prompt| prompt.seq);
+                        if epoch_fallback.is_none()
+                            && !state.rewound_agents.contains(&agent_id)
+                            && let Some(existing) = state.full_outline_prompts.get(&agent_id)
+                        {
+                            let catchup_horizon = outline_prompts
+                                .last()
+                                .map(|prompt| prompt.seq)
+                                .unwrap_or(0)
+                                .max(max_incoming_seq);
+                            for live_prompt in existing {
+                                if live_prompt.seq > catchup_horizon {
+                                    outline_prompts.push(live_prompt.clone());
+                                }
+                            }
+                            outline_prompts.sort_by_key(|prompt| prompt.seq);
+                            outline_prompts.dedup_by_key(|prompt| prompt.seq);
+                        }
+                        if state.full_outline_prompts.get(&agent_id) != Some(&outline_prompts) {
+                            state
+                                .full_outline_prompts
+                                .insert(agent_id.clone(), outline_prompts);
+                            state.mark_stage_meta_dirty(&agent_id);
+                        }
+                    } else {
+                        let mut outline_changed = false;
+                        for event in &events {
+                            outline_changed |= state.observe_outline_prompt(event);
+                        }
+                        if has_older_history && let Some(fallback) = epoch_fallback {
+                            let pre_tail: Vec<TimelineOutlinePrompt> = fallback
+                                .into_iter()
+                                .filter(|prompt| {
+                                    min_incoming_pos_seq.is_none_or(|min_s| prompt.seq < min_s)
+                                })
+                                .collect();
+                            outline_changed |= state.merge_outline_prompts(&agent_id, &pre_tail);
+                        }
+                        if outline_changed {
+                            state.mark_stage_meta_dirty(&agent_id);
+                        }
+                    }
                     let was_tail = state.pending_tail_catchups.remove(&agent_id);
                     if was_tail || has_older_history {
                         state
@@ -6002,6 +6202,9 @@ impl OrbitAppCore {
                         .insert(agent_id.clone(), has_more_older);
                     persist_has_older = Some((agent_id.clone(), has_more_older));
                     if !events.is_empty() {
+                        for event in &events {
+                            state.observe_outline_prompt(event);
+                        }
                         history_page_to_persist = Some(events.clone());
                         let list = state.timelines.entry(agent_id.clone()).or_default();
                         let mut combined = std::mem::take(list);
@@ -6019,6 +6222,7 @@ impl OrbitAppCore {
                 WireMessage::HostRelayConfigured { .. } => {}
                 WireMessage::TimelineLive { event } => {
                     let agent_id = event.agent_id.clone();
+                    state.observe_outline_prompt(&event);
                     let live_seq = event.seq;
                     let is_status_changed =
                         matches!(event.payload, TimelinePayload::StatusChanged { .. });
@@ -8109,7 +8313,6 @@ impl OrbitAppCore {
             0
         };
         let since_seq = self.safe_catchup_since_seq(agent_id, mem_max_seq);
-        let tail_limit = (since_seq == 0).then_some(300);
         if since_seq == 0
             && let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
@@ -8122,7 +8325,7 @@ impl OrbitAppCore {
                 request_id: Uuid::new_v4(),
                 agent_id: agent_id.to_string(),
                 since_seq,
-                tail_limit,
+                tail_limit: Some(300),
             },
         );
     }
@@ -8167,6 +8370,9 @@ impl OrbitAppCore {
             if let Ok(mut guard) = self.hosts.write()
                 && let Some(h) = guard.get_mut(host_id)
             {
+                for ev in &local_older {
+                    h.observe_outline_prompt(ev);
+                }
                 let list = h.timelines.entry(agent_id.to_string()).or_default();
                 let mut combined = std::mem::take(list);
                 combined.extend(local_older);
@@ -8733,6 +8939,8 @@ impl OrbitAppCore {
             if agent_id.starts_with("opt_") {
                 h.agents.remove(agent_id);
                 h.timelines.remove(agent_id);
+                h.full_outline_prompts.remove(agent_id);
+                h.pending_epoch_outline_fallback.remove(agent_id);
                 h.timeline_has_older.remove(agent_id);
                 h.timeline_loading_older.remove(agent_id);
                 h.pending_tail_catchups.remove(agent_id);
@@ -8787,6 +8995,8 @@ impl OrbitAppCore {
         {
             h.agents.remove(agent_id);
             h.timelines.remove(agent_id);
+            h.full_outline_prompts.remove(agent_id);
+            h.pending_epoch_outline_fallback.remove(agent_id);
             h.timeline_has_older.remove(agent_id);
             h.timeline_loading_older.remove(agent_id);
             h.pending_tail_catchups.remove(agent_id);
@@ -12163,13 +12373,12 @@ impl OrbitAppCore {
                     })
                     .await;
                 for (agent_id, since_seq) in resubs {
-                    let tail_limit = (since_seq == 0).then_some(300);
                     let _ = handle
                         .send_wire(WireMessage::SubscribeTimeline {
                             request_id: Uuid::new_v4(),
                             agent_id,
                             since_seq,
-                            tail_limit,
+                            tail_limit: Some(300),
                         })
                         .await;
                 }
@@ -13061,6 +13270,30 @@ impl OrbitAppCore {
         cwd: &str,
         path: &str,
     ) -> Result<WorkspaceFileView, String> {
+        self.read_workspace_file_on_host_inner(host_id, cwd, path, false)
+            .await
+    }
+
+    /// Desktop-optimized workspace file read: returns only the eagerly highlighted prefix
+    /// (first 250 lines) so large files avoid duplicating trailing plain-text lines across IPC
+    /// while virtualized viewers lazily highlight deeper chunks on scroll.
+    pub async fn read_workspace_file_on_host_prefix(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: &str,
+    ) -> Result<WorkspaceFileView, String> {
+        self.read_workspace_file_on_host_inner(host_id, cwd, path, true)
+            .await
+    }
+
+    async fn read_workspace_file_on_host_inner(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: &str,
+        prefix_highlight_only: bool,
+    ) -> Result<WorkspaceFileView, String> {
         let (session, is_local) = {
             let guard = self
                 .hosts
@@ -13104,6 +13337,7 @@ impl OrbitAppCore {
                         writable: raw.writable,
                         line_ending: raw.line_ending,
                     },
+                    prefix_highlight_only,
                 ))
             })
             .await
@@ -13243,7 +13477,13 @@ impl OrbitAppCore {
 
             let final_view = match raw_res {
                 Ok(raw) => tokio::task::spawn_blocking(move || {
-                    build_workspace_file_view(&owned_host_id, &owned_cwd, &owned_path, raw)
+                    build_workspace_file_view(
+                        &owned_host_id,
+                        &owned_cwd,
+                        &owned_path,
+                        raw,
+                        prefix_highlight_only,
+                    )
                 })
                 .await
                 .map_err(|_| "file highlight task cancelled".to_string()),
@@ -18221,24 +18461,36 @@ fn read_local_host_identity_and_secret() -> (Option<(String, String)>, Option<St
     (identity, secret)
 }
 
+const EAGER_FILE_HIGHLIGHT_LINES: usize = 250;
+
 fn build_workspace_file_view(
     host_id: &str,
     cwd: &str,
     path: &str,
     raw: RawFileReadResponse,
+    prefix_highlight_only: bool,
 ) -> WorkspaceFileView {
     let language = detect_language_for_path(path).to_string();
     let (highlighted_lines, markdown_blocks) = if raw.content_kind == "text" {
         if language == "markdown" {
-            // Markdown opens in Preview mode by default; skip expensive upfront 2,500-line
-            // `syntect` source highlighting so large Markdown artifacts open instantaneously.
+            // Markdown opens in Preview mode by default; skip expensive upfront `syntect`
+            // source highlighting so large Markdown artifacts open instantaneously.
             // Source view falls back cleanly to raw content and lazily highlights on demand.
             let md = parse_markdown_blocks(&raw.content, false);
             (Vec::new(), md)
+        } else if language == "text" {
+            // Plain text / log files need neither syntax highlighting nor duplicate line wrappers.
+            (Vec::new(), Vec::new())
+        } else if prefix_highlight_only {
+            // Highlight one virtualized 250-line chunk eagerly for instant first paint;
+            // Desktop FileViewerTab renders deeper lines directly from `content` and lazily
+            // highlights visible 250-line chunks on scroll without IPC payload duplication.
+            let lines =
+                highlight_code_lines_prefix(&language, &raw.content, EAGER_FILE_HIGHLIGHT_LINES);
+            (lines, Vec::new())
         } else {
-            // Highlight up to 600 lines eagerly for sub-15ms first paint; FileViewerTab virtualizes
-            // all lines and lazily highlights deeper ranges via `highlight_code_snippet` when scrolled.
-            let lines = highlight_code_lines_capped(&language, &raw.content, 600);
+            let lines =
+                highlight_code_lines_capped(&language, &raw.content, EAGER_FILE_HIGHLIGHT_LINES);
             (lines, Vec::new())
         }
     } else {
@@ -20811,6 +21063,7 @@ mod tests {
                 agent_id: "ag_1".into(),
                 has_more: false,
                 has_older_history: false,
+                outline_prompts: Vec::new(),
                 events: vec![TimelineEvent {
                     seq: 1,
                     epoch: 1,
@@ -20934,6 +21187,7 @@ mod tests {
                 agent_id: "ag_existing".into(),
                 has_more: false,
                 has_older_history: false,
+                outline_prompts: Vec::new(),
                 events: vec![TimelineEvent {
                     seq: 5,
                     epoch: 1,
@@ -21057,6 +21311,7 @@ mod tests {
                 agent_id: "ag_w".into(),
                 has_more: false,
                 has_older_history: false,
+                outline_prompts: Vec::new(),
                 events: vec![
                     TimelineEvent {
                         seq: 1,
@@ -21138,6 +21393,506 @@ mod tests {
     }
 
     #[test]
+    fn outline_survives_tail_paging_and_tracks_live_edits_without_streaming_resends() {
+        let core = OrbitAppCore::open_in_memory().expect("core");
+        let host = "outline_host";
+        let agent = "outline_agent";
+        let offer = PairingOffer {
+            host_id: host.into(),
+            hostname: host.into(),
+            daemon_pubkey_b64: orbit_crypto::HostIdentityKeypair::generate()
+                .expect("keypair")
+                .public_key_b64,
+            direct_endpoints: vec![],
+            relay_url: None,
+            pairing_secret: "test".into(),
+        };
+        core.pair_host(&offer.to_qr_uri().expect("uri"))
+            .expect("pair");
+        let prompt = |seq, text: &str| TimelineEvent {
+            seq,
+            epoch: 1,
+            agent_id: agent.into(),
+            turn_id: None,
+            timestamp: Utc::now(),
+            payload: TimelinePayload::UserPrompt {
+                message_id: format!("u{seq}"),
+                text: text.into(),
+                badges: vec![],
+            },
+        };
+        let anchor = |seq, text: &str| TimelineOutlinePrompt {
+            seq,
+            preview: text.into(),
+        };
+        let catchup = |events, outline_prompts| WireMessage::TimelineCatchup {
+            request_id: Uuid::new_v4(),
+            agent_id: agent.into(),
+            has_more: false,
+            has_older_history: true,
+            events,
+            outline_prompts,
+        };
+        let previews = |view: &SessionInsightsView| {
+            view.outline_prompts
+                .iter()
+                .map(|p| (p.seq, p.preview.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        // A cached page or old daemon still yields useful anchors.
+        core.handle_inbound_wire(host, catchup(vec![prompt(10, "tail")], vec![]));
+        let tail = core.agent_stage_delta(host, agent, 0);
+        assert_eq!(previews(&tail.insights), [(10, "tail".into())]);
+
+        core.handle_inbound_wire(
+            host,
+            catchup(
+                vec![],
+                vec![anchor(5, "middle"), anchor(1, "first"), anchor(5, "middle")],
+            ),
+        );
+        let full = core.agent_stage_delta_windowed(
+            host,
+            agent,
+            tail.revision,
+            Some(tail.aux_revision),
+            None,
+            None,
+        );
+        assert!(full.aux_revision > tail.aux_revision);
+        assert_eq!(full.total_turn_count, 1);
+        assert_eq!(
+            previews(&full.insights),
+            [
+                (1, "first".into()),
+                (5, "middle".into()),
+                (10, "tail".into())
+            ]
+        );
+        core.handle_inbound_wire(
+            host,
+            WireMessage::TimelineHistoryPage {
+                request_id: Uuid::new_v4(),
+                agent_id: agent.into(),
+                events: vec![prompt(5, "middle")],
+                has_more_older: true,
+            },
+        );
+        for (seq, text) in [
+            (20, "later"),
+            (15, "new"),
+            (20, "updated"),
+            (25, "/compact"),
+        ] {
+            core.handle_inbound_wire(
+                host,
+                WireMessage::TimelineLive {
+                    event: prompt(seq, text),
+                },
+            );
+        }
+        let live = core.agent_stage_delta(host, agent, full.revision);
+        assert_eq!(
+            previews(&live.insights),
+            [
+                (1, "first".into()),
+                (5, "middle".into()),
+                (10, "tail".into()),
+                (15, "new".into()),
+                (20, "updated".into())
+            ]
+        );
+        core.handle_inbound_wire(
+            host,
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: "reply".into(),
+                        text: "stream".into(),
+                        streaming: true,
+                    },
+                    ..prompt(26, "")
+                },
+            },
+        );
+        let stream = core.agent_stage_delta_windowed(
+            host,
+            agent,
+            live.revision,
+            Some(live.aux_revision),
+            None,
+            None,
+        );
+        assert!(stream.aux_unchanged);
+        assert_eq!(stream.aux_revision, live.aux_revision);
+        assert!(stream.insights.outline_prompts.is_empty());
+
+        // The only event on a budget-limited tail page may be the streaming reply itself.
+        let stream_only = "assistant_only_tail";
+        let reply = |text: &str| TimelineEvent {
+            agent_id: stream_only.into(),
+            payload: TimelinePayload::AssistantMessage {
+                item_id: "reply".into(),
+                text: text.into(),
+                streaming: true,
+            },
+            ..prompt(40, "")
+        };
+        core.handle_inbound_wire(
+            host,
+            WireMessage::TimelineCatchup {
+                request_id: Uuid::new_v4(),
+                agent_id: stream_only.into(),
+                has_more: false,
+                has_older_history: true,
+                events: vec![reply("start")],
+                outline_prompts: vec![anchor(1, "off-page")],
+            },
+        );
+        let initial = core.agent_stage_delta(host, stream_only, 0);
+        core.handle_inbound_wire(
+            host,
+            WireMessage::TimelineLive {
+                event: reply("start more"),
+            },
+        );
+        let delta = core.agent_stage_delta_with_aux(
+            host,
+            stream_only,
+            initial.revision,
+            Some(initial.aux_revision),
+        );
+        assert!(delta.aux_unchanged);
+        assert!(delta.insights.outline_prompts.is_empty());
+    }
+
+    #[test]
+    fn outline_anchors_never_decrease_as_content_grows_across_epoch_races_and_replica_hydration() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let host = "h_outline_mono";
+        let agent = "ag_outline_mono";
+        let now = Utc::now();
+        let make_agent = |latest_seq: u64, timeline_epoch: u64| AgentSummary {
+            agent_id: agent.into(),
+            workspace_id: "ws1".into(),
+            cwd: "/repo".into(),
+            title: "Outline Monotonic".into(),
+            provider: ProviderKind::ClaudeCode,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::Default,
+            status: AgentStatus::Running {
+                turn_id: "t1".into(),
+            },
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq,
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
+            timeline_epoch,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: None,
+            queued_prompts: Vec::new(),
+        };
+        let offer = PairingOffer {
+            host_id: host.into(),
+            hostname: host.into(),
+            daemon_pubkey_b64: orbit_crypto::HostIdentityKeypair::generate()
+                .expect("keypair")
+                .public_key_b64,
+            direct_endpoints: vec![],
+            relay_url: None,
+            pairing_secret: "test".into(),
+        };
+        core.pair_host(&offer.to_qr_uri().expect("uri"))
+            .expect("pair");
+        {
+            let mut guard = core.hosts.write().expect("lock");
+            guard
+                .get_mut(host)
+                .expect("paired host")
+                .agents
+                .insert(agent.into(), make_agent(40, 0));
+        }
+
+        let prompt = |seq: u64, text: &str| TimelineEvent {
+            seq,
+            epoch: 1,
+            agent_id: agent.into(),
+            turn_id: None,
+            timestamp: now,
+            payload: TimelinePayload::UserPrompt {
+                message_id: format!("u{seq}"),
+                text: text.into(),
+                badges: vec![],
+            },
+        };
+        let reply = |seq: u64, id: &str, text: &str| TimelineEvent {
+            seq,
+            epoch: 1,
+            agent_id: agent.into(),
+            turn_id: None,
+            timestamp: now,
+            payload: TimelinePayload::AssistantMessage {
+                item_id: id.into(),
+                text: text.into(),
+                streaming: false,
+            },
+        };
+        let seqs_of = |view: &SessionInsightsView| -> Vec<u64> {
+            view.outline_prompts.iter().map(|p| p.seq).collect()
+        };
+
+        // 1. Legacy daemon starts with 4 prompts fitting inside the tail page.
+        core.handle_inbound_wire(
+            host,
+            WireMessage::TimelineCatchup {
+                request_id: Uuid::new_v4(),
+                agent_id: agent.into(),
+                events: vec![
+                    prompt(10, "p1"),
+                    prompt(20, "p2"),
+                    prompt(30, "p3"),
+                    prompt(40, "p4"),
+                ],
+                has_more: false,
+                has_older_history: false,
+                outline_prompts: Vec::new(),
+            },
+        );
+        let d0 = core.agent_stage_delta(host, agent, 0);
+        assert_eq!(seqs_of(&d0.insights), vec![10, 20, 30, 40]);
+
+        // 2. Live prompt #5 streams in, then an out-of-order AgentUpdated arrives with stale
+        //    latest_seq (40 < 50) while timeline_epoch is unchanged: must NOT wipe or shrink anchors!
+        core.handle_inbound_wire(
+            host,
+            WireMessage::TimelineLive {
+                event: prompt(50, "p5"),
+            },
+        );
+        core.handle_inbound_wire(
+            host,
+            WireMessage::AgentUpdated {
+                agent: make_agent(40, 0),
+            },
+        );
+        let d_race = core.agent_stage_delta(host, agent, 0);
+        assert_eq!(seqs_of(&d_race.insights), vec![10, 20, 30, 40, 50]);
+
+        // 3. Content grows further (late finalization bumps timeline_epoch 0 -> 1); legacy daemon
+        //    returns a smaller tail window (only prompts 40, 50, 60) with `outline_prompts: []`
+        //    and `has_older_history: true`: anchor count MUST NOT decrease (stays 6: 10..60)!
+        core.handle_inbound_wire(
+            host,
+            WireMessage::AgentUpdated {
+                agent: make_agent(65, 1),
+            },
+        );
+        core.handle_inbound_wire(
+            host,
+            WireMessage::TimelineCatchup {
+                request_id: Uuid::new_v4(),
+                agent_id: agent.into(),
+                events: vec![
+                    prompt(40, "p4"),
+                    prompt(50, "p5"),
+                    prompt(60, "p6"),
+                    reply(65, "r6", "done"),
+                ],
+                has_more: false,
+                has_older_history: true,
+                outline_prompts: Vec::new(),
+            },
+        );
+        let d_epoch1 = core.agent_stage_delta(host, agent, 0);
+        assert_eq!(seqs_of(&d_epoch1.insights), vec![10, 20, 30, 40, 50, 60]);
+
+        // 4. Even heavier turn bumps timeline_epoch 1 -> 2; tail page now covers ONLY prompt 70!
+        //    Anchor count STILL never decreases (all 7: 10..70 preserved)!
+        core.handle_inbound_wire(
+            host,
+            WireMessage::AgentUpdated {
+                agent: make_agent(400, 2),
+            },
+        );
+        core.handle_inbound_wire(
+            host,
+            WireMessage::TimelineCatchup {
+                request_id: Uuid::new_v4(),
+                agent_id: agent.into(),
+                events: vec![prompt(70, "p7"), reply(400, "r7", "heavy")],
+                has_more: false,
+                has_older_history: true,
+                outline_prompts: Vec::new(),
+            },
+        );
+        let d_epoch2 = core.agent_stage_delta(host, agent, 0);
+        assert_eq!(
+            seqs_of(&d_epoch2.insights),
+            vec![10, 20, 30, 40, 50, 60, 70]
+        );
+
+        // 5. Delayed modern catchup arriving AFTER a newer live prompt (seq 80) must preserve seq 80.
+        core.handle_inbound_wire(
+            host,
+            WireMessage::TimelineLive {
+                event: prompt(80, "p8"),
+            },
+        );
+        core.handle_inbound_wire(
+            host,
+            WireMessage::TimelineCatchup {
+                request_id: Uuid::new_v4(),
+                agent_id: agent.into(),
+                events: vec![],
+                has_more: false,
+                has_older_history: true,
+                outline_prompts: vec![
+                    TimelineOutlinePrompt {
+                        seq: 10,
+                        preview: "p1".into(),
+                    },
+                    TimelineOutlinePrompt {
+                        seq: 20,
+                        preview: "p2".into(),
+                    },
+                    TimelineOutlinePrompt {
+                        seq: 30,
+                        preview: "p3".into(),
+                    },
+                    TimelineOutlinePrompt {
+                        seq: 40,
+                        preview: "p4".into(),
+                    },
+                    TimelineOutlinePrompt {
+                        seq: 50,
+                        preview: "p5".into(),
+                    },
+                    TimelineOutlinePrompt {
+                        seq: 60,
+                        preview: "p6".into(),
+                    },
+                    TimelineOutlinePrompt {
+                        seq: 70,
+                        preview: "p7".into(),
+                    },
+                ],
+            },
+        );
+        let d_delayed = core.agent_stage_delta(host, agent, 0);
+        assert_eq!(
+            seqs_of(&d_delayed.insights),
+            vec![10, 20, 30, 40, 50, 60, 70, 80]
+        );
+
+        // 6. Modern daemon remote rewind via epoch bump replaces fallback with authoritative outline.
+        core.handle_inbound_wire(
+            host,
+            WireMessage::AgentUpdated {
+                agent: make_agent(25, 3),
+            },
+        );
+        core.handle_inbound_wire(
+            host,
+            WireMessage::TimelineCatchup {
+                request_id: Uuid::new_v4(),
+                agent_id: agent.into(),
+                events: vec![prompt(10, "p1"), prompt(20, "p2")],
+                has_more: false,
+                has_older_history: false,
+                outline_prompts: vec![
+                    TimelineOutlinePrompt {
+                        seq: 10,
+                        preview: "p1".into(),
+                    },
+                    TimelineOutlinePrompt {
+                        seq: 20,
+                        preview: "p2".into(),
+                    },
+                ],
+            },
+        );
+        let d_modern_rewind = core.agent_stage_delta(host, agent, 0);
+        assert_eq!(seqs_of(&d_modern_rewind.insights), vec![10, 20]);
+
+        // 7. Cold replica hydration on a >300-event session must immediately hydrate pre-tail
+        //    outline prompts from `client_replica_events` even though memory only loads 300 events.
+        let rep_agent = "ag_replica_350";
+        let mut replica_events = Vec::new();
+        replica_events.push(TimelineEvent {
+            seq: 1,
+            epoch: 1,
+            agent_id: rep_agent.into(),
+            turn_id: None,
+            timestamp: now,
+            payload: TimelinePayload::UserPrompt {
+                message_id: "rep_u1".into(),
+                text: "pre-tail first".into(),
+                badges: vec![],
+            },
+        });
+        replica_events.push(TimelineEvent {
+            seq: 2,
+            epoch: 1,
+            agent_id: rep_agent.into(),
+            turn_id: None,
+            timestamp: now,
+            payload: TimelinePayload::UserPrompt {
+                message_id: "rep_u2".into(),
+                text: "pre-tail second".into(),
+                badges: vec![],
+            },
+        });
+        for seq in 3..=349u64 {
+            replica_events.push(TimelineEvent {
+                seq,
+                epoch: 1,
+                agent_id: rep_agent.into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::Notice {
+                    level: "info".into(),
+                    message: format!("event {seq}"),
+                },
+            });
+        }
+        replica_events.push(TimelineEvent {
+            seq: 350,
+            epoch: 1,
+            agent_id: rep_agent.into(),
+            turn_id: None,
+            timestamp: now,
+            payload: TimelinePayload::UserPrompt {
+                message_id: "rep_u3".into(),
+                text: "tail third".into(),
+                badges: vec![],
+            },
+        });
+        core.store
+            .upsert_replica_timeline_events_batch_for_host(host, &replica_events)
+            .expect("seed replica");
+        let rep_stage = core.agent_stage_delta(host, rep_agent, 0);
+        assert_eq!(seqs_of(&rep_stage.insights), vec![1, 2, 350]);
+    }
+
+    #[test]
     fn incremental_agent_stage_delta_slices_tail_resolves_gates_and_resets_on_rewind() {
         let core = OrbitAppCore::open_in_memory().expect("open core");
         let now = Utc::now();
@@ -21208,6 +21963,7 @@ mod tests {
                 agent_id: "ag1".into(),
                 has_more: false,
                 has_older_history: false,
+                outline_prompts: Vec::new(),
                 events: vec![
                     TimelineEvent {
                         seq: 1,
@@ -21400,6 +22156,19 @@ mod tests {
         assert!(d_rewind.reset);
         assert_eq!(d_rewind.replace_from_turn_index, 0);
         assert_eq!(d_rewind.total_turn_count, 1);
+        assert_eq!(
+            d_rewind.insights.outline_prompts,
+            vec![stage::SessionOutlinePromptView {
+                seq: 1,
+                preview: "turn 1".into()
+            }]
+        );
+        let mut agent = core.hosts.read().expect("read hosts")["h1"].agents["ag1"].clone();
+        agent.timeline_epoch += 1;
+        core.handle_inbound_wire("h1", WireMessage::AgentUpdated { agent });
+        let new_epoch = core.agent_stage_delta("h1", "ag1", d_rewind.revision);
+        assert!(new_epoch.reset);
+        assert!(new_epoch.insights.outline_prompts.is_empty());
     }
 
     #[test]
@@ -22161,6 +22930,7 @@ mod tests {
                 agent_id: "ag_s".into(),
                 has_more: false,
                 has_older_history: false,
+                outline_prompts: Vec::new(),
                 events: vec![
                     TimelineEvent {
                         seq: 1,
@@ -23731,6 +24501,7 @@ mod tests {
                 events: catchup_batch,
                 has_more: false,
                 has_older_history: false,
+                outline_prompts: Vec::new(),
             },
         );
 
@@ -25420,6 +26191,7 @@ mod tests {
                 agent_id: "ag_win".into(),
                 has_more: false,
                 has_older_history: false,
+                outline_prompts: Vec::new(),
                 events,
             },
         );
@@ -25661,6 +26433,7 @@ mod tests {
                 agent_id: "ag_diff".into(),
                 has_more: false,
                 has_older_history: false,
+                outline_prompts: Vec::new(),
                 events: vec![
                     TimelineEvent {
                         seq: 1,

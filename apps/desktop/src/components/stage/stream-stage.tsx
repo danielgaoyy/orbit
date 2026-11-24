@@ -2,6 +2,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useImperativeHandle,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -17,17 +18,21 @@ import {
   type Virtualizer,
 } from "@tanstack/react-virtual";
 import { ArrowDown, GitBranch, RotateCcw, RotateCw } from "lucide-react";
+import { ComposerPlanShelf } from "@/components/composer/composer-plan-shelf";
+import { planSourceTurn } from "@/components/composer/composer-plan-shelf-model";
 import { OmniComposer } from "@/components/composer/omni-composer";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
+import { useViewportTracking } from "@/components/conversation/conversation-viewport";
 import { DecisionDock } from "@/components/stage/stage-approval-dock";
-import { ChatOutlineRail } from "@/components/stage/stage-outline-rail";
+import { ChatOutlineRail, type OutlinePromptItem } from "@/components/stage/stage-outline-rail";
+import { resolveOutlinePrompts } from "@/lib/outline-rail";
 import { StageOverviewPanel } from "@/components/stage/stage-overview-panel";
-import { ParentSubagentBanner } from "@/components/stage/subagents-track";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   type ArtifactSummary,
   type PromptBadge,
+  type SessionPlanStepView,
   type StageTurnView,
   type TimelineItemView,
   isAgentForegroundRunning,
@@ -37,24 +42,20 @@ import { isAgentInGitRepo } from "@/lib/projects";
 import {
   type ResolvedSubagentItem,
   type SubagentNameMatcher,
-  areResolvedSubagentsEqual,
   buildSubagentNameMatcher,
 } from "@/lib/subagents";
+import { openSubagent } from "./subagent-crew-dock";
 import { useDelegationDispatches } from "./use-delegation-dispatches";
 import { computePrependRestoredScrollTop } from "@/lib/stage-pagination";
 import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
 import { cn } from "@/lib/utils";
-import {
-  type SessionSubagentWithAvatar,
-  selectPendingDecisions,
-  selectSessionSubagents,
-} from "@/state/selectors/session-selectors";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import {
   EMPTY_ARTIFACTS,
   EMPTY_DIFF_FILES,
   EMPTY_INSIGHTS,
   EMPTY_TURNS,
+  EMPTY_TURN_TIMINGS,
   FAST_FLICK_PX_PER_SEC,
   IDLE_LOOKAHEAD_DOWN_PX,
   IDLE_LOOKAHEAD_UP_PX,
@@ -69,21 +70,27 @@ import {
   SCROLL_TRAILING_PX,
   type ScrollVelocityState,
   type StageScrollUiStore,
-  TURN_LIST_GAP_PX,
-  type ThinkingDurationLookupFn,
-  type TurnTimingRecord,
+  type StageTimingHistory,
+  type TurnListRow,
   type ViewportAnchorHoldFn,
   WARM_RESTING_CAP,
   WARM_SCROLLING_CAP,
   areArtifactListsEquivalent,
+  computeStageScrollState,
   createStageScrollUiStore,
-  estimateTurnSizeFallback,
+  createStageSessionSelector,
+  createTurnProseMatcherLookup,
   extractUserPromptPresentation,
   findTurnIndexForSeq,
   getCachedHistoricalThinkingSignature,
   getCachedTurnHeight,
+  getTurnContentStart,
+  getTurnItemHeight,
+  getTurnListRows,
   isRevertibleWorkspaceFile,
   setCachedTurnHeight,
+  turnHasSubagentReferences,
+  updateStageTimingHistory,
 } from "./stage-helpers";
 import {
   ForkedFromBanner,
@@ -95,11 +102,18 @@ import { TurnStageSection } from "./stage-turn-card";
 export { PromptImageLightbox, TurnStageSection };
 export type { PromptImagePreviewTarget };
 
+interface TurnJump {
+  index: number;
+  align: "start" | "center";
+  behavior: "auto" | "smooth";
+}
+
 const StageHydratingFallback = memo(function StageHydratingFallback({
   bootstrapError,
 }: {
   bootstrapError: string | null;
 }) {
+  const { t } = useI18n();
   const [showIndicator, setShowIndicator] = useState(false);
   const [showSlowRetry, setShowSlowRetry] = useState(false);
   const [retrying, setRetrying] = useState(false);
@@ -127,10 +141,10 @@ const StageHydratingFallback = memo(function StageHydratingFallback({
         )}
         <span className="text-muted-foreground/85">
           {bootstrapError
-            ? "Unable to load workspace"
+            ? t("stage.loadWorkspaceError")
             : showSlowRetry
-              ? "Taking longer than usual to connect…"
-              : "Connecting to workspace…"}
+              ? t("stage.connectionSlow")
+              : t("stage.connecting")}
         </span>
       </div>
       {needsRetry && (
@@ -144,10 +158,10 @@ const StageHydratingFallback = memo(function StageHydratingFallback({
               setRetrying(false);
             });
           }}
-          className="border-border/80 text-foreground/80 hover:bg-accent hover:text-foreground inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:opacity-50"
+          className="border-border/80 text-foreground/80 hover:bg-accent hover:text-foreground inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[13px] font-medium transition-colors disabled:opacity-50"
         >
           <RotateCw className={cn("size-3", retrying && "animate-spin")} />
-          <span>{retrying ? "Retrying…" : "Retry"}</span>
+          <span>{t(retrying ? "stage.retrying" : "common.retry")}</span>
         </button>
       )}
     </div>
@@ -172,6 +186,7 @@ const NewSessionLaunchpad = memo(function NewSessionLaunchpad() {
 const StageOutlineRailBridge = memo(function StageOutlineRailBridge({
   scrollUiStore,
   prompts,
+  jumpingToSeq,
   onJumpToSeq,
   visible,
   offsetPx,
@@ -179,7 +194,8 @@ const StageOutlineRailBridge = memo(function StageOutlineRailBridge({
   isAnimating,
 }: {
   scrollUiStore: StageScrollUiStore;
-  prompts: OutlinePromptWithIndex[];
+  prompts: readonly OutlinePromptItem[];
+  jumpingToSeq: number | null;
   onJumpToSeq: (seq: number) => void;
   visible: boolean;
   offsetPx: number;
@@ -195,6 +211,7 @@ const StageOutlineRailBridge = memo(function StageOutlineRailBridge({
     <ChatOutlineRail
       prompts={prompts}
       activeSeq={activePromptSeq ?? prompts[prompts.length - 1]?.seq ?? null}
+      jumpingToSeq={jumpingToSeq}
       onJumpToSeq={onJumpToSeq}
       visible={visible}
       offsetPx={offsetPx}
@@ -205,6 +222,7 @@ const StageOutlineRailBridge = memo(function StageOutlineRailBridge({
 });
 
 const STAGE_TOP_PAGINATE_THRESHOLD_PX = 480;
+const EMPTY_PLAN_STEPS: readonly SessionPlanStepView[] = [];
 
 const StageBottomViewportOverlay = memo(function StageBottomViewportOverlay({
   scrollUiStore,
@@ -212,13 +230,16 @@ const StageBottomViewportOverlay = memo(function StageBottomViewportOverlay({
   overviewReservePx,
   overviewReserveTransition,
   onJumpLatest,
+  isGenerating,
 }: {
   scrollUiStore: StageScrollUiStore;
   stagePushStyle: CSSProperties;
   overviewReservePx: number;
   overviewReserveTransition: string;
   onJumpLatest: () => void;
+  isGenerating: boolean;
 }) {
+  const { t } = useI18n();
   const snap = useSyncExternalStore(
     scrollUiStore.subscribe,
     scrollUiStore.getSnapshot,
@@ -254,21 +275,32 @@ const StageBottomViewportOverlay = memo(function StageBottomViewportOverlay({
       >
         <div style={stagePushStyle} className="pointer-events-none relative px-[24px]">
           <div className="pointer-events-none relative mx-auto flex w-full max-w-[var(--orbit-stage-max-w,740px)] items-end justify-center">
-            <button
-              type="button"
-              aria-label="Scroll to latest"
-              aria-hidden={!snap.showJumpLatest}
-              tabIndex={snap.showJumpLatest ? 0 : -1}
-              onClick={onJumpLatest}
+            <div
               className={cn(
-                "border-border-default bg-surface-raised text-ink-tertiary hover:text-ink-primary hover:border-border-strong floating-surface absolute bottom-3 left-1/2 inline-flex size-[32px] -translate-x-1/2 cursor-pointer items-center justify-center rounded-full border transition-[transform,opacity,color,border-color] duration-200 ease-[var(--ease-out-expo)]",
+                "pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 transition-[opacity,scale,translate]",
                 snap.showJumpLatest
-                  ? "pointer-events-auto translate-y-0 scale-100 opacity-100"
-                  : "pointer-events-none translate-y-1 scale-95 opacity-0",
+                  ? "translate-y-0 scale-100 opacity-100 duration-[160ms] ease-[var(--ease-out-expo)]"
+                  : "translate-y-1 scale-95 opacity-0 duration-[115ms] ease-[var(--ease-exit)]",
               )}
             >
-              <ArrowDown className="size-[16px] stroke-[1.9]" />
-            </button>
+              <button
+                type="button"
+                aria-label={t("stage.scrollToLatest")}
+                aria-description={isGenerating ? t("sidebar.running") : undefined}
+                aria-hidden={!snap.showJumpLatest}
+                tabIndex={snap.showJumpLatest ? 0 : -1}
+                onClick={onJumpLatest}
+                className={cn(
+                  "orbit-press border-border-default bg-surface-raised text-ink-tertiary hover:text-ink-primary hover:border-border-strong floating-surface relative inline-flex size-[32px] cursor-pointer items-center justify-center rounded-full border",
+                  snap.showJumpLatest ? "pointer-events-auto" : "pointer-events-none",
+                )}
+              >
+                {snap.showJumpLatest && isGenerating && (
+                  <OrbitSpinner size={30} className="text-ink-muted pointer-events-none absolute opacity-75 motion-reduce:animate-none" />
+                )}
+                <ArrowDown className="size-[16px] stroke-[1.9]" />
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -301,6 +333,9 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   selectedHostId,
   selectedAgentId,
   stageTurns,
+  hasPlanSteps,
+  rows,
+  jumpToTurnRef,
   highlightedTurnKey,
   hasPendingJump,
   isLatestTurnActive,
@@ -312,14 +347,12 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   effectiveCwd,
   stageMaxContentWidthPx,
   hostArtifacts,
-  timingTick,
+  timingHistory,
   scrollRef,
   stickToBottomRef,
   holdActiveRef,
+  restoringPrependRef,
   virtualizerRef,
-  turnTimingsRef,
-  thinkingTimingsRef,
-  getThinkingDurationMs,
   holdViewport,
   onRequestRewind,
   onRequestFork,
@@ -332,6 +365,9 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   selectedHostId: string;
   selectedAgentId: string;
   stageTurns: StageTurnView[];
+  hasPlanSteps: boolean;
+  rows: readonly TurnListRow[];
+  jumpToTurnRef: React.RefObject<((jump: TurnJump) => void) | null>;
   highlightedTurnKey: string | null;
   hasPendingJump: boolean;
   isLatestTurnActive: boolean;
@@ -343,14 +379,12 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   effectiveCwd: string;
   stageMaxContentWidthPx: number | null;
   hostArtifacts: readonly ArtifactSummary[];
-  timingTick: number;
+  timingHistory: StageTimingHistory;
   scrollRef: React.RefObject<HTMLDivElement | null>;
   stickToBottomRef: React.RefObject<boolean>;
   holdActiveRef: React.RefObject<boolean>;
+  restoringPrependRef: React.RefObject<boolean>;
   virtualizerRef: React.MutableRefObject<ReactVirtualizer<HTMLDivElement, HTMLDivElement> | null>;
-  turnTimingsRef: React.RefObject<Record<string, TurnTimingRecord>>;
-  thinkingTimingsRef: React.RefObject<Record<string, TurnTimingRecord>>;
-  getThinkingDurationMs: ThinkingDurationLookupFn;
   holdViewport: ViewportAnchorHoldFn;
   onRequestRewind: (seq: number, promptText: string, badges: readonly PromptBadge[]) => void;
   onRequestFork: (upToSeq: number | null, worktree: boolean) => void;
@@ -372,8 +406,15 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
     wasScrolling: false,
   });
   const localVirtualizerRef = useRef<ReactVirtualizer<HTMLDivElement, HTMLDivElement> | null>(null);
+  const [turnJump, setTurnJump] = useState<TurnJump | null>(null);
+  useImperativeHandle(jumpToTurnRef, () => setTurnJump, []);
 
   const dispatches = useDelegationDispatches(stageTurns, sessionSubagents, selectedHostId);
+
+  const proseMatcherForTurn = useMemo(
+    () => createTurnProseMatcherLookup(sessionSubagentMatcher),
+    [sessionSubagentMatcher],
+  );
 
   const turnsRef = useRef(stageTurns);
   turnsRef.current = stageTurns;
@@ -457,6 +498,14 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
     [],
   );
 
+  const heightCachePrefix = `${selectedHostId}::${selectedAgentId}::${widthBucket}::`;
+  const getItemKey = useCallback((index: number) => rows[index].key, [rows]);
+  const estimateSize = useCallback((index: number) => {
+    const row = rows[index];
+    const contentHeight = getCachedTurnHeight(heightCachePrefix + row.key);
+    return getTurnItemHeight(turnsRef.current[index], row, contentHeight);
+  }, [rows, heightCachePrefix]);
+
   const rangeExtractor = useCallback(
     (range: Range): number[] => {
       const turns = turnsRef.current;
@@ -492,8 +541,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
         clampedStart - windowStart < MAX_OVERSCAN_ITEMS_PER_SIDE
       ) {
         const prevIdx = windowStart - 1;
-        const size = measurements?.[prevIdx]?.size ?? estimateTurnSizeFallback(turns[prevIdx]);
-        accUp += size + TURN_LIST_GAP_PX;
+        accUp += measurements?.[prevIdx]?.size ?? estimateSize(prevIdx);
         windowStart = prevIdx;
       }
 
@@ -505,8 +553,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
         windowEnd - clampedEnd < MAX_OVERSCAN_ITEMS_PER_SIDE
       ) {
         const nextIdx = windowEnd + 1;
-        const size = measurements?.[nextIdx]?.size ?? estimateTurnSizeFallback(turns[nextIdx]);
-        accDown += size + TURN_LIST_GAP_PX;
+        accDown += measurements?.[nextIdx]?.size ?? estimateSize(nextIdx);
         windowEnd = nextIdx;
       }
 
@@ -559,22 +606,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
       warmKeysRef.current = nextWarmKeys;
       return Array.from(merged).sort((a, b) => a - b);
     },
-    [readScrollVelocity, warmRevision],
-  );
-
-  const getItemKey = useCallback(
-    (index: number) => turnsRef.current[index]?.key ?? index,
-    [],
-  );
-
-  const estimateSize = useCallback(
-    (index: number) => {
-      const turn = turnsRef.current[index];
-      if (!turn) return 180;
-      const cached = getCachedTurnHeight(`${selectedAgentId}::${turn.key}::${widthBucket}`);
-      return cached ?? estimateTurnSizeFallback(turn);
-    },
-    [selectedAgentId, widthBucket],
+    [readScrollVelocity, warmRevision, estimateSize],
   );
 
   const handleVirtualizerChange = useCallback(
@@ -614,9 +646,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
     if (hasPendingJump || stageTurns.length === 0) return 0;
     let total = 0;
     for (let i = 0; i < stageTurns.length; i += 1) {
-      const turn = stageTurns[i];
-      const cached = getCachedTurnHeight(`${selectedAgentId}::${turn.key}::${widthBucket}`);
-      total += (cached ?? estimateTurnSizeFallback(turn)) + TURN_LIST_GAP_PX;
+      total += estimateSize(i);
     }
     return Math.max(0, total - initialRect.height);
     // Compute initial bottom anchor only when mounting a fresh session list
@@ -646,24 +676,69 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
     [initialBottomOffset, stickToBottomRef],
   );
 
+  // TanStack caches the full border box by turn key. The reusable session cache
+  // stores the content height so a prepend can give the same turn a new gap.
+  const measuredSpacing = useRef(new Map<string, number>());
+  const measureTurn = useCallback((
+    el: HTMLDivElement,
+    entry: ResizeObserverEntry | undefined,
+    instance: Virtualizer<HTMLDivElement, HTMLDivElement>,
+  ) => {
+    const row = rows[instance.indexFromElement(el)];
+    const oldSpacing = measuredSpacing.current.get(row.key);
+    // Fractional line heights accumulate over many peer reports. Preserve the
+    // border-box precision instead of rounding every virtual row to whole pixels.
+    const cached = !entry && oldSpacing === row.spacingPx ? instance.itemSizeCache.get(row.key) : undefined;
+    const size = entry?.borderBoxSize?.[0]?.blockSize ?? cached ?? el.getBoundingClientRect().height;
+    measuredSpacing.current.set(row.key, row.spacingPx);
+    if (size > 0 || el.getClientRects().length > 0) {
+      setCachedTurnHeight(heightCachePrefix + row.key, size - row.spacingPx);
+    }
+    return size;
+  }, [heightCachePrefix, rows]);
+
   const virtualizer = useVirtualizer<HTMLDivElement, HTMLDivElement>({
     count: stageTurns.length,
     getScrollElement: () => scrollRef.current,
     getItemKey,
     estimateSize,
+    measureElement: measureTurn,
     initialRect,
     initialOffset: initialBottomOffset,
     observeElementOffset: observeOffsetWithBottomSeed,
     rangeExtractor,
     onChange: handleVirtualizerChange,
-    gap: TURN_LIST_GAP_PX,
+    gap: 0,
+    // scrollToIndex aligns the padded border box. Advance its target to the
+    // content edge (or half the inset for its center), even while remeasuring.
+    scrollPaddingStart: turnJump
+      ? -(rows[turnJump.index]?.topGapPx ?? 0) / (turnJump.align === "center" ? 2 : 1)
+      : 0,
     overscan: 0,
     useScrollendEvent: true,
     directDomUpdates: true,
   });
 
+  // A measured row may be offscreen when its predecessor changes. Correct its
+  // padded size before the parent's prepend effect snapshots the new height.
+  useLayoutEffect(() => {
+    rows.forEach((row, index) => {
+      const oldSpacing = measuredSpacing.current.get(row.key);
+      if (oldSpacing === undefined || oldSpacing === row.spacingPx) return;
+      measuredSpacing.current.set(row.key, row.spacingPx);
+      const size = virtualizer.itemSizeCache.get(row.key);
+      if (size !== undefined) {
+        virtualizer.resizeItem(index, getTurnItemHeight(turnsRef.current[index], row, size - oldSpacing));
+      }
+    });
+  }, [rows, virtualizer]);
+
+  useLayoutEffect(() => {
+    if (turnJump) virtualizer.scrollToIndex(turnJump.index, turnJump);
+  }, [turnJump, virtualizer]);
+
   virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item, _delta, instance) => {
-    if (holdActiveRef.current) {
+    if (holdActiveRef.current || restoringPrependRef.current) {
       return false;
     }
     const scrollOffset = instance.scrollOffset ?? 0;
@@ -763,22 +838,6 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
     };
   }, [selectedAgentId, stageTurns.length, isLatestTurnActive]);
 
-  const measureTurnNode = useCallback(
-    (el: HTMLDivElement | null) => {
-      virtualizer.measureElement(el);
-      if (el) {
-        const idxAttr = el.getAttribute("data-index");
-        const idx = idxAttr ? Number.parseInt(idxAttr, 10) : -1;
-        const turn = idx >= 0 ? turnsRef.current[idx] : undefined;
-        const cachedSize = turn ? virtualizer.itemSizeCache.get(turn.key) : undefined;
-        if (turn && cachedSize && cachedSize > 0) {
-          setCachedTurnHeight(`${selectedAgentId}::${turn.key}::${widthBucket}`, cachedSize);
-        }
-      }
-    },
-    [virtualizer, selectedAgentId, widthBucket],
-  );
-
   const virtualItems = virtualizer.getVirtualItems();
 
   return (
@@ -791,12 +850,13 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
         const isFreshLivePrompt =
           turn.user_prompt?.item_type === "user_prompt" &&
           turn.user_prompt.seq > baselineMaxSeq;
-        const timing = turnTimingsRef.current[`${selectedAgentId}::${turn.key}`];
+        const needsSubagents = turnActive || turnHasSubagentReferences(turn);
+        const timings = timingHistory.get(`${selectedHostId}::${selectedAgentId}::${turn.key}`) ?? EMPTY_TURN_TIMINGS;
         const thinkingSignature = getCachedHistoricalThinkingSignature(
           turn,
           selectedAgentId,
-          thinkingTimingsRef.current,
-          timingTick,
+          timings.thinking,
+          timings.thinkingVersion,
           turnActive,
         );
 
@@ -807,7 +867,8 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
             key={vItem.key}
             data-index={vItem.index}
             data-orbit-turn-index={vItem.index}
-            ref={measureTurnNode}
+            ref={virtualizer.measureElement}
+            style={{ paddingTop: rows[vItem.index].topGapPx }}
             className={cn(
               "absolute top-0 left-0 w-full min-w-0 rounded-2xl transition-colors duration-700",
               isHighlighted &&
@@ -816,7 +877,8 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
           >
             <TurnStageSection
               turn={turn}
-              dispatches={dispatches}
+              hasPlanSteps={hasPlanSteps}
+              dispatches={needsSubagents ? dispatches : undefined}
               isTurnActive={turnActive}
               isLastTurn={isLast}
               agentStatusLabel={turnActive ? agentStatusLabel : null}
@@ -828,16 +890,16 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
               cwd={effectiveCwd}
               agentId={selectedAgentId}
               hostArtifacts={hostArtifacts}
-              timing={timing}
+              timing={timings.timing}
               thinkingSignature={thinkingSignature}
-              getThinkingDurationMs={getThinkingDurationMs}
+              getThinkingDurationMs={timings.getThinkingDurationMs}
               holdViewport={holdViewport}
               onRequestRewind={onRequestRewind}
               onRequestFork={onRequestFork}
               canForkWorktree={canForkWorktree}
               onPreviewImage={onPreviewImage}
-              sessionSubagents={sessionSubagents}
-              sessionSubagentMatcher={sessionSubagentMatcher}
+              sessionSubagents={needsSubagents ? sessionSubagents : undefined}
+              sessionSubagentMatcher={needsSubagents ? sessionSubagentMatcher : proseMatcherForTurn(turn)}
               onOpenSubagent={onOpenSubagent}
             />
           </div>
@@ -848,6 +910,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
 });
 
 export function StreamStage() {
+  const { t } = useI18n();
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
@@ -878,10 +941,9 @@ export function StreamStage() {
     canDockOverview,
     onStageTransitionEnd,
   } = useWorkspaceMotion();
-  const hostDetails = useOrbitSelector((s) => s.hostDetails);
-  const fleet = useOrbitSelector((s) => s.fleet);
-  const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
-  const hostDetail = selectedHostId ? (hostDetails[selectedHostId] ?? null) : null;
+  const hostDetail = useOrbitSelector((s) =>
+    selectedHostId ? (s.hostDetails[selectedHostId] ?? null) : null,
+  );
   const stageView = useOrbitSelector((s) =>
     s.selectedHostId && s.selectedAgentId
       ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`] ?? null)
@@ -908,16 +970,21 @@ export function StreamStage() {
   const stageContainerRef = useRef<HTMLDivElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
-  const composerShelfRef = useRef<HTMLDivElement | null>(null);
   const virtualizerRef = useRef<ReactVirtualizer<HTMLDivElement, HTMLDivElement> | null>(null);
-  const prevComposerHeightRef = useRef<number>(0);
+  const jumpToTurnRef = useRef<((jump: TurnJump) => void) | null>(null);
   const lastObservedScrollTopRef = useRef<number>(0);
+  const lastObservedClientHeightRef = useRef<number>(0);
   const stickToBottomRef = useRef<boolean>(true);
   const sessionEntryLockUntilRef = useRef<number>(0);
+  const turnSettleUntilRef = useRef(0);
+  const previousLatestKeyRef = useRef<string | undefined>(undefined);
   const prevTurnsCountRef = useRef<number>(0);
-  const holdActiveRef = useRef<boolean>(false);
+  const holdActiveRef = useRef(false);
+  const restoringPrependRef = useRef(false);
   const programmaticScrollRef = useRef<boolean>(false);
   const programmaticScrollTimerRef = useRef<number | null>(null);
+  const [jumpingToOutlineSeq, setJumpingToOutlineSeq] = useState<number | null>(null);
+  const outlineJumpReqIdRef = useRef(0);
   const scrollRafRef = useRef<number | null>(null);
   const bottomSyncRafRef = useRef<number | null>(null);
   const lastOutlineSyncAtRef = useRef<number>(0);
@@ -927,8 +994,7 @@ export function StreamStage() {
   }
   const scrollUiStore = scrollUiStoreRef.current;
 
-  const turnTimingsRef = useRef<Record<string, TurnTimingRecord>>({});
-  const thinkingTimingsRef = useRef<Record<string, TurnTimingRecord>>({});
+  const [timingHistory, setTimingHistory] = useState<StageTimingHistory>(() => new Map());
   const mountedBaselineRef = useRef<{ agentId: string | null; maxSeq: number }>({
     agentId: null,
     maxSeq: 0,
@@ -938,7 +1004,6 @@ export function StreamStage() {
   isStageWideRef.current = isStageWide;
   const isShellLayoutMovingRef = useRef(isAnimating || isResizing);
   isShellLayoutMovingRef.current = isAnimating || isResizing;
-  const [timingTick, setTimingTick] = useState(0);
   const [rewindTarget, setRewindTarget] = useState<RewindRequestTarget | null>(null);
   const [rewindSubmitting, setRewindSubmitting] = useState(false);
   const [loadingEarlierTurns, setLoadingEarlierTurns] = useState(false);
@@ -953,6 +1018,7 @@ export function StreamStage() {
     scope: string;
     prevScrollHeight: number;
     prevScrollTop: number;
+    anchor?: { key: string; contentStart: number };
   } | null>(null);
   const prevWindowStartRef = useRef<{
     scope: string | null;
@@ -973,10 +1039,6 @@ export function StreamStage() {
     if (!open) setRewindTarget(null);
   }, []);
 
-  const getThinkingDurationMs = useCallback<ThinkingDurationLookupFn>((thinkKey) => {
-    return thinkingTimingsRef.current[thinkKey]?.durationMs ?? null;
-  }, []);
-
   const currentAgent = useMemo(
     () =>
       hostDetail?.agents.find((a) => a.agent_id === selectedAgentId) ??
@@ -989,6 +1051,15 @@ export function StreamStage() {
   const bootstrapError = useOrbitSelector((s) => s.bootstrapError);
 
   const stageTurns = stageView?.turns ?? EMPTY_TURNS;
+  const latestTurn = stageTurns.at(-1) ?? null;
+  const isLatestTurnActive = Boolean(latestTurn && isAgentRunning);
+  const isLatestTurnActiveRef = useRef(isLatestTurnActive);
+  useLayoutEffect(() => {
+    turnSettleUntilRef.current = isLatestTurnActiveRef.current && !isLatestTurnActive && stickToBottomRef.current
+      ? performance.now() + 320
+      : 0;
+    isLatestTurnActiveRef.current = isLatestTurnActive;
+  }, [isLatestTurnActive]);
   const firstTurnKey = stageTurns[0]?.key ?? null;
   const firstTurnKeyRef = useRef(firstTurnKey);
   firstTurnKeyRef.current = firstTurnKey;
@@ -1012,43 +1083,33 @@ export function StreamStage() {
       : null;
   const activeSessionScopeRef = useRef<string | null>(activeSessionScope);
   activeSessionScopeRef.current = activeSessionScope;
-  const selectorSlice = useMemo(
-    () => ({
-      hostDetails,
-      fleet,
-      archivedSubagents,
-      stages:
-        selectedHostId && selectedAgentId && stageView
-          ? { [`${selectedHostId}::${selectedAgentId}`]: stageView }
-          : {},
-    }),
-    [hostDetails, fleet, archivedSubagents, selectedHostId, selectedAgentId, stageView],
+  const rowsRef = useRef<readonly TurnListRow[]>([]);
+  const turnRows = useMemo(() => {
+    const rows = getTurnListRows(stageTurns, activeSessionScope, timingHistory, isLatestTurnActive, rowsRef.current);
+    rowsRef.current = rows;
+    return rows;
+  }, [stageTurns, activeSessionScope, timingHistory, isLatestTurnActive]);
+  const selectSession = useMemo(
+    () => createStageSessionSelector(selectedHostId, selectedAgentId),
+    [selectedHostId, selectedAgentId],
   );
-
-  const unifiedDecisions = useMemo(
-    () => selectPendingDecisions(selectorSlice, selectedHostId, selectedAgentId),
-    [selectorSlice, selectedHostId, selectedAgentId],
-  );
+  const { subagents: sessionSubagents, decisions: unifiedDecisions } = useOrbitSelector(selectSession);
   const pendingPermissions = unifiedDecisions.parentPermissions;
   const pendingQuestions = unifiedDecisions.parentQuestions;
   const subagentPermissions = unifiedDecisions.subagentPermissions;
+  const hasPendingDecisions = unifiedDecisions.totalCount > 0;
+  // A child approval yields the shelf while the parent can still be working.
+  const isPlanForegroundRunning =
+    isAgentRunning && !currentAgent?.is_awaiting_permission &&
+    pendingPermissions.length === 0 && pendingQuestions.length === 0;
   const sessionTurnDiffs = stageView?.session_turn_diffs ?? EMPTY_DIFF_FILES;
   const stageInsights = stageView?.insights ?? EMPTY_INSIGHTS;
-
-  const sessionSubagentsRef = useRef<readonly SessionSubagentWithAvatar[]>([]);
-  const sessionSubagents = useMemo(() => {
-    const summary = selectSessionSubagents(selectorSlice, selectedHostId, selectedAgentId);
-    const next = summary.all;
-    if (
-      areResolvedSubagentsEqual(sessionSubagentsRef.current, next) &&
-      sessionSubagentsRef.current.length === next.length &&
-      sessionSubagentsRef.current.every((s, idx) => s.character.id === next[idx]?.character.id)
-    ) {
-      return sessionSubagentsRef.current;
-    }
-    sessionSubagentsRef.current = next;
-    return next;
-  }, [selectorSlice, selectedHostId, selectedAgentId]);
+  const planSteps = stageInsights.plan_steps ?? EMPTY_PLAN_STEPS;
+  const firstStepSeq = planSteps[0]?.updated_seq;
+  const sourceTurn = useMemo(
+    () => planSourceTurn(stageTurns, firstStepSeq),
+    [stageTurns, firstStepSeq],
+  );
 
   const sessionSubagentMatcher = useMemo(
     () => buildSubagentNameMatcher(sessionSubagents),
@@ -1056,115 +1117,18 @@ export function StreamStage() {
   );
 
   const handleOpenSubagent = useCallback(
-    (sa: ResolvedSubagentItem) => {
-      if (sa.status === "awaiting_permission" && sa.isManaged && sa.childAgentId) {
-        orbitActions.selectAgent(sa.childHostId, sa.childAgentId);
-        return;
-      }
-      orbitActions.openSubagentTab({
-        callId: sa.callId,
-        role: sa.title,
-        promptPreview: sa.promptPreview,
-        childAgentId: sa.childAgentId,
-        childHostId: sa.childHostId || undefined,
-        providerSubagentId: sa.providerSubagentId,
-        parentAgentId: selectedAgentId,
-      });
-    },
+    (sa: ResolvedSubagentItem) => openSubagent(selectedAgentId ?? undefined, sa),
     [selectedAgentId],
   );
 
-  const latestTurn = stageTurns[stageTurns.length - 1] ?? null;
-  const isLatestTurnActive = Boolean(latestTurn && isAgentRunning);
-
   // Record live turn & per-thinking-block start/completion durations for the active session
   useEffect(() => {
-    if (!selectedAgentId || !latestTurn) return;
-    let changed = false;
+    if (!selectedHostId || !selectedAgentId || !latestTurn) return;
     const now = Date.now();
-
-    const timingKey = `${selectedAgentId}::${latestTurn.key}`;
-    const existing = turnTimingsRef.current[timingKey];
-    const seededStartMs =
-      latestTurn.started_at_ms !== null && latestTurn.started_at_ms <= now
-        ? latestTurn.started_at_ms
-        : now;
-
-    if (isLatestTurnActive) {
-      if (!existing || existing.completedAtMs !== null) {
-        turnTimingsRef.current[timingKey] = {
-          startedAtMs: seededStartMs,
-          completedAtMs: null,
-          durationMs: null,
-          workDurationMs: null,
-        };
-        changed = true;
-      } else if (latestTurn.terminal_reply !== null && existing.workDurationMs === null) {
-        turnTimingsRef.current[timingKey] = {
-          ...existing,
-          workDurationMs: Math.max(0, now - existing.startedAtMs),
-        };
-        changed = true;
-      } else if (latestTurn.terminal_reply === null && existing.workDurationMs !== null) {
-        turnTimingsRef.current[timingKey] = {
-          ...existing,
-          workDurationMs: null,
-        };
-        changed = true;
-      }
-    } else if (existing && existing.completedAtMs === null) {
-      const totalMs = Math.max(0, now - existing.startedAtMs);
-      turnTimingsRef.current[timingKey] = {
-        ...existing,
-        completedAtMs: now,
-        durationMs: totalMs,
-        workDurationMs: existing.workDurationMs ?? totalMs,
-      };
-      changed = true;
-    }
-
-    const lastSeg = latestTurn.live_segments[latestTurn.live_segments.length - 1] ?? null;
-    const lastSegItem =
-      lastSeg?.kind === "step_group" ? (lastSeg.items[lastSeg.items.length - 1] ?? null) : null;
-
-    for (const seg of latestTurn.live_segments) {
-      if (seg.kind !== "step_group") continue;
-      for (const item of seg.items) {
-        if (item.item_type !== "assistant_thinking") continue;
-
-        const thinkKey = `${selectedAgentId}::think::${item.item_id || item.seq}`;
-        const isCurrentlyThinking =
-          isLatestTurnActive &&
-          lastSegItem?.item_type === "assistant_thinking" &&
-          lastSegItem.seq === item.seq;
-        const prevThink = thinkingTimingsRef.current[thinkKey];
-
-        if (isCurrentlyThinking) {
-          if (!prevThink) {
-            thinkingTimingsRef.current[thinkKey] = {
-              startedAtMs: now,
-              completedAtMs: null,
-              durationMs: null,
-              workDurationMs: null,
-            };
-            changed = true;
-          }
-        } else if (prevThink && prevThink.completedAtMs === null) {
-          thinkingTimingsRef.current[thinkKey] = {
-            ...prevThink,
-            completedAtMs: now,
-            durationMs: Math.max(0, now - prevThink.startedAtMs),
-            workDurationMs: null,
-          };
-          changed = true;
-        }
-      }
-    }
-
-    if (changed) {
-      setTimingTick((n) => n + 1);
-    }
-  }, [selectedAgentId, latestTurn, isLatestTurnActive]);
+    setTimingHistory((history) =>
+      updateStageTimingHistory(history, selectedHostId, selectedAgentId, latestTurn, isLatestTurnActive, now),
+    );
+  }, [selectedHostId, selectedAgentId, latestTurn, isLatestTurnActive]);
 
   const stagePushStyle = useMemo<CSSProperties>(
     () => ({
@@ -1175,27 +1139,37 @@ export function StreamStage() {
     [stageShiftPx, stageTransition, isAnimating],
   );
 
-  const outlinePrompts = useMemo<OutlinePromptWithIndex[]>(() => {
+  const promptFallback = t("stage.prompt");
+  // Loaded prompt turns map seq -> virtualizer turnIndex for O(log N) scroll-sync binary search.
+  const loadedOutlineAnchors = useMemo<OutlinePromptWithIndex[]>(() => {
     const out: OutlinePromptWithIndex[] = [];
     for (let turnIndex = 0; turnIndex < stageTurns.length; turnIndex += 1) {
-      const t = stageTurns[turnIndex];
-      if (t.user_prompt?.item_type === "user_prompt" && !t.is_compaction_command) {
-        const promptItem = t.user_prompt as Extract<TimelineItemView, { item_type: "user_prompt" }>;
+      const turn = stageTurns[turnIndex];
+      if (turn.user_prompt?.item_type === "user_prompt" && !turn.is_compaction_command) {
+        const promptItem = turn.user_prompt as Extract<TimelineItemView, { item_type: "user_prompt" }>;
         const pres = extractUserPromptPresentation(promptItem);
         const summary =
-          pres.cleanText || pres.badges.map((b) => b.label).join(" ") || "Prompt";
+          pres.cleanText || pres.badges.map((b) => b.label).join(" ") || promptFallback;
         out.push({
-          seq: t.anchor_seq,
+          seq: turn.anchor_seq,
           turnIndex,
           preview: summary.replace(/\s+/g, " ").trim().slice(0, 110),
         });
       }
     }
     return out;
-  }, [stageTurns]);
+  }, [stageTurns, promptFallback]);
 
-  const outlinePromptsRef = useRef(outlinePrompts);
-  outlinePromptsRef.current = outlinePrompts;
+  // Prefer full-history outline anchors projected by Rust core (independent of tail-first pagination).
+  // Fall back to or union with confirmed loaded turns so anchors never drop on legacy/partial snapshots.
+  const coreOutlinePrompts = stageInsights.outline_prompts;
+  const outlinePrompts = useMemo<readonly OutlinePromptItem[]>(
+    () => resolveOutlinePrompts(coreOutlinePrompts, loadedOutlineAnchors, promptFallback),
+    [coreOutlinePrompts, loadedOutlineAnchors, promptFallback],
+  );
+
+  const loadedOutlineAnchorsRef = useRef(loadedOutlineAnchors);
+  loadedOutlineAnchorsRef.current = loadedOutlineAnchors;
   const stageTurnsRef = useRef(stageTurns);
   stageTurnsRef.current = stageTurns;
   const turnsCountRef = useRef(stageTurns.length);
@@ -1272,10 +1246,8 @@ export function StreamStage() {
     [selectedHostId, selectedAgentId],
   );
 
-  const sidebarView = useOrbitSelector((s) => s.sidebarView);
-  const canForkWorktree = useMemo(
-    () => isAgentInGitRepo(selectedHostId, currentAgent, hostDetail, sidebarView),
-    [selectedHostId, currentAgent, hostDetail, sidebarView],
+  const canForkWorktree = useOrbitSelector((s) =>
+    isAgentInGitRepo(selectedHostId, currentAgent, hostDetail, s.sidebarView),
   );
 
   const handleConfirmRewind = useCallback(
@@ -1322,6 +1294,19 @@ export function StreamStage() {
     };
   }, []);
 
+  const capturePrependPosition = useCallback((el: HTMLDivElement, scope: string) => {
+    const item = virtualizerRef.current?.getVirtualItemForOffset(el.scrollTop);
+    const row = item && rowsRef.current[item.index];
+    pendingTurnPrependRef.current = {
+      scope,
+      prevScrollTop: el.scrollTop,
+      prevScrollHeight: el.scrollHeight,
+      anchor: item && row?.key === item.key
+        ? { key: row.key, contentStart: getTurnContentStart(row, item.start) }
+        : undefined,
+    };
+  }, []);
+
   const triggerLoadEarlierTurns = useCallback(
     (targetTurnIndex?: number, capturePrependAnchor = true) => {
       const hostId = activeHostIdRef.current;
@@ -1346,11 +1331,7 @@ export function StreamStage() {
       }
 
       if (capturePrependAnchor && scrollRef.current) {
-        pendingTurnPrependRef.current = {
-          scope,
-          prevScrollHeight: scrollRef.current.scrollHeight,
-          prevScrollTop: scrollRef.current.scrollTop,
-        };
+        capturePrependPosition(scrollRef.current, scope);
       }
 
       loadingEarlierTurnsRef.current = true;
@@ -1390,7 +1371,7 @@ export function StreamStage() {
           }
         });
     },
-    [],
+    [capturePrependPosition],
   );
 
   const syncScrollMetrics = useCallback(() => {
@@ -1400,53 +1381,47 @@ export function StreamStage() {
     const prevTop = lastObservedScrollTopRef.current;
     lastObservedScrollTopRef.current = currentTop;
 
-    const distanceFromBottom = Math.max(0, el.scrollHeight - currentTop - el.clientHeight);
+    const currentClientHeight = el.clientHeight;
+    const prevClientHeight = lastObservedClientHeightRef.current || currentClientHeight;
+    lastObservedClientHeightRef.current = currentClientHeight;
+
+    const distanceFromBottom = Math.max(0, el.scrollHeight - currentTop - currentClientHeight);
     const hasTurns = turnsCountRef.current > 0;
+    // Shrinking a bottom dock/shelf (ComposerPlanShelf, DecisionDock, Composer) grows
+    // `clientHeight` and causes the browser to clamp `scrollTop` downward at the bottom;
+    // never misinterpret that viewport clamp as a human upward scroll gesture.
+    const clampedAtBottomByViewportGrow =
+      currentClientHeight > prevClientHeight && distanceFromBottom <= 2;
 
-    let nextOccluding = false;
-    let nextJump = false;
-
-    if (programmaticScrollRef.current) {
-      if (distanceFromBottom < 8) {
-        programmaticScrollRef.current = false;
-        if (programmaticScrollTimerRef.current !== null) {
-          window.clearTimeout(programmaticScrollTimerRef.current);
-          programmaticScrollTimerRef.current = null;
-        }
+    const programmatic = programmaticScrollRef.current;
+    if (programmatic && distanceFromBottom < 8) {
+      programmaticScrollRef.current = false;
+      if (programmaticScrollTimerRef.current !== null) {
+        window.clearTimeout(programmaticScrollTimerRef.current);
+        programmaticScrollTimerRef.current = null;
       }
-      stickToBottomRef.current = true;
-    } else {
-      const nearBottom = distanceFromBottom < 36;
-      const scrolledUp = currentTop < prevTop - 1.5;
-      const inEntrySettle = performance.now() < sessionEntryLockUntilRef.current;
-      if (inEntrySettle && stickToBottomRef.current) {
-        if (distanceFromBottom >= 2) {
-          el.scrollTop = el.scrollHeight;
-          lastObservedScrollTopRef.current = el.scrollTop;
-        }
-      } else if (nearBottom) {
-        stickToBottomRef.current = true;
-      } else if (scrolledUp && !isShellLayoutMovingRef.current) {
-        stickToBottomRef.current = false;
-      }
-      const pinned = stickToBottomRef.current;
-      nextOccluding = !pinned && distanceFromBottom > 4 && hasTurns;
-      nextJump = !pinned && !nearBottom && hasTurns;
     }
+    const state = computeStageScrollState({
+      currentTop,
+      previousTop: clampedAtBottomByViewportGrow ? currentTop : prevTop,
+      distanceFromBottom,
+      stickToBottom: stickToBottomRef.current,
+      holdActive: holdActiveRef.current || restoringPrependRef.current || programmatic,
+      isShellLayoutMoving: isShellLayoutMovingRef.current,
+      hasTurns,
+    });
+    stickToBottomRef.current = state.stickToBottom;
 
     if (
       loadingEarlierTurnsRef.current &&
       pendingTurnPrependRef.current &&
       pendingTurnPrependRef.current.scope === activeSessionScopeRef.current
     ) {
-      pendingTurnPrependRef.current = {
-        scope: pendingTurnPrependRef.current.scope,
-        prevScrollHeight: el.scrollHeight,
-        prevScrollTop: currentTop,
-      };
+      capturePrependPosition(el, pendingTurnPrependRef.current.scope);
     } else if (
       !stickToBottomRef.current &&
       !programmaticScrollRef.current &&
+      !holdActiveRef.current &&
       currentTop < STAGE_TOP_PAGINATE_THRESHOLD_PX &&
       (windowStartTurnIndexRef.current > 0 || hasOlderHistoryRef.current)
     ) {
@@ -1454,8 +1429,8 @@ export function StreamStage() {
     }
 
     let nextActiveSeq = scrollUiStore.getSnapshot().activePromptSeq;
-    const prompts = outlinePromptsRef.current;
-    if (isStageWideRef.current && prompts.length >= 2) {
+    const loadedAnchors = loadedOutlineAnchorsRef.current;
+    if (isStageWideRef.current && loadedAnchors.length >= 1) {
       const now = performance.now();
       if (now - lastOutlineSyncAtRef.current >= 80) {
         lastOutlineSyncAtRef.current = now;
@@ -1463,13 +1438,14 @@ export function StreamStage() {
         const anchorOffset = Math.max(0, currentTop + 96);
         if (measurements && measurements.length > 0) {
           let lo = 0;
-          let hi = prompts.length - 1;
-          let best = prompts[0].seq;
+          let hi = loadedAnchors.length - 1;
+          let best = loadedAnchors[0].seq;
           while (lo <= hi) {
             const mid = (lo + hi) >> 1;
-            const m = measurements[prompts[mid].turnIndex];
-            if (!m || m.start <= anchorOffset) {
-              best = prompts[mid].seq;
+            const m = measurements[loadedAnchors[mid].turnIndex];
+            const row = m && rowsRef.current[m.index];
+            if (!row || row.key !== m.key || getTurnContentStart(row, m.start) <= anchorOffset) {
+              best = loadedAnchors[mid].seq;
               lo = mid + 1;
             } else {
               hi = mid - 1;
@@ -1481,11 +1457,11 @@ export function StreamStage() {
     }
 
     scrollUiStore.update({
-      isOccludingText: nextOccluding,
-      showJumpLatest: nextJump,
+      isOccludingText: !programmatic && state.isOccludingText,
+      showJumpLatest: !programmatic && state.showJumpLatest,
       activePromptSeq: nextActiveSeq,
     });
-  }, [scrollUiStore, triggerLoadEarlierTurns]);
+  }, [scrollUiStore, triggerLoadEarlierTurns, capturePrependPosition]);
 
   const snapScrollerToBottom = useCallback(() => {
     const el = scrollRef.current;
@@ -1494,20 +1470,24 @@ export function StreamStage() {
     lastObservedScrollTopRef.current = el.scrollTop;
   }, []);
 
+  const canAutoFollow = useCallback((turnAppended = false) => {
+    const now = performance.now();
+    return stickToBottomRef.current && !programmaticScrollRef.current &&
+      !loadingEarlierTurnsRef.current && !holdActiveRef.current && !restoringPrependRef.current &&
+      (isLatestTurnActiveRef.current || now < sessionEntryLockUntilRef.current ||
+       now < turnSettleUntilRef.current || turnAppended);
+  }, []);
+
   const scheduleBottomSync = useCallback(() => {
     if (bottomSyncRafRef.current !== null) return;
     bottomSyncRafRef.current = window.requestAnimationFrame(() => {
       bottomSyncRafRef.current = null;
-      if (
-        stickToBottomRef.current &&
-        !programmaticScrollRef.current &&
-        !loadingEarlierTurnsRef.current
-      ) {
+      if (canAutoFollow()) {
         snapScrollerToBottom();
       }
       syncScrollMetrics();
     });
-  }, [snapScrollerToBottom, syncScrollMetrics]);
+  }, [canAutoFollow, snapScrollerToBottom, syncScrollMetrics]);
 
   const handleScroll = useCallback(() => {
     if (scrollRafRef.current !== null) return;
@@ -1517,54 +1497,62 @@ export function StreamStage() {
     });
   }, [syncScrollMetrics]);
 
+  const { cancelHold, holdViewport } = useViewportTracking(
+    scrollRef, stickToBottomRef, holdActiveRef, syncScrollMetrics, activeSessionScope,
+  );
+  const interruptFollow = useCallback(() => {
+    outlineJumpReqIdRef.current += 1;
+    setJumpingToOutlineSeq(null);
+    cancelHold();
+    sessionEntryLockUntilRef.current = 0;
+    turnSettleUntilRef.current = 0;
+    stickToBottomRef.current = false;
+    if (programmaticScrollRef.current) {
+      const el = scrollRef.current;
+      el?.scrollTo({ top: el.scrollTop, behavior: "instant" });
+      programmaticScrollRef.current = false;
+    }
+    if (programmaticScrollTimerRef.current !== null) {
+      window.clearTimeout(programmaticScrollTimerRef.current);
+      programmaticScrollTimerRef.current = null;
+    }
+  }, [cancelHold]);
+
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     const onPassiveWheel = (e: WheelEvent) => {
-      if (e.deltaY < -0.5) {
-        sessionEntryLockUntilRef.current = 0;
-        stickToBottomRef.current = false;
-        if (programmaticScrollRef.current) {
-          programmaticScrollRef.current = false;
-          if (programmaticScrollTimerRef.current !== null) {
-            window.clearTimeout(programmaticScrollTimerRef.current);
-            programmaticScrollTimerRef.current = null;
-          }
-        }
+      if (e.deltaY < 0) {
+        interruptFollow();
         if (
           el.scrollTop < STAGE_TOP_PAGINATE_THRESHOLD_PX &&
           (windowStartTurnIndexRef.current > 0 || hasOlderHistoryRef.current)
         ) {
           triggerLoadEarlierTurns(undefined, true);
         }
+      } else if (e.deltaY > 0) {
+        cancelHold();
       }
-    };
-    const onTouchStart = () => {
-      sessionEntryLockUntilRef.current = 0;
     };
     const onPointerDown = (e: PointerEvent) => {
-      const rect = el.getBoundingClientRect();
-      if (e.clientX >= rect.right - 20) {
-        sessionEntryLockUntilRef.current = 0;
-      }
+      if (e.target === el && e.clientX >= el.getBoundingClientRect().right - 20) interruptFollow();
     };
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "ArrowUp" || e.key === "PageUp" || e.key === "Home") {
-        sessionEntryLockUntilRef.current = 0;
-        stickToBottomRef.current = false;
-      }
+      if (e.key === "ArrowUp" || e.key === "PageUp" || e.key === "Home") interruptFollow();
     };
     el.addEventListener("wheel", onPassiveWheel, { passive: true });
-    el.addEventListener("touchstart", onTouchStart, { passive: true });
+    el.addEventListener("touchstart", interruptFollow, { passive: true });
+    el.addEventListener("touchmove", interruptFollow, { passive: true });
     el.addEventListener("pointerdown", onPointerDown, { passive: true });
     el.addEventListener("keydown", onKeyDown);
     return () => {
       el.removeEventListener("wheel", onPassiveWheel);
-      el.removeEventListener("touchstart", onTouchStart);
+      el.removeEventListener("touchstart", interruptFollow);
+      el.removeEventListener("touchmove", interruptFollow);
       el.removeEventListener("pointerdown", onPointerDown);
       el.removeEventListener("keydown", onKeyDown);
     };
-  }, [isDraft, selectedHostId, selectedAgentId, triggerLoadEarlierTurns]);
+  }, [isDraft, selectedHostId, selectedAgentId, cancelHold, interruptFollow, triggerLoadEarlierTurns]);
 
   useLayoutEffect(() => {
     const contentEl = contentRef.current;
@@ -1577,17 +1565,25 @@ export function StreamStage() {
     const ro = new ResizeObserver(() => {
       const sh = scrollerEl.scrollHeight;
       const ch = scrollerEl.clientHeight;
+      const clientShrankBy = lastClientHeight - ch;
       const heightChanged = sh !== lastScrollHeight || ch !== lastClientHeight;
       lastScrollHeight = sh;
       lastClientHeight = ch;
 
       if (heightChanged) {
-        const distanceFromBottom = Math.max(0, sh - scrollerEl.scrollTop - ch);
-        const allowSnap =
-          !loadingEarlierTurnsRef.current &&
-          (performance.now() < sessionEntryLockUntilRef.current || distanceFromBottom <= 120);
-        if (stickToBottomRef.current && !programmaticScrollRef.current && allowSnap) {
+        if (canAutoFollow()) {
           snapScrollerToBottom();
+        } else if (
+          clientShrankBy > 0.5 &&
+          stickToBottomRef.current &&
+          !programmaticScrollRef.current &&
+          !holdActiveRef.current &&
+          !restoringPrependRef.current
+        ) {
+          // Bottom dock/shelf grew (e.g. expanding ComposerPlanShelf or multi-line composer);
+          // keep the bottom line visible right above it even when the session is idle.
+          scrollerEl.scrollTop += clientShrankBy;
+          lastObservedScrollTopRef.current = scrollerEl.scrollTop;
         }
         scheduleBottomSync();
       } else {
@@ -1601,43 +1597,16 @@ export function StreamStage() {
     isDraft,
     selectedHostId,
     selectedAgentId,
+    canAutoFollow,
     snapScrollerToBottom,
     scheduleBottomSync,
     handleScroll,
   ]);
 
-  useEffect(() => {
-    const shelfEl = composerShelfRef.current;
-    if (!shelfEl || typeof ResizeObserver === "undefined") return;
-    prevComposerHeightRef.current = shelfEl.getBoundingClientRect().height;
-
-    const ro = new ResizeObserver((entries) => {
-      const nextH =
-        entries[0]?.borderBoxSize?.[0]?.blockSize ??
-        entries[0]?.contentRect.height ??
-        shelfEl.getBoundingClientRect().height;
-      const prevH = prevComposerHeightRef.current;
-      prevComposerHeightRef.current = nextH;
-
-      const deltaH = nextH - prevH;
-      if (Math.abs(deltaH) < 0.5) return;
-
-      const scroller = scrollRef.current;
-      if (scroller && stickToBottomRef.current) {
-        if (deltaH > 0) {
-          scroller.scrollTop += deltaH;
-        }
-        lastObservedScrollTopRef.current = scroller.scrollTop;
-      }
-      syncScrollMetrics();
-    });
-    ro.observe(shelfEl);
-    return () => ro.disconnect();
-  }, [isDraft, selectedAgentId, syncScrollMetrics]);
-
   const scrollToLatest = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
+    cancelHold();
     programmaticScrollRef.current = true;
     stickToBottomRef.current = true;
     scrollUiStore.update({ isOccludingText: false, showJumpLatest: false });
@@ -1652,74 +1621,71 @@ export function StreamStage() {
     }, 800);
 
     el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-  }, [scrollUiStore, syncScrollMetrics]);
-
-  const holdViewport: ViewportAnchorHoldFn = useCallback(
-    (triggerEl, apply, edge = "top") => {
-      const scroller = scrollRef.current;
-      if (!scroller || !triggerEl) {
-        apply();
-        return;
-      }
-      const beforeRect = triggerEl.getBoundingClientRect();
-      const beforeAnchor = edge === "bottom" ? beforeRect.bottom : beforeRect.top;
-      const wasPinnedBottom = stickToBottomRef.current;
-      stickToBottomRef.current = false;
-      holdActiveRef.current = true;
-
-      apply();
-
-      requestAnimationFrame(() => {
-        const curScroller = scrollRef.current;
-        if (!curScroller || !triggerEl.isConnected) {
-          holdActiveRef.current = false;
-          return;
-        }
-        const afterRect = triggerEl.getBoundingClientRect();
-        const afterAnchor = edge === "bottom" ? afterRect.bottom : afterRect.top;
-        const delta = afterAnchor - beforeAnchor;
-        if (Math.abs(delta) > 1) {
-          curScroller.scrollTop += delta;
-        }
-        lastObservedScrollTopRef.current = curScroller.scrollTop;
-
-        const parentWrapper = triggerEl.parentElement;
-        if (parentWrapper) {
-          const wrapperRect = parentWrapper.getBoundingClientRect();
-          const scrollerRect = curScroller.getBoundingClientRect();
-          const overflowBelow = wrapperRect.bottom - scrollerRect.bottom;
-          if (overflowBelow > 8 && wrapperRect.height < scrollerRect.height * 0.75) {
-            curScroller.scrollBy({
-              top: Math.min(overflowBelow + 12, 220),
-              behavior: "smooth",
-            });
-          }
-        }
-
-        if (wasPinnedBottom) {
-          const dist =
-            curScroller.scrollHeight - curScroller.scrollTop - curScroller.clientHeight;
-          stickToBottomRef.current = dist < 48;
-        }
-        syncScrollMetrics();
-        requestAnimationFrame(() => {
-          holdActiveRef.current = false;
-        });
-      });
-    },
-    [syncScrollMetrics],
-  );
+  }, [cancelHold, scrollUiStore, syncScrollMetrics]);
 
   const jumpToPromptSeq = useCallback(
     (seq: number) => {
-      const entry = outlinePromptsRef.current.find((p) => p.seq === seq);
-      const v = virtualizerRef.current;
-      if (!entry || !v) return;
-      stickToBottomRef.current = false;
+      const loaded = loadedOutlineAnchorsRef.current.find((p) => p.seq === seq);
+      if (loaded) {
+        interruptFollow();
+        scrollUiStore.update({ activePromptSeq: seq });
+        jumpToTurnRef.current?.({ index: loaded.turnIndex, align: "start", behavior: "smooth" });
+        return;
+      }
+
+      const hostId = activeHostIdRef.current;
+      const agentId = activeAgentIdRef.current;
+      const scope = activeSessionScopeRef.current;
+      if (!hostId || !agentId || !scope) return;
+
+      interruptFollow();
       scrollUiStore.update({ activePromptSeq: seq });
-      v.scrollToIndex(entry.turnIndex, { align: "start", behavior: "smooth" });
+      const reqId = (outlineJumpReqIdRef.current += 1);
+      setJumpingToOutlineSeq(seq);
+
+      void (async () => {
+        try {
+          for (let attempt = 0; attempt < 24; attempt += 1) {
+            if (outlineJumpReqIdRef.current !== reqId || activeSessionScopeRef.current !== scope) {
+              return;
+            }
+            const match = findTurnIndexForSeq(stageTurnsRef.current, seq);
+            if (match.exact && match.index >= 0) {
+              break;
+            }
+            if (windowStartTurnIndexRef.current <= 0 && !hasOlderHistoryRef.current) {
+              break;
+            }
+            const loadedCount = await orbitActions.loadEarlierStageTurns(hostId, agentId, 0);
+            if (outlineJumpReqIdRef.current !== reqId || activeSessionScopeRef.current !== scope) {
+              return;
+            }
+            if (loadedCount === 0) break;
+            // Wait one frame for React & virtualizer rows to settle before re-checking `stageTurnsRef`.
+            await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+          }
+
+          if (outlineJumpReqIdRef.current !== reqId || activeSessionScopeRef.current !== scope) {
+            return;
+          }
+          const finalMatch = findTurnIndexForSeq(stageTurnsRef.current, seq);
+          if (finalMatch.index >= 0) {
+            const idx = finalMatch.index;
+            jumpToTurnRef.current?.({ index: idx, align: "start", behavior: "auto" });
+            window.requestAnimationFrame(() => {
+              if (outlineJumpReqIdRef.current !== reqId) return;
+              jumpToTurnRef.current?.({ index: idx, align: "start", behavior: "auto" });
+              syncScrollMetrics();
+            });
+          }
+        } finally {
+          if (outlineJumpReqIdRef.current === reqId) {
+            setJumpingToOutlineSeq(null);
+          }
+        }
+      })();
     },
-    [scrollUiStore],
+    [interruptFollow, scrollUiStore, syncScrollMetrics],
   );
 
   const hasPendingJumpForActive = Boolean(
@@ -1734,11 +1700,14 @@ export function StreamStage() {
 
   useLayoutEffect(() => {
     earlierLoadReqIdRef.current += 1;
+    outlineJumpReqIdRef.current += 1;
+    setJumpingToOutlineSeq(null);
     loadingEarlierTurnsRef.current = false;
     setLoadingEarlierTurns(false);
     pendingTurnPrependRef.current = null;
     exhaustedEarlierWindowRef.current = null;
     jumpEarlierAttemptedNonceRef.current = null;
+    lastObservedClientHeightRef.current = scrollRef.current?.clientHeight ?? 0;
     prevWindowStartRef.current = {
       scope: activeSessionScope,
       windowStart: windowStartTurnIndexRef.current,
@@ -1768,7 +1737,8 @@ export function StreamStage() {
     }
     setJumpFallbackNonce(null);
     programmaticScrollRef.current = false;
-    holdActiveRef.current = false;
+    cancelHold();
+    turnSettleUntilRef.current = 0;
     const isTargetedJump = hasPendingJumpForActiveRef.current;
     if (!isTargetedJump) {
       if (highlightTimerRef.current !== null) {
@@ -1793,7 +1763,7 @@ export function StreamStage() {
     }
 
     const anchorToBottom = () => {
-      if (!stickToBottomRef.current || programmaticScrollRef.current) return;
+      if (!canAutoFollow()) return;
       if (turnsCountRef.current > 0) {
         virtualizerRef.current?.scrollToIndex(turnsCountRef.current - 1, { align: "end" });
       }
@@ -1818,6 +1788,8 @@ export function StreamStage() {
   }, [
     activeSessionScope,
     sessionScrollNonce,
+    cancelHold,
+    canAutoFollow,
     scrollUiStore,
     snapScrollerToBottom,
     scheduleBottomSync,
@@ -1851,22 +1823,25 @@ export function StreamStage() {
     if (!snap || snap.scope !== activeSessionScope || !el) return;
     if (hasPendingJumpForActiveRef.current) return;
 
-    const deltaHeight = el.scrollHeight - snap.prevScrollHeight;
-    if (deltaHeight > 0) {
-      holdActiveRef.current = true;
-      el.scrollTop = computePrependRestoredScrollTop(
-        snap.prevScrollTop,
-        snap.prevScrollHeight,
-        el.scrollHeight,
-      );
+    // Anchor to the same turn's content, including its new top gap if it used
+    // to be first. Streaming or expanding content below it must not move it.
+    const anchor = snap.anchor;
+    const anchorIndex = anchor ? rowsRef.current.findIndex((row) => row.key === anchor.key) : -1;
+    const item = virtualizerRef.current?.measurementsCache[anchorIndex];
+    const restoredTop = anchor && item?.key === anchor.key
+      ? Math.max(0, snap.prevScrollTop + getTurnContentStart(rowsRef.current[anchorIndex], item.start) - anchor.contentStart)
+      : computePrependRestoredScrollTop(snap.prevScrollTop, snap.prevScrollHeight, el.scrollHeight);
+    if (restoredTop !== el.scrollTop) {
+      restoringPrependRef.current = true;
+      el.scrollTop = restoredTop;
       lastObservedScrollTopRef.current = el.scrollTop;
       const raf = window.requestAnimationFrame(() => {
-        holdActiveRef.current = false;
+        restoringPrependRef.current = false;
         syncScrollMetrics();
       });
       return () => {
         window.cancelAnimationFrame(raf);
-        holdActiveRef.current = false;
+        restoringPrependRef.current = false;
       };
     }
   }, [activeSessionScope, windowStartTurnIndex, firstTurnKey, stageTurns.length, syncScrollMetrics]);
@@ -1917,6 +1892,7 @@ export function StreamStage() {
       jumpFallbackTimerRef.current = null;
     }
 
+    cancelHold();
     const turnIdx = match.index;
     const targetTurn = stageTurns[turnIdx];
 
@@ -1933,7 +1909,8 @@ export function StreamStage() {
     }, 250);
 
     const performJump = () => {
-      virtualizerRef.current?.scrollToIndex(turnIdx, {
+      jumpToTurnRef.current?.({
+        index: turnIdx,
         align: "center",
         behavior: "auto",
       });
@@ -1980,6 +1957,7 @@ export function StreamStage() {
     loadingEarlierTurns,
     stageView?.latest_seq,
     jumpFallbackNonce,
+    cancelHold,
     syncScrollMetrics,
     triggerLoadEarlierTurns,
   ]);
@@ -2006,33 +1984,23 @@ export function StreamStage() {
     const prevCount = prevTurnsCountRef.current;
     prevTurnsCountRef.current = stageTurns.length;
 
-    if (prevCount === 0 && stageTurns.length > 0 && stickToBottomRef.current) {
+    const appended = stageTurns.length > prevCount && latestTurn?.key !== previousLatestKeyRef.current;
+    previousLatestKeyRef.current = latestTurn?.key;
+    if (prevCount === 0 && appended && canAutoFollow(true)) {
       sessionEntryLockUntilRef.current = performance.now() + 600;
       virtualizerRef.current?.scrollToIndex(stageTurns.length - 1, { align: "end" });
-      snapScrollerToBottom();
-      const raf = window.requestAnimationFrame(() => {
-        if (stickToBottomRef.current && !programmaticScrollRef.current && turnsCountRef.current > 0) {
-          virtualizerRef.current?.scrollToIndex(turnsCountRef.current - 1, { align: "end" });
-          snapScrollerToBottom();
-          syncScrollMetrics();
-        }
-      });
-      return () => window.cancelAnimationFrame(raf);
     }
-
-    if (stickToBottomRef.current && !programmaticScrollRef.current) {
-      snapScrollerToBottom();
-    }
+    if (canAutoFollow(appended)) snapScrollerToBottom();
     scheduleBottomSync();
   }, [
     activeSessionScope,
     stageView?.latest_seq,
+    latestTurn?.key,
     stageTurns.length,
-    stageMaxContentWidthPx,
-    isAnimating,
+    isLatestTurnActive,
+    canAutoFollow,
     snapScrollerToBottom,
     scheduleBottomSync,
-    syncScrollMetrics,
   ]);
 
   if (!selectedHostId) {
@@ -2040,8 +2008,8 @@ export function StreamStage() {
       return <StageHydratingFallback bootstrapError={bootstrapError} />;
     }
     return (
-      <div className="text-muted-foreground flex flex-1 items-center justify-center text-[13.5px]">
-        Pair or select an Orbit host to begin.
+      <div className="text-muted-foreground flex flex-1 items-center justify-center text-[13px]">
+        {t("stage.selectHost")}
       </div>
     );
   }
@@ -2097,7 +2065,7 @@ export function StreamStage() {
       className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
     >
       {/* Peripheral Megathread Outline Rail (clean left gutter >= 800px / < 776px) */}
-      {outlinePrompts.length >= 2 && (
+      {outlinePrompts.length >= 1 && (
         <StageOutlineRailBridge
           visible={isStageWide}
           offsetPx={outlineOffsetPx}
@@ -2105,23 +2073,9 @@ export function StreamStage() {
           isAnimating={isAnimating}
           scrollUiStore={scrollUiStore}
           prompts={outlinePrompts}
+          jumpingToSeq={jumpingToOutlineSeq}
           onJumpToSeq={jumpToPromptSeq}
         />
-      )}
-
-      {/* Parent Back Banner when inspecting a managed subagent */}
-      {selectedHostId && currentAgent?.parent_agent_id && (
-        <div
-          style={{
-            paddingRight: `${24 + overviewReservePx}px`,
-            transition: overviewReserveTransition,
-          }}
-          className="shrink-0 pl-[24px]"
-        >
-          <div style={stagePushStyle}>
-            <ParentSubagentBanner hostId={selectedHostId} agent={currentAgent} />
-          </div>
-        </div>
       )}
 
       {/* Subtle 1-line provenance chip when viewing a forked conversation */}
@@ -2167,7 +2121,7 @@ export function StreamStage() {
             transition: overviewReserveTransition,
           }}
           onViewportTransitionEnd={onStageTransitionEnd}
-          viewportClassName="pt-6 pb-[56px] pl-[24px]"
+          viewportClassName="pt-6 pb-[24px] pl-[24px]"
           contentClassName={stageTurns.length === 0 ? "flex min-h-full flex-col" : undefined}
         >
           <div
@@ -2199,15 +2153,15 @@ export function StreamStage() {
                     <div className="bg-foreground/[0.035] text-muted-foreground/70 mb-3 flex size-9 items-center justify-center rounded-full ring-1 ring-inset ring-black/[0.06] dark:bg-white/[0.045] dark:ring-white/[0.08]">
                       <RotateCcw className="size-4 stroke-[1.7]" />
                     </div>
-                    <p className="text-foreground/85 text-[14px] font-medium tracking-[-0.012em]">
-                      Back to the start
+                    <p className="text-foreground/85 text-[13px] font-medium tracking-[-0.012em]">
+                      {t("stage.backToStart")}
                     </p>
                     {(folderLabel || wsBranch) && (
-                      <div className="text-muted-foreground/70 mt-1 flex items-center justify-center gap-1.5 text-[12px]">
+                      <div className="text-muted-foreground/70 mt-1 flex items-center justify-center gap-1.5 text-[11px]">
                         {folderLabel && <span className="max-w-[220px] truncate">{folderLabel}</span>}
                         {folderLabel && wsBranch && <span className="opacity-45">·</span>}
                         {wsBranch && (
-                          <span className="inline-flex max-w-[180px] items-center gap-1 truncate font-mono text-[11.5px]">
+                          <span className="inline-flex max-w-[180px] items-center gap-1 truncate font-mono text-[11px]">
                             <GitBranch className="size-3 shrink-0 opacity-75" />
                             <span className="truncate">{wsBranch}</span>
                           </span>
@@ -2225,6 +2179,9 @@ export function StreamStage() {
                   selectedHostId={selectedHostId}
                   selectedAgentId={selectedAgentId}
                   stageTurns={stageTurns}
+                  hasPlanSteps={planSteps.length > 0}
+                  rows={turnRows}
+                  jumpToTurnRef={jumpToTurnRef}
                   highlightedTurnKey={highlightedTurnKey}
                   hasPendingJump={hasPendingJumpForActive}
                   isLatestTurnActive={isLatestTurnActive}
@@ -2236,14 +2193,12 @@ export function StreamStage() {
                   effectiveCwd={effectiveCwd}
                   stageMaxContentWidthPx={stageMaxContentWidthPx}
                   hostArtifacts={stableHostArtifacts}
-                  timingTick={timingTick}
+                  timingHistory={timingHistory}
                   scrollRef={scrollRef}
                   stickToBottomRef={stickToBottomRef}
                   holdActiveRef={holdActiveRef}
+                  restoringPrependRef={restoringPrependRef}
                   virtualizerRef={virtualizerRef}
-                  turnTimingsRef={turnTimingsRef}
-                  thinkingTimingsRef={thinkingTimingsRef}
-                  getThinkingDurationMs={getThinkingDurationMs}
                   holdViewport={holdViewport}
                   onRequestRewind={handleRequestRewind}
                   onRequestFork={handleRequestFork}
@@ -2254,14 +2209,7 @@ export function StreamStage() {
                   onOpenSubagent={handleOpenSubagent}
                 />
 
-                {/* Dynamic Reading Runway: gives active streaming output a calm centered eye-zone cushion above Composer */}
-                <div
-                  aria-hidden="true"
-                  className={cn(
-                    "w-full shrink-0 transition-[height] duration-300 ease-[var(--ease-out-expo)]",
-                    isLatestTurnActive ? "h-[clamp(120px,26vh,220px)]" : "h-0",
-                  )}
-                />
+                {isLatestTurnActive && <div aria-hidden="true" className="h-[32px] shrink-0" />}
               </>
             )}
           </div>
@@ -2273,11 +2221,12 @@ export function StreamStage() {
           overviewReservePx={overviewReservePx}
           overviewReserveTransition={overviewReserveTransition}
           onJumpLatest={scrollToLatest}
+          isGenerating={isLatestTurnActive}
         />
       </div>
 
-      {/* 2. Docked Composer Shelf — Pure Input & Unified Decision Bay (no Subagent/Goal pileup!) */}
-      <div ref={composerShelfRef} className="bg-surface-base relative z-20 shrink-0">
+      {/* DecisionDock, session plan, then the composer's queue and input. */}
+      <div className="bg-surface-base relative z-20 shrink-0">
         <div
           style={{
             paddingRight: `${overviewReservePx}px`,
@@ -2293,14 +2242,20 @@ export function StreamStage() {
               questions={pendingQuestions}
               subagentPermissions={subagentPermissions}
             />
+            {stageView && (
+              <ComposerPlanShelf
+                hostId={selectedHostId}
+                agentId={selectedAgentId}
+                planSteps={planSteps}
+                sourceTurn={sourceTurn}
+                latestTurnAnchorSeq={latestTurn?.anchor_seq ?? null}
+                isForegroundRunning={isPlanForegroundRunning}
+                hasPendingDecisions={hasPendingDecisions}
+              />
+            )}
             <StageDockedComposer
               scrollUiStore={scrollUiStore}
-              hasPendingDecisions={
-                pendingPermissions.length +
-                  pendingQuestions.length +
-                  subagentPermissions.length >
-                0
-              }
+              hasPendingDecisions={hasPendingDecisions}
             />
           </div>
         </div>

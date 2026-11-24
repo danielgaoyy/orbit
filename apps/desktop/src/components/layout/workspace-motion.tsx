@@ -17,13 +17,88 @@ import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
 export type ShellMotionPhase = "idle" | "prep" | "playing";
 
-const PANEL_EASE = "cubic-bezier(0.32, 0.72, 0, 1)";
-const OVERVIEW_OPACITY_IN = "opacity 210ms cubic-bezier(0.25, 1, 0.5, 1)";
-const OVERVIEW_OPACITY_OUT = "opacity 175ms cubic-bezier(0.4, 0, 0.2, 1)";
+const PANEL_EASE = "var(--ease-panel)";
+const OVERVIEW_OPACITY_IN = "opacity 210ms var(--ease-out-quart)";
+const OVERVIEW_OPACITY_OUT = "opacity 175ms var(--ease-exit)";
 const STAGE_MAX_WIDTH_PX = 740;
 const STAGE_MIN_LOCK_WIDTH_PX = 240;
 const STAGE_H_PADDING_PX = 48;
 const OVERVIEW_DOCK_RESERVE_PX = 304;
+
+function clampNumber(value: number, lo: number, hi: number): number {
+  return Math.min(hi, Math.max(lo, value));
+}
+
+function readElementTranslateX(selector: string): number | null {
+  if (typeof document === "undefined" || typeof window === "undefined") return null;
+  const el = document.querySelector<HTMLElement>(selector);
+  if (!el) return null;
+  const transform = window.getComputedStyle(el).transform;
+  if (!transform || transform === "none") return 0;
+  if (typeof DOMMatrix !== "undefined") {
+    try {
+      const matrix = new DOMMatrix(transform);
+      return Number.isFinite(matrix.m41) ? matrix.m41 : null;
+    } catch {
+      return null;
+    }
+  }
+  const match2d = transform.match(/^matrix\(([^)]+)\)$/);
+  if (match2d) {
+    const tx = Number(match2d[1].split(",")[4]);
+    return Number.isFinite(tx) ? tx : null;
+  }
+  const match3d = transform.match(/^matrix3d\(([^)]+)\)$/);
+  if (match3d) {
+    const tx = Number(match3d[1].split(",")[12]);
+    return Number.isFinite(tx) ? tx : null;
+  }
+  return null;
+}
+
+/**
+ * Samples the actual live mid-flight visual geometry of sliding shell panels via computed
+ * `DOMMatrix.m41` so interrupting an active transition retargets seamlessly from the exact
+ * visible pixel instead of teleporting to `motion.to`.
+ */
+function sampleLivePlayingTuple(m: ShellMotionSnapshot): ShellGeometryTuple {
+  let L = m.to.L;
+  if (Math.abs(m.to.L - m.from.L) > 0.5) {
+    const fullW = m.leftPanelWidthPx || Math.max(m.from.L, m.to.L);
+    const tx = readElementTranslateX(".orbit-panel-left");
+    if (tx !== null && fullW > 0) {
+      const visibleL = clampNumber(fullW + tx, 0, fullW);
+      L = clampNumber(visibleL, Math.min(m.from.L, m.to.L), Math.max(m.from.L, m.to.L));
+    }
+  }
+
+  let W = m.to.W;
+  if (Math.abs(m.to.W - m.from.W) > 0.5) {
+    const fullW = m.rightPanelWidthPx || Math.max(m.from.W, m.to.W);
+    const tx = readElementTranslateX(".orbit-panel-right");
+    if (tx !== null && fullW > 0) {
+      const visibleW = clampNumber(fullW - tx, 0, fullW);
+      W = clampNumber(visibleW, Math.min(m.from.W, m.to.W), Math.max(m.from.W, m.to.W));
+    }
+  }
+
+  let D = m.to.D;
+  if (Math.abs(m.to.D - m.from.D) > 0.5) {
+    let progress: number | null = null;
+    if (Math.abs(m.to.W - m.from.W) > 0.5) {
+      progress = clampNumber((W - m.from.W) / (m.to.W - m.from.W), 0, 1);
+    } else if (Math.abs(m.to.L - m.from.L) > 0.5) {
+      progress = clampNumber((L - m.from.L) / (m.to.L - m.from.L), 0, 1);
+    } else if (m.durationMs > 0 && typeof performance !== "undefined") {
+      progress = clampNumber((performance.now() - m.startedAtMs) / m.durationMs, 0, 1);
+    }
+    if (progress !== null) {
+      D = m.from.D + (m.to.D - m.from.D) * progress;
+    }
+  }
+
+  return { L, W, D };
+}
 
 function availStageContent(V: number, t: ShellGeometryTuple): number {
   return Math.max(0, V - t.L - t.W - t.D - STAGE_H_PADDING_PX);
@@ -95,6 +170,9 @@ interface ShellMotionSnapshot {
   base: ShellGeometryTuple;
   viewportWidth: number;
   durationMs: number;
+  leftPanelWidthPx: number;
+  rightPanelWidthPx: number;
+  startedAtMs: number;
 }
 
 interface CommittedToggleFlags {
@@ -334,6 +412,9 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
       base: init,
       viewportWidth: vw,
       durationMs: 260,
+      leftPanelWidthPx: init.L,
+      rightPanelWidthPx: init.W,
+      startedAtMs: 0,
     };
   });
   const motionRef = useRef(motion);
@@ -360,7 +441,28 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
 
     const nextTarget = snapshotTupleFor(currentV, nextFlags);
     const prevFrom =
-      phase === "playing" ? motion.to : snapshotTupleFor(currentV, prevFlags);
+      phase === "playing"
+        ? sampleLivePlayingTuple(motion)
+        : phase === "prep"
+          ? motion.from
+          : snapshotTupleFor(currentV, prevFlags);
+
+    const nextLeftPanelWidthPx =
+      nextTarget.L > 0
+        ? nextTarget.L
+        : prevFrom.L > 0
+          ? phase === "playing" || phase === "prep"
+            ? Math.max(prevFrom.L, motion.leftPanelWidthPx)
+            : prevFrom.L
+          : 0;
+    const nextRightPanelWidthPx =
+      nextTarget.W > 0
+        ? nextTarget.W
+        : prevFrom.W > 0
+          ? phase === "playing" || phase === "prep"
+            ? Math.max(prevFrom.W, motion.rightPanelWidthPx)
+            : prevFrom.W
+          : 0;
 
     // Switching between views (e.g. New Conversation <-> Session, or Automations <-> Session)
     // mounts a different page rather than toggling Overview on the current conversation.
@@ -373,9 +475,9 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
       setPhase("idle");
     } else if (
       phase === "playing" &&
-      nextTarget.L === motion.from.L &&
-      nextTarget.W === motion.from.W &&
-      nextTarget.D === motion.from.D
+      Math.abs(nextTarget.L - motion.from.L) < 0.5 &&
+      Math.abs(nextTarget.W - motion.from.W) < 0.5 &&
+      Math.abs(nextTarget.D - motion.from.D) < 0.5
     ) {
       const openingAny =
         nextTarget.L > motion.to.L || nextTarget.W > motion.to.W || nextTarget.D > motion.to.D;
@@ -385,11 +487,14 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
         base: motion.base,
         viewportWidth: currentV,
         durationMs: openingAny ? 260 : 225,
+        leftPanelWidthPx: nextLeftPanelWidthPx || motion.leftPanelWidthPx,
+        rightPanelWidthPx: nextRightPanelWidthPx || motion.rightPanelWidthPx,
+        startedAtMs: typeof performance !== "undefined" ? performance.now() : 0,
       });
     } else if (
-      prevFrom.L === nextTarget.L &&
-      prevFrom.W === nextTarget.W &&
-      prevFrom.D === nextTarget.D
+      Math.abs(prevFrom.L - nextTarget.L) < 0.5 &&
+      Math.abs(prevFrom.W - nextTarget.W) < 0.5 &&
+      Math.abs(prevFrom.D - nextTarget.D) < 0.5
     ) {
       setPhase("idle");
     } else {
@@ -406,6 +511,9 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
         base,
         viewportWidth: currentV,
         durationMs: openingAny ? 260 : 225,
+        leftPanelWidthPx: nextLeftPanelWidthPx,
+        rightPanelWidthPx: nextRightPanelWidthPx,
+        startedAtMs: typeof performance !== "undefined" ? performance.now() : 0,
       });
       setPhase("prep");
     }
@@ -491,6 +599,7 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
     }
 
     if (phase === "playing") {
+      motionRef.current.startedAtMs = typeof performance !== "undefined" ? performance.now() : 0;
       armFallbackTimer(motion.durationMs);
       return cancelPendingMotion;
     }
@@ -518,12 +627,14 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
       } else if (e.propertyName !== "transform") {
         return;
       }
+      const leftChanged = Math.abs(m.from.L - m.to.L) > 0.5;
+      const rightChanged = Math.abs(m.from.W - m.to.W) > 0.5;
       const stageMoved = !isFluidWidthMotion && Math.abs(playingShiftPx - prepShiftPx) > 0.5;
       const expectedAxis: "left" | "right" | "stage" = stageMoved
         ? "stage"
-        : m.from.W !== m.to.W
+        : rightChanged
           ? "right"
-          : m.from.L !== m.to.L
+          : leftChanged
             ? "left"
             : "stage";
       if (axis !== expectedAxis) return;
@@ -572,20 +683,35 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
     const m = motion;
     const V = m.viewportWidth;
 
-    const xTitle = (l: number) => l + (l > 0 ? 16 : isMac ? 114 : 48);
-    const xTopRight = (w: number) => V - w - (w > 0 ? 12 : hasSelectedHost ? 42 : 12);
+    const closedLeftPad = isMac ? 114 : 48;
+    const closedRightPad = hasSelectedHost ? 42 : 12;
+    const leftFullW = m.leftPanelWidthPx || Math.max(m.from.L, m.to.L);
+    const rightFullW = m.rightPanelWidthPx || Math.max(m.from.W, m.to.W);
+    const xTitle = (l: number) => {
+      if (l <= 0 || leftFullW <= 0) return closedLeftPad;
+      const p = clampNumber(l / leftFullW, 0, 1);
+      return l + (closedLeftPad + p * (16 - closedLeftPad));
+    };
+    const xTopRight = (w: number) => {
+      if (w <= 0 || rightFullW <= 0) return V - closedRightPad;
+      const p = clampNumber(w / rightFullW, 0, 1);
+      return V - w - (closedRightPad + p * (12 - closedRightPad));
+    };
 
     const stageGeom = phase === "idle" ? null : computeStageMotionGeometry(V, m);
     const isFluidWidthMotion = Boolean(stageGeom?.isFluidWidthMotion);
+    const leftChanged = Math.abs(m.from.L - m.to.L) > 0.5;
+    const rightChanged = Math.abs(m.from.W - m.to.W) > 0.5;
+    const overviewChanged = Math.abs(m.from.D - m.to.D) > 0.5;
 
     const leftWidthCss =
       phase === "idle"
         ? "var(--orbit-left-w)"
-        : `${Math.max(m.from.L, m.to.L)}px`;
+        : `${leftFullW}px`;
     const panelWidthCss =
       phase === "idle"
         ? "var(--orbit-right-w)"
-        : `${Math.max(m.from.W, m.to.W)}px`;
+        : `${rightFullW}px`;
 
     const leftLayoutReserveCss =
       phase === "idle"
@@ -615,33 +741,56 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
           : m.base.D;
     const dockedOverviewLayout = overviewReservePx > 0;
 
-    const shellReserveTransition =
-      !isResizing && phase === "playing" && isFluidWidthMotion
-        ? `padding-left ${m.durationMs}ms ${PANEL_EASE}, padding-right ${m.durationMs}ms ${PANEL_EASE}`
-        : "none";
+    // Only transition the exact layout reserve axis that actually changes in narrow fluid mode
+    const shellReserveAxes: string[] = [];
+    if (!isResizing && phase === "playing" && isFluidWidthMotion) {
+      if (leftChanged) shellReserveAxes.push(`padding-left ${m.durationMs}ms ${PANEL_EASE}`);
+      if (rightChanged) shellReserveAxes.push(`padding-right ${m.durationMs}ms ${PANEL_EASE}`);
+    }
+    const shellReserveTransition = shellReserveAxes.length > 0 ? shellReserveAxes.join(", ") : "none";
     const overviewReserveTransition =
-      !isResizing && phase === "playing" && isFluidWidthMotion
+      !isResizing && phase === "playing" && isFluidWidthMotion && overviewChanged
         ? `padding-right ${m.durationMs}ms ${PANEL_EASE}`
         : "none";
 
     const leftVisible =
       phase === "idle" ? sidebarOpen : m.from.L > 0 || m.to.L > 0;
-    const leftIsIn =
-      phase === "idle" ? sidebarOpen : phase === "prep" ? m.from.L > 0 : m.to.L > 0;
-    const leftTransform = leftIsIn ? "translate3d(0, 0, 0)" : "translate3d(-100%, 0, 0)";
+    let leftTransform: string;
+    if (phase === "idle") {
+      leftTransform = sidebarOpen ? "translate3d(0, 0, 0)" : "translate3d(-100%, 0, 0)";
+    } else {
+      const activeL = phase === "prep" ? m.from.L : m.to.L;
+      if (leftFullW <= 0 || activeL <= 0.5) {
+        leftTransform = "translate3d(-100%, 0, 0)";
+      } else if (Math.abs(activeL - leftFullW) < 0.5) {
+        leftTransform = "translate3d(0, 0, 0)";
+      } else {
+        leftTransform = `translate3d(${activeL - leftFullW}px, 0, 0)`;
+      }
+    }
     const leftTransition =
-      !isResizing && phase === "playing" && m.from.L !== m.to.L
+      !isResizing && phase === "playing" && leftChanged
         ? `transform ${m.durationMs}ms ${PANEL_EASE}`
         : "none";
 
     const rightVisible =
       phase === "idle" ? shouldRightOpen : m.from.W > 0 || m.to.W > 0;
     const isRightSettledOpen = shouldRightOpen && phase === "idle";
-    const rightIsIn =
-      phase === "idle" ? shouldRightOpen : phase === "prep" ? m.from.W > 0 : m.to.W > 0;
-    const rightTransform = rightIsIn ? "translate3d(0, 0, 0)" : "translate3d(100%, 0, 0)";
+    let rightTransform: string;
+    if (phase === "idle") {
+      rightTransform = shouldRightOpen ? "translate3d(0, 0, 0)" : "translate3d(100%, 0, 0)";
+    } else {
+      const activeW = phase === "prep" ? m.from.W : m.to.W;
+      if (rightFullW <= 0 || activeW <= 0.5) {
+        rightTransform = "translate3d(100%, 0, 0)";
+      } else if (Math.abs(activeW - rightFullW) < 0.5) {
+        rightTransform = "translate3d(0, 0, 0)";
+      } else {
+        rightTransform = `translate3d(${rightFullW - activeW}px, 0, 0)`;
+      }
+    }
     const rightTransition =
-      !isResizing && phase === "playing" && m.from.W !== m.to.W
+      !isResizing && phase === "playing" && rightChanged
         ? `transform ${m.durationMs}ms ${PANEL_EASE}`
         : "none";
 
@@ -662,12 +811,9 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
             ? m.from.W === 0
             : m.to.W === 0
           : m.base.W === 0);
-    const topbarPaddingTransition =
-      !isResizing && phase === "playing" && isFluidWidthMotion
-        ? `padding-left ${m.durationMs}ms ${PANEL_EASE}, padding-right ${m.durationMs}ms ${PANEL_EASE}`
-        : "none";
+    const topbarPaddingTransition = shellReserveTransition;
 
-    const baseTitleX = xTitle(m.base.L);
+    const baseTitleX = m.base.L + (m.base.L > 0 ? 16 : closedLeftPad);
     const topbarTitleOffsetPx =
       phase === "idle" || isFluidWidthMotion
         ? 0
@@ -675,11 +821,11 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
           ? xTitle(m.from.L) - baseTitleX
           : xTitle(m.to.L) - baseTitleX;
     const topbarTitleTransition =
-      !isResizing && phase === "playing" && !isFluidWidthMotion && m.from.L !== m.to.L
+      !isResizing && phase === "playing" && !isFluidWidthMotion && leftChanged
         ? `transform ${m.durationMs}ms ${PANEL_EASE}`
         : "none";
 
-    const baseRightX = xTopRight(m.base.W);
+    const baseRightX = V - m.base.W - (m.base.W > 0 ? 12 : closedRightPad);
     const topbarRightOffsetPx =
       phase === "idle" || isFluidWidthMotion
         ? 0
@@ -687,7 +833,7 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
           ? xTopRight(m.from.W) - baseRightX
           : xTopRight(m.to.W) - baseRightX;
     const topbarRightTransition =
-      !isResizing && phase === "playing" && !isFluidWidthMotion && m.from.W !== m.to.W
+      !isResizing && phase === "playing" && !isFluidWidthMotion && rightChanged
         ? `transform ${m.durationMs}ms ${PANEL_EASE}`
         : "none";
 
@@ -698,7 +844,7 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
           ? m.from.L - m.base.L
           : m.to.L - m.base.L;
     const outlineTransition =
-      !isResizing && phase === "playing" && !isFluidWidthMotion && m.from.L !== m.to.L
+      !isResizing && phase === "playing" && !isFluidWidthMotion && leftChanged
         ? `transform ${m.durationMs}ms ${PANEL_EASE}`
         : "none";
 

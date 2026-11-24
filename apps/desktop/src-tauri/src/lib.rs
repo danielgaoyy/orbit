@@ -2353,7 +2353,7 @@ async fn read_workspace_file(
 ) -> Result<WorkspaceFileView, String> {
     state
         .core
-        .read_workspace_file_on_host(&host_id, &cwd, &path)
+        .read_workspace_file_on_host_prefix(&host_id, &cwd, &path)
         .await
 }
 

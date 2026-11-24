@@ -14,8 +14,9 @@ import {
   type SubagentNameMatcher,
   resolveDelegationDispatches,
 } from "@/lib/subagents";
-import { formatThoughtSummaryLabel } from "@/lib/timeline-coalesce";
+import { useI18n } from "@/lib/i18n";
 import {
+  coalescePeerFinishes,
   computeWorkChunkDurationMs,
   splitStepGroupChronologically,
   summarizeWorkChunk,
@@ -31,11 +32,12 @@ import {
   type TurnTimingRecord,
   type ViewportAnchorHoldFn,
   computeTotalThinkingDurationMs,
+  getTurnFooter,
+  isCompactionMarkerTurn,
   isHiddenWakeupLabel,
   isWaitingWakeupLabel,
   parseArtifactRefsFromMessage,
   parseArtifactRefsFromTurnTools,
-  resolveTurnForkSeq,
 } from "./stage-helpers";
 import {
   TurnChangesBar,
@@ -88,9 +90,10 @@ const StageAssistantMessageSegment = memo(function StageAssistantMessageSegment(
   sessionSubagentMatcher?: SubagentNameMatcher | null;
   onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
 }) {
+  const { locale } = useI18n();
   const msgArtifacts = useMemo(
-    () => (!item.streaming ? parseArtifactRefsFromMessage(item.text, hostArtifacts) : []),
-    [item.streaming, item.text, hostArtifacts],
+    () => (!item.streaming ? parseArtifactRefsFromMessage(item.text, hostArtifacts, locale) : []),
+    [item.streaming, item.text, hostArtifacts, locale],
   );
 
   return (
@@ -129,9 +132,10 @@ export const TurnStageSection = memo(function TurnStageSection({
   turn,
   dispatches,
   isTurnActive,
-  isLastTurn = false,
+  isLastTurn,
   agentStatusLabel = null,
   hasLiveBackgroundTasks = false,
+  hasPlanSteps = false,
   isNetworkOffline,
   animatePromptEntrance = false,
   autoFoldCompleted,
@@ -158,6 +162,7 @@ export const TurnStageSection = memo(function TurnStageSection({
   isLastTurn?: boolean;
   agentStatusLabel?: string | null;
   hasLiveBackgroundTasks?: boolean;
+  hasPlanSteps?: boolean;
   isNetworkOffline: boolean;
   animatePromptEntrance?: boolean;
   autoFoldCompleted: boolean;
@@ -178,7 +183,14 @@ export const TurnStageSection = memo(function TurnStageSection({
   onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
   parentMessageLabel?: string | null;
 }) {
-  const rawSegments = turn.live_segments;
+  const { t, locale } = useI18n();
+  const rawSegments = useMemo(() => {
+    if (!hasPlanSteps) return turn.live_segments;
+    return turn.live_segments.filter((seg) => {
+      if (seg.kind !== "notice" || seg.item.item_type !== "notice") return true;
+      return !/^Plan:\n\[[x~ !-]\] /.test(seg.item.message);
+    });
+  }, [hasPlanSteps, turn.live_segments]);
   // When `hostArtifacts` is passed from StreamStage, avoid touching `s.hostDetails` so
   // historical turns register 0 topic subscriptions and never wake on `host_changed` bursts.
   const fallbackHostArtifacts = useOrbitSelector((s) =>
@@ -189,12 +201,12 @@ export const TurnStageSection = memo(function TurnStageSection({
   const hostArtifacts = providedHostArtifacts ?? fallbackHostArtifacts;
 
   const turnToolArtifactRefs = useMemo(
-    () => parseArtifactRefsFromTurnTools(turn, hostArtifacts),
-    [turn, hostArtifacts],
+    () => parseArtifactRefsFromTurnTools(turn, hostArtifacts, locale),
+    [turn, hostArtifacts, locale],
   );
   const lastRawSeg = rawSegments[rawSegments.length - 1] ?? null;
 
-  const segments = useMemo(() => {
+  const { segments, finishStatuses } = useMemo(() => {
     const out: typeof rawSegments = [];
     for (const seg of rawSegments) {
       if (seg.kind === "wakeup") {
@@ -204,21 +216,8 @@ export const TurnStageSection = memo(function TurnStageSection({
       }
       out.push(seg);
     }
-    return out;
-  }, [rawSegments]);
-
-  if (
-    turn.is_compaction_command &&
-    turn.folded_steps.length === 0 &&
-    turn.terminal_reply === null &&
-    turn.notices.length === 0
-  ) {
-    return (
-      <div className="min-w-0 px-[10px]">
-        <CompactionMilestoneRow label={turn.compactions[0]?.label || "Context compacted"} />
-      </div>
-    );
-  }
+    return coalescePeerFinishes(turn.agent_message, out, hostId);
+  }, [rawSegments, turn.agent_message, hostId]);
 
   const isWaitingOnlyOnBackgroundTasks =
     hasLiveBackgroundTasks &&
@@ -241,7 +240,8 @@ export const TurnStageSection = memo(function TurnStageSection({
 
   const isTrailingSettledDelegation = useMemo(() => {
     if (!isTurnActive || lastRawSeg?.kind !== "step_group") return false;
-    const split = stepGroupSplits.get(lastRawSeg.key);
+    const lastGroup = segments.at(-1);
+    const split = lastGroup && stepGroupSplits.get(lastGroup.key);
     const lastChunk = split ? (split.chunks[split.chunks.length - 1] ?? null) : null;
     if (!lastChunk || lastChunk.kind !== "delegation") return false;
     const matches = dispatches ?? resolveDelegationDispatches(lastChunk.items, sessionSubagents ?? EMPTY_SUBAGENTS, hostId);
@@ -253,7 +253,7 @@ export const TurnStageSection = memo(function TurnStageSection({
         resolved?.subagent.status === "awaiting_permission"
       );
     });
-  }, [isTurnActive, lastRawSeg, stepGroupSplits, sessionSubagents, hostId, dispatches]);
+  }, [isTurnActive, lastRawSeg, segments, stepGroupSplits, sessionSubagents, hostId, dispatches]);
 
   const needsTrailingActivity =
     isTurnActive &&
@@ -268,20 +268,26 @@ export const TurnStageSection = memo(function TurnStageSection({
       lastRawSeg.kind === "agent_message" ||
       isTrailingSettledDelegation);
 
-  const hasBody = segments.length > 0 || needsTrailingActivity;
+  const hasBody = segments.length > 0 || finishStatuses.size > 0 || needsTrailingActivity;
+  const hasBodyContent = segments.length > 0 || needsTrailingActivity ||
+    turnToolArtifactRefs.length > 0 || turn.turn_diffs.length > 0;
   const liveStartedAtMs = timing?.startedAtMs ?? turn.started_at_ms ?? null;
   const promptItem =
     turn.user_prompt?.item_type === "user_prompt" ? turn.user_prompt : null;
-  const lastReplyText =
-    !isTurnActive && turn.last_assistant_reply?.item_type === "assistant_message"
-      ? turn.last_assistant_reply.text.trim() || null
-      : null;
-  const turnForkSeq = useMemo(() => resolveTurnForkSeq(turn), [turn]);
+  const footer = getTurnFooter(turn, { isActive: isTurnActive, isLastTurn, canFork: !!onRequestFork, timing });
+
+  if (isCompactionMarkerTurn(turn)) {
+    return (
+      <div className="min-w-0 px-[10px]">
+        <CompactionMilestoneRow label={turn.compactions[0]?.label} />
+      </div>
+    );
+  }
 
   return (
     <div
       style={!isTurnActive ? { contain: "layout style" } : undefined}
-      className="min-w-0 space-y-4"
+      className={hasBody && !hasBodyContent ? "group/turn min-w-0" : "group/turn min-w-0 space-y-4"}
     >
       {promptItem && (
         <UserPromptBubble
@@ -301,12 +307,14 @@ export const TurnStageSection = memo(function TurnStageSection({
           hostId={hostId}
           agentId={agentId}
           item={turn.agent_message}
+          holdViewport={holdViewport}
+          coalescedFinishStatus={finishStatuses.get(turn.agent_message)}
           sessionSubagents={sessionSubagents}
         />
       )}
 
       {hasBody && (
-        <div className="group/turn min-w-0 px-[10px]">
+        <div className="flow-root min-w-0 px-[10px]">
           <div className="min-w-0 space-y-3">
             {(() => {
               let nextWorkOrdinal = 0;
@@ -350,6 +358,8 @@ export const TurnStageSection = memo(function TurnStageSection({
                       hostId={hostId}
                       agentId={agentId}
                       item={seg.item}
+                      holdViewport={holdViewport}
+                      coalescedFinishStatus={finishStatuses.get(seg.item)}
                       inline
                       sessionSubagents={sessionSubagents}
                     />
@@ -386,10 +396,6 @@ export const TurnStageSection = memo(function TurnStageSection({
                     computeTotalThinkingDurationMs(seg.items, agentId, getThinkingDurationMs) ??
                     seg.thought_duration_ms ??
                     null;
-                  const groupSettledLabel =
-                    seg.summary.counts.action_steps === 0 && seg.summary.counts.thought_count > 0
-                      ? formatThoughtSummaryLabel(groupThoughtMs, seg.summary.counts.thought_count)
-                      : seg.summary.label;
                   const groupSettledDurationMs =
                     seg.work_duration_ms ??
                     (segments.length === 1
@@ -404,7 +410,9 @@ export const TurnStageSection = memo(function TurnStageSection({
                       isWorkActive={isGroupActive}
                       liveLabel={seg.summary.live_label}
                       liveDetail={seg.summary.live_detail ?? null}
-                      settledLabel={groupSettledLabel}
+                      settledLabel={seg.summary.label}
+                      hasProjectedSummary
+                      thoughtDurationMs={groupThoughtMs}
                       summaryCounts={seg.summary.counts}
                       labelIncludesFailure={seg.summary.label_includes_failure}
                       defaultCollapsed={autoFoldCompleted}
@@ -449,6 +457,7 @@ export const TurnStageSection = memo(function TurnStageSection({
                         sessionSubagents={sessionSubagents}
                         dispatches={dispatches}
                         parentMessageLabel={parentMessageLabel}
+                        holdViewport={holdViewport}
                       />
                     );
                   }
@@ -461,7 +470,7 @@ export const TurnStageSection = memo(function TurnStageSection({
                     agentId,
                     getThinkingDurationMs,
                   );
-                  const chunkSummary = summarizeWorkChunk(chunk.items, chunkThoughtMs);
+                  const chunkSummary = summarizeWorkChunk(chunk.items, chunkThoughtMs, locale);
                   const chunkHasRunningStep = chunk.items.some(
                     (it) => it.item_type === "tool_call" && it.status === "running",
                   );
@@ -484,10 +493,6 @@ export const TurnStageSection = memo(function TurnStageSection({
                     isTurnActive &&
                     !chunkHasFollowingContent &&
                     (chunkHasRunningStep || (isLastSeg && !chunkIsTrailingFailed));
-                  const chunkSettledLabel =
-                    chunkSummary.counts.action_steps === 0 && chunkSummary.counts.thought_count > 0
-                      ? formatThoughtSummaryLabel(chunkThoughtMs, chunkSummary.counts.thought_count)
-                      : chunkSummary.label;
                   const chunkDurationMs = computeWorkChunkDurationMs(chunk.items);
                   const firstChunkTs = chunk.items[0]?.timestamp_ms ?? null;
                   const lastChunkTs = chunk.items[chunk.items.length - 1]?.timestamp_ms ?? null;
@@ -507,7 +512,8 @@ export const TurnStageSection = memo(function TurnStageSection({
                       isWorkActive={isChunkActive}
                       liveLabel={chunkSummary.live_label}
                       liveDetail={chunkSummary.live_detail ?? null}
-                      settledLabel={chunkSettledLabel}
+                      settledLabel={chunkSummary.label}
+                      thoughtDurationMs={chunkThoughtMs}
                       summaryCounts={chunkSummary.counts}
                       labelIncludesFailure={chunkSummary.label_includes_failure}
                       defaultCollapsed={autoFoldCompleted}
@@ -549,7 +555,7 @@ export const TurnStageSection = memo(function TurnStageSection({
             {needsTrailingActivity && (() => {
               const trailingLabel =
                 lastRawSeg === null
-                  ? "Working…"
+                  ? t("stage.working")
                   : lastRawSeg.kind === "wakeup" &&
                       !isHiddenWakeupLabel(lastRawSeg.label) &&
                       lastRawSeg.label.trim()
@@ -562,7 +568,7 @@ export const TurnStageSection = memo(function TurnStageSection({
                       ? agentStatusLabel.trim().endsWith("…")
                         ? agentStatusLabel.trim()
                         : `${agentStatusLabel.trim()}…`
-                      : "Thinking…";
+                      : t("stage.thinkingPending");
               const isTrailingBackgroundWait = /background task/i.test(trailingLabel);
               return (
                 <TurnActivityDisclosure
@@ -590,18 +596,15 @@ export const TurnStageSection = memo(function TurnStageSection({
             })()}
 
             {!isTurnActive && <TurnChangesBar diffs={turn.turn_diffs} cwd={cwd} />}
-
+          </div>
+          {footer && (
             <TurnFooter
-              isTurnActive={isTurnActive}
-              timing={timing}
-              completedAtMs={turn.completed_at_ms}
-              replyText={lastReplyText}
-              forkUpToSeq={turnForkSeq}
+              {...footer}
               isLastTurn={isLastTurn}
               canForkWorktree={canForkWorktree}
               onRequestFork={onRequestFork}
             />
-          </div>
+          )}
         </div>
       )}
     </div>
@@ -612,6 +615,7 @@ export const TurnStageSection = memo(function TurnStageSection({
   prev.isLastTurn === next.isLastTurn &&
   prev.agentStatusLabel === next.agentStatusLabel &&
   prev.hasLiveBackgroundTasks === next.hasLiveBackgroundTasks &&
+  prev.hasPlanSteps === next.hasPlanSteps &&
   prev.isNetworkOffline === next.isNetworkOffline &&
   prev.animatePromptEntrance === next.animatePromptEntrance &&
   prev.autoFoldCompleted === next.autoFoldCompleted &&

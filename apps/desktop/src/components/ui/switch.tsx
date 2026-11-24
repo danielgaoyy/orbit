@@ -23,7 +23,7 @@ export function Switch({ className, ...props }: SwitchProps) {
       <BaseSwitch.Thumb
         data-slot="switch-thumb"
         className={cn(
-          "bg-surface-overlay data-[checked]:bg-action-primary-fg pointer-events-none block h-[18px] w-[18px] rounded-full shadow-xs ring-0 transition-transform duration-150 data-[checked]:translate-x-[16px] data-[unchecked]:translate-x-0",
+          "bg-surface-overlay data-[checked]:bg-action-primary-fg pointer-events-none block h-[18px] w-[18px] rounded-full shadow-xs ring-0 transition-transform duration-150 ease-[var(--ease-out-expo)] data-[checked]:translate-x-[16px] data-[unchecked]:translate-x-0",
         )}
       />
     </BaseSwitch.Root>

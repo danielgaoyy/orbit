@@ -1335,7 +1335,7 @@ function CommandPaletteDialog() {
         )}
 
         {mode === "files" && parsedFile.line != null && (
-          <span className="bg-primary/12 text-primary shrink-0 rounded px-1.5 py-0.5 font-mono text-[11px] font-medium">
+          <span className="bg-signal-info/12 text-signal-info shrink-0 rounded px-1.5 py-0.5 font-mono text-[11px] font-medium">
             L{parsedFile.line}
           </span>
         )}

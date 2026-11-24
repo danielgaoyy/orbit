@@ -1,5 +1,12 @@
 import { useEffect, useRef } from "react";
 import {
+  hasOpenSettingsBlockingOverlay,
+  isFocusInsideFileViewerPane,
+  isFocusInsideSidePanel,
+  shouldCloseSettingsOnEscape,
+  SIDE_PANEL_SELECTOR,
+} from "@/lib/file-viewer-shortcuts";
+import {
   isAgentForegroundRunning,
   isMacDesktop,
   orbitIpc,
@@ -46,8 +53,15 @@ export function useGlobalErgonomicKeybindings(): void {
         return;
       }
 
-      // 1a. Filter Sidebar Conversations (`⌘F` / `Ctrl+F`) — yield to terminal search & modal overlays
+      // 1a. Filter Sidebar Conversations (`⌘F` / `Ctrl+F`) — yield to terminal search, Side Panel / File Viewer, & modal overlays
       if (mod && !e.shiftKey && !e.altKey && keyLower === "f" && !snap.terminalFocused) {
+        const sidePanelEl = document.querySelector<HTMLElement>(SIDE_PANEL_SELECTOR);
+        const focusInsideSidePanelOrFileViewer =
+          isFocusInsideSidePanel(e.target, document.activeElement) ||
+          isFocusInsideFileViewerPane(sidePanelEl, e.target, document.activeElement);
+        if (focusInsideSidePanelOrFileViewer) {
+          return;
+        }
         const isOverlayOpen =
           snap.activeView === "settings" ||
           snap.commandPaletteOpen ||
@@ -59,7 +73,11 @@ export function useGlobalErgonomicKeybindings(): void {
           snap.copyCodeBlocksTarget !== null ||
           snap.handoffDialogTarget !== null ||
           snap.mediaPreviewTarget !== null ||
-          Boolean(document.querySelector('[data-slot="dialog-content"]'));
+          Boolean(
+            document.querySelector(
+              '[data-slot="dialog-content"], [role="dialog"], [role="alertdialog"]',
+            ),
+          );
         if (!isOverlayOpen) {
           e.preventDefault();
           if (e.repeat) return;
@@ -76,10 +94,25 @@ export function useGlobalErgonomicKeybindings(): void {
         return;
       }
 
-      // 1c. Escape inside Settings View returns instantaneously to Workspace
-      if (e.key === "Escape" && snap.activeView === "settings" && !snap.commandPaletteOpen) {
-        const tag = (e.target as HTMLElement | null)?.tagName;
-        if (tag !== "INPUT" && tag !== "TEXTAREA") {
+      // 1c. Escape inside Settings View returns instantaneously to Workspace —
+      //     unless an inner dialog, popover, menu, or listbox overlay is open.
+      if (e.key === "Escape" && snap.activeView === "settings") {
+        const hasBlockingOverlay =
+          snap.pairDialogOpen ||
+          snap.relayDialogOpen ||
+          snap.remoteFolderPickerHostId !== null ||
+          snap.mediaPreviewTarget !== null ||
+          hasOpenSettingsBlockingOverlay();
+        if (
+          shouldCloseSettingsOnEscape({
+            key: e.key,
+            defaultPrevented: e.defaultPrevented,
+            activeView: snap.activeView,
+            commandPaletteOpen: snap.commandPaletteOpen,
+            targetTagName: (e.target as HTMLElement | null)?.tagName,
+            hasBlockingOverlay,
+          })
+        ) {
           e.preventDefault();
           orbitActions.closeSettings();
           return;

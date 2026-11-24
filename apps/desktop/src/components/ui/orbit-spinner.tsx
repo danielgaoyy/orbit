@@ -34,7 +34,10 @@ export const OrbitSpinner = memo(function OrbitSpinner({
       viewBox="0 0 16 16"
       fill="none"
       aria-hidden="true"
-      className={cn("shrink-0 animate-[spin_0.85s_linear_infinite] will-change-transform", className)}
+      className={cn(
+        "orbit-spinner-reduced shrink-0 animate-[spin_0.85s_linear_infinite] will-change-transform",
+        className,
+      )}
     >
       <defs>
         <linearGradient id={gradId} x1="8" y1="1.75" x2="14.25" y2="8" gradientUnits="userSpaceOnUse">

@@ -41,7 +41,7 @@ function DialogContent({
 }) {
   return (
     <BaseDialog.Portal>
-      <BaseDialog.Backdrop className="orbit-dialog-overlay fixed inset-0 z-50 bg-black/45 backdrop-blur-[2px]" />
+      <BaseDialog.Backdrop className="orbit-dialog-overlay fixed inset-0 z-50 bg-black/45 dark:bg-black/55" />
       <BaseDialog.Popup
         data-slot="dialog-content"
         className={cn(

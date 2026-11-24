@@ -40,6 +40,11 @@ import { DiffStat } from "@/components/ui/diff-stat";
 import { IconButton } from "@/components/ui/icon-button";
 import { ListRow } from "@/components/ui/list-row";
 import { SimpleTooltip } from "@/components/ui/overlays";
+import {
+  cancelHoverPrefetch,
+  scheduleHoverPrefetch,
+  shouldPrefetchOnPointerDown,
+} from "@/lib/file-prefetch";
 import { useI18n } from "@/lib/i18n";
 import { modSymbol } from "@/lib/keybindings";
 import {
@@ -169,17 +174,17 @@ const StageOverviewBody = memo(function StageOverviewBody({
       : EMPTY_TIMERS,
   );
   const localSubagentHostDetail = useOrbitSelector((s) =>
-    hasLocalSubagentRecords(s.hostDetails[hostId], hostId, agentId)
+    hasLocalSubagentRecords(s.hostDetails[hostId], hostId, agentId, insights.subagents)
       ? (s.hostDetails[hostId] ?? null)
       : null,
   );
   const crossHostDetails = useOrbitSelector((s) =>
-    hasCrossHostChildAgents(s.hostDetails, hostId, agentId)
+    hasCrossHostChildAgents(s.hostDetails, hostId, agentId, insights.subagents)
       ? s.hostDetails
       : EMPTY_HOST_DETAILS,
   );
   const crossHostFleetHosts = useOrbitSelector((s) =>
-    hasCrossHostChildAgents(s.hostDetails, hostId, agentId)
+    hasCrossHostChildAgents(s.hostDetails, hostId, agentId, insights.subagents)
       ? s.fleet.hosts
       : EMPTY_FLEET_HOSTS,
   );
@@ -188,6 +193,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
     selectScopedTerminalCount(s.terminalTabs, s.hostDetails[hostId]?.terminals, hostId, cwd),
   );
   const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
+  const selectedDiffPath = useOrbitSelector((s) => s.selectedDiffPath);
   const activeSideTab = useOrbitSelector((s) =>
     s.sidePanelOpen
       ? (s.sidePanelTabs.find((tab) => tab.id === s.activeSidePanelTabId) ?? null)
@@ -436,8 +442,8 @@ const StageOverviewBody = memo(function StageOverviewBody({
     <>
       {/* 1. Fixed Top Workspace Quick Bar */}
       <div className="shrink-0 px-2 pt-2 pb-1.5 select-none">
-        <div className="flex h-[24px] items-center justify-between pr-0.5 pl-2 pb-0.5">
-          <span className="text-ink-tertiary text-[11px] font-medium tracking-[0.04em] uppercase">
+        <div className="flex h-[26px] items-center justify-between pr-0.5 pl-2 pb-0.5">
+          <span className="text-ink-primary text-[13px] font-medium">
             {t("overview.title")}
           </span>
           <IconButton
@@ -845,73 +851,85 @@ const StageOverviewBody = memo(function StageOverviewBody({
                         : t("overview.fileActionRead");
 
                   return (
-                    <div key={file.path} className="group/tfile relative">
-                      <ListRow
-                        density="compact"
-                        selected={
-                          activeSideTab?.kind === "file" &&
-                          doesTouchedFileMatchOpenPath(activeSideTab.filePath, file, cwd)
-                        }
-                        title={`${actionLabel} · ${file.display_path}`}
-                        onClick={() =>
-                          orbitActions.openFileInSidePanel(file.path, { hostId, cwd })
-                        }
-                        leading={
-                          <span
-                            className={cn(
-                              "size-[6px] rounded-full",
-                              file.action === "created"
-                                ? "bg-signal-success"
-                                : file.action === "edited"
-                                  ? "bg-signal-info"
-                                  : "bg-ink-muted/60",
-                            )}
-                          />
-                        }
-                        trailing={
-                          file.additions > 0 || file.deletions > 0 ? (
-                            <span
-                              className={cn(
-                                isModified &&
-                                  "transition-opacity duration-150 group-focus-within/tfile:opacity-0 group-hover/tfile:opacity-0",
-                              )}
-                            >
-                              <DiffStat
-                                size="xs"
-                                additions={file.additions}
-                                deletions={file.deletions}
-                              />
-                            </span>
-                          ) : undefined
-                        }
-                      >
-                        <span className="flex min-w-0 items-baseline gap-1.5">
-                          <span className="min-w-0 truncate font-mono text-[12px]">{basename}</span>
-                          {dirHint && (
-                            <span className="text-ink-faint max-w-[44%] shrink-0 truncate font-mono text-[10.5px] font-normal">
-                              {dirHint}
-                            </span>
-                          )}
-                        </span>
-                      </ListRow>
-
-                      {isModified && (
-                        <div className="bg-[var(--overview-surface,var(--surface-raised))]/95 border-border-subtle pointer-events-none absolute top-1/2 right-1.5 flex -translate-y-1/2 items-center rounded-[7px] border p-0.5 opacity-0 shadow-xs backdrop-blur-[6px] transition-opacity duration-150 group-focus-within/tfile:pointer-events-auto group-focus-within/tfile:opacity-100 group-hover/tfile:pointer-events-auto group-hover/tfile:opacity-100">
-                          <IconButton
-                            size="xs"
-                            tooltip={t("overview.viewFileDiff")}
-                            onClick={() =>
-                              orbitActions.openReviewTab({
-                                path: file.display_path,
-                                scope: toolSummary.reviewScope,
-                              })
+                    <ListRow
+                      key={file.path}
+                      density="compact"
+                      selected={
+                        activeSideTab?.kind === "review" && isModified
+                          ? doesTouchedFileMatchOpenPath(selectedDiffPath, file, cwd)
+                          : activeSideTab?.kind === "file" &&
+                            doesTouchedFileMatchOpenPath(activeSideTab.filePath, file, cwd)
+                      }
+                      title={`${actionLabel} · ${file.display_path}`}
+                      onMouseEnter={
+                        !isModified
+                          ? () =>
+                              scheduleHoverPrefetch(() =>
+                                orbitActions.prefetchWorkspaceFile(file.path, {
+                                  hostId,
+                                  cwd,
+                                  intent: "hover",
+                                }),
+                              )
+                          : undefined
+                      }
+                      onMouseLeave={!isModified ? cancelHoverPrefetch : undefined}
+                      onPointerDown={
+                        !isModified
+                          ? (e) => {
+                              if (shouldPrefetchOnPointerDown(e)) {
+                                cancelHoverPrefetch();
+                                orbitActions.prefetchWorkspaceFile(file.path, {
+                                  hostId,
+                                  cwd,
+                                  intent: "press",
+                                });
+                              }
                             }
-                          >
-                            <FileDiff className="size-3" />
-                          </IconButton>
-                        </div>
-                      )}
-                    </div>
+                          : undefined
+                      }
+                      onClick={() => {
+                        cancelHoverPrefetch();
+                        if (isModified) {
+                          orbitActions.openReviewTab({
+                            path: file.path,
+                            scope: toolSummary.reviewScope,
+                          });
+                        } else {
+                          orbitActions.openFileInSidePanel(file.path, { hostId, cwd });
+                        }
+                      }}
+                      leading={
+                        <span
+                          className={cn(
+                            "size-[6px] rounded-full",
+                            file.action === "created"
+                              ? "bg-signal-success"
+                              : file.action === "edited"
+                                ? "bg-signal-info"
+                                : "bg-ink-muted/60",
+                          )}
+                        />
+                      }
+                      trailing={
+                        file.additions > 0 || file.deletions > 0 ? (
+                          <DiffStat
+                            size="xs"
+                            additions={file.additions}
+                            deletions={file.deletions}
+                          />
+                        ) : undefined
+                      }
+                    >
+                      <span className="flex min-w-0 items-baseline gap-1.5">
+                        <span className="min-w-0 truncate font-mono text-[13px]">{basename}</span>
+                        {dirHint && (
+                          <span className="text-ink-faint max-w-[44%] shrink-0 truncate font-mono text-[11px] font-normal">
+                            {dirHint}
+                          </span>
+                        )}
+                      </span>
+                    </ListRow>
                   );
                 })}
               </div>
@@ -937,6 +955,7 @@ const DockedOverviewShell = memo(function DockedOverviewShell({
   children: ReactNode;
 }) {
   const {
+    isAnimating,
     dockedOverviewMounted,
     dockedOverviewVisualOpen,
     dockedOverviewTransform,
@@ -957,9 +976,10 @@ const DockedOverviewShell = memo(function DockedOverviewShell({
         transform: dockedOverviewTransform,
         opacity: dockedOverviewVisualOpen ? 1 : 0,
         transition: dockedOverviewTransition,
+        willChange: isAnimating ? "transform, opacity" : undefined,
       }}
       className={cn(
-        "fixed right-4 z-[25] flex w-[288px] origin-top-right flex-col will-change-[transform,opacity]",
+        "fixed right-4 z-[25] flex w-[288px] origin-top-right flex-col",
         !dockedOverviewVisualOpen && "pointer-events-none",
       )}
     >
@@ -984,10 +1004,26 @@ const PopoverOverviewShell = memo(function PopoverOverviewShell({
   const isPopoverVisible = !canDock && popoverOpen;
   const [popoverMounted, setPopoverMounted] = useState(isPopoverVisible);
   const [popoverVisualOpen, setPopoverVisualOpen] = useState(isPopoverVisible);
+  const [isPopoverAnimating, setIsPopoverAnimating] = useState(false);
+  const mountedRef = useRef(popoverMounted);
+  mountedRef.current = popoverMounted;
 
   useEffect(() => {
+    const prefersReducedMotion =
+      typeof window !== "undefined" &&
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+
     if (isPopoverVisible) {
       setPopoverMounted(true);
+      if (prefersReducedMotion) {
+        setIsPopoverAnimating(false);
+        setPopoverVisualOpen(true);
+        const raf = window.requestAnimationFrame(() => {
+          popoverRef.current?.focus({ preventScroll: true });
+        });
+        return () => window.cancelAnimationFrame(raf);
+      }
+      setIsPopoverAnimating(true);
       let raf2 = 0;
       const raf1 = window.requestAnimationFrame(() => {
         raf2 = window.requestAnimationFrame(() => {
@@ -995,13 +1031,29 @@ const PopoverOverviewShell = memo(function PopoverOverviewShell({
           popoverRef.current?.focus({ preventScroll: true });
         });
       });
+      const settleTimer = window.setTimeout(() => setIsPopoverAnimating(false), 215);
       return () => {
         window.cancelAnimationFrame(raf1);
         if (raf2) window.cancelAnimationFrame(raf2);
+        window.clearTimeout(settleTimer);
       };
     }
+
     setPopoverVisualOpen(false);
-    const timer = window.setTimeout(() => setPopoverMounted(false), 165);
+    if (!mountedRef.current) {
+      setIsPopoverAnimating(false);
+      return undefined;
+    }
+    if (prefersReducedMotion) {
+      setIsPopoverAnimating(false);
+      setPopoverMounted(false);
+      return undefined;
+    }
+    setIsPopoverAnimating(true);
+    const timer = window.setTimeout(() => {
+      setIsPopoverAnimating(false);
+      setPopoverMounted(false);
+    }, 150);
     return () => window.clearTimeout(timer);
   }, [isPopoverVisible]);
 
@@ -1050,11 +1102,20 @@ const PopoverOverviewShell = memo(function PopoverOverviewShell({
       role="dialog"
       aria-label={ariaLabel}
       inert={!popoverVisualOpen}
+      onTransitionEnd={(e) => {
+        if (e.target !== e.currentTarget) return;
+        if (e.propertyName !== "transform" && e.propertyName !== "opacity") return;
+        setIsPopoverAnimating(false);
+        if (!isPopoverVisible) {
+          setPopoverMounted(false);
+        }
+      }}
+      style={isPopoverAnimating ? { willChange: "transform, opacity" } : undefined}
       className={cn(
-        "absolute top-3 right-4 z-30 flex max-h-[min(560px,calc(100%-24px))] w-[288px] max-w-[calc(100%-32px)] origin-top-right flex-col outline-none will-change-[transform,opacity]",
+        "absolute top-3 right-4 z-30 flex max-h-[min(560px,calc(100%-24px))] w-[288px] max-w-[calc(100%-32px)] origin-top-right flex-col outline-none motion-reduce:transition-none",
         popoverVisualOpen
-          ? "translate-x-0 translate-y-0 scale-100 opacity-100 transition-[opacity,transform] duration-[190ms] ease-[var(--ease-out-expo)]"
-          : "pointer-events-none translate-x-1 -translate-y-1.5 scale-[0.97] opacity-0 transition-[opacity,transform] duration-[145ms] ease-[var(--ease-exit)]",
+          ? "translate-x-0 translate-y-0 scale-100 opacity-100 transition-[opacity,transform] duration-[165ms] ease-[var(--ease-out-expo)]"
+          : "pointer-events-none translate-x-1 -translate-y-1.5 scale-[0.97] opacity-0 transition-[opacity,transform] duration-[120ms] ease-[var(--ease-exit)]",
       )}
     >
       <Card className="floating-surface flex min-h-0 max-h-full w-full flex-col gap-0 overflow-hidden rounded-[12px] border p-0">

@@ -13,7 +13,6 @@ import {
   FileWarning,
   GitCompareArrows,
   Info,
-  Loader2,
   MessageSquarePlus,
   Pencil,
   RefreshCw,
@@ -28,6 +27,7 @@ import {
   MarkdownLinkProvider,
 } from "@/components/markdown-blocks";
 import { WorkspaceCodeEditor } from "@/components/side-panel/workspace-code-editor";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { MediaPlayer } from "@/components/viewers/media-player";
 import { PdfViewer } from "@/components/viewers/pdf-viewer";
 import { formatLineRangeLabel, normalizeLineRange } from "@/lib/file-links";
@@ -42,6 +42,7 @@ import { SimpleTooltip } from "@/components/ui/overlays";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { formatFileSizeCompact } from "@/lib/session-insights";
 import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
+import { useDelayedLoading } from "@/lib/use-delayed-loading";
 import {
   type SidePanelTab,
   fileCacheKey,
@@ -164,6 +165,8 @@ export const FileViewerTab = memo(function FileViewerTab({
   }, [isLogFile, logFollow, hostId, cwd, path, tab.id, isCacheError]);
 
   const data = cacheEntry?.data ?? null;
+  const isInitialLoading = Boolean((!cacheEntry || cacheEntry.status === "loading") && !data);
+  const showLoadingIndicator = useDelayedLoading(isInitialLoading);
   const relPath = useMemo(() => stripWorkspacePrefix(path, cwd), [path, cwd]);
   const displayHeaderPath = useMemo(() => {
     if (!isTaskLogPath) return relPath;
@@ -320,9 +323,10 @@ export const FileViewerTab = memo(function FileViewerTab({
   }, [gitStatusFiles, relPath, path]);
 
   // Build virtualized code lines lazily:
-  // - Non-markdown text files receive pre-highlighted initial lines from Rust (`data.highlighted_lines`).
-  // - Markdown files skip upfront `syntect` when opening in Preview mode; plain lines are materialized
-  //   only if the user switches to Source view, with visible chunks highlighted lazily in the background.
+  // - Non-markdown source files receive a pre-highlighted prefix from Rust (`data.highlighted_lines`,
+  //   up to 250 lines) so large files never duplicate trailing plain lines across IPC or JS heap.
+  // - Deeper ranges (and Markdown Source mode) render immediately from raw lines and highlight
+  //   visible 250-line chunks lazily in the background.
   const isCodeViewActive = Boolean(
     data &&
       data.content_kind === "text" &&
@@ -331,31 +335,16 @@ export const FileViewerTab = memo(function FileViewerTab({
       (!isMarkdown || markdownMode === "source"),
   );
 
-  const baseCodeLines = useMemo<readonly HighlightedLineView[]>(() => {
+  const rawCodeLines = useMemo<readonly string[]>(() => {
     if (!isCodeViewActive || !data) return [];
-    if (data.highlighted_lines.length > 0) {
-      return data.highlighted_lines;
-    }
-    const raw = data.content.split(/\r?\n/);
-    return raw.map((text, idx) => ({
-      line_number: idx + 1,
-      tokens:
-        text.length > 0
-          ? [
-              {
-                text,
-                fg_hex: DARK_PLAIN_TOKEN_FG,
-                light_fg_hex: LIGHT_PLAIN_TOKEN_FG,
-                bold: false,
-                italic: false,
-              },
-            ]
-          : [],
-    }));
+    return data.content.split(/\r?\n/);
   }, [isCodeViewActive, data]);
 
+  const codeLineCount = rawCodeLines.length;
+  const preHighlightedLineCount = data?.highlighted_lines.length ?? 0;
+
   const codeVirtualizer = useVirtualizer({
-    count: isCodeViewActive ? baseCodeLines.length : 0,
+    count: isCodeViewActive ? codeLineCount : 0,
     getScrollElement: () => codeViewportRef.current,
     estimateSize: () => 20,
     overscan: 28,
@@ -363,7 +352,7 @@ export const FileViewerTab = memo(function FileViewerTab({
 
   const virtualCodeItems = codeVirtualizer.getVirtualItems();
 
-  // Lazily syntax-highlight unhighlighted visible 250-line chunks (e.g. lines > 600 or Markdown Source)
+  // Lazily syntax-highlight unhighlighted visible 250-line chunks (e.g. lines beyond pre-highlighted prefix or Markdown Source)
   const firstVisibleIdx = virtualCodeItems[0]?.index ?? -1;
   const lastVisibleIdx = virtualCodeItems[virtualCodeItems.length - 1]?.index ?? -1;
   useEffect(() => {
@@ -376,9 +365,9 @@ export const FileViewerTab = memo(function FileViewerTab({
     for (let c = startChunk; c <= endChunk; c += 1) {
       if (lazyHighlightRequestedChunksRef.current.has(c)) continue;
       const chunkStart = c * CHUNK_SIZE;
-      const chunkEnd = Math.min(baseCodeLines.length, chunkStart + CHUNK_SIZE);
-      // Skip chunks that already came pre-highlighted from Rust (non-markdown first 600 lines)
-      if (data.highlighted_lines.length > 0 && chunkEnd <= 600) {
+      const chunkEnd = Math.min(codeLineCount, chunkStart + CHUNK_SIZE);
+      // Skip chunks fully covered by Rust's eager highlighted prefix
+      if (preHighlightedLineCount > 0 && chunkEnd <= preHighlightedLineCount) {
         lazyHighlightRequestedChunksRef.current.add(c);
         continue;
       }
@@ -394,11 +383,8 @@ export const FileViewerTab = memo(function FileViewerTab({
         if (lazyHighlightRequestedChunksRef.current.has(c)) continue;
         lazyHighlightRequestedChunksRef.current.add(c);
         const chunkStart = c * CHUNK_SIZE;
-        const chunkEnd = Math.min(baseCodeLines.length, chunkStart + CHUNK_SIZE);
-        const chunkText = baseCodeLines
-          .slice(chunkStart, chunkEnd)
-          .map((l) => l.tokens.map((t) => t.text).join(""))
-          .join("\n");
+        const chunkEnd = Math.min(codeLineCount, chunkStart + CHUNK_SIZE);
+        const chunkText = rawCodeLines.slice(chunkStart, chunkEnd).join("\n");
         void orbitIpc
           .highlightWorkspaceCode(data.language, chunkText, CHUNK_SIZE)
           .then((highlighted) => {
@@ -422,7 +408,15 @@ export const FileViewerTab = memo(function FileViewerTab({
     }, 60);
 
     return () => window.clearTimeout(timer);
-  }, [isCodeViewActive, data, baseCodeLines, firstVisibleIdx, lastVisibleIdx]);
+  }, [
+    isCodeViewActive,
+    data,
+    rawCodeLines,
+    codeLineCount,
+    preHighlightedLineCount,
+    firstVisibleIdx,
+    lastVisibleIdx,
+  ]);
 
   // Compute lowercase search buffer strictly on demand when Find bar is actively searching
   const activeSearchQuery = findOpen ? findQuery.trim().toLowerCase() : "";
@@ -519,8 +513,8 @@ export const FileViewerTab = memo(function FileViewerTab({
   useEffect(() => {
     if (!activeTargetLine || isEditMode) return;
     const rafId = window.requestAnimationFrame(() => {
-      if (isCodeViewActive && baseCodeLines.length > 0) {
-        const clampedIdx = Math.max(0, Math.min(activeTargetLine - 1, baseCodeLines.length - 1));
+      if (isCodeViewActive && codeLineCount > 0) {
+        const clampedIdx = Math.max(0, Math.min(activeTargetLine - 1, codeLineCount - 1));
         codeVirtualizer.scrollToIndex(clampedIdx, { align: "center" });
         return;
       }
@@ -538,7 +532,7 @@ export const FileViewerTab = memo(function FileViewerTab({
     renderedLineCap,
     isEditMode,
     isCodeViewActive,
-    baseCodeLines.length,
+    codeLineCount,
     codeVirtualizer,
   ]);
 
@@ -728,10 +722,10 @@ export const FileViewerTab = memo(function FileViewerTab({
                 const targetLine = focusRange.startLine;
                 if (targetLine == null) return;
                 window.requestAnimationFrame(() => {
-                  if (isCodeViewActive && baseCodeLines.length > 0) {
+                  if (isCodeViewActive && codeLineCount > 0) {
                     const clampedIdx = Math.max(
                       0,
-                      Math.min(targetLine - 1, baseCodeLines.length - 1),
+                      Math.min(targetLine - 1, codeLineCount - 1),
                     );
                     codeVirtualizer.scrollToIndex(clampedIdx, { align: "center" });
                     return;
@@ -740,7 +734,7 @@ export const FileViewerTab = memo(function FileViewerTab({
                   node?.scrollIntoView({ block: "center", behavior: "smooth" });
                 });
               }}
-              className="bg-primary/[0.12] text-primary hover:bg-primary/[0.18] tabular-nums shrink-0 cursor-pointer rounded px-1.5 py-0.5 font-mono text-[11px] font-medium transition-colors"
+              className="bg-signal-info/[0.12] text-signal-info hover:bg-signal-info/[0.18] tabular-nums shrink-0 cursor-pointer rounded px-1.5 py-0.5 font-mono text-[11px] font-medium transition-colors"
             >
               {focusLabel}
             </button>
@@ -870,7 +864,7 @@ export const FileViewerTab = memo(function FileViewerTab({
                 )}
               >
                 {draft?.saving ? (
-                  <Loader2 className="h-[12px] w-[12px] animate-spin" />
+                  <OrbitSpinner size={12} />
                 ) : (
                   <Save className="h-[12px] w-[12px]" />
                 )}
@@ -1081,11 +1075,15 @@ export const FileViewerTab = memo(function FileViewerTab({
       )}
 
       {/* Main Content Surface */}
-      {cacheEntry?.status === "loading" && !data ? (
-        <div className="text-muted-foreground flex flex-1 items-center justify-center gap-2 text-[12.5px]">
-          <Loader2 className="h-[15px] w-[15px] animate-spin" />
-          <span>Reading {relPath}…</span>
-        </div>
+      {isInitialLoading ? (
+        showLoadingIndicator ? (
+          <div className="orbit-stage-enter text-muted-foreground flex flex-1 items-center justify-center gap-2 text-[12.5px]">
+            <OrbitSpinner size={14} />
+            <span>Reading {relPath}…</span>
+          </div>
+        ) : (
+          <div className="flex flex-1" />
+        )
       ) : cacheEntry?.status === "error" && !data ? (
         <div className="text-muted-foreground flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
           <FileWarning className="h-5 w-5 opacity-60" />
@@ -1230,7 +1228,7 @@ export const FileViewerTab = memo(function FileViewerTab({
                       "text-foreground/84 rounded-[4px] px-1 py-[0.5px]",
                       logWrapLines ? "break-words whitespace-pre-wrap" : "whitespace-pre",
                       isFocused &&
-                        "bg-primary/[0.14] shadow-[inset_2px_0_0_0_var(--color-primary)]",
+                        "bg-signal-info/[0.14] shadow-[inset_2px_0_0_0_var(--signal-info)]",
                       !isFocused && isMatched && "bg-amber-500/[0.14]",
                     )}
                   >
@@ -1365,26 +1363,32 @@ export const FileViewerTab = memo(function FileViewerTab({
               className="relative min-w-full"
             >
               {virtualCodeItems.map((vRow) => {
-                const baseLine = baseCodeLines[vRow.index];
-                if (!baseLine) return null;
-                const line = lazyHighlights[baseLine.line_number] ?? baseLine;
-                const isMatched = matchLineSet.has(line.line_number);
+                const rawLineText = rawCodeLines[vRow.index];
+                if (rawLineText === undefined) return null;
+                const lineNumber = vRow.index + 1;
+                const preHighlighted =
+                  vRow.index < data.highlighted_lines.length &&
+                  data.highlighted_lines[vRow.index]?.line_number === lineNumber
+                    ? data.highlighted_lines[vRow.index]
+                    : undefined;
+                const highlightedLine = lazyHighlights[lineNumber] ?? preHighlighted;
+                const isMatched = matchLineSet.has(lineNumber);
                 const isRangeFocused =
                   matchLineNumbers.length === 0 &&
                   focusRange.startLine != null &&
-                  line.line_number >= focusRange.startLine &&
-                  line.line_number <= (focusRange.endLine ?? focusRange.startLine);
+                  lineNumber >= focusRange.startLine &&
+                  lineNumber <= (focusRange.endLine ?? focusRange.startLine);
                 const isFocused =
                   (matchLineNumbers.length > 0 &&
                     matchLineNumbers[Math.min(activeMatchIdx, matchLineNumbers.length - 1)] ===
-                      line.line_number) ||
+                      lineNumber) ||
                   isRangeFocused;
-                const lineDiag = diagByLine.get(line.line_number);
+                const lineDiag = diagByLine.get(lineNumber);
                 let runningCol = 1;
 
                 return (
                   <div
-                    key={line.line_number}
+                    key={lineNumber}
                     style={{
                       position: "absolute",
                       top: 0,
@@ -1402,7 +1406,7 @@ export const FileViewerTab = memo(function FileViewerTab({
                     className={cn(
                       "group/fln flex h-[20px] min-w-fit items-center px-2 transition-colors hover:bg-black/[0.03] dark:hover:bg-white/[0.035]",
                       isFocused &&
-                        "bg-primary/[0.12] shadow-[inset_2px_0_0_0_var(--color-primary)]",
+                        "bg-signal-info/[0.12] shadow-[inset_2px_0_0_0_var(--signal-info)]",
                       !isFocused && isMatched && "bg-amber-500/[0.12]",
                     )}
                   >
@@ -1422,29 +1426,30 @@ export const FileViewerTab = memo(function FileViewerTab({
                           )}
                         />
                       )}
-                      <span>{line.line_number}</span>
+                      <span>{lineNumber}</span>
                     </span>
                     <button
                       type="button"
                       title={t("sidePanel.quoteLineTooltip")}
                       onClick={() => {
-                        const rawLineText = line.tokens.map((t) => t.text).join("");
-                        orbitActions.quoteDiffLineToComposer(relPath, line.line_number, rawLineText);
+                        orbitActions.quoteDiffLineToComposer(relPath, lineNumber, rawLineText);
                       }}
                       className="text-muted-foreground hover:text-foreground mr-1.5 inline-flex h-[16px] w-[16px] shrink-0 cursor-pointer items-center justify-center rounded opacity-0 transition-opacity group-hover/fln:opacity-100 hover:bg-black/[0.08] dark:hover:bg-white/[0.12]"
                     >
                       <MessageSquarePlus className="h-[11.5px] w-[11.5px]" />
                     </button>
                     <span className="pr-4 whitespace-pre">
-                      {line.tokens.length === 0
-                        ? " "
-                        : line.tokens.map((tok, idx) => {
+                      {highlightedLine ? (
+                        highlightedLine.tokens.length === 0 ? (
+                          " "
+                        ) : (
+                          highlightedLine.tokens.map((tok, idx) => {
                             const tokStartCol = runningCol;
                             runningCol += tok.text.length;
                             return (
                               <span
                                 key={idx}
-                                data-tok-line={isLspEligible ? line.line_number : undefined}
+                                data-tok-line={isLspEligible ? lineNumber : undefined}
                                 data-tok-col={isLspEligible ? tokStartCol : undefined}
                                 style={{
                                   color: resolveTokenColor(tok, isDark),
@@ -1455,7 +1460,21 @@ export const FileViewerTab = memo(function FileViewerTab({
                                 {tok.text}
                               </span>
                             );
-                          })}
+                          })
+                        )
+                      ) : rawLineText.length === 0 ? (
+                        " "
+                      ) : (
+                        <span
+                          data-tok-line={isLspEligible ? lineNumber : undefined}
+                          data-tok-col={isLspEligible ? 1 : undefined}
+                          style={{
+                            color: isDark ? DARK_PLAIN_TOKEN_FG : LIGHT_PLAIN_TOKEN_FG,
+                          }}
+                        >
+                          {rawLineText}
+                        </span>
+                      )}
                     </span>
                   </div>
                 );
@@ -1465,7 +1484,7 @@ export const FileViewerTab = memo(function FileViewerTab({
 
           {/* Subtle bottom metadata strip (keeps top 36px breadcrumb bar airy & restrained) */}
           <div className="border-border/60 text-muted-foreground/70 tabular-nums flex h-[22px] shrink-0 items-center justify-between gap-2 border-t px-3 font-mono text-[10.5px] select-none">
-            <span>{t("common.linesCount", { count: baseCodeLines.length.toLocaleString() })}</span>
+            <span>{t("common.linesCount", { count: codeLineCount.toLocaleString() })}</span>
             <div className="flex items-center gap-2.5">
               <span>{data.language.toUpperCase()}</span>
               <span>{formatFileSizeCompact(data.size_bytes)}</span>

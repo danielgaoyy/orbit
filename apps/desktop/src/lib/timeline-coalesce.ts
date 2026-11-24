@@ -1,3 +1,4 @@
+import { DEFAULT_LOCALE, translate, type OrbitLocale } from "./i18n/index.ts";
 import type { TimelineItemView } from "@/lib/orbit-ipc";
 import { stripWindowsVerbatimPrefix } from "./stage-cache.ts";
 
@@ -25,19 +26,20 @@ export function basenameOfPath(filePath: string): string {
   return parts[parts.length - 1] ?? trimmed;
 }
 
-export function formatDurationCompact(durationMs: number): string {
+export function formatDurationCompact(durationMs: number, locale: OrbitLocale = DEFAULT_LOCALE): string {
+  const t = translate.bind(null, locale);
   const totalSeconds = Math.max(1, Math.round(durationMs / 1000));
   if (totalSeconds < 60) {
-    return `${totalSeconds}s`;
+    return t("stage.elapsedSeconds", { seconds: totalSeconds });
   }
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   if (minutes >= 60) {
     const hours = Math.floor(minutes / 60);
     const remMin = minutes % 60;
-    return remMin > 0 ? `${hours}h ${remMin}m` : `${hours}h`;
+    return remMin > 0 ? t("stage.elapsedHoursMinutes", { hours, minutes: remMin }) : t("stage.elapsedHours", { hours });
   }
-  return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
+  return seconds > 0 ? t("stage.elapsedMinutesSeconds", { minutes, seconds }) : t("stage.elapsedMinutes", { minutes });
 }
 
 /**
@@ -48,14 +50,15 @@ export function formatDurationCompact(durationMs: number): string {
 export function formatThoughtSummaryLabel(
   durationMs?: number | null,
   thoughtCount = 1,
+  locale: OrbitLocale = DEFAULT_LOCALE,
 ): string {
   if (typeof durationMs === "number" && Number.isFinite(durationMs)) {
     const roundedSec = Math.round(durationMs / 1000);
     if (roundedSec >= 1) {
-      return `Thought for ${formatDurationCompact(durationMs)}`;
+      return translate(locale, "stage.thoughtFor", { duration: formatDurationCompact(durationMs, locale) });
     }
   }
-  return thoughtCount > 1 ? "Thought process" : "Thought about it";
+  return translate(locale, thoughtCount > 1 ? "stage.thoughtProcess" : "stage.thoughtAboutIt");
 }
 
 /**
@@ -230,7 +233,9 @@ export interface ToolStepDescriptor {
 export function describeToolStep(
   item: Extract<TimelineItemView, { item_type: "tool_call" }>,
   cwd?: string | null,
+  locale: OrbitLocale = DEFAULT_LOCALE,
 ): ToolStepDescriptor {
+  const t = translate.bind(null, locale);
   const isRunning = item.status === "running";
   const isFailed = item.status === "failed";
   const isDenied = item.status === "denied";
@@ -241,20 +246,20 @@ export function describeToolStep(
 
   switch (item.detail.kind) {
     case "file_read": {
-      const rel = stripWorkspacePrefix(item.detail.path, cwd) || "file";
+      const rel = stripWorkspacePrefix(item.detail.path, cwd) || t("stage.file");
       const range =
         item.detail.start_line && item.detail.end_line
           ? `L${item.detail.start_line}–${item.detail.end_line}`
           : item.detail.start_line
-            ? `from L${item.detail.start_line}`
+            ? t("stage.fromLine", { line: item.detail.start_line })
             : null;
       const verb = isDenied
-        ? "Declined read"
+        ? t("stage.readDeclined")
         : isFailed
-          ? "Couldn’t read"
+          ? t("stage.readFailed")
           : isRunning
-            ? "Reading"
-            : "Read";
+            ? t("stage.reading")
+            : t("overview.fileActionRead");
       return {
         kind: "file_read",
         verb,
@@ -273,20 +278,20 @@ export function describeToolStep(
 
     case "file_edit": {
       const isCreate = isFileCreateToolCall(item);
-      const rel = stripWorkspacePrefix(item.detail.path, cwd) || "file";
+      const rel = stripWorkspacePrefix(item.detail.path, cwd) || t("stage.file");
       const verb = isDenied
-        ? "Declined edit"
+        ? t("stage.editDeclined")
         : isFailed
           ? isCreate
-            ? "Failed to create"
-            : "Failed to edit"
+            ? t("stage.createFailed")
+            : t("stage.editFailed")
           : isRunning
             ? isCreate
-              ? "Creating"
-              : "Editing"
+              ? t("stage.creating")
+              : t("stage.editing")
             : isCreate
-              ? "Created"
-              : "Edited";
+              ? t("overview.fileActionCreated")
+              : t("overview.fileActionEdited");
       return {
         kind: isCreate ? "file_create" : "file_edit",
         verb,
@@ -308,22 +313,22 @@ export function describeToolStep(
       let verb: string;
       if (subkind === "web") {
         verb = isFailed
-          ? "Failed to search the web"
+          ? t("stage.webSearchFailed")
           : isRunning
-            ? "Searching the web"
-            : "Searched the web";
+            ? t("stage.searchingWeb")
+            : t("stage.searchedWeb");
       } else if (subkind === "glob") {
         verb = isFailed
-          ? "Failed to find files"
+          ? t("stage.findFilesFailed")
           : isRunning
-            ? "Looking for files"
-            : "Looked for files";
+            ? t("stage.findingFiles")
+            : t("stage.foundFiles");
       } else {
         verb = isFailed
-          ? "Search failed"
+          ? t("stage.searchFailed")
           : isRunning
-            ? "Searching"
-            : "Searched";
+            ? t("stage.searching")
+            : t("stage.searched");
       }
       const scopeRel = item.detail.scope
         ? stripWorkspacePrefix(item.detail.scope, cwd)
@@ -332,7 +337,7 @@ export function describeToolStep(
         kind: "search",
         verb,
         target: item.detail.query,
-        secondaryMeta: scopeRel ? `in ${scopeRel}` : null,
+        secondaryMeta: scopeRel ? t("stage.inScope", { scope: scopeRel }) : null,
         openPath: null,
         additions,
         deletions,
@@ -346,16 +351,16 @@ export function describeToolStep(
 
     case "shell": {
       const verb = isDenied
-        ? "Stopped running the command"
+        ? t("stage.commandStopped")
         : isFailed
-          ? "Command failed"
+          ? t("stage.commandFailed")
           : isRunning
-            ? "Running"
-            : "Ran";
+            ? t("sidebar.running")
+            : t("stage.ran");
       return {
         kind: "shell",
         verb,
-        target: item.detail.command || "command",
+        target: item.detail.command || t("stage.command"),
         secondaryMeta: null,
         openPath: null,
         additions,
@@ -370,12 +375,12 @@ export function describeToolStep(
 
     case "subagent": {
       const verb = isDenied
-        ? "Stopped subagent"
+        ? t("stage.subagentStopped")
         : isFailed
-          ? "Subagent failed"
+          ? t("stage.subagentFailed")
           : isRunning
-            ? "Running subagent"
-            : "Ran subagent";
+            ? t("stage.subagentRunning")
+            : t("stage.subagentRan");
       return {
         kind: "subagent",
         verb,
@@ -401,11 +406,12 @@ export function describeToolStep(
         rawTitle.toLowerCase() !== parsed.displayLabel.toLowerCase()
           ? rawTitle
           : "";
+      const tool = item.detail.tool_name.trim() ? parsed.displayLabel : t("approval.tool");
       const verb = isDenied
-        ? `Declined ${parsed.displayLabel}`
+        ? t("stage.toolDeclined", { tool })
         : isFailed
-          ? `${parsed.displayLabel} failed`
-          : parsed.displayLabel;
+          ? t("stage.toolFailed", { tool })
+          : tool;
       const cleanArgs = (item.detail.arguments_json ?? "").trim();
       const hasNonEmptyArgs =
         cleanArgs.length > 0 && cleanArgs !== "{}" && cleanArgs !== "null";

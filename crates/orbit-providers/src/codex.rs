@@ -514,7 +514,7 @@ async fn run_codex_actor(
     };
     let mut msg_accum: HashMap<String, String> = HashMap::new();
     let mut thought_accum: HashMap<String, String> = HashMap::new();
-    let mut file_change_cache: HashMap<String, ToolCallDetail> = HashMap::new();
+    let mut tool_detail_cache: HashMap<String, ToolCallDetail> = HashMap::new();
     let mut pending_approvals: HashMap<String, PendingCodexApproval> = HashMap::new();
     let mut pending_questions: HashMap<String, PendingCodexQuestion> = HashMap::new();
     let mut queued_prompts: VecDeque<(String, String)> = VecDeque::new();
@@ -724,7 +724,7 @@ async fn run_codex_actor(
                                 &val["params"],
                                 &mode,
                                 &client_turn_id,
-                                &file_change_cache,
+                                &tool_detail_cache,
                                 &shim,
                                 &mut pending_approvals,
                                 &mut pending_questions,
@@ -742,7 +742,7 @@ async fn run_codex_actor(
                                 &mut client_turn_id,
                                 &mut msg_accum,
                                 &mut thought_accum,
-                                &mut file_change_cache,
+                                &mut tool_detail_cache,
                                 &mut usage_tracker,
                                 &evt_tx,
                             )
@@ -1065,6 +1065,7 @@ struct CodexTurnUsageTracker {
     latest_total: Option<CodexUsageBreakdown>,
     accum_last: CodexUsageBreakdown,
     last_call_prompt_tokens: Option<u64>,
+    context_window_tokens: Option<u64>,
     model: Option<String>,
 }
 
@@ -1076,6 +1077,17 @@ impl CodexTurnUsageTracker {
             .filter(|s| !s.trim().is_empty())
         {
             self.model = Some(m.to_string());
+        }
+        if let Some(window) = params
+            .pointer("/tokenUsage/modelContextWindow")
+            .or_else(|| params.pointer("/token_usage/model_context_window"))
+            .or_else(|| params.pointer("/info/model_context_window"))
+            .or_else(|| params.get("modelContextWindow"))
+            .or_else(|| params.get("model_context_window"))
+            .and_then(|v| v.as_u64())
+            .filter(|&w| w > 0)
+        {
+            self.context_window_tokens = Some(window);
         }
         let total = params
             .pointer("/tokenUsage/total")
@@ -1116,6 +1128,7 @@ impl CodexTurnUsageTracker {
         let latest_total = self.latest_total.take();
         let accum_last = std::mem::take(&mut self.accum_last);
         let last_call_prompt_tokens = self.last_call_prompt_tokens.take();
+        let context_window_tokens = self.context_window_tokens;
 
         let breakdown = if let Some(u) = completed_usage {
             if let Some(t) = latest_total {
@@ -1141,6 +1154,7 @@ impl CodexTurnUsageTracker {
             cache_read_tokens: breakdown.cache_read_tokens,
             cache_write_tokens: 0,
             last_call_prompt_tokens,
+            context_window_tokens,
             model,
         })
     }
@@ -1155,7 +1169,7 @@ async fn handle_codex_notification(
     client_turn_id: &mut Option<String>,
     msg_accum: &mut HashMap<String, String>,
     thought_accum: &mut HashMap<String, String>,
-    file_change_cache: &mut HashMap<String, ToolCallDetail>,
+    tool_detail_cache: &mut HashMap<String, ToolCallDetail>,
     usage_tracker: &mut CodexTurnUsageTracker,
     evt_tx: &mpsc::Sender<DriverEvent>,
 ) -> bool {
@@ -1310,7 +1324,7 @@ async fn handle_codex_notification(
                             ))
                         },
                     };
-                    file_change_cache.insert(item_id.clone(), detail.clone());
+                    tool_detail_cache.insert(item_id.clone(), detail.clone());
                     let status =
                         map_codex_item_status(item.get("status").and_then(|v| v.as_str()), is_done);
                     let _ = evt_tx
@@ -1342,17 +1356,35 @@ async fn handle_codex_notification(
                 "mcpToolCall" | "McpToolCall" => {
                     let server = item.get("server").and_then(|v| v.as_str()).unwrap_or("mcp");
                     let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("tool");
-                    let args = serde_json::to_string(&item["arguments"]).unwrap_or_default();
+                    let previous = tool_detail_cache.remove(&item_id);
+                    let detail = if matches!(previous, Some(ToolCallDetail::Subagent { .. }))
+                        || ((server.eq_ignore_ascii_case("orbit")
+                            || tool.starts_with("mcp_orbit_")
+                            || tool.starts_with("mcp__orbit__"))
+                            && crate::managed_dispatch::is_launch(tool))
+                    {
+                        let dispatch = crate::managed_dispatch::detail(
+                            &item["arguments"],
+                            &item["result"],
+                            previous.as_ref(),
+                        );
+                        if !is_done {
+                            tool_detail_cache.insert(item_id.clone(), dispatch.clone());
+                        }
+                        dispatch
+                    } else {
+                        ToolCallDetail::Generic {
+                            tool_name: format!("{server}/{tool}"),
+                            arguments_json: truncate_str(&item["arguments"].to_string(), 800),
+                        }
+                    };
                     let status =
                         map_codex_item_status(item.get("status").and_then(|v| v.as_str()), is_done);
                     let _ = evt_tx
                         .send(DriverEvent::ToolCall {
                             call_id: item_id,
                             status,
-                            detail: ToolCallDetail::Generic {
-                                tool_name: format!("{server}/{tool}"),
-                                arguments_json: truncate_str(&args, 800),
-                            },
+                            detail,
                             background_task: None,
                         })
                         .await;
@@ -1472,7 +1504,7 @@ async fn handle_codex_server_request(
     params: &Value,
     mode: &SessionMode,
     client_turn_id: &Option<String>,
-    file_change_cache: &HashMap<String, ToolCallDetail>,
+    tool_detail_cache: &HashMap<String, ToolCallDetail>,
     shim: &orbit_shim::ShimClient,
     pending_approvals: &mut HashMap<String, PendingCodexApproval>,
     pending_questions: &mut HashMap<String, PendingCodexQuestion>,
@@ -1528,7 +1560,7 @@ async fn handle_codex_server_request(
             }
             let req_id = format!("cfile_{rpc_id}");
             let item_id = params.get("itemId").and_then(|v| v.as_str()).unwrap_or("");
-            let detail = file_change_cache.get(item_id).cloned().unwrap_or_else(|| {
+            let detail = tool_detail_cache.get(item_id).cloned().unwrap_or_else(|| {
                 ToolCallDetail::FileEdit {
                     path: "workspace files".into(),
                     unified_diff: None,
@@ -2907,6 +2939,7 @@ mod tests {
         tracker.on_token_usage_updated(&json!({
             "model": "gpt-5.4",
             "tokenUsage": {
+                "modelContextWindow": 272000,
                 "last": { "inputTokens": 20000, "cachedInputTokens": 12000, "outputTokens": 800, "reasoningOutputTokens": 500 },
                 "total": { "inputTokens": 20000, "cachedInputTokens": 12000, "outputTokens": 800, "reasoningOutputTokens": 500 }
             }
@@ -2935,6 +2968,7 @@ mod tests {
                 cache_read_tokens,
                 cache_write_tokens,
                 last_call_prompt_tokens,
+                context_window_tokens,
                 model,
             } => {
                 // Uncached input = 83000 - 62000 = 21000
@@ -2945,6 +2979,7 @@ mod tests {
                 assert_eq!(cache_write_tokens, 0);
                 // Instantaneous single-call prompt occupancy is 35000 (NOT 83000!)
                 assert_eq!(last_call_prompt_tokens, Some(35_000));
+                assert_eq!(context_window_tokens, Some(272_000));
                 assert_eq!(model.as_deref(), Some("gpt-5.4"));
             }
             other => panic!("expected TurnUsage, got {other:?}"),

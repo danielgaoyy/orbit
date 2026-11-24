@@ -286,7 +286,9 @@ struct OmniComposerView: View {
             }
         case "ask", "supervised":
             store.applySessionMode(.default)
-        case "edits", "auto":
+        case "auto":
+            store.applySessionMode(.auto)
+        case "edits":
             store.applySessionMode(.acceptEdits)
         case "full":
             store.applySessionMode(.fullAccess)

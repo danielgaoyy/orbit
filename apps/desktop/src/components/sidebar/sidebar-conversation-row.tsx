@@ -15,6 +15,7 @@ import {
   SidebarRelativeTime,
 } from "@/components/sidebar/sidebar-primitives";
 import type { ThreadDragSource } from "@/components/sidebar/use-sidebar-drag";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { IconButton } from "@/components/ui/icon-button";
 import { orbitActions, useHasThreadDraft } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -116,6 +117,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
   const { t } = useI18n();
 
   const isForegroundRunning = isAgentForegroundRunning(agent);
+  const isRunning = isForegroundRunning || hasRunningSubagents;
   const hasUnsentDraft = useHasThreadDraft(threadKey, !selected);
 
   useEffect(() => {
@@ -236,8 +238,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
           ? "bg-accent text-ink-primary font-medium"
           : isUnread
             ? "text-ink-primary hover:bg-accent/55 font-medium"
-            : isForegroundRunning ||
-                hasRunningSubagents ||
+            : isRunning ||
                 agent.is_awaiting_permission ||
                 agent.status_label === "Error"
               ? "text-ink-primary hover:bg-accent/55"
@@ -252,32 +253,12 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
         <div className="bg-primary pointer-events-none absolute right-1.5 -bottom-[1px] left-1.5 z-20 h-[2px] rounded-full" />
       )}
 
-      {/* Unified Left Status Rail (`16×16` on top-level rows; inline-only on active grouped/child rows) + Title */}
       <div
-        className={cn(
-          "flex min-w-0 flex-1 items-center",
-          inGroupRail || isChild ? "gap-1.5" : "gap-2.5",
-        )}
+        className={cn("flex min-w-0 flex-1 items-center", inGroupRail || isChild ? "gap-1.5" : "gap-2.5")}
       >
-        {!isChild && !inGroupRail ? (
-          <span className="inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
-            <ConversationStatusGlyph
-              agent={agent}
-              isForegroundRunning={isForegroundRunning}
-              hasRunningSubagents={hasRunningSubagents}
-              isWorktree={isWorktree}
-              isUnread={isUnread}
-            />
-          </span>
-        ) : (
-          <ConversationStatusGlyph
-            agent={agent}
-            isForegroundRunning={isForegroundRunning}
-            hasRunningSubagents={hasRunningSubagents}
-            isWorktree={isWorktree}
-            isUnread={isUnread}
-          />
-        )}
+        <span className="inline-flex size-4 shrink-0 items-center justify-center">
+          <ConversationStatusGlyph agent={agent} isWorktree={isWorktree} isUnread={isUnread} />
+        </span>
 
         {isRenaming ? (
           <input
@@ -328,45 +309,47 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
         )}
       </div>
 
-      {/* Right Slot: natural resting width (maximizes title readability) ↔ hover action buttons */}
       {!isRenaming && (
-        <div className="flex shrink-0 items-center justify-end gap-1.5">
-          {contextLabel && (
-            <span
-              className={cn(
-                "text-ink-faint max-w-[74px] truncate text-[11px] leading-none",
-                menuOpen ? "hidden" : "inline group-hover/item:hidden",
-              )}
-            >
-              {contextLabel}
-            </span>
-          )}
-
-          {hasUnsentDraft ? (
-            <span
-              data-draft-indicator="true"
-              className={cn(
-                DRAFT_BADGE_CLASS,
-                menuOpen ? "hidden" : "group-hover/item:hidden",
-              )}
-            >
-              {t("sidebar.draft")}
-            </span>
-          ) : (
-            <SidebarRelativeTime
-              rfc3339={agent.updated_at_rfc3339}
-              className={cn(
-                "text-ink-faint tabular-nums text-[11.5px] leading-none",
-                menuOpen ? "hidden" : "group-hover/item:hidden",
-              )}
-            />
-          )}
+        <div className="grid shrink-0 items-center justify-items-end">
+          <div
+            className={cn(
+              "col-start-1 row-start-1 flex items-center gap-1.5 transition-opacity duration-100 motion-reduce:transition-none",
+              menuOpen
+                ? "pointer-events-none opacity-0"
+                : "group-hover/item:pointer-events-none group-hover/item:opacity-0 group-focus-within/item:pointer-events-none group-focus-within/item:opacity-0",
+            )}
+          >
+            {contextLabel && (
+              <span className="text-ink-faint max-w-[74px] truncate text-[11px] leading-none">
+                {contextLabel}
+              </span>
+            )}
+            {isRunning ? (
+              <span
+                className="text-ink-secondary inline-flex"
+                role="img"
+                aria-label={isForegroundRunning ? t("sidebar.running") : t("sidebar.subagentRunning")}
+              >
+                <OrbitSpinner size={13} />
+              </span>
+            ) : hasUnsentDraft ? (
+              <span data-draft-indicator="true" className={DRAFT_BADGE_CLASS}>
+                {t("sidebar.draft")}
+              </span>
+            ) : (
+              <SidebarRelativeTime
+                rfc3339={agent.updated_at_rfc3339}
+                className="text-ink-faint tabular-nums text-[11.5px] leading-none"
+              />
+            )}
+          </div>
 
           <div
             data-thread-action="true"
             className={cn(
-              "items-center gap-0.5",
-              menuOpen ? "inline-flex" : "hidden group-hover/item:inline-flex",
+              "col-start-1 row-start-1 flex items-center gap-0.5 transition-opacity duration-100 motion-reduce:transition-none",
+              !menuOpen &&
+                "pointer-events-none opacity-0 group-hover/item:pointer-events-auto group-hover/item:opacity-100 group-focus-within/item:pointer-events-auto group-focus-within/item:opacity-100",
             )}
             onClick={(e) => e.stopPropagation()}
           >

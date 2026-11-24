@@ -175,7 +175,7 @@ pub fn slash_commands(platform: ClientPlatform) -> Vec<SlashCommandView> {
             command: "/files".into(),
             label: "Browse Workspace Files".into(),
             description: "Open the workspace file explorer in Side Panel".into(),
-            shortcut_key: Some("P".into()),
+            shortcut_key: None,
             icon_key: "files".into(),
             keywords: vec![
                 "files".into(),
@@ -351,14 +351,30 @@ pub fn slash_commands(platform: ClientPlatform) -> Vec<SlashCommandView> {
         },
         SlashCommandView {
             id: "auto".into(),
+            command: "/auto".into(),
+            label: "Auto (Guardian) Permissions".into(),
+            description: "Auto-approve low-risk reads & tests via Guardian; ask on risky actions"
+                .into(),
+            shortcut_key: None,
+            icon_key: "shield_check".into(),
+            keywords: vec![
+                "auto".into(),
+                "guardian".into(),
+                "smart".into(),
+                "risk".into(),
+                "permission".into(),
+            ],
+            desktop_only: false,
+        },
+        SlashCommandView {
+            id: "edits".into(),
             command: "/edits".into(),
             label: "Accept Edits Permissions".into(),
             description: "Auto-approve file edits, ask before shell commands".into(),
             shortcut_key: None,
-            icon_key: "shield_check".into(),
+            icon_key: "file_pen".into(),
             keywords: vec![
                 "edits".into(),
-                "auto".into(),
                 "edit".into(),
                 "accept".into(),
                 "permission".into(),
@@ -1654,7 +1670,7 @@ pub fn rank_mention_candidates_with_peers_and_rules(
                 kind: "workspace_peer".into(),
                 token_label: "@all".into(),
                 title: "@all".into(),
-                subtitle: "Broadcast to all peers in this Mission Workspace".into(),
+                subtitle: "Broadcast to all peers in this group".into(),
                 file_path: String::new(),
                 git_status: String::new(),
                 score: all_score,
@@ -1773,7 +1789,21 @@ mod tests {
         let desktop = slash_commands(ClientPlatform::Desktop);
         let ios = slash_commands(ClientPlatform::Ios);
         let android = slash_commands(ClientPlatform::Android);
-        assert!(desktop.iter().any(|c| c.id == "files"));
+        assert!(
+            desktop
+                .iter()
+                .any(|c| c.id == "files" && c.shortcut_key.is_none())
+        );
+        assert!(
+            desktop
+                .iter()
+                .any(|c| c.id == "auto" && c.command == "/auto" && c.icon_key == "shield_check")
+        );
+        assert!(
+            desktop
+                .iter()
+                .any(|c| c.id == "edits" && c.command == "/edits" && c.icon_key == "file_pen")
+        );
         assert!(ios.iter().any(|c| c.id == "files"));
         assert!(!ios.iter().any(|c| c.id == "browser"));
         assert!(!android.iter().any(|c| c.id == "files"));

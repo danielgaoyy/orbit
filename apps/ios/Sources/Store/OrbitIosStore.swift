@@ -1591,6 +1591,7 @@ public final class OrbitIosStore: ObservableObject {
             acpAgentId: nil,
             attentionLabel: nil,
             latestSeq: 22,
+            createdAtRfc3339: nil,
             updatedAtRfc3339: "2026-11-22T06:00:00Z",
             isPinned: true,
             seenSeq: 22,

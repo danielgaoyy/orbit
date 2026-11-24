@@ -12,6 +12,7 @@ import {
   Server,
 } from "lucide-react";
 import { basenameOfCwd } from "@/components/composer/composer-constants";
+import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import {
   filterAndRankProjects,
@@ -31,6 +32,7 @@ import {
   Popover,
   PopoverContent,
   PopoverTrigger,
+  SimpleTooltip,
 } from "@/components/ui/overlays";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
@@ -61,6 +63,7 @@ function formatCompactParentDir(path: string): string {
  * Never subscribes to `composerDrafts`, so typing in the `<textarea>` triggers zero re-renders here.
  */
 export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
+  const { t } = useI18n();
   const fleet = useOrbitSelector((s) => s.fleet);
   const sidebarView = useOrbitSelector((s) => s.sidebarView);
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
@@ -68,10 +71,21 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
   const draftUseWorktree = useOrbitSelector((s) => s.draftUseWorktree);
   const draftWorktreeRepoPath = useOrbitSelector((s) => s.draftWorktreeRepoPath);
   const draftWorkspaceId = useOrbitSelector((s) => s.draftWorkspaceId);
-  const gitReposCache = useOrbitSelector((s) => s.gitReposCache);
-  const hostDetails = useOrbitSelector((s) => s.hostDetails);
   const hiddenProjectKeys = useOrbitSelector((s) => s.hiddenProjectKeys);
-  const hostDetail = selectedHostId ? (hostDetails[selectedHostId] ?? null) : null;
+  // Narrow host-scoped subscriptions: immune to unrelated remote-host heartbeats & repo cache noise
+  const hostDetail = useOrbitSelector((s) =>
+    s.selectedHostId ? (s.hostDetails[s.selectedHostId] ?? null) : null,
+  );
+  const cleanSelectedCwd = normalizeProjectPath(selectedCwd);
+  const cachedInspection = useOrbitSelector((s) => {
+    if (!s.selectedHostId) return null;
+    const norm = normalizeProjectPath(s.selectedWorkspaceCwd);
+    return (
+      s.gitReposCache[`${s.selectedHostId}::${norm}`] ??
+      s.hostDetails[s.selectedHostId]?.git_repos_by_cwd?.[norm] ??
+      null
+    );
+  });
 
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const [projectQuery, setProjectQuery] = useState("");
@@ -280,13 +294,6 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
     );
   }, [heroProjects, selectedHostId, selectedCwd]);
 
-  const cleanSelectedCwd = normalizeProjectPath(selectedCwd);
-  const gitCacheKey = selectedHostId ? `${selectedHostId}::${cleanSelectedCwd}` : "";
-  const cachedInspection =
-    (gitCacheKey ? gitReposCache[gitCacheKey] : undefined) ??
-    (selectedHostId ? hostDetail?.git_repos_by_cwd?.[cleanSelectedCwd] : undefined) ??
-    null;
-
   useEffect(() => {
     if (!selectedHostId || !cleanSelectedCwd || cleanSelectedCwd === "~") return;
     if (cachedInspection) return;
@@ -400,10 +407,10 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
         className={cn(
           "flex w-full cursor-pointer items-center justify-between gap-2.5 rounded-[9px] px-2.5 py-1.5 text-left text-[13px] transition-colors outline-none",
           isHighlighted
-            ? "bg-accent text-foreground"
+            ? "bg-accent text-ink-primary"
             : active
-              ? "bg-foreground/[0.07] text-foreground dark:bg-white/[0.09]"
-              : "text-foreground/84 hover:bg-accent hover:text-foreground",
+              ? "bg-accent/70 text-ink-primary"
+              : "text-ink-secondary hover:bg-accent hover:text-ink-primary",
           active && "font-medium",
         )}
       >
@@ -411,13 +418,13 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
           <Folder
             className={cn(
               "size-4 shrink-0 stroke-[1.75]",
-              active ? "text-foreground/85" : "text-muted-foreground",
+              active ? "text-ink-primary" : "text-ink-muted",
             )}
           />
           <span className="flex min-w-0 flex-1 flex-col">
             <span className="truncate leading-tight">{proj.name}</span>
             {showParent && (
-              <span className="text-muted-foreground/75 truncate text-[11px] leading-tight font-normal">
+              <span className="text-ink-muted truncate text-[11px] leading-tight font-normal">
                 {formatCompactParentDir(proj.path)}
               </span>
             )}
@@ -425,12 +432,12 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
         </span>
         <span className="flex shrink-0 items-center gap-1.5">
           {proj.branch && (
-            <span className="text-muted-foreground/70 max-w-20 truncate font-mono text-[11px] font-normal">
+            <span className="text-ink-faint max-w-20 truncate font-mono text-[11px] font-normal">
               {proj.branch}
             </span>
           )}
           {active && (
-            <Check className="text-foreground size-3.5 shrink-0 stroke-[2]" />
+            <Check className="text-ink-primary size-3.5 shrink-0 stroke-[2]" />
           )}
         </span>
       </button>
@@ -442,17 +449,18 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
       <div className="flex min-w-0 items-center gap-0.5">
         {/* 1. Clean Project Switcher (Strictly Directories — Never Workspaces!) */}
         <Popover open={projectPickerOpen} onOpenChange={setProjectPickerOpen}>
-          <PopoverTrigger asChild>
-            <button
-              type="button"
-              title={`Project: ${selectedCwd}`}
-              className="text-foreground/80 hover:text-foreground inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-            >
-              <Folder className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
-              <span className="max-w-44 truncate font-medium">{activeProjectLabel}</span>
-              <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
-            </button>
-          </PopoverTrigger>
+          <SimpleTooltip label={t("composer.heroProjectTooltip", { path: selectedCwd })} side="top">
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                className="text-ink-secondary hover:text-ink-primary hover:bg-accent inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors"
+              >
+                <Folder className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
+                <span className="max-w-44 truncate font-medium">{activeProjectLabel}</span>
+                <ChevronDown className="text-ink-faint size-3.5 shrink-0 stroke-[1.75]" />
+              </button>
+            </PopoverTrigger>
+          </SimpleTooltip>
           <PopoverContent
             side="bottom"
             align="start"
@@ -461,15 +469,15 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
             className="w-[292px] p-1.5 select-none"
           >
             <div className="flex items-center justify-between gap-2 px-2.5 pt-1 pb-1.5">
-              <span className="text-muted-foreground text-[11.5px] font-medium">
-                Projects
+              <span className="text-ink-muted text-[11.5px] font-medium">
+                {t("composer.heroProjects")}
               </span>
               {multiHost && (
-                <span className="text-muted-foreground/80 inline-flex max-w-32 items-center gap-1.5 truncate text-[11px]">
+                <span className="text-ink-muted inline-flex max-w-32 items-center gap-1.5 truncate text-[11px]">
                   <span
                     className={cn(
                       "size-1.5 shrink-0 rounded-full",
-                      activeHostOnline ? "bg-emerald-500" : "bg-zinc-400",
+                      activeHostOnline ? "bg-signal-success" : "bg-ink-faint",
                     )}
                   />
                   <span className="truncate">{activeHostLabel}</span>
@@ -479,8 +487,8 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
 
             {heroProjects.length >= 6 && (
               <div className="px-1 pb-1.5">
-                <div className="border-border/80 bg-canvas/80 flex h-[28px] items-center gap-1.5 rounded-lg border px-2">
-                  <Search className="text-muted-foreground/70 size-3.5 shrink-0" />
+                <div className="border-border-default bg-surface-base flex h-[28px] items-center gap-1.5 rounded-lg border px-2">
+                  <Search className="text-ink-muted size-3.5 shrink-0" />
                   <input
                     ref={projectSearchInputRef}
                     value={projectQuery}
@@ -518,21 +526,21 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
                         setProjectPickerOpen(false);
                       }
                     }}
-                    placeholder="Filter projects…"
-                    className="text-foreground placeholder:text-muted-foreground/60 min-w-0 flex-1 bg-transparent text-[12px] outline-none"
+                    placeholder={t("composer.heroFilterProjects")}
+                    className="text-ink-primary placeholder:text-ink-faint min-w-0 flex-1 bg-transparent text-[12px] outline-none"
                   />
                 </div>
               </div>
             )}
 
             {filteredHeroProjects.length === 0 ? (
-              <div className="text-muted-foreground/75 px-2.5 py-3 text-center text-[12px]">
-                No matching projects
+              <div className="text-ink-muted px-2.5 py-3 text-center text-[12px]">
+                {t("composer.heroNoMatchingProjects")}
               </div>
             ) : (
               <ScrollArea className="-mx-1.5" viewportClassName="max-h-72 px-1.5">
                 <div
-                  className="space-y-0.5"
+                  className="flex flex-col gap-0.5"
                   onMouseLeave={() => {
                     if (!hasProjectQuery) setHighlightedIndex(null);
                   }}
@@ -545,9 +553,9 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
 
                       {activeProjectsSection.length > 0 && discoveredProjectsSection.length > 0 && (
                         <div className="pt-1.5 pb-0.5">
-                          <div className="bg-border/70 mx-1 mb-1.5 h-px" />
-                          <div className="text-muted-foreground/75 px-2.5 pb-1 text-[11px] font-medium">
-                            Other folders
+                          <div className="bg-border-subtle mx-1 mb-1.5 h-px" />
+                          <div className="text-ink-muted px-2.5 pb-1 text-[11px] font-medium">
+                            {t("composer.heroOtherFolders")}
                           </div>
                         </div>
                       )}
@@ -561,17 +569,17 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
               </ScrollArea>
             )}
 
-            <div className="bg-border/80 -mx-1.5 my-1.5 h-px" />
+            <div className="bg-border-subtle -mx-1.5 my-1.5 h-px" />
             <button
               type="button"
               onClick={() => {
                 setProjectPickerOpen(false);
                 void orbitActions.promptAddProject(selectedHostId ?? undefined);
               }}
-              className="text-foreground/82 hover:bg-accent hover:text-foreground flex w-full cursor-pointer items-center gap-2 rounded-[9px] px-2.5 py-1.5 text-left text-[13px] transition-colors"
+              className="text-ink-secondary hover:bg-accent hover:text-ink-primary flex w-full cursor-pointer items-center gap-2 rounded-[9px] px-2.5 py-1.5 text-left text-[13px] transition-colors"
             >
-              <FolderPlus className="text-muted-foreground size-4 shrink-0 stroke-[1.75]" />
-              <span>Add new project…</span>
+              <FolderPlus className="text-ink-muted size-4 shrink-0 stroke-[1.75]" />
+              <span>{t("composer.heroAddProject")}</span>
             </button>
           </PopoverContent>
         </Popover>
@@ -579,30 +587,34 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
         {/* Optional Group Selector — quiet opt-in pill shown only when the project already has Groups */}
         {(curatedWorkspacesForProject.length > 0 || selectedDraftWs) && (
           <>
-            <span className="text-foreground/20 select-none text-[13px]">/</span>
+            <span className="text-ink-faint select-none text-[13px] opacity-40">/</span>
             <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <button
-                  type="button"
-                  title={
-                    selectedDraftWs
-                      ? `Group: ${selectedDraftWs.title}`
-                      : "Optional: add this conversation to a group"
-                  }
-                  className={cn(
-                    "inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]",
-                    selectedDraftWs
-                      ? "text-foreground/80 hover:text-foreground font-medium"
-                      : "text-foreground/50 hover:text-foreground/80",
-                  )}
-                >
-                  <Layers className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
-                  <span className="max-w-36 truncate">
-                    {selectedDraftWs ? selectedDraftWs.title : "Group"}
-                  </span>
-                  <ChevronDown className="text-foreground/40 size-3.5 shrink-0 stroke-[1.75]" />
-                </button>
-              </DropdownMenuTrigger>
+              <SimpleTooltip
+                label={
+                  selectedDraftWs
+                    ? t("composer.heroGroupSelectedTooltip", { title: selectedDraftWs.title })
+                    : t("composer.heroGroupTooltip")
+                }
+                side="top"
+              >
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    className={cn(
+                      "hover:bg-accent inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors",
+                      selectedDraftWs
+                        ? "text-ink-secondary hover:text-ink-primary font-medium"
+                        : "text-ink-muted hover:text-ink-primary",
+                    )}
+                  >
+                    <Layers className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
+                    <span className="max-w-36 truncate">
+                      {selectedDraftWs ? selectedDraftWs.title : t("composer.heroGroup")}
+                    </span>
+                    <ChevronDown className="text-ink-faint size-3.5 shrink-0 stroke-[1.75]" />
+                  </button>
+                </DropdownMenuTrigger>
+              </SimpleTooltip>
               <DropdownMenuContent
                 align="start"
                 side="bottom"
@@ -610,12 +622,12 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
                 className="min-w-[204px] max-w-[260px]"
               >
                 <DropdownMenuGroup>
-                  <DropdownMenuLabel>Group</DropdownMenuLabel>
+                  <DropdownMenuLabel>{t("composer.heroGroup")}</DropdownMenuLabel>
                   <DropdownMenuItem
                     onSelect={() => orbitActions.setDraftConfig({ workspaceId: null })}
                   >
                     <span className="text-ink-muted flex min-w-0 items-center gap-2">
-                      <span className="truncate">None</span>
+                      <span className="truncate">{t("composer.heroGroupNone")}</span>
                     </span>
                     {!selectedDraftWs && <Check className="size-3.5 shrink-0" />}
                   </DropdownMenuItem>
@@ -658,11 +670,11 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
             <DropdownMenuTrigger asChild>
               <button
                 type="button"
-                className="text-foreground/65 hover:text-foreground inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
+                className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors"
               >
                 <Server className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
                 <span className="max-w-36 truncate">{activeHostLabel}</span>
-                <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
+                <ChevronDown className="text-ink-faint size-3.5 shrink-0 stroke-[1.75]" />
               </button>
             </DropdownMenuTrigger>
             <DropdownMenuContent
@@ -672,7 +684,7 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
               className="min-w-[204px] max-w-[260px]"
             >
               <DropdownMenuGroup>
-                <DropdownMenuLabel>Target Host</DropdownMenuLabel>
+                <DropdownMenuLabel>{t("composer.heroTargetHost")}</DropdownMenuLabel>
                 {fleet.hosts.map((h) => {
                   const active = h.host_id === selectedHostId;
                   const online = h.connection_state.startsWith("online");
@@ -685,7 +697,7 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
                         <span
                           className={cn(
                             "size-1.5 shrink-0 rounded-full",
-                            online ? "bg-emerald-500" : "bg-zinc-400",
+                            online ? "bg-signal-success" : "bg-ink-faint",
                           )}
                         />
                         <span className="truncate">{h.display_name}</span>
@@ -698,7 +710,7 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
               <DropdownMenuSeparator />
               <DropdownMenuGroup>
                 <DropdownMenuItem onSelect={() => orbitActions.openSettings("hosts")}>
-                  <span className="text-ink-muted">Manage Hosts…</span>
+                  <span className="text-ink-muted">{t("composer.heroManageHosts")}</span>
                 </DropdownMenuItem>
               </DropdownMenuGroup>
             </DropdownMenuContent>
@@ -708,100 +720,60 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
 
       {/* 2. Right: Clean Execution Environment Menu (Non-Git Guard + Nested Git Repo Worktree Picker) */}
       {!canUseWorktree ? (
-        <div
-          title="Not a Git repository — running directly in local folder"
-          className="text-foreground/60 inline-flex h-8 items-center gap-1.5 rounded-full px-2.5 text-[13px] select-none"
-        >
-          <Laptop className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
-          <span>Local</span>
-        </div>
+        <SimpleTooltip label={t("composer.heroNotGitRepoTooltip")} side="top">
+          <div className="text-ink-muted inline-flex h-8 items-center gap-1.5 rounded-full px-2.5 text-[13px] select-none">
+            <Laptop className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
+            <span>{t("composer.heroLocal")}</span>
+          </div>
+        </SimpleTooltip>
       ) : (
         <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <button
-              type="button"
-              title={
-                effectiveUsingWorktree
-                  ? activeRepoBranch
-                    ? `Worktree — new isolated branch from ${activeRepoBranch}`
-                    : "Worktree — isolated Git worktree for parallel tasks"
-                  : rootRepoBranch
-                    ? `Local — edit directly on ${rootRepoBranch}`
-                    : "Local — work directly in current project folder"
-              }
-              className="text-foreground/72 hover:text-foreground inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-            >
-              {effectiveUsingWorktree ? (
-                <GitBranch className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
-              ) : (
-                <Laptop className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
-              )}
-              <span>
-                {effectiveUsingWorktree
-                  ? selectedNestedRepo && !isDirectGitRepo
-                    ? `Worktree · ${selectedNestedRepo.name}`
-                    : "Worktree"
-                  : "Local"}
-              </span>
-              <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
-            </button>
-          </DropdownMenuTrigger>
+          <SimpleTooltip
+            label={
+              effectiveUsingWorktree
+                ? activeRepoBranch
+                  ? t("composer.heroWorktreeBranchTooltip", { branch: activeRepoBranch })
+                  : t("composer.heroWorktreeDescTooltip")
+                : rootRepoBranch
+                  ? t("composer.heroLocalBranchTooltip", { branch: rootRepoBranch })
+                  : t("composer.heroLocalFolderTooltip")
+            }
+            side="top"
+          >
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                className="text-ink-secondary hover:text-ink-primary hover:bg-accent inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors"
+              >
+                {effectiveUsingWorktree ? (
+                  <GitBranch className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
+                ) : (
+                  <Laptop className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
+                )}
+                <span>
+                  {effectiveUsingWorktree
+                    ? selectedNestedRepo && !isDirectGitRepo
+                      ? `${t("composer.heroWorktree")} · ${selectedNestedRepo.name}`
+                      : t("composer.heroWorktree")
+                    : t("composer.heroLocal")}
+                </span>
+                <ChevronDown className="text-ink-faint size-3.5 shrink-0 stroke-[1.75]" />
+              </button>
+            </DropdownMenuTrigger>
+          </SimpleTooltip>
           <DropdownMenuContent
             side="bottom"
             align="end"
             finalFocus={false}
             className="w-[320px] p-1.5"
           >
-            <DropdownMenuLabel>Execution Environment</DropdownMenuLabel>
+            <DropdownMenuGroup>
+              <DropdownMenuLabel>{t("composer.heroExecEnv")}</DropdownMenuLabel>
 
-            <DropdownMenuItem
-              onSelect={() =>
-                orbitActions.setDraftConfig({
-                  useWorktree: false,
-                  worktreeBranch: "",
-                  worktreeRepoPath: null,
-                })
-              }
-              className="items-start gap-3 px-2.5 py-2"
-            >
-              <div className="flex min-w-0 flex-1 items-start gap-2.5">
-                <Laptop
-                  className={cn(
-                    "mt-0.5 size-4 shrink-0 stroke-[1.75]",
-                    !effectiveUsingWorktree ? "text-foreground" : "text-muted-foreground",
-                  )}
-                />
-                <div className="flex min-w-0 flex-col gap-0.5">
-                  <span className="text-foreground text-[13px] leading-tight font-medium">
-                    Local
-                  </span>
-                  {rootRepoBranch ? (
-                    <span
-                      title={rootRepoBranch}
-                      className="text-muted-foreground flex min-w-0 items-center gap-1 text-[11.5px] leading-snug"
-                    >
-                      <span className="shrink-0">Edit directly on</span>
-                      <span className="text-foreground/70 min-w-0 truncate font-mono text-[11px]">
-                        {rootRepoBranch}
-                      </span>
-                    </span>
-                  ) : (
-                    <span className="text-muted-foreground text-[11.5px] leading-snug">
-                      Work directly in current project folder
-                    </span>
-                  )}
-                </div>
-              </div>
-              {!effectiveUsingWorktree && (
-                <Check className="text-foreground mt-0.5 size-3.5 shrink-0" />
-              )}
-            </DropdownMenuItem>
-
-            {isDirectGitRepo && (
               <DropdownMenuItem
                 onSelect={() =>
                   orbitActions.setDraftConfig({
-                    useWorktree: true,
+                    useWorktree: false,
                     worktreeBranch: "",
                     worktreeRepoPath: null,
                   })
@@ -809,96 +781,145 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
                 className="items-start gap-3 px-2.5 py-2"
               >
                 <div className="flex min-w-0 flex-1 items-start gap-2.5">
-                  <GitBranch
+                  <Laptop
                     className={cn(
                       "mt-0.5 size-4 shrink-0 stroke-[1.75]",
-                      effectiveUsingWorktree && !selectedNestedRepo
-                        ? "text-foreground"
-                        : "text-muted-foreground",
+                      !effectiveUsingWorktree ? "text-ink-primary" : "text-ink-muted",
                     )}
                   />
                   <div className="flex min-w-0 flex-col gap-0.5">
-                    <span className="text-foreground text-[13px] leading-tight font-medium">
-                      Worktree
+                    <span className="text-ink-primary text-[13px] leading-tight font-medium">
+                      {t("composer.heroLocal")}
                     </span>
                     {rootRepoBranch ? (
                       <span
-                        title={`New isolated branch from ${rootRepoBranch}`}
-                        className="text-muted-foreground flex min-w-0 items-center gap-1 text-[11.5px] leading-snug"
+                        title={rootRepoBranch}
+                        className="text-ink-muted flex min-w-0 items-center gap-1 text-[11.5px] leading-snug"
                       >
-                        <span className="shrink-0">New branch from</span>
-                        <span className="text-foreground/70 min-w-0 truncate font-mono text-[11px]">
+                        <span className="shrink-0">{t("composer.heroEditDirectlyOn")}</span>
+                        <span className="text-ink-secondary min-w-0 truncate font-mono text-[11px]">
                           {rootRepoBranch}
                         </span>
                       </span>
                     ) : (
-                      <span className="text-muted-foreground text-[11.5px] leading-snug">
-                        Isolated Git worktree for parallel tasks
+                      <span className="text-ink-muted text-[11.5px] leading-snug">
+                        {t("composer.heroWorkDirectlyInFolder")}
                       </span>
                     )}
                   </div>
                 </div>
-                {effectiveUsingWorktree && !selectedNestedRepo && (
-                  <Check className="text-foreground mt-0.5 size-3.5 shrink-0" />
+                {!effectiveUsingWorktree && (
+                  <Check className="text-ink-primary mt-0.5 size-3.5 shrink-0" />
                 )}
               </DropdownMenuItem>
-            )}
+
+              {isDirectGitRepo && (
+                <DropdownMenuItem
+                  onSelect={() =>
+                    orbitActions.setDraftConfig({
+                      useWorktree: true,
+                      worktreeBranch: "",
+                      worktreeRepoPath: null,
+                    })
+                  }
+                  className="items-start gap-3 px-2.5 py-2"
+                >
+                  <div className="flex min-w-0 flex-1 items-start gap-2.5">
+                    <GitBranch
+                      className={cn(
+                        "mt-0.5 size-4 shrink-0 stroke-[1.75]",
+                        effectiveUsingWorktree && !selectedNestedRepo
+                          ? "text-ink-primary"
+                          : "text-ink-muted",
+                      )}
+                    />
+                    <div className="flex min-w-0 flex-col gap-0.5">
+                      <span className="text-ink-primary text-[13px] leading-tight font-medium">
+                        {t("composer.heroWorktree")}
+                      </span>
+                      {rootRepoBranch ? (
+                        <span
+                          title={t("composer.heroWorktreeBranchTooltip", { branch: rootRepoBranch })}
+                          className="text-ink-muted flex min-w-0 items-center gap-1 text-[11.5px] leading-snug"
+                        >
+                          <span className="shrink-0">{t("composer.heroNewBranchFrom")}</span>
+                          <span className="text-ink-secondary min-w-0 truncate font-mono text-[11px]">
+                            {rootRepoBranch}
+                          </span>
+                        </span>
+                      ) : (
+                        <span className="text-ink-muted text-[11.5px] leading-snug">
+                          {t("composer.heroIsolatedWorktreeDesc")}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  {effectiveUsingWorktree && !selectedNestedRepo && (
+                    <Check className="text-ink-primary mt-0.5 size-3.5 shrink-0" />
+                  )}
+                </DropdownMenuItem>
+              )}
+            </DropdownMenuGroup>
 
             {nestedGitRepos.length > 0 && (
               <>
                 <DropdownMenuSeparator />
-                <DropdownMenuLabel className="text-[11px]">
-                  {isDirectGitRepo
-                    ? "Worktree · Nested Git Repos"
-                    : "Worktree · Git Repos in Project"}
-                </DropdownMenuLabel>
-                <ScrollArea className="-mx-1.5" viewportClassName="max-h-48 px-1.5">
-                  <div className="space-y-0.5">
-                    {nestedGitRepos.map((repo) => {
-                      const active =
-                        effectiveUsingWorktree && draftWorktreeRepoPath === repo.path;
-                      return (
-                        <DropdownMenuItem
-                          key={repo.path}
-                          onSelect={() =>
-                            orbitActions.setDraftConfig({
-                              useWorktree: true,
-                              worktreeBranch: "",
-                              worktreeRepoPath: repo.path,
-                            })
-                          }
-                          className="items-start gap-2.5 px-2.5 py-1.5"
-                        >
-                          <FolderGit2
-                            className={cn(
-                              "mt-0.5 size-4 shrink-0 stroke-[1.75]",
-                              active ? "text-foreground" : "text-muted-foreground",
-                            )}
-                          />
-                          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                            <span className="text-foreground truncate text-[12.5px] leading-tight font-medium">
-                              {repo.relative_path || repo.name}
-                            </span>
-                            {repo.git_branch && (
-                              <span
-                                title={`New branch from ${repo.git_branch}`}
-                                className="text-muted-foreground flex min-w-0 items-center gap-1 text-[11px]"
-                              >
-                                <span className="shrink-0">New branch from</span>
-                                <span className="text-foreground/70 min-w-0 truncate font-mono">
-                                  {repo.git_branch}
-                                </span>
+                <DropdownMenuGroup>
+                  <DropdownMenuLabel className="text-[11px]">
+                    {isDirectGitRepo
+                      ? t("composer.heroNestedGitRepos")
+                      : t("composer.heroProjectGitRepos")}
+                  </DropdownMenuLabel>
+                  <ScrollArea className="-mx-1.5" viewportClassName="max-h-48 px-1.5">
+                    <div className="flex flex-col gap-0.5">
+                      {nestedGitRepos.map((repo) => {
+                        const active =
+                          effectiveUsingWorktree && draftWorktreeRepoPath === repo.path;
+                        return (
+                          <DropdownMenuItem
+                            key={repo.path}
+                            onSelect={() =>
+                              orbitActions.setDraftConfig({
+                                useWorktree: true,
+                                worktreeBranch: "",
+                                worktreeRepoPath: repo.path,
+                              })
+                            }
+                            className="items-start gap-2.5 px-2.5 py-1.5"
+                          >
+                            <FolderGit2
+                              className={cn(
+                                "mt-0.5 size-4 shrink-0 stroke-[1.75]",
+                                active ? "text-ink-primary" : "text-ink-muted",
+                              )}
+                            />
+                            <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                              <span className="text-ink-primary truncate text-[12.5px] leading-tight font-medium">
+                                {repo.relative_path || repo.name}
                               </span>
+                              {repo.git_branch && (
+                                <span
+                                  title={t("composer.heroWorktreeBranchTooltip", {
+                                    branch: repo.git_branch,
+                                  })}
+                                  className="text-ink-muted flex min-w-0 items-center gap-1 text-[11px]"
+                                >
+                                  <span className="shrink-0">{t("composer.heroNewBranchFrom")}</span>
+                                  <span className="text-ink-secondary min-w-0 truncate font-mono">
+                                    {repo.git_branch}
+                                  </span>
+                                </span>
+                              )}
+                            </div>
+                            {active && (
+                              <Check className="text-ink-primary mt-0.5 size-3.5 shrink-0" />
                             )}
-                          </div>
-                          {active && (
-                            <Check className="text-foreground mt-0.5 size-3.5 shrink-0" />
-                          )}
-                        </DropdownMenuItem>
-                      );
-                    })}
-                  </div>
-                </ScrollArea>
+                          </DropdownMenuItem>
+                        );
+                      })}
+                    </div>
+                  </ScrollArea>
+                </DropdownMenuGroup>
               </>
             )}
           </DropdownMenuContent>

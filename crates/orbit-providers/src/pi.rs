@@ -477,6 +477,15 @@ fn map_pi_tool_detail(
     result: Option<&Value>,
     prev: Option<&ToolCallDetail>,
 ) -> ToolCallDetail {
+    if crate::managed_dispatch::is_launch(tool_name)
+        || matches!(prev, Some(ToolCallDetail::Subagent { .. }))
+    {
+        return crate::managed_dispatch::detail(
+            args.unwrap_or(&Value::Null),
+            result.unwrap_or(&Value::Null),
+            prev,
+        );
+    }
     let lower = tool_name.trim().to_ascii_lowercase();
     let out_preview = extract_pi_result_text(result);
 

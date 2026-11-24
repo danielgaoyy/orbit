@@ -1344,6 +1344,7 @@ mod tests {
             archived_at_rfc3339: None,
             labels: HashMap::new(),
             latest_seq: 5,
+            created_at_rfc3339: None,
             updated_at_rfc3339: updated_at_rfc3339.to_string(),
             is_pinned,
             seen_seq: if is_unread { 2 } else { 5 },

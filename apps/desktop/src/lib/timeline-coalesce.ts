@@ -1,5 +1,5 @@
 import type { TimelineItemView } from "@/lib/orbit-ipc";
-import { stripWindowsVerbatimPrefix } from "@/lib/stage-cache";
+import { stripWindowsVerbatimPrefix } from "./stage-cache.ts";
 
 export function stripWorkspacePrefix(filePath: string, cwd?: string | null): string {
   if (!filePath) return filePath;
@@ -428,13 +428,28 @@ export function describeToolStep(
 }
 
 export type FocusedDecisionTarget =
-  | { kind: "permission"; requestId: string }
-  | { kind: "question"; requestId: string }
+  | {
+      kind: "permission";
+      queueKey: string;
+      hostId: string;
+      agentId: string;
+      requestId: string;
+      allowedDecisions: readonly string[];
+      onResolve?: (decision: string) => void;
+    }
+  | {
+      kind: "question";
+      queueKey: string;
+      hostId: string;
+      agentId: string;
+      requestId: string;
+    }
   | null;
 
 let activeFocusedDecisionTarget: FocusedDecisionTarget = null;
+let activeDecisionQueueStepper: ((delta: -1 | 1) => void) | null = null;
 
-/** Returns the decision card currently focused in `StickyApprovalDock`. */
+/** Returns the decision card currently focused in `DecisionDock`. */
 export function getFocusedDecisionTarget(): FocusedDecisionTarget {
   return activeFocusedDecisionTarget;
 }
@@ -442,6 +457,18 @@ export function getFocusedDecisionTarget(): FocusedDecisionTarget {
 /** Updates the currently visible decision target for scoped keyboard approval shortcuts. */
 export function setFocusedDecisionTarget(target: FocusedDecisionTarget): void {
   activeFocusedDecisionTarget = target;
+}
+
+/** Registers the active queue stepper callback when multiple decisions are queued. */
+export function setDecisionQueueStepper(stepper: ((delta: -1 | 1) => void) | null): void {
+  activeDecisionQueueStepper = stepper;
+}
+
+/** Steps the active decision queue via keyboard shortcut if multiple decisions are queued. */
+export function stepFocusedDecisionQueue(delta: -1 | 1): boolean {
+  if (!activeDecisionQueueStepper) return false;
+  activeDecisionQueueStepper(delta);
+  return true;
 }
 
 export function isDenyDecision(dec: string): boolean {

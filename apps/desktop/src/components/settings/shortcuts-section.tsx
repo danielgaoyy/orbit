@@ -70,6 +70,8 @@ export function ShortcutsSection() {
       { group: approvalsGroup, action: t("settings.scAllow"), keys: `${mod}Y` },
       { group: approvalsGroup, action: t("settings.scAlwaysAllow"), keys: `${mod}${shift}Y` },
       { group: approvalsGroup, action: t("settings.scDeny"), keys: `${mod}${backspace}` },
+      { group: approvalsGroup, action: t("settings.scSwitchApproval"), keys: `${mod}[ / ${mod}]` },
+      { group: approvalsGroup, action: t("settings.scQuickSelectOption"), keys: "1 .. 9" },
     ];
 
     const q = query.trim().toLowerCase();

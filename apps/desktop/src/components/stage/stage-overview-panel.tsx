@@ -546,7 +546,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
         <div className="orbit-native-scroll border-border-subtle min-h-0 shrink overflow-y-auto overscroll-contain border-t select-none">
           {/* === Tier 1: Live Runtime (Subagents -> Goal & Timers -> Background Tasks) === */}
 
-          {/* 1. Living Subagents Crew (OneWorks 3D Avatars — top priority for live work & approvals) */}
+          {/* 1. Subagent crew, first for live work and approvals */}
           {subagentSummary.visible.length > 0 && (
             <OverviewSection
               id="subagents"

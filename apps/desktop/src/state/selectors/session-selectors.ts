@@ -66,7 +66,7 @@ const EMPTY_INSIGHT_SUBAGENTS: readonly SessionSubagentEntryView[] = Object.free
 
 /**
  * Single source of truth for a conversation's subagents (managed + provider-native + cross-host),
- * including collision-free OneWorks 3D character assignment and archive filtering.
+ * including collision-free animal avatar assignment and archive filtering.
  */
 export function selectSessionSubagents(
   state: Pick<OrbitUiState, "hostDetails" | "fleet" | "archivedSubagents"> &

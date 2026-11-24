@@ -1129,6 +1129,7 @@ export interface AgentCardView {
   task_summary?: string | null;
   forked_from_agent_id?: string | null;
   forked_at_seq?: number | null;
+  created_at_rfc3339?: string | null;
   updated_at_rfc3339: string;
   is_pinned: boolean;
   seen_seq: number;

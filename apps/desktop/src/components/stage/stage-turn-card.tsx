@@ -12,7 +12,7 @@ import type {
 import {
   type ResolvedSubagentItem,
   type SubagentNameMatcher,
-  resolveToolCallSubagent,
+  resolveDelegationDispatches,
 } from "@/lib/subagents";
 import { formatThoughtSummaryLabel } from "@/lib/timeline-coalesce";
 import {
@@ -127,6 +127,7 @@ const StageAssistantMessageSegment = memo(function StageAssistantMessageSegment(
  */
 export const TurnStageSection = memo(function TurnStageSection({
   turn,
+  dispatches,
   isTurnActive,
   isLastTurn = false,
   agentStatusLabel = null,
@@ -152,6 +153,7 @@ export const TurnStageSection = memo(function TurnStageSection({
   parentMessageLabel,
 }: {
   turn: StageTurnView;
+  dispatches?: ReturnType<typeof resolveDelegationDispatches>;
   isTurnActive: boolean;
   isLastTurn?: boolean;
   agentStatusLabel?: string | null;
@@ -242,15 +244,16 @@ export const TurnStageSection = memo(function TurnStageSection({
     const split = stepGroupSplits.get(lastRawSeg.key);
     const lastChunk = split ? (split.chunks[split.chunks.length - 1] ?? null) : null;
     if (!lastChunk || lastChunk.kind !== "delegation") return false;
+    const matches = dispatches ?? resolveDelegationDispatches(lastChunk.items, sessionSubagents ?? EMPTY_SUBAGENTS, hostId);
     return !lastChunk.items.some((it) => {
       if (it.status === "running") return true;
-      const resolved = resolveToolCallSubagent(it, sessionSubagents ?? EMPTY_SUBAGENTS, hostId);
+      const resolved = matches.get(it);
       return (
         resolved?.subagent.status === "running" ||
         resolved?.subagent.status === "awaiting_permission"
       );
     });
-  }, [isTurnActive, lastRawSeg, stepGroupSplits, sessionSubagents, hostId]);
+  }, [isTurnActive, lastRawSeg, stepGroupSplits, sessionSubagents, hostId, dispatches]);
 
   const needsTrailingActivity =
     isTurnActive &&
@@ -444,7 +447,7 @@ export const TurnStageSection = memo(function TurnStageSection({
                         hostId={hostId}
                         agentId={agentId}
                         sessionSubagents={sessionSubagents}
-                        onOpenSubagent={onOpenSubagent}
+                        dispatches={dispatches}
                         parentMessageLabel={parentMessageLabel}
                       />
                     );
@@ -627,6 +630,7 @@ export const TurnStageSection = memo(function TurnStageSection({
   prev.onRequestFork === next.onRequestFork &&
   prev.canForkWorktree === next.canForkWorktree &&
   prev.onPreviewImage === next.onPreviewImage &&
+  prev.dispatches === next.dispatches &&
   prev.sessionSubagents === next.sessionSubagents &&
   prev.sessionSubagentMatcher === next.sessionSubagentMatcher &&
   prev.onOpenSubagent === next.onOpenSubagent &&

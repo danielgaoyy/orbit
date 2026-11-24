@@ -930,12 +930,10 @@ const StageOverviewBody = memo(function StageOverviewBody({
 const DockedOverviewShell = memo(function DockedOverviewShell({
   ariaLabel,
   dockedTopPx,
-  maxHeightPx,
   children,
 }: {
   ariaLabel: string;
   dockedTopPx: number;
-  maxHeightPx: number;
   children: ReactNode;
 }) {
   const {
@@ -947,25 +945,25 @@ const DockedOverviewShell = memo(function DockedOverviewShell({
 
   if (!dockedOverviewMounted) return null;
 
+  const responsiveMaxHeight = `min(640px, max(160px, calc(100dvh - ${dockedTopPx + 16}px)))`;
+
   return (
     <aside
       aria-label={ariaLabel}
       inert={!dockedOverviewVisualOpen}
       style={{
         top: `${dockedTopPx}px`,
+        maxHeight: responsiveMaxHeight,
         transform: dockedOverviewTransform,
         opacity: dockedOverviewVisualOpen ? 1 : 0,
         transition: dockedOverviewTransition,
       }}
       className={cn(
-        "fixed right-4 z-[15] w-[288px] origin-top-right will-change-[transform,opacity]",
+        "fixed right-4 z-[25] flex w-[288px] origin-top-right flex-col will-change-[transform,opacity]",
         !dockedOverviewVisualOpen && "pointer-events-none",
       )}
     >
-      <Card
-        style={{ maxHeight: `${maxHeightPx}px` }}
-        className="overview-card-surface flex w-full flex-col gap-0 overflow-hidden rounded-[12px] p-0"
-      >
+      <Card className="overview-card-surface flex min-h-0 max-h-full w-full flex-col gap-0 overflow-hidden rounded-[12px] p-0">
         {children}
       </Card>
     </aside>
@@ -975,12 +973,10 @@ const DockedOverviewShell = memo(function DockedOverviewShell({
 const PopoverOverviewShell = memo(function PopoverOverviewShell({
   canDock,
   ariaLabel,
-  maxHeightPx,
   children,
 }: {
   canDock: boolean;
   ariaLabel: string;
-  maxHeightPx: number;
   children: ReactNode;
 }) {
   const popoverOpen = useOrbitSelector((s) => s.overviewPopoverOpen);
@@ -1054,18 +1050,14 @@ const PopoverOverviewShell = memo(function PopoverOverviewShell({
       role="dialog"
       aria-label={ariaLabel}
       inert={!popoverVisualOpen}
-      style={{ maxHeight: `${maxHeightPx}px` }}
       className={cn(
-        "absolute top-3 right-4 z-30 w-[288px] max-w-[calc(100%-32px)] origin-top-right outline-none will-change-[transform,opacity]",
+        "absolute top-3 right-4 z-30 flex max-h-[min(560px,calc(100%-24px))] w-[288px] max-w-[calc(100%-32px)] origin-top-right flex-col outline-none will-change-[transform,opacity]",
         popoverVisualOpen
           ? "translate-x-0 translate-y-0 scale-100 opacity-100 transition-[opacity,transform] duration-[190ms] ease-[var(--ease-out-expo)]"
           : "pointer-events-none translate-x-1 -translate-y-1.5 scale-[0.97] opacity-0 transition-[opacity,transform] duration-[145ms] ease-[var(--ease-exit)]",
       )}
     >
-      <Card
-        style={{ maxHeight: `${maxHeightPx}px` }}
-        className="floating-surface flex w-full flex-col gap-0 overflow-hidden rounded-[12px] border p-0"
-      >
+      <Card className="floating-surface flex min-h-0 max-h-full w-full flex-col gap-0 overflow-hidden rounded-[12px] border p-0">
         {children}
       </Card>
     </div>
@@ -1120,20 +1112,14 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
 }: StageOverviewPanelProps) {
   const { t } = useI18n();
   const [dockedTopPx, setDockedTopPx] = useState(52);
-  const [stageHeightPx, setStageHeightPx] = useState(640);
 
   useLayoutEffect(() => {
     const el = stageContainerRef?.current;
     if (!el) return;
     let rafId = 0;
     const syncRect = () => {
-      const rect = el.getBoundingClientRect();
-      const nextTop = Math.round(rect.top) + 12;
-      const nextHeight = Math.round(rect.height);
+      const nextTop = Math.round(el.getBoundingClientRect().top) + 12;
       setDockedTopPx((prev) => (prev === nextTop ? prev : nextTop));
-      if (nextHeight > 0) {
-        setStageHeightPx((prev) => (prev === nextHeight ? prev : nextHeight));
-      }
     };
     const scheduleSyncRect = () => {
       if (rafId) return;
@@ -1154,8 +1140,6 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
     };
   }, [stageContainerRef, canDock]);
 
-  const dockedMaxHeightPx = Math.min(640, Math.max(240, stageHeightPx - 28));
-  const popoverMaxHeightPx = Math.min(560, Math.max(240, stageHeightPx - 24));
   const overviewAriaLabel = t("overview.ariaLabel");
 
   const agentWorkspaceId = currentAgent?.workspace_id ?? null;
@@ -1195,7 +1179,6 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
       <DockedOverviewShell
         ariaLabel={overviewAriaLabel}
         dockedTopPx={dockedTopPx}
-        maxHeightPx={dockedMaxHeightPx}
       >
         {bodyNode}
       </DockedOverviewShell>
@@ -1203,7 +1186,6 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
       <PopoverOverviewShell
         canDock={canDock}
         ariaLabel={overviewAriaLabel}
-        maxHeightPx={popoverMaxHeightPx}
       >
         {bodyNode}
       </PopoverOverviewShell>

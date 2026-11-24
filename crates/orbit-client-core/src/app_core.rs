@@ -1054,11 +1054,19 @@ struct ClientQueuedPreviewBytes {
 
 impl Drop for ClientQueuedPreviewBytes {
     fn drop(&mut self) {
-        let _ = self.queued_bytes.fetch_update(
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-            |cur| Some(cur.saturating_sub(self.len)),
-        );
+        let mut cur = self.queued_bytes.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            let next = cur.saturating_sub(self.len);
+            match self.queued_bytes.compare_exchange_weak(
+                cur,
+                next,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 }
 
@@ -22416,17 +22424,26 @@ fn enqueue_client_preview_tunnel_data(
         let Some(sink) = active_tunnels.get(&tunnel_id) else {
             return Ok(());
         };
-        let reserved = sink
-            .queued_bytes
-            .fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |cur| {
-                    let next = cur.checked_add(len)?;
-                    (next <= MAX_PREVIEW_TUNNEL_QUEUED_BYTES).then_some(next)
-                },
-            )
-            .is_ok();
+        let reserved = {
+            let mut cur = sink.queued_bytes.load(std::sync::atomic::Ordering::Acquire);
+            loop {
+                let Some(next) = cur
+                    .checked_add(len)
+                    .filter(|n| *n <= MAX_PREVIEW_TUNNEL_QUEUED_BYTES)
+                else {
+                    break false;
+                };
+                match sink.queued_bytes.compare_exchange_weak(
+                    cur,
+                    next,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                ) {
+                    Ok(_) => break true,
+                    Err(actual) => cur = actual,
+                }
+            }
+        };
         if !reserved {
             Some("preview tunnel byte buffer overflow")
         } else {

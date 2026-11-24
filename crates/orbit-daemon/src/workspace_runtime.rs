@@ -1364,7 +1364,7 @@ impl WorkspaceScriptRegistry {
 
         let tcp = match connect_local_upstream(port).await {
             Ok(s) => s,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         };
 
         let (mut sender, conn) =
@@ -1456,7 +1456,7 @@ impl WorkspaceScriptRegistry {
 
         let tcp = match connect_local_upstream(port).await {
             Ok(s) => s,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         };
 
         let (mut sender, conn) = match hyper::client::conn::http1::handshake(TokioIo::new(tcp))
@@ -1618,7 +1618,7 @@ fn validate_single_host_authority(
     }
 }
 
-async fn connect_local_upstream(port: u16) -> Result<TcpStream, Response<Body>> {
+async fn connect_local_upstream(port: u16) -> Result<TcpStream, Box<Response<Body>>> {
     match tokio::time::timeout(
         SERVICE_PROXY_CONNECT_TIMEOUT,
         TcpStream::connect(("127.0.0.1", port)),
@@ -1629,11 +1629,11 @@ async fn connect_local_upstream(port: u16) -> Result<TcpStream, Response<Body>> 
             let _ = stream.set_nodelay(true);
             Ok(stream)
         }
-        Ok(Err(err)) => Err(bad_gateway_response(port, &err.to_string())),
-        Err(_) => Err(bad_gateway_response(
+        Ok(Err(err)) => Err(Box::new(bad_gateway_response(port, &err.to_string()))),
+        Err(_) => Err(Box::new(bad_gateway_response(
             port,
             "timed out connecting to upstream service",
-        )),
+        ))),
     }
 }
 

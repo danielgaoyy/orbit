@@ -1377,6 +1377,40 @@ fn normalize_path_separators(raw: &str) -> String {
     }
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn normalize_windows_glob_separators(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(&next) = chars.peek()
+                && matches!(next, '\\' | '*' | '?' | '[' | ']')
+            {
+                out.push('\\');
+                out.push(next);
+                let _ = chars.next();
+                continue;
+            }
+            out.push('/');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn normalize_glob_pattern_separators(raw: &str) -> String {
+    #[cfg(windows)]
+    let normalized = normalize_windows_glob_separators(raw);
+    #[cfg(not(windows))]
+    let normalized = raw.to_string();
+    if normalized.len() > 1 {
+        normalized.trim_end_matches('/').to_string()
+    } else {
+        normalized
+    }
+}
+
 fn match_path_glob_for_decision(
     raw_pattern: &str,
     target: &NormalizedTargetPath,
@@ -1385,7 +1419,7 @@ fn match_path_glob_for_decision(
     if is_allow && target.resolution_failed {
         return false;
     }
-    let pat = normalize_path_separators(raw_pattern);
+    let pat = normalize_glob_pattern_separators(raw_pattern);
     if pat.is_empty() {
         return false;
     }
@@ -2708,6 +2742,14 @@ mod tests {
         )
         .expect("should derive escaped rule");
         assert_eq!(derived.pattern, r"src/report_\*_\[1\].txt");
+        assert_eq!(
+            normalize_windows_glob_separators(&derived.pattern),
+            r"src/report_\*_\[1\].txt"
+        );
+        assert_eq!(
+            normalize_windows_glob_separators(r"src\sub\report_\*_\[1\].txt"),
+            r"src/sub/report_\*_\[1\].txt"
+        );
 
         let rule = make_rule(
             "r_special",

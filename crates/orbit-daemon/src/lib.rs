@@ -2182,24 +2182,37 @@ fn try_reserve_atomic_budget(
     amount: usize,
     limit: usize,
 ) -> bool {
-    counter
-        .fetch_update(
+    let mut cur = counter.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        let Some(next) = cur.checked_add(amount).filter(|n| *n <= limit) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(
+            cur,
+            next,
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
-            |cur| {
-                let next = cur.checked_add(amount)?;
-                (next <= limit).then_some(next)
-            },
-        )
-        .is_ok()
+        ) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
 }
 
 fn saturating_atomic_sub(counter: &std::sync::atomic::AtomicUsize, amount: usize) {
-    let _ = counter.fetch_update(
-        std::sync::atomic::Ordering::AcqRel,
-        std::sync::atomic::Ordering::Acquire,
-        |cur| Some(cur.saturating_sub(amount)),
-    );
+    let mut cur = counter.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        let next = cur.saturating_sub(amount);
+        match counter.compare_exchange_weak(
+            cur,
+            next,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(actual) => cur = actual,
+        }
+    }
 }
 
 struct ActivePreviewTunnel {

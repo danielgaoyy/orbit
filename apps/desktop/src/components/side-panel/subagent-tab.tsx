@@ -9,6 +9,8 @@ import {
   type PromptImagePreviewTarget,
   TurnStageSection,
 } from "@/components/stage/stream-stage";
+import { useDelegationDispatches } from "@/components/stage/use-delegation-dispatches";
+import { selectSessionSubagents } from "@/state/selectors/session-selectors";
 import { ContextBanner } from "@/components/ui/context-banner";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { SubagentAvatar } from "@/components/ui/subagent-avatar";
@@ -21,15 +23,12 @@ import {
 import { computeSubagentTurnsFingerprint } from "@/lib/stage-cache";
 import {
   type ResolvedSubagentItem,
-  areResolvedSubagentsEqual,
   buildSubagentNameMatcher,
-  resolveSessionSubagents,
 } from "@/lib/subagents";
 import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
 const NOOP_REWIND = () => {};
 const EMPTY_STAGE_SUBAGENTS: readonly SessionSubagentEntryView[] = [];
-const EMPTY_RESOLVED_SUBAGENTS: readonly ResolvedSubagentItem[] = [];
 
 interface ThinkingTimingRecord {
   startedAtMs: number;
@@ -364,58 +363,32 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
   const effectiveAgentId = tab.childAgentId ?? tab.providerSubagentId ?? parentAgentId ?? "";
   const effectiveHostId = isManaged ? (hostId ?? "") : (parentHostId ?? "");
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
-  const fleetHosts = useOrbitSelector((s) => s.fleet.hosts);
+  const fleet = useOrbitSelector((s) => s.fleet);
+  const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
   const parentStageSubagents = useOrbitSelector((s) =>
     parentHostId && parentAgentId
       ? (s.stages[`${parentHostId}::${parentAgentId}`]?.insights.subagents ?? EMPTY_STAGE_SUBAGENTS)
       : EMPTY_STAGE_SUBAGENTS,
   );
 
-  const subagentSessionSubagentsRef = useRef<readonly ResolvedSubagentItem[]>(
-    EMPTY_RESOLVED_SUBAGENTS,
+  const childInsights = childStage?.insights.subagents ?? EMPTY_STAGE_SUBAGENTS;
+  const children = useMemo(() => selectSessionSubagents(
+    { hostDetails, fleet, archivedSubagents }, effectiveHostId, effectiveAgentId, childInsights,
+  ).all, [hostDetails, fleet, archivedSubagents, effectiveHostId, effectiveAgentId, childInsights]);
+  const siblings = useMemo(() => selectSessionSubagents(
+    { hostDetails, fleet, archivedSubagents }, parentHostId, parentAgentId, parentStageSubagents,
+  ).all, [hostDetails, fleet, archivedSubagents, parentHostId, parentAgentId, parentStageSubagents]);
+  const currentPeer = siblings.find((sa) =>
+    (tab.childAgentId && sa.childAgentId === tab.childAgentId) ||
+    (tab.providerSubagentId && sa.providerSubagentId === tab.providerSubagentId) ||
+    sa.callId === tab.subagentCallId,
   );
   const subagentSessionSubagents = useMemo(() => {
-    const resolved = new Map<string, ResolvedSubagentItem>();
-    if (effectiveHostId && effectiveAgentId && childStage) {
-      for (const sa of resolveSessionSubagents({
-        hostId: effectiveHostId,
-        agentId: effectiveAgentId,
-        insightsSubagents: childStage.insights.subagents,
-        hostDetails,
-        fleetHosts,
-      })) {
-        resolved.set(sa.key, sa);
-      }
-    }
-    if (parentHostId && parentAgentId) {
-      for (const sa of resolveSessionSubagents({
-        hostId: parentHostId,
-        agentId: parentAgentId,
-        insightsSubagents: parentStageSubagents,
-        hostDetails,
-        fleetHosts,
-      })) {
-        if (!resolved.has(sa.key)) {
-          resolved.set(sa.key, sa);
-        }
-      }
-    }
-    const next = resolved.size === 0 ? EMPTY_RESOLVED_SUBAGENTS : Array.from(resolved.values());
-    if (areResolvedSubagentsEqual(subagentSessionSubagentsRef.current, next)) {
-      return subagentSessionSubagentsRef.current;
-    }
-    subagentSessionSubagentsRef.current = next;
-    return next;
-  }, [
-    effectiveHostId,
-    effectiveAgentId,
-    childStage,
-    parentHostId,
-    parentAgentId,
-    parentStageSubagents,
-    hostDetails,
-    fleetHosts,
-  ]);
+    const peers = new Map(siblings.map((sa) => [sa.key, sa]));
+    for (const child of children) peers.set(child.key, child);
+    return Array.from(peers.values());
+  }, [children, siblings]);
+  const dispatches = useDelegationDispatches(displayTurns, children, effectiveHostId, subagentSessionSubagents);
 
   const subagentNameMatcher = useMemo(
     () => buildSubagentNameMatcher(subagentSessionSubagents),
@@ -524,6 +497,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
           tone={needsApproval ? "warning" : "neutral"}
           icon={
             <SubagentAvatar
+              character={currentPeer?.character}
               seedKey={tab.childAgentId || tab.providerSubagentId || tab.subagentCallId || tab.title}
               status={status}
               size="xs"
@@ -585,6 +559,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
                   <TurnStageSection
                     key={turn.key}
                     turn={turn}
+                    dispatches={dispatches}
                     isTurnActive={isTurnActive}
                     agentStatusLabel={liveLabel}
                     isNetworkOffline={isNetworkOffline}

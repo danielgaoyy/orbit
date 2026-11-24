@@ -1,3 +1,4 @@
+import type { ComposerInlineDirective } from "@/lib/slash-commands";
 import type { DraftPersistenceController } from "@/lib/draft-persistence";
 import type { NotificationSoundTone } from "@/lib/notification-sound";
 import type {
@@ -73,7 +74,7 @@ export interface OrbitCrossSliceActions {
     hostId?: string,
     cwd?: string,
     prefillPrompt?: string,
-    prefillSlash?: SlashDirective | null,
+    prefillSlash?: ComposerInlineDirective | null,
     workspaceId?: string | null,
   ): void;
   focusComposer(opts?: ComposerFocusOptions): void;
@@ -99,6 +100,8 @@ export interface OrbitCrossSliceActions {
     hostId: string,
     key: string,
     steerImmediately: boolean,
+    rawDraft: string,
+    storedDirective: SlashDirective | null,
   ): Promise<void>;
   forkAgent(opts: {
     hostId: string;
@@ -120,6 +123,9 @@ export interface OrbitCrossSliceActions {
   closeSidePanelTab(tabId: string, opts?: { skipUnsavedGuard?: boolean }): void;
   openReviewTab(opts?: { path?: string | null; scope?: ReviewScope }): void;
   toggleReviewTab(openOverride?: boolean): void;
+  openFilesExplorerTab(): void;
+  openExportDialog(hostId: string, agentId: string): void;
+  openCopyCodeBlocksModal(hostId: string, agentId: string): Promise<void>;
   openFileInSidePanel(
     rawPath: string,
     opts?: {
@@ -177,6 +183,7 @@ export interface OrbitCrossSliceActions {
     action: BrowserActionRequest,
   ): Promise<BrowserActionResponseView | null>;
   openTerminalTab(opts?: { spawnIfEmpty?: boolean }): void;
+  toggleTerminalTab(openOverride?: boolean): void;
   openBrowserTab(initialUrl?: string): void;
   openSideQuestionTab(opts?: { entryId?: string }): void;
   submitSideQuestion(

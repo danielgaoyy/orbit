@@ -166,6 +166,8 @@ pub enum DriverEvent {
         /// Instantaneous prompt token count of the most recent single LLM API call in the turn
         /// (distinct from cumulative multi-step turn sums).
         last_call_prompt_tokens: Option<u64>,
+        /// Authoritative model context window size reported by the provider, when available.
+        context_window_tokens: Option<u64>,
         model: Option<String>,
     },
     Exited {

@@ -252,9 +252,9 @@ pub struct AgentOrchestrator {
     /// Agents that already persisted provider-reported `DriverEvent::TurnUsage` for the active turn,
     /// avoiding double-counting when the turn settles to `Idle`.
     turn_usage_recorded: RwLock<std::collections::HashSet<String>>,
-    /// Most recent provider-reported instantaneous single-call prompt token count `(tokens, recorded_at_ms)`
-    /// per `agent_id` for accurate context occupancy without multi-step turn-sum inflation.
-    last_call_prompt_occupancy: RwLock<HashMap<String, (u64, i64)>>,
+    /// Most recent provider-reported instantaneous single-call context telemetry per `agent_id`
+    /// for accurate context occupancy without multi-step turn-sum inflation.
+    last_call_prompt_occupancy: RwLock<HashMap<String, orbit_store::AgentContextTelemetry>>,
     /// In-flight AI organizer / summarizer locks keyed by `sum:<agent_id>` or `org:<project_root>`.
     /// Uses a synchronous `std::sync::Mutex` (never held across `.await`) so RAII `OrganizerLockGuard`
     /// always releases the lock and marks `keep_awake` idle on cancellation or panic.
@@ -5413,6 +5413,7 @@ impl AgentOrchestrator {
                 cache_read_tokens,
                 cache_write_tokens,
                 last_call_prompt_tokens,
+                context_window_tokens,
                 model,
             } => {
                 let recorded_at_ms = Utc::now().timestamp_millis();
@@ -5420,17 +5421,26 @@ impl AgentOrchestrator {
                     .write()
                     .await
                     .insert(agent_id.to_string());
-                if let Some(prompt_toks) = last_call_prompt_tokens
-                    && prompt_toks > 0
-                {
+                let telemetry_opt =
+                    last_call_prompt_tokens
+                        .filter(|&toks| toks > 0)
+                        .map(|prompt_tokens| orbit_store::AgentContextTelemetry {
+                            prompt_tokens,
+                            context_window_tokens: context_window_tokens.filter(|&w| w > 0),
+                            recorded_at_ms,
+                        });
+                if let Some(telemetry) = telemetry_opt {
                     self.last_call_prompt_occupancy
                         .write()
                         .await
-                        .insert(agent_id.to_string(), (prompt_toks, recorded_at_ms));
+                        .insert(agent_id.to_string(), telemetry);
                 }
                 let store_bg = Arc::clone(&self.store);
                 let aid_bg = agent_id.to_string();
                 tokio::task::spawn_blocking(move || {
+                    if let Some(telemetry) = telemetry_opt {
+                        let _ = store_bg.upsert_agent_context_telemetry(&aid_bg, telemetry);
+                    }
                     if let Ok(Some(ag)) = store_bg.get_agent(&aid_bg) {
                         let provider_slug = ag.provider.slug().to_string();
                         let effective_model = model
@@ -6243,9 +6253,12 @@ impl AgentOrchestrator {
 
     // --- Detached PTY Terminals ---
 
-    /// Return the latest provider-reported single-call prompt token count `(tokens, recorded_at_ms)`
-    /// observed in-memory for `agent_id`, if available.
-    pub async fn latest_single_call_prompt_tokens(&self, agent_id: &str) -> Option<(u64, i64)> {
+    /// Return the latest provider-reported single-call context telemetry observed in-memory
+    /// for `agent_id`, if available (caller falls back to persisted SQLite telemetry on restart).
+    pub async fn latest_single_call_prompt_tokens(
+        &self,
+        agent_id: &str,
+    ) -> Option<orbit_store::AgentContextTelemetry> {
         self.last_call_prompt_occupancy
             .read()
             .await

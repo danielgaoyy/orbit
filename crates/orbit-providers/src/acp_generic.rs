@@ -1888,6 +1888,12 @@ fn map_generic_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> Too
     let raw_in = update.get("rawInput");
     let raw_out = update.get("rawOutput");
 
+    if crate::managed_dispatch::is_launch(title)
+        || matches!(prev, Some(ToolCallDetail::Subagent { .. }))
+    {
+        return crate::managed_dispatch::acp_detail(update, prev);
+    }
+
     let out_preview = raw_out.and_then(|o| {
         if let Some(s) = o.as_str() {
             Some(truncate_preview(s, 800))

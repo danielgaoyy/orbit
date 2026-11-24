@@ -470,6 +470,8 @@ pub struct AgentCardView {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels: HashMap<String, String>,
     pub latest_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_rfc3339: Option<String>,
     pub updated_at_rfc3339: String,
     #[serde(default)]
     pub is_pinned: bool,
@@ -20705,6 +20707,7 @@ fn agent_to_card_view_with_timers(
         archived_at_rfc3339: a.archived_at.map(|ts| ts.to_rfc3339()),
         labels: a.labels.clone(),
         latest_seq: a.latest_seq,
+        created_at_rfc3339: Some(a.created_at.to_rfc3339()),
         updated_at_rfc3339: a.updated_at.to_rfc3339(),
         is_pinned,
         seen_seq: effective_seen_seq,

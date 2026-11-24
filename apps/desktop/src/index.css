@@ -1,6 +1,5 @@
 @import "tailwindcss";
 @import "@xterm/xterm/css/xterm.css";
-@import "@oneworks/avatar-react/renderer.css";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -324,8 +323,41 @@
     0 2px 10px 0 oklch(0 0 0 / 22%);
 }
 
-.composer-surface[data-plan="true"] {
+.composer-surface[data-plan="true"],
+.dark .composer-surface[data-plan="true"] {
   border-color: var(--signal-info-border);
+}
+
+/* Soft visual recession when DecisionDock is actively commanding focal priority above Composer */
+.composer-surface[data-dock-active="true"]:not(:focus-within) {
+  border-color: var(--border-subtle);
+  box-shadow: 0 1px 2px 0 oklch(0 0 0 / 2%);
+  opacity: 0.92;
+}
+
+.dark .composer-surface[data-dock-active="true"]:not(:focus-within) {
+  border-color: var(--border-subtle);
+  box-shadow:
+    inset 0 0.5px 0 0 oklch(1 0 0 / 4.5%),
+    0 1px 6px 0 oklch(0 0 0 / 16%);
+  opacity: 0.92;
+}
+
+/* Queued Follow-Up Strip surface docked above Composer */
+.composer-queue-surface {
+  background: var(--surface-raised);
+  border: 1px solid var(--border-subtle);
+  box-shadow:
+    0 1px 2px 0 oklch(0 0 0 / 2.2%),
+    0 4px 14px -4px oklch(0 0 0 / 3.5%);
+}
+
+.dark .composer-queue-surface {
+  background: var(--surface-raised);
+  border: 1px solid var(--border-subtle);
+  box-shadow:
+    inset 0 0.5px 0 0 oklch(1 0 0 / 5.5%),
+    0 2px 8px 0 oklch(0 0 0 / 18%);
 }
 
 /* Unified Decision Dock surface (Parent & Subagent Approvals / Clarifications) */
@@ -333,17 +365,27 @@
   background: var(--surface-raised);
   border: 1px solid var(--border-default);
   box-shadow:
-    0 1px 3px 0 oklch(0 0 0 / 3%),
-    0 6px 18px -4px oklch(0 0 0 / 4%);
+    0 1px 3px 0 oklch(0 0 0 / 3.5%),
+    0 8px 22px -4px oklch(0 0 0 / 5.5%);
 }
 
 .dark .approval-dock-surface {
   background: var(--surface-raised);
   border: 1px solid var(--border-default);
   box-shadow:
-    inset 0 0.5px 0 0 oklch(1 0 0 / 6.5%),
-    0 2px 10px 0 oklch(0 0 0 / 20%),
-    0 8px 24px -6px oklch(0 0 0 / 26%);
+    inset 0 0.5px 0 0 oklch(1 0 0 / 7.5%),
+    0 2px 12px 0 oklch(0 0 0 / 24%),
+    0 10px 28px -6px oklch(0 0 0 / 30%);
+}
+
+.approval-dock-surface[data-risk="danger"],
+.dark .approval-dock-surface[data-risk="danger"] {
+  border-color: var(--signal-danger-border);
+}
+
+.approval-dock-surface[data-risk="warning"],
+.dark .approval-dock-surface[data-risk="warning"] {
+  border-color: var(--signal-warning-border);
 }
 
 /* Elevated User Prompt Bubble surface */
@@ -403,36 +445,78 @@
     0 2px 8px 0 oklch(0 0 0 / 24%);
 }
 
-/* OneWorks 3D Subagent Avatar optical ring outline (per interface-design SKILL Image Outlines) */
+/* Inset optical rim on the light and dark backdrops. */
 .orbit-avatar-frame {
-  position: relative;
+  background: var(--av-light);
   overflow: hidden;
-  border-radius: 9999px;
+  border-radius: 50%;
+  outline: 1px solid #00000017;
+  outline-offset: -1px;
 }
 
-.orbit-avatar-frame::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  pointer-events: none;
-  box-shadow: inset 0 0 0 1px oklch(0 0 0 / 9%);
+.dark .orbit-avatar-frame {
+  background: var(--av-dark);
+  outline-color: #ffffff21;
 }
 
-.dark .orbit-avatar-frame::after {
-  box-shadow: inset 0 0 0 1px oklch(1 0 0 / 13%);
-}
-
-.orbit-avatar-frame[data-attention="true"] {
+[data-attention="true"] > .orbit-avatar-frame {
   box-shadow:
     0 0 0 1.5px var(--surface-base),
     0 0 0 3px var(--signal-warning);
 }
 
-/* Neutralize OneWorks grab cursor inside non-interactive Orbit Subagent portraits */
-.orbit-avatar-noninteractive .interactive-avatar__canvas {
-  cursor: inherit !important;
-  pointer-events: none !important;
+[data-status="canceled"] > .orbit-avatar-frame {
+  opacity: 0.75;
+  filter: grayscale(0.35);
+}
+
+/* Distances are in SVG user units so the same turn reads at every size. */
+@media (prefers-reduced-motion: no-preference) {
+  [data-animate="working"] { --av-cycle: orbit-av-hop 1160ms; }
+  [data-animate="awaiting"] { --av-cycle: orbit-av-tilt 1560ms; }
+
+  .orbit-av-rig {
+    transform-origin: 32px 37px;
+    --av-right: translate3d(0.8px, -3.8px, 0) rotate(5deg);
+    --av-left: translate3d(-0.6px, -2.8px, 0) rotate(-4deg);
+  }
+
+  .orbit-av-back {
+    --av-right: translate3d(-1.4px, 0, 0);
+    --av-left: translate3d(1.4px, 0, 0);
+  }
+
+  .orbit-av-face {
+    --av-right: translate3d(2.6px, -0.9px, 0);
+    --av-left: translate3d(-2.6px, 0.9px, 0);
+  }
+
+  [data-animate="awaiting"] .orbit-av-rig { --av-right: translate3d(0, -1.1px, 0) rotate(7deg); }
+
+  [data-animate] :is(.orbit-av-rig, .orbit-av-back, .orbit-av-face) {
+    animation: var(--av-cycle) ease-in-out infinite;
+  }
+
+  [data-animate] .orbit-av-eyes {
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: orbit-av-blink 3400ms linear infinite;
+  }
+}
+
+@keyframes orbit-av-hop {
+  24% { transform: var(--av-right); }
+  50% { transform: none; }
+  76% { transform: var(--av-left); }
+}
+
+@keyframes orbit-av-tilt {
+  42%, 58% { transform: var(--av-right); }
+}
+
+@keyframes orbit-av-blink {
+  0%, 90%, 95%, 100% { transform: scaleY(1); }
+  92.5% { transform: scaleY(0.12); }
 }
 
 /* Long Folded Activity Disclosure: bounded scroll track + sticky header when full-expanded */

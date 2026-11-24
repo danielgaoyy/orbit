@@ -25,6 +25,14 @@ pub struct QuotaSampleRecord {
     pub sampled_at_ms: i64,
 }
 
+/// Persisted latest single-call provider context telemetry for an agent session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentContextTelemetry {
+    pub prompt_tokens: u64,
+    pub context_window_tokens: Option<u64>,
+    pub recorded_at_ms: i64,
+}
+
 /// Idempotent schema bootstrap for `usage_ledger` and `quota_samples`.
 ///
 /// Intentionally does NOT alter `PRAGMA user_version`.
@@ -69,6 +77,13 @@ pub(crate) fn migrate_usage_schema(conn: &Connection) -> Result<(), StoreError> 
 
         CREATE INDEX IF NOT EXISTS idx_quota_samples_sampled_at
             ON quota_samples(sampled_at_ms DESC);
+
+        CREATE TABLE IF NOT EXISTS agent_context_telemetry (
+            agent_id              TEXT PRIMARY KEY,
+            prompt_tokens         INTEGER NOT NULL,
+            context_window_tokens INTEGER,
+            recorded_at_ms        INTEGER NOT NULL
+        );
         ",
     )?;
     Ok(())
@@ -243,6 +258,62 @@ impl OrbitStore {
         let rows = stmt.query_map(params![since_ms], map_quota_sample_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    /// Persist latest single-call provider context telemetry for `agent_id` so context occupancy
+    /// survives daemon restarts without regressing to character estimates.
+    pub fn upsert_agent_context_telemetry(
+        &self,
+        agent_id: &str,
+        telemetry: AgentContextTelemetry,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let window_i64 = telemetry
+            .context_window_tokens
+            .filter(|&w| w > 0)
+            .map(|w| w.min(i64::MAX as u64) as i64);
+        conn.execute(
+            "INSERT INTO agent_context_telemetry (
+                agent_id, prompt_tokens, context_window_tokens, recorded_at_ms
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(agent_id) DO UPDATE SET
+                prompt_tokens = excluded.prompt_tokens,
+                context_window_tokens = COALESCE(excluded.context_window_tokens, agent_context_telemetry.context_window_tokens),
+                recorded_at_ms = excluded.recorded_at_ms",
+            params![
+                agent_id,
+                telemetry.prompt_tokens.min(i64::MAX as u64) as i64,
+                window_i64,
+                telemetry.recorded_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve persisted latest single-call provider context telemetry for `agent_id`.
+    pub fn get_agent_context_telemetry(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<AgentContextTelemetry>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.query_row(
+            "SELECT prompt_tokens, context_window_tokens, recorded_at_ms
+             FROM agent_context_telemetry
+             WHERE agent_id = ?1",
+            params![agent_id],
+            |row| {
+                let prompt_i64: i64 = row.get(0)?;
+                let window_opt: Option<i64> = row.get(1)?;
+                let recorded_at_ms: i64 = row.get(2)?;
+                Ok(AgentContextTelemetry {
+                    prompt_tokens: prompt_i64.max(0) as u64,
+                    context_window_tokens: window_opt.filter(|&w| w > 0).map(|w| w as u64),
+                    recorded_at_ms,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
 }
 
 #[cfg(test)]
@@ -354,5 +425,31 @@ mod tests {
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].used_percent, 32.5);
         assert_eq!(samples[1].used_percent, 45.0);
+    }
+
+    #[test]
+    fn agent_context_telemetry_persists_prompt_and_window_across_reads() {
+        let store = OrbitStore::open_in_memory().expect("open store");
+        assert_eq!(
+            store
+                .get_agent_context_telemetry("ag_missing")
+                .expect("query missing"),
+            None
+        );
+
+        let rec = AgentContextTelemetry {
+            prompt_tokens: 48_500,
+            context_window_tokens: Some(1_000_000),
+            recorded_at_ms: 1_760_000_123_000,
+        };
+        store
+            .upsert_agent_context_telemetry("ag_ctx", rec)
+            .expect("upsert telemetry");
+        assert_eq!(
+            store
+                .get_agent_context_telemetry("ag_ctx")
+                .expect("read telemetry"),
+            Some(rec)
+        );
     }
 }

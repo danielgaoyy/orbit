@@ -35,6 +35,7 @@ export interface ResolvedSubagentItem {
   key: string;
   /** Call ID passed to openSubagentTab */
   callId: string;
+  handle?: string | null;
   /** Human-readable role or thread title */
   title: string;
   /** Prompt / subtitle preview for tooltips and SubagentTab fallback */
@@ -53,6 +54,8 @@ export interface ResolvedSubagentItem {
   childProvider: ProviderKind | null;
   /** Provider native subagent ID when read-only native subagent */
   providerSubagentId: string | null;
+  /** Managed card creation time, or zero when unavailable. */
+  createdAtMs: number;
   /** Sort tie-breaker (higher = more recent) */
   sortOrder: number;
 }
@@ -65,7 +68,7 @@ const STATUS_PRIORITY: Record<ResolvedSubagentStatus, number> = {
   completed: 4,
 };
 
-function mapManagedStatus(agent: AgentCardView, fallbackStatus?: string): ResolvedSubagentStatus {
+function mapManagedStatus(agent: AgentCardView): ResolvedSubagentStatus {
   if (agent.is_awaiting_permission) return "awaiting_permission";
   if (isAgentForegroundRunningLocal(agent)) return "running";
   const lowerLabel = agent.status_label.toLowerCase();
@@ -76,12 +79,7 @@ function mapManagedStatus(agent: AgentCardView, fallbackStatus?: string): Resolv
   ) {
     return "canceled";
   }
-  if (
-    fallbackStatus === "failed" ||
-    fallbackStatus === "denied" ||
-    lowerLabel.includes("error") ||
-    lowerLabel.includes("fail")
-  ) {
+  if (lowerLabel.includes("error") || lowerLabel.includes("fail")) {
     return "failed";
   }
   return "completed";
@@ -142,12 +140,14 @@ export function resolveSessionSubagents(params: {
   >();
   const archivedManagedIds = new Set<string>();
 
+  // Workspace peers have no parent pointer. Their dispatch result identifies them.
+  const dispatchedIds = new Set(insightsSubagents.map((sa) => sa.child_agent_id));
   for (const [hid, detail] of Object.entries(hostDetails)) {
     for (const ag of detail.agents) {
       const matchesParent =
         ag.parent_agent_id === agentId &&
         (!ag.parent_host_id || ag.parent_host_id === hostId);
-      if (!matchesParent) continue;
+      if (!matchesParent && !(ag.agent_id.startsWith("ag_") && dispatchedIds.has(ag.agent_id))) continue;
 
       if (ag.archived_at_rfc3339 && !ag.is_running && !ag.is_awaiting_permission) {
         archivedManagedIds.add(ag.agent_id);
@@ -185,15 +185,17 @@ export function resolveSessionSubagents(params: {
       out.push({
         key: `managed:${managed.childHostId}:${managed.agent.agent_id}`,
         callId: sa.id,
+        handle: managed.agent.handle,
         title: managed.agent.title || sa.role || "Subagent",
         promptPreview: sa.prompt_preview || managed.agent.status_label || "",
-        status: mapManagedStatus(managed.agent, sa.status),
+        status: mapManagedStatus(managed.agent),
         isManaged: true,
         childHostId: managed.childHostId,
         remoteHostName: managed.remoteHostName,
         childAgentId: managed.agent.agent_id,
         childProvider: managed.agent.provider,
         providerSubagentId: null,
+        createdAtMs: parseTimestampMs(managed.agent.created_at_rfc3339),
         sortOrder: Math.max(
           sa.last_seq,
           managed.agent.latest_seq,
@@ -220,6 +222,7 @@ export function resolveSessionSubagents(params: {
         childAgentId: null,
         childProvider: null,
         providerSubagentId: providerSub.subagent_id,
+        createdAtMs: 0,
         sortOrder: Math.max(sa.last_seq, parseTimestampMs(providerSub.updated_at)),
       });
       continue;
@@ -230,13 +233,15 @@ export function resolveSessionSubagents(params: {
       callId: sa.id,
       title: sa.role || "Subagent",
       promptPreview: sa.prompt_preview || "",
-      status: mapInsightStatus(sa.status),
+      status: sa.child_agent_id?.startsWith("ag_") && sa.status === "completed"
+        ? "running" : mapInsightStatus(sa.status),
       isManaged: false,
       childHostId: hostId,
       remoteHostName: null,
       childAgentId: null,
       childProvider: null,
       providerSubagentId: sa.provider_subagent_id ?? null,
+      createdAtMs: 0,
       sortOrder: sa.last_seq,
     });
   }
@@ -247,6 +252,7 @@ export function resolveSessionSubagents(params: {
     out.push({
       key: `managed:${entry.childHostId}:${childId}`,
       callId: childId,
+      handle: entry.agent.handle,
       title: entry.agent.title || "Subagent",
       promptPreview: entry.agent.status_label || "",
       status: mapManagedStatus(entry.agent),
@@ -256,6 +262,7 @@ export function resolveSessionSubagents(params: {
       childAgentId: childId,
       childProvider: entry.agent.provider,
       providerSubagentId: null,
+      createdAtMs: parseTimestampMs(entry.agent.created_at_rfc3339),
       sortOrder: Math.max(
         entry.agent.latest_seq,
         parseTimestampMs(entry.agent.updated_at_rfc3339),
@@ -278,6 +285,7 @@ export function resolveSessionSubagents(params: {
       childAgentId: null,
       childProvider: null,
       providerSubagentId: ps.subagent_id,
+      createdAtMs: 0,
       sortOrder: parseTimestampMs(ps.updated_at),
     });
   }
@@ -327,6 +335,7 @@ export function filterVisibleSubagents<
 }
 
 export interface ResolvedToolCallSubagent {
+  linked: boolean;
   subagent: ResolvedSubagentItem;
   action: "dispatch" | "message";
 }
@@ -378,6 +387,10 @@ export function areResolvedSubagentsEqual(
     const y = b[i];
     if (
       x.key !== y.key ||
+      x.callId !== y.callId ||
+      x.handle !== y.handle ||
+      x.createdAtMs !== y.createdAtMs ||
+      x.sortOrder !== y.sortOrder ||
       x.title !== y.title ||
       x.status !== y.status ||
       x.childAgentId !== y.childAgentId ||
@@ -391,20 +404,19 @@ export function areResolvedSubagentsEqual(
   return true;
 }
 
+function isManagedDispatchTool(name: string): boolean {
+  const clean = name.trim().toLowerCase().replace(/^run\s+/, "").replace(/[_\s]+/g, " ");
+  return /^(?:mcp orbit |orbit[/:.])?(?:create agent|spawn workspace peer)$/.test(clean);
+}
+
 export function classifyGenericSubagentTool(toolName: string): "dispatch" | "message" | null {
   const stripped = toolName.trim().replace(/^run\s+/i, "");
+  if (isManagedDispatchTool(toolName) || /^(?:invoke|spawn)\s+subagent$/i.test(stripped)) return "dispatch";
   if (!stripped) return null;
   const firstToken = (stripped.split(/\s+/)[0] ?? "").toLowerCase();
   if (!firstToken) return null;
   const leaf = firstToken.split(/[:/.]|__/).pop() ?? firstToken;
-  if (
-    leaf === "invoke_subagent" ||
-    leaf === "spawn_subagent" ||
-    leaf === "create_agent" ||
-    leaf === "spawn_workspace_peer" ||
-    leaf === "mcp_orbit_create_agent" ||
-    leaf === "mcp_orbit_spawn_workspace_peer"
-  ) {
+  if (leaf === "invoke_subagent" || leaf === "spawn_subagent" || isManagedDispatchTool(leaf)) {
     return "dispatch";
   }
   if (
@@ -444,15 +456,50 @@ function readStringField(obj: Record<string, unknown> | null, keys: readonly str
   return "";
 }
 
+type DispatchToolItem = Extract<TimelineItemView, { item_type: "tool_call" }> & {
+  output_preview?: string | null;
+};
+
+function resultField(value: unknown, keys: readonly string[]): string {
+  if (typeof value === "string") {
+    try {
+      return resultField(JSON.parse(value), keys);
+    } catch {
+      // Historical previews can include a prose prefix or end mid-object.
+      for (const key of keys) {
+        const match = value.match(new RegExp(`"${key}"\\s*:\\s*("(?:\\\\.|[^"\\\\])*")`));
+        if (match) {
+          try { return JSON.parse(match[1]).trim(); } catch { continue; }
+        }
+      }
+    }
+  } else if (Array.isArray(value)) {
+    for (const block of value) {
+      const field = resultField(block, keys);
+      if (field) return field;
+    }
+  } else if (value && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    const direct = readStringField(obj, keys);
+    if (direct) return direct;
+    for (const key of ["structuredContent", "content", "result", "output", "text"]) {
+      const field = resultField(obj[key], keys);
+      if (field) return field;
+    }
+  }
+  return "";
+}
+
 /**
  * Resolves a subagent dispatch (`invoke_subagent`, `create_agent`, `spawn_workspace_peer`, or
  * `detail.kind === "subagent"`) or follow-up messaging (`send_message`, `send_agent_prompt`,
  * `message_peer`) tool call against the session's unified `ResolvedSubagentItem` list.
  */
-export function resolveToolCallSubagent(
-  item: Extract<TimelineItemView, { item_type: "tool_call" }>,
+function resolveExactToolCall(
+  item: DispatchToolItem,
   subagents: readonly ResolvedSubagentItem[],
   fallbackHostId?: string,
+  matchNames = true,
 ): ResolvedToolCallSubagent | null {
   const matchById = (id: string | null | undefined): ResolvedSubagentItem | undefined => {
     const clean = id?.trim();
@@ -465,75 +512,184 @@ export function resolveToolCallSubagent(
     );
   };
 
-  const matchByTitle = (title: string | null | undefined): ResolvedSubagentItem | undefined => {
-    const clean = title?.trim();
-    if (!clean || clean.toLowerCase() === "subagent") return undefined;
-    const lower = clean.toLowerCase();
-    return subagents.find((sa) => sa.title.trim().toLowerCase() === lower);
+  const normalize = (value: string) =>
+    value.trim().toLowerCase().replace(/^@/, "").replace(/[-_\s]+/g, " ");
+  const matchByTitle = (title: string, candidates = subagents) => {
+    const normal = normalize(title);
+    if (!matchNames || !normal || normal === "subagent") return undefined;
+    const matches = candidates.filter((sa) =>
+      normalize(sa.title) === normal || normalize(sa.handle ?? "") === normal,
+    );
+    return matches.length === 1 ? matches[0] : undefined;
   };
 
+  let title: string;
+  let prompt: string;
+  let childId: string | null;
+  let managed = false;
+  let matched: ResolvedSubagentItem | undefined;
   if (item.detail.kind === "subagent") {
-    const isLegacyPlaceholder =
-      !item.detail.child_agent_id &&
-      !item.detail.prompt_preview.trim() &&
-      item.detail.role.trim().toLowerCase() === "subagent";
-    if (isLegacyPlaceholder) return null;
-
-    const matched =
-      matchById(item.call_id) ??
-      matchById(item.detail.child_agent_id) ??
-      matchByTitle(item.detail.role);
-    if (matched) {
-      return { subagent: matched, action: "dispatch" };
+    title = item.detail.role.trim();
+    prompt = item.detail.prompt_preview;
+    childId = item.detail.child_agent_id;
+    if (!childId && !prompt.trim() && title.toLowerCase() === "subagent" && item.status !== "running") {
+      return null;
     }
-    const role = item.detail.role.trim() || "Subagent";
+    managed = Boolean(childId?.startsWith("ag_"));
+    matched = managed
+      ? subagents.find((sa) => sa.childAgentId === childId)
+      : matchById(childId) ?? subagents.find((sa) => sa.callId === item.call_id);
+    if (!matched && !childId) matched = matchByTitle(title);
+  } else if (item.detail.kind === "generic") {
+    const name = item.detail.tool_name;
+    const action = classifyGenericSubagentTool(name);
+    if (!action) return null;
+    const args = tryParseJsonObject(item.detail.arguments_json ?? "");
+    if (action === "message") {
+      const recipient = readStringField(args, ["Recipient", "recipient", "agent_id", "conversation_id", "conversationId", "child_agent_id"]);
+      matched = matchById(recipient) ?? matchByTitle(recipient) ?? matchByTitle(readStringField(args, ["Role", "role", "title", "handle"]));
+      return matched ? { subagent: matched, action, linked: true } : null;
+    }
+
+    const titles = ["title", "handle", "toolSummary", "Role", "role", "TypeName", "type_name"];
+    const ids = ["child_agent_id", "agent_id"];
+    const rawArgs = item.detail.arguments_json;
+    const argumentField = (keys: readonly string[]) =>
+      args ? readStringField(args, keys) : resultField(rawArgs, keys);
+    title = resultField(item.output_preview, titles) || argumentField(titles);
+    prompt = argumentField(["initial_prompt", "Prompt", "prompt", "brief", "task"]);
+    managed = isManagedDispatchTool(name);
+    const targetId = resultField(item.output_preview, ids) || argumentField(ids) ||
+      (!managed ? readStringField(args, ["conversation_id", "conversationId", "Recipient", "recipient"]) : "");
+    childId = managed && targetId ? targetId : null;
+    const candidates = managed ? subagents.filter((sa) => sa.isManaged) : subagents;
+    if (targetId) {
+      matched = managed ? candidates.find((sa) => sa.childAgentId === targetId) : matchById(targetId);
+    } else {
+      matched = candidates.find((sa) => sa.callId === item.call_id) ?? matchByTitle(title, candidates);
+      if (!matched && typeof args?.handle === "string") {
+        matched = matchByTitle(args.handle, candidates);
+      }
+    }
+  } else {
+    return null;
+  }
+
+  const callId = item.call_id || `dispatch-${item.seq}`;
+  if (matched) {
     return {
-      subagent: {
-        key: `tool:${item.call_id}`,
-        callId: item.call_id,
-        title: role,
-        promptPreview: item.detail.prompt_preview || "",
-        status:
-          item.status === "running"
-            ? "running"
-            : item.status === "failed" || item.status === "denied"
-              ? "failed"
-              : "completed",
-        isManaged: false,
-        childHostId: fallbackHostId ?? "",
-        remoteHostName: null,
-        childAgentId: item.detail.child_agent_id,
-        childProvider: null,
-        providerSubagentId: null,
-        sortOrder: item.seq,
-      },
+      linked: true,
+      subagent: { ...matched, callId, promptPreview: prompt || matched.promptPreview },
       action: "dispatch",
     };
   }
+  return {
+    linked: false,
+    action: "dispatch",
+    subagent: {
+      key: `tool:${callId}`,
+      callId,
+      title: title || "Subagent",
+      promptPreview: prompt,
+      status: managed && item.status === "completed" ? "running" : mapInsightStatus(item.status),
+      isManaged: managed,
+      childHostId: fallbackHostId ?? "",
+      remoteHostName: null,
+      childAgentId: childId,
+      childProvider: null,
+      providerSubagentId: null,
+      createdAtMs: 0,
+      sortOrder: item.seq,
+    },
+  };
+}
 
-  if (item.detail.kind === "generic") {
-    const action = classifyGenericSubagentTool(item.detail.tool_name);
-    if (!action) return null;
-    const args = tryParseJsonObject(item.detail.arguments_json);
-    const targetId = readStringField(args, [
-      "Recipient",
-      "recipient",
-      "agent_id",
-      "conversation_id",
-      "conversationId",
-      "child_agent_id",
-    ]);
-    const targetRole = readStringField(args, ["Role", "role", "title", "handle"]);
-    const matched =
-      (action === "dispatch" ? matchById(item.call_id) : undefined) ??
-      matchById(targetId) ??
-      matchByTitle(targetRole);
-    if (matched) {
-      return { subagent: matched, action };
+/** Reserve exact identities before assigning anonymous launches across the loaded timeline. */
+export function resolveDelegationDispatches(
+  items: readonly DispatchToolItem[],
+  sessionSubagents: readonly ResolvedSubagentItem[],
+  fallbackHostId?: string,
+  messagePeers = sessionSubagents,
+) {
+  const resolved = new Map<DispatchToolItem, ResolvedToolCallSubagent>();
+  const claimCounts = new Map<string, number>();
+  for (const item of items) {
+    const recipients = messagePeers !== sessionSubagents && item.detail.kind === "generic" &&
+      classifyGenericSubagentTool(item.detail.tool_name) === "message"
+      ? messagePeers : sessionSubagents;
+    const match = resolveExactToolCall(item, recipients, fallbackHostId);
+    if (!match) continue;
+    resolved.set(item, match);
+    if (match.action === "dispatch" && match.linked) {
+      const key = match.subagent.key;
+      claimCounts.set(key, (claimCounts.get(key) ?? 0) + 1);
     }
   }
 
-  return null;
+  const claimed = new Set<string>();
+  const pending: { item: DispatchToolItem; fallback: ResolvedSubagentItem; timestamp: number }[] = [];
+  for (const [item, initial] of resolved) {
+    if (initial.action !== "dispatch") continue;
+    // Multiple launches can request the same title. Only IDs are authoritative
+    // in a conflict; return name-only claims to the chronological pass.
+    let match = initial;
+    if (initial.linked && (claimCounts.get(initial.subagent.key) ?? 0) > 1) {
+      match = resolveExactToolCall(item, sessionSubagents, fallbackHostId, false)!;
+      resolved.set(item, match);
+    }
+    if (match.linked) {
+      claimed.add(match.subagent.key);
+    } else if (
+      match.subagent.isManaged &&
+      !match.subagent.childAgentId &&
+      item.timestamp_ms != null &&
+      (item.status === "completed" || item.status === "running")
+    ) {
+      pending.push({ item, fallback: match.subagent, timestamp: item.timestamp_ms });
+    }
+  }
+
+  if (!pending.length) return resolved;
+  const candidates = sessionSubagents.filter((sa) => sa.isManaged && !claimed.has(sa.key));
+  const edges = pending.flatMap((launch) => candidates.flatMap((card) => {
+    const delta = card.createdAtMs - launch.timestamp;
+    if (card.createdAtMs > 0 && delta >= -5_000 && delta <= 30_000) {
+      return [{ launch, card, distance: Math.abs(delta) }];
+    }
+    // Older snapshots only have last activity. Require a single anonymous
+    // launch and a single unattached card with exactly the same clock reading.
+    if (!card.createdAtMs && card.callId === card.childAgentId &&
+        pending.length === 1 && candidates.length === 1 &&
+        launch.fallback.title === "Subagent" && card.sortOrder === launch.timestamp) {
+      return [{ launch, card, distance: 0 }];
+    }
+    return [];
+  }));
+  edges.sort((a, b) => a.distance - b.distance || a.launch.timestamp - b.launch.timestamp ||
+    a.launch.item.seq - b.launch.item.seq || a.launch.item.call_id.localeCompare(b.launch.item.call_id) ||
+    a.card.key.localeCompare(b.card.key));
+
+  const assigned = new Set<DispatchToolItem>();
+  for (const { launch: { item, fallback }, card } of edges) {
+    if (assigned.has(item) || claimed.has(card.key)) continue;
+    assigned.add(item);
+    claimed.add(card.key);
+    resolved.set(item, {
+      action: "dispatch",
+      linked: true,
+      subagent: { ...card, callId: fallback.callId, promptPreview: fallback.promptPreview || card.promptPreview },
+    });
+  }
+  return resolved;
+}
+
+export function resolveToolCallSubagent(
+  item: DispatchToolItem,
+  subagents: readonly ResolvedSubagentItem[],
+  fallbackHostId?: string,
+): ResolvedToolCallSubagent | null {
+  if (!subagents.length) return resolveExactToolCall(item, subagents, fallbackHostId);
+  return resolveDelegationDispatches([item], subagents, fallbackHostId).get(item) ?? null;
 }
 
 const GENERIC_SUBAGENT_TITLES = new Set([

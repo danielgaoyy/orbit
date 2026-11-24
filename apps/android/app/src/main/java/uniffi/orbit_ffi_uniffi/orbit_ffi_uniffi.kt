@@ -6743,6 +6743,8 @@ data class FfiAgentCard (
     , 
     var `latestSeq`: kotlin.ULong
     , 
+    var `createdAtRfc3339`: kotlin.String?
+    , 
     var `updatedAtRfc3339`: kotlin.String
     , 
     var `isPinned`: kotlin.Boolean
@@ -6795,6 +6797,7 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterULong.read(buf),
+            FfiConverterOptionalString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterULong.read(buf),
@@ -6831,6 +6834,7 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterOptionalString.allocationSize(value.`acpAgentId`) +
             FfiConverterOptionalString.allocationSize(value.`attentionLabel`) +
             FfiConverterULong.allocationSize(value.`latestSeq`) +
+            FfiConverterOptionalString.allocationSize(value.`createdAtRfc3339`) +
             FfiConverterString.allocationSize(value.`updatedAtRfc3339`) +
             FfiConverterBoolean.allocationSize(value.`isPinned`) +
             FfiConverterULong.allocationSize(value.`seenSeq`) +
@@ -6866,6 +6870,7 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterOptionalString.write(value.`acpAgentId`, buf)
             FfiConverterOptionalString.write(value.`attentionLabel`, buf)
             FfiConverterULong.write(value.`latestSeq`, buf)
+            FfiConverterOptionalString.write(value.`createdAtRfc3339`, buf)
             FfiConverterString.write(value.`updatedAtRfc3339`, buf)
             FfiConverterBoolean.write(value.`isPinned`, buf)
             FfiConverterULong.write(value.`seenSeq`, buf)

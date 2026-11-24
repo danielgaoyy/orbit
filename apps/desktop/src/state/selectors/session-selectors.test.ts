@@ -86,7 +86,7 @@ function makeHostDetail(
 }
 
 describe("session-selectors", () => {
-  it("resolves session subagents with unique OneWorks characters and aggregates pending decisions", () => {
+  it("resolves session subagents with unique animal avatars and aggregates pending decisions", () => {
     const host = makeHostCard();
     const parent = makeAgent({ agent_id: "parent-1" });
     const childA = makeAgent({
@@ -94,6 +94,7 @@ describe("session-selectors", () => {
       parent_agent_id: "parent-1",
       parent_host_id: "local",
       title: "Codebase Researcher",
+      created_at_rfc3339: "2026-11-23T09:00:00Z",
       is_running: true,
     });
     const childB = makeAgent({
@@ -136,6 +137,8 @@ describe("session-selectors", () => {
 
     const summary = selectSessionSubagents(state, "local", "parent-1");
     assert.equal(summary.visible.length, 2);
+    assert.equal(summary.visible.find((sa) => sa.childAgentId === "child-a")?.createdAtMs, Date.parse("2026-11-23T09:00:00Z"));
+    assert.equal(summary.visible.find((sa) => sa.childAgentId === "child-b")?.createdAtMs, 0);
     assert.equal(summary.activeCount, 2);
     assert.equal(summary.awaitingCount, 1);
     assert.notEqual(summary.visible[0]!.character.id, summary.visible[1]!.character.id);

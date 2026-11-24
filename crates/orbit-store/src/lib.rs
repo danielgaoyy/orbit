@@ -26,7 +26,9 @@ pub use triggers::{
     DEFAULT_RECENT_DELIVERIES_LIMIT, StoredEventTrigger, UpsertEventTriggerParams,
     mask_trigger_secret,
 };
-pub use usage::{QUOTA_SAMPLES_RETENTION_MS, QuotaSampleRecord, USAGE_LEDGER_RETENTION_MS};
+pub use usage::{
+    AgentContextTelemetry, QUOTA_SAMPLES_RETENTION_MS, QuotaSampleRecord, USAGE_LEDGER_RETENTION_MS,
+};
 pub use workspace_sync::{AgentContextSnippet, LABEL_HANDLE_ALIASES, SemanticIdentityOptions};
 
 use std::collections::{HashMap, HashSet};

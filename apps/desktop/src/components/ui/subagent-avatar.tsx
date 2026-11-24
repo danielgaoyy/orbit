@@ -1,223 +1,129 @@
-import { Suspense, lazy, memo, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, type ReactNode, memo, useCallback } from "react";
 import { Check, X } from "lucide-react";
 import type { ResolvedSubagentStatus } from "@/lib/subagents";
-import {
-  type SubagentCharacterSpec,
-  resolveSubagentCharacter,
-} from "@/lib/subagent-avatar";
-import { SUBAGENT_AVATAR_PORTRAITS } from "@/components/ui/subagent-avatar-portraits";
-import { useOrbitSelector } from "@/state/orbit-store";
+import { type AvatarPath, type SubagentCharacterSpec, resolveSubagentCharacter } from "@/lib/subagent-avatar";
 import { cn } from "@/lib/utils";
-
-const LazyLiveSubagentAvatar = lazy(() => import("@/components/ui/subagent-avatar-live"));
 
 export type SubagentAvatarSize = "xs" | "sm" | "md" | "lg";
 
-const SIZE_PX: Record<SubagentAvatarSize, number> = {
-  xs: 18,
-  sm: 20,
-  md: 24,
-  lg: 28,
-};
+const SIZE_PX = { xs: 18, sm: 20, md: 24, lg: 28 };
 
-function useAvatarMotionAllowed(): boolean {
-  const [allowed, setAllowed] = useState(() => {
-    if (typeof window === "undefined" || typeof document === "undefined") return false;
-    const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
-    return !reduced && document.visibilityState === "visible";
-  });
+type Motion = "working" | "awaiting";
+type MotionState = { motion: Motion; visible: boolean };
+const active = new Map<HTMLSpanElement, MotionState>();
+let observer: IntersectionObserver | undefined;
+let reducedMotion: MediaQueryList | undefined;
 
-  useEffect(() => {
-    if (typeof window === "undefined" || typeof document === "undefined") return;
-    const mq = window.matchMedia?.("(prefers-reduced-motion: reduce)") ?? null;
-    const sync = () => {
-      const reduced = mq?.matches ?? false;
-      setAllowed(!reduced && document.visibilityState === "visible");
-    };
-    sync();
-    document.addEventListener("visibilitychange", sync);
-    mq?.addEventListener?.("change", sync);
-    return () => {
-      document.removeEventListener("visibilitychange", sync);
-      mq?.removeEventListener?.("change", sync);
-    };
-  }, []);
-
-  return allowed;
+function syncMotion(el: HTMLSpanElement, state: MotionState) {
+  if (state.visible && !reducedMotion?.matches && document.visibilityState === "visible") {
+    el.dataset.animate = state.motion;
+  } else {
+    delete el.dataset.animate;
+  }
 }
+
+function syncAll() {
+  active.forEach((state, el) => syncMotion(el, state));
+}
+
+// Active avatars share one observer and one pair of document/preference listeners.
+function observeMotion(el: HTMLSpanElement, motion: Motion) {
+  if (typeof IntersectionObserver === "undefined") return;
+  if (!observer) {
+    reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+    reducedMotion.addEventListener("change", syncAll);
+    document.addEventListener("visibilitychange", syncAll);
+    observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        const el = entry.target as HTMLSpanElement;
+        const state = active.get(el);
+        if (state) {
+          state.visible = entry.intersectionRatio > 0;
+          syncMotion(el, state);
+        }
+      }
+    }, { threshold: Number.EPSILON });
+  }
+  active.set(el, { motion, visible: false });
+  observer.observe(el);
+  return () => {
+    active.delete(el);
+    observer?.unobserve(el);
+    delete el.dataset.animate;
+    if (active.size === 0) {
+      observer?.disconnect();
+      observer = undefined;
+      reducedMotion?.removeEventListener("change", syncAll);
+      document.removeEventListener("visibilitychange", syncAll);
+    }
+  };
+}
+
+function layer(name: string, paths: readonly AvatarPath[], children?: ReactNode) {
+  return (
+    <g className={`orbit-av-${name}`}>
+      {paths.map(({ d, fill }, index) => <path key={index} d={d} fill={fill} />)}
+      {children}
+    </g>
+  );
+}
+
+const Portrait = memo(function Portrait({ character }: { character: SubagentCharacterSpec }) {
+  return (
+    <svg viewBox="0 0 64 64" aria-hidden="true" className="orbit-avatar-frame block size-full">
+      <g className="orbit-av-rig">
+        {layer("back", character.back)}
+        {layer("head", character.head)}
+        {layer("face", character.face, layer("eyes", character.eyes))}
+      </g>
+    </svg>
+  );
+});
 
 export interface SubagentAvatarProps {
   /** Pre-assigned collision-free character spec (falls back to deterministic `seedKey`) */
   character?: SubagentCharacterSpec | null;
-  /** Stable identity key used when `character` is not pre-assigned */
   seedKey?: string;
-  /** Lifecycle status controlling whether the 3D character animates or rests */
   status?: ResolvedSubagentStatus;
   size?: SubagentAvatarSize;
-  /** Show tiny status corner badge (check on completed, x on failed/canceled) */
   showStatusBadge?: boolean;
   className?: string;
 }
 
-/**
- * Living OneWorks 3D Subagent portrait:
- * - Resting (`completed` / `failed` / `canceled`) or off-screen portraits render an instant
- *   pre-baked 128x128 transparent portrait (<0.05ms, zero Marching Tetrahedra CPU compilation,
- *   zero inline SVG polygon DOM bloat) with live theme-matched circular backdrops.
- * - Active (`running` / `awaiting_permission`) portraits paint frame 0 instantaneously with the
- *   identical static portrait and seamlessly upgrade on the next animation frame (while in view)
- *   to the lazily-loaded live animated OneWorks 3D `<Avatar>`.
- * - Automatically pauses & tears down live animation on completion, window hide, or
- *   `prefers-reduced-motion: reduce`.
- */
 export const SubagentAvatar = memo(function SubagentAvatar({
-  character,
-  seedKey,
-  status = "completed",
-  size = "md",
-  showStatusBadge = false,
-  className,
+  character, seedKey, status = "completed", size = "md", showStatusBadge = false, className,
 }: SubagentAvatarProps) {
-  const resolvedTheme = useOrbitSelector((s) => s.resolvedTheme, "preferences");
-  const motionAllowed = useAvatarMotionAllowed();
-  const rootRef = useRef<HTMLSpanElement | null>(null);
-
-  const spec = useMemo(
-    () => character ?? resolveSubagentCharacter(seedKey ?? "subagent"),
-    [character, seedKey],
-  );
-
-  const staticPortraitUrl = SUBAGENT_AVATAR_PORTRAITS[spec.id] ?? null;
-  const isWorking = status === "running";
-  const isAwaiting = status === "awaiting_permission";
-  const wantsLiveAnimation = motionAllowed && (isWorking || isAwaiting);
-
-  // Defer live 3D mount by 1 animation frame and gate on viewport visibility so thread switches
-  // paint frame 0 at 60fps and off-screen running subagents never burn CPU.
-  const [liveMounted, setLiveMounted] = useState(false);
-
-  useEffect(() => {
-    if (!wantsLiveAnimation) {
-      setLiveMounted(false);
-      return;
-    }
-
-    let cancelled = false;
-    let rafId: number | null = null;
-    const scheduleMount = () => {
-      if (cancelled || rafId !== null) return;
-      rafId = window.requestAnimationFrame(() => {
-        rafId = null;
-        if (!cancelled) setLiveMounted(true);
-      });
-    };
-
-    const el = rootRef.current;
-    if (el && typeof IntersectionObserver !== "undefined") {
-      const observer = new IntersectionObserver(
-        (entries) => {
-          const visible = entries.some((entry) => entry.isIntersecting);
-          if (visible) {
-            scheduleMount();
-          } else {
-            if (rafId !== null) {
-              window.cancelAnimationFrame(rafId);
-              rafId = null;
-            }
-            setLiveMounted(false);
-          }
-        },
-        { rootMargin: "64px" },
-      );
-      observer.observe(el);
-      return () => {
-        cancelled = true;
-        if (rafId !== null) window.cancelAnimationFrame(rafId);
-        observer.disconnect();
-      };
-    }
-
-    scheduleMount();
-    return () => {
-      cancelled = true;
-      if (rafId !== null) window.cancelAnimationFrame(rafId);
-    };
-  }, [wantsLiveAnimation]);
-
+  const spec = character ?? resolveSubagentCharacter(seedKey ?? "subagent");
+  const awaiting = status === "awaiting_permission";
+  const motion = awaiting ? "awaiting" : status === "running" ? "working" : undefined;
+  const ref = useCallback((el: HTMLSpanElement | null) => {
+    if (el && motion) return observeMotion(el, motion);
+  }, [motion]);
   const px = SIZE_PX[size];
-  const badgeSize = size === "lg" ? "size-[11px]" : "size-[10px]";
-  const backdropColor = resolvedTheme === "dark" ? spec.darkBg : spec.lightBg;
-
-  const staticPortraitEl = staticPortraitUrl ? (
-    <span
-      style={{ backgroundColor: backdropColor }}
-      className="block size-full rounded-full"
-    >
-      <img
-        src={staticPortraitUrl}
-        alt=""
-        aria-hidden="true"
-        draggable={false}
-        decoding="async"
-        className="pointer-events-none block size-full select-none object-cover"
-      />
-    </span>
-  ) : null;
-
-  const shouldRenderLive = (wantsLiveAnimation && liveMounted) || !staticPortraitUrl;
+  const Badge = status === "completed" ? Check : X;
 
   return (
     <span
-      ref={rootRef}
+      ref={ref}
       data-slot="subagent-avatar"
       data-status={status}
       data-character={spec.id}
-      style={{ width: px, height: px }}
+      data-attention={awaiting ? "true" : undefined}
+      style={{ width: px, height: px, "--av-light": spec.lightBg, "--av-dark": spec.darkBg } as CSSProperties}
       className={cn("relative inline-flex shrink-0 items-center justify-center select-none", className)}
     >
-      <span
-        data-attention={isAwaiting ? "true" : undefined}
-        className={cn(
-          "orbit-avatar-frame orbit-avatar-noninteractive block size-full transition-shadow duration-200",
-          status === "canceled" && "opacity-75 grayscale-[35%]",
-        )}
-      >
-        {shouldRenderLive ? (
-          <Suspense fallback={staticPortraitEl}>
-            <LazyLiveSubagentAvatar
-              spec={spec}
-              resolvedTheme={resolvedTheme}
-              status={status}
-              shouldAnimate={wantsLiveAnimation}
-            />
-          </Suspense>
-        ) : (
-          staticPortraitEl
-        )}
-      </span>
-
-      {showStatusBadge && status === "completed" && (
-        <span
+      <Portrait character={spec} />
+      {showStatusBadge && !motion && (
+        <Badge
           aria-hidden="true"
+          size={size === "lg" ? 11 : 10}
+          strokeWidth={3}
+          style={{ right: -2, bottom: -2, padding: 1.5 }}
           className={cn(
-            "bg-signal-success ring-surface-base absolute -right-[2px] -bottom-[2px] flex items-center justify-center rounded-full text-white ring-[1.5px]",
-            badgeSize,
+            "ring-surface-base absolute rounded-full text-white ring-[1.5px]",
+            status === "completed" ? "bg-signal-success" : status === "failed" ? "bg-signal-danger" : "bg-ink-muted",
           )}
-        >
-          <Check className="size-[7px] stroke-[3]" />
-        </span>
-      )}
-
-      {showStatusBadge && status === "failed" && (
-        <span
-          aria-hidden="true"
-          className={cn(
-            "bg-signal-danger ring-surface-base absolute -right-[2px] -bottom-[2px] flex items-center justify-center rounded-full text-white ring-[1.5px]",
-            badgeSize,
-          )}
-        >
-          <X className="size-[7px] stroke-[3]" />
-        </span>
+        />
       )}
     </span>
   );

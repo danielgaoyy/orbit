@@ -516,26 +516,44 @@ export const FleetSidebar = memo(function FleetSidebar() {
         </IconButton>
       </div>
 
-      {/* 2. Top Global Navigation: Primary Action (`New Conversation`) + Secondary View (`Automations`) */}
-      <div className="space-y-1 px-2 pt-0.5 pb-2.5">
-        <button
-          type="button"
-          onClick={() => orbitActions.startNewThreadDraft()}
-          className="group/new orbit-press bg-surface-raised border-border-subtle text-ink-primary hover:border-border-default flex h-[32px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] border px-2 text-left text-[13px] font-medium shadow-2xs transition-[border-color,background-color,color,transform]"
-        >
-          <span className="flex min-w-0 items-center gap-2.5">
-            <span className="inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
-              <Plus className="text-ink-secondary group-hover/new:text-ink-primary size-[14.5px] stroke-[2] transition-colors" />
-            </span>
-            <span className="truncate">{t("sidebar.newConversation")}</span>
-          </span>
-          <ShortcutKbd
-            keys={`${mod}N`}
-            size="xs"
-            variant="subtle"
-            className="shrink-0 opacity-0 transition-opacity group-hover/new:opacity-100"
-          />
-        </button>
+      {/* 2. Top Global Navigation: Quiet borderless nav rows (`New Conversation`, `Automations`, `Personal Router`) */}
+      <div className="space-y-0.5 px-2 pt-0.5 pb-2.5">
+        {(() => {
+          const isNewConversationActive =
+            workspacePanel === "conversation" && isDraftNewSession;
+          return (
+            <button
+              type="button"
+              onClick={() => orbitActions.startNewThreadDraft()}
+              className={cn(
+                "group/new flex h-[30px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 text-left text-[13px] transition-colors",
+                isNewConversationActive
+                  ? "bg-accent text-ink-primary font-medium"
+                  : "text-ink-secondary hover:bg-accent/55 hover:text-ink-primary",
+              )}
+            >
+              <span className="flex min-w-0 items-center gap-2.5">
+                <span className="inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
+                  <Plus
+                    className={cn(
+                      "size-[14.5px] stroke-[1.75] transition-colors",
+                      isNewConversationActive
+                        ? "text-ink-primary"
+                        : "text-ink-muted group-hover/new:text-ink-primary",
+                    )}
+                  />
+                </span>
+                <span className="truncate">{t("sidebar.newConversation")}</span>
+              </span>
+              <ShortcutKbd
+                keys={`${mod}N`}
+                size="xs"
+                variant="subtle"
+                className="shrink-0 opacity-0 transition-opacity group-hover/new:opacity-100"
+              />
+            </button>
+          );
+        })()}
 
         <button
           type="button"

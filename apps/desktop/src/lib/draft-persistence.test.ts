@@ -122,6 +122,9 @@ describe("draft-persistence", () => {
     slices.composerDrafts["draft::host-1"] = "Start a brand new task";
     slices.slashDirectives["draft::host-1"] = "plan";
 
+    slices.slashDirectives["host-1::side"] = "btw";
+    slices.slashDirectives["host-2::goal"] = "goal";
+
     const writer = createDraftPersistenceController(() => slices, {
       storage,
       debounceMs: 25,
@@ -131,7 +134,7 @@ describe("draft-persistence", () => {
     });
 
     // Debounce coalesces rapid mutations without immediate synchronous writes
-    writer.markDirty("host-1::agent-a");
+    writer.markDirty(["host-1::agent-a", "host-1::side", "host-2::goal"]);
     clock += 10;
     writer.markDirty("draft::host-1");
     assert.equal(storage.setCalls, 0);
@@ -153,6 +156,8 @@ describe("draft-persistence", () => {
     reader.dispose();
 
     assert.equal(hydrated.prunedCount, 0);
+    assert.equal(hydrated.slashDirectives["host-1::side"], "btw");
+    assert.equal(hydrated.slashDirectives["host-2::goal"], "goal");
     assert.equal(
       hydrated.composerDrafts["host-1::agent-a"],
       "  keep leading & trailing spaces ",
@@ -827,5 +832,70 @@ describe("draft-persistence", () => {
     const kept = payload.drafts["host-1::tight"]?.contextItems ?? [];
     assert.equal(kept.length, 1);
     assert.equal(kept[0]?.kind, "image");
+  });
+
+  it("roundtrips attached skill pills and drops malformed skill entries on hydration", () => {
+    const storage = new MemoryStorage();
+    const nowMs = 1_700_000_000_000;
+    const slices = emptySlices();
+    slices.contextItems = {
+      "host-1::skill-scope": [
+        {
+          id: "skill_interface-design",
+          kind: "skill",
+          slug: "interface-design",
+          label: "Interface Design",
+          description: "Craft-first UI review & refinement",
+        },
+      ],
+    };
+
+    assert.equal(hasNonEmptyScopeDraft(slices, "host-1::skill-scope"), true);
+
+    const writer = createDraftPersistenceController(() => slices, {
+      storage,
+      windowTarget: null,
+      documentTarget: null,
+      now: () => nowMs,
+    });
+    writer.markDirty("host-1::skill-scope");
+    writer.flushNow();
+    writer.dispose();
+
+    const reader = createDraftPersistenceController(emptySlices, {
+      storage,
+      windowTarget: null,
+      documentTarget: null,
+      now: () => nowMs + 1_000,
+    });
+    const hydrated = reader.hydrate();
+    reader.dispose();
+
+    assert.deepEqual(hydrated.contextItems["host-1::skill-scope"], [
+      {
+        id: "skill_interface-design",
+        kind: "skill",
+        slug: "interface-design",
+        label: "Interface Design",
+        description: "Craft-first UI review & refinement",
+      },
+    ]);
+
+    const corrupt = JSON.stringify({
+      version: DRAFT_SCHEMA_VERSION,
+      drafts: {
+        "host-1::mixed": {
+          updatedAt: nowMs,
+          contextItems: [
+            { id: "bad_skill", kind: "skill", slug: "   ", label: "Broken" },
+            { id: "good_skill", kind: "skill", slug: "shadcn", label: "shadcn" },
+          ],
+        },
+      },
+    });
+    const parsed = parseAndValidatePersistedDrafts(corrupt, { nowMs });
+    assert.deepEqual(parsed.contextItems["host-1::mixed"], [
+      { id: "good_skill", kind: "skill", slug: "shadcn", label: "shadcn" },
+    ]);
   });
 });

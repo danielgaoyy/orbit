@@ -1,6 +1,9 @@
+import { type ComposerInlineDirective, resolveComposerSubmission } from "@/lib/slash-commands";
 import {
   PROVIDERS,
+  modeLabel,
 } from "@/components/composer/composer-constants";
+import { t as translateGlobal } from "@/lib/i18n";
 import {
   hasNonEmptyScopeDraft,
 } from "@/lib/draft-persistence";
@@ -30,6 +33,7 @@ import {
   type ProviderKind,
   type ReasoningEffort,
   type SessionMode,
+  type SlashDirective,
   isAgentForegroundRunning,
   orbitIpc,
 } from "@/lib/orbit-ipc";
@@ -63,7 +67,6 @@ import type {
   PastedAttachment,
   PendingDraftCreateState,
   QueuedPromptItem,
-  SlashDirective,
   WindowedAgentStageView,
 } from "../store-types";
 
@@ -194,10 +197,10 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
           throw err;
         }
         if (isOfflineUploadError(msg)) {
-          notifyToast("Host is offline; attachment will upload when reconnected before sending");
+          notifyToast(translateGlobal("composer.toastHostOfflineUpload"));
         } else {
           removeContextMentionInScope(scopeKey, itemId);
-          notifyToast(`Attachment upload failed: ${msg}`);
+          notifyToast(translateGlobal("composer.toastUploadFailed", { error: msg }));
         }
       } finally {
         inflightAttachmentUploads.delete(itemId);
@@ -532,7 +535,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         if (isDraft && (action === false || action === "disable" || getState().draftFastMode)) {
           ctx.actions.setDraftConfig({ fastMode: false });
         }
-        notifyToast("Fast mode unavailable for this model");
+        notifyToast(translateGlobal("composer.toastFastUnavailable"));
         return;
       }
 
@@ -546,20 +549,26 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
             : !current;
 
       if (next && !modelAllowsFast) {
-        notifyToast("Fast mode unavailable for this model");
+        notifyToast(translateGlobal("composer.toastFastUnavailable"));
         return;
       }
 
       if (activeAgent && hostId) {
-        void orbitIpc.updateAgent({
-          hostId,
-          agentId: activeAgent.agent_id,
-          fastMode: next,
-        });
+        void orbitIpc
+          .updateAgent({
+            hostId,
+            agentId: activeAgent.agent_id,
+            fastMode: next,
+          })
+          .catch((err) => {
+            notifyToast(translateGlobal("composer.modelConfigFailed", { error: String(err) }));
+          });
       } else {
         ctx.actions.setDraftConfig({ fastMode: next });
       }
-      notifyToast(next ? "Fast mode on" : "Fast mode off");
+      notifyToast(
+        next ? translateGlobal("composer.toastFastOn") : translateGlobal("composer.toastFastOff"),
+      );
     },
 
 
@@ -570,6 +579,11 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         const idx = cycle.findIndex((m) => m === snap.draftMode);
         const next = cycle[(idx + 1) % cycle.length];
         ctx.actions.setDraftConfig({ mode: next });
+        notifyToast(
+          translateGlobal("composer.modeSwitchedToast", {
+            mode: modeLabel(next, translateGlobal),
+          }),
+        );
         return;
       }
       const detail = snap.hostDetails[snap.selectedHostId];
@@ -577,7 +591,18 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       if (!ag) return;
       const idx = cycle.findIndex((m) => m === ag.mode);
       const next = cycle[(idx + 1) % cycle.length];
-      void orbitIpc.setSessionMode(snap.selectedHostId, ag.agent_id, next);
+      void orbitIpc
+        .setSessionMode(snap.selectedHostId, ag.agent_id, next)
+        .then(() => {
+          notifyToast(
+            translateGlobal("composer.modeSwitchedToast", {
+              mode: modeLabel(next, translateGlobal),
+            }),
+          );
+        })
+        .catch((err) => {
+          notifyToast(translateGlobal("composer.modeSwitchFailed", { error: String(err) }));
+        });
     },
 
 
@@ -607,7 +632,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
     },
 
 
-    setSlashDirective(directive: SlashDirective | null): void {
+    setSlashDirective(directive: ComposerInlineDirective | null): void {
       const key = composerScopeKey(getState());
       setState((s) => ({
         ...s,
@@ -624,7 +649,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       const lineCount = content.split("\n").length;
       const item: PastedAttachment = {
         id: `paste_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        label: `Pasted text · ${lineCount} lines`,
+        label: translateGlobal("composer.pastedTextLabel", { count: lineCount }),
         lineCount,
         content,
       };
@@ -672,7 +697,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         composerDrafts: { ...s.composerDrafts, [key]: next },
       }));
       draftPersistence.markDirty(key);
-      notifyToast(`Cited ${clean}`);
+      notifyToast(translateGlobal("composer.toastCited", { citation: clean }));
       ctx.actions.focusComposer();
     },
 
@@ -748,12 +773,15 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
     addContextMention(item: ContextMentionItem): void {
       const key = composerScopeKey(getState());
       const existing = getState().contextItems[key] ?? [];
-      // Prevent duplicate file or git_diff mentions
+      // Prevent duplicate file, git_diff, or skill mentions
       const duplicate = existing.some((x) => {
         if (x.kind === "file" && item.kind === "file") {
           return x.path.length > 0 && x.path === item.path;
         }
         if (x.kind === "git_diff" && item.kind === "git_diff") return x.staged === item.staged;
+        if (x.kind === "skill" && item.kind === "skill") {
+          return x.slug.toLowerCase() === item.slug.toLowerCase();
+        }
         return false;
       });
       if (duplicate) return;
@@ -810,7 +838,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       const slot = activeTab?.slot ?? 1;
       const ch = terminalChannels.get(`${hostId}::${slot}`);
       if (!ch || ch.chunks.length === 0) {
-        notifyToast("No active terminal output buffered yet");
+        notifyToast(translateGlobal("composer.toastNoTerminalOutput"));
         return null;
       }
 
@@ -828,12 +856,15 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         .slice(-80);
 
       if (tailLines.length === 0) {
-        notifyToast("Active terminal buffer is empty");
+        notifyToast(translateGlobal("composer.toastEmptyTerminalBuffer"));
         return null;
       }
 
       return {
-        label: `${activeTab?.title ?? "Terminal"} · ${tailLines.length} lines`,
+        label: translateGlobal("composer.terminalLinesLabel", {
+          title: activeTab?.title ?? translateGlobal("sidePanel.actionTerminal"),
+          count: tailLines.length,
+        }),
         lineCount: tailLines.length,
         content: tailLines.join("\n"),
       };
@@ -856,7 +887,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
 
     async stageAndAttachFile(file: File): Promise<void> {
       if (file.size > MAX_ATTACHMENT_BYTES) {
-        notifyToast(`Attachment "${file.name}" exceeds 25 MiB limit`);
+        notifyToast(translateGlobal("composer.toastAttachmentTooLarge", { name: file.name }));
         return;
       }
 
@@ -881,7 +912,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         if (hostId) {
           await uploadContextAttachmentToHost(scopeKey, id, file, name, hostId, false);
         } else {
-          notifyToast("Select a host before sending to upload attached image");
+          notifyToast(translateGlobal("composer.toastSelectHostUpload"));
         }
         return;
       }
@@ -912,7 +943,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         if (hostId) {
           await uploadContextAttachmentToHost(scopeKey, id, file, name, hostId, false);
         } else {
-          notifyToast(`Select a host before sending to upload attached ${mediaKind.toUpperCase()}`);
+          notifyToast(translateGlobal("composer.toastSelectHostUpload"));
         }
         return;
       }
@@ -929,7 +960,10 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
               ...(s.pastedAttachments[scopeKey] ?? []),
               {
                 id: `file_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-                label: `${file.name} · ${lineCount} lines`,
+                label: translateGlobal("composer.fileLinesLabel", {
+                  name: file.name,
+                  count: lineCount,
+                }),
                 filename: file.name,
                 lineCount,
                 content: `// File: ${file.name}\n${text}`,
@@ -954,7 +988,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       if (hostId) {
         await uploadContextAttachmentToHost(scopeKey, id, file, name, hostId, false);
       } else {
-        notifyToast("Select a host before sending to upload attached file");
+        notifyToast(translateGlobal("composer.toastSelectHostUpload"));
       }
     },
 
@@ -963,7 +997,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       const hostId = getState().selectedHostId;
       const agentId = getState().selectedAgentId;
       if (!hostId || getState().isDraftNewSession || !agentId) {
-        notifyToast("Start an active session first to compact context");
+        notifyToast(translateGlobal("composer.toastSessionRequiredCompact"));
         return;
       }
       const detail = getState().hostDetails[hostId];
@@ -989,14 +1023,50 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
 
 
     async submitComposer(steerImmediately = false): Promise<void> {
-      const hostId = getState().selectedHostId;
+      const state = getState();
+      const hostId = state.selectedHostId;
       if (!hostId) return;
 
-      const key = composerScopeKey(getState());
+      const key = composerScopeKey(state);
+      const rawDraft = (state.composerDrafts[key] ?? "").trim();
+      const submission = resolveComposerSubmission(state.slashDirectives[key] ?? null, rawDraft);
+
+      // Local commands must remain available even while a main prompt is uploading or queued.
+      if (submission.kind !== "prompt") {
+        const clearDirectiveDraft = () => {
+          setState((s) => ({
+            ...s,
+            composerDrafts: { ...s.composerDrafts, [key]: "" },
+            slashDirectives: { ...s.slashDirectives, [key]: null },
+          }));
+          draftPersistence.flushNow();
+        };
+        if (submission.kind === "btw") {
+          clearDirectiveDraft();
+          ctx.actions.openSideQuestionTab();
+          if (submission.text) void ctx.actions.submitSideQuestion(submission.text);
+          return;
+        }
+
+        const agentId = state.selectedAgentId;
+        if (state.isDraftNewSession || !agentId || !state.hostDetails[hostId]?.agents.some((a) => a.agent_id === agentId)) {
+          notifyToast(translateGlobal("composer.toastSessionRequiredGoal"));
+          return;
+        }
+        if (!submission.text) {
+          notifyToast(translateGlobal("composer.toastGoalObjectiveRequired"));
+          ctx.actions.focusComposer();
+          return;
+        }
+        clearDirectiveDraft();
+        await ctx.actions.startGoalRun({ hostId, agentId, objective: submission.text });
+        return;
+      }
+
       if (submittingComposerScopes.has(key)) return;
       submittingComposerScopes.add(key);
       try {
-        await ctx.actions._submitComposerUnlocked(hostId, key, steerImmediately);
+        await ctx.actions._submitComposerUnlocked(hostId, key, steerImmediately, rawDraft, submission.directive);
       } finally {
         submittingComposerScopes.delete(key);
       }
@@ -1007,6 +1077,8 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       hostId: string,
       key: string,
       steerImmediately: boolean,
+      rawDraft: string,
+      storedDirective: SlashDirective | null,
     ): Promise<void> {
       // Snapshot ALL routing and draft config fields up front before any async upload/diff/compose
       // awaits so switching Agent or Workspace mid-submit can never misroute the prompt or settings.
@@ -1039,33 +1111,115 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
           : resolveAvailableDraftProvider(initialHostDetail, getState().draftProvider),
       };
 
-      const rawDraft = (getState().composerDrafts[submitTarget.scopeKey] ?? "").trim();
-      const storedDirective = getState().slashDirectives[submitTarget.scopeKey] ?? null;
-
-      // Inline `/goal <objective>` command starts an unattended autonomous Goal run directly
-      if (!storedDirective && /^\/goal(?:\s+|$)/i.test(rawDraft)) {
-        const objective = rawDraft.replace(/^\/goal\s*/i, "").trim();
-        if (submitTarget.isDraftNewSession || !submitTarget.agentId) {
-          notifyToast("Start an active session first to run /goal");
-          return;
-        }
-        if (!objective) {
-          notifyToast("Provide a goal objective after /goal");
-          return;
-        }
-        ctx.actions.setComposerDraft("");
-        await ctx.actions.startGoalRun({
-          hostId: submitTarget.hostId,
-          agentId: submitTarget.agentId,
-          objective,
-        });
-        return;
-      }
-
       const initialContexts = getState().contextItems[submitTarget.scopeKey] ?? [];
       const registeredInline = getState().inlineMentions[submitTarget.scopeKey] ?? [];
       const pastes = getState().pastedAttachments[submitTarget.scopeKey] ?? [];
       const quotes = getState().diffQuotes[submitTarget.scopeKey] ?? [];
+
+      // Intercept standalone immediate UI/mode slash commands typed & submitted directly via Enter
+      // so they never leak as literal `/ask` / `/diff` / `/new` prompts to the LLM.
+      if (
+        !storedDirective &&
+        initialContexts.length === 0 &&
+        pastes.length === 0 &&
+        quotes.length === 0 &&
+        /^\/[a-z0-9_-]+$/i.test(rawDraft)
+      ) {
+        const standaloneCmd = rawDraft.toLowerCase();
+        const clearBareCommand = () => {
+          setState((s) => ({
+            ...s,
+            composerDrafts: { ...s.composerDrafts, [submitTarget.scopeKey]: "" },
+          }));
+          draftPersistence.flushNow();
+        };
+        const applyImmediateMode = async (nextMode: SessionMode) => {
+          clearBareCommand();
+          if (submitTarget.isDraftNewSession || !submitTarget.agentId) {
+            ctx.actions.setDraftConfig({ mode: nextMode });
+            notifyToast(
+              translateGlobal("composer.modeSwitchedToast", {
+                mode: modeLabel(nextMode, translateGlobal),
+              }),
+            );
+          } else {
+            try {
+              await orbitIpc.setSessionMode(submitTarget.hostId, submitTarget.agentId, nextMode);
+              notifyToast(
+                translateGlobal("composer.modeSwitchedToast", {
+                  mode: modeLabel(nextMode, translateGlobal),
+                }),
+              );
+            } catch (err) {
+              notifyToast(translateGlobal("composer.modeSwitchFailed", { error: String(err) }));
+            }
+          }
+        };
+        if (standaloneCmd === "/ask" || standaloneCmd === "/supervised") {
+          await applyImmediateMode("default");
+          return;
+        }
+        if (standaloneCmd === "/auto") {
+          await applyImmediateMode("auto");
+          return;
+        }
+        if (standaloneCmd === "/edits") {
+          await applyImmediateMode("accept_edits");
+          return;
+        }
+        if (standaloneCmd === "/full") {
+          await applyImmediateMode("full_access");
+          return;
+        }
+        if (standaloneCmd === "/diff") {
+          clearBareCommand();
+          ctx.actions.toggleReviewTab();
+          return;
+        }
+        if (standaloneCmd === "/files") {
+          clearBareCommand();
+          ctx.actions.openFilesExplorerTab();
+          return;
+        }
+        if (standaloneCmd === "/browser") {
+          clearBareCommand();
+          ctx.actions.openBrowserTab();
+          return;
+        }
+        if (standaloneCmd === "/terminal") {
+          clearBareCommand();
+          ctx.actions.toggleTerminalTab();
+          return;
+        }
+        if (standaloneCmd === "/new") {
+          clearBareCommand();
+          ctx.actions.startNewThreadDraft();
+          return;
+        }
+        if (standaloneCmd === "/settings") {
+          clearBareCommand();
+          ctx.actions.openSettings();
+          return;
+        }
+        if (standaloneCmd === "/export") {
+          if (!submitTarget.isDraftNewSession && submitTarget.agentId) {
+            clearBareCommand();
+            ctx.actions.openExportDialog(submitTarget.hostId, submitTarget.agentId);
+          } else {
+            notifyToast(translateGlobal("composer.toastSessionRequiredExport"));
+          }
+          return;
+        }
+        if (standaloneCmd === "/copy") {
+          if (!submitTarget.isDraftNewSession && submitTarget.agentId) {
+            clearBareCommand();
+            void ctx.actions.openCopyCodeBlocksModal(submitTarget.hostId, submitTarget.agentId);
+          } else {
+            notifyToast(translateGlobal("composer.toastSessionRequiredCopy"));
+          }
+          return;
+        }
+      }
 
       // Ensure every attached image/file has completed uploading to the target `submitTarget.hostId`
       // BEFORE composing the wire prompt or clearing the composer draft.
@@ -1101,7 +1255,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
             }
           }
         } catch (err) {
-          notifyToast(`Attachment upload failed: ${String(err)}`);
+          notifyToast(translateGlobal("composer.toastUploadFailed", { error: String(err) }));
           return;
         }
       }
@@ -1216,7 +1370,12 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
 
       const providerForCompose: ProviderKind = submitTarget.providerForCompose;
 
-      const contextInputs: ComposerContextInput[] = mergedContexts.map((ctx) => {
+      const skillContexts = mergedContexts.filter(
+        (c): c is Extract<ContextMentionItem, { kind: "skill" }> => c.kind === "skill",
+      );
+      const nonSkillContexts = mergedContexts.filter((c) => c.kind !== "skill");
+
+      const contextInputs: ComposerContextInput[] = nonSkillContexts.map((ctx) => {
         switch (ctx.kind) {
           case "image":
             return { kind: "image", path: ctx.path, filename: ctx.filename };
@@ -1290,7 +1449,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
 
       if (composed.is_fork) {
         if (submitTarget.isDraftNewSession || !submitTarget.agentId) {
-          notifyToast("Start an active session first to fork");
+          notifyToast(translateGlobal("composer.toastSessionRequiredFork"));
           return;
         }
         setState((s) => ({
@@ -1356,7 +1515,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
 
       if (composed.is_compact) {
         if (submitTarget.isDraftNewSession || !submitTarget.agentId) {
-          notifyToast("Start an active session first to compact context");
+          notifyToast(translateGlobal("composer.toastSessionRequiredCompact"));
           return;
         }
         setState((s) => ({
@@ -1372,7 +1531,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         return;
       }
 
-      if (composed.is_empty) {
+      if (composed.is_empty && skillContexts.length === 0) {
         return;
       }
 
@@ -1383,7 +1542,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       const sentImages: SentImagePreviewMeta[] = [];
       const targetAgentId = submitTarget.agentId;
       const revokedLocalUrls = new Set<string>();
-      for (const ctx of mergedContexts) {
+      for (const ctx of nonSkillContexts) {
         if (ctx.kind === "image") {
           if (ctx.path && ctx.previewUrl) {
             seedPromptImagePreview(submitTarget.hostId, ctx.path, ctx.previewUrl, true);
@@ -1422,23 +1581,41 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       if (sentImages.length > 0) {
         recordRecentSentTurnImages(submitTarget.hostId, targetAgentId, cleanUserText, sentImages);
       }
-      const badges: PromptBadge[] = composed.badges.map((b) => {
-        if (b.path) return b;
-        if (b.kind === "image") {
-          const fallbackPath = imagePathQueueByLabel.get(b.label)?.shift();
-          if (fallbackPath) return { ...b, path: fallbackPath };
-        } else if (
-          b.kind === "file" ||
-          b.kind === "pdf" ||
-          b.kind === "audio" ||
-          b.kind === "video"
-        ) {
-          const fallbackPath = filePathQueueByLabel.get(b.label)?.shift();
-          if (fallbackPath) return { ...b, path: fallbackPath };
-        }
-        return b;
-      });
-      const assembledWirePrompt = composed.wire_prompt;
+      const skillBadges: PromptBadge[] = skillContexts.map((sk) => ({
+        kind: "skill",
+        label: `/${sk.slug}`,
+        path: null,
+      }));
+      const badges: PromptBadge[] = [
+        ...composed.badges.map((b) => {
+          if (b.path) return b;
+          if (b.kind === "image") {
+            const fallbackPath = imagePathQueueByLabel.get(b.label)?.shift();
+            if (fallbackPath) return { ...b, path: fallbackPath };
+          } else if (
+            b.kind === "file" ||
+            b.kind === "pdf" ||
+            b.kind === "audio" ||
+            b.kind === "video"
+          ) {
+            const fallbackPath = filePathQueueByLabel.get(b.label)?.shift();
+            if (fallbackPath) return { ...b, path: fallbackPath };
+          }
+          return b;
+        }),
+        ...skillBadges,
+      ];
+      const skillPrefix =
+        skillContexts.length > 0
+          ? skillContexts
+              .map((sk) => `Use skill /${sk.slug} (${sk.label}).`)
+              .join("\n")
+          : "";
+      const assembledWirePrompt = skillPrefix
+        ? composed.wire_prompt
+          ? `${skillPrefix}\n\n${composed.wire_prompt}`
+          : skillPrefix
+        : composed.wire_prompt;
 
       const nextHistory =
         cleanUserText && getState().promptHistory[getState().promptHistory.length - 1] !== cleanUserText
@@ -1471,7 +1648,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
           (a) => a.installed && a.spec.enabled,
         );
         if (hostDetailForCreate && installedProviders.length === 0 && installedAcpList.length === 0) {
-          ctx.actions.showToast("No installed Agent CLI detected on this host");
+          ctx.actions.showToast(translateGlobal("composer.toastNoAgentCli"));
           return;
         }
         const effectiveProvider = resolveAvailableDraftProvider(

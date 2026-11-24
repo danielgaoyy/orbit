@@ -3107,7 +3107,10 @@ async fn register_agy_subagent_monitor(
     evt_tx: &mpsc::Sender<DriverEvent>,
 ) {
     let clean_id = child_conv_id.trim();
-    if clean_id.is_empty() || subagent_monitors.contains_key(clean_id) {
+    if clean_id.is_empty()
+        || clean_id.starts_with("ag_")
+        || subagent_monitors.contains_key(clean_id)
+    {
         return;
     }
     let now = Utc::now();
@@ -3233,6 +3236,14 @@ fn map_agy_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCal
     let raw_in = update.get("rawInput");
     let raw_out = update.get("rawOutput");
 
+    if crate::managed_dispatch::is_launch(title) {
+        return crate::managed_dispatch::acp_detail(update, prev);
+    }
+
+    if matches!(prev, Some(ToolCallDetail::Subagent { .. })) {
+        return agy_subagent_detail(update, prev);
+    }
+
     let out_preview = raw_out.and_then(|o| {
         if let Some(s) = o.as_str() {
             Some(truncate_preview(s, 800))
@@ -3318,44 +3329,9 @@ fn map_agy_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCal
         };
     }
 
-    let prev_subagent = match prev {
-        Some(ToolCallDetail::Subagent {
-            child_agent_id,
-            role,
-            prompt_preview,
-        }) => Some((child_agent_id.clone(), role.clone(), prompt_preview.clone())),
-        _ => None,
-    };
-
-    if is_subagent_launch_tool(title, raw_in) || prev_subagent.is_some() {
-        let (prev_child_id, prev_role, prev_prompt) =
-            prev_subagent.unwrap_or((None, String::new(), String::new()));
-        let role = raw_in
-            .and_then(|i| {
-                i.get("Role")
-                    .or_else(|| i.get("TypeName"))
-                    .or_else(|| i.get("role"))
-            })
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToOwned::to_owned)
-            .or_else(|| (!prev_role.trim().is_empty()).then_some(prev_role))
-            .unwrap_or_else(|| "Subagent".to_string());
-        let prompt = raw_in
-            .and_then(|i| i.get("Prompt").or_else(|| i.get("prompt")))
-            .and_then(|v| v.as_str())
-            .map(|s| truncate_preview(s, 240))
-            .filter(|s| !s.is_empty())
-            .unwrap_or(prev_prompt);
-        let child_id = extract_subagent_conversation_id(raw_out, None).or(prev_child_id);
-        return ToolCallDetail::Subagent {
-            child_agent_id: child_id,
-            role,
-            prompt_preview: prompt,
-        };
+    if is_subagent_launch_tool(title, raw_in) {
+        return agy_subagent_detail(update, prev);
     }
-
     if let Some(existing) = prev {
         return existing.clone();
     }
@@ -3364,6 +3340,16 @@ fn map_agy_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCal
         tool_name: title.to_string(),
         arguments_json: raw_in.map(|v| v.to_string()).unwrap_or_default(),
     }
+}
+
+fn agy_subagent_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCallDetail {
+    let mut dispatch = crate::managed_dispatch::acp_detail(update, prev);
+    if let ToolCallDetail::Subagent { child_agent_id, .. } = &mut dispatch
+        && child_agent_id.is_none()
+    {
+        *child_agent_id = extract_subagent_conversation_id(update.get("rawOutput"), None);
+    }
+    dispatch
 }
 
 /// Parses structured `ask_question` raw input items shared by permission-wrapped
@@ -5570,6 +5556,10 @@ fn map_transcript_tool_detail(tool_name: &str, args: Option<&Value>) -> ToolCall
         return ToolCallDetail::Search { query, scope };
     }
 
+    if crate::managed_dispatch::is_launch(tool_name) {
+        return crate::managed_dispatch::detail(args.unwrap_or(&Value::Null), &Value::Null, None);
+    }
+
     if is_subagent_launch_tool(tool_name, args) {
         let role = transcript_arg_str(args, &["Role", "TypeName", "role"])
             .unwrap_or_else(|| "Subagent".into());
@@ -5613,7 +5603,8 @@ fn attach_transcript_tool_result(mut detail: ToolCallDetail, content: &str) -> T
         }
         ToolCallDetail::Subagent { child_agent_id, .. } => {
             if child_agent_id.is_none() {
-                *child_agent_id = extract_subagent_conversation_id(None, Some(content));
+                *child_agent_id = crate::managed_dispatch::child_id(&Value::String(content.into()))
+                    .or_else(|| extract_subagent_conversation_id(None, Some(content)));
             }
         }
         ToolCallDetail::Generic { arguments_json, .. } => {
@@ -8561,6 +8552,37 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             arguments_json: "{}".into(),
         });
         assert!(signatures_match(&acp_sig, &tx_sig));
+    }
+
+    #[test]
+    fn managed_dispatch_partial_acp_and_transcript_results_link_orbit_thread() {
+        for name in [
+            "create_agent",
+            "mcp_orbit_create_agent",
+            "mcp__orbit__create_agent",
+            "spawn_workspace_peer",
+            "mcp_orbit_spawn_workspace_peer",
+            "mcp__orbit__spawn_workspace_peer",
+            "Run mcp orbit create agent",
+        ] {
+            let args = json!({"title":"Review", "initial_prompt":"Check permissions"});
+            let started = map_agy_tool_detail(
+                &json!({"title": name, "kind":"execute", "rawInput":args}),
+                None,
+            );
+            let result = json!({"content":[{"type":"text","text":"Created thread: {\"agent_id\":\"ag_one\"}"}]});
+            let done = map_agy_tool_detail(&json!({"rawOutput":result}), Some(&started));
+            let replay = attach_transcript_tool_result(
+                map_transcript_tool_detail(name, Some(&args)),
+                &result.to_string(),
+            );
+            for detail in [done, replay] {
+                assert!(
+                    matches!(detail, ToolCallDetail::Subagent { child_agent_id: Some(id), role, prompt_preview }
+                    if id == "ag_one" && role == "Review" && prompt_preview == "Check permissions")
+                );
+            }
+        }
     }
 
     #[test]

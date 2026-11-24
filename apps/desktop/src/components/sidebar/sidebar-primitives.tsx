@@ -8,7 +8,6 @@ import {
 import { useI18n } from "@/lib/i18n";
 import { isLocalHostCard } from "@/lib/projects";
 import { IconButton } from "@/components/ui/icon-button";
-import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -108,25 +107,12 @@ export const SidebarRelativeTime = memo(function SidebarRelativeTime({
   return <span className={className}>{formatCompactRelativeTime(rfc3339, nowMs)}</span>;
 });
 
-/**
- * Unified left `16×16px` lifecycle status rail (strictly aligned with Codex Desktop / Cursor / Claude Code):
- * 1. Blocked / awaiting approval -> amber 6px signal dot
- * 2. Actively running (main agent or subagents) -> monochrome `OrbitSpinner`
- * 3. Error -> red 6px signal dot
- * 4. Completed & unread -> blue 6px signal dot
- * 5. Idle & read inside isolated Git worktree -> faint `GitBranch` glyph
- * 6. Normal idle & read (including background dev servers / armed timers, which live in Overview) -> empty
- */
 export const ConversationStatusGlyph = memo(function ConversationStatusGlyph({
   agent,
-  isForegroundRunning,
-  hasRunningSubagents,
   isWorktree,
   isUnread,
 }: {
   agent: AgentCardView;
-  isForegroundRunning: boolean;
-  hasRunningSubagents: boolean;
   isWorktree: boolean;
   isUnread: boolean;
 }) {
@@ -137,16 +123,6 @@ export const ConversationStatusGlyph = memo(function ConversationStatusGlyph({
         title={t("sidebar.waitingForApproval")}
         className="bg-signal-warning size-[6px] shrink-0 rounded-full"
       />
-    );
-  }
-  if (isForegroundRunning || hasRunningSubagents) {
-    return (
-      <span
-        title={isForegroundRunning ? t("sidebar.running") : t("sidebar.subagentRunning")}
-        className="text-ink-secondary inline-flex shrink-0 items-center justify-center"
-      >
-        <OrbitSpinner size={13} />
-      </span>
     );
   }
   if (agent.status_label === "Error") {
@@ -176,7 +152,7 @@ export const ConversationStatusGlyph = memo(function ConversationStatusGlyph({
   if (isWorktree) {
     return (
       <span
-        title={agent.worktree_branch || undefined}
+        title={agent.worktree_branch || t("peerStrip.worktree")}
         className="inline-flex shrink-0 items-center justify-center"
       >
         <GitBranch className="text-ink-faint size-[12px] shrink-0 stroke-[1.75]" />

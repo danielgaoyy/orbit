@@ -4,7 +4,6 @@ import {
   ArrowLeftRight,
   ArrowRight,
   ArrowUp,
-  ArrowUpRight,
   Blocks,
   Check,
   ChevronRight,
@@ -20,12 +19,13 @@ import { IconButton } from "@/components/ui/icon-button";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { SubagentAvatar } from "@/components/ui/subagent-avatar";
+import { useI18n } from "@/lib/i18n";
 import { sharedDisclosureStateStore } from "@/lib/disclosure-state";
 import type { TimelineItemView, WorkSummaryResultView } from "@/lib/orbit-ipc";
 import {
   type ResolvedSubagentItem,
   extractSubagentMessageCall,
-  resolveToolCallSubagent,
+  resolveDelegationDispatches,
 } from "@/lib/subagents";
 import {
   type SubagentCharacterSpec,
@@ -34,7 +34,6 @@ import {
 import { formatDurationCompact } from "@/lib/timeline-coalesce";
 import {
   type ToolCallTimelineItem,
-  extractFallbackDispatchCall,
   extractStateChangeMilestoneCall,
 } from "@/lib/turn-delegation-split";
 import { cn } from "@/lib/utils";
@@ -47,6 +46,7 @@ import {
   formatJsonPreview,
   stableStepItemKey,
 } from "./stage-helpers";
+import { openSubagent } from "./subagent-crew-dock";
 import { InlineLiveElapsed, StepItemRow } from "./stage-tool-renderers";
 
 type SubagentMaybeWithAvatar = ResolvedSubagentItem & {
@@ -131,6 +131,7 @@ type DelegationMilestoneEntry =
       key: string;
       subagent: SubagentMaybeWithAvatar;
       character: SubagentCharacterSpec;
+      linked: boolean;
       callStatus: "running" | "completed" | "failed" | "denied";
     }
   | {
@@ -147,28 +148,17 @@ type DelegationMilestoneEntry =
   | {
       kind: "state_change";
       key: string;
-      milestoneKind: "timer" | "handoff" | "dispatch_fallback";
+      milestoneKind: "timer" | "handoff";
       label: string;
       detailText: string;
       detailIsMono: boolean;
       status: "running" | "completed" | "failed" | "denied";
     };
 
-function subagentChipStatusWord(
-  status: ResolvedSubagentItem["status"],
-  callStatus: "running" | "completed" | "failed" | "denied",
-): string {
-  if (status === "awaiting_permission") return "approval";
-  if (status === "running" || callStatus === "running") return "working";
-  if (status === "failed" || callStatus === "failed" || callStatus === "denied") return "failed";
-  if (status === "canceled") return "stopped";
-  return "done";
-}
-
 /**
  * First-class chronological milestone row rendered outside folded step groups:
  * 1. Subagent dispatches (`invoke_subagent`, `create_agent`, `spawn_workspace_peer`) — compact horizontal
- *    chips featuring each subagent's living OneWorks 3D Avatar (bouncing while working, quiet when done).
+ *    chips featuring each subagent's animal avatar (bouncing while working, quiet when done).
  * 2. Inter-agent messages (`send_message`, `message_peer`, `send_agent_prompt`) — compact expandable
  *    left-aligned rows matching `AgentMessageCard` with clean left-rail body (never card-inside-card).
  * 3. Session state milestones (Timers, Worktree Handoffs) — subtle inline chips.
@@ -178,25 +168,27 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
   hostId,
   agentId,
   sessionSubagents,
-  onOpenSubagent,
+  dispatches,
   parentMessageLabel,
 }: {
   items: readonly ToolCallTimelineItem[];
   hostId?: string;
   agentId?: string;
   sessionSubagents?: readonly SubagentMaybeWithAvatar[];
-  onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
+  dispatches?: ReturnType<typeof resolveDelegationDispatches>;
   parentMessageLabel?: string | null;
 }) {
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
+  const { t } = useI18n();
+  const sentMessageLabel = parentMessageLabel || t("stage.sentMessage");
   const entries = useMemo(() => {
     const out: DelegationMilestoneEntry[] = [];
-    const dispatchIndexByKey = new Map<string, number>();
 
+    const matches = dispatches ?? resolveDelegationDispatches(items, sessionSubagents ?? EMPTY_SUBAGENTS, hostId);
     for (const it of items) {
-      const resolved = resolveToolCallSubagent(it, sessionSubagents ?? EMPTY_SUBAGENTS, hostId);
+      const resolved = matches.get(it);
       if (resolved) {
         const enriched = resolved.subagent as SubagentMaybeWithAvatar;
         const character =
@@ -226,27 +218,14 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
           continue;
         }
 
-        const existingIdx = dispatchIndexByKey.get(enriched.key);
-        if (existingIdx !== undefined) {
-          const prev = out[existingIdx];
-          if (prev?.kind === "subagent_dispatch") {
-            out[existingIdx] = {
-              ...prev,
-              subagent: enriched,
-              character,
-              callStatus: it.status,
-            };
-          }
-        } else {
-          dispatchIndexByKey.set(enriched.key, out.length);
-          out.push({
-            kind: "subagent_dispatch",
-            key: enriched.key,
-            subagent: enriched,
-            character,
-            callStatus: it.status,
-          });
-        }
+        out.push({
+          kind: "subagent_dispatch",
+          key: `dispatch:${it.call_id || it.seq}`,
+          subagent: enriched,
+          character,
+          linked: resolved.linked,
+          callStatus: it.status,
+        });
         continue;
       }
 
@@ -259,7 +238,7 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
           !msgCall.recipient.startsWith("ag_");
         const label = isNamedHandle
           ? `→ @${msgCall.recipient.replace(/^@+/, "")}`
-          : parentMessageLabel || "Sent message";
+          : sentMessageLabel;
         const isFailed = msgCall.status === "failed" || msgCall.status === "denied";
         const rawArgs = it.detail.kind === "generic" ? it.detail.arguments_json.trim() : "";
         const hasFallbackArgs =
@@ -291,23 +270,10 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
         });
         continue;
       }
-
-      const fallbackDispatch = extractFallbackDispatchCall(it);
-      if (fallbackDispatch) {
-        out.push({
-          kind: "state_change",
-          key: `dispatch:${fallbackDispatch.callId}`,
-          milestoneKind: "dispatch_fallback",
-          label: fallbackDispatch.label,
-          detailText: fallbackDispatch.preview,
-          detailIsMono: fallbackDispatch.preview.startsWith("{"),
-          status: fallbackDispatch.status,
-        });
-      }
     }
 
     return out;
-  }, [items, sessionSubagents, hostId, parentMessageLabel]);
+  }, [items, sessionSubagents, hostId, sentMessageLabel, dispatches]);
 
   if (entries.length === 0) return null;
 
@@ -320,21 +286,7 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
       e.kind === "inter_agent_message",
   );
 
-  const openSubagentRecord = (subagent: ResolvedSubagentItem) => {
-    if (onOpenSubagent) {
-      onOpenSubagent(subagent);
-    } else {
-      orbitActions.openSubagentTab({
-        callId: subagent.callId,
-        role: subagent.title,
-        promptPreview: subagent.promptPreview,
-        childAgentId: subagent.childAgentId,
-        childHostId: subagent.childHostId || undefined,
-        providerSubagentId: subagent.providerSubagentId,
-        parentAgentId: agentId || undefined,
-      });
-    }
-  };
+  const openSubagentRecord = (subagent: ResolvedSubagentItem) => openSubagent(agentId, subagent);
 
   const activeChipDetail = expandedKey
     ? (chipEntries.find(
@@ -345,32 +297,38 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
 
   return (
     <div className="space-y-1.5">
-      {/* 1. Compact horizontal row for Subagent dispatches (with living OneWorks 3D Avatars) & state chips */}
+      {/* 1. Compact horizontal row for Subagent dispatches (with animal avatars) & state chips */}
       {chipEntries.length > 0 && (
         <div className="flex flex-wrap items-center gap-1.5">
           {chipEntries.map((entry) => {
             if (entry.kind === "subagent_dispatch") {
               const { subagent, character, callStatus } = entry;
-              const effectiveStatus =
-                subagent.status === "awaiting_permission"
-                  ? "awaiting_permission"
-                  : subagent.status === "running" || callStatus === "running"
-                    ? "running"
-                    : callStatus === "failed" || callStatus === "denied"
-                      ? "failed"
-                      : subagent.status;
+              const effectiveStatus = subagent.status;
+              const starting = effectiveStatus === "running" && !entry.linked;
+              const actionKey =
+                callStatus === "failed" || callStatus === "denied"
+                  ? "stage.subagentLaunch"
+                  : starting && callStatus === "running"
+                    ? "stage.creatingSubagent"
+                    : "stage.spawnedSubagent";
+              const statusKey = {
+                running: starting ? "stage.subagentStarting" : "overview.subagentWorking",
+                awaiting_permission: "overview.subagentApprovalRequired",
+                failed: "overview.subagentFailed",
+                completed: "stage.subagentDone",
+                canceled: "overview.subagentStopped",
+              } as const;
               const isFailed = effectiveStatus === "failed";
               const isAwaiting = effectiveStatus === "awaiting_permission";
-              const statusWord = subagentChipStatusWord(effectiveStatus, callStatus);
 
               return (
                 <button
                   key={entry.key}
                   type="button"
-                  title={subagent.promptPreview || `Open ${subagent.title}`}
+                  title={subagent.promptPreview || t("overview.openSubagent", { name: subagent.title })}
                   onClick={() => openSubagentRecord(subagent)}
                   className={cn(
-                    "group/sachip inline-flex h-[30px] max-w-[280px] cursor-pointer items-center gap-2 rounded-full border pl-1.5 pr-2.5 text-[12px] leading-none transition-colors",
+                    "group/sachip inline-flex min-h-[34px] min-w-0 max-w-full cursor-pointer items-center gap-2 rounded-[10px] border px-2.5 py-1 text-left text-[12px] leading-none transition-colors",
                     isFailed
                       ? "border-signal-danger-border bg-signal-danger-bg/65 text-ink-primary hover:bg-signal-danger-bg"
                       : isAwaiting
@@ -378,26 +336,17 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
                         : "border-border-subtle bg-surface-raised/85 text-ink-primary hover:border-border-default hover:bg-accent/70",
                   )}
                 >
+                  <span className="text-ink-tertiary text-[11px]">{t(actionKey)}</span>
                   <SubagentAvatar
                     character={character}
                     status={effectiveStatus}
                     size="sm"
-                    showStatusBadge={effectiveStatus === "completed" || effectiveStatus === "failed"}
+                    showStatusBadge={false}
                   />
-                  <span className="min-w-0 truncate font-medium">{subagent.title}</span>
-                  <span
-                    className={cn(
-                      "shrink-0 text-[11px]",
-                      isFailed
-                        ? "text-signal-danger"
-                        : isAwaiting
-                          ? "text-signal-warning font-medium"
-                          : "text-ink-tertiary",
-                    )}
-                  >
-                    {statusWord}
-                  </span>
-                  <ArrowUpRight className="text-ink-muted group-hover/sachip:text-ink-primary size-3 shrink-0 opacity-45 transition-opacity group-hover/sachip:opacity-100" />
+                  {(entry.linked || subagent.title !== "Subagent") && (
+                    <span className="min-w-0 max-w-[440px] truncate font-medium">{subagent.title}</span>
+                  )}
+                  <span className="text-ink-secondary ml-auto shrink-0 pl-1 text-[11px]">{t(statusKey[effectiveStatus])}</span>
                 </button>
               );
             }
@@ -431,10 +380,8 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
                     <AlertTriangle className="text-signal-danger size-3" />
                   ) : entry.milestoneKind === "timer" ? (
                     <Timer className="text-signal-warning size-3" />
-                  ) : entry.milestoneKind === "handoff" ? (
-                    <ArrowLeftRight className="text-signal-info size-3" />
                   ) : (
-                    <Check className="text-signal-success size-3 stroke-[2.2]" />
+                    <ArrowLeftRight className="text-signal-info size-3" />
                   )}
                 </span>
                 <span className="min-w-0 truncate font-medium">{entry.label}</span>
@@ -513,16 +460,17 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
             >
               <button
                 type="button"
-                disabled={!canExpand}
-                aria-expanded={canExpand ? isOpen : undefined}
-                title={msg.preview || msg.label}
+                disabled={!msg.subagent && !canExpand}
+                aria-expanded={!msg.subagent && canExpand ? isOpen : undefined}
+                title={msg.subagent ? t("overview.openSubagent", { name: msg.subagent.title }) : msg.preview || msg.label}
                 onClick={() => {
+                  if (msg.subagent) return openSubagentRecord(msg.subagent);
                   if (!canExpand) return;
                   setExpandedKey((prev) => (prev === msg.key ? null : msg.key));
                 }}
                 className={cn(
                   "flex min-h-[34px] min-w-0 flex-1 items-center gap-2 py-1 pl-2 pr-1 text-left text-[12px]",
-                  canExpand ? "cursor-pointer" : "cursor-default",
+                  msg.subagent || canExpand ? "cursor-pointer" : "cursor-default",
                 )}
               >
                 {msg.character ? (
@@ -556,20 +504,11 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
               </button>
 
               <div className="flex shrink-0 items-center gap-0.5">
-                {msg.subagent && (
-                  <button
-                    type="button"
-                    onClick={() => openSubagentRecord(msg.subagent!)}
-                    className="text-ink-tertiary hover:text-ink-primary hover:bg-accent hidden h-[22px] cursor-pointer items-center gap-0.5 rounded-[6px] px-1.5 text-[11px] font-medium transition-colors group-focus-within/msgrow:inline-flex group-hover/msgrow:inline-flex"
-                  >
-                    <span>Open</span>
-                    <ArrowUpRight className="size-3 shrink-0" />
-                  </button>
-                )}
                 {canExpand && (
                   <IconButton
                     size="xs"
-                    aria-label={isOpen ? "Collapse message" : "Expand message"}
+                    aria-expanded={isOpen}
+                    aria-label={t(isOpen ? "stage.collapseMessage" : "stage.expandMessage")}
                     onClick={() => setExpandedKey((prev) => (prev === msg.key ? null : msg.key))}
                   >
                     <ChevronRight

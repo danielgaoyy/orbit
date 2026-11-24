@@ -8,7 +8,9 @@ import {
   getFocusedDecisionTarget,
   isAlwaysDecision,
   isDenyDecision,
+  stepFocusedDecisionQueue,
 } from "@/lib/timeline-coalesce";
+import { t as translateGlobal } from "@/lib/i18n";
 import { orbitActions } from "@/state/orbit-store";
 
 export function modSymbol(): string {
@@ -205,9 +207,19 @@ export function useGlobalErgonomicKeybindings(): void {
         return;
       }
 
-      // 9. Cycle Session Mode (`Shift+Tab`)
+      // 9. Cycle Session Mode (`Shift+Tab`) — yield to native reverse tabbing inside secondary form inputs
       if (e.shiftKey && e.key === "Tab" && !mod && !e.altKey) {
+        const activeEl = document.activeElement as HTMLElement | null;
+        const activeTag = activeEl?.tagName;
+        const isMainComposerInput = activeEl?.dataset?.orbitComposerInput === "true";
+        const inSecondaryEditable =
+          !isMainComposerInput &&
+          (activeTag === "INPUT" ||
+            activeTag === "TEXTAREA" ||
+            activeTag === "SELECT" ||
+            Boolean(activeEl?.isContentEditable));
         if (
+          !inSecondaryEditable &&
           !snap.commandPaletteOpen &&
           !snap.pairDialogOpen &&
           !snap.relayDialogOpen &&
@@ -223,67 +235,90 @@ export function useGlobalErgonomicKeybindings(): void {
       }
 
       // 10. Quick Permission Approval Chords (`⌘Y` Allow, `⌘⇧Y` Always Allow, `⌘⌫` Deny)
+      //     and Queue Stepper (`⌘[` / `⌘]`) across both parent AND child subagent permissions.
       if (mod && !e.altKey && !e.repeat && snap.selectedHostId && snap.selectedAgentId && !snap.isDraftNewSession) {
+        if (!e.shiftKey && (e.key === "[" || e.key === "]")) {
+          const delta: -1 | 1 = e.key === "[" ? -1 : 1;
+          if (stepFocusedDecisionQueue(delta)) {
+            e.preventDefault();
+            return;
+          }
+        }
+
         const focused = getFocusedDecisionTarget();
         if (focused?.kind !== "question") {
-          const stage = snap.stages[`${snap.selectedHostId}::${snap.selectedAgentId}`];
-          if (stage) {
-            const pendingPerms = stage.pending_permissions.filter(
+          let targetHostId: string | null = null;
+          let targetAgentId: string | null = null;
+          let targetRequestId: string | null = null;
+          let rawDecisions: readonly string[] = [];
+          let resolveHandler: ((decision: string) => void) | undefined;
+
+          if (focused?.kind === "permission") {
+            // Strictly honor the exact visible DecisionDock card (parent OR managed child subagent)
+            targetHostId = focused.hostId;
+            targetAgentId = focused.agentId;
+            targetRequestId = focused.requestId;
+            rawDecisions = focused.allowedDecisions;
+            resolveHandler = focused.onResolve;
+          } else {
+            // Fallback when dock has not mounted/registered yet: first unresolved parent permission
+            const stage = snap.stages[`${snap.selectedHostId}::${snap.selectedAgentId}`];
+            const firstPerm = stage?.pending_permissions.find(
               (it): it is Extract<(typeof stage.pending_permissions)[number], { item_type: "permission_request" }> =>
                 it.item_type === "permission_request" && !it.resolved_decision,
             );
-            const focusedPerm =
-              focused?.kind === "permission"
-                ? pendingPerms.find((it) => it.request_id === focused.requestId) ?? null
-                : null;
-            const targetPerm = focusedPerm ?? pendingPerms[0] ?? null;
-            if (targetPerm) {
-              const decisions =
-                targetPerm.allowed_decisions.length > 0
-                  ? targetPerm.allowed_decisions
-                  : ["allow", "allow_always", "deny"];
-              const allowChoice =
-                decisions.find((d) => !isDenyDecision(d) && !isAlwaysDecision(d)) ?? null;
-              const alwaysChoice = decisions.find((d) => isAlwaysDecision(d)) ?? null;
-              const denyChoice = decisions.find((d) => isDenyDecision(d)) ?? null;
+            if (firstPerm) {
+              targetHostId = snap.selectedHostId;
+              targetAgentId = snap.selectedAgentId;
+              targetRequestId = firstPerm.request_id;
+              rawDecisions = firstPerm.allowed_decisions;
+            }
+          }
 
-              if (!e.shiftKey && keyLower === "y" && allowChoice) {
-                e.preventDefault();
-                void orbitIpc.resolvePermission(
-                  snap.selectedHostId,
-                  snap.selectedAgentId,
-                  targetPerm.request_id,
-                  allowChoice,
-                );
+          if (targetHostId && targetAgentId && targetRequestId) {
+            const decisions =
+              rawDecisions.length > 0 ? rawDecisions : ["allow", "allow_always", "deny"];
+            const allowChoice =
+              decisions.find((d) => !isDenyDecision(d) && !isAlwaysDecision(d)) ?? null;
+            const alwaysChoice = decisions.find((d) => isAlwaysDecision(d)) ?? null;
+            const denyChoice = decisions.find((d) => isDenyDecision(d)) ?? null;
+
+            const dispatchDecision = (choice: string) => {
+              if (resolveHandler) {
+                resolveHandler(choice);
                 return;
               }
-              if (e.shiftKey && keyLower === "y" && alwaysChoice) {
-                e.preventDefault();
-                void orbitIpc.resolvePermission(
-                  snap.selectedHostId,
-                  snap.selectedAgentId,
-                  targetPerm.request_id,
-                  alwaysChoice,
-                );
-                return;
-              }
-              if (!e.shiftKey && e.key === "Backspace" && denyChoice) {
-                const activeEl = document.activeElement as HTMLElement | null;
-                const activeTag = activeEl?.tagName;
-                const isEditable =
-                  activeTag === "INPUT" ||
-                  activeTag === "TEXTAREA" ||
-                  Boolean(activeEl?.isContentEditable);
-                if (!isEditable) {
-                  e.preventDefault();
-                  void orbitIpc.resolvePermission(
-                    snap.selectedHostId,
-                    snap.selectedAgentId,
-                    targetPerm.request_id,
-                    denyChoice,
+              void orbitIpc
+                .resolvePermission(targetHostId!, targetAgentId!, targetRequestId!, choice)
+                .catch((err) => {
+                  orbitActions.showToast(
+                    translateGlobal("approval.permissionFailed", { error: String(err) }),
                   );
-                  return;
-                }
+                });
+            };
+
+            if (!e.shiftKey && keyLower === "y" && allowChoice) {
+              e.preventDefault();
+              dispatchDecision(allowChoice);
+              return;
+            }
+            if (e.shiftKey && keyLower === "y" && alwaysChoice) {
+              e.preventDefault();
+              dispatchDecision(alwaysChoice);
+              return;
+            }
+            if (!e.shiftKey && e.key === "Backspace" && denyChoice) {
+              const activeEl = document.activeElement as HTMLElement | null;
+              const activeTag = activeEl?.tagName;
+              const isNonEmptyInput =
+                ((activeTag === "INPUT" || activeTag === "TEXTAREA") &&
+                  (activeEl as HTMLInputElement | HTMLTextAreaElement).value.length > 0) ||
+                (Boolean(activeEl?.isContentEditable) &&
+                  (activeEl?.textContent?.length ?? 0) > 0);
+              if (!isNonEmptyInput) {
+                e.preventDefault();
+                dispatchDecision(denyChoice);
+                return;
               }
             }
           }
@@ -310,7 +345,7 @@ export function useGlobalErgonomicKeybindings(): void {
             if (isAgentForegroundRunning(ag) || ag?.is_awaiting_permission) {
               e.preventDefault();
               void orbitIpc.interruptAgent(snap.selectedHostId, snap.selectedAgentId);
-              orbitActions.showToast("Interrupted active turn");
+              orbitActions.showToast(translateGlobal("composer.toastInterruptedTurn"));
             }
           }
         } else {

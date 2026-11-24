@@ -119,6 +119,7 @@ export interface AgentCardDto {
   archived_at_rfc3339?: string | null;
   handle?: string | null;
   latest_seq: number;
+  created_at_rfc3339?: string | null;
   updated_at_rfc3339: string;
   is_pinned?: boolean;
   seen_seq?: number;

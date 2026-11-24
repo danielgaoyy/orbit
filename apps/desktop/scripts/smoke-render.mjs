@@ -48,7 +48,7 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
     custom_direct_endpoint: null,
     via_ssh_tunnel: false,
     last_ping_ms: 1,
-    daemon_version: "0.10.0",
+    daemon_version: "0.10.1",
     os_arch: "darwin/aarch64",
     daemon_pubkey_b64: "",
     direct_endpoints: ["127.0.0.1:6868"],
@@ -119,9 +119,9 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
         case "subscribe_core_events":
           return null;
         case "get_bridge_info":
-          return { protocol_version: 2, core_version: "0.10.0", capabilities: [] };
+          return { protocol_version: 2, core_version: "0.10.1", capabilities: [] };
         case "get_app_version":
-          return "0.10.0";
+          return "0.10.1";
         case "list_external_editors":
         case "list_ssh_hosts":
         case "get_fallback_provider_catalogs":

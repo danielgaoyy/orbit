@@ -629,6 +629,7 @@ impl DaemonRuntime {
         .map_err(|e| anyhow::anyhow!("provider discovery task failed: {e}"))?;
 
         let persisted_relay = persisted.relay_url.clone();
+        let advertised_port = persisted.listen_addr.map(|a| a.port()).unwrap_or(6868);
         let host_info = HostInfo {
             host_id,
             hostname: host_display_name,
@@ -639,6 +640,7 @@ impl DaemonRuntime {
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             available_providers,
             relay_url: persisted_relay.clone(),
+            direct_endpoints: discover_lan_ws_endpoints(advertised_port),
         };
 
         let (pairing_secret_rotated_tx, _) = broadcast::channel(16);
@@ -896,6 +898,10 @@ impl DaemonRuntime {
     pub async fn effective_host_info(&self) -> HostInfo {
         let mut info = self.host_info.clone();
         info.relay_url = self.relay_url.read().await.clone();
+        let live_port = *self.listen_port.read().await;
+        if live_port > 0 {
+            info.direct_endpoints = discover_lan_ws_endpoints(live_port);
+        }
         info
     }
 
@@ -1334,6 +1340,79 @@ where
     Ok(control_chan)
 }
 
+#[derive(serde::Deserialize)]
+struct LocalRelayJsonPreview {
+    listen_addr: SocketAddr,
+    #[serde(default)]
+    allowed_pubkeys: Vec<String>,
+    #[serde(default)]
+    fleet_token: Option<String>,
+}
+
+fn extract_relay_query_ft(relay_url: &str) -> Option<String> {
+    let query = relay_url.split_once('?')?.1.split('#').next()?;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=')
+            && k == "ft"
+            && !v.trim().is_empty()
+        {
+            return Some(v.trim().to_string());
+        }
+    }
+    None
+}
+
+/// If a host cannot reach its configured public/tunneled Relay (e.g. blocked public firewall,
+/// intranet hairpin timeout, or offline egress) and runs a compatible host-local Relay
+/// (`<home_dir>/relay.json`), fall back directly to `ws://127.0.0.1:<port>[?ft=...]`.
+fn resolve_local_relay_fallback(
+    home_dir: &Path,
+    configured_relay: &str,
+    pubkey: &str,
+) -> Option<String> {
+    let raw = std::fs::read_to_string(home_dir.join("relay.json")).ok()?;
+    let local: LocalRelayJsonPreview = serde_json::from_str(&raw).ok()?;
+    let port = local.listen_addr.port();
+    if port == 0 {
+        return None;
+    }
+
+    let local_ft = local
+        .fleet_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let cfg_ft = extract_relay_query_ft(configured_relay);
+
+    let pubkey_trimmed = pubkey.trim();
+    let pubkey_in_allowlist = local
+        .allowed_pubkeys
+        .iter()
+        .any(|k| k.trim() == pubkey_trimmed);
+    let pubkey_allowed = local.allowed_pubkeys.is_empty() || pubkey_in_allowlist;
+
+    let authorized = match (local_ft, cfg_ft.as_deref()) {
+        (Some(lft), Some(cft)) => {
+            if lft != cft {
+                return None;
+            }
+            true
+        }
+        (Some(_), None) => pubkey_allowed,
+        (None, Some(_)) => false,
+        (None, None) => pubkey_allowed,
+    };
+
+    if !authorized {
+        return None;
+    }
+
+    Some(match local_ft {
+        Some(ft) => format!("ws://127.0.0.1:{port}?ft={ft}"),
+        None => format!("ws://127.0.0.1:{port}"),
+    })
+}
+
 async fn outbound_relay_loop(runtime: Arc<DaemonRuntime>, relay_base: String) {
     const CONTROL_PING_INTERVAL: Duration = Duration::from_secs(20);
     const CONTROL_DEADLINE: Duration = Duration::from_secs(65);
@@ -1351,132 +1430,160 @@ async fn outbound_relay_loop(runtime: Arc<DaemonRuntime>, relay_base: String) {
 
     loop {
         let mut backoff = Duration::from_secs(2);
-        match RelayConnector::connect(&relay_base).await {
-            Ok(connector) => {
-                let connector = Arc::new(connector);
-                match connector
-                    .open_ws_with_limit(&ctrl_path, MAX_RELAY_CONTROL_WS_FRAME_BYTES)
-                    .await
-                {
-                    Ok(ws) => {
-                        let (mut sink, mut stream) = ws.split();
-                        match complete_relay_control_pop(&mut sink, &mut stream, &priv_bytes).await
-                        {
-                            Ok(mut control_chan) => {
-                                info!(
-                                    relay = %display_relay,
-                                    "Authenticated (PoP) and connected outbound to Orbit Relay"
-                                );
-                                let mut ping_interval =
-                                    tokio::time::interval(CONTROL_PING_INTERVAL);
-                                ping_interval.set_missed_tick_behavior(
-                                    tokio::time::MissedTickBehavior::Delay,
-                                );
-                                ping_interval.tick().await;
-                                let mut last_seen = tokio::time::Instant::now();
+        let primary_attempt: Result<(Arc<RelayConnector>, _, String), String> =
+            match RelayConnector::connect(&relay_base).await {
+                Ok(connector) => {
+                    let connector = Arc::new(connector);
+                    match connector
+                        .open_ws_with_limit(&ctrl_path, MAX_RELAY_CONTROL_WS_FRAME_BYTES)
+                        .await
+                    {
+                        Ok(ws) => Ok((connector, ws, display_relay.clone())),
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+                Err(e) => Err(e.to_string()),
+            };
 
-                                loop {
-                                    tokio::select! {
-                                        _ = ping_interval.tick() => {
-                                            if last_seen.elapsed() > CONTROL_DEADLINE {
-                                                warn!(relay = %display_relay, "Relay control heartbeat timed out, reconnecting...");
+        let resolved = match primary_attempt {
+            Ok(ok) => Ok(ok),
+            Err(primary_err) => {
+                if let Some(local_fallback) =
+                    resolve_local_relay_fallback(&runtime.home_dir, &relay_base, &pubkey)
+                    && let Ok(fb_conn) = RelayConnector::connect(&local_fallback).await
+                {
+                    let fb_conn = Arc::new(fb_conn);
+                    if let Ok(fb_ws) = fb_conn
+                        .open_ws_with_limit(&ctrl_path, MAX_RELAY_CONTROL_WS_FRAME_BYTES)
+                        .await
+                    {
+                        let fb_display = redact_relay_url(&local_fallback);
+                        info!(
+                            configured = %display_relay,
+                            fallback = %fb_display,
+                            "Primary Relay unreachable; connected to host-local Relay loopback fallback"
+                        );
+                        Ok((fb_conn, fb_ws, fb_display))
+                    } else {
+                        Err(primary_err)
+                    }
+                } else {
+                    Err(primary_err)
+                }
+            }
+        };
+
+        match resolved {
+            Ok((connector, ws, active_display)) => {
+                let (mut sink, mut stream) = ws.split();
+                match complete_relay_control_pop(&mut sink, &mut stream, &priv_bytes).await {
+                    Ok(mut control_chan) => {
+                        info!(
+                            relay = %active_display,
+                            "Authenticated (PoP) and connected outbound to Orbit Relay"
+                        );
+                        let mut ping_interval = tokio::time::interval(CONTROL_PING_INTERVAL);
+                        ping_interval
+                            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        ping_interval.tick().await;
+                        let mut last_seen = tokio::time::Instant::now();
+
+                        loop {
+                            tokio::select! {
+                                _ = ping_interval.tick() => {
+                                    if last_seen.elapsed() > CONTROL_DEADLINE {
+                                        warn!(relay = %active_display, "Relay control heartbeat timed out, reconnecting...");
+                                        break;
+                                    }
+                                    if sink.send(TungMsg::Ping(b"hb".to_vec().into())).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                maybe_msg = stream.next() => {
+                                    match maybe_msg {
+                                        Some(Ok(TungMsg::Binary(ct))) => {
+                                            last_seen = tokio::time::Instant::now();
+                                            let Ok(plain) = control_chan.open_record(&ct) else {
+                                                warn!(
+                                                    relay = %active_display,
+                                                    bytes = ct.len(),
+                                                    "Failed to decrypt Relay control frame; reconnecting"
+                                                );
                                                 break;
+                                            };
+                                            if let Ok(v) =
+                                                serde_json::from_slice::<serde_json::Value>(&plain)
+                                                && v.get("op").and_then(|x| x.as_str())
+                                                    == Some("open_tunnel")
+                                                && let Some(tid) =
+                                                    v.get("tunnel_id").and_then(|x| x.as_str())
+                                                && let Some(secret_b64) =
+                                                    v.get("attach_secret").and_then(|x| x.as_str())
+                                                && let Ok(attach_secret) =
+                                                    orbit_crypto::decode_key_32(secret_b64)
+                                            {
+                                                let rt_tun = runtime.clone();
+                                                let conn_tun = Arc::clone(&connector);
+                                                let tid_owned = tid.to_string();
+                                                let secret_owned =
+                                                    zeroize::Zeroizing::new(attach_secret);
+                                                tokio::spawn(async move {
+                                                    let _ = serve_e2ee_relay_tunnel(
+                                                        rt_tun,
+                                                        &conn_tun,
+                                                        &tid_owned,
+                                                        secret_owned,
+                                                    )
+                                                    .await;
+                                                });
                                             }
-                                            if sink.send(TungMsg::Ping(b"hb".to_vec().into())).await.is_err() {
+                                        }
+                                        Some(Ok(TungMsg::Ping(p))) => {
+                                            last_seen = tokio::time::Instant::now();
+                                            if sink.send(TungMsg::Pong(p)).await.is_err() {
                                                 break;
                                             }
                                         }
-                                        maybe_msg = stream.next() => {
-                                            match maybe_msg {
-                                                Some(Ok(TungMsg::Binary(ct))) => {
-                                                    last_seen = tokio::time::Instant::now();
-                                                    let Ok(plain) = control_chan.open_record(&ct) else {
-                                                        warn!(
-                                                            relay = %display_relay,
-                                                            bytes = ct.len(),
-                                                            "Failed to decrypt Relay control frame; reconnecting"
-                                                        );
-                                                        break;
-                                                    };
-                                                    if let Ok(v) =
-                                                        serde_json::from_slice::<serde_json::Value>(&plain)
-                                                        && v.get("op").and_then(|x| x.as_str())
-                                                            == Some("open_tunnel")
-                                                        && let Some(tid) =
-                                                            v.get("tunnel_id").and_then(|x| x.as_str())
-                                                        && let Some(secret_b64) =
-                                                            v.get("attach_secret").and_then(|x| x.as_str())
-                                                        && let Ok(attach_secret) =
-                                                            orbit_crypto::decode_key_32(secret_b64)
-                                                    {
-                                                        let rt_tun = runtime.clone();
-                                                        let conn_tun = Arc::clone(&connector);
-                                                        let tid_owned = tid.to_string();
-                                                        let secret_owned =
-                                                            zeroize::Zeroizing::new(attach_secret);
-                                                        tokio::spawn(async move {
-                                                            let _ = serve_e2ee_relay_tunnel(
-                                                                rt_tun,
-                                                                &conn_tun,
-                                                                &tid_owned,
-                                                                secret_owned,
-                                                            )
-                                                            .await;
-                                                        });
-                                                    }
-                                                }
-                                                Some(Ok(TungMsg::Ping(p))) => {
-                                                    last_seen = tokio::time::Instant::now();
-                                                    if sink.send(TungMsg::Pong(p)).await.is_err() {
-                                                        break;
-                                                    }
-                                                }
-                                                Some(Ok(TungMsg::Close(_))) | Some(Err(_)) | None => break,
-                                                Some(Ok(TungMsg::Pong(_))) => {
-                                                    last_seen = tokio::time::Instant::now();
-                                                }
-                                                Some(Ok(other)) => {
-                                                    last_seen = tokio::time::Instant::now();
-                                                    let (kind, bytes) = describe_tung_frame(&other);
-                                                    warn!(
-                                                        relay = %display_relay,
-                                                        frame_kind = kind,
-                                                        bytes,
-                                                        "Ignored unexpected unencrypted Relay control frame"
-                                                    );
-                                                }
-                                            }
+                                        Some(Ok(TungMsg::Close(_))) | Some(Err(_)) | None => break,
+                                        Some(Ok(TungMsg::Pong(_))) => {
+                                            last_seen = tokio::time::Instant::now();
+                                        }
+                                        Some(Ok(other)) => {
+                                            last_seen = tokio::time::Instant::now();
+                                            let (kind, bytes) = describe_tung_frame(&other);
+                                            warn!(
+                                                relay = %active_display,
+                                                frame_kind = kind,
+                                                bytes,
+                                                "Ignored unexpected unencrypted Relay control frame"
+                                            );
                                         }
                                     }
                                 }
-                                warn!(relay = %display_relay, "Disconnected from Relay, reconnecting...");
-                            }
-                            Err(e) => {
-                                warn!(
-                                    relay = %display_relay,
-                                    error = %e,
-                                    "Relay control Proof-of-Possession handshake failed, retrying in 2s..."
-                                );
                             }
                         }
+                        warn!(relay = %active_display, "Disconnected from Relay, reconnecting...");
                     }
                     Err(e) => {
-                        let detail = e.to_string();
-                        if detail.contains("403") {
-                            backoff = Duration::from_secs(10);
-                            warn!(
-                                relay = %display_relay,
-                                pubkey = %pubkey,
-                                "Relay rejected host daemon public key (HTTP 403 Forbidden); authorize it with `orbit relay allow {pubkey}`"
-                            );
-                        } else {
-                            warn!(relay = %display_relay, error = %e, "Relay control stream failed, retrying in 2s...");
-                        }
+                        warn!(
+                            relay = %active_display,
+                            error = %e,
+                            "Relay control Proof-of-Possession handshake failed, retrying in 2s..."
+                        );
                     }
                 }
             }
-            Err(e) => {
-                warn!(relay = %display_relay, error = %e, "Relay connection failed, retrying in 2s...");
+            Err(detail) => {
+                if detail.contains("403") {
+                    backoff = Duration::from_secs(10);
+                    warn!(
+                        relay = %display_relay,
+                        pubkey = %pubkey,
+                        "Relay rejected host daemon public key (HTTP 403 Forbidden); authorize it with `orbit relay allow {pubkey}`"
+                    );
+                } else {
+                    warn!(relay = %display_relay, error = %detail, "Relay connection failed, retrying in 2s...");
+                }
             }
         }
         tokio::time::sleep(backoff).await;
@@ -11582,5 +11689,61 @@ mod self_upgrade_tests {
                 } if tunnel_id == tid && r.contains("empty")
             ));
         }
+    }
+
+    #[test]
+    fn local_relay_fallback_matches_fleet_token_and_rejects_mismatched_clusters() {
+        let tmp =
+            std::env::temp_dir().join(format!("orbit-local-relay-fb-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+
+        // 1. No relay.json -> None
+        assert!(
+            resolve_local_relay_fallback(&tmp, "wss://t.trycloudflare.com?ft=abc", "pk1").is_none()
+        );
+
+        // 2. Local relay.json with fleet_token + allowlist
+        let relay_json = serde_json::json!({
+            "listen_addr": "127.0.0.1:7878",
+            "allowed_pubkeys": ["pk_host_a"],
+            "fleet_token": "tok_shared_123"
+        });
+        std::fs::write(tmp.join("relay.json"), relay_json.to_string()).expect("write relay.json");
+
+        // Matching fleet_token triggers fallback even for another fleet pubkey
+        assert_eq!(
+            resolve_local_relay_fallback(
+                &tmp,
+                "wss://cf.trycloudflare.com?ft=tok_shared_123",
+                "pk_host_b"
+            )
+            .as_deref(),
+            Some("ws://127.0.0.1:7878?ft=tok_shared_123")
+        );
+
+        // Legacy ssh+relay without `?ft=` falls back when pubkey is in allowlist
+        assert_eq!(
+            resolve_local_relay_fallback(&tmp, "ssh+relay://ec2-user@1.2.3.4:22/7878", "pk_host_a")
+                .as_deref(),
+            Some("ws://127.0.0.1:7878?ft=tok_shared_123")
+        );
+
+        // Different fleet_token MUST NOT hijack another relay cluster
+        assert!(
+            resolve_local_relay_fallback(&tmp, "wss://other.relay?ft=tok_other_999", "pk_host_a")
+                .is_none()
+        );
+
+        // Unauthorized pubkey without fleet_token MUST NOT fall back
+        assert!(
+            resolve_local_relay_fallback(
+                &tmp,
+                "ssh+relay://ec2-user@1.2.3.4:22/7878",
+                "pk_stranger"
+            )
+            .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

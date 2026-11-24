@@ -13112,6 +13112,7 @@ diff --git a/config/prod.env b/config/prod.env\n\
             daemon_version: "0.10.3".into(),
             available_providers: Vec::new(),
             relay_url: None,
+            direct_endpoints: Vec::new(),
         };
         let connected = crate::connected_hosts::ConnectedHostsManager::new(
             host_info.host_id.clone(),

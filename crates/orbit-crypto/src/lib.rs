@@ -15,8 +15,8 @@ pub use vault::{
     CLOUD_VAULT_CIPHER, CLOUD_VAULT_ENVELOPE_FORMAT, CLOUD_VAULT_KDF, DerivedVaultKey,
     EncryptedVaultEnvelope, VaultCryptoError, VaultKdfParams, decrypt_vault_bytes,
     decrypt_vault_json, derive_new_vault_key, derive_vault_key, encrypt_vault_bytes,
-    encrypt_vault_json, generate_recovery_passphrase, generate_vault_salt_b64,
-    validate_envelope_header,
+    encrypt_vault_json, generate_random_vault_key, generate_recovery_passphrase,
+    generate_vault_salt_b64, validate_envelope_header,
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};

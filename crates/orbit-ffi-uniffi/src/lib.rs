@@ -6660,6 +6660,38 @@ impl OrbitMobileCore {
             })
     }
 
+    pub fn cloud_sync_export_device_link_uri(&self) -> Result<String, FfiOrbitError> {
+        self.inner
+            .cloud_sync_export_device_link_uri()
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn cloud_sync_import_device_link_uri(
+        &self,
+        uri: String,
+    ) -> Result<FfiCloudSyncResult, FfiOrbitError> {
+        self.inner
+            .cloud_sync_import_device_link_uri(&uri)
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn cloud_sync_set_manual_passphrase_mode(
+        &self,
+        require_manual: bool,
+    ) -> Result<FfiCloudSyncStatus, FfiOrbitError> {
+        self.inner
+            .cloud_sync_set_manual_passphrase_mode(require_manual)
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
     pub fn cloud_sync_logout(
         &self,
         clear_local_hosts: bool,
@@ -7061,6 +7093,7 @@ pub struct FfiCloudSyncStatus {
     pub gist_html_url: Option<String>,
     pub remote_vault_exists: bool,
     pub auto_sync_enabled: bool,
+    pub instant_unlock_enabled: bool,
     pub last_synced_at_ms: Option<i64>,
     pub last_vault_revision: u64,
     pub synced_host_count: u32,
@@ -7082,6 +7115,7 @@ impl From<CloudSyncStatusView> for FfiCloudSyncStatus {
             gist_html_url: v.gist_html_url,
             remote_vault_exists: v.remote_vault_exists,
             auto_sync_enabled: v.auto_sync_enabled,
+            instant_unlock_enabled: v.instant_unlock_enabled,
             last_synced_at_ms: v.last_synced_at_ms,
             last_vault_revision: v.last_vault_revision,
             synced_host_count: v.synced_host_count,

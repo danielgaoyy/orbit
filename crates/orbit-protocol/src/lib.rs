@@ -16,6 +16,7 @@ pub mod media;
 pub mod orchestration;
 pub mod permission_rules;
 pub mod plan_approval;
+pub mod plugins;
 pub mod push;
 pub mod router;
 pub mod rules;
@@ -40,6 +41,7 @@ pub use media::*;
 pub use orchestration::*;
 pub use permission_rules::*;
 pub use plan_approval::*;
+pub use plugins::*;
 pub use push::*;
 pub use router::*;
 pub use rules::*;
@@ -3034,6 +3036,63 @@ pub enum WireMessage {
         injected_markdown: String,
         #[serde(default)]
         total_tokens: u32,
+    },
+
+    // Host-local WASM extensions. "op" is already the wire envelope discriminator.
+    ListPlugins {
+        request_id: Uuid,
+    },
+    PluginsList {
+        request_id: Uuid,
+        plugins: Vec<InstalledPluginView>,
+    },
+    InstallPlugin {
+        request_id: Uuid,
+        source: String,
+        #[serde(default)]
+        enable: bool,
+    },
+    PluginInstalled {
+        request_id: Uuid,
+        plugin: InstalledPluginView,
+    },
+    SetPluginEnabled {
+        request_id: Uuid,
+        plugin_id: String,
+        enabled: bool,
+    },
+    UninstallPlugin {
+        request_id: Uuid,
+        plugin_id: String,
+    },
+    InvokePluginOp {
+        request_id: Uuid,
+        plugin_id: String,
+        #[serde(rename = "operation")]
+        op: String,
+        cwd: Option<String>,
+        #[serde(default)]
+        input: serde_json::Value,
+    },
+    PluginOpResult {
+        request_id: Uuid,
+        plugin_id: String,
+        #[serde(rename = "operation")]
+        op: String,
+        result: serde_json::Value,
+    },
+    RenderPluginUi {
+        request_id: Uuid,
+        plugin_id: String,
+        slot: OrbitPluginUiSlot,
+        cwd: Option<String>,
+        action_id: Option<String>,
+        payload: Option<serde_json::Value>,
+    },
+    PluginUiRendered {
+        request_id: Uuid,
+        plugin_id: String,
+        spec: OrbitPluginUiSpec,
     },
 
     // Pure-Rust LSP Language Server Integration

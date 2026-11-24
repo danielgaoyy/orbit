@@ -94,6 +94,8 @@ All Contract v2 request/response DTOs are canonically defined in `crates/orbit-c
 
 ---
 
+Plugin discovery, operation results and UI trees are host-local correlated wire replies. A client renders the typed JSON tree and routes button actions back to the originating host and plugin. The ABI, limits and supported slots are specified in the [plugin SDK](architecture/plugins.md).
+
 ## 4. Thread Preferences Persistence & Legacy Migration
 
 Thread metadata (`seen_seq`, `is_pinned`, `pinned_order`, `updated_at_ms`) is persisted in the SQLite table `client_thread_prefs` inside `crates/orbit-store/src/lib.rs`, with cascade cleanup when a replica agent or host is removed:

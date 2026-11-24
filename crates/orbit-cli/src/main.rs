@@ -2,6 +2,7 @@ mod acp_cli;
 mod cloud_sync_cli;
 mod mcp_bridge;
 mod orchestration_cli;
+mod plugin_cli;
 mod service;
 mod ssh_config;
 
@@ -544,6 +545,12 @@ enum Commands {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+
+    /// Manage WASM plugins on the selected daemon.
+    Plugin {
+        #[command(subcommand)]
+        action: plugin_cli::PluginAction,
     },
 
     /// Inspect or install bundled Orbit Orchestration skills (`orbit`, `orbit-handoff`, `orbit-committee`, `orbit-advisor`).
@@ -1849,6 +1856,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         }
         Commands::Config { action } => {
             cmd_config(&home_dir, &server, via_relay, json_mode, action).await?;
+        }
+        Commands::Plugin { action } => {
+            let client = connect_cli_server(&home_dir, &server, via_relay).await?;
+            plugin_cli::run(&client, action, json_mode).await?;
         }
         Commands::Skill { action } => {
             cmd_skill(&home_dir, &server, via_relay, json_mode, action).await?;

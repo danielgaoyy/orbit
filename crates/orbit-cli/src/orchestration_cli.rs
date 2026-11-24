@@ -466,6 +466,10 @@ fn matches_rpc_response(w: &WireMessage, req_id: Uuid) -> bool {
         | WireMessage::ConnectedHostAdded { request_id, .. }
         | WireMessage::OrchestrationConfigSnapshot { request_id, .. }
         | WireMessage::OrchestrationSkillsSnapshot { request_id, .. }
+        | WireMessage::PluginsList { request_id, .. }
+        | WireMessage::PluginInstalled { request_id, .. }
+        | WireMessage::PluginUiRendered { request_id, .. }
+        | WireMessage::PluginOpResult { request_id, .. }
         | WireMessage::ManagedSkillsSnapshot { request_id, .. }
         | WireMessage::ManagedSkillContentResponse { request_id, .. }
         | WireMessage::KeepAwakeStatusSnapshot { request_id, .. }
@@ -480,7 +484,7 @@ fn matches_rpc_response(w: &WireMessage, req_id: Uuid) -> bool {
     }
 }
 
-async fn send_rpc(
+pub(crate) async fn send_rpc(
     client: &HostSessionHandle,
     req_id: Uuid,
     msg: WireMessage,

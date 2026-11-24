@@ -589,6 +589,10 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::ConnectedHostAdded { request_id, .. }
         | WireMessage::OrchestrationConfigSnapshot { request_id, .. }
         | WireMessage::OrchestrationSkillsSnapshot { request_id, .. }
+        | WireMessage::PluginsList { request_id, .. }
+        | WireMessage::PluginInstalled { request_id, .. }
+        | WireMessage::PluginUiRendered { request_id, .. }
+        | WireMessage::PluginOpResult { request_id, .. }
         | WireMessage::ManagedSkillsSnapshot { request_id, .. }
         | WireMessage::ManagedSkillContentResponse { request_id, .. }
         | WireMessage::KeepAwakeStatusSnapshot { request_id, .. }

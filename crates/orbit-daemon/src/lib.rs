@@ -39,6 +39,7 @@ pub mod permission_rules;
 pub mod personal_router;
 pub mod plan_approval;
 pub mod platform;
+pub mod plugins;
 pub mod push;
 pub mod rules;
 mod sandbox;
@@ -480,6 +481,7 @@ pub struct DaemonRuntime {
     exporter: std::sync::OnceLock<Arc<telemetry::Exporter>>,
     rpc_count: std::sync::atomic::AtomicU64,
     relay_connected: std::sync::atomic::AtomicBool,
+    pub plugins: Arc<plugins::PluginRuntime>,
     pub host_info: HostInfo,
     pub keypair: HostIdentityKeypair,
     pub store: Arc<OrbitStore>,
@@ -858,10 +860,15 @@ impl DaemonRuntime {
             .set_workspace_watcher(Arc::clone(&workspace_watcher))
             .await;
 
+        let plugin_home = home_dir.to_owned();
+        let plugins =
+            tokio::task::spawn_blocking(move || plugins::PluginRuntime::open(&plugin_home))
+                .await??;
         Ok(Arc::new(Self {
             exporter: Default::default(),
             rpc_count: Default::default(),
             relay_connected: Default::default(),
+            plugins,
             host_info,
             keypair,
             store,
@@ -6522,6 +6529,24 @@ async fn handle_wire_rpc(
                     result,
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        WireMessage::ListPlugins { request_id }
+        | WireMessage::InstallPlugin { request_id, .. }
+        | WireMessage::SetPluginEnabled { request_id, .. }
+        | WireMessage::UninstallPlugin { request_id, .. }
+        | WireMessage::InvokePluginOp { request_id, .. }
+        | WireMessage::RenderPluginUi { request_id, .. } => {
+            let runtime = runtime.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let msg = plugins::handle_rpc(&runtime, req, request_id)
+                    .await
+                    .unwrap_or_else(|e| rpc_err(request_id, "plugin_error", e));
+                let _ = tx.send(SessionFrame::Wire { msg, zstd }).await;
             });
             None
         }

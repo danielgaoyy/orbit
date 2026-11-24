@@ -92,3 +92,7 @@ Model prices are estimates in USD per million tokens. At settlement the host rel
 On Windows, `orbit daemon up` registers an interactive-token task for the current Windows user. `orbit daemon up --service` and `orbit relay up` install LocalService SCM services with restart recovery. Service installation requires permission to manage the SCM. The SCM Stop handler signals the daemon shutdown path so detached shims can continue running.
 
 Built-in token estimates use standard API rates. Local model overrides take precedence for negotiated contracts and regional deployments. [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing), [GPT-5.4 pricing](https://developers.openai.com/api/docs/models/gpt-5.4), [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing), [DeepSeek pricing](https://api-docs.deepseek.com/quick_start/pricing/), [Qwen pricing](https://www.alibabacloud.com/help/en/model-studio/model-pricing).
+
+## WASM 插件运行时
+
+WASM 插件由 Daemon 在独立的限额阻塞任务中执行。插件 RPC、宿主能力、执行预算与按需 MCP 工具发现见 [Plugin SDK](plugins.md)。

@@ -39,9 +39,19 @@ zeroize.workspace = true
 vt100.workspace = true
 reqwest.workspace = true
 notify.workspace = true
-cap-std = "3"
-cap-fs-ext = "3"
+cap-std = "4.0"
+cap-fs-ext = "4.0"
 serde-saphyr = { version = "2.2", default-features = false, features = ["serialize", "deserialize"] }
+wasmi = { version = "2.0.2", default-features = false, features = ["std", "validate", "portable-dispatch", "extra-checks"] }
+globset = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
-tempfile = "3"
+wat = "1"
+
+[[example]]
+name = "build_plugins"
+test = true
+path = "../../examples/plugins/build.rs"

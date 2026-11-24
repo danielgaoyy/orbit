@@ -40,3 +40,4 @@ sha2.workspace = true
 [dev-dependencies]
 russh.workspace = true
 orbit-store.workspace = true
+tempfile = "3"

@@ -18,6 +18,7 @@
    - `Pitfall Regressions`：`-p orbit-cli --test e2e_pitfall_regressions`
    - `Relay E2EE & Isolation`：`-p orbit-cli --test e2e_relay_and_pty --test e2e_multi_user_isolation`
    - `Orchestration & Fleet Mesh`：`-p orbit-cli --test e2e_orchestration`
+     此分片还通过 CLI、鉴权 WebSocket 和 HTTP MCP 验证插件安装、启停、调用与条件工具目录。
    - `Workspace Sync & Worktree`：`-p orbit-cli --test e2e_workspace_sync_and_worktree`
 3. **跨端构建与烟测任务**：
    - `desktop-frontend-build`（`Desktop Frontend Typecheck & Build`）：Node unit tests + `npm run build` + `npm run test:smoke`

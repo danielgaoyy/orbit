@@ -68,3 +68,7 @@ To help us reproduce and fix the issue quickly, please include:
 - Vulnerabilities inside third-party AI provider CLIs themselves (please report those directly to the upstream provider).
 - Attacks that require pre-existing arbitrary code execution as the same OS user account running `orbit daemon`.
 - Denial-of-service against a self-hosted `orbit relay` caused by network-level flooding without a protocol bypass.
+
+## WASM plugins
+
+Installed plugins execute in a fuel-metered interpreter with per-call memory and wall-clock limits. Imports grant read-only access to explicitly matched regular files within an authorized workspace and HTTPS GET to declared public hosts. See the [plugin SDK](docs/architecture/plugins.md) for the complete boundary and UI rendering contract.

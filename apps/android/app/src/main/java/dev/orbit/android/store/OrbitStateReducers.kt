@@ -10,6 +10,9 @@ import uniffi.orbit_ffi_uniffi.FfiReasoningEffort
 import uniffi.orbit_ffi_uniffi.FfiSessionMode
 import uniffi.orbit_ffi_uniffi.FfiTimelineItem
 import uniffi.orbit_ffi_uniffi.FfiToolCallDetail
+import uniffi.orbit_ffi_uniffi.GuardianAssessment
+import uniffi.orbit_ffi_uniffi.GuardianRiskLevel
+import uniffi.orbit_ffi_uniffi.GuardianDecision
 import uniffi.orbit_ffi_uniffi.PlanApprovalAction
 import uniffi.orbit_ffi_uniffi.ProviderKind
 import uniffi.orbit_ffi_uniffi.PushPreferences
@@ -66,38 +69,20 @@ object StageDeltaReducer {
         val sameStage = prevStage != null &&
             prevStage.hostId == hostId &&
             (prevStage.agent?.agentId ?: agentId) == agentId
-        val resolvedInsights = if (delta.auxUnchanged && sameStage) {
-            prevStage!!.insights
-        } else {
-            delta.insights
-        }
-        val mergedStage = if (!delta.reset && sameStage && delta.replaceFromTurnIndex.toInt() <= prevStage!!.turns.size) {
-            val prefixCount = delta.replaceFromTurnIndex.toInt()
-            val mergedTurns = prevStage.turns.take(prefixCount) + delta.changedTurns
-            FfiAgentStage(
-                revision = delta.revision,
-                hostId = delta.hostId,
-                agent = delta.agent ?: prevStage.agent,
-                turns = mergedTurns,
-                pendingPermissions = delta.pendingPermissions,
-                pendingQuestions = delta.pendingQuestions,
-                sessionTurnDiffs = delta.sessionTurnDiffs,
-                insights = resolvedInsights,
-                latestSeq = delta.latestSeq,
-            )
-        } else {
-            FfiAgentStage(
-                revision = delta.revision,
-                hostId = delta.hostId,
-                agent = delta.agent,
-                turns = delta.changedTurns,
-                pendingPermissions = delta.pendingPermissions,
-                pendingQuestions = delta.pendingQuestions,
-                sessionTurnDiffs = delta.sessionTurnDiffs,
-                insights = resolvedInsights,
-                latestSeq = delta.latestSeq,
-            )
-        }
+        val incremental = sameStage && !delta.reset && delta.replaceFromTurnIndex <= prevStage!!.turns.size.toUInt()
+        val previous = prevStage.takeIf { incremental }
+        val aux = previous.takeIf { delta.auxUnchanged }
+        val mergedStage = FfiAgentStage(
+            revision = delta.revision,
+            hostId = delta.hostId,
+            agent = delta.agent ?: previous?.agent,
+            turns = previous?.let { it.turns.take(delta.replaceFromTurnIndex.toInt()) + delta.changedTurns } ?: delta.changedTurns,
+            pendingPermissions = aux?.pendingPermissions ?: delta.pendingPermissions,
+            pendingQuestions = aux?.pendingQuestions ?: delta.pendingQuestions,
+            sessionTurnDiffs = aux?.sessionTurnDiffs ?: delta.sessionTurnDiffs,
+            insights = aux?.insights ?: delta.insights,
+            latestSeq = delta.latestSeq,
+        )
         return StageMergeOutcome(
             stage = mergedStage,
             hasOlderTurns = delta.hasOlderTurns,
@@ -248,38 +233,16 @@ data class OverviewCalmSummary(
 )
 
 object OverviewSafetyReducer {
-    private val DESTRUCTIVE_TOKENS = listOf(
-        "rm ", "rm\t", "sudo", "chmod", "chown", "mkfs", "dd ",
-        "git push", "git reset", "git clean", "drop table", "delete from",
-        "curl ", "wget ", "ssh ", "scp ", "kill ", "pkill", "> /", "reboot",
-    )
-
-    /**
-     * Returns true ONLY for read-only or low-risk workspace operations eligible for 1-tap safe batch approve.
-     * Human-only Plan Approvals and destructive/network shell commands ALWAYS return false.
-     */
-    fun isSafeLowRiskBatchCandidate(permission: FfiTimelineItem.PermissionRequest): Boolean {
-        if (permission.resolvedDecision != null) return false
-        if (PlanApprovalReducer.detectPlanApproval(permission) != null) return false
-        return when (val detail = permission.detail) {
-            is FfiToolCallDetail.FileRead,
-            is FfiToolCallDetail.Search -> true
-            is FfiToolCallDetail.Shell -> {
-                val cmd = detail.command.trim().lowercase()
-                if (cmd.isEmpty()) return false
-                if (DESTRUCTIVE_TOKENS.any { cmd.contains(it) }) return false
-                val safePrefixes = listOf(
-                    "git status", "git diff", "git log", "git branch",
-                    "ls", "pwd", "cat ", "head ", "tail ", "rg ", "grep ", "find ",
-                    "cargo check", "cargo test", "npm test", "pytest", "go test",
-                )
-                safePrefixes.any { cmd == it.trim() || cmd.startsWith(it) }
-            }
-            is FfiToolCallDetail.FileEdit,
-            is FfiToolCallDetail.Subagent,
-            is FfiToolCallDetail.Generic -> false
-        }
-    }
+    fun isSafeLowRiskBatchCandidate(
+        permission: FfiTimelineItem.PermissionRequest,
+        assessment: GuardianAssessment?,
+    ): Boolean =
+        assessment?.riskLevel == GuardianRiskLevel.LOW &&
+            assessment.decision != GuardianDecision.AUTO_DENY &&
+            permission.resolvedDecision == null &&
+            "allow" in permission.allowedDecisions &&
+            PlanApprovalReducer.detectPlanApproval(permission) == null &&
+            (permission.detail is FfiToolCallDetail.FileRead || permission.detail is FfiToolCallDetail.Search)
 
     fun summarizeFleet(
         hosts: List<FfiHostCard>,

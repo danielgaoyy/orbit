@@ -1,6 +1,6 @@
 package dev.orbit.android.ui.shell
 
-import android.app.Activity
+import androidx.activity.compose.LocalActivity
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
@@ -60,7 +60,7 @@ object OrbitFoldablePostureMapper {
             return OrbitFoldablePosture.FlatOrStandard
         }
 
-        if (hinge.isVerticalAxis && (hinge.isSeparatingSurface || hinge.isHalfFolded)) {
+        if (hinge.isVerticalAxis) {
             val leftWidthDp = hinge.leftPx / density
             val gapDp = hinge.spanWidthPx / density
             val rightWidthDp = (viewportWidthPx - hinge.rightPx) / density
@@ -121,7 +121,7 @@ fun rememberOrbitFoldablePosture(
     viewportWidthPx: Int,
     viewportHeightPx: Int,
 ): OrbitFoldablePosture {
-    val activity = LocalContext.current as? Activity
+    val activity = LocalActivity.current
     val density = LocalDensity.current.density
 
     val layoutInfo by produceState<WindowLayoutInfo?>(initialValue = null, key1 = activity) {

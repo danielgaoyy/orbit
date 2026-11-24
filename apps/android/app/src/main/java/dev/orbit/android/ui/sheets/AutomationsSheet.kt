@@ -58,6 +58,11 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
+import dev.orbit.android.R
+import dev.orbit.android.store.OrbitUiState
+import dev.orbit.android.store.OrbitAndroidStore
+import androidx.compose.ui.res.stringResource
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -98,16 +103,17 @@ import uniffi.orbit_ffi_uniffi.FfiWorkflowRunRecord
 import uniffi.orbit_ffi_uniffi.FfiWorkflowRunStatus
 import uniffi.orbit_ffi_uniffi.FfiWorkflowStepStatus
 
-private enum class AutomationTab(val label: String) {
-    SCHEDULES("Schedules"),
-    TIMERS("Timers"),
-    GOALS("Goals"),
-    WORKFLOWS("Workflows"),
+private enum class AutomationTab(val label: Int) {
+    GOALS(R.string.auto_tab_goals), SCHEDULES(R.string.auto_tab_schedules),
+    MONITORS(R.string.auto_tab_monitors), TRIGGERS(R.string.triggers),
+    WORKFLOWS(R.string.auto_tab_workflows), HOOKS(R.string.hooks),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AutomationsSheet(
+    ui: OrbitUiState,
+    store: OrbitAndroidStore,
     schedules: List<FfiScheduleSpec>,
     scheduleRunsById: Map<String, List<FfiScheduleRunRecord>>,
     conditionalTimers: List<FfiConditionalTimerRecord>,
@@ -308,44 +314,17 @@ fun AutomationsSheet(
                     modifier = Modifier.weight(1f),
                 )
             } else {
-                // Segmented tab row
-                SingleChoiceSegmentedButtonRow(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = OrbitSpacing.lg, vertical = OrbitSpacing.xs),
-                ) {
-                    AutomationTab.entries.forEachIndexed { idx, tab ->
-                        val selected = activeTab == tab
-                        SegmentedButton(
-                            selected = selected,
-                            onClick = {
-                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                activeTab = tab
-                            },
-                            shape = SegmentedButtonDefaults.itemShape(
-                                index = idx,
-                                count = AutomationTab.entries.size,
-                            ),
-                            colors = SegmentedButtonDefaults.colors(
-                                activeContainerColor = colors.elevated,
-                                activeContentColor = colors.fgPrimary,
-                                inactiveContainerColor = if (colors.isDark) colors.drawer else colors.subtleFill,
-                                inactiveContentColor = colors.fgSecondary,
-                                activeBorderColor = colors.hairline,
-                                inactiveBorderColor = colors.hairline,
-                            ),
-                            icon = {},
-                        ) {
-                            Text(
-                                text = tab.label,
-                                style = if (selected) typography.metaSemiBold else typography.metaMedium,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
+                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())) {
+                    AutomationTab.entries.forEach { tab ->
+                        TextButton(onClick = { activeTab = tab }) {
+                            Text(stringResource(tab.label), color = if (activeTab == tab) colors.fgPrimary else colors.fgMuted,
+                                style = if (activeTab == tab) typography.subheadSemiBold else typography.subhead)
                         }
                     }
                 }
-
+                if (activeTab !in listOf(AutomationTab.SCHEDULES, AutomationTab.HOOKS)) {
+                    NewAutomationAction(activeTab, ui, store)
+                }
                 HorizontalDivider(
                     thickness = OrbitSpacing.hairline,
                     color = colors.hairline,
@@ -398,7 +377,7 @@ fun AutomationsSheet(
                         }
                     }
 
-                    AutomationTab.TIMERS -> {
+                    AutomationTab.TRIGGERS -> {
                         if (conditionalTimers.isEmpty()) {
                             AutomationEmptyState(
                                 icon = Icons.Outlined.Timer,
@@ -423,54 +402,20 @@ fun AutomationsSheet(
                         }
                     }
 
-                    AutomationTab.GOALS -> {
-                        if (goalRuns.isEmpty() && monitorWatches.isEmpty()) {
-                            AutomationEmptyState(
-                                icon = Icons.Outlined.Flag,
-                                title = "No Goals or Monitors",
-                                subtitle = "Start an unattended /goal run or background monitor watch from any session to track progress here.",
-                                modifier = Modifier.weight(1f),
-                            )
-                        } else {
-                            LazyColumn(
-                                modifier = Modifier.weight(1f),
-                                contentPadding = PaddingValues(OrbitSpacing.lg),
-                                verticalArrangement = Arrangement.spacedBy(OrbitSpacing.md),
-                            ) {
-                                if (goalRuns.isNotEmpty()) {
-                                    item(key = "hdr_goals") {
-                                        Text(
-                                            text = "Goals (${goalRuns.size})",
-                                            style = typography.metaMedium,
-                                            color = colors.fgMuted,
-                                        )
-                                    }
-                                    items(goalRuns, key = { "goal_${it.goalId}" }) { goal ->
-                                        GoalRunCard(
-                                            goal = goal,
-                                            onControl = { action -> onControlGoal(goal.goalId, action) },
-                                        )
-                                    }
-                                }
-                                if (monitorWatches.isNotEmpty()) {
-                                    item(key = "hdr_monitors") {
-                                        Text(
-                                            text = "Monitors (${monitorWatches.size})",
-                                            style = typography.metaMedium,
-                                            color = colors.fgMuted,
-                                            modifier = Modifier.padding(top = if (goalRuns.isNotEmpty()) OrbitSpacing.sm else 0.dp),
-                                        )
-                                    }
-                                    items(monitorWatches, key = { "mon_${it.monitorId}" }) { watch ->
-                                        MonitorWatchCard(
-                                            watch = watch,
-                                            onStop = { onStopMonitor(watch.monitorId) },
-                                        )
-                                    }
-                                }
-                            }
+                    AutomationTab.GOALS -> LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(16.dp)) {
+                        items(goalRuns, key = { it.goalId }) { goal ->
+                            GoalRunCard(goal) { onControlGoal(goal.goalId, it) }
                         }
                     }
+                    AutomationTab.MONITORS -> LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(16.dp)) {
+                        items(monitorWatches, key = { it.monitorId }) { watch ->
+                            MonitorWatchCard(watch) { onStopMonitor(watch.monitorId) }
+                        }
+                    }
+                    AutomationTab.HOOKS -> ui.selectedHostId?.let { host ->
+                        Text(".orbit/hooks.json", style = typography.code, modifier = Modifier.padding(12.dp))
+                        WorkspaceFileContent(host, activeCwd, ".orbit/hooks.json", store)
+                    } ?: Unit
 
                     AutomationTab.WORKFLOWS -> {
                         if (workflowRuns.isEmpty()) {
@@ -1422,4 +1367,51 @@ private fun CompactActionPill(
             maxLines = 1,
         )
     }
+}
+
+@Composable
+private fun NewAutomationAction(tab: AutomationTab, ui: OrbitUiState, store: OrbitAndroidStore) {
+    val label = when (tab) {
+        AutomationTab.GOALS -> R.string.auto_start_goal
+        AutomationTab.MONITORS -> R.string.auto_start_monitor
+        AutomationTab.WORKFLOWS -> R.string.start_workflow
+        AutomationTab.TRIGGERS -> R.string.new_trigger
+        else -> return
+    }
+    var open by androidx.compose.runtime.remember(tab) { mutableStateOf(false) }
+    TextButton(onClick = { open = true }, enabled = ui.selectedHostId != null &&
+        (tab == AutomationTab.WORKFLOWS || ui.selectedAgentId != null)) { Text(stringResource(label)) }
+    if (!open) return
+    var input by remember { mutableStateOf("") }
+    var argument by remember { mutableStateOf("") }
+    val valid = input.isNotBlank() && when (tab) {
+        AutomationTab.TRIGGERS -> (argument.toULongOrNull() ?: 0uL) > 0uL
+        AutomationTab.WORKFLOWS, AutomationTab.MONITORS -> argument.isNotBlank()
+        else -> true
+    }
+    AlertDialog(onDismissRequest = { open = false }, title = { Text(stringResource(label)) }, text = {
+        Column {
+            OutlinedTextField(input, { input = it }, label = {
+                Text(stringResource(if (tab == AutomationTab.MONITORS || tab == AutomationTab.WORKFLOWS) R.string.automation_name else R.string.automation_prompt))
+            })
+            if (tab != AutomationTab.GOALS) OutlinedTextField(argument, { argument = it }, label = {
+                Text(stringResource(when (tab) {
+                    AutomationTab.TRIGGERS -> R.string.duration_seconds
+                    AutomationTab.MONITORS -> R.string.log_path
+                    else -> R.string.automation_prompt
+                }))
+            })
+        }
+    }, confirmButton = {
+        TextButton(enabled = valid, onClick = {
+            when (tab) {
+                AutomationTab.GOALS -> store.startGoalRun(input, emptyList(), null, null)
+                AutomationTab.TRIGGERS -> store.createConditionalTimer(argument.toULong(), input)
+                AutomationTab.WORKFLOWS -> store.startSimpleDagWorkflow(input, argument)
+                AutomationTab.MONITORS -> store.createMonitorWatch(input, uniffi.orbit_ffi_uniffi.MonitorKind.LogFileTail(argument, ".*"))
+                else -> Unit
+            }
+            open = false
+        }) { Text(stringResource(label)) }
+    })
 }

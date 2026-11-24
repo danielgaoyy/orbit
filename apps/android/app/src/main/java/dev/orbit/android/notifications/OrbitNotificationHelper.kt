@@ -93,12 +93,14 @@ object OrbitNotificationHelper {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
 
-    fun dispatchPushRoute(context: Context, route: OrbitPushRoute) {
-        val channelId = when (route.channel) {
+    internal fun channelIdFor(channel: OrbitPushChannelRoute): String = when (channel) {
             OrbitPushChannelRoute.APPROVALS -> CHANNEL_APPROVALS
             OrbitPushChannelRoute.COMPLETIONS -> CHANNEL_COMPLETIONS
             OrbitPushChannelRoute.ERRORS -> CHANNEL_ERRORS
         }
+
+    fun dispatchPushRoute(context: Context, route: OrbitPushRoute) {
+        val channelId = channelIdFor(route.channel)
         val priority = when (route.channel) {
             OrbitPushChannelRoute.APPROVALS, OrbitPushChannelRoute.ERRORS -> NotificationCompat.PRIORITY_HIGH
             OrbitPushChannelRoute.COMPLETIONS -> NotificationCompat.PRIORITY_DEFAULT
@@ -208,8 +210,10 @@ object OrbitNotificationHelper {
             .setContentIntent(pendingIntent)
             .build()
 
-        runCatching {
+        try {
             NotificationManagerCompat.from(context).notify(notificationId, notification)
+        } catch (_: SecurityException) {
+            // Notification permission can be revoked between the check and delivery.
         }
     }
 }

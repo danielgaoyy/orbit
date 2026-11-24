@@ -78,6 +78,7 @@ fi
 
 cargo run -p orbit-uniffi-bindgen --bin uniffi-bindgen -- generate \
   --library "$REPO_ROOT/target/aarch64-linux-android/release/liborbit_ffi_uniffi.a" \
+  --config "$ANDROID_DIR/uniffi.toml" \
   --language kotlin \
   --no-format \
   --out-dir "$ANDROID_DIR/app/src/main/java"

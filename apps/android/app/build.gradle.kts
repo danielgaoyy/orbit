@@ -4,8 +4,11 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
+    id("com.google.gms.google-services") version "4.4.2" apply false
     alias(libs.plugins.kotlin.compose)
 }
+
+if (file("google-services.json").isFile) apply(plugin = "com.google.gms.google-services")
 
 val keystoreProps = Properties().apply {
     val propsFile = rootProject.file("keystore.properties")
@@ -92,7 +95,7 @@ android {
     }
 
     lint {
-        abortOnError = false
+        abortOnError = true
         warningsAsErrors = false
         checkReleaseBuilds = false
     }
@@ -105,6 +108,7 @@ kotlin {
 }
 
 dependencies {
+    implementation("com.google.firebase:firebase-messaging:24.1.2")
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.runtime.compose)

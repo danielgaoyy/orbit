@@ -197,4 +197,24 @@
     <string name="export_markdown">Markdown (.md)</string>
     <string name="export_json">JSON (.json)</string>
     <string name="export_html">HTML (.html)</string>
+    <string name="recent_sessions">最近のセッション</string>
+    <string name="plan_switch_mode">実行モード</string>
+    <string name="mode_default">標準</string>
+    <string name="mode_accept_edits">編集を許可</string>
+    <string name="files_conflict">ホスト上でファイルが変更されました。開き直して最新版を確認してください。</string>
+    <string name="git_changes">Git の変更</string>
+    <string name="git_push_terminal">ターミナルでプッシュを確認</string>
+    <string name="triggers">トリガー</string>
+    <string name="hooks">フック</string>
+    <string name="start_workflow">ワークフローを開始</string>
+    <string name="new_trigger">タイマートリガーを作成</string>
+    <string name="automation_name">名前</string>
+    <string name="automation_prompt">プロンプト</string>
+    <string name="duration_seconds">待ち時間（秒）</string>
+    <string name="log_path">ログファイルのパス</string>
+    <string name="voice_open_overview">概要を開く</string>
+    <string name="voice_open_search">グローバル検索を開く</string>
+    <string name="terminal_busy">ターミナルの入力バッファーがいっぱいです</string>
+    <string name="create_hooks_file">プロジェクトのフックファイルを作成</string>
+    <string name="sync_qr_failed">デバイスリンクを生成できませんでした。同期状態を確認して再試行してください。</string>
 </resources>

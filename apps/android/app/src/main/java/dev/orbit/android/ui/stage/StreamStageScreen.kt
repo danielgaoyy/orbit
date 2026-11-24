@@ -75,6 +75,16 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.stringResource
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
+import androidx.compose.ui.unit.Dp
+import dev.orbit.android.R
+import dev.orbit.android.store.PlanApprovalReducer
+import dev.orbit.android.ui.shell.OrbitFoldablePosture
+import uniffi.orbit_ffi_uniffi.FfiTimelineItem
 import dev.orbit.android.store.OrbitAndroidStore
 import dev.orbit.android.store.OrbitFormatters
 import dev.orbit.android.store.OrbitUiState
@@ -93,6 +103,8 @@ import uniffi.orbit_ffi_uniffi.FfiConnectionState
 fun StreamStageScreen(
     ui: OrbitUiState,
     store: OrbitAndroidStore,
+    tabletop: OrbitFoldablePosture.TabletopSplit?,
+    inlineTerminalOpen: Boolean,
     onOpenContextPicker: () -> Unit,
     onOpenModelSelector: () -> Unit,
     onOpenDiffForFile: (String?) -> Unit,
@@ -125,6 +137,27 @@ fun StreamStageScreen(
         if (listState.isScrollInProgress) {
             focusManager.clearFocus()
             keyboardController?.hide()
+        }
+    }
+
+    var anchor by remember { mutableStateOf<Pair<String, Int>?>(null) }
+    fun earlier() {
+        if (ui.isLoadingOlderTurns || !ui.stageHasOlderTurns) return
+        val first = turns.getOrNull(listState.firstVisibleItemIndex) ?: return
+        anchor = first.key to listState.firstVisibleItemScrollOffset
+        store.loadOlderTimeline()
+    }
+    val dragging by listState.interactionSource.collectIsDraggedAsState()
+    LaunchedEffect(listState.firstVisibleItemIndex == 0, dragging) {
+        if (dragging && listState.firstVisibleItemIndex == 0 && listState.canScrollForward) earlier()
+    }
+    LaunchedEffect(ui.isLoadingOlderTurns, turns.firstOrNull()?.key) {
+        val saved = anchor
+        if (!ui.isLoadingOlderTurns && saved != null) {
+            // Stable LazyColumn keys already preserve a reader who kept scrolling during the fetch.
+            val index = dev.orbit.android.store.StageDeltaReducer.resolvePrependedAnchorIndex(saved.first, turns.map { it.key }, 0)
+            if (index != null && listState.firstVisibleItemIndex == 0) listState.scrollToItem(index, saved.second)
+            anchor = null
         }
     }
 
@@ -171,141 +204,198 @@ fun StreamStageScreen(
         }
     }
     LaunchedEffect(stageSeq, turnCount) {
-        if (turns.isNotEmpty() && !canScrollForward) {
+        if (turns.isNotEmpty() && anchor == null && !canScrollForward) {
             listState.animateScrollToItem(turns.lastIndex, scrollOffset = 100_000)
         }
     }
 
+    var windowTop by remember { mutableStateOf(0.dp) }
+    val density = LocalDensity.current
     Column(
-        modifier = modifier
+        modifier = modifier.onGloballyPositioned { windowTop = with(density) { it.positionInWindow().y.toDp() } }
             .fillMaxSize()
             .background(colors.canvas),
     ) {
-        // Error Banner
-        ui.lastError?.let { err ->
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = OrbitSpacing.lg, vertical = OrbitSpacing.xs)
-                    .background(colors.diffRemovedBg, RoundedCornerShape(OrbitSpacing.sm))
-                    .border(OrbitSpacing.hairline, colors.dangerRemoved.copy(alpha = 0.45f), RoundedCornerShape(OrbitSpacing.sm))
-                    .padding(start = OrbitSpacing.md),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text(
-                    text = err,
-                    style = typography.subhead,
-                    color = colors.dangerRemoved,
+        Column(if (tabletop == null) Modifier.weight(1f) else Modifier.height((tabletop.upperStageHeightDp - windowTop).coerceAtLeast(0.dp))) {
+            StageLineage(ui, store)
+            // Error Banner
+            ui.lastError?.let { err ->
+                Row(
                     modifier = Modifier
-                        .weight(1f)
-                        .padding(vertical = OrbitSpacing.sm),
-                )
-                Box(
-                    modifier = Modifier
-                        .size(44.dp)
-                        .clickable { store.dismissError() },
-                    contentAlignment = Alignment.Center,
+                        .fillMaxWidth()
+                        .padding(horizontal = OrbitSpacing.lg, vertical = OrbitSpacing.xs)
+                        .background(colors.diffRemovedBg, RoundedCornerShape(OrbitSpacing.sm))
+                        .border(OrbitSpacing.hairline, colors.dangerRemoved.copy(alpha = 0.45f), RoundedCornerShape(OrbitSpacing.sm))
+                        .padding(start = OrbitSpacing.md),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
-                    Icon(
-                        imageVector = Icons.Outlined.Close,
-                        contentDescription = "Dismiss error",
-                        tint = colors.dangerRemoved,
-                        modifier = Modifier.size(OrbitSpacing.iconMd),
+                    Text(
+                        text = err,
+                        style = typography.subhead,
+                        color = colors.dangerRemoved,
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(vertical = OrbitSpacing.sm),
                     )
+                    Box(
+                        modifier = Modifier
+                            .size(44.dp)
+                            .clickable { store.dismissError() },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Close,
+                            contentDescription = "Dismiss error",
+                            tint = colors.dangerRemoved,
+                            modifier = Modifier.size(OrbitSpacing.iconMd),
+                        )
+                    }
                 }
             }
-        }
 
-        // Main Editorial Stage Area with Native Pull-to-Refresh
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-                .pointerInput(Unit) {
-                    awaitEachGesture {
-                        awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                        val up = waitForUpOrCancellation(pass = PointerEventPass.Initial)
-                        if (up != null) {
-                            focusManager.clearFocus()
-                            keyboardController?.hide()
+            if (ui.stageHasOlderTurns && turns.isNotEmpty() && listState.firstVisibleItemIndex == 0) {
+                androidx.compose.material3.TextButton(onClick = ::earlier, enabled = !ui.isLoadingOlderTurns) {
+                    Text(stringResource(if (ui.isLoadingOlderTurns) R.string.stage_loading_older else R.string.stage_load_older))
+                }
+            }
+
+            // Main Editorial Stage Area with Native Pull-to-Refresh
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .pointerInput(Unit) {
+                        awaitEachGesture {
+                            awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                            val up = waitForUpOrCancellation(pass = PointerEventPass.Initial)
+                            if (up != null) {
+                                focusManager.clearFocus()
+                                keyboardController?.hide()
+                            }
+                        }
+                    }
+                    .onSizeChanged { size ->
+                        stageViewportHeightPx = size.height
+                    },
+            ) {
+                if (ui.hosts.isEmpty()) {
+                    UnpairedWelcomeHero(
+                        localDaemonAvailable = ui.localDaemonUri != null,
+                        onOpenPairSheet = onOpenPairSheet,
+                        onConnectLocal = { store.discoverLocalDaemon() },
+                        modifier = Modifier.align(Alignment.Center),
+                    )
+                } else {
+                    PullToRefreshBox(
+                        isRefreshing = ui.isRefreshingStage,
+                        onRefresh = { store.refreshStageAndHost() },
+                        state = pullRefreshState,
+                        modifier = Modifier.fillMaxSize(),
+                        indicator = {
+                            PullToRefreshDefaults.Indicator(
+                                state = pullRefreshState,
+                                isRefreshing = ui.isRefreshingStage,
+                                containerColor = colors.elevated,
+                                color = colors.primary,
+                                modifier = Modifier.align(Alignment.TopCenter),
+                            )
+                        },
+                    ) {
+                        if (turns.isEmpty()) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .verticalScroll(rememberScrollState()),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                NewSessionZenCanvas(
+                                    ui = ui,
+                                    onSelectProject = { path -> store.selectWorkspaceCwd(path) },
+                                    onSelectHost = { hostId -> store.selectHost(hostId) },
+                                    onSetDraftUseWorktree = { useWt -> store.setDraftUseWorktree(useWt) },
+                                )
+                            }
+                        } else {
+                            LazyColumn(
+                                state = listState,
+                                modifier = Modifier.fillMaxSize(),
+                                contentPadding = PaddingValues(
+                                    horizontal = OrbitSpacing.lg,
+                                    vertical = OrbitSpacing.lg,
+                                ),
+                                // STRICT 24dp vertical spacing between conversation turns
+                                verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xl),
+                            ) {
+                                itemsIndexed(
+                                    items = turns,
+                                    key = { _, it -> it.key },
+                                ) { index, turn ->
+                                    val isTurnActive = isActiveAgentRunning && index == turns.lastIndex
+                                    TurnItem(
+                                        turn = turn,
+                                        isTurnActive = isTurnActive,
+                                        activeCwd = ui.activeCwd,
+                                        describeStep = { store.describeStep(it) },
+                                        onOpenDiffFile = { filePath -> onOpenDiffForFile(filePath) },
+                                        onQuoteDiffLine = { path, lineLabel, content ->
+                                            store.addQuotedDiffLine(path, lineLabel, content)
+                                        },
+                                        onCopyAssistantReply = { replyText ->
+                                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                            cm?.setPrimaryClip(ClipData.newPlainText("assistant_reply", replyText))
+                                            store.showToast("Copied reply to clipboard")
+                                        },
+                                        onQuoteAssistantReply = { replyText ->
+                                            store.addQuotedAssistantReply(replyText)
+                                        },
+                                    )
+                                }
+                            }
                         }
                     }
                 }
-                .onSizeChanged { size ->
-                    stageViewportHeightPx = size.height
-                },
-        ) {
-            if (ui.hosts.isEmpty()) {
-                UnpairedWelcomeHero(
-                    localDaemonAvailable = ui.localDaemonUri != null,
-                    onOpenPairSheet = onOpenPairSheet,
-                    onConnectLocal = { store.discoverLocalDaemon() },
-                    modifier = Modifier.align(Alignment.Center),
-                )
-            } else {
-                PullToRefreshBox(
-                    isRefreshing = ui.isRefreshingStage,
-                    onRefresh = { store.refreshStageAndHost() },
-                    state = pullRefreshState,
-                    modifier = Modifier.fillMaxSize(),
-                    indicator = {
-                        PullToRefreshDefaults.Indicator(
-                            state = pullRefreshState,
-                            isRefreshing = ui.isRefreshingStage,
-                            containerColor = colors.elevated,
-                            color = colors.primary,
-                            modifier = Modifier.align(Alignment.TopCenter),
-                        )
-                    },
+
+                // Native 36.dp circular scroll-to-bottom button above OmniComposer (standard fade, no bounce)
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = turns.isNotEmpty() && canScrollForward,
+                    enter = fadeIn(),
+                    exit = fadeOut(),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = OrbitSpacing.sm),
                 ) {
-                    if (turns.isEmpty()) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .verticalScroll(rememberScrollState()),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            NewSessionZenCanvas(
-                                ui = ui,
-                                onSelectProject = { path -> store.selectWorkspaceCwd(path) },
-                                onSelectHost = { hostId -> store.selectHost(hostId) },
-                                onSetDraftUseWorktree = { useWt -> store.setDraftUseWorktree(useWt) },
+                    Surface(
+                        shape = CircleShape,
+                        color = colors.elevated,
+                        tonalElevation = 1.dp,
+                        shadowElevation = 2.dp,
+                        modifier = Modifier
+                            .size(36.dp)
+                            .border(OrbitSpacing.hairline, colors.hairline, CircleShape)
+                            .clip(CircleShape)
+                            .clickable {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                scope.launch {
+                                    if (turns.isNotEmpty()) {
+                                        listState.animateScrollToItem(turns.lastIndex, scrollOffset = 100_000)
+                                    }
+                                }
+                            },
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = Icons.Outlined.ArrowDownward,
+                                contentDescription = "Scroll to bottom",
+                                tint = colors.fgPrimary,
+                                modifier = Modifier.size(18.dp),
                             )
-                        }
-                    } else {
-                        LazyColumn(
-                            state = listState,
-                            modifier = Modifier.fillMaxSize(),
-                            contentPadding = PaddingValues(
-                                horizontal = OrbitSpacing.lg,
-                                vertical = OrbitSpacing.lg,
-                            ),
-                            // STRICT 24dp vertical spacing between conversation turns
-                            verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xl),
-                        ) {
-                            itemsIndexed(
-                                items = turns,
-                                key = { _, it -> it.key },
-                            ) { index, turn ->
-                                val isTurnActive = isActiveAgentRunning && index == turns.lastIndex
-                                TurnItem(
-                                    turn = turn,
-                                    isTurnActive = isTurnActive,
-                                    activeCwd = ui.activeCwd,
-                                    describeStep = { store.describeStep(it) },
-                                    onOpenDiffFile = { filePath -> onOpenDiffForFile(filePath) },
-                                    onQuoteDiffLine = { path, lineLabel, content ->
-                                        store.addQuotedDiffLine(path, lineLabel, content)
-                                    },
-                                    onCopyAssistantReply = { replyText ->
-                                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                                        cm?.setPrimaryClip(ClipData.newPlainText("assistant_reply", replyText))
-                                        store.showToast("Copied reply to clipboard")
-                                    },
-                                    onQuoteAssistantReply = { replyText ->
-                                        store.addQuotedAssistantReply(replyText)
-                                    },
+                            if (isActiveAgentRunning) {
+                                BreathingDot(
+                                    color = colors.primary,
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(6.dp),
                                 )
                             }
                         }
@@ -313,62 +403,23 @@ fun StreamStageScreen(
                 }
             }
 
-            // Native 36.dp circular scroll-to-bottom button above OmniComposer (standard fade, no bounce)
-            androidx.compose.animation.AnimatedVisibility(
-                visible = turns.isNotEmpty() && canScrollForward,
-                enter = fadeIn(),
-                exit = fadeOut(),
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = OrbitSpacing.sm),
-            ) {
-                Surface(
-                    shape = CircleShape,
-                    color = colors.elevated,
-                    tonalElevation = 1.dp,
-                    shadowElevation = 2.dp,
-                    modifier = Modifier
-                        .size(36.dp)
-                        .border(OrbitSpacing.hairline, colors.hairline, CircleShape)
-                        .clip(CircleShape)
-                        .clickable {
-                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            scope.launch {
-                                if (turns.isNotEmpty()) {
-                                    listState.animateScrollToItem(turns.lastIndex, scrollOffset = 100_000)
-                                }
-                            }
-                        },
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = Icons.Outlined.ArrowDownward,
-                            contentDescription = "Scroll to bottom",
-                            tint = colors.fgPrimary,
-                            modifier = Modifier.size(18.dp),
-                        )
-                        if (isActiveAgentRunning) {
-                            BreathingDot(
-                                color = colors.primary,
-                                modifier = Modifier
-                                    .align(Alignment.TopEnd)
-                                    .padding(6.dp),
-                            )
-                        }
-                    }
-                }
-            }
         }
-
+        if (tabletop != null) Spacer(Modifier.height(tabletop.hingeGapDp))
         val showBottomControls = ui.hosts.isNotEmpty() ||
             activeDecisionCount > 0 ||
             ui.composer.text.isNotEmpty() ||
             ui.composer.hasContextAttachments
 
-        if (showBottomControls) {
-            if (activeDecisionCount > 0) {
+        if (showBottomControls && !inlineTerminalOpen) {
+            val plans = mergedPermissions.filterIsInstance<FfiTimelineItem.PermissionRequest>()
+                .mapNotNull(PlanApprovalReducer::detectPlanApproval)
+            val normalPermissions = mergedPermissions.filterNot { item ->
+                item is FfiTimelineItem.PermissionRequest && plans.any { it.requestId == item.requestId }
+            }
+            plans.firstOrNull()?.let { PlanReview(it, store) }
+            if (normalPermissions.isNotEmpty() || mergedQuestions.isNotEmpty()) {
                 StickyDecisionBar(
-                    pendingPermissions = mergedPermissions,
+                    pendingPermissions = normalPermissions,
                     pendingQuestions = mergedQuestions,
                     onResolvePermission = { reqId, decision -> store.resolvePermission(reqId, decision) },
                     onAnswerQuestion = { reqId, answers -> store.answerQuestion(reqId, answers) },
@@ -385,6 +436,10 @@ fun StreamStageScreen(
                 isAgentRunning = isActiveAgentRunning,
                 hasHost = ui.selectedHostId != null || ui.composer.text.isNotEmpty(),
                 onTextChange = { store.updateComposerText(it) },
+                onVoiceNavigate = { when (it) {
+                    dev.orbit.android.ui.composer.VoiceNavigation.OVERVIEW -> store.openGlobalOverview()
+                    dev.orbit.android.ui.composer.VoiceNavigation.SEARCH -> store.requestSheet("search")
+                } },
                 onSend = { store.submitComposerPrompt() },
                 onQueue = { store.enqueueComposerPrompt() },
                 onInterrupt = { store.interruptActiveAgent() },
@@ -445,8 +500,10 @@ private fun UnpairedWelcomeHero(
     val typography = OrbitTheme.typography
     val btnShape = RoundedCornerShape(OrbitSpacing.md)
 
+    var windowTop by remember { mutableStateOf(0.dp) }
+    val density = LocalDensity.current
     Column(
-        modifier = modifier
+        modifier = modifier.onGloballyPositioned { windowTop = with(density) { it.positionInWindow().y.toDp() } }
             .fillMaxWidth()
             .navigationBarsPadding()
             .padding(horizontal = OrbitSpacing.xl),
@@ -544,8 +601,10 @@ private fun NewSessionZenCanvas(
         FfiConnectionState.DISCONNECTED -> colors.dangerRemoved
     }
 
+    var windowTop by remember { mutableStateOf(0.dp) }
+    val density = LocalDensity.current
     Column(
-        modifier = modifier
+        modifier = modifier.onGloballyPositioned { windowTop = with(density) { it.positionInWindow().y.toDp() } }
             .fillMaxWidth()
             .padding(horizontal = OrbitSpacing.lg)
             .padding(bottom = 24.dp),

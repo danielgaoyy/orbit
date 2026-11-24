@@ -117,7 +117,11 @@ object OrbitPushRouter {
 
         val rawKind = data["event_kind"]?.takeIf { it.isNotBlank() }
             ?: data["kind"]?.takeIf { it.isNotBlank() }
-        val eventKind = OrbitPushEventKind.fromRaw(rawKind)
+        val eventKind = rawKind?.let(OrbitPushEventKind::fromRaw) ?: when (parsedLink) {
+            is OrbitDeepLinkAction.OpenThread -> parsedLink.eventKind
+            is OrbitDeepLinkAction.OpenHost -> parsedLink.eventKind
+            else -> null
+        } ?: OrbitPushEventKind.TURN_COMPLETED
 
         val canonicalLink = buildCanonicalOpenUri(resolvedHost, resolvedAgent, eventKind)
         val title = data["title"]?.trim().orEmpty().ifBlank { defaultTitleFor(eventKind) }
@@ -158,15 +162,14 @@ object OrbitPushRouter {
     fun parseDeepLink(rawUri: String?): OrbitDeepLinkAction? {
         val trimmed = rawUri?.trim().orEmpty()
         if (trimmed.isEmpty()) return null
-        val lower = trimmed.lowercase()
-        if (lower.startsWith("orbit://pair")) {
-            return OrbitDeepLinkAction.PairHost(trimmed)
+        val uri = runCatching { java.net.URI(trimmed) }.getOrNull() ?: return null
+        if (!"orbit".equals(uri.scheme, ignoreCase = true) || uri.userInfo != null || uri.port != -1) return null
+        when (uri.host?.lowercase()) {
+            "pair" -> return OrbitDeepLinkAction.PairHost(trimmed)
+            "sync-login" -> return OrbitDeepLinkAction.ImportDeviceLink(trimmed)
+            "open" -> if (!uri.path.isNullOrEmpty() && uri.path != "/") return null
+            else -> return null
         }
-        if (lower.startsWith("orbit://sync-login")) {
-            return OrbitDeepLinkAction.ImportDeviceLink(trimmed)
-        }
-        if (!lower.startsWith("orbit://open")) return null
-
         val queryIdx = trimmed.indexOf('?')
         if (queryIdx < 0 || queryIdx >= trimmed.lastIndex) return null
         val query = trimmed.substring(queryIdx + 1).substringBefore('#')

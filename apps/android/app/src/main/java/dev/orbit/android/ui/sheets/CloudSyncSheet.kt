@@ -72,6 +72,7 @@ import uniffi.orbit_ffi_uniffi.FfiGitHubDeviceFlowStart
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CloudSyncSheet(
+    deviceLinkControls: @Composable () -> Unit,
     status: FfiCloudSyncStatus?,
     deviceFlow: FfiGitHubDeviceFlowStart?,
     isBusy: Boolean,
@@ -225,6 +226,8 @@ fun CloudSyncSheet(
                     .padding(OrbitSpacing.lg),
                 verticalArrangement = Arrangement.spacedBy(OrbitSpacing.lg),
             ) {
+                deviceLinkControls()
+
                 // Status summary header
                 Row(
                     modifier = Modifier.fillMaxWidth(),

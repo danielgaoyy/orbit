@@ -40,8 +40,8 @@ object MasterKeyEnvelopeCodec {
         require(iv.size == GCM_IV_BYTES) {
             "Expected $GCM_IV_BYTES-byte GCM IV, got ${iv.size}"
         }
-        require(ciphertext.size >= MASTER_KEY_BYTES + GCM_TAG_BYTES) {
-            "Ciphertext too short (${ciphertext.size} bytes)"
+        require(ciphertext.size == MASTER_KEY_BYTES + GCM_TAG_BYTES) {
+            "Invalid ciphertext length (${ciphertext.size} bytes)"
         }
         val raw = ByteArray(1 + iv.size + ciphertext.size)
         raw[0] = FORMAT_VERSION
@@ -53,7 +53,7 @@ object MasterKeyEnvelopeCodec {
     fun decodeEnvelope(encoded: String): SealedEnvelope {
         val raw = Base64.getDecoder().decode(encoded.trim())
         val minLen = 1 + GCM_IV_BYTES + MASTER_KEY_BYTES + GCM_TAG_BYTES
-        require(raw.size >= minLen) {
+        require(raw.size == minLen) {
             "Corrupt master key envelope (${raw.size} bytes)"
         }
         val version = raw[0]
@@ -117,7 +117,7 @@ object OrbitMasterKeyStore {
     fun getOrCreateMasterKey(context: Context): ByteArray = synchronized(lock) {
         val appContext = context.applicationContext
         val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val existing = prefs.getString(KEY_WRAPPED_MASTER, null)?.trim()?.takeIf { it.isNotEmpty() }
+        val existing = prefs.getString(KEY_WRAPPED_MASTER, null)
 
         if (existing != null) {
             val wrappingKey = loadExistingKeystoreKey()

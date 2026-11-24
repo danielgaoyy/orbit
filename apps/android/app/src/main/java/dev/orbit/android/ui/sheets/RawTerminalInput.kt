@@ -161,8 +161,8 @@ class OrbitRawTerminalView(context: Context) : View(context) {
             }
 
             override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
-                val count = beforeLength.coerceAtLeast(1)
-                onBytesReady?.invoke(ByteArray(count) { 0x7F })
+                if (beforeLength > 0) emitBytes(ByteArray(beforeLength) { 0x7F })
+                if (afterLength > 0) emitBytes("\u001B[3~".repeat(afterLength).toByteArray())
                 return true
             }
 

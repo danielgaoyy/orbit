@@ -120,6 +120,7 @@ fun TurnItem(
         modifier = modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(OrbitSpacing.md),
     ) {
+        (turn.agentMessage as? FfiTimelineItem.AgentMessage)?.let { AgentMessageBody(it) }
         // 1. User Prompt Bubble (or compact-only divider suppression)
         if (isCompactionOnly) {
             CompactionDividerRow(label = "Context compacted")
@@ -745,10 +746,7 @@ private fun LiveTurnSegments(
 
                 is FfiTurnLiveSegment.AgentMessage -> {
                     (seg.item as? FfiTimelineItem.AgentMessage)?.let { msg ->
-                        MarkdownBlocks(
-                            blocks = msg.blocks,
-                            fallbackText = msg.text,
-                        )
+                        AgentMessageBody(msg)
                     }
                 }
 
@@ -1041,10 +1039,7 @@ private fun StepRow(
             )
         }
         is FfiTimelineItem.AgentMessage -> {
-            MarkdownBlocks(
-                blocks = item.blocks,
-                fallbackText = item.text,
-            )
+            AgentMessageBody(item)
         }
         is FfiTimelineItem.PermissionRequest,
         is FfiTimelineItem.QuestionRequest,

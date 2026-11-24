@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.orbit_ffi_uniffi.ConnectedHostSummary
@@ -306,20 +307,17 @@ data class OrbitUiState(
     val sideQuestionDraftsByScope: Map<String, String> = emptyMap(),
     val cloudSyncStatus: FfiCloudSyncStatus? = null,
     val cloudSyncDeviceFlow: FfiGitHubDeviceFlowStart? = null,
-    val cloudSyncDeviceLinkUri: String? = null,
     val cloudSyncBusy: Boolean = false,
     val cloudSyncError: String? = null,
     val pushRegistrationStatus: FfiPushRegistrationStatus? = null,
     val pushDevicesSnapshot: FfiPushDevicesSnapshot? = null,
-    val showGlobalOverview: Boolean = false,
+    val showGlobalOverview: Boolean = true,
+    val fleetSessions: List<Pair<String, FfiAgentCard>> = emptyList(),
     val overviewPendingDecisions: List<OverviewPendingDecision> = emptyList(),
     val stageHasOlderTurns: Boolean = false,
     val stageOldestLoadedSeq: ULong = 0uL,
     val stageAuxRevision: ULong = 0uL,
     val isLoadingOlderTurns: Boolean = false,
-    val activeFilePreview: FfiWorkspaceFile? = null,
-    val isLoadingFilePreview: Boolean = false,
-    val filePreviewError: String? = null,
     val gitPrStatus: GitPrStatus? = null,
     val gitConflicts: List<GitConflictFile> = emptyList(),
     val gitStashes: List<GitStashEntry> = emptyList(),
@@ -361,7 +359,7 @@ data class OrbitUiState(
     val activeSideQuestionDraft: String
         get() = sideQuestionDraftsByScope[activeSideQuestionScopeKey].orEmpty()
     val selectedHost: FfiHostCard?
-        get() = hostDetail?.host ?: hosts.firstOrNull { it.hostId == selectedHostId }
+        get() = hostDetail?.host?.takeIf { it.hostId == selectedHostId } ?: hosts.firstOrNull { it.hostId == selectedHostId }
 
     val activeAgent: FfiAgentCard?
         get() = if (selectedAgentId == null) {
@@ -684,6 +682,16 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         }
     }
 
+    private val terminalInput = kotlinx.coroutines.channels.Channel<Triple<String, UByte, ByteArray>>(256)
+    init {
+        viewModelScope.launch(Dispatchers.IO) {
+            for ((host, slot, bytes) in terminalInput) {
+                runCatching { checkNotNull(core).sendTerminalBytes(host, slot, bytes) }
+                    .onFailure { postToast(extractErrorMessage(it, "Terminal input failed")) }
+            }
+        }
+    }
+
     private val listener = object : MobileCoreListener {
         override fun onCoreEvent(event: FfiCoreEvent) {
             viewModelScope.launch(Dispatchers.IO) {
@@ -939,6 +947,11 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
 
         // Debug/automation launch extras are strictly restricted to debug builds so third-party apps
         // cannot inject PTY commands or UI state into the exported MainActivity in release builds.
+        if (intent.hasExtra("google.message_id") || intent.hasExtra("gcm.message_id")) {
+            val fields = listOf("event_kind", "host_id", "agent_id", "deep_link", "kind")
+                .mapNotNull { key -> intent.getStringExtra(key)?.let { key to it } }.toMap()
+            OrbitPushRouter.parsePayload(fields)?.let { handleDeepLinkUri(it.deepLink) }
+        }
         if (!BuildConfig.DEBUG) return
 
         // 2. Immediate zero-flash theme (`--es orbit_theme <system|light|dark>`)
@@ -1081,11 +1094,11 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             is OrbitDeepLinkAction.PairHost -> pairHost(action.uri)
             is OrbitDeepLinkAction.ImportDeviceLink -> importCloudSyncDeviceLinkUri(action.uri)
             is OrbitDeepLinkAction.OpenThread -> openThreadFromDeepLink(action.hostId, action.agentId)
-            is OrbitDeepLinkAction.OpenHost -> openHostFromDeepLink(action.hostId)
+            is OrbitDeepLinkAction.OpenHost -> openHostFromDeepLink(action.hostId, action.eventKind)
         }
     }
 
-    private fun openHostFromDeepLink(hostId: String) {
+    private fun openHostFromDeepLink(hostId: String, kind: dev.orbit.android.notifications.OrbitPushEventKind?) {
         viewModelScope.launch(Dispatchers.IO) {
             val readyCore = core ?: coreReady.await() ?: return@launch
             reloadFleetInternal()
@@ -1096,6 +1109,9 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             }
             pendingDeepLink = null
             selectHost(hostId)
+            if (kind in setOf(dev.orbit.android.notifications.OrbitPushEventKind.GOAL_FINISHED,
+                    dev.orbit.android.notifications.OrbitPushEventKind.TIMER_FIRED)) requestSheet("automations")
+            else openGlobalOverview()
             runCatching { readyCore.connectHost(hostId) }
         }
     }
@@ -1115,6 +1131,12 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             _state.update { prev ->
                 prev.copy(
                     selectedHostId = hostId,
+                    showGlobalOverview = false,
+                    hostDetail = prev.hostDetail?.takeIf { it.host.hostId == hostId },
+                    gitReview = null,
+                    terminalScreen = null,
+                    pushDevicesSnapshot = null,
+                    agentStage = null,
                     selectedAgentId = agentId,
                     isNewSessionMode = false,
                     lastError = null,
@@ -1189,6 +1211,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         var deepLinkMissingToast = false
         val activeDeepLink = pendingDeepLink?.takeIf { it.first == hostId }
         _state.update { prev ->
+            if (prev.selectedHostId != hostId) return@update prev
             // Remap optimistic agent IDs once daemon confirms real session ID
             val remappedAgentId = prev.selectedAgentId?.let { currentId ->
                 detail.replacedOptimisticAgents[currentId] ?: currentId
@@ -1427,6 +1450,9 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         val stage = merged.stage
 
         _state.update { prev ->
+            if (prev.selectedHostId != hostId || prev.selectedAgentId != agentId || prev.isNewSessionMode) return@update prev
+            if (prev.agentStage?.hostId == hostId && prev.agentStage.agent?.agentId == agentId &&
+                prev.agentStage.revision > stage.revision) return@update prev
             val ag = stage.agent
             val nextComposer = if (ag != null) {
                 prev.composer.copy(
@@ -1444,7 +1470,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 stageHasOlderTurns = merged.hasOlderTurns,
                 stageOldestLoadedSeq = merged.oldestLoadedSeq,
                 stageAuxRevision = merged.auxRevision,
-                isLoadingOlderTurns = false,
+                isLoadingOlderTurns = prev.isLoadingOlderTurns && merged.hasOlderTurns && merged.oldestLoadedSeq == prev.stageOldestLoadedSeq,
                 activeCwd = ag?.cwd ?: prev.activeCwd,
                 composer = nextComposer,
             )
@@ -1485,6 +1511,10 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 isNewSessionMode = false,
                 agentStage = null,
                 gitReview = null,
+                hostDetail = null,
+                workspaceFiles = emptyList(),
+                pushDevicesSnapshot = null,
+                activeCwd = "~",
                 terminalScreen = null,
                 lastError = null,
             )
@@ -1778,6 +1808,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 selectedAgentId = agentId,
                 isNewSessionMode = false,
                 showGlobalOverview = false,
+                agentStage = prev.agentStage?.takeIf { it.hostId == hostId && it.agent?.agentId == agentId },
+                isLoadingOlderTurns = false,
                 stageHasOlderTurns = false,
                 stageOldestLoadedSeq = 0uL,
                 stageAuxRevision = 0uL,
@@ -1862,7 +1894,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { core?.fetchWorkspaceFiles(hostId, cur.activeCwd) }
             val files = runCatching { core?.workspaceFiles(hostId, cur.activeCwd) }.getOrNull().orEmpty()
-            _state.update { it.copy(workspaceFiles = files) }
+            _state.update { if (it.selectedHostId == hostId && it.activeCwd == cur.activeCwd) it.copy(workspaceFiles = files) else it }
         }
     }
 
@@ -3043,7 +3075,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             runCatching { core?.fetchGitDiff(hostId, cwd, null, staged) }
             val review = runCatching { core?.gitReview(hostId, cwd, null) }.getOrNull()
             if (review != null) {
-                _state.update { it.copy(gitReview = review) }
+                _state.update { if (it.selectedHostId == hostId && it.activeCwd == cwd) it.copy(gitReview = review) else it }
             }
         }
     }
@@ -3177,11 +3209,13 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun sendTerminalBytes(bytes: ByteArray, slot: UByte = 1u) {
-        val hostId = _state.value.selectedHostId ?: return
+    fun sendTerminalBytes(bytes: ByteArray) {
+        val current = _state.value
+        val hostId = current.selectedHostId ?: return
+        val slot: UByte = current.hostDetail?.takeIf { it.host.hostId == hostId }?.activeTerminalSlot?.coerceAtLeast(1u) ?: 1u
         if (bytes.isEmpty()) return
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { core?.sendTerminalBytes(hostId, slot, bytes) }
+        if (terminalInput.trySend(Triple(hostId, slot, bytes)).isFailure) {
+            postToast(getApplication<Application>().getString(dev.orbit.android.R.string.terminal_busy))
         }
     }
 
@@ -4002,26 +4036,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun exportCloudSyncDeviceLinkUri() {
-        _state.update { it.copy(cloudSyncBusy = true, cloudSyncError = null) }
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val uri = core?.cloudSyncExportDeviceLinkUri()
-                    ?: throw IllegalStateException("Orbit core not ready")
-                _state.update { it.copy(cloudSyncDeviceLinkUri = uri, cloudSyncBusy = false) }
-            } catch (t: Throwable) {
-                _state.update {
-                    it.copy(
-                        cloudSyncBusy = false,
-                        cloudSyncError = extractErrorMessage(t, "Failed to export Device Link QR"),
-                    )
-                }
-            }
-        }
-    }
-
-    fun clearCloudSyncDeviceLinkUri() {
-        _state.update { it.copy(cloudSyncDeviceLinkUri = null) }
+    suspend fun exportCloudSyncDeviceLinkUri(): String = withContext(Dispatchers.IO) {
+        checkNotNull(core ?: coreReady.await()).cloudSyncExportDeviceLinkUri()
     }
 
     fun importCloudSyncDeviceLinkUri(uri: String, onSuccess: (() -> Unit)? = null) {
@@ -4053,6 +4069,9 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
 
     // --- Real Push Notification Device Registration (`registerPushDevice` UniFFI RPC) ---
 
+    private val registrationMutex = kotlinx.coroutines.sync.Mutex()
+    private val registeredHostTokens = mutableMapOf<String, String>()
+
     fun registerPushToken(platform: String, token: String) {
         val cleanToken = token.trim()
         if (cleanToken.isEmpty()) return
@@ -4074,17 +4093,15 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 sandbox = BuildConfig.DEBUG,
                 liveActivityToken = null,
             )
-            var latestSnapshot: FfiPushDevicesSnapshot? = null
-            hostIds.forEach { hostId ->
-                runCatching { activeCore.registerPushDevice(hostId, req) }
-                    .onSuccess { snap ->
-                        if (hostId == _state.value.selectedHostId || latestSnapshot == null) {
-                            latestSnapshot = snap
+            registrationMutex.withLock {
+                hostIds.forEach { hostId ->
+                    if (registeredHostTokens[hostId] != cleanToken) {
+                        runCatching { activeCore.registerPushDevice(hostId, req) }.onSuccess { snapshot ->
+                            registeredHostTokens[hostId] = cleanToken
+                            _state.update { if (it.selectedHostId == hostId) it.copy(pushDevicesSnapshot = snapshot) else it }
                         }
                     }
-            }
-            latestSnapshot?.let { snap ->
-                _state.update { it.copy(pushDevicesSnapshot = snap) }
+                }
             }
         }
     }
@@ -4094,7 +4111,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         viewModelScope.launch(Dispatchers.IO) {
             val activeCore = core ?: return@launch
             runCatching { activeCore.listPushDevices(targetHost) }
-                .onSuccess { snap -> _state.update { it.copy(pushDevicesSnapshot = snap) } }
+                .onSuccess { snap -> _state.update { if (it.selectedHostId == targetHost) it.copy(pushDevicesSnapshot = snap) else it } }
         }
     }
 
@@ -4138,6 +4155,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             _state.value.hosts.forEach { host ->
                 runCatching { activeCore?.unregisterPushDevice(host.hostId, deviceId) }
             }
+            registrationMutex.withLock { registeredHostTokens.clear() }
             runCatching { activeCore?.unregisterPushToken(OrbitFirebaseMessagingBridge.PLATFORM_ANDROID_FCM) }
             OrbitFirebaseMessagingBridge.clearToken(getApplication())
             val st = runCatching { activeCore?.pushRegistrationStatus() }.getOrNull()
@@ -4157,16 +4175,24 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         _state.update { it.copy(showGlobalOverview = false) }
     }
 
+    private val overviewGeneration = java.util.concurrent.atomic.AtomicLong()
+
     fun refreshOverviewPendingDecisions() {
+        val generation = overviewGeneration.incrementAndGet()
         viewModelScope.launch(Dispatchers.IO) {
             val activeCore = core ?: return@launch
             val cur = _state.value
             val hostNameById = cur.hosts.associate { it.hostId to it.displayName }
             val collected = mutableListOf<OverviewPendingDecision>()
-            val seenKeys = HashSet<String>()
+            val sessions = mutableListOf<Pair<String, FfiAgentCard>>()
+            val seenKeys = HashSet<Triple<String, String, String>>()
 
             cur.hosts.forEach { host ->
                 val detail = runCatching { activeCore.hostDetail(host.hostId) }.getOrNull() ?: return@forEach
+                sessions += detail.agents.filter { it.archivedAtRfc3339 == null }.map { host.hostId to it }
+                val audits = if (detail.agents.any { it.isAwaitingPermission }) {
+                    runCatching { activeCore.getGuardianConfig(host.hostId).recentAudits }.getOrDefault(emptyList())
+                } else emptyList()
                 detail.agents
                     .filter { it.isAwaitingPermission }
                     .forEach { agent ->
@@ -4177,7 +4203,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                             .filterIsInstance<FfiTimelineItem.PermissionRequest>()
                             .filter { it.resolvedDecision == null }
                             .forEach { perm ->
-                                val key = "${host.hostId}::${agent.agentId}::${perm.requestId}"
+                                val key = Triple(host.hostId, agent.agentId, perm.requestId)
                                 if (seenKeys.add(key)) {
                                     collected.add(
                                         OverviewPendingDecision(
@@ -4188,7 +4214,10 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                                                 OrbitFormatters.providerLabel(agent.provider)
                                             },
                                             permission = perm,
-                                            isSafeLowRisk = OverviewSafetyReducer.isSafeLowRiskBatchCandidate(perm),
+                                            isSafeLowRisk = OverviewSafetyReducer.isSafeLowRiskBatchCandidate(
+                                                perm, audits.filter { it.agentId == agent.agentId && it.requestId == perm.requestId }
+                                                    .maxByOrNull { it.decidedAtMs }?.assessment,
+                                            ),
                                             isPlanApproval = PlanApprovalReducer.detectPlanApproval(perm) != null,
                                         )
                                     )
@@ -4196,7 +4225,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                             }
                     }
             }
-            _state.update { it.copy(overviewPendingDecisions = collected) }
+            val recent = sessions.sortedByDescending { it.second.updatedAtRfc3339 }
+            _state.update { if (overviewGeneration.get() == generation) it.copy(overviewPendingDecisions = collected, fleetSessions = recent) else it }
         }
     }
 
@@ -4234,17 +4264,25 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         hostId: String,
         permissionsByAgent: List<Pair<String, FfiTimelineItem.PermissionRequest>>,
     ) {
-        val safeItems = permissionsByAgent
-            .filter { (_, perm) -> OverviewSafetyReducer.isSafeLowRiskBatchCandidate(perm) }
-            .map { (agentId, perm) -> FfiPermissionRequestId(agentId = agentId, permissionRequestId = perm.requestId) }
-        if (safeItems.isEmpty()) {
-            postToast("No low-risk approvals eligible for batch approve")
-            return
-        }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val res = core?.resolvePermissionsBatch(hostId, safeItems, "allow")
-                    ?: throw IllegalStateException("Orbit core not ready")
+                val activeCore = core ?: return@launch
+                val audits = activeCore.getGuardianConfig(hostId).recentAudits
+                val safeItems = permissionsByAgent.groupBy { it.first }.flatMap { (agentId, rows) ->
+                    val requested = rows.map { it.second.requestId }.toSet()
+                    activeCore.agentStageDelta(hostId, agentId, 0uL).pendingPermissions
+                        .filterIsInstance<FfiTimelineItem.PermissionRequest>()
+                        .filter { p ->
+                            p.requestId in requested && OverviewSafetyReducer.isSafeLowRiskBatchCandidate(p,
+                                audits.filter { it.agentId == agentId && it.requestId == p.requestId }
+                                    .maxByOrNull { it.decidedAtMs }?.assessment)
+                        }.map { FfiPermissionRequestId(agentId, it.requestId) }
+                }
+                if (safeItems.isEmpty()) {
+                    refreshOverviewPendingDecisions()
+                    return@launch
+                }
+                val res = activeCore.resolvePermissionsBatch(hostId, safeItems, "allow")
                 reloadFleetInternal()
                 reloadHostDetailInternal(hostId)
                 _state.value.selectedAgentId?.let { aid ->
@@ -4264,6 +4302,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         originalMarkdown: String,
         draftMarkdown: String,
         feedback: String,
+        buildMode: uniffi.orbit_ffi_uniffi.SessionMode = uniffi.orbit_ffi_uniffi.SessionMode.Default,
     ) {
         val cur = _state.value
         val hostId = cur.selectedHostId ?: return
@@ -4283,7 +4322,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                     action = payload.action,
                     editedPlanMarkdown = payload.editedPlanMarkdown,
                     feedback = payload.feedback,
-                    targetMode = payload.targetMode,
+                    targetMode = payload.targetMode?.let { buildMode },
                 )
                 reloadStageInternal(hostId, agentId)
                 reloadHostDetailInternal(hostId)
@@ -4293,45 +4332,25 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun sendPersonalAgentPrompt(promptText: String) {
+    fun sendPersonalAgentPrompt(promptText: String, onSent: () -> Unit) {
         val trimmed = promptText.trim()
         if (trimmed.isEmpty()) return
         val cur = _state.value
         val routerHost = cur.routerHosts.firstOrNull { it.activeRouterAgentId != null && it.online }
             ?: cur.routerHosts.firstOrNull { it.routerEnabled && it.online }
-        val activeRouterAgentId = cur.routerStatus?.routerAgent?.agentId ?: routerHost?.activeRouterAgentId
-        val targetHostId = routerHost?.hostId ?: cur.selectedHostId ?: cur.hosts.firstOrNull()?.hostId ?: return
+        val activeRouterAgentId = routerHost?.activeRouterAgentId
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
-                if (activeRouterAgentId != null) {
-                    activeCore.sendPrompt(targetHostId, activeRouterAgentId, trimmed)
-                    withContext(Dispatchers.Main) {
-                        selectHostAndAgent(targetHostId, activeRouterAgentId)
-                    }
-                } else {
-                    val agentId = activeCore.createSession(
-                        FfiCreateSessionRequest(
-                            hostId = targetHostId,
-                            cwd = cur.activeCwd,
-                            extraDirs = emptyList(),
-                            provider = cur.composer.provider,
-                            acpAgentId = null,
-                            model = cur.composer.model,
-                            effort = cur.composer.effort,
-                            fastMode = cur.composer.fastMode,
-                            mode = cur.composer.mode,
-                            initialPrompt = trimmed,
-                            initialDisplayPrompt = trimmed,
-                            initialBadges = emptyList(),
-                            worktreeBranch = null,
-                        )
-                    )
-                    reloadHostDetailInternal(targetHostId)
-                    withContext(Dispatchers.Main) {
-                        selectHostAndAgent(targetHostId, agentId)
-                    }
+                if (routerHost == null || activeRouterAgentId == null) {
+                    requestSheet("router")
+                    return@launch
+                }
+                activeCore.sendPrompt(routerHost.hostId, activeRouterAgentId, trimmed)
+                withContext(Dispatchers.Main) {
+                    onSent()
+                    selectHostAndAgent(routerHost.hostId, activeRouterAgentId)
                 }
             } catch (t: Throwable) {
                 _state.update { it.copy(lastError = extractErrorMessage(t, "Failed to send to Personal Agent")) }
@@ -4351,8 +4370,10 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             try {
                 val loadedMore = core?.loadOlderAgentTimeline(hostId, agentId, limitEvents) ?: false
                 reloadStageInternal(hostId, agentId)
-                if (!loadedMore) {
-                    _state.update { it.copy(stageHasOlderTurns = false, isLoadingOlderTurns = false) }
+                if (loadedMore) delay(8_000) // Remote pages arrive via TimelineChanged after the RPC returns.
+                _state.update {
+                    if (it.selectedHostId == hostId && it.selectedAgentId == agentId && it.stageOldestLoadedSeq == cur.stageOldestLoadedSeq)
+                        it.copy(isLoadingOlderTurns = false) else it
                 }
             } catch (t: Throwable) {
                 _state.update { it.copy(isLoadingOlderTurns = false) }
@@ -4379,35 +4400,26 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
 
     // --- File Explorer & Syntax-Highlighted Code Viewer ---
 
-    fun openWorkspaceFile(path: String) {
-        val cur = _state.value
-        val hostId = cur.selectedHostId ?: return
-        val cwd = cur.activeCwd
-        _state.update { it.copy(isLoadingFilePreview = true, filePreviewError = null) }
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val file = core?.readWorkspaceFile(hostId, cwd, path)
-                    ?: throw IllegalStateException("Orbit core not ready")
-                _state.update {
-                    it.copy(
-                        activeFilePreview = file,
-                        isLoadingFilePreview = false,
-                        filePreviewError = null,
-                    )
-                }
-            } catch (t: Throwable) {
-                _state.update {
-                    it.copy(
-                        isLoadingFilePreview = false,
-                        filePreviewError = extractErrorMessage(t, "Failed to read file"),
-                    )
-                }
-            }
-        }
+    suspend fun readFile(host: String, cwd: String, path: String): FfiWorkspaceFile = withContext(Dispatchers.IO) {
+        checkNotNull(core ?: coreReady.await()).readWorkspaceFile(host, cwd, path)
     }
 
-    fun clearWorkspaceFilePreview() {
-        _state.update { it.copy(activeFilePreview = null, filePreviewError = null, isLoadingFilePreview = false) }
+    suspend fun createProjectHooks(host: String, cwd: String) = withContext(Dispatchers.IO) {
+        checkNotNull(core).createWorkspaceEntry(uniffi.orbit_ffi_uniffi.FfiCreateWorkspaceEntryRequest(
+            host, cwd, ".orbit/hooks.json", false, """{"version":1,"hooks":[]}"""))
+    }
+
+    suspend fun providerTimeline(host: String, parent: String, id: String, open: Boolean) = withContext(Dispatchers.IO) {
+        val activeCore = checkNotNull(core)
+        if (open) activeCore.openProviderSubagentTimeline(host, parent, id)
+        activeCore.providerSubagentTimeline(host, parent, id)
+    }
+
+    suspend fun saveFile(file: FfiWorkspaceFile, text: String): Boolean = withContext(Dispatchers.IO) {
+        require(file.writable && !file.truncated && !file.etag.isNullOrEmpty())
+        val result = checkNotNull(core).writeWorkspaceFile(uniffi.orbit_ffi_uniffi.FfiWriteWorkspaceFileRequest(
+            file.hostId, file.cwd, file.path, text, file.etag, false))
+        result.conflict == null
     }
 
     // --- Git Write Operations (Stage, Unstage, Commit, Generate Message, PR, Conflicts, Stash) ---
@@ -4422,6 +4434,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             val conflicts = runCatching { activeCore.gitConflicts(hostId, cwd).files }.getOrDefault(emptyList())
             val stashes = runCatching { activeCore.gitStashList(hostId, cwd).entries }.getOrDefault(emptyList())
             _state.update {
+                if (it.selectedHostId != hostId || it.activeCwd != cwd) return@update it
                 it.copy(
                     gitPrStatus = pr,
                     gitConflicts = conflicts,
@@ -4438,7 +4451,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         _state.update { it.copy(gitMutationBusy = true) }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                core?.gitStagePaths(hostId, cwd, paths, all)
+                checkNotNull(core).gitStagePaths(hostId, cwd, paths, all)
                 loadGitReview(cwd = cwd, path = cur.gitSelectedPath)
                 postToast(if (all) "Staged all changes" else "Staged ${paths.size} file(s)")
             } catch (t: Throwable) {
@@ -4456,7 +4469,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         _state.update { it.copy(gitMutationBusy = true) }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                core?.gitUnstagePaths(hostId, cwd, paths, all)
+                checkNotNull(core).gitUnstagePaths(hostId, cwd, paths, all)
                 loadGitReview(cwd = cwd, path = cur.gitSelectedPath)
                 postToast(if (all) "Unstaged all changes" else "Unstaged ${paths.size} file(s)")
             } catch (t: Throwable) {
@@ -4474,8 +4487,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         _state.update { it.copy(gitMutationBusy = true) }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val res = core?.gitGenerateCommitMessage(hostId, cwd)
-                _state.update { it.copy(generatedCommitMessage = res?.message, gitMutationBusy = false) }
+                val res = checkNotNull(core).gitGenerateCommitMessage(hostId, cwd)
+                _state.update { if (it.selectedHostId == hostId && it.activeCwd == cwd) it.copy(generatedCommitMessage = res.message, gitMutationBusy = false) else it.copy(gitMutationBusy = false) }
             } catch (t: Throwable) {
                 _state.update { it.copy(gitMutationBusy = false) }
                 postToast(extractErrorMessage(t, "Failed to generate commit message"))
@@ -4496,10 +4509,10 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         _state.update { it.copy(gitMutationBusy = true) }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val res = core?.gitCommit(hostId, cwd, trimmed, amend)
+                val res = checkNotNull(core).gitCommit(hostId, cwd, trimmed, amend)
                 loadGitReview(cwd = cwd, path = cur.gitSelectedPath)
                 refreshGitExtras()
-                postToast("Committed ${res?.shortSha.orEmpty()}")
+                postToast("Committed ${res.shortSha}")
                 withContext(Dispatchers.Main) { onCommitted() }
             } catch (t: Throwable) {
                 postToast(extractErrorMessage(t, "Git commit failed"))
@@ -4517,9 +4530,9 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         _state.update { it.copy(gitMutationBusy = true) }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val res = core?.gitCreatePr(hostId, cwd, title.trim(), body.trim(), base?.trim()?.ifEmpty { null }, draft)
+                val res = checkNotNull(core).gitCreatePr(hostId, cwd, title.trim(), body.trim(), base?.trim()?.ifEmpty { null }, draft)
                 refreshGitExtras()
-                postToast("Created PR #${res?.number ?: ""}".trim())
+                postToast("Created PR #${res.number}".trim())
                 withContext(Dispatchers.Main) { onCreated() }
             } catch (t: Throwable) {
                 postToast(extractErrorMessage(t, "Failed to create Pull Request"))
@@ -4743,7 +4756,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
 
     // --- Personal Router & Fleet Mesh ---
 
-    fun refreshRouterAndMesh() {
+    fun refreshRouterAndMesh(requestedHost: String? = null) {
         _state.update { it.copy(isLoadingRouterMesh = true) }
         viewModelScope.launch(Dispatchers.IO) {
             val activeCore = core ?: run {
@@ -4751,7 +4764,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 return@launch
             }
             val routerHosts = runCatching { activeCore.discoverFleetRouterHosts() }.getOrDefault(emptyList())
-            val primaryHostId = routerHosts.firstOrNull { it.routerEnabled }?.hostId
+            val primaryHostId = requestedHost ?: routerHosts.firstOrNull { it.routerEnabled && it.online }?.hostId
                 ?: _state.value.selectedHostId
                 ?: routerHosts.firstOrNull()?.hostId
             val routerStatus = primaryHostId?.let { hid ->
@@ -4801,7 +4814,10 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
 
     // --- Global Cross-Host Search (Local FTS5 + Remote Daemons) ---
 
+    private val searchGeneration = java.util.concurrent.atomic.AtomicLong()
+
     fun runGlobalSearch(query: String, includeRemote: Boolean = true) {
+        val generation = searchGeneration.incrementAndGet()
         val trimmed = query.trim()
         _state.update { it.copy(globalSearchQuery = query) }
         if (trimmed.length < 2) {
@@ -4815,10 +4831,10 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             }
             return
         }
-        _state.update { it.copy(isSearchingGlobal = true) }
+        _state.update { it.copy(isSearchingGlobal = true, globalSearchHits = emptyList()) }
         viewModelScope.launch(Dispatchers.IO) {
-            val activeCore = core ?: return@launch
             try {
+                val activeCore = checkNotNull(core ?: coreReady.await())
                 if (includeRemote) {
                     val res = activeCore.searchMessagesRemote(
                         SearchMessagesRequest(
@@ -4829,6 +4845,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                         )
                     )
                     _state.update {
+                        if (searchGeneration.get() != generation) return@update it
                         it.copy(
                             globalSearchHits = res.hits,
                             globalSearchRemoteQueried = res.remoteHostsQueried,
@@ -4854,6 +4871,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                         )
                     }
                     _state.update {
+                        if (searchGeneration.get() != generation) return@update it
                         it.copy(
                             globalSearchHits = localHits,
                             globalSearchRemoteQueried = 0u,
@@ -4863,6 +4881,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                     }
                 }
             } catch (t: Throwable) {
+                if (searchGeneration.get() != generation) return@launch
                 _state.update { it.copy(isSearchingGlobal = false) }
                 postToast(extractErrorMessage(t, "Search failed"))
             }
@@ -4870,6 +4889,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     }
 
     override fun onCleared() {
+        terminalInput.close()
         cloudSyncPollJob?.cancel()
         OrbitFirebaseMessagingBridge.detachTokenListener()
         networkObserver.stop()

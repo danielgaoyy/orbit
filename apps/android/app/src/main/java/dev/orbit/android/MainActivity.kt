@@ -23,7 +23,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.orbit.android.notifications.OrbitNotificationHelper
 import dev.orbit.android.store.OrbitAndroidStore
-import dev.orbit.android.ui.shell.AdaptiveOrbitShell
+import dev.orbit.android.ui.shell.OrbitAppShell
 import dev.orbit.android.ui.theme.OrbitTheme
 
 class MainActivity : ComponentActivity() {
@@ -44,6 +44,13 @@ class MainActivity : ComponentActivity() {
             val notifPermissionLauncher = rememberLauncherForActivityResult(
                 contract = ActivityResultContracts.RequestPermission(),
             ) { _ -> Unit }
+
+            val onlineHosts = ui.hosts.filter { it.connectionState == uniffi.orbit_ffi_uniffi.FfiConnectionState.ONLINE_DIRECT ||
+                it.connectionState == uniffi.orbit_ffi_uniffi.FfiConnectionState.ONLINE_RELAY }.map { it.hostId }.toSet()
+            LaunchedEffect(onlineHosts) {
+                if (onlineHosts.isNotEmpty()) dev.orbit.android.notifications.OrbitFirebaseMessagingBridge
+                    .loadPersistedToken(this@MainActivity)?.let { store.registerPushToken("fcm", it) }
+            }
 
             LaunchedEffect(ui.hosts.isNotEmpty()) {
                 if (ui.hosts.isNotEmpty() &&
@@ -78,7 +85,7 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = OrbitTheme.colors.canvas,
                 ) {
-                    AdaptiveOrbitShell(
+                    OrbitAppShell(
                         ui = ui,
                         store = store,
                     )

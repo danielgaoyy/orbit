@@ -11,6 +11,8 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -222,6 +224,7 @@ fun OmniComposer(
     isAgentRunning: Boolean,
     hasHost: Boolean,
     onTextChange: (String) -> Unit,
+    onVoiceNavigate: (VoiceNavigation) -> Unit,
     onSend: () -> Unit,
     onQueue: () -> Unit,
     onInterrupt: () -> Unit,
@@ -260,6 +263,7 @@ fun OmniComposer(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
+    var listening by remember { mutableStateOf(false) }
     var plusMenuExpanded by remember { mutableStateOf(false) }
     var modeMenuExpanded by remember { mutableStateOf(false) }
     var pendingCameraFile by remember { mutableStateOf<File?>(null) }
@@ -714,6 +718,8 @@ fun OmniComposer(
                 // Inline Input Row (`/` directive prefix lives INSIDE the input row!)
                 val placeholderText = "Ask anything, @ to mention, / for actions"
 
+                if (listening) Text(androidx.compose.ui.res.stringResource(dev.orbit.android.R.string.composer_voice_listening),
+                    style = typography.meta, color = colors.fgSecondary)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -804,13 +810,13 @@ fun OmniComposer(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(start = 8.dp, end = 8.dp, bottom = 6.dp)
-                        .height(36.dp),
+                        .height(48.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     // Left Cluster: `+` Attachment Menu, Model Pill, Permission Pill
                     Row(
-                        modifier = Modifier.weight(1f),
+                        modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
@@ -818,7 +824,7 @@ fun OmniComposer(
                         Box {
                             Box(
                                 modifier = Modifier
-                                    .size(32.dp)
+                                    .size(48.dp)
                                     .clip(CircleShape)
                                     .background(colors.subtleFill, CircleShape)
                                     .border(OrbitSpacing.hairline, colors.hairline, CircleShape)
@@ -923,8 +929,8 @@ fun OmniComposer(
                         val pillShape = RoundedCornerShape(10.dp)
                         Row(
                             modifier = Modifier
-                                .height(30.dp)
-                                .widthIn(max = 224.dp)
+                                .height(48.dp)
+                                .widthIn(min = 48.dp, max = 224.dp)
                                 .clip(pillShape)
                                 .background(colors.subtleFill, pillShape)
                                 .border(OrbitSpacing.hairline, colors.hairline, pillShape)
@@ -963,18 +969,11 @@ fun OmniComposer(
                                 modifier = Modifier.size(14.dp),
                             )
                         }
-                    }
-
-                    // Right Action Cluster: Fast Mode Pill + Access Permissions Shield + Send / Queue / Stop
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
                         // Fast Mode Toggle Pill
                         val fastPillShape = RoundedCornerShape(10.dp)
                         Row(
                             modifier = Modifier
-                                .height(30.dp)
+                                .height(48.dp)
                                 .clip(fastPillShape)
                                 .background(
                                     if (draft.fastMode) colors.warning.copy(alpha = 0.16f) else Color.Transparent,
@@ -1019,7 +1018,7 @@ fun OmniComposer(
                             }
                             Box(
                                 modifier = Modifier
-                                    .size(32.dp)
+                                    .size(48.dp)
                                     .clip(CircleShape)
                                     .clickable {
                                         haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -1083,68 +1082,17 @@ fun OmniComposer(
                                 )
                             }
                         }
-                        if (isAgentRunning) {
-                            if (draft.canSend) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(32.dp)
-                                        .clip(CircleShape)
-                                        .background(colors.primary, CircleShape)
-                                        .clickable {
-                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                            onQueue()
-                                        },
-                                    contentAlignment = Alignment.Center,
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.AutoMirrored.Outlined.PlaylistAdd,
-                                        contentDescription = "Queue prompt",
-                                        tint = colors.onPrimary,
-                                        modifier = Modifier.size(OrbitSpacing.iconSm),
-                                    )
-                                }
-                            }
-                            Box(
-                                modifier = Modifier
-                                    .size(32.dp)
-                                    .clip(CircleShape)
-                                    .background(colors.subtleFill, CircleShape)
-                                    .border(OrbitSpacing.hairline, colors.hairline, CircleShape)
-                                    .clickable {
-                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                        onInterrupt()
-                                    },
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Outlined.Stop,
-                                    contentDescription = "Stop agent",
-                                    tint = colors.dangerRemoved,
-                                    modifier = Modifier.size(OrbitSpacing.iconSm),
-                                )
-                            }
-                        } else {
-                            val enabled = hasHost && draft.canSend
-                            Box(
-                                modifier = Modifier
-                                    .size(32.dp)
-                                    .clip(CircleShape)
-                                    .background(if (enabled) colors.primary else colors.subtleFill, CircleShape)
-                                    .clickable(enabled = enabled) {
-                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                        onSend()
-                                    },
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Outlined.ArrowUpward,
-                                    contentDescription = "Send prompt",
-                                    tint = if (enabled) colors.onPrimary else colors.fgMuted,
-                                    modifier = Modifier.size(OrbitSpacing.iconMd),
-                                )
-                            }
-                        }
                     }
+                    ComposerAction(
+                        hasDraft = draft.canSend,
+                        running = isAgentRunning,
+                        enabled = hasHost,
+                        onDictated = { onTextChange(listOf(draft.text, it).filter(String::isNotBlank).joinToString(" ")) },
+                        onListening = { listening = it },
+                        onSubmit = if (isAgentRunning) onQueue else onSend,
+                        onInterrupt = onInterrupt,
+                        onNavigate = onVoiceNavigate,
+                    )
                 }
             }
         }

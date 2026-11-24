@@ -197,4 +197,24 @@
     <string name="export_markdown">Markdown (.md)</string>
     <string name="export_json">JSON (.json)</string>
     <string name="export_html">HTML (.html)</string>
+    <string name="recent_sessions">最近的会话</string>
+    <string name="plan_switch_mode">执行模式</string>
+    <string name="mode_default">默认</string>
+    <string name="mode_accept_edits">允许编辑</string>
+    <string name="files_conflict">文件已在主机上更改。请重新打开以查看最新版本。</string>
+    <string name="git_changes">Git 更改</string>
+    <string name="git_push_terminal">在终端中确认推送</string>
+    <string name="triggers">触发器</string>
+    <string name="hooks">生命周期钩子</string>
+    <string name="start_workflow">启动工作流</string>
+    <string name="new_trigger">创建定时触发器</string>
+    <string name="automation_name">名称</string>
+    <string name="automation_prompt">提示词</string>
+    <string name="duration_seconds">延迟秒数</string>
+    <string name="log_path">日志文件路径</string>
+    <string name="voice_open_overview">打开概览</string>
+    <string name="voice_open_search">打开全局搜索</string>
+    <string name="terminal_busy">终端输入缓冲区已满</string>
+    <string name="create_hooks_file">创建项目钩子文件</string>
+    <string name="sync_qr_failed">无法生成设备链接。请检查同步状态后重试。</string>
 </resources>

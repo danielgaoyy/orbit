@@ -430,7 +430,8 @@ fun PairQrSheet(
 }
 
 @Composable
-private fun ZxingCameraPreview(
+internal fun ZxingCameraPreview(
+    accepts: (String) -> Boolean = { dev.orbit.android.notifications.OrbitPushRouter.parseDeepLink(it) is dev.orbit.android.notifications.OrbitDeepLinkAction.PairHost },
     onQrDecoded: (String) -> Unit,
 ) {
     val context = LocalContext.current
@@ -469,7 +470,7 @@ private fun ZxingCameraPreview(
                         try {
                             if (!decodedOnce.get()) {
                                 val resultText = decodeOrbitQrFromImageProxy(imageProxy, reader, hints)
-                                if (resultText != null && decodedOnce.compareAndSet(false, true)) {
+                                if (resultText != null && accepts(resultText) && decodedOnce.compareAndSet(false, true)) {
                                     mainExecutor.execute {
                                         onQrDecoded(resultText)
                                     }

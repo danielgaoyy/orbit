@@ -1,0 +1,20 @@
+[package]
+name = "orbit-client-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+orbit-client-core = { path = "../orbit-client-core", default-features = false }
+orbit-protocol = { path = "../orbit-protocol", default-features = false }
+orbit-crypto = { path = "../orbit-crypto", default-features = false }
+wasm-bindgen = "0.2"
+serde.workspace = true
+serde_json.workspace = true
+serde-wasm-bindgen = "0.6"

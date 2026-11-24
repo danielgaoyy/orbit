@@ -237,6 +237,10 @@ pub fn encrypt_vault_bytes(
     if plaintext.len() > MAX_VAULT_PLAINTEXT_BYTES {
         return Err(VaultCryptoError::PayloadTooLarge);
     }
+    #[cfg(not(all(feature = "zstd-compression", not(target_arch = "wasm32"))))]
+    let compressed =
+        ruzstd::encoding::compress_to_vec(plaintext, ruzstd::encoding::CompressionLevel::Fastest);
+    #[cfg(all(feature = "zstd-compression", not(target_arch = "wasm32")))]
     let compressed = zstd::bulk::compress(plaintext, 3)
         .map_err(|e| VaultCryptoError::Compression(e.to_string()))?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -289,6 +293,22 @@ pub fn decrypt_vault_bytes(
         )
         .map_err(|_| VaultCryptoError::DecryptionFailed)?;
 
+    #[cfg(not(all(feature = "zstd-compression", not(target_arch = "wasm32"))))]
+    let plaintext = {
+        use std::io::Read;
+        let decoder = ruzstd::decoding::StreamingDecoder::new(compressed.as_slice())
+            .map_err(|e| VaultCryptoError::Compression(e.to_string()))?;
+        let mut bytes = Vec::new();
+        decoder
+            .take(MAX_VAULT_PLAINTEXT_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| VaultCryptoError::Compression(e.to_string()))?;
+        if bytes.len() > MAX_VAULT_PLAINTEXT_BYTES {
+            return Err(VaultCryptoError::PayloadTooLarge);
+        }
+        bytes
+    };
+    #[cfg(all(feature = "zstd-compression", not(target_arch = "wasm32")))]
     let plaintext = zstd::bulk::decompress(&compressed, MAX_VAULT_PLAINTEXT_BYTES)
         .map_err(|e| VaultCryptoError::Compression(e.to_string()))?;
     Ok(plaintext)
@@ -362,6 +382,23 @@ mod tests {
     struct SamplePayload {
         hosts: Vec<String>,
         revision: u64,
+    }
+
+    #[test]
+    #[cfg(all(feature = "zstd-compression", not(target_arch = "wasm32")))]
+    fn browser_and_native_vault_codecs_interoperate() -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Read;
+        let data = b"Orbit encrypted vault payload".repeat(9000);
+        let portable = ruzstd::encoding::compress_to_vec(
+            data.as_slice(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        assert_eq!(zstd::bulk::decompress(&portable, data.len())?, data);
+        let native = zstd::bulk::compress(&data, 3)?;
+        let mut recovered = Vec::new();
+        ruzstd::decoding::StreamingDecoder::new(native.as_slice())?.read_to_end(&mut recovered)?;
+        assert_eq!(recovered, data);
+        Ok(())
     }
 
     #[test]

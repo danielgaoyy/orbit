@@ -2,6 +2,14 @@ import type { MessageDictionary } from "./en.ts";
 
 export const zhCN: MessageDictionary = {
   // Common
+  "web.pairTitle": "配对主机",
+  "web.pairHelp": "在主机上运行 orbit pair。粘贴配对 URI 或选择配对二维码图片。",
+  "web.uri": "配对 URI",
+  "web.qr": "二维码图片",
+  "web.qrError": "未在图片中找到 Orbit 配对码。",
+  "web.connecting": "连接中…",
+  "web.connect": "连接",
+  "web.startError": "Orbit 网页端启动失败。",
   "common.newSession": "新会话",
   "common.newConversation": "新建对话",
   "common.conversation": "对话",

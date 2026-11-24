@@ -65,6 +65,7 @@ pub enum ClientPlatform {
     Ios,
     Android,
     Harmony,
+    Web,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

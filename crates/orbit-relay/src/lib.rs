@@ -198,6 +198,10 @@ fn build_relay_router(state: RelayState) -> Router {
 }
 
 pub async fn run_relay(config: RelayConfig) -> anyhow::Result<()> {
+    run_relay_with_web(config, None).await
+}
+
+pub async fn run_relay_with_web(config: RelayConfig, web: Option<Router>) -> anyhow::Result<()> {
     let has_fleet_token = config
         .fleet_token
         .as_deref()
@@ -210,6 +214,10 @@ pub async fn run_relay(config: RelayConfig) -> anyhow::Result<()> {
         TUNNEL_ATTACH_TIMEOUT,
     );
     let app = build_relay_router(state);
+    let app = match web {
+        Some(routes) => app.merge(routes),
+        None => app,
+    };
 
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
     info!(

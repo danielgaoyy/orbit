@@ -7,10 +7,19 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["zstd-compression"]
+zstd-compression = ["dep:zstd"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
-zstd.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zstd = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { workspace = true, features = ["js"] }

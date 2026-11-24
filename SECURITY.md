@@ -39,6 +39,10 @@ Security events in `security_audit_chain` link to the preceding SHA-256 digest. 
 
 `GET /metrics` requires a loopback peer, an accepted Origin and the active pairing secret as a bearer token. The endpoint emits aggregate counts. Diagnostic bundles export allowlisted configuration and per-line log severity. OTLP sends static event metadata.
 
+### Browser pairing
+
+Web clients authenticate the daemon static key and pairing PSK with the same Noise handshake as native clients. Compression negotiation is encrypted. A browser never sends the pairing secret as a WebSocket URL parameter. IndexedDB stores encrypted profiles and cached views, with a non-extractable origin-bound wrapping key. Scripts served by the PWA origin can use that key, so the shell, service worker and WASM distribution are trusted client code. To keep a third-party relay outside that trust boundary, host the PWA independently.
+
 ## Reporting a Vulnerability
 
 **Please do not report security vulnerabilities in public GitHub issues or pull requests.**

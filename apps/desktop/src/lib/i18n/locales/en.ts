@@ -1,5 +1,13 @@
 export const en = {
   // Common
+  "web.pairTitle": "Pair a host",
+  "web.pairHelp": "Run orbit pair on your host. Paste its URI or choose a pairing QR image.",
+  "web.uri": "Pairing URI",
+  "web.qr": "QR image",
+  "web.qrError": "No Orbit pairing code found in this image.",
+  "web.connecting": "Connecting…",
+  "web.connect": "Connect",
+  "web.startError": "Orbit Web could not start.",
   "common.newSession": "New session",
   "common.newConversation": "New Conversation",
   "common.conversation": "Conversation",

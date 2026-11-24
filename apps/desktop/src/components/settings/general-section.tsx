@@ -27,6 +27,7 @@ import {
   type ExternalEditorKind,
   type HostCardView,
   compareSemver,
+  isWebRuntime,
   normalizeSemver,
 } from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
@@ -312,18 +313,20 @@ export function GeneralSection() {
             />
           </SettingRow>
 
-          <SettingRow
-            title={t("settings.externalEditor")}
-            description={t("settings.externalEditorDesc", { mod })}
-          >
-            <SettingSelect
-              value={effectivePreferred}
-              options={editorOptions}
-              onChange={(kind) => orbitActions.setPreferredEditor(kind)}
-              placeholder={t("settings.noEditorsFound")}
-              disabled={editorOptions.length === 0}
-            />
-          </SettingRow>
+          {!isWebRuntime() && (
+            <SettingRow
+              title={t("settings.externalEditor")}
+              description={t("settings.externalEditorDesc", { mod })}
+            >
+              <SettingSelect
+                value={effectivePreferred}
+                options={editorOptions}
+                onChange={(kind) => orbitActions.setPreferredEditor(kind)}
+                placeholder={t("settings.noEditorsFound")}
+                disabled={editorOptions.length === 0}
+              />
+            </SettingRow>
+          )}
         </SettingCard>
       </div>
 
@@ -359,7 +362,7 @@ export function GeneralSection() {
       </div>
 
       {/* Fleet Software Updates (Local Desktop + All Connected Hosts) */}
-      <div className="space-y-2">
+      <div className="space-y-2" hidden={isWebRuntime()}>
         <SettingGroupLabel>{t("settings.groupUpdatesFleet")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow

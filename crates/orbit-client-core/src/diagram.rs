@@ -17,6 +17,8 @@ use mermaid_rs_renderer::{
     measure_svg_dimensions, parse_mermaid, parse_mermaid_strict, render_svg,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(target_arch = "wasm32")]
+use wasm_mermaid as mermaid_rs_renderer;
 
 const MAX_DIAGRAM_SOURCE_BYTES: usize = 512 * 1024;
 const DIAGRAM_CACHE_CAPACITY: usize = 128;

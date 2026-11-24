@@ -146,8 +146,7 @@ use crate::workspace_files::{
 use crate::workspace_runtime::WorkspaceScriptRegistry;
 
 const DIRECT_BIN_ZSTD_WIRE: u8 = 0x00;
-const E2EE_FRAME_WIRE: u8 = 0x00;
-const E2EE_FRAME_TERMINAL: u8 = 0x01;
+use orbit_protocol::{E2EE_FRAME_TERMINAL, E2EE_FRAME_WIRE, E2EE_FRAME_WIRE_JSON};
 
 /// Filename inside `$ORBIT_HOME` storing the host's persisted 256-bit WS pairing secret (`0600`).
 pub const PAIRING_SECRET_FILENAME: &str = "pairing-secret";
@@ -1194,7 +1193,7 @@ fn resolve_user_home() -> PathBuf {
     crate::platform::resolve_user_home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn build_http_router(runtime: Arc<DaemonRuntime>) -> Router {
+fn build_http_router(runtime: Arc<DaemonRuntime>, web: Option<Router>) -> Router {
     let im_webhook_routes = Router::new()
         .route(
             "/im/lark/{channel_id}",
@@ -1216,7 +1215,7 @@ fn build_http_router(runtime: Arc<DaemonRuntime>) -> Router {
             crate::im_channels::MAX_WEBHOOK_BODY_BYTES,
         ));
 
-    Router::new()
+    let app = Router::new()
         .route("/healthz", get(healthz_handler))
         .route("/metrics", get(metrics_handler))
         .route("/ws", get(ws_handler))
@@ -1228,13 +1227,18 @@ fn build_http_router(runtime: Arc<DaemonRuntime>) -> Router {
                 crate::triggers::MAX_WEBHOOK_BODY_BYTES,
             )),
         )
-        .merge(im_webhook_routes)
-        .fallback(not_found_fallback)
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::clone(&runtime),
-            service_reverse_proxy_host_middleware,
-        ))
-        .with_state(runtime)
+        .merge(im_webhook_routes);
+    let app = match web {
+        Some(assets) => app
+            .layer(axum::Extension(ServingWeb))
+            .fallback_service(assets),
+        None => app.fallback(not_found_fallback),
+    };
+    app.layer(axum::middleware::from_fn_with_state(
+        Arc::clone(&runtime),
+        service_reverse_proxy_host_middleware,
+    ))
+    .with_state(runtime)
 }
 
 /// Intercept requests targeting a registered `*.localhost` workspace service BEFORE daemon routes
@@ -1287,11 +1291,25 @@ async fn not_found_fallback() -> Response {
 }
 
 pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
-    run_daemon_until(config, None, wait_daemon_shutdown_signal()).await
+    run_daemon_until_with_web(config, None, None, wait_daemon_shutdown_signal()).await
 }
+
+pub async fn run_daemon_with_web(config: DaemonConfig, web: Option<Router>) -> anyhow::Result<()> {
+    run_daemon_until_with_web(config, None, web, wait_daemon_shutdown_signal()).await
+}
+
 pub async fn run_daemon_until(
     config: DaemonConfig,
     exporter: Option<Arc<telemetry::Exporter>>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    run_daemon_until_with_web(config, exporter, None, shutdown).await
+}
+
+pub async fn run_daemon_until_with_web(
+    config: DaemonConfig,
+    exporter: Option<Arc<telemetry::Exporter>>,
+    web: Option<Router>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let persisted = DaemonPersistedConfig::load(&config.home_dir);
@@ -1361,7 +1379,7 @@ pub async fn run_daemon_until(
     }
 
     let runtime_shutdown = runtime.clone();
-    let app = build_http_router(runtime);
+    let app = build_http_router(runtime, web);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -1432,7 +1450,7 @@ pub async fn spawn_embedded_daemon(
         let _ = runtime.set_outbound_relay(Some(r_url), false).await;
     }
 
-    let app = build_http_router(runtime.clone());
+    let app = build_http_router(runtime.clone(), None);
     tokio::spawn(async move {
         let _ = axum::serve(
             listener,
@@ -1789,10 +1807,7 @@ where
                     let plain = chan
                         .open_record(&ct)
                         .map_err(|_| anyhow::anyhow!("invalid first E2EE transport ciphertext"))?;
-                    if plain.is_empty() || plain[0] != E2EE_FRAME_WIRE {
-                        anyhow::bail!("unexpected first E2EE frame discriminator");
-                    }
-                    let wire = WireMessage::decode_zstd(&plain[1..]).map_err(|err| {
+                    let wire = WireMessage::decode_e2ee(&plain).map_err(|err| {
                         anyhow::anyhow!(
                             "failed to decode first E2EE wire message: {}",
                             format_concise_wire_decode_error(&err)
@@ -2063,13 +2078,8 @@ where
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
             let plain = match frame {
-                SessionFrame::Wire { msg, .. } => match msg.encode_zstd(3) {
-                    Ok(z) => {
-                        let mut p = Vec::with_capacity(1 + z.len());
-                        p.push(E2EE_FRAME_WIRE);
-                        p.extend_from_slice(&z);
-                        p
-                    }
+                SessionFrame::Wire { msg, zstd } => match msg.encode_e2ee(zstd) {
+                    Ok(frame) => frame,
                     Err(_) => continue,
                 },
                 SessionFrame::Terminal(t) => {
@@ -2102,24 +2112,27 @@ where
                         continue;
                     }
                     match plain[0] {
-                        E2EE_FRAME_WIRE => match WireMessage::decode_zstd(&plain[1..]) {
-                            Ok(wire) => {
-                                if in_tx
-                                    .send(SessionFrame::Wire {
-                                        msg: wire,
-                                        zstd: true,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
+                        E2EE_FRAME_WIRE | E2EE_FRAME_WIRE_JSON => {
+                            match WireMessage::decode_e2ee(&plain) {
+                                Ok(wire) => {
+                                    if in_tx
+                                        .send(SessionFrame::Wire {
+                                            msg: wire,
+                                            // Only Hello negotiates encrypted output compression.
+                                            zstd: false,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(err) => {
+                                    let summary = format_concise_wire_decode_error(&err);
+                                    tracing::warn!(error = %summary, bytes = plain.len(), "failed to decode E2EE wire message");
                                 }
                             }
-                            Err(err) => {
-                                let summary = format_concise_wire_decode_error(&err);
-                                tracing::warn!(error = %summary, bytes = plain.len(), "failed to decode E2EE zstd wire message");
-                            }
-                        },
+                        }
                         E2EE_FRAME_TERMINAL => {
                             if let Ok(term) = TerminalBinaryFrame::decode(&plain[1..])
                                 && in_tx.send(SessionFrame::Terminal(term)).await.is_err()
@@ -2189,14 +2202,48 @@ fn tung_msg_to_axum(msg: TungMsg) -> AxumWsMsg {
     }
 }
 
+#[derive(Clone)]
+struct ServingWeb;
+
+fn same_web_origin(headers: &HeaderMap) -> bool {
+    use axum::http::{
+        Uri,
+        header::{HOST, ORIGIN},
+    };
+    let mut origins = headers.get_all(ORIGIN).iter();
+    let mut hosts = headers.get_all(HOST).iter();
+    let Some(origin) = origins.next().and_then(|h| h.to_str().ok()) else {
+        return false;
+    };
+    let Some(host) = hosts.next().and_then(|h| h.to_str().ok()) else {
+        return false;
+    };
+    let Ok(uri) = origin.parse::<Uri>() else {
+        return false;
+    };
+    origins.next().is_none()
+        && hosts.next().is_none()
+        && matches!(uri.scheme_str(), Some("http" | "https"))
+        && uri
+            .authority()
+            .is_some_and(|a| a.as_str().eq_ignore_ascii_case(host))
+        && origin
+            .strip_prefix("https://")
+            .or_else(|| origin.strip_prefix("http://"))
+            .is_some_and(|a| a.eq_ignore_ascii_case(host))
+}
+
 /// Direct Noise_NKpsk0 E2EE WebSocket endpoint (`/ws/e2ee`) used by Peer-Bridged multi-hop
 /// tunneling over LAN / SSH so intermediate bridge Daemons never see plaintext.
 async fn ws_e2ee_handler(
     headers: HeaderMap,
+    serving: Option<axum::Extension<ServingWeb>>,
     State(runtime): State<Arc<DaemonRuntime>>,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
-    if let Err(status) = validate_request_origin(&headers) {
+    if let Err(status) = validate_request_origin(&headers)
+        && !(serving.is_some() && same_web_origin(&headers))
+    {
         warn!(
             origin = ?headers.get(axum::http::header::ORIGIN),
             "Rejected /ws/e2ee request due to disallowed Origin header"

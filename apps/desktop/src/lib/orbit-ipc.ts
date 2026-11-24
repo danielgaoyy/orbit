@@ -1,4 +1,4 @@
-import { Channel, invoke } from "@tauri-apps/api/core";
+import { Channel, invoke as tauriInvoke, type InvokeArgs, type InvokeOptions } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { t } from "@/lib/i18n";
 
@@ -2940,7 +2940,7 @@ export interface ResolvedModelSelectionView {
   supports_fast_mode?: boolean;
 }
 
-export type ClientPlatform = "desktop" | "ios" | "android" | "harmony";
+export type ClientPlatform = "desktop" | "ios" | "android" | "harmony" | "web";
 export type SlashDirective =
   | "plan"
   | "review"
@@ -3509,30 +3509,60 @@ export function normalizeBinaryChunk(payload: unknown): Uint8Array | null {
   return null;
 }
 
+export interface OrbitTransportBackend {
+  invoke<T>(command: string, args?: InvokeArgs, options?: InvokeOptions): Promise<T>;
+  subscribe(handler: (event: CoreNotification) => void): Promise<void>;
+}
+
+class TauriIpcBackend implements OrbitTransportBackend {
+  invoke<T>(command: string, args?: InvokeArgs, options?: InvokeOptions): Promise<T> {
+    return tauriInvoke<T>(command, args, options);
+  }
+  async subscribe(handler: (event: CoreNotification) => void): Promise<void> {
+    const channel = new Channel<CoreNotification>();
+    channel.onmessage = handler;
+    await this.invoke("subscribe_core_events", { onEvent: channel });
+  }
+}
+
+const nativeBackend = new TauriIpcBackend();
+let browserBackend: OrbitTransportBackend | undefined;
+export function installWebBackend(backend: OrbitTransportBackend): void {
+  browserBackend = backend;
+}
+export function isWebRuntime(): boolean {
+  return !!browserBackend && !isTauriRuntime();
+}
+function transport(): OrbitTransportBackend | undefined {
+  return isTauriRuntime() ? nativeBackend : browserBackend;
+}
+function invoke<T>(command: string, args?: InvokeArgs, options?: InvokeOptions): Promise<T> {
+  const backend = transport();
+  if (!backend) return Promise.reject(new Error("Orbit transport unavailable"));
+  return backend.invoke<T>(command, args, options);
+}
+
 export const orbitIpc = {
   async subscribe(onNotification: (ev: CoreNotification) => void): Promise<void> {
-    if (!isTauriRuntime()) return;
-    const channel = new Channel<CoreNotification>();
-    channel.onmessage = onNotification;
-    await invoke("subscribe_core_events", { onEvent: channel });
+    await transport()?.subscribe(onNotification);
   },
 
   async getFleetOverview(): Promise<FleetOverviewView> {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { revision: 0, total_pending_approvals: 0, hosts: [], projects: [] };
     }
     return invoke("get_fleet_overview");
   },
 
   async getBridgeInfo(): Promise<BridgeInfoView> {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { protocol_version: 2, core_version: "0.3.7", capabilities: [] };
     }
     return invoke("get_bridge_info");
   },
 
   async getFleetSidebar(req: FleetSidebarRequest): Promise<FleetSidebarView> {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         revision: 0,
         projects: [],
@@ -3545,12 +3575,12 @@ export const orbitIpc = {
   },
 
   async getHostDetail(hostId: string): Promise<HostDetailView | null> {
-    if (!isTauriRuntime()) return null;
+    if (!transport()) return null;
     return invoke("get_host_detail", { hostId });
   },
 
   async getAgentStage(hostId: string, agentId: string): Promise<AgentStageView> {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         revision: 0,
         host_id: hostId,
@@ -3578,7 +3608,7 @@ export const orbitIpc = {
     sinceAuxRevision?: number | null,
     tailTurnLimit?: number | null,
   ): Promise<AgentStageDeltaView> {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         revision: 0,
         host_id: hostId,
@@ -3620,7 +3650,7 @@ export const orbitIpc = {
     startTurnIndex: number,
     count: number,
   ): Promise<StageTurnView[]> {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke("get_agent_stage_turns_slice", {
       hostId,
       agentId,
@@ -3634,7 +3664,7 @@ export const orbitIpc = {
     agentId: string,
     limitEvents = 300,
   ): Promise<boolean> {
-    if (!isTauriRuntime()) return false;
+    if (!transport()) return false;
     return invoke("load_older_agent_timeline", {
       hostId,
       agentId,
@@ -3643,12 +3673,12 @@ export const orbitIpc = {
   },
 
   async getFallbackProviderCatalogs(): Promise<ProviderModelCatalog[]> {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke("get_fallback_provider_catalogs");
   },
 
   async resolveModelSelection(req: ModelSelectionRequest): Promise<ResolvedModelSelectionView | null> {
-    if (!isTauriRuntime()) return null;
+    if (!transport()) return null;
     return invoke("resolve_model_selection", { req });
   },
 
@@ -3656,12 +3686,12 @@ export const orbitIpc = {
     platform: ClientPlatform = "desktop",
     query?: string | null,
   ): Promise<SlashCommandView[]> {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke("get_slash_commands", { platform, query: query ?? null });
   },
 
   async composePrompt(req: ComposePromptRequest): Promise<ComposedPromptView> {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       const text = req.raw_text.trim();
       const fastAction = (() => {
         if (
@@ -3724,7 +3754,7 @@ export const orbitIpc = {
   },
 
   async rankMentionCandidates(req: MentionRankRequest): Promise<MentionCandidateView[]> {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke("rank_mention_candidates", { req });
   },
 
@@ -3733,12 +3763,12 @@ export const orbitIpc = {
     agentId: string,
     maxChars = 3000,
   ): Promise<string> {
-    if (!isTauriRuntime()) return "";
+    if (!transport()) return "";
     return invoke("build_side_question_context", { hostId, agentId, maxChars });
   },
 
   async renderDiagram(req: RenderDiagramRequest): Promise<RenderDiagramView> {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         kind: req.kind,
         theme: req.theme,
@@ -3753,47 +3783,47 @@ export const orbitIpc = {
   },
 
   async markAgentSeen(hostId: string, agentId: string, seq: number): Promise<void> {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("mark_agent_seen", { hostId, agentId, seq });
   },
 
   async markAgentUnread(hostId: string, agentId: string): Promise<void> {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("mark_agent_unread", { hostId, agentId });
   },
 
   async setAgentPinned(hostId: string, agentId: string, pinned: boolean): Promise<void> {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("set_agent_pinned", { hostId, agentId, pinned });
   },
 
   async togglePinAgent(hostId: string, agentId: string): Promise<boolean> {
-    if (!isTauriRuntime()) return false;
+    if (!transport()) return false;
     return invoke<boolean>("toggle_pin_agent", { hostId, agentId });
   },
 
   async seedThreadPrefs(seeds: ClientThreadPrefSeed[]): Promise<void> {
-    if (!isTauriRuntime() || seeds.length === 0) return;
+    if (!transport() || seeds.length === 0) return;
     await invoke<void>("seed_thread_prefs", { seeds });
   },
 
   async onAppForeground(): Promise<void> {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("on_app_foreground");
   },
 
   async onAppBackground(): Promise<void> {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("on_app_background");
   },
 
   async onNetworkChanged(): Promise<void> {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("on_network_changed");
   },
 
   async getAgentTimeline(hostId: string, agentId: string): Promise<AgentTimelineView> {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { revision: 0, host_id: hostId, agent: null, items: [] };
     }
     return invoke("get_agent_timeline", { hostId, agentId });
@@ -3804,7 +3834,7 @@ export const orbitIpc = {
     agentId: string,
     sinceSeq: number,
   ): Promise<AgentTimelineDeltaView> {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         revision: 0,
         host_id: hostId,
@@ -3819,7 +3849,7 @@ export const orbitIpc = {
   },
 
   async getGitReview(hostId: string, cwd: string, path: string | null): Promise<GitReviewView> {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         revision: 0,
         host_id: hostId,
@@ -3849,7 +3879,7 @@ export const orbitIpc = {
   },
 
   getLocalMachineInfo: async (): Promise<LocalMachineInfo | null> => {
-    if (!isTauriRuntime()) return null;
+    if (!transport()) return null;
     return invoke<LocalMachineInfo>("get_local_machine_info");
   },
 
@@ -3892,17 +3922,17 @@ export const orbitIpc = {
   },
 
   removeProject: async (projectId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("remove_project", { projectId });
   },
 
   reorderProjects: async (orderedKeys: string[]): Promise<string[]> => {
-    if (!isTauriRuntime()) return orderedKeys;
+    if (!transport()) return orderedKeys;
     return invoke<string[]>("reorder_projects", { orderedKeys });
   },
 
   getProjectOrder: async (): Promise<string[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<string[]>("get_project_order");
   },
 
@@ -3911,7 +3941,7 @@ export const orbitIpc = {
     path: string,
     extraDirs?: string[],
   ): Promise<GitReposInspectionView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { path, is_git_repo: false, git_branch: null, nested_git_repos: [] };
     }
     return invoke<GitReposInspectionView>("inspect_git_repos", {
@@ -3922,52 +3952,52 @@ export const orbitIpc = {
   },
 
   getGitRepos: async (hostId: string, path: string): Promise<GitReposInspectionView | null> => {
-    if (!isTauriRuntime()) return null;
+    if (!transport()) return null;
     return invoke<GitReposInspectionView | null>("get_git_repos", { hostId, path });
   },
 
   listDirectory: async (hostId: string, path: string | null): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("list_directory", { hostId, path });
   },
 
   removeHost: async (hostId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("remove_host", { hostId });
   },
 
   updateHostRelay: async (hostId: string, relayUrl: string | null): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("update_host_relay", { hostId, relayUrl });
   },
 
   applyRelayToAllHosts: async (rawRelayUrl: string): Promise<number> => {
-    if (!isTauriRuntime()) return 0;
+    if (!transport()) return 0;
     return invoke<number>("apply_relay_to_all_hosts", { rawRelayUrl });
   },
 
   connectHost: async (hostId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("connect_host", { hostId });
   },
 
   connectAllHosts: async (): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("connect_all_hosts");
   },
 
   refreshHost: async (hostId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("refresh_host", { hostId });
   },
 
   refreshQuotas: async (hostId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("refresh_quotas", { hostId });
   },
 
   refreshProviderModels: async (hostId: string, forceRefresh = false): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("refresh_provider_models", { hostId, forceRefresh });
   },
 
@@ -3990,7 +4020,7 @@ export const orbitIpc = {
     handle?: string | null;
     autoCluster?: boolean | null;
   }): Promise<string> => {
-    if (!isTauriRuntime()) return "";
+    if (!transport()) return "";
     return invoke<string>("create_agent", {
       ...params,
       acpAgentId: params.acpAgentId ?? null,
@@ -4007,7 +4037,7 @@ export const orbitIpc = {
   },
 
   openAgentTimeline: async (hostId: string, agentId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("open_agent_timeline", { hostId, agentId });
   },
 
@@ -4021,7 +4051,7 @@ export const orbitIpc = {
       activeTurnBehavior?: ActiveTurnBehavior;
     },
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("send_prompt", {
       hostId,
       agentId,
@@ -4042,7 +4072,7 @@ export const orbitIpc = {
       queueId?: string;
     },
   ): Promise<string> => {
-    if (!isTauriRuntime()) return meta?.queueId ?? `q_${Date.now()}`;
+    if (!transport()) return meta?.queueId ?? `q_${Date.now()}`;
     return invoke<string>("enqueue_prompt", {
       hostId,
       agentId,
@@ -4058,7 +4088,7 @@ export const orbitIpc = {
     agentId: string,
     queueId: string,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("remove_queued_prompt", { hostId, agentId, queueId });
   },
 
@@ -4067,7 +4097,7 @@ export const orbitIpc = {
     agentId: string,
     queueId: string,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("flush_queued_prompt_now", { hostId, agentId, queueId });
   },
 
@@ -4076,17 +4106,17 @@ export const orbitIpc = {
     agentId: string,
     queueIds: string[],
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("reorder_queued_prompts", { hostId, agentId, queueIds });
   },
 
   interruptAgent: async (hostId: string, agentId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("interrupt_agent", { hostId, agentId });
   },
 
   interruptAgentAndContinue: async (hostId: string, agentId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("interrupt_agent_and_continue", { hostId, agentId });
   },
 
@@ -4095,7 +4125,7 @@ export const orbitIpc = {
     agentId: string,
     mode: SessionMode,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("set_session_mode", { hostId, agentId, mode });
   },
 
@@ -4105,7 +4135,7 @@ export const orbitIpc = {
     model: string | null,
     effort: ReasoningEffort | null,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("set_agent_config", { hostId, agentId, model, effort });
   },
 
@@ -4114,7 +4144,7 @@ export const orbitIpc = {
     agentId: string,
     model: string | null,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("set_agent_model", { hostId, agentId, model });
   },
 
@@ -4126,7 +4156,7 @@ export const orbitIpc = {
     effort: ReasoningEffort | null = null,
     acpAgentId: string | null = null,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("switch_agent_provider", {
       hostId,
       agentId,
@@ -4138,27 +4168,27 @@ export const orbitIpc = {
   },
 
   archiveAgent: async (hostId: string, agentId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("archive_agent", { hostId, agentId });
   },
 
   unarchiveAgent: async (hostId: string, agentId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("unarchive_agent", { hostId, agentId });
   },
 
   deleteAgent: async (hostId: string, agentId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("delete_agent", { hostId, agentId });
   },
 
   detachAgent: async (hostId: string, agentId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("detach_agent", { hostId, agentId });
   },
 
   markAgentRead: async (hostId: string, agentId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("mark_agent_read", { hostId, agentId });
   },
 
@@ -4173,7 +4203,7 @@ export const orbitIpc = {
     labels?: Record<string, string> | null;
     handle?: string | null;
   }): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("update_agent", {
       hostId: params.hostId,
       agentId: params.agentId,
@@ -4188,7 +4218,7 @@ export const orbitIpc = {
   },
 
   fetchWorkspaceBoard: async (hostId: string, workspaceId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("fetch_workspace_board", { hostId, workspaceId });
   },
 
@@ -4196,7 +4226,7 @@ export const orbitIpc = {
     hostId: string,
     workspaceId: string,
   ): Promise<WorkspaceBoardSnapshot | null> => {
-    if (!isTauriRuntime()) return null;
+    if (!transport()) return null;
     return invoke<WorkspaceBoardSnapshot | null>("get_workspace_board", {
       hostId,
       workspaceId,
@@ -4210,7 +4240,7 @@ export const orbitIpc = {
     section?: string | null;
     updatedBy?: string | null;
   }): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("update_workspace_board", {
       hostId: params.hostId,
       workspaceId: params.workspaceId,
@@ -4225,7 +4255,7 @@ export const orbitIpc = {
     workspaceId: string,
     limit?: number | null,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("fetch_workspace_events", {
       hostId,
       workspaceId,
@@ -4237,7 +4267,7 @@ export const orbitIpc = {
     hostId: string,
     workspaceId: string,
   ): Promise<WorkspaceEventRecord[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<WorkspaceEventRecord[]>("get_workspace_events", { hostId, workspaceId });
   },
 
@@ -4246,7 +4276,7 @@ export const orbitIpc = {
     workspaceId: string,
     goal: string,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("update_workspace_goal", { hostId, workspaceId, goal });
   },
 
@@ -4256,7 +4286,7 @@ export const orbitIpc = {
     targetWorkspaceId?: string | null,
     opts?: { newWorkspaceTitle?: string | null; makeUnclassified?: boolean },
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("move_agent_to_workspace_v2", {
       hostId,
       agentId,
@@ -4272,7 +4302,7 @@ export const orbitIpc = {
     agentIds: string[] = [],
     autoApply = true,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("organize_project_workspaces", {
       hostId,
       projectRoot,
@@ -4282,7 +4312,7 @@ export const orbitIpc = {
   },
 
   summarizeAgent: async (hostId: string, agentId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("summarize_agent", { hostId, agentId });
   },
 
@@ -4295,7 +4325,7 @@ export const orbitIpc = {
     lockHandle?: boolean;
     lockTitle?: boolean;
   }): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("update_agent_identity", {
       hostId: params.hostId,
       agentId: params.agentId,
@@ -4316,7 +4346,7 @@ export const orbitIpc = {
     worktreeBranch?: string | null;
     baseRef?: string | null;
   }): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("create_mission_workspace", {
       hostId: params.hostId,
       sourceCwd: params.sourceCwd,
@@ -4333,7 +4363,7 @@ export const orbitIpc = {
     sourceWorkspaceId: string,
     targetWorkspaceId: string,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("merge_workspaces", {
       hostId,
       sourceWorkspaceId,
@@ -4342,12 +4372,12 @@ export const orbitIpc = {
   },
 
   dismissClusterSuggestion: async (hostId: string, agentId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("dismiss_cluster_suggestion", { hostId, agentId });
   },
 
   spawnWorkspacePeer: async (req: SpawnWorkspacePeerRequest): Promise<string> => {
-    if (!isTauriRuntime()) return "";
+    if (!transport()) return "";
     return invoke<string>("spawn_workspace_peer", { req });
   },
 
@@ -4361,7 +4391,7 @@ export const orbitIpc = {
     baseRef?: string | null;
     prNumber?: number | null;
   }): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("create_workspace_v2", {
       hostId: params.hostId,
       sourceCwd: params.sourceCwd,
@@ -4375,7 +4405,7 @@ export const orbitIpc = {
   },
 
   renameWorkspace: async (hostId: string, workspaceId: string, title: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("rename_workspace", { hostId, workspaceId, title });
   },
 
@@ -4384,7 +4414,7 @@ export const orbitIpc = {
     workspaceId: string,
     keepAgentsUnclassified = false,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("archive_workspace_v2", {
       hostId,
       workspaceId,
@@ -4393,14 +4423,14 @@ export const orbitIpc = {
   },
 
   unarchiveWorkspace: async (hostId: string, workspaceId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("unarchive_workspace", { hostId, workspaceId });
   },
 
   previewWorktreeHandoff: async (
     req: PreviewWorktreeHandoffRequest,
   ): Promise<WorktreeHandoffPreview> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Worktree handoff requires the Orbit desktop runtime");
     }
     return invoke<WorktreeHandoffPreview>("preview_worktree_handoff", { req });
@@ -4409,14 +4439,14 @@ export const orbitIpc = {
   executeWorktreeHandoff: async (
     req: ExecuteWorktreeHandoffRequest,
   ): Promise<WorktreeHandoffOutcome> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Worktree handoff requires the Orbit desktop runtime");
     }
     return invoke<WorktreeHandoffOutcome>("execute_worktree_handoff", { req });
   },
 
   listWorkspaceScripts: async (hostId: string, workspaceId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("list_workspace_scripts", { hostId, workspaceId });
   },
 
@@ -4425,7 +4455,7 @@ export const orbitIpc = {
     workspaceId: string,
     scriptName: string,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("start_workspace_script", { hostId, workspaceId, scriptName });
   },
 
@@ -4434,17 +4464,17 @@ export const orbitIpc = {
     workspaceId: string,
     scriptName: string,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("stop_workspace_script", { hostId, workspaceId, scriptName });
   },
 
   upsertProfile: async (hostId: string, profile: AgentProfile): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("upsert_profile", { hostId, profile });
   },
 
   deleteProfile: async (hostId: string, profileId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("delete_profile", { hostId, profileId });
   },
 
@@ -4453,7 +4483,7 @@ export const orbitIpc = {
     workspaceId?: string | null,
     agentId?: string | null,
   ): Promise<ArtifactSummary[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<ArtifactSummary[]>("list_artifacts", {
       hostId,
       workspaceId: workspaceId ?? null,
@@ -4466,7 +4496,7 @@ export const orbitIpc = {
     artifactId: string,
     version?: number | null,
   ): Promise<ArtifactDetail> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime unavailable");
     }
     return invoke<ArtifactDetail>("get_artifact", {
@@ -4477,14 +4507,14 @@ export const orbitIpc = {
   },
 
   upsertArtifact: async (request: UpsertArtifactRequest): Promise<ArtifactSummary> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime unavailable");
     }
     return invoke<ArtifactSummary>("upsert_artifact", { request });
   },
 
   deleteArtifact: async (hostId: string, artifactId: string): Promise<string> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime unavailable");
     }
     return invoke<string>("delete_artifact", { hostId, artifactId });
@@ -4496,7 +4526,7 @@ export const orbitIpc = {
     artifactVersion: number | null,
     uri: string,
   ): Promise<McpResourceContent> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime unavailable");
     }
     return invoke<McpResourceContent>("read_mcp_resource", {
@@ -4514,7 +4544,7 @@ export const orbitIpc = {
     toolName: string,
     argumentsObj: Record<string, unknown>,
   ): Promise<McpToolCallOutcome> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime unavailable");
     }
     return invoke<McpToolCallOutcome>("call_artifact_mcp_tool", {
@@ -4527,12 +4557,12 @@ export const orbitIpc = {
   },
 
   listAcpAgents: async (hostId: string): Promise<AcpAgentAvailability[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<AcpAgentAvailability[]>("list_acp_agents", { hostId });
   },
 
   refreshAcpAgents: async (hostId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("refresh_acp_agents", { hostId });
   },
 
@@ -4540,7 +4570,7 @@ export const orbitIpc = {
     hostId: string,
     spec: AcpAgentSpec,
   ): Promise<AcpAgentAvailability[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<AcpAgentAvailability[]>("upsert_custom_acp_agent", { hostId, spec });
   },
 
@@ -4548,7 +4578,7 @@ export const orbitIpc = {
     hostId: string,
     agentId: string,
   ): Promise<AcpAgentAvailability[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<AcpAgentAvailability[]>("delete_custom_acp_agent", { hostId, agentId });
   },
 
@@ -4557,7 +4587,7 @@ export const orbitIpc = {
     agentId: string,
     cwd?: string | null,
   ): Promise<AcpProbeResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         agent_id: agentId,
         ok: false,
@@ -4578,7 +4608,7 @@ export const orbitIpc = {
     hostId: string,
     registryUrl?: string | null,
   ): Promise<AcpRegistryRefreshView> => {
-    if (!isTauriRuntime()) return { agents: [], warning: null };
+    if (!transport()) return { agents: [], warning: null };
     return invoke<AcpRegistryRefreshView>("refresh_acp_registry", {
       hostId,
       registryUrl: registryUrl ?? null,
@@ -4589,7 +4619,7 @@ export const orbitIpc = {
     hostId: string,
     cwd?: string | null,
   ): Promise<ExternalMcpServerRecord[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<ExternalMcpServerRecord[]>("list_external_mcp_servers", {
       hostId,
       cwd: cwd ?? null,
@@ -4599,7 +4629,7 @@ export const orbitIpc = {
   upsertExternalMcpServer: async (
     request: UpsertExternalMcpServerRequest,
   ): Promise<ExternalMcpServerRecord[]> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime unavailable");
     }
     return invoke<ExternalMcpServerRecord[]>("upsert_external_mcp_server", { request });
@@ -4611,7 +4641,7 @@ export const orbitIpc = {
     enabled: boolean,
     cwd?: string | null,
   ): Promise<ExternalMcpServerRecord[]> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime unavailable");
     }
     return invoke<ExternalMcpServerRecord[]>("toggle_external_mcp_server", {
@@ -4627,7 +4657,7 @@ export const orbitIpc = {
     serverId: string,
     cwd?: string | null,
   ): Promise<ExternalMcpServerRecord[]> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime unavailable");
     }
     return invoke<ExternalMcpServerRecord[]>("delete_external_mcp_server", {
@@ -4642,7 +4672,7 @@ export const orbitIpc = {
     serverId: string,
     cwd?: string | null,
   ): Promise<McpProbeResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         ok: false,
         tools: [],
@@ -4667,7 +4697,7 @@ export const orbitIpc = {
     target: ScheduleTarget;
     maxRuns?: number | null;
   }): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("create_schedule", {
       hostId: params.hostId,
       name: params.name,
@@ -4688,7 +4718,7 @@ export const orbitIpc = {
     maxRuns?: number | null;
     archiveOnFinish?: boolean | null;
   }): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("update_schedule", {
       hostId: params.hostId,
       scheduleId: params.scheduleId,
@@ -4701,22 +4731,22 @@ export const orbitIpc = {
   },
 
   pauseSchedule: async (hostId: string, scheduleId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("pause_schedule", { hostId, scheduleId });
   },
 
   resumeSchedule: async (hostId: string, scheduleId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("resume_schedule", { hostId, scheduleId });
   },
 
   runScheduleOnce: async (hostId: string, scheduleId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("run_schedule_once", { hostId, scheduleId });
   },
 
   deleteSchedule: async (hostId: string, scheduleId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("delete_schedule", { hostId, scheduleId });
   },
 
@@ -4725,12 +4755,12 @@ export const orbitIpc = {
     scheduleId: string,
     limit?: number | null,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("fetch_schedule_runs", { hostId, scheduleId, limit: limit ?? null });
   },
 
   getScheduleRuns: async (hostId: string, scheduleId: string): Promise<ScheduleRunRecord[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<ScheduleRunRecord[]>("get_schedule_runs", { hostId, scheduleId });
   },
 
@@ -4739,7 +4769,7 @@ export const orbitIpc = {
     pairingUri: string,
     label?: string | null,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("add_connected_host", {
       hostId,
       label: label ?? null,
@@ -4752,7 +4782,7 @@ export const orbitIpc = {
     registrationId: string,
     params: { label?: string | null; enabled?: boolean | null },
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("update_connected_host", {
       hostId,
       registrationId,
@@ -4762,12 +4792,12 @@ export const orbitIpc = {
   },
 
   removeConnectedHost: async (hostId: string, registrationId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("remove_connected_host", { hostId, registrationId });
   },
 
   syncFleetConnectedHosts: async (targetHostId: string): Promise<number> => {
-    if (!isTauriRuntime()) return 0;
+    if (!transport()) return 0;
     return invoke<number>("sync_fleet_connected_hosts", { targetHostId });
   },
 
@@ -4775,12 +4805,12 @@ export const orbitIpc = {
     hostId: string,
     config: OrchestrationConfig,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("update_orchestration_config", { hostId, config });
   },
 
   syncOrchestrationSkills: async (hostId: string, skillIds: string[]): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("sync_orchestration_skills", { hostId, skillIds });
   },
 
@@ -4788,7 +4818,7 @@ export const orbitIpc = {
     hostId: string,
     cwd?: string | null,
   ): Promise<ManagedSkillRecord[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<ManagedSkillRecord[]>("list_managed_skills", {
       hostId,
       cwd: cwd ?? null,
@@ -4800,7 +4830,7 @@ export const orbitIpc = {
     skillId: string,
     cwd?: string | null,
   ): Promise<ManagedSkillContentView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { skill_id: skillId, content: "", etag: "" };
     }
     return invoke<ManagedSkillContentView>("read_managed_skill", {
@@ -4823,7 +4853,7 @@ export const orbitIpc = {
       expectedEtag?: string | null;
     },
   ): Promise<ManagedSkillRecord[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<ManagedSkillRecord[]>("upsert_managed_skill", {
       hostId,
       scope: params.scope,
@@ -4843,7 +4873,7 @@ export const orbitIpc = {
     enabled: boolean,
     cwd?: string | null,
   ): Promise<ManagedSkillRecord[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<ManagedSkillRecord[]>("toggle_managed_skill", {
       hostId,
       skillId,
@@ -4857,7 +4887,7 @@ export const orbitIpc = {
     skillId: string,
     cwd?: string | null,
   ): Promise<ManagedSkillRecord[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<ManagedSkillRecord[]>("delete_managed_skill", {
       hostId,
       skillId,
@@ -4874,7 +4904,7 @@ export const orbitIpc = {
       slugOverride?: string | null;
     },
   ): Promise<ManagedSkillRecord[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<ManagedSkillRecord[]>("import_managed_skill", {
       hostId,
       scope: params.scope,
@@ -4885,7 +4915,7 @@ export const orbitIpc = {
   },
 
   listProviderSubagents: async (hostId: string, parentAgentId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("list_provider_subagents", { hostId, parentAgentId });
   },
 
@@ -4894,7 +4924,7 @@ export const orbitIpc = {
     parentAgentId: string,
     subagentId: string,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("open_provider_subagent_timeline", { hostId, parentAgentId, subagentId });
   },
 
@@ -4903,7 +4933,7 @@ export const orbitIpc = {
     parentAgentId: string,
     subagentId: string,
   ): Promise<ProviderSubagentEvent[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<ProviderSubagentEvent[]>("get_provider_subagent_timeline", {
       hostId,
       parentAgentId,
@@ -4917,7 +4947,7 @@ export const orbitIpc = {
     subagentId: string,
     fallbackPrompt?: string | null,
   ): Promise<StageTurnView[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<StageTurnView[]>("get_provider_subagent_turns", {
       hostId,
       parentAgentId,
@@ -4927,7 +4957,7 @@ export const orbitIpc = {
   },
 
   refreshPendingPermissions: async (hostId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("refresh_pending_permissions", { hostId });
   },
 
@@ -4959,7 +4989,7 @@ export const orbitIpc = {
     restoreFiles: boolean,
     restorePaths?: string[] | null,
   ): Promise<RewindAgentResultView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Rewind is unavailable outside the desktop runtime");
     }
     return invoke<RewindAgentResultView>("rewind_agent", {
@@ -4985,7 +5015,7 @@ export const orbitIpc = {
     return invoke<NativeNotificationDispatchResult>("send_native_approval_notification", { req });
   },
   forkAgent: async (req: ForkAgentRequest): Promise<ForkAgentResultView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Fork is unavailable outside the desktop runtime");
     }
     return invoke<ForkAgentResultView>("fork_agent", { req });
@@ -4996,7 +5026,7 @@ export const orbitIpc = {
     permissionRequestId: string,
     decision: string,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("resolve_permission", {
       hostId,
       agentId,
@@ -5016,7 +5046,7 @@ export const orbitIpc = {
       targetMode?: SessionMode | null;
     },
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("resolve_plan_approval", {
       hostId,
       agentId,
@@ -5034,7 +5064,7 @@ export const orbitIpc = {
     questionRequestId: string,
     answers: string[][],
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("answer_question", {
       hostId,
       agentId,
@@ -5044,7 +5074,7 @@ export const orbitIpc = {
   },
 
   fetchGitStatus: async (hostId: string, cwd: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("fetch_git_status", { hostId, cwd });
   },
 
@@ -5054,7 +5084,7 @@ export const orbitIpc = {
     path: string | null,
     staged: boolean,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("fetch_git_diff", { hostId, cwd, path, staged });
   },
 
@@ -5064,7 +5094,7 @@ export const orbitIpc = {
     paths?: string[];
     all?: boolean;
   }): Promise<GitMutationOutcome> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to stage git files.");
     }
     return invoke<GitMutationOutcome>("git_stage_files", {
@@ -5081,7 +5111,7 @@ export const orbitIpc = {
     paths?: string[];
     all?: boolean;
   }): Promise<GitMutationOutcome> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to unstage git files.");
     }
     return invoke<GitMutationOutcome>("git_unstage_files", {
@@ -5099,7 +5129,7 @@ export const orbitIpc = {
     reverse?: boolean;
     cached?: boolean;
   }): Promise<GitMutationOutcome> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to apply git hunks.");
     }
     return invoke<GitMutationOutcome>("git_apply_hunk", {
@@ -5117,7 +5147,7 @@ export const orbitIpc = {
     paths: string[];
     includeUntracked?: boolean;
   }): Promise<GitMutationOutcome> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to discard git changes.");
     }
     return invoke<GitMutationOutcome>("git_discard_files", {
@@ -5134,7 +5164,7 @@ export const orbitIpc = {
     message: string;
     amend?: boolean;
   }): Promise<GitCommitResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to create git commits.");
     }
     return invoke<GitCommitResult>("git_commit", {
@@ -5152,7 +5182,7 @@ export const orbitIpc = {
     branch?: string | null;
     setUpstream?: boolean;
   }): Promise<GitPushResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to push git branches.");
     }
     return invoke<GitPushResult>("git_push", {
@@ -5172,7 +5202,7 @@ export const orbitIpc = {
     base?: string | null;
     draft?: boolean;
   }): Promise<GitCreatePrResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to create pull requests.");
     }
     return invoke<GitCreatePrResult>("git_create_pr", {
@@ -5189,7 +5219,7 @@ export const orbitIpc = {
     hostId: string;
     cwd: string;
   }): Promise<GitStashListResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { entries: [] };
     }
     return invoke<GitStashListResult>("git_stash_list", {
@@ -5204,7 +5234,7 @@ export const orbitIpc = {
     message?: string | null;
     includeUntracked?: boolean;
   }): Promise<GitStashMutationResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to stash changes.");
     }
     return invoke<GitStashMutationResult>("git_stash_push", {
@@ -5221,7 +5251,7 @@ export const orbitIpc = {
     stashRef: string;
     expectedOid?: string | null;
   }): Promise<GitStashMutationResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to apply stashes.");
     }
     return invoke<GitStashMutationResult>("git_stash_apply", {
@@ -5238,7 +5268,7 @@ export const orbitIpc = {
     stashRef: string;
     expectedOid?: string | null;
   }): Promise<GitStashMutationResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to pop stashes.");
     }
     return invoke<GitStashMutationResult>("git_stash_pop", {
@@ -5255,7 +5285,7 @@ export const orbitIpc = {
     stashRef: string;
     expectedOid?: string | null;
   }): Promise<GitStashMutationResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to drop stashes.");
     }
     return invoke<GitStashMutationResult>("git_stash_drop", {
@@ -5270,7 +5300,7 @@ export const orbitIpc = {
     hostId: string;
     cwd: string;
   }): Promise<GitRebaseStatus> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         in_progress: false,
         kind: "none",
@@ -5290,7 +5320,7 @@ export const orbitIpc = {
     cwd: string;
     ontoRef: string;
   }): Promise<GitRebaseActionResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to start rebase.");
     }
     return invoke<GitRebaseActionResult>("git_rebase_start", {
@@ -5304,7 +5334,7 @@ export const orbitIpc = {
     hostId: string;
     cwd: string;
   }): Promise<GitRebaseActionResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to continue rebase.");
     }
     return invoke<GitRebaseActionResult>("git_rebase_continue", {
@@ -5317,7 +5347,7 @@ export const orbitIpc = {
     hostId: string;
     cwd: string;
   }): Promise<GitRebaseActionResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to abort rebase.");
     }
     return invoke<GitRebaseActionResult>("git_rebase_abort", {
@@ -5331,7 +5361,7 @@ export const orbitIpc = {
     cwd: string;
     expectedStep?: number | null;
   }): Promise<GitRebaseActionResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to skip rebase commit.");
     }
     return invoke<GitRebaseActionResult>("git_rebase_skip", {
@@ -5345,7 +5375,7 @@ export const orbitIpc = {
     hostId: string;
     cwd: string;
   }): Promise<GitConflictListResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { files: [] };
     }
     return invoke<GitConflictListResult>("git_list_conflicts", {
@@ -5363,7 +5393,7 @@ export const orbitIpc = {
     autoStage?: boolean;
     expectedSha256?: string | null;
   }): Promise<GitResolveConflictResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to resolve conflicts.");
     }
     return invoke<GitResolveConflictResult>("git_resolve_conflict", {
@@ -5381,7 +5411,7 @@ export const orbitIpc = {
     hostId: string;
     cwd: string;
   }): Promise<GitPrStatus> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         availability: "unavailable",
         is_draft: false,
@@ -5403,7 +5433,7 @@ export const orbitIpc = {
     hostId: string;
     cwd: string;
   }): Promise<GitGeneratedCommitMessage> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to generate commit message.");
     }
     return invoke<GitGeneratedCommitMessage>("git_generate_commit_message", {
@@ -5418,7 +5448,7 @@ export const orbitIpc = {
     cols: number,
     rows: number,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("start_terminal", { hostId, cwd, cols, rows });
   },
 
@@ -5427,12 +5457,12 @@ export const orbitIpc = {
     terminalId: string,
     slot: number,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("attach_terminal", { hostId, terminalId, slot });
   },
 
   killTerminal: async (hostId: string, terminalId: string): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("kill_terminal", { hostId, terminalId });
   },
 
@@ -5459,12 +5489,12 @@ export const orbitIpc = {
   },
 
   unsubscribeTerminalBinary: async (subscriptionId: string): Promise<void> => {
-    if (!isTauriRuntime() || !subscriptionId) return;
+    if (!transport() || !subscriptionId) return;
     await invoke<void>("unsubscribe_terminal_binary", { subscriptionId });
   },
 
   ensureTerminalSlot: async (hostId: string, terminalId: string): Promise<number | null> => {
-    if (!isTauriRuntime()) return null;
+    if (!transport()) return null;
     return invoke<number>("ensure_terminal_slot", { hostId, terminalId });
   },
 
@@ -5473,7 +5503,7 @@ export const orbitIpc = {
     terminalId: string,
     data: string,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("write_terminal_input", { hostId, terminalId, data });
   },
 
@@ -5482,7 +5512,7 @@ export const orbitIpc = {
     slot: number,
     data: string,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("send_terminal_input_slot", { hostId, slot, data });
   },
 
@@ -5492,7 +5522,7 @@ export const orbitIpc = {
     rows: number,
     terminalId?: string | null,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("resize_terminal", {
       hostId,
       cols,
@@ -5507,7 +5537,7 @@ export const orbitIpc = {
     cols: number,
     rows: number,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("resize_terminal_slot", { hostId, slot, cols, rows });
   },
 
@@ -5517,7 +5547,7 @@ export const orbitIpc = {
     title: string,
     cwd?: string,
   ): Promise<string | null> => {
-    if (!isTauriRuntime()) return null;
+    if (!transport()) return null;
     return invoke<string>("open_detached_terminal_window", {
       hostId,
       terminalId,
@@ -5532,7 +5562,7 @@ export const orbitIpc = {
     title: string,
     cwd?: string,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("reattach_detached_terminal", {
       hostId,
       terminalId,
@@ -5553,12 +5583,12 @@ export const orbitIpc = {
   },
 
   listSshHosts: async (): Promise<SshHostItem[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke("list_ssh_hosts");
   },
 
   listExternalEditors: async (): Promise<ExternalEditorInfo[]> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return [
         { kind: "cursor", label: "Cursor", installed: true },
         { kind: "zed", label: "Zed", installed: true },
@@ -5575,19 +5605,19 @@ export const orbitIpc = {
     cwd: string,
     sshTarget: string | null,
   ): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("open_in_editor", { editor, cwd, sshTarget });
   },
 
   pickProjectFolder: async (initialDir?: string | null): Promise<string | null> => {
-    if (!isTauriRuntime()) return null;
+    if (!transport()) return null;
     return invoke<string | null>("pick_project_folder", {
       initialDir: initialDir ?? null,
     });
   },
 
   getWorkspaceFiles: async (hostId: string, cwd: string, force = false): Promise<string[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<string[]>("get_workspace_files", { hostId, cwd, force });
   },
 
@@ -5596,7 +5626,7 @@ export const orbitIpc = {
     cwd: string,
     path: string,
   ): Promise<WorkspaceFileView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         host_id: hostId,
         cwd,
@@ -5638,7 +5668,7 @@ export const orbitIpc = {
     query: string,
     limit = 30,
   ): Promise<WorkspaceSymbolsView> {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { host_id: hostId, cwd, symbols: [], truncated: false };
     }
     return invoke<WorkspaceSymbolsView>("search_workspace_symbols", {
@@ -5657,7 +5687,7 @@ export const orbitIpc = {
     expectedEtag?: string | null;
     force?: boolean;
   }): Promise<WorkspaceFileWriteResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to save host files.");
     }
     return invoke<WorkspaceFileWriteResult>("write_workspace_file", {
@@ -5677,7 +5707,7 @@ export const orbitIpc = {
     isDir: boolean;
     initialContent?: string | null;
   }): Promise<WorkspaceEntryMutationResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to create workspace entries.");
     }
     return invoke<WorkspaceEntryMutationResult>("create_workspace_entry", {
@@ -5695,7 +5725,7 @@ export const orbitIpc = {
     oldPath: string;
     newPath: string;
   }): Promise<WorkspaceEntryMutationResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to rename workspace entries.");
     }
     return invoke<WorkspaceEntryMutationResult>("rename_workspace_entry", {
@@ -5711,7 +5741,7 @@ export const orbitIpc = {
     cwd: string;
     path: string;
   }): Promise<WorkspaceEntryMutationResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to delete workspace entries.");
     }
     return invoke<WorkspaceEntryMutationResult>("delete_workspace_entry", {
@@ -5725,7 +5755,7 @@ export const orbitIpc = {
     hostId: string,
     cwd: string,
   ): Promise<InstructionFilesSnapshotView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         host_id: hostId,
         cwd,
@@ -5745,7 +5775,7 @@ export const orbitIpc = {
     cwd: string,
     path: string,
   ): Promise<InstructionFileContentView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         host_id: hostId,
         cwd,
@@ -5769,7 +5799,7 @@ export const orbitIpc = {
     content: string;
     expectedEtag?: string | null;
   }): Promise<InstructionFileSavedView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to save instruction files.");
     }
     return invoke<InstructionFileSavedView>("save_instruction_file", {
@@ -5782,7 +5812,7 @@ export const orbitIpc = {
   },
 
   listPathRules: async (hostId: string, cwd: string): Promise<PathRulesSnapshotView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         host_id: hostId,
         cwd,
@@ -5795,7 +5825,7 @@ export const orbitIpc = {
   },
 
   upsertPathRule: async (params: UpsertPathRuleParams): Promise<PathRulesSnapshotView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to save path rules.");
     }
     return invoke<PathRulesSnapshotView>("upsert_path_rule", {
@@ -5817,7 +5847,7 @@ export const orbitIpc = {
     cwd: string;
     path: string;
   }): Promise<PathRulesSnapshotView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to delete path rules.");
     }
     return invoke<PathRulesSnapshotView>("delete_path_rule", {
@@ -5833,7 +5863,7 @@ export const orbitIpc = {
     activePaths: string[];
     manualRuleNames: string[];
   }): Promise<MatchedPathRulesView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         host_id: params.hostId,
         cwd: params.cwd,
@@ -5851,7 +5881,7 @@ export const orbitIpc = {
   },
 
   listLspServers: async (hostId: string, cwd: string): Promise<LspServerStatus[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<LspServerStatus[]>("list_lsp_servers", { hostId, cwd });
   },
 
@@ -5862,7 +5892,7 @@ export const orbitIpc = {
     path?: string | null;
     limit?: number;
   }): Promise<LspSymbolInfo[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<LspSymbolInfo[]>("lsp_query_symbols", {
       hostId: params.hostId,
       cwd: params.cwd,
@@ -5877,7 +5907,7 @@ export const orbitIpc = {
     cwd: string,
     path?: string | null,
   ): Promise<LspDiagnostic[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<LspDiagnostic[]>("lsp_get_diagnostics", {
       hostId,
       cwd,
@@ -5892,7 +5922,7 @@ export const orbitIpc = {
     line: number;
     col: number;
   }): Promise<LspLocation[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<LspLocation[]>("lsp_goto_definition", {
       hostId: params.hostId,
       cwd: params.cwd,
@@ -5910,7 +5940,7 @@ export const orbitIpc = {
     col: number;
     content?: string | null;
   }): Promise<LspHoverInfo | null> => {
-    if (!isTauriRuntime()) return null;
+    if (!transport()) return null;
     return invoke<LspHoverInfo | null>("lsp_hover", {
       hostId: params.hostId,
       cwd: params.cwd,
@@ -5930,7 +5960,7 @@ export const orbitIpc = {
     includeDeclaration?: boolean;
     content?: string | null;
   }): Promise<LspReferenceLocation[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<LspReferenceLocation[]>("lsp_references", {
       hostId: params.hostId,
       cwd: params.cwd,
@@ -5951,7 +5981,7 @@ export const orbitIpc = {
     triggerCharacter?: string | null;
     content?: string | null;
   }): Promise<LspCompletionItem[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<LspCompletionItem[]>("lsp_completion", {
       hostId: params.hostId,
       cwd: params.cwd,
@@ -5974,7 +6004,7 @@ export const orbitIpc = {
     diagnostics?: LspDiagnostic[];
     content?: string | null;
   }): Promise<LspCodeAction[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<LspCodeAction[]>("lsp_code_action", {
       hostId: params.hostId,
       cwd: params.cwd,
@@ -5997,7 +6027,7 @@ export const orbitIpc = {
     newName: string;
     content?: string | null;
   }): Promise<LspWorkspaceEditResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { applied: false, modified_files: [], total_edits: 0 };
     }
     return invoke<LspWorkspaceEditResult>("lsp_rename", {
@@ -6016,7 +6046,7 @@ export const orbitIpc = {
     cwd: string;
     edit: LspWorkspaceEdit;
   }): Promise<LspWorkspaceEditResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { applied: false, modified_files: [], total_edits: 0 };
     }
     return invoke<LspWorkspaceEditResult>("lsp_apply_workspace_edit", {
@@ -6031,7 +6061,7 @@ export const orbitIpc = {
     cwd: string,
     serverId: string,
   ): Promise<LspServerStatus[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<LspServerStatus[]>("restart_lsp_server", {
       hostId,
       cwd,
@@ -6046,7 +6076,7 @@ export const orbitIpc = {
     prompt: string;
     condition: TimerCondition;
   }): Promise<ConditionalTimerRecord> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Tauri runtime unavailable");
     }
     return invoke<ConditionalTimerRecord>("create_conditional_timer", {
@@ -6063,7 +6093,7 @@ export const orbitIpc = {
     agentId?: string | null,
     includeResolved = true,
   ): Promise<ConditionalTimerRecord[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<ConditionalTimerRecord[]>("list_conditional_timers", {
       hostId,
       agentId: agentId ?? null,
@@ -6075,7 +6105,7 @@ export const orbitIpc = {
     hostId: string,
     timerId: string,
   ): Promise<ConditionalTimerRecord> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Tauri runtime unavailable");
     }
     return invoke<ConditionalTimerRecord>("cancel_conditional_timer", {
@@ -6088,7 +6118,7 @@ export const orbitIpc = {
     hostId: string,
     timerId: string,
   ): Promise<ConditionalTimerRecord> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Tauri runtime unavailable");
     }
     return invoke<ConditionalTimerRecord>("fire_conditional_timer_now", {
@@ -6098,7 +6128,7 @@ export const orbitIpc = {
   },
 
   getGuardianConfig: async (hostId: string): Promise<GuardianConfigSnapshotView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         config: {
           enabled: true,
@@ -6120,7 +6150,7 @@ export const orbitIpc = {
     hostId: string,
     config: GuardianPolicyConfig,
   ): Promise<GuardianConfigSnapshotView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { config, recent_audits: [] };
     }
     return invoke<GuardianConfigSnapshotView>("update_guardian_config", { hostId, config });
@@ -6130,7 +6160,7 @@ export const orbitIpc = {
     hostId: string,
     projectCwd?: string | null,
   ): Promise<PermissionRuleRecord[]> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return [];
     }
     return invoke<PermissionRuleRecord[]>("list_permission_rules", {
@@ -6143,7 +6173,7 @@ export const orbitIpc = {
     hostId: string,
     rule: UpsertPermissionRuleInput,
   ): Promise<PermissionRuleRecord> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         id: rule.id ?? `pr_mock_${Date.now()}`,
         scope_kind: rule.scope_kind,
@@ -6164,7 +6194,7 @@ export const orbitIpc = {
   },
 
   deletePermissionRule: async (hostId: string, ruleId: string): Promise<boolean> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return true;
     }
     return invoke<boolean>("delete_permission_rule", { hostId, ruleId });
@@ -6175,7 +6205,7 @@ export const orbitIpc = {
     items: Array<[string, string]>,
     decision = "allow",
   ): Promise<ResolvePermissionsBatchResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { resolved_count: 0, skipped_count: items.length, skipped_reasons: [] };
     }
     return invoke<ResolvePermissionsBatchResult>("resolve_permissions_batch", {
@@ -6186,7 +6216,7 @@ export const orbitIpc = {
   },
 
   listImChannels: async (hostId: string): Promise<ImChannelsSnapshotView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { channels: [], bindings: [], base_webhook_url: "http://127.0.0.1:7788" };
     }
     return invoke<ImChannelsSnapshotView>("list_im_channels", { hostId });
@@ -6196,7 +6226,7 @@ export const orbitIpc = {
     hostId: string,
     request: UpsertImChannelRequest,
   ): Promise<ImChannelsSnapshotView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { channels: [], bindings: [], base_webhook_url: "http://127.0.0.1:7788" };
     }
     return invoke<ImChannelsSnapshotView>("upsert_im_channel", { hostId, request });
@@ -6206,7 +6236,7 @@ export const orbitIpc = {
     hostId: string,
     channelId: string,
   ): Promise<ImChannelsSnapshotView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { channels: [], bindings: [], base_webhook_url: "http://127.0.0.1:7788" };
     }
     return invoke<ImChannelsSnapshotView>("delete_im_channel", { hostId, channelId });
@@ -6218,7 +6248,7 @@ export const orbitIpc = {
     targetChatId: string,
     message: string,
   ): Promise<ImChannelTestResultView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { ok: false, detail: "Not running in Tauri runtime" };
     }
     return invoke<ImChannelTestResultView>("test_im_channel", {
@@ -6230,7 +6260,7 @@ export const orbitIpc = {
   },
 
   getPersonalRouterStatus: async (hostId: string): Promise<RouterStatusSnapshot> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Not running in Tauri runtime");
     }
     return invoke<RouterStatusSnapshot>("get_personal_router_status", { hostId });
@@ -6242,7 +6272,7 @@ export const orbitIpc = {
     activate = true,
     externalWebhookSecret?: string | null,
   ): Promise<RouterStatusSnapshot> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Not running in Tauri runtime");
     }
     return invoke<RouterStatusSnapshot>("configure_personal_router", {
@@ -6254,21 +6284,21 @@ export const orbitIpc = {
   },
 
   discoverFleetRouterHosts: async (): Promise<RouterHostCapabilities[]> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return [];
     }
     return invoke<RouterHostCapabilities[]>("discover_fleet_router_hosts");
   },
 
   exportHermesBridgeConfig: async (hostId: string): Promise<HermesBridgeBundle> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Not running in Tauri runtime");
     }
     return invoke<HermesBridgeBundle>("export_hermes_bridge_config", { hostId });
   },
 
   getPrimaryRouterSelection: async (): Promise<PrimaryRouterSelection | null> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return null;
     }
     return invoke<PrimaryRouterSelection | null>("get_primary_router_selection");
@@ -6277,7 +6307,7 @@ export const orbitIpc = {
   setPrimaryRouterSelection: async (
     selection: PrimaryRouterSelection | null,
   ): Promise<PrimaryRouterSelection | null> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return selection;
     }
     return invoke<PrimaryRouterSelection | null>("set_primary_router_selection", { selection });
@@ -6287,7 +6317,7 @@ export const orbitIpc = {
     content: string,
     maxLines = 2500,
   ): Promise<HighlightedLineView[]> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return content.split(/\r?\n/).map((line, i) => ({
         line_number: i + 1,
         tokens: [
@@ -6320,7 +6350,7 @@ export const orbitIpc = {
     },
     onEvent: (ev: SideQuestionStreamEvent) => void,
   ): Promise<string> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       const id = `mock_${Date.now()}`;
       setTimeout(() => {
         onEvent({
@@ -6332,6 +6362,7 @@ export const orbitIpc = {
       }, 150);
       return id;
     }
+    if (!isTauriRuntime()) throw new Error("Side questions are unavailable in Orbit Web");
     const ch = new Channel<SideQuestionStreamEvent>();
     ch.onmessage = onEvent;
     return invoke<string>("ask_side_question", {
@@ -6350,12 +6381,13 @@ export const orbitIpc = {
     markdown: string,
     streaming: boolean,
   ): Promise<RichBlockView[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<RichBlockView[]>("parse_markdown_preview", { markdown, streaming });
   },
 
   openBrowserPopoutWindow: async (url: string, title?: string | null): Promise<void> => {
     if (!isTauriRuntime()) {
+      if (!/^https?:\/\//i.test(url)) throw new Error("Unsupported browser URL");
       window.open(url, "_blank", "noopener,noreferrer");
       return;
     }
@@ -6367,6 +6399,7 @@ export const orbitIpc = {
 
   openExternalBrowserUrl: async (url: string): Promise<void> => {
     if (!isTauriRuntime()) {
+      if (!/^https?:\/\//i.test(url)) throw new Error("Unsupported browser URL");
       window.open(url, "_blank", "noopener,noreferrer");
       return;
     }
@@ -6378,7 +6411,7 @@ export const orbitIpc = {
     cwd: string,
     path: string,
   ): Promise<void> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Desktop runtime required to open local files externally");
     }
     await invoke<void>("open_local_file_externally", { hostId, cwd, path });
@@ -6389,7 +6422,7 @@ export const orbitIpc = {
     filename: string,
     bytes: Uint8Array,
   ): Promise<StagedAttachmentInfo> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { path: `/tmp/${filename}`, filename, size_bytes: bytes.byteLength };
     }
     return invoke<StagedAttachmentInfo>("stage_host_attachment_bytes", bytes, {
@@ -6405,7 +6438,7 @@ export const orbitIpc = {
     filename: string,
     dataB64: string,
   ): Promise<StagedAttachmentInfo> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       const approxBytes = Math.floor((dataB64.length * 3) / 4);
       return { path: `/tmp/${filename}`, filename, size_bytes: approxBytes };
     }
@@ -6417,7 +6450,7 @@ export const orbitIpc = {
   },
 
   readClipboardImages: async (): Promise<ClipboardImagePayload[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<ClipboardImagePayload[]>("read_clipboard_images");
   },
 
@@ -6432,7 +6465,7 @@ export const orbitIpc = {
   },
 
   getAppVersion: async (): Promise<string> => {
-    if (!isTauriRuntime()) return "0.10.4";
+    if (!transport()) return "0.10.4";
     return invoke<string>("get_app_version");
   },
 
@@ -6444,6 +6477,7 @@ export const orbitIpc = {
     targetTag: string | null | undefined,
     onProgress: (ev: AppUpdateProgress) => void,
   ): Promise<void> => {
+    if (!isTauriRuntime()) throw new Error("Native updates require Orbit Desktop");
     const ch = new Channel<AppUpdateProgress>();
     ch.onmessage = onProgress;
     return invoke<void>("perform_app_self_update", {
@@ -6456,7 +6490,7 @@ export const orbitIpc = {
     hostId?: string | null,
     force = false,
   ): Promise<LocalDaemonSyncResult> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { status: "skipped_dev", daemon_version: null, source: "dev" };
     }
     return invoke<LocalDaemonSyncResult>("sync_local_daemon", {
@@ -6469,7 +6503,7 @@ export const orbitIpc = {
     hostId: string,
     targetVersion?: string | null,
   ): Promise<string> => {
-    if (!isTauriRuntime()) return "ok";
+    if (!transport()) return "ok";
     return invoke<string>("upgrade_host_daemon_over_wire", {
       hostId,
       targetVersion: targetVersion ?? null,
@@ -6477,7 +6511,7 @@ export const orbitIpc = {
   },
 
   getCloudSyncStatus: async (): Promise<CloudSyncStatusView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         state: "signed_out",
         provider: "github_gist",
@@ -6501,7 +6535,7 @@ export const orbitIpc = {
   },
 
   cloudSyncGeneratePassphrase: async (): Promise<string> => {
-    if (!isTauriRuntime()) return "orbit-DEMO-KEY1-KEY2-KEY3-KEY4";
+    if (!transport()) return "orbit-DEMO-KEY1-KEY2-KEY3-KEY4";
     return invoke<string>("cloud_sync_generate_passphrase");
   },
 
@@ -6548,7 +6582,7 @@ export const orbitIpc = {
   },
 
   cloudSyncTriggerBackground: async (): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("cloud_sync_trigger_background").catch(() => undefined);
   },
 
@@ -6557,17 +6591,17 @@ export const orbitIpc = {
   },
 
   cloudSyncGetPreferences: async (): Promise<Record<string, unknown>> => {
-    if (!isTauriRuntime()) return {};
+    if (!transport()) return {};
     return invoke<Record<string, unknown>>("cloud_sync_get_preferences");
   },
 
   cloudSyncUpdatePreferences: async (patch: Record<string, unknown>): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("cloud_sync_update_preferences", { patch }).catch(() => undefined);
   },
 
   searchMessages: async (query: string, limit = 20): Promise<ConversationSearchHit[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     const trimmed = query.trim();
     if (!trimmed) return [];
     return invoke<ConversationSearchHit[]>("search_messages", {
@@ -6579,7 +6613,7 @@ export const orbitIpc = {
   searchMessagesRemote: async (
     req: SearchMessagesRemoteRequest,
   ): Promise<SearchMessagesRemoteResponse> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { hits: [], remote_hosts_queried: 0, remote_hosts_failed: 0 };
     }
     const trimmed = req.query.trim();
@@ -6599,7 +6633,7 @@ export const orbitIpc = {
     agentId: string,
     options?: Partial<ExportOptions>,
   ): Promise<ExportedTranscript> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Transcript export requires the Orbit desktop runtime");
     }
     return invoke<ExportedTranscript>("export_agent_transcript", {
@@ -6622,7 +6656,7 @@ export const orbitIpc = {
     options?: Partial<ExportOptions>,
     initialDir?: string | null,
   ): Promise<string | null> => {
-    if (!isTauriRuntime()) return null;
+    if (!transport()) return null;
     return invoke<string | null>("save_exported_transcript", {
       hostId,
       agentId,
@@ -6642,7 +6676,7 @@ export const orbitIpc = {
     hostId: string,
     agentId: string,
   ): Promise<ExtractedCodeBlock[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<ExtractedCodeBlock[]>("list_agent_code_blocks", {
       hostId,
       agentId,
@@ -6653,7 +6687,7 @@ export const orbitIpc = {
     hostId: string,
     days = 7,
   ): Promise<UsageInsightsSnapshot> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         days,
         total_cost_usd: 0,
@@ -6678,7 +6712,7 @@ export const orbitIpc = {
     hostId: string,
     agentId: string,
   ): Promise<ContextOccupancyBreakdown> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         agent_id: agentId,
         model: "default",
@@ -6705,7 +6739,7 @@ export const orbitIpc = {
     hostId: string,
     cwd: string | null,
   ): Promise<LifecycleHooksSnapshotView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { hooks: [], recent_executions: [], project_hooks_trusted: false };
     }
     return invoke<LifecycleHooksSnapshotView>("list_lifecycle_hooks", {
@@ -6719,7 +6753,7 @@ export const orbitIpc = {
     cwd: string | null,
     hook: LifecycleHookRule,
   ): Promise<LifecycleHooksSnapshotView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { hooks: [hook], recent_executions: [], project_hooks_trusted: false };
     }
     return invoke<LifecycleHooksSnapshotView>("upsert_lifecycle_hook", {
@@ -6735,7 +6769,7 @@ export const orbitIpc = {
     hookId: string,
     scope: HookScope,
   ): Promise<LifecycleHooksSnapshotView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { hooks: [], recent_executions: [], project_hooks_trusted: false };
     }
     return invoke<LifecycleHooksSnapshotView>("delete_lifecycle_hook", {
@@ -6751,7 +6785,7 @@ export const orbitIpc = {
     cwd: string,
     trusted: boolean,
   ): Promise<LifecycleHooksSnapshotView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { hooks: [], recent_executions: [], project_hooks_trusted: trusted };
     }
     return invoke<LifecycleHooksSnapshotView>("set_project_hooks_trust", {
@@ -6767,7 +6801,7 @@ export const orbitIpc = {
     hookId: string,
     samplePayload: Record<string, unknown>,
   ): Promise<HookExecutionRecord> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Hook testing requires the Orbit desktop runtime");
     }
     return invoke<HookExecutionRecord>("test_lifecycle_hook", {
@@ -6799,7 +6833,7 @@ export const orbitIpc = {
   },
 
   listGoalRuns: async (hostId: string, agentId?: string | null): Promise<GoalRunRecord[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<GoalRunRecord[]>("list_goal_runs", {
       hostId,
       agentId: agentId ?? null,
@@ -6838,7 +6872,7 @@ export const orbitIpc = {
     hostId: string,
     agentId?: string | null,
   ): Promise<MonitorWatchRecord[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<MonitorWatchRecord[]>("list_monitor_watches", {
       hostId,
       agentId: agentId ?? null,
@@ -6853,7 +6887,7 @@ export const orbitIpc = {
   },
 
   listEventTriggers: async (hostId: string): Promise<EventTriggersSnapshotView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { triggers: [], recent_deliveries: [], base_webhook_url: "http://127.0.0.1:6868" };
     }
     return invoke<EventTriggersSnapshotView>("list_event_triggers", { hostId });
@@ -6862,7 +6896,7 @@ export const orbitIpc = {
   upsertEventTrigger: async (
     req: UpsertEventTriggerRequest,
   ): Promise<EventTriggersSnapshotView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { triggers: [], recent_deliveries: [], base_webhook_url: "http://127.0.0.1:6868" };
     }
     return invoke<EventTriggersSnapshotView>("upsert_event_trigger", { req });
@@ -6872,7 +6906,7 @@ export const orbitIpc = {
     hostId: string,
     triggerId: string,
   ): Promise<EventTriggersSnapshotView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return { triggers: [], recent_deliveries: [], base_webhook_url: "http://127.0.0.1:6868" };
     }
     return invoke<EventTriggersSnapshotView>("delete_event_trigger", {
@@ -6887,7 +6921,7 @@ export const orbitIpc = {
     sampleEventType: string,
     samplePayload: Record<string, unknown>,
   ): Promise<EventTriggerDelivery> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("Trigger testing requires the Orbit desktop runtime");
     }
     return invoke<EventTriggerDelivery>("test_event_trigger", {
@@ -6899,7 +6933,7 @@ export const orbitIpc = {
   },
 
   listBrowserSessions: async (hostId: string): Promise<BrowserSessionsSnapshotView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         host_id: hostId,
         sessions: [],
@@ -6975,7 +7009,7 @@ export const orbitIpc = {
     targetPort: number,
     proxyHost?: string | null,
   ): Promise<RemotePreviewTunnelView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         host_id: hostId,
         target_port: targetPort,
@@ -6997,7 +7031,7 @@ export const orbitIpc = {
     targetPort: number,
     proxyHost?: string | null,
   ): Promise<boolean> => {
-    if (!isTauriRuntime()) return false;
+    if (!transport()) return false;
     return invoke<boolean>("close_remote_preview_tunnel", {
       hostId,
       targetPort,
@@ -7075,7 +7109,7 @@ export const orbitIpc = {
     hostId: string,
     includeCompleted = true,
   ): Promise<WorkflowRunRecord[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<WorkflowRunRecord[]>("list_workflow_runs", {
       hostId,
       includeCompleted,
@@ -7106,7 +7140,7 @@ export const orbitIpc = {
   // --- Enhanced Desktop Notifications & Native Mobile Background Push ---
 
   focusMainWindow: async (): Promise<void> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       if (typeof window !== "undefined") window.focus();
       return;
     }
@@ -7114,7 +7148,7 @@ export const orbitIpc = {
   },
 
   updateTrayStatus: async (runningCount: number, pendingApprovals: number): Promise<void> => {
-    if (!isTauriRuntime()) return;
+    if (!transport()) return;
     await invoke<void>("update_tray_status", {
       runningCount: Math.max(0, Math.floor(runningCount)),
       pendingApprovals: Math.max(0, Math.floor(pendingApprovals)),
@@ -7147,19 +7181,19 @@ export const orbitIpc = {
   },
 
   probeLocalProviderReadiness: async (): Promise<ProviderReadinessInfo[]> => {
-    if (!isTauriRuntime()) return [];
+    if (!transport()) return [];
     return invoke<ProviderReadinessInfo[]>("probe_local_provider_readiness");
   },
 
   renderQrSvg: async (content: string): Promise<string> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       throw new Error("QR rendering requires the Orbit Desktop runtime");
     }
     return invoke<string>("render_qr_svg", { content });
   },
 
   listPushDevices: async (hostId: string): Promise<PushDevicesSnapshotView> => {
-    if (!isTauriRuntime()) {
+    if (!transport()) {
       return {
         devices: [],
         preferences: {

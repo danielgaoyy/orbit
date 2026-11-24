@@ -1,6 +1,6 @@
 # `crates/` 局部工程规范（Rust Workspace）
 
-本文件管辖 `crates/*` 下全部 13 个 Rust crate 的共有工程要求。
+本文件管辖 `crates/*` 下全部 Rust crate 的共有工程要求。
 
 1. **编码与安全红线**：
    - Workspace 已强制 `unsafe_code = "deny"` 与 `clippy::unwrap_used = "warn"`；生产代码严禁新增 `.unwrap()` / `.expect()` 裸崩或未校验敏感外泄，错误统一由 `thiserror` / `anyhow` 显式向上传递。

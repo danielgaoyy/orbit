@@ -12,6 +12,8 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+axum.workspace = true
+cap-std = "4"
 orbit-protocol.workspace = true
 orbit-crypto.workspace = true
 orbit-shim.workspace = true

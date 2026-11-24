@@ -1,0 +1,28 @@
+{
+  "extends": "../desktop/tsconfig.app.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/web.tsbuildinfo",
+    "baseUrl": ".",
+    "typeRoots": [
+      "../desktop/node_modules/@types"
+    ],
+    "paths": {
+      "@/*": [
+        "../desktop/src/*"
+      ],
+      "react": [
+        "../desktop/node_modules/@types/react"
+      ],
+      "react/*": [
+        "../desktop/node_modules/@types/react/*"
+      ],
+      "react-dom/*": [
+        "../desktop/node_modules/@types/react-dom/*"
+      ]
+    }
+  },
+  "include": [
+    "src",
+    "../desktop/src/vite-env.d.ts"
+  ]
+}

@@ -2,6 +2,14 @@ import type { MessageDictionary } from "./en.ts";
 
 export const ja: MessageDictionary = {
   // Common
+  "web.pairTitle": "ホストをペアリング",
+  "web.pairHelp": "ホストで orbit pair を実行し、URI を貼り付けるか QR コードの画像を選択してください。",
+  "web.uri": "ペアリング URI",
+  "web.qr": "QR コード画像",
+  "web.qrError": "この画像に Orbit ペアリングコードが見つかりません。",
+  "web.connecting": "接続中…",
+  "web.connect": "接続",
+  "web.startError": "Orbit Web を起動できませんでした。",
   "common.newSession": "新しいセッション",
   "common.newConversation": "新しい会話",
   "common.conversation": "会話",

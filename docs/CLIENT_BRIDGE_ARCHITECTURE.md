@@ -1,6 +1,6 @@
 # Orbit Client Architecture & Client Bridge Protocol v2
 
-This document describes the unified cross-platform architecture of Orbit across all four clients (**Desktop React/TS**, **iOS SwiftUI**, **Android Jetpack Compose**, and **HarmonyOS ArkTS V2**), anchored on **`orbit-client-core`** + **`orbit-store`** as the single authoritative data, persistence, and domain-logic layer.
+Desktop, Web PWA, iOS, Android and HarmonyOS share the Rust presentation model in `orbit-client-core`. Native clients use SQLite and the native transport runtime. The browser uses WebAssembly, WebSocket and IndexedDB.
 
 ---
 
@@ -105,7 +105,7 @@ Thread metadata (`seen_seq`, `is_pinned`, `pinned_order`, `updated_at_ms`) is pe
 
 ---
 
-## 5. Four-Platform Ownership & Parity Matrix
+## 5. Native binding coverage
 
 | Feature / Domain | Rust Core (`orbit-client-core`) | Desktop (React/TS) | iOS (SwiftUI) | Android (Compose) | HarmonyOS (ArkTS V2) |
 | --- | --- | --- | --- | --- | --- |
@@ -151,3 +151,13 @@ The shared Rust entry points on `OrbitAppCore` take an explicit `host_id` and co
 For permission approvals, display the visual permission UI on `requires_visual_confirmation`. On `requires_spoken_confirmation`, collect an explicit confirmation for the same request. Route confirmed approvals through `approve_voice_permission`; it checks the live request again before a one-time dispatch. An absent, unassessed, high-risk, human-only or plan request yields visual confirmation.
 
 `synthesize_voice_speech` returns a validated WAV, MIME type, duration and backend. Its structured error code `voice_client_tts_required` requests client synthesis. The separate `voice_tts_disabled` code respects the host's explicit preference for silence. Clients may use `auto_speak_responses` when selecting assistant replies for speech.
+
+## 7. WebAssembly and browser transport
+
+`orbit-client-wasm` links the renderer, diagram, math, stage, sidebar, catalog, composer and export modules from `orbit-client-core` with its native feature disabled. Browser Noise and cloud vault operations call `orbit-crypto`. A pure Rust zstd implementation preserves the encrypted Gist vault format. The browser keeps one session and one timeline replica per paired host.
+
+`apps/web` loads the generated bindings and installs `WasmWebBackend` before mounting the Desktop React workspace. Tauri selects `TauriIpcBackend` and retains native IPC channels and binary arguments. Browser sessions try the direct WebSocket routes and then the configured WebSocket relay. The first authenticated Hello advertises `supports_zstd: false`. Welcome must match the pairing offer's host ID and static public key. Inside Noise, wire JSON uses discriminator `0x02`, compressed wire JSON uses `0x00`, and terminal frames use `0x01`. Older Hellos default to compressed output. Relay tunnel forwarding operates on ciphertext for both encodings.
+
+Pair with the URI or QR image printed by `orbit pair`. The browser stores paired profiles and bounded host snapshots in IndexedDB under a non-extractable AES-GCM key. Reopening the shell hydrates host metadata offline and refreshes it on connection. Live timelines are scoped to host and agent. Native SSH, external editors and OS integration require the desktop application.
+
+Install the Rust `wasm32-unknown-unknown` target, then run `npm ci && npm run build` in `apps/web`. The build generates version-matched wasm-bindgen glue and a service worker precache for that release's shell and WASM. Serve `dist` from a trusted HTTPS origin or run `orbit daemon --serve-web apps/web/dist` on loopback. The foreground relay accepts the same option. Static hosting defaults to off. An HTTPS page needs browser-permitted WebSocket endpoints, normally `wss://`. The daemon admits its hosted same-origin PWA on the encrypted endpoint. The existing direct RPC origin and bearer checks still apply to native RPC endpoints.

@@ -1,6 +1,6 @@
 # `apps/` 局部工程规范（全客户端共享约束）
 
-本文件适用于 `apps/desktop`、`apps/ios`、`apps/android` 与 `apps/harmony`。
+本文件适用于 `apps/desktop`、`apps/web`、`apps/ios`、`apps/android` 与 `apps/harmony`。
 
 1. **UI / 交互改动必读 Skill**：
    - 修改 `apps/` 下任何页面、布局、样式、弹窗或交互前，**必须先完整读取并遵循 [`.agents/skills/interface-design/SKILL.md`](../.agents/skills/interface-design/SKILL.md)** 与 [`docs/design/README.md`](../docs/design/README.md)（若仓库存在 `.interface-design/system.md` 需一并读取）。

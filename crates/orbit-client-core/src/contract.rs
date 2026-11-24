@@ -13,12 +13,12 @@ use orbit_protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::HostRouteMode;
-pub use crate::app_core::{AgentCardView, AskSideQuestionRequest};
 pub use crate::diagram::{DiagramKind, DiagramTheme, RenderDiagramRequest, RenderDiagramView};
 pub use crate::export::{
     ExportAgentMeta, ExportFormat, ExportOptions, ExportedTranscript, ExtractedCodeBlock,
 };
 use crate::sidebar::{SidebarProjectSort, SidebarThreadFilter};
+pub use crate::viewmodel::{AgentCardView, AskSideQuestionRequest};
 
 pub const CLIENT_BRIDGE_PROTOCOL_VERSION: u32 = 2;
 

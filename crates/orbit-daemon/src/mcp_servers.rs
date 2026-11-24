@@ -604,7 +604,7 @@ impl Drop for TempFileGuard {
     }
 }
 
-fn write_json_atomic(
+pub(crate) fn write_json_atomic(
     path: &Path,
     value: &Value,
     #[cfg_attr(not(unix), allow(unused_variables))] private_mode: bool,

@@ -22,7 +22,7 @@
      此分片同时验证插件安装/启停/调用/条件 MCP 目录以及本地离线语音控制面端到端流程。
    - `Workspace Sync & Worktree`：`-p orbit-cli --test e2e_workspace_sync_and_worktree`
 3. **跨端构建与烟测任务**：
-   - `desktop-frontend-build`（`Desktop Frontend Typecheck & Build`）：Node unit tests + `npm run build` + `npm run test:smoke`
+   - `desktop-frontend-build`（`Desktop Frontend Typecheck & Build`）：Node unit tests + `npm run build` + `npm run test:smoke` + `apps/docs` Astro Starlight 双语文档站构建校验
    - `tauri-rust-check`（macOS）：Tauri crate fmt / clippy / tests
    - `windows-rust-and-desktop-check`（Windows）：`cargo build -p orbit-cli --bin orbit` + `cargo test --workspace -- --skip live_devbox_ssh_one_click_e2e` + Desktop check
    - `ios-build-and-simulator-smoke`（macOS）：XCFramework + `xcodegen` + 并行唤醒模拟器与单遍 Simulator `xcodebuild test` + Launch 截图烟测
@@ -79,3 +79,5 @@ In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight
 若需增删或重命名 `rust-quality-and-unit`、`e2e-regression-matrix` 标签或 `desktop-frontend-build`，**必须在同一 PR 合入前后同步调整 GitHub Ruleset `protect-main-and-master`（ID `27444583`）的 `required_status_checks`**，否则所有 PR 将被永久挂起。
 
 The Rust quality job runs `bash scripts/check-ohos-dts-sync.sh` to verify every N-API method against the checked-in ArkTS declarations, including factories, optional arguments and promise results. After changing the Rust exports, run the script with `--write` to regenerate `index.d.ts`.
+
+[Orbit Patrol’s opt-in workflow](../../.github/workflows/orbit-pr-review.yml.example) runs on read-only pull request events. It builds the reviewer at the trusted base SHA and reads the fork head as Git objects. Download the JSON report from the run artifacts.

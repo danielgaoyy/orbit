@@ -62,12 +62,20 @@ import {
   X,
 } from "lucide-react";
 import {
+  type FimConfig,
   type LspCodeAction,
   type LspDiagnostic,
   type LspReferenceLocation,
   type WorkspaceFileConflict,
   orbitIpc,
 } from "@/lib/orbit-ipc";
+import {
+  DEFAULT_FIM_CONFIG,
+  clearGhostTextEffect,
+  createFimGhostTextExtension,
+  getGhostText,
+  type FimRuntimeStatus,
+} from "@/lib/codemirror-fim";
 import {
   convertLspTextEditsToChanges,
   extractIdentifierAtOffset,
@@ -81,6 +89,7 @@ import {
 } from "@/lib/codemirror-helpers";
 import { createCodeMirrorLanguageExtension } from "@/lib/codemirror-languages";
 import { createOrbitCodeMirrorTheme } from "@/lib/codemirror-theme";
+import { FimSettingsPopover } from "@/components/side-panel/fim-settings-popover";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ShortcutKbd } from "@/components/ui/kbd";
@@ -219,6 +228,7 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor(
   const viewRef = useRef<EditorView | null>(null);
   const themeCompartmentRef = useRef<Compartment>(new Compartment());
   const languageCompartmentRef = useRef<Compartment>(new Compartment());
+  const ghostTextCompartmentRef = useRef<Compartment>(new Compartment());
   const lastEmittedValueRef = useRef<string>(value);
   const copiedMineTimerRef = useRef<number | null>(null);
   const aiInputRef = useRef<HTMLInputElement | null>(null);
@@ -226,6 +236,7 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor(
   const codeActionsMenuRef = useRef<HTMLDivElement | null>(null);
   const refsSeqRef = useRef<number>(0);
   const codeActionSeqRef = useRef<number>(0);
+  const fimLoadSeqRef = useRef<number>(0);
 
   // Latest-props ref so CodeMirror extensions never capture stale closures or force remounts
   const propsRef = useRef(props);
@@ -264,6 +275,53 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor(
     items: [],
     error: null,
   });
+
+  // Host-scoped Inline FIM ghost-text configuration & status (M8.1)
+  const [fimConfig, setFimConfig] = useState<FimConfig>(() => ({ ...DEFAULT_FIM_CONFIG }));
+  const [fimLoading, setFimLoading] = useState(false);
+  const [fimStatus, setFimStatus] = useState<FimRuntimeStatus>({ phase: "idle" });
+
+  useEffect(() => {
+    if (!hostId) {
+      setFimConfig({ ...DEFAULT_FIM_CONFIG });
+      setFimStatus({ phase: "idle" });
+      return;
+    }
+    const seq = ++fimLoadSeqRef.current;
+    setFimLoading(true);
+    void orbitIpc
+      .getFimConfig(hostId)
+      .then((cfg) => {
+        if (fimLoadSeqRef.current !== seq) return;
+        setFimConfig(cfg);
+        setFimStatus({ phase: "idle" });
+      })
+      .catch(() => {
+        if (fimLoadSeqRef.current !== seq) return;
+        setFimConfig({ ...DEFAULT_FIM_CONFIG });
+      })
+      .finally(() => {
+        if (fimLoadSeqRef.current === seq) {
+          setFimLoading(false);
+        }
+      });
+  }, [hostId]);
+
+  const handleSaveFimConfig = useCallback(
+    async (nextConfig: FimConfig): Promise<FimConfig> => {
+      const saved = await orbitIpc.updateFimConfig(hostId, nextConfig);
+      setFimConfig(saved);
+      if (saved.mode === "off") {
+        setFimStatus({ phase: "idle" });
+      }
+      return saved;
+    },
+    [hostId],
+  );
+
+  const returnFocusToEditor = useCallback(() => {
+    viewRef.current?.focus();
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -798,6 +856,7 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor(
           activateOnTyping: true,
           maxRenderedOptions: 80,
         }),
+        ghostTextCompartmentRef.current.of([]),
         customKeymap,
         keymap.of([
           ...closeBracketsKeymap,
@@ -862,6 +921,61 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor(
       ),
     });
   }, [language, filePath]);
+
+  // Reconfigure M8.1 FIM ghost-text compartment reactively without disturbing Undo/Redo history
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    const hasConfiguredBackend = Boolean(
+      fimConfig.endpoint_url || fimConfig.allow_fast_cli_fallback,
+    );
+    const enabled = Boolean(
+      hostId && cwd && filePath && fimConfig.mode !== "off" && hasConfiguredBackend,
+    );
+    const extension = createFimGhostTextExtension({
+      mode: fimConfig.mode,
+      enabled,
+      requestPrediction: async (payload) => {
+        const p = propsRef.current;
+        return orbitIpc.predictInlineEdit(p.hostId, {
+          cwd: p.cwd,
+          file_path: p.filePath,
+          language: p.language || null,
+          prefix: payload.prefix,
+          suffix: payload.suffix,
+          cursor_line: payload.cursor_line,
+          cursor_col: payload.cursor_col,
+        });
+      },
+      onStatusChange: (status) => {
+        setFimStatus((prev) =>
+          prev.phase === status.phase &&
+          prev.source === status.source &&
+          prev.latencyMs === status.latencyMs &&
+          prev.error === status.error
+            ? prev
+            : status,
+        );
+      },
+    });
+
+    const effects = [ghostTextCompartmentRef.current.reconfigure(extension)];
+    if (getGhostText(view.state)) {
+      effects.push(clearGhostTextEffect.of(null));
+    }
+    view.dispatch({ effects });
+    if (!enabled) {
+      setFimStatus({ phase: "idle" });
+    }
+  }, [
+    fimConfig.mode,
+    fimConfig.endpoint_url,
+    fimConfig.allow_fast_cli_fallback,
+    hostId,
+    cwd,
+    filePath,
+    language,
+  ]);
 
   // Sync external buffer reloads (e.g. conflict reload or F2 Rename) without breaking local edits
   useEffect(() => {
@@ -1581,6 +1695,14 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor(
               </SimpleTooltip>
             </div>
           )}
+
+          <FimSettingsPopover
+            config={fimConfig}
+            loading={fimLoading}
+            runtimeStatus={fimStatus}
+            onSaveConfig={handleSaveFimConfig}
+            onReturnFocusToEditor={returnFocusToEditor}
+          />
 
           <SimpleTooltip label={t("sidePanel.editorAiEditTooltip")} shortcut={`${mod}K`}>
             <button

@@ -13,10 +13,13 @@ import {
   Plus,
   RotateCcw,
   Search,
+  ShieldAlert,
   Trash2,
   UnfoldVertical,
+  Wrench,
   X,
 } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { IconButton } from "@/components/ui/icon-button";
 import { Textarea } from "@/components/ui/textarea";
@@ -40,7 +43,35 @@ import {
   type DiffLineView,
   type HighlightedTokenView,
   type InlineDiffSpan,
+  type PrPatrolCategory,
+  type PrPatrolFinding,
+  type PrPatrolSeverity,
 } from "@/lib/orbit-ipc";
+import {
+  formatPatrolLineRange,
+  indexPatrolFindings,
+  normalizePatrolPath,
+} from "@/lib/pr-patrol";
+
+function patrolCategoryI18nKey(category: PrPatrolCategory):
+  | "review.patrolCategorySecurity"
+  | "review.patrolCategoryCorrectness"
+  | "review.patrolCategoryConcurrency"
+  | "review.patrolCategoryPerformance"
+  | "review.patrolCategoryMaintainability" {
+  switch (category) {
+    case "security":
+      return "review.patrolCategorySecurity";
+    case "correctness":
+      return "review.patrolCategoryCorrectness";
+    case "concurrency":
+      return "review.patrolCategoryConcurrency";
+    case "performance":
+      return "review.patrolCategoryPerformance";
+    default:
+      return "review.patrolCategoryMaintainability";
+  }
+}
 import { type DiffLayoutMode, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -75,6 +106,8 @@ type DiffVirtualRow =
       collapsed: boolean;
       viewed: boolean;
       commentCount: number;
+      patrolCount: number;
+      patrolHighestSeverity: PrPatrolSeverity | null;
     }
   | {
       kind: "hunk_header";
@@ -92,6 +125,8 @@ type DiffVirtualRow =
       line: DiffLineView;
       lineIdx: number;
       isLastInFile: boolean;
+      patrolAnchorKey: string | null;
+      patrolFindings: readonly PrPatrolFinding[] | null;
     }
   | {
       kind: "split_pair";
@@ -102,6 +137,14 @@ type DiffVirtualRow =
       right?: DiffLineView;
       rowIdx: number;
       isLastInFile: boolean;
+      patrolAnchorKey: string | null;
+      patrolFindings: readonly PrPatrolFinding[] | null;
+    }
+  | {
+      kind: "patrol_finding_list";
+      key: string;
+      anchorKey: string;
+      findings: readonly PrPatrolFinding[];
     }
   | {
       kind: "comment_list";
@@ -176,6 +219,28 @@ function buildExpandedContextLines(
     });
   }
   return out;
+}
+
+function patrolSeverityVariant(severity: PrPatrolSeverity): "destructive" | "warning" | "default" {
+  if (severity === "P0") return "destructive";
+  if (severity === "P1") return "warning";
+  return "default";
+}
+
+function patrolLineBorderClass(severity: PrPatrolSeverity): string {
+  if (severity === "P0") return "border-l-2 border-l-signal-danger/80";
+  if (severity === "P1") return "border-l-2 border-l-signal-warning/80";
+  return "border-l-2 border-l-signal-info/75";
+}
+
+function patrolInlinePillClass(severity: PrPatrolSeverity): string {
+  if (severity === "P0") {
+    return "border-signal-danger-border bg-signal-danger-bg text-signal-danger";
+  }
+  if (severity === "P1") {
+    return "border-signal-warning-border bg-signal-warning-bg text-signal-warning";
+  }
+  return "border-signal-info-border bg-signal-info-bg text-signal-info";
 }
 
 function buildSplitRows(lines: DiffLineView[]): SplitRow[] {
@@ -440,6 +505,8 @@ function estimateRowHeight(row: DiffVirtualRow): number {
     case "unified_line":
     case "split_pair":
       return 20;
+    case "patrol_finding_list":
+      return 68 + Math.max(0, row.findings.length - 1) * 56;
     case "comment_list":
       return 42 + Math.max(0, row.comments.length - 1) * 28;
     case "comment_composer":
@@ -482,6 +549,10 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
   onStageHunk,
   onUnstageHunk,
   onDiscardHunk,
+  patrolFindings,
+  patrolCwd,
+  jumpTarget,
+  onFixPatrolFinding,
 }: {
   files: DiffFileView[];
   hostId?: string | null;
@@ -511,6 +582,10 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
   onStageHunk?: (path: string, hunk: IndexedDiffHunk) => void;
   onUnstageHunk?: (path: string, hunk: IndexedDiffHunk) => void;
   onDiscardHunk?: (path: string, hunk: IndexedDiffHunk) => void;
+  patrolFindings?: readonly PrPatrolFinding[];
+  patrolCwd?: string;
+  jumpTarget?: { path: string; line: number; nonce: number } | null;
+  onFixPatrolFinding?: (finding: PrPatrolFinding) => void;
 }) {
   const { t } = useI18n();
   const isDark = useOrbitSelector((s) => s.resolvedTheme === "dark");
@@ -524,6 +599,9 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
   const [findActiveIndex, setFindActiveIndex] = useState(0);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const findInputRef = useRef<HTMLInputElement | null>(null);
+  const [expandedPatrolKeys, setExpandedPatrolKeys] = useState<Set<string>>(() => new Set());
+  const [highlightedRowKey, setHighlightedRowKey] = useState<string | null>(null);
+  const highlightTimerRef = useRef<number | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const fileContextCacheRef = useRef(fileContextCache);
   fileContextCacheRef.current = fileContextCache;
@@ -584,6 +662,32 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
   );
 
   const effectiveCollapsed = collapsedPaths ?? localCollapsed;
+
+  const patrolIndex = useMemo(
+    () => indexPatrolFindings(patrolFindings ?? [], patrolCwd),
+    [patrolFindings, patrolCwd],
+  );
+
+  useEffect(() => {
+    setExpandedPatrolKeys(new Set());
+  }, [patrolFindings]);
+
+  useEffect(() => {
+    return () => {
+      if (highlightTimerRef.current !== null) {
+        window.clearTimeout(highlightTimerRef.current);
+      }
+    };
+  }, []);
+
+  const togglePatrolAnchor = useCallback((anchorKey: string) => {
+    setExpandedPatrolKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(anchorKey)) next.delete(anchorKey);
+      else next.add(anchorKey);
+      return next;
+    });
+  }, []);
 
   const handleToggleCollapse = useCallback(
     (path: string) => {
@@ -699,6 +803,8 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
       const viewed = viewedPaths?.has(file.path) ?? false;
       const commentCount = commentsByFileAndAnchor.countByFile.get(file.path) ?? 0;
       const anchorMap = commentsByFileAndAnchor.byFile.get(file.path);
+      const normFilePath = normalizePatrolPath(file.path, patrolCwd);
+      const filePatrol = patrolIndex.byFile.get(normFilePath) ?? null;
 
       out.push({
         kind: "file_header",
@@ -708,6 +814,8 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
         collapsed,
         viewed,
         commentCount,
+        patrolCount: filePatrol?.count ?? 0,
+        patrolHighestSeverity: filePatrol?.highestSeverity ?? null,
       });
 
       if (!collapsed) {
@@ -767,6 +875,8 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                   right: ctxLine,
                   rowIdx: -100000 - eIdx,
                   isLastInFile: false,
+                  patrolAnchorKey: null,
+                  patrolFindings: null,
                 });
               } else {
                 out.push({
@@ -777,6 +887,8 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                   line: ctxLine,
                   lineIdx: -100000 - eIdx,
                   isLastInFile: false,
+                  patrolAnchorKey: null,
+                  patrolFindings: null,
                 });
               }
             }
@@ -823,6 +935,11 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
               if (line.new_line != null && line.new_line > prevNewEnd) {
                 prevNewEnd = line.new_line;
               }
+              const newLn = line.kind === "removed" ? null : (line.new_line ?? line.old_line);
+              const linePatrol =
+                newLn != null && filePatrol ? (filePatrol.byLine.get(newLn) ?? null) : null;
+              const patrolAnchorKey =
+                linePatrol && newLn != null ? `${normFilePath}:${newLn}` : null;
               out.push({
                 kind: "unified_line",
                 key: `ul:${fileKey}:${idx}`,
@@ -831,7 +948,17 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                 line,
                 lineIdx: idx,
                 isLastInFile: isLast,
+                patrolAnchorKey,
+                patrolFindings: linePatrol,
               });
+              if (patrolAnchorKey && linePatrol && expandedPatrolKeys.has(patrolAnchorKey)) {
+                out.push({
+                  kind: "patrol_finding_list",
+                  key: `pf:${fileKey}:${patrolAnchorKey}:${idx}`,
+                  anchorKey: patrolAnchorKey,
+                  findings: linePatrol,
+                });
+              }
               const side: "old" | "new" = line.kind === "removed" ? "old" : "new";
               const targetLn = side === "old" ? line.old_line : (line.new_line ?? line.old_line);
               const ak = `${side}:${targetLn ?? `idx_${idx}`}`;
@@ -878,6 +1005,11 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
               if (sr.right?.new_line != null && sr.right.new_line > prevNewEnd) {
                 prevNewEnd = sr.right.new_line;
               }
+              const rightLn = sr.right?.new_line ?? null;
+              const linePatrol =
+                rightLn != null && filePatrol ? (filePatrol.byLine.get(rightLn) ?? null) : null;
+              const patrolAnchorKey =
+                linePatrol && rightLn != null ? `${normFilePath}:${rightLn}` : null;
               out.push({
                 kind: "split_pair",
                 key: `sp:${fileKey}:${rIdx}`,
@@ -887,7 +1019,17 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                 right: sr.right,
                 rowIdx: rIdx,
                 isLastInFile: isLast,
+                patrolAnchorKey,
+                patrolFindings: linePatrol,
               });
+              if (patrolAnchorKey && linePatrol && expandedPatrolKeys.has(patrolAnchorKey)) {
+                out.push({
+                  kind: "patrol_finding_list",
+                  key: `spf:${fileKey}:${patrolAnchorKey}:${rIdx}`,
+                  anchorKey: patrolAnchorKey,
+                  findings: linePatrol,
+                });
+              }
               const leftAk = `old:${sr.left?.old_line ?? `r_${rIdx}`}`;
               const rightAk = `new:${sr.right?.new_line ?? `r_${rIdx}`}`;
               const rowComments = [
@@ -941,6 +1083,9 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
     canExpandHiddenContext,
     fileContextCache,
     expandedGaps,
+    patrolIndex,
+    patrolCwd,
+    expandedPatrolKeys,
   ]);
 
   const virtualizer = useVirtualizer({
@@ -1036,6 +1181,73 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, [localFindEnabled, openDiffFind]);
 
+  // Jump smoothly to a Patrol finding's (file, line) row inside the virtualized diff stream
+  useEffect(() => {
+    if (!jumpTarget) return;
+    const targetNorm = normalizePatrolPath(jumpTarget.path, patrolCwd);
+    const anchorKey = `${targetNorm}:${jumpTarget.line}`;
+
+    let matchIndex = -1;
+    let fileHeaderFallback = -1;
+    for (let i = 0; i < flatRows.length; i += 1) {
+      const r = flatRows[i];
+      if (
+        r.kind === "file_header" &&
+        fileHeaderFallback === -1 &&
+        normalizePatrolPath(r.file.path, patrolCwd) === targetNorm
+      ) {
+        fileHeaderFallback = i;
+      } else if (
+        r.kind === "unified_line" &&
+        normalizePatrolPath(r.file.path, patrolCwd) === targetNorm &&
+        (r.line.kind !== "removed" && (r.line.new_line ?? r.line.old_line) === jumpTarget.line)
+      ) {
+        matchIndex = i;
+        break;
+      } else if (
+        r.kind === "split_pair" &&
+        normalizePatrolPath(r.file.path, patrolCwd) === targetNorm &&
+        r.right?.new_line === jumpTarget.line
+      ) {
+        matchIndex = i;
+        break;
+      }
+    }
+
+    const scrollIdx = matchIndex !== -1 ? matchIndex : fileHeaderFallback;
+    if (scrollIdx === -1) return;
+
+    const matchedRow = flatRows[scrollIdx];
+    if (
+      (matchedRow.kind === "unified_line" || matchedRow.kind === "split_pair") &&
+      matchedRow.patrolAnchorKey
+    ) {
+      setExpandedPatrolKeys((prev) => {
+        if (prev.has(anchorKey)) return prev;
+        const next = new Set(prev);
+        next.add(anchorKey);
+        return next;
+      });
+    }
+
+    setHighlightedRowKey(matchedRow.key);
+    if (highlightTimerRef.current !== null) {
+      window.clearTimeout(highlightTimerRef.current);
+    }
+    highlightTimerRef.current = window.setTimeout(() => {
+      highlightTimerRef.current = null;
+      setHighlightedRowKey(null);
+    }, 1800);
+
+    if (virtualized) {
+      window.requestAnimationFrame(() => {
+        virtualizer.scrollToIndex(scrollIdx, { align: "center" });
+      });
+    }
+    // Trigger strictly on new jumpTarget nonces
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jumpTarget?.nonce]);
+
   const codeWrapClass = wrapLines ? "whitespace-pre-wrap break-all" : "whitespace-pre";
 
   const renderRow = (row: DiffVirtualRow, flatIndex: number): ReactNode => {
@@ -1079,6 +1291,17 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                 <span className="bg-sky-500/15 text-sky-700 dark:text-sky-300 shrink-0 rounded-full px-1.5 py-0.25 font-sans text-[10.5px] font-medium">
                   {row.commentCount}
                 </span>
+              )}
+              {row.patrolCount > 0 && row.patrolHighestSeverity && (
+                <Badge
+                  variant={patrolSeverityVariant(row.patrolHighestSeverity)}
+                  className="tabular-nums h-[17px] shrink-0 px-1.5 font-mono text-[10px]"
+                >
+                  <ShieldAlert className="size-[10px]" />
+                  <span>
+                    {row.patrolHighestSeverity} · {row.patrolCount}
+                  </span>
+                </Badge>
               )}
             </button>
             <div className="tabular-nums flex shrink-0 items-center gap-1.5 font-mono text-[12px]">
@@ -1244,7 +1467,8 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
       }
 
       case "unified_line": {
-        const { line, file, fileKey, lineIdx, isLastInFile } = row;
+        const { line, file, fileKey, lineIdx, isLastInFile, patrolAnchorKey, patrolFindings: linePatrol } =
+          row;
         const rowClass =
           line.kind === "added"
             ? "bg-emerald-500/[0.11] dark:bg-emerald-500/[0.10]"
@@ -1264,13 +1488,23 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
             .get(file.path)
             ?.some((r) => isLineWithinSelection(targetLn, side, r)) ??
             false);
+        const topPatrol = linePatrol?.[0] ?? null;
+        const isPatrolExpanded = Boolean(
+          patrolAnchorKey && expandedPatrolKeys.has(patrolAnchorKey),
+        );
+        const isJumpHighlighted = highlightedRowKey === row.key;
 
         return (
           <div
             className={cn(
-              "border-border group selectable-text flex w-full items-start border-x px-2 font-mono text-[12px] leading-[20px]",
-              isLastInFile && "rounded-b-lg border-b",
+              "border-border group selectable-text flex w-full items-start border-x px-2 font-mono text-[12px] leading-[20px] transition-colors",
+              isLastInFile && !isPatrolExpanded && "rounded-b-lg border-b",
               rowClass,
+              !inActiveSelection &&
+                !inSavedRange &&
+                topPatrol &&
+                cn(patrolLineBorderClass(topPatrol.severity), "pl-[6px]"),
+              isJumpHighlighted && "bg-signal-info-bg",
               inActiveSelection &&
                 "border-l-2 border-l-sky-500/80 bg-sky-500/[0.08] pl-[6px] dark:border-l-sky-400/80 dark:bg-sky-400/[0.09]",
               inSavedRange &&
@@ -1410,12 +1644,35 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                 isDark,
               )}
             </span>
+            {topPatrol && patrolAnchorKey && linePatrol && (
+              <button
+                type="button"
+                title={topPatrol.title}
+                onClick={() => togglePatrolAnchor(patrolAnchorKey)}
+                className={cn(
+                  "mt-[1.5px] ml-2 inline-flex h-[17px] shrink-0 cursor-pointer items-center gap-1 rounded-[5px] border px-1.5 font-sans text-[10px] font-medium transition-opacity hover:opacity-85",
+                  patrolInlinePillClass(topPatrol.severity),
+                )}
+              >
+                <ShieldAlert className="size-[10px] shrink-0" />
+                <span className="font-mono">{topPatrol.severity}</span>
+                {linePatrol.length > 1 && (
+                  <span className="tabular-nums opacity-80">+{linePatrol.length - 1}</span>
+                )}
+              </button>
+            )}
           </div>
         );
       }
 
       case "split_pair": {
-        const { left, right, file, fileKey, rowIdx, isLastInFile } = row;
+        const { left, right, file, fileKey, rowIdx, isLastInFile, patrolAnchorKey, patrolFindings: linePatrol } =
+          row;
+        const topPatrol = linePatrol?.[0] ?? null;
+        const isPatrolExpanded = Boolean(
+          patrolAnchorKey && expandedPatrolKeys.has(patrolAnchorKey),
+        );
+        const isJumpHighlighted = highlightedRowKey === row.key;
         const leftAk = `old:${left?.old_line ?? `r_${rowIdx}`}`;
         const rightAk = `new:${right?.new_line ?? `r_${rowIdx}`}`;
         const savedRanges = commentsByFileAndAnchor.rangesByFile.get(file.path);
@@ -1440,7 +1697,7 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
           <div
             className={cn(
               "border-border-subtle divide-border-subtle selectable-text bg-surface-recessed grid w-full grid-cols-2 divide-x border-x font-mono text-[12px] leading-[20px]",
-              isLastInFile && "overflow-hidden rounded-b-lg border-b",
+              isLastInFile && !isPatrolExpanded && "overflow-hidden rounded-b-lg border-b",
               isActiveFindMatch
                 ? "bg-amber-400/24 ring-1 ring-inset ring-amber-500/65 dark:bg-amber-400/20"
                 : isFindMatch && "bg-amber-400/12 dark:bg-amber-400/12",
@@ -1558,12 +1815,17 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
             {/* New side */}
             <div
               className={cn(
-                "group flex min-w-0 items-start px-1.5",
+                "group flex min-w-0 items-start px-1.5 transition-colors",
                 right?.kind === "added"
                   ? "bg-emerald-500/[0.11] dark:bg-emerald-500/[0.10]"
                   : right
                     ? "text-zinc-700 dark:text-zinc-300"
                     : "bg-black/[0.015] dark:bg-white/[0.01]",
+                !rightSelected &&
+                  !rightSaved &&
+                  topPatrol &&
+                  cn(patrolLineBorderClass(topPatrol.severity), "pl-[4px]"),
+                isJumpHighlighted && "bg-signal-info-bg",
                 rightSelected &&
                   "border-l-2 border-l-sky-500/80 bg-sky-500/[0.08] pl-[4px] dark:border-l-sky-400/80 dark:bg-sky-400/[0.09]",
                 rightSaved &&
@@ -1663,10 +1925,92 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                     )
                   : ""}
               </span>
+              {topPatrol && patrolAnchorKey && linePatrol && (
+                <button
+                  type="button"
+                  title={topPatrol.title}
+                  onClick={() => togglePatrolAnchor(patrolAnchorKey)}
+                  className={cn(
+                    "mt-[1.5px] ml-1.5 inline-flex h-[17px] shrink-0 cursor-pointer items-center gap-1 rounded-[5px] border px-1.5 font-sans text-[10px] font-medium transition-opacity hover:opacity-85",
+                    patrolInlinePillClass(topPatrol.severity),
+                  )}
+                >
+                  <ShieldAlert className="size-[10px] shrink-0" />
+                  <span className="font-mono">{topPatrol.severity}</span>
+                  {linePatrol.length > 1 && (
+                    <span className="tabular-nums opacity-80">+{linePatrol.length - 1}</span>
+                  )}
+                </button>
+              )}
             </div>
           </div>
         );
       }
+
+      case "patrol_finding_list":
+        return (
+          <div className="border-border bg-surface-raised/95 flex flex-col gap-1.5 border-x border-b px-3 py-2 font-sans">
+            {row.findings.map((finding) => (
+              <div
+                key={finding.id}
+                className="border-border-subtle bg-surface-base flex flex-col gap-1 rounded-md border px-2.5 py-2"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <Badge
+                      variant={patrolSeverityVariant(finding.severity)}
+                      className="h-[17px] px-1.5 font-mono text-[10px]"
+                    >
+                      {finding.severity}
+                    </Badge>
+                    <span className="text-ink-tertiary text-[10.5px] font-medium">
+                      {t(patrolCategoryI18nKey(finding.category))}
+                    </span>
+                    <span className="text-ink-faint tabular-nums font-mono text-[10.5px]">
+                      {formatPatrolLineRange(finding.start_line, finding.end_line)}
+                    </span>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    {onFixPatrolFinding && (
+                      <button
+                        type="button"
+                        onClick={() => onFixPatrolFinding(finding)}
+                        className="border-border-default bg-surface-raised text-ink-primary hover:bg-accent inline-flex h-[20px] cursor-pointer items-center gap-1 rounded-[5px] border px-1.5 text-[10.5px] font-medium transition-colors"
+                      >
+                        <Wrench className="size-[10px]" />
+                        <span>{t("review.patrolFixWithAgent")}</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      aria-label={t("common.close")}
+                      onClick={() => togglePatrolAnchor(row.anchorKey)}
+                      className="text-ink-tertiary hover:bg-accent hover:text-ink-primary inline-flex size-[20px] cursor-pointer items-center justify-center rounded"
+                    >
+                      <X className="size-[11px]" />
+                    </button>
+                  </div>
+                </div>
+                <div className="text-ink-primary text-[12px] font-medium leading-snug">
+                  {finding.title}
+                </div>
+                {finding.summary.trim() && (
+                  <p className="text-ink-secondary text-[11.5px] leading-snug">
+                    {finding.summary}
+                  </p>
+                )}
+                {finding.suggested_fix.trim() && (
+                  <p className="text-ink-tertiary text-[11px] leading-snug">
+                    <span className="text-ink-secondary font-medium">
+                      {t("review.patrolSuggestedFixLabel")}{" "}
+                    </span>
+                    {finding.suggested_fix}
+                  </p>
+                )}
+              </div>
+            ))}
+          </div>
+        );
 
       case "comment_list":
         return (
@@ -1889,7 +2233,10 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
             const row = flatRows[vItem.index];
             if (!row) return null;
             const needsDynamicMeasure =
-              wrapLines || row.kind === "comment_list" || row.kind === "comment_composer";
+              wrapLines ||
+              row.kind === "patrol_finding_list" ||
+              row.kind === "comment_list" ||
+              row.kind === "comment_composer";
             return (
               <div
                 key={vItem.key}

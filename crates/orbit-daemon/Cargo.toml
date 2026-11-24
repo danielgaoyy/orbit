@@ -47,6 +47,9 @@ cap-fs-ext = "4.0"
 serde-saphyr = { version = "2.2", default-features = false, features = ["serialize", "deserialize"] }
 wasmi = { version = "2.0.2", default-features = false, features = ["std", "validate", "portable-dispatch", "extra-checks"] }
 globset = "0.4"
+regex = "1"
+rustc_lexer = "0.1"
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }

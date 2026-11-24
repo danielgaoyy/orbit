@@ -15,6 +15,7 @@ pub mod diagnostics;
 pub mod discovery;
 mod egress_proxy;
 pub mod fast_copy;
+mod fim;
 pub mod finish_subscriptions;
 pub mod git;
 pub mod git_collab;
@@ -40,6 +41,7 @@ pub mod personal_router;
 pub mod plan_approval;
 pub mod platform;
 pub mod plugins;
+pub mod pr_patrol;
 pub mod push;
 pub mod rules;
 mod sandbox;
@@ -2659,7 +2661,7 @@ impl Drop for AbortTaskOnDrop {
 /// always aborted immediately even when `run_client_session_loop` is dropped mid-await on secret revocation.
 struct SessionCleanupGuard {
     slot_to_terminal: HashMap<u8, (String, tokio::task::AbortHandle)>,
-    active_side_questions: Vec<tokio::task::AbortHandle>,
+    active_session_tasks: Vec<tokio::task::AbortHandle>,
     active_peer_bridges: HashMap<Uuid, ActivePeerBridge>,
     active_preview_tunnels: HashMap<Uuid, ActivePreviewTunnel>,
     preview_session_queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
@@ -2669,7 +2671,7 @@ impl SessionCleanupGuard {
     fn new() -> Self {
         Self {
             slot_to_terminal: HashMap::new(),
-            active_side_questions: Vec::new(),
+            active_session_tasks: Vec::new(),
             active_peer_bridges: HashMap::new(),
             active_preview_tunnels: HashMap::new(),
             preview_session_queued_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2682,7 +2684,7 @@ impl Drop for SessionCleanupGuard {
         for (_, (_, abort_handle)) in self.slot_to_terminal.drain() {
             abort_handle.abort();
         }
-        for abort_handle in self.active_side_questions.drain(..) {
+        for abort_handle in self.active_session_tasks.drain(..) {
             abort_handle.abort();
         }
         for (_, bridge) in self.active_peer_bridges.drain() {
@@ -2786,7 +2788,7 @@ async fn run_client_session_loop(
             &mut subscribed_agents,
             &mut subscribed_provider_subagents,
             &mut cleanup.slot_to_terminal,
-            &mut cleanup.active_side_questions,
+            &mut cleanup.active_session_tasks,
             &out_tx,
         ))
         .await
@@ -2830,7 +2832,7 @@ async fn run_client_session_loop(
                         if zstd {
                             use_zstd = true;
                         }
-                        cleanup.active_side_questions.retain(|h| !h.is_finished());
+                        cleanup.active_session_tasks.retain(|h| !h.is_finished());
                         cleanup
                             .active_peer_bridges
                             .retain(|_, b| !b.task.is_finished());
@@ -2915,7 +2917,7 @@ async fn run_client_session_loop(
                                     &mut subscribed_agents,
                                     &mut subscribed_provider_subagents,
                                     &mut cleanup.slot_to_terminal,
-                                    &mut cleanup.active_side_questions,
+                                    &mut cleanup.active_session_tasks,
                                     &out_tx,
                                 ))
                                 .await
@@ -3621,7 +3623,7 @@ async fn handle_wire_rpc(
     subscribed_agents: &mut HashSet<String>,
     subscribed_provider_subagents: &mut HashSet<(String, String)>,
     slot_to_terminal: &mut HashMap<u8, (String, tokio::task::AbortHandle)>,
-    active_side_questions: &mut Vec<tokio::task::AbortHandle>,
+    active_session_tasks: &mut Vec<tokio::task::AbortHandle>,
     out_tx: &mpsc::Sender<SessionFrame>,
 ) -> Option<WireMessage> {
     runtime
@@ -7188,6 +7190,89 @@ async fn handle_wire_rpc(
             None
         }
 
+        WireMessage::GetFimConfig { request_id } => {
+            Some(match fim::config(&runtime.home_dir).await {
+                Ok(config) => WireMessage::FimConfigState { request_id, config },
+                Err(e) => rpc_err(request_id, "fim_config", e),
+            })
+        }
+        WireMessage::UpdateFimConfig { request_id, config } => {
+            Some(match fim::update(&runtime.home_dir, config).await {
+                Ok(config) => WireMessage::FimConfigState { request_id, config },
+                Err(e) => rpc_err(request_id, "fim_config", e),
+            })
+        }
+        WireMessage::PredictInlineEdit {
+            request_id,
+            prefix,
+            suffix,
+            ..
+        } => {
+            static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+            let Ok(slot) = SLOTS.try_acquire() else {
+                return Some(rpc_err(
+                    request_id,
+                    "fim_busy",
+                    "Too many pending predictions",
+                ));
+            };
+            let home = runtime.home_dir.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let task = tokio::spawn(async move {
+                let _slot = slot;
+                let prediction = async {
+                    let config = fim::config(&home).await?;
+                    fim::predict(&config, request_id, &prefix, &suffix).await
+                }
+                .await;
+                let msg = match prediction {
+                    Ok(p) => WireMessage::InlineEditPrediction {
+                        request_id,
+                        completion: p.completion,
+                        latency_ms: p.latency_ms,
+                        source: p.source,
+                    },
+                    Err(e) => rpc_err(request_id, "fim_prediction", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg, zstd }).await;
+            });
+            active_session_tasks.push(task.abort_handle());
+            None
+        }
+        WireMessage::RunPrPatrol {
+            request_id,
+            cwd,
+            base_ref,
+            head_ref,
+            pr_number,
+            post_github_comments,
+        } => {
+            let store = runtime.store.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let task = tokio::spawn(async move {
+                let msg =
+                    match authorize_git_repo_root_mutation(&store, &expand_host_path(&cwd)).await {
+                        Ok(root) => match pr_patrol::run(
+                            &root,
+                            base_ref.as_deref(),
+                            head_ref.as_deref(),
+                            pr_number,
+                            post_github_comments,
+                        )
+                        .await
+                        {
+                            Ok(report) => WireMessage::PrPatrolCompleted { request_id, report },
+                            Err(e) => rpc_err(request_id, "pr_patrol", e),
+                        },
+                        Err((message, code)) => rpc_err(request_id, code, message),
+                    };
+                let _ = tx.send(SessionFrame::Wire { msg, zstd }).await;
+            });
+            active_session_tasks.push(task.abort_handle());
+            None
+        }
         // Guardian AI Risk-Assessment Auto-Approval Policy & Audit Log
         WireMessage::GetGuardianConfig { request_id } => {
             let (config, recent_audits) = runtime.orchestrator.guardian.snapshot().await;
@@ -9345,7 +9430,7 @@ async fn handle_wire_rpc(
                     })
                     .await;
             });
-            active_side_questions.push(handle.abort_handle());
+            active_session_tasks.push(handle.abort_handle());
             None
         }
 

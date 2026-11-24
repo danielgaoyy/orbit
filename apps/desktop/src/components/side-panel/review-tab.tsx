@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertCircle,
   ArrowLeftRight,
   ArrowUp,
   Check,
@@ -19,10 +20,13 @@ import {
   Rows3,
   Search,
   Send,
+  ShieldCheck,
   Sparkles,
   WrapText,
+  X,
 } from "lucide-react";
 import { DiffFilesViewer, type ReviewCommentDraft } from "@/components/diff-viewer";
+import { PatrolReportPanel } from "@/components/review/patrol-report-panel";
 import { CreatePrDialog } from "@/components/side-panel/create-pr-dialog";
 import { GitConflictResolver } from "@/components/side-panel/git-conflict-resolver";
 import { GitPrStatusBar } from "@/components/side-panel/git-pr-status-bar";
@@ -31,6 +35,8 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Input } from "@/components/ui/input";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
+import { SimpleTooltip } from "@/components/ui/overlays";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Textarea } from "@/components/ui/textarea";
 import { formatReviewCommentsPrompt } from "@/lib/git-collab";
@@ -52,7 +58,14 @@ import {
   type GitPrStatus,
   type GitRebaseStatus,
   type GitStashEntry,
+  type PrPatrolFinding,
+  type PrPatrolReport,
 } from "@/lib/orbit-ipc";
+import {
+  buildPatrolBatchFixPrompt,
+  buildPatrolFindingFixPrompt,
+  findMatchingDiffLine,
+} from "@/lib/pr-patrol";
 import { normalizeProjectPath } from "@/lib/projects";
 import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
 import { cn } from "@/lib/utils";
@@ -133,6 +146,13 @@ export const ReviewTab = memo(function ReviewTab({
       ? (s.gitReviews[`${s.selectedHostId}::${s.selectedWorkspaceCwd}`] ?? null)
       : null,
   );
+  const isHostOnline = useOrbitSelector((s) => {
+    const connState =
+      s.fleet?.hosts?.find((h) => h.host_id === selectedHostId)?.connection_state ??
+      s.hostDetails[selectedHostId]?.host?.connection_state;
+    return connState === "online_direct" || connState === "online_relay";
+  });
+
   // Only read session_turn_diffs reference; never trigger working_tree re-renders on unrelated streaming deltas.
   const sessionTurnDiffs = useOrbitSelector((s) => {
     if (!s.selectedHostId || !s.selectedAgentId) return EMPTY_DIFFS;
@@ -167,8 +187,20 @@ export const ReviewTab = memo(function ReviewTab({
   const [conflictFiles, setConflictFiles] = useState<GitConflictFile[]>([]);
   const [prStatus, setPrStatus] = useState<GitPrStatus | null>(null);
   const [isLoadingPrStatus, setIsLoadingPrStatus] = useState(false);
+
+  // Orbit Patrol two-stage PR review state (M8.2)
+  const [patrolReport, setPatrolReport] = useState<PrPatrolReport | null>(null);
+  const [isRunningPatrol, setIsRunningPatrol] = useState(false);
+  const [patrolError, setPatrolError] = useState<string | null>(null);
+  const [diffJumpTarget, setDiffJumpTarget] = useState<{
+    path: string;
+    line: number;
+    nonce: number;
+  } | null>(null);
+
   const collabGenRef = useRef(0);
   const prGenRef = useRef(0);
+  const patrolGenRef = useRef(0);
   const mountedRef = useRef(true);
   const activeScopeRef = useRef({ hostId: selectedHostId, cwd: selectedCwd });
   activeScopeRef.current = { hostId: selectedHostId, cwd: selectedCwd };
@@ -179,12 +211,14 @@ export const ReviewTab = memo(function ReviewTab({
       mountedRef.current = false;
       collabGenRef.current += 1;
       prGenRef.current += 1;
+      patrolGenRef.current += 1;
     };
   }, []);
 
   useEffect(() => {
     collabGenRef.current += 1;
     prGenRef.current += 1;
+    patrolGenRef.current += 1;
     setCollapsedPaths(new Set());
     setViewedPaths(new Set());
     setDraftComments([]);
@@ -205,6 +239,10 @@ export const ReviewTab = memo(function ReviewTab({
     setConflictFiles([]);
     setPrStatus(null);
     setIsLoadingPrStatus(false);
+    setPatrolReport(null);
+    setIsRunningPatrol(false);
+    setPatrolError(null);
+    setDiffJumpTarget(null);
   }, [selectedHostId, selectedCwd]);
 
   const isWorkingTreeWritable =
@@ -937,6 +975,96 @@ export const ReviewTab = memo(function ReviewTab({
     [refreshPrStatus, t],
   );
 
+  const isGitRepo = Boolean(selectedCwd && gitReview?.status?.is_git_repo);
+  const canRunPatrol = isHostOnline && isGitRepo;
+  const patrolButtonTooltip = !isHostOnline
+    ? t("review.patrolDisabledOffline")
+    : !isGitRepo
+      ? t("review.patrolDisabledNotGit")
+      : t("review.runPatrolTooltip");
+
+  const handleRunPatrol = useCallback(async () => {
+    if (!canRunPatrol || !selectedCwd || isRunningPatrol) return;
+    const reqHostId = selectedHostId;
+    const reqCwd = selectedCwd;
+    const gen = ++patrolGenRef.current;
+    setIsRunningPatrol(true);
+    setPatrolError(null);
+    try {
+      const report = await orbitIpc.runPrPatrol({
+        hostId: reqHostId,
+        cwd: reqCwd,
+        postGithubComments: false,
+      });
+      if (patrolGenRef.current !== gen || !isSameActiveScope(reqHostId, reqCwd)) return;
+      setPatrolReport(report);
+    } catch (err) {
+      if (patrolGenRef.current !== gen || !isSameActiveScope(reqHostId, reqCwd)) return;
+      const detail = formatErrorDetail(err);
+      setPatrolError(detail);
+      orbitActions.showToast(t("review.patrolFailedToast", { detail }));
+    } finally {
+      if (patrolGenRef.current === gen && isSameActiveScope(reqHostId, reqCwd)) {
+        setIsRunningPatrol(false);
+      }
+    }
+  }, [canRunPatrol, selectedHostId, selectedCwd, isRunningPatrol, isSameActiveScope, t]);
+
+  const handleJumpToPatrolFinding = useCallback(
+    (finding: PrPatrolFinding) => {
+      const scopeDiffs =
+        reviewScope === "session_turns" ? sessionTurnDiffs : (gitReview?.diff_files ?? EMPTY_DIFFS);
+      const match = findMatchingDiffLine(scopeDiffs, finding, selectedCwd);
+      if (match && match.exactLine) {
+        if (selectedDiffPath && !pathsMatch(selectedDiffPath, match.filePath, selectedCwd)) {
+          orbitActions.selectDiffFile(null);
+        }
+        if (fileQuery.trim() && !match.filePath.toLowerCase().includes(fileQuery.trim().toLowerCase())) {
+          setFileQuery("");
+        }
+        setCollapsedPaths((prev) => {
+          if (!prev.has(match.filePath)) return prev;
+          const next = new Set(prev);
+          next.delete(match.filePath);
+          return next;
+        });
+        setDiffJumpTarget({ path: match.filePath, line: match.line, nonce: Date.now() });
+        return;
+      }
+      handleOpenFile(finding.file_path, finding.start_line);
+    },
+    [reviewScope, sessionTurnDiffs, gitReview, selectedCwd, selectedDiffPath, fileQuery, handleOpenFile],
+  );
+
+  const handleOpenPatrolFindingInEditor = useCallback(
+    (finding: PrPatrolFinding) => {
+      handleOpenFile(finding.file_path, finding.start_line);
+    },
+    [handleOpenFile],
+  );
+
+  const handleFixPatrolFinding = useCallback(
+    (finding: PrPatrolFinding) => {
+      const prompt = buildPatrolFindingFixPrompt(finding);
+      if (!prompt) return;
+      orbitActions.appendToComposerDraft(prompt);
+      orbitActions.focusComposer();
+      orbitActions.showToast(t("review.patrolFixInsertedToast", { title: finding.title }));
+    },
+    [t],
+  );
+
+  const handleFixPatrolActionable = useCallback(
+    (findings: readonly PrPatrolFinding[]) => {
+      const prompt = buildPatrolBatchFixPrompt(findings, patrolReport);
+      if (!prompt) return;
+      orbitActions.appendToComposerDraft(prompt);
+      orbitActions.focusComposer();
+      orbitActions.showToast(t("review.patrolBatchFixInsertedToast", { count: findings.length }));
+    },
+    [patrolReport, t],
+  );
+
   const showApplyToLocal = Boolean(activeWorkspace?.is_worktree);
   const showMoveToWorktree = Boolean(
     activeWorkspace &&
@@ -1000,6 +1128,29 @@ export const ReviewTab = memo(function ReviewTab({
         </div>
 
         <div className="flex items-center gap-1">
+          <SimpleTooltip label={patrolButtonTooltip}>
+            <span className="inline-flex">
+              <button
+                type="button"
+                disabled={!canRunPatrol || isRunningPatrol}
+                onClick={() => void handleRunPatrol()}
+                className={cn(
+                  "border-border-default bg-surface-base text-ink-secondary hover:bg-accent hover:text-ink-primary inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-md border px-2 text-[11px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-45",
+                  isRunningPatrol && "text-ink-primary",
+                )}
+              >
+                {isRunningPatrol ? (
+                  <OrbitSpinner size={11} />
+                ) : (
+                  <ShieldCheck className="size-[12px] shrink-0" />
+                )}
+                <span>
+                  {isRunningPatrol ? t("review.patrolRunning") : t("review.runPatrol")}
+                </span>
+              </button>
+            </span>
+          </SimpleTooltip>
+
           {draftComments.length > 0 && (
             <button
               type="button"
@@ -1341,6 +1492,36 @@ export const ReviewTab = memo(function ReviewTab({
         />
       )}
 
+      {/* Orbit Patrol Error Banner (M8.2) */}
+      {patrolError && (
+        <div className="border-signal-danger-border bg-signal-danger-bg text-signal-danger flex shrink-0 items-center justify-between gap-2 border-b px-3 py-1.5 text-[11.5px]">
+          <div className="flex min-w-0 items-center gap-1.5">
+            <AlertCircle className="size-[12.5px] shrink-0" />
+            <span className="truncate">{patrolError}</span>
+          </div>
+          <button
+            type="button"
+            aria-label={t("common.close")}
+            onClick={() => setPatrolError(null)}
+            className="hover:bg-signal-danger/15 inline-flex size-[20px] shrink-0 cursor-pointer items-center justify-center rounded"
+          >
+            <X className="size-[12px]" />
+          </button>
+        </div>
+      )}
+
+      {/* Orbit Patrol Two-Stage Verified Findings Report (M8.2) */}
+      {patrolReport && (
+        <PatrolReportPanel
+          report={patrolReport}
+          onJumpToFinding={handleJumpToPatrolFinding}
+          onOpenFindingInEditor={handleOpenPatrolFindingInEditor}
+          onFixFinding={handleFixPatrolFinding}
+          onFixActionable={handleFixPatrolActionable}
+          onDismiss={() => setPatrolReport(null)}
+        />
+      )}
+
       {/* Virtualized Diff Stream Body (O(1) DOM nodes regardless of file/line count) */}
       <DiffFilesViewer
         virtualized
@@ -1353,6 +1534,10 @@ export const ReviewTab = memo(function ReviewTab({
         collapsedPaths={collapsedPaths}
         viewedPaths={viewedPaths}
         comments={draftComments}
+        patrolFindings={patrolReport?.findings}
+        patrolCwd={selectedCwd}
+        jumpTarget={diffJumpTarget}
+        onFixPatrolFinding={handleFixPatrolFinding}
         gitWriteMode={isWorkingTreeWritable ? (diffStaged ? "staged" : "unstaged") : null}
         busyPaths={isWorkingTreeWritable ? busyPaths : undefined}
         busyHunkKeys={isWorkingTreeWritable ? busyHunkKeys : undefined}

@@ -3286,6 +3286,72 @@ export interface MentionRankRequest {
   active_agent_id?: string | null;
 }
 
+export type FimMode = "off" | "subtle" | "eager";
+
+export interface FimConfig {
+  mode: FimMode;
+  endpoint_url: string | null;
+  model: string | null;
+  api_key_env: string | null;
+  max_tokens: number;
+  timeout_ms: number;
+  allow_fast_cli_fallback: boolean;
+}
+
+export interface InlineEditInput {
+  cwd: string;
+  file_path: string;
+  language: string | null;
+  prefix: string;
+  suffix: string;
+  cursor_line: number;
+  cursor_col: number;
+}
+
+export interface InlineEditResult {
+  request_id: string;
+  completion: string;
+  latency_ms: number;
+  source: string;
+}
+
+export type PrPatrolSeverity = "P0" | "P1" | "P2";
+
+export type PrPatrolCategory =
+  | "security"
+  | "correctness"
+  | "concurrency"
+  | "performance"
+  | "maintainability";
+
+export interface PrPatrolFinding {
+  id: string;
+  severity: PrPatrolSeverity;
+  category: PrPatrolCategory;
+  file_path: string;
+  start_line: number;
+  end_line: number;
+  title: string;
+  summary: string;
+  evidence: string;
+  suggested_fix: string;
+  verified_by_stage2: boolean;
+  confidence: number;
+}
+
+export interface PrPatrolReport {
+  repo_root: string;
+  base_ref: string;
+  head_ref: string;
+  pr_number: number | null;
+  files_reviewed: number;
+  candidates_found: number;
+  findings: PrPatrolFinding[];
+  dropped_false_positives: number;
+  summary: string;
+  duration_ms: number;
+}
+
 export type CoreNotification =
   | { kind: "fleet_changed"; revision: number }
   | { kind: "host_changed"; revision: number; host_id: string }
@@ -7942,6 +8008,77 @@ export const orbitIpc = {
       text,
       language: options?.language ?? null,
       voiceId: options?.voiceId ?? null,
+    });
+  },
+
+  // --- M8.1 Host-Scoped Inline FIM & M8.2 Two-Stage PR Patrol ---
+
+  getFimConfig: async (hostId: string): Promise<FimConfig> => {
+    if (!transport()) {
+      return {
+        mode: "off",
+        endpoint_url: null,
+        model: null,
+        api_key_env: null,
+        max_tokens: 128,
+        timeout_ms: 1800,
+        allow_fast_cli_fallback: false,
+      };
+    }
+    return invoke<FimConfig>("get_fim_config", { hostId });
+  },
+
+  updateFimConfig: async (hostId: string, config: FimConfig): Promise<FimConfig> => {
+    if (!transport()) {
+      return config;
+    }
+    return invoke<FimConfig>("update_fim_config", { hostId, config });
+  },
+
+  predictInlineEdit: async (
+    hostId: string,
+    input: InlineEditInput,
+  ): Promise<InlineEditResult> => {
+    if (!transport()) {
+      return {
+        request_id: "00000000-0000-0000-0000-000000000000",
+        completion: "",
+        latency_ms: 0,
+        source: "off",
+      };
+    }
+    return invoke<InlineEditResult>("predict_inline_edit", { hostId, input });
+  },
+
+  runPrPatrol: async (req: {
+    hostId: string;
+    cwd: string;
+    baseRef?: string | null;
+    headRef?: string | null;
+    prNumber?: number | null;
+    postGithubComments?: boolean;
+  }): Promise<PrPatrolReport> => {
+    if (!transport()) {
+      return {
+        repo_root: req.cwd,
+        base_ref: req.baseRef ?? "HEAD~1",
+        head_ref: req.headRef ?? "HEAD",
+        pr_number: req.prNumber ?? null,
+        files_reviewed: 0,
+        candidates_found: 0,
+        findings: [],
+        dropped_false_positives: 0,
+        summary: "Patrol unavailable outside the Orbit runtime.",
+        duration_ms: 0,
+      };
+    }
+    return invoke<PrPatrolReport>("run_pr_patrol", {
+      hostId: req.hostId,
+      cwd: req.cwd,
+      baseRef: req.baseRef ?? null,
+      headRef: req.headRef ?? null,
+      prNumber: req.prNumber ?? null,
+      postGithubComments: Boolean(req.postGithubComments),
     });
   },
 };

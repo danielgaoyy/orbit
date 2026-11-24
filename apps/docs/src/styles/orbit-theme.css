@@ -1,0 +1,1041 @@
+/* ============================================================================
+ * Orbit Docs & Showcase Theme — "Orbital Quiet Precision"
+ * Exact OKLCH 258° cool-slate neutral axis shared with apps/desktop:
+ *   Light ("Alabaster Paper"): #FCFCFE base / #F5F6F8 recessed / #FFFFFF raised
+ *   Dark  ("Obsidian Graphite"): #17181E base / #121318 recessed / #20222B raised
+ * Monochrome primary actions · Hairline precision · WCAG-AA semantic signals
+ * ============================================================================ */
+
+:root,
+:root[data-theme="dark"] {
+  /* Orbit Canonical Tokens — Obsidian Graphite (Dark) */
+  --orbit-surface-recessed: #121318;
+  --orbit-surface-base: #17181e;
+  --orbit-surface-raised: #20222b;
+  --orbit-surface-overlay: #272a35;
+
+  --orbit-ink-primary: #f1f2f7;
+  --orbit-ink-secondary: #b2b6c7;
+  --orbit-ink-tertiary: #83889c;
+  --orbit-ink-faint: #5f6477;
+
+  --orbit-border-subtle: rgba(255, 255, 255, 0.075);
+  --orbit-border-default: rgba(255, 255, 255, 0.12);
+  --orbit-border-strong: rgba(255, 255, 255, 0.2);
+
+  --orbit-action-bg: #f1f2f7;
+  --orbit-action-fg: #14161d;
+  --orbit-action-hover: #ffffff;
+
+  --orbit-success: #3ed598;
+  --orbit-success-bg: rgba(62, 213, 152, 0.12);
+  --orbit-success-border: rgba(62, 213, 152, 0.28);
+  --orbit-warning: #f5b749;
+  --orbit-warning-bg: rgba(245, 183, 73, 0.13);
+  --orbit-warning-border: rgba(245, 183, 73, 0.3);
+  --orbit-danger: #f87171;
+  --orbit-danger-bg: rgba(248, 113, 113, 0.13);
+  --orbit-info: #6fa8ff;
+  --orbit-info-bg: rgba(111, 168, 255, 0.13);
+  --orbit-info-border: rgba(111, 168, 255, 0.28);
+
+  --orbit-shadow-card: 0 0 0 1px rgba(255, 255, 255, 0.08), 0 12px 32px -12px rgba(0, 0, 0, 0.55);
+  --orbit-shadow-frame: 0 0 0 1px rgba(255, 255, 255, 0.1), 0 28px 68px -20px rgba(0, 0, 0, 0.72);
+  --orbit-grid-line: rgba(255, 255, 255, 0.035);
+  --orbit-ring-stroke: rgba(255, 255, 255, 0.08);
+  --orbit-ring-accent: rgba(255, 255, 255, 0.18);
+
+  --orbit-ease: cubic-bezier(0.23, 1, 0.32, 1);
+
+  /* Starlight Variable Bindings (Dark) */
+  --sl-font: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Segoe UI", sans-serif;
+  --sl-font-mono: "JetBrains Mono", "SF Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  --sl-color-white: #f1f2f7;
+  --sl-color-gray-1: #e4e6ef;
+  --sl-color-gray-2: #b2b6c7;
+  --sl-color-gray-3: #83889c;
+  --sl-color-gray-4: #4b5063;
+  --sl-color-gray-5: #282b36;
+  --sl-color-gray-6: #1c1e26;
+  --sl-color-black: #17181e;
+
+  --sl-color-bg: var(--orbit-surface-base);
+  --sl-color-bg-nav: rgba(23, 24, 30, 0.86);
+  --sl-color-bg-sidebar: var(--orbit-surface-base);
+  --sl-color-bg-inline-code: var(--orbit-surface-raised);
+  --sl-color-hairline: var(--orbit-border-subtle);
+  --sl-color-hairline-light: var(--orbit-border-subtle);
+  --sl-color-hairline-shade: var(--orbit-border-default);
+
+  --sl-color-accent-low: rgba(111, 168, 255, 0.14);
+  --sl-color-accent: #6fa8ff;
+  --sl-color-accent-high: #e4ecff;
+  --sl-color-text-accent: #8cb9ff;
+  --sl-color-text-invert: #14161d;
+}
+
+:root[data-theme="light"] {
+  /* Orbit Canonical Tokens — Alabaster Paper (Light) */
+  --orbit-surface-recessed: #f5f6f8;
+  --orbit-surface-base: #fcfcfe;
+  --orbit-surface-raised: #ffffff;
+  --orbit-surface-overlay: #ffffff;
+
+  --orbit-ink-primary: #14161d;
+  --orbit-ink-secondary: #4a5060;
+  --orbit-ink-tertiary: #6e7487;
+  --orbit-ink-faint: #969cae;
+
+  --orbit-border-subtle: rgba(20, 22, 29, 0.075);
+  --orbit-border-default: rgba(20, 22, 29, 0.12);
+  --orbit-border-strong: rgba(20, 22, 29, 0.2);
+
+  --orbit-action-bg: #14161d;
+  --orbit-action-fg: #fcfcfe;
+  --orbit-action-hover: #262936;
+
+  --orbit-success: #0f7b55;
+  --orbit-success-bg: rgba(15, 123, 85, 0.09);
+  --orbit-success-border: rgba(15, 123, 85, 0.24);
+  --orbit-warning: #b45309;
+  --orbit-warning-bg: rgba(180, 83, 9, 0.1);
+  --orbit-warning-border: rgba(180, 83, 9, 0.26);
+  --orbit-danger: #c8283b;
+  --orbit-danger-bg: rgba(200, 40, 59, 0.09);
+  --orbit-info: #2563eb;
+  --orbit-info-bg: rgba(37, 99, 235, 0.09);
+  --orbit-info-border: rgba(37, 99, 235, 0.24);
+
+  --orbit-shadow-card: 0 0 0 1px rgba(20, 22, 29, 0.06), 0 1px 2px rgba(20, 22, 29, 0.05), 0 6px 20px -6px rgba(20, 22, 29, 0.07);
+  --orbit-shadow-frame: 0 0 0 1px rgba(20, 22, 29, 0.08), 0 12px 32px -12px rgba(20, 22, 29, 0.12), 0 28px 64px -24px rgba(20, 22, 29, 0.14);
+  --orbit-grid-line: rgba(20, 22, 29, 0.038);
+  --orbit-ring-stroke: rgba(20, 22, 29, 0.075);
+  --orbit-ring-accent: rgba(20, 22, 29, 0.16);
+
+  /* Starlight Variable Bindings (Light) */
+  --sl-color-white: #14161d;
+  --sl-color-gray-1: #232734;
+  --sl-color-gray-2: #4a5060;
+  --sl-color-gray-3: #6e7487;
+  --sl-color-gray-4: #969cae;
+  --sl-color-gray-5: #dfe1e8;
+  --sl-color-gray-6: #f2f3f7;
+  --sl-color-gray-7: #f8f9fb;
+  --sl-color-black: #fcfcfe;
+
+  --sl-color-bg: var(--orbit-surface-base);
+  --sl-color-bg-nav: rgba(252, 252, 254, 0.88);
+  --sl-color-bg-sidebar: var(--orbit-surface-base);
+  --sl-color-bg-inline-code: var(--orbit-surface-recessed);
+  --sl-color-hairline: var(--orbit-border-subtle);
+  --sl-color-hairline-light: var(--orbit-border-subtle);
+  --sl-color-hairline-shade: var(--orbit-border-default);
+
+  --sl-color-accent-low: rgba(37, 99, 235, 0.08);
+  --sl-color-accent: #2563eb;
+  --sl-color-accent-high: #14161d;
+  --sl-color-text-accent: #1d4ed8;
+  --sl-color-text-invert: #fcfcfe;
+}
+
+/* Global typography refinement */
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+}
+
+header.header {
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--orbit-border-subtle);
+}
+
+.site-title {
+  font-weight: 650;
+  letter-spacing: -0.025em;
+  gap: 0.55rem;
+  color: var(--orbit-ink-primary) !important;
+}
+
+.site-title img {
+  height: 22px;
+  width: 22px;
+}
+
+/* Crisp Orbital Quiet Precision active sidebar item (high contrast in both Light & Dark) */
+.sidebar-content a[aria-current="page"],
+.sidebar-content a[aria-current="page"]:hover,
+.sidebar-content a[aria-current="page"]:focus {
+  background: var(--orbit-surface-raised);
+  color: var(--orbit-ink-primary);
+  font-weight: 600;
+  box-shadow: inset 0 0 0 1px var(--orbit-border-default);
+}
+
+/* Crisp docs content typography */
+.sl-markdown-content h1,
+.sl-markdown-content h2,
+.sl-markdown-content h3 {
+  letter-spacing: -0.025em;
+  text-wrap: balance;
+}
+
+.sl-markdown-content code:not(pre code) {
+  border: 1px solid var(--orbit-border-subtle);
+  border-radius: 5px;
+  padding: 0.1rem 0.36rem;
+  font-size: 0.86em;
+}
+
+.sl-markdown-content table {
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+
+.sl-markdown-content th {
+  text-transform: uppercase;
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  color: var(--orbit-ink-tertiary);
+  background: var(--orbit-surface-recessed);
+}
+
+/* ============================================================================
+ * Splash Landing Page Layout Reset (Full-bleed Editorial Canvas)
+ * ============================================================================ */
+body:has(.orbit-landing) .main-pane {
+  width: 100%;
+  max-width: 100%;
+}
+
+body:has(.orbit-landing) .content-panel {
+  padding: 0;
+  border: none;
+}
+
+body:has(.orbit-landing) .content-panel + .content-panel {
+  border-top: none;
+}
+
+body:has(.orbit-landing) .sl-container {
+  max-width: 100%;
+  margin: 0;
+}
+
+body:has(.orbit-landing) .sl-markdown-content {
+  margin-top: 0;
+}
+
+/* Hide Starlight's default page-title h1 panel on our custom showcase landing pages */
+body:has(.orbit-landing) .content-panel:has(h1#_top) {
+  display: none;
+}
+
+/* Neutralize Starlight's global markdown sibling-margin rule inside our custom showcase */
+.sl-markdown-content .orbit-landing :is(div, section, article, footer, nav, button, a, table, pre, p, h1, h2, h3, span, img, svg) {
+  margin-top: 0;
+}
+
+/* Restore explicit vertical rhythm inside .orbit-landing */
+.sl-markdown-content .orbit-landing .orbit-h2 {
+  margin-top: 14px;
+}
+.sl-markdown-content .orbit-landing .orbit-lead {
+  margin-top: 16px;
+}
+.sl-markdown-content .orbit-landing .orbit-hero-title {
+  margin-top: 20px;
+}
+.sl-markdown-content .orbit-landing .orbit-hero-sub {
+  margin-top: 20px;
+}
+.sl-markdown-content .orbit-landing .orbit-cta-row {
+  margin-top: 28px;
+}
+.sl-markdown-content .orbit-landing .orbit-telemetry-strip {
+  margin-top: 32px;
+}
+.sl-markdown-content .orbit-landing .orbit-stat-lbl {
+  margin-top: 5px;
+}
+.sl-markdown-content .orbit-landing .orbit-frame-shell {
+  margin-top: 32px;
+}
+.sl-markdown-content .orbit-landing .orbit-caption-grid {
+  margin-top: 20px;
+}
+.sl-markdown-content .orbit-landing .orbit-caption-title,
+.sl-markdown-content .orbit-landing .orbit-caption-desc {
+  margin-top: 4px;
+}
+.sl-markdown-content .orbit-landing .orbit-matrix-wrap,
+.sl-markdown-content .orbit-landing .orbit-bento {
+  margin-top: 36px;
+}
+.sl-markdown-content .orbit-landing .orbit-bento-title {
+  margin-top: 8px;
+}
+.sl-markdown-content .orbit-landing .orbit-bento-body {
+  margin-top: 10px;
+}
+.sl-markdown-content .orbit-landing .orbit-topo-tag {
+  margin-top: 1px;
+}
+
+/* ============================================================================
+ * Custom Editorial Showcase Components (.orbit-landing)
+ * ============================================================================ */
+.orbit-landing {
+  color: var(--orbit-ink-primary);
+  background: var(--orbit-surface-base);
+  overflow-x: clip;
+  font-size: 16px;
+  line-height: 1.6;
+}
+
+.orbit-landing *,
+.orbit-landing *::before,
+.orbit-landing *::after {
+  box-sizing: border-box;
+}
+
+.orbit-wrap {
+  width: 100%;
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+.orbit-section {
+  padding: 88px 0;
+  border-top: 1px solid var(--orbit-border-subtle);
+  position: relative;
+}
+
+.orbit-section-tight {
+  padding: 64px 0;
+}
+
+.orbit-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--sl-font-mono);
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--orbit-ink-tertiary);
+}
+
+.orbit-eyebrow-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--orbit-success);
+  box-shadow: 0 0 0 3px var(--orbit-success-bg);
+}
+
+.orbit-h2 {
+  margin: 14px 0 0;
+  font-size: clamp(28px, 3.6vw, 42px);
+  line-height: 1.12;
+  font-weight: 600;
+  letter-spacing: -0.032em;
+  color: var(--orbit-ink-primary);
+  text-wrap: balance;
+}
+
+.orbit-lead {
+  margin: 16px 0 0;
+  max-width: 640px;
+  font-size: 16.5px;
+  line-height: 1.62;
+  color: var(--orbit-ink-secondary);
+  text-wrap: pretty;
+}
+
+/* ---- HERO ---- */
+.orbit-hero {
+  position: relative;
+  padding: 56px 0 76px;
+  background-image:
+    linear-gradient(to right, var(--orbit-grid-line) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--orbit-grid-line) 1px, transparent 1px);
+  background-size: 56px 56px;
+  background-position: top center;
+}
+
+.orbit-hero::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    ellipse 85% 65% at 50% 0%,
+    transparent 35%,
+    var(--orbit-surface-base) 92%
+  );
+}
+
+.orbit-hero-inner {
+  position: relative;
+  z-index: 1;
+}
+
+.orbit-hero-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.02fr) minmax(0, 1.18fr);
+  gap: 40px;
+  align-items: center;
+}
+
+.orbit-pill-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px 5px 9px;
+  border-radius: 999px;
+  background: var(--orbit-surface-raised);
+  border: 1px solid var(--orbit-border-default);
+  font-family: var(--sl-font-mono);
+  font-size: 12px;
+  color: var(--orbit-ink-secondary);
+}
+
+.orbit-hero-title {
+  margin: 20px 0 0;
+  font-size: clamp(36px, 4.6vw, 56px);
+  line-height: 1.06;
+  font-weight: 650;
+  letter-spacing: -0.038em;
+  color: var(--orbit-ink-primary);
+  text-wrap: balance;
+}
+
+.orbit-hero-title em {
+  font-style: normal;
+  color: var(--orbit-ink-tertiary);
+}
+
+.orbit-hero-sub {
+  margin: 20px 0 0;
+  max-width: 530px;
+  font-size: 16.5px;
+  line-height: 1.62;
+  color: var(--orbit-ink-secondary);
+  text-wrap: pretty;
+}
+
+.orbit-cta-row {
+  margin-top: 28px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.orbit-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 42px;
+  padding: 0 18px;
+  border-radius: 9px;
+  font-size: 14px;
+  font-weight: 550;
+  letter-spacing: -0.01em;
+  text-decoration: none;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: transform 120ms var(--orbit-ease), background-color 150ms var(--orbit-ease), border-color 150ms var(--orbit-ease), color 150ms var(--orbit-ease);
+}
+
+.orbit-btn:active {
+  transform: scale(0.98);
+}
+
+.orbit-btn-primary {
+  background: var(--orbit-action-bg);
+  color: var(--orbit-action-fg);
+}
+
+.orbit-btn-primary:hover {
+  background: var(--orbit-action-hover);
+  color: var(--orbit-action-fg);
+}
+
+.orbit-btn-secondary {
+  background: var(--orbit-surface-raised);
+  color: var(--orbit-ink-primary);
+  border-color: var(--orbit-border-default);
+}
+
+.orbit-btn-secondary:hover {
+  border-color: var(--orbit-border-strong);
+  color: var(--orbit-ink-primary);
+}
+
+.orbit-telemetry-strip {
+  margin-top: 32px;
+  padding-top: 20px;
+  border-top: 1px solid var(--orbit-border-subtle);
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.orbit-stat-val {
+  font-family: var(--sl-font-mono);
+  font-size: 20px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+  color: var(--orbit-ink-primary);
+  line-height: 1.2;
+}
+
+.orbit-stat-lbl {
+  margin-top: 4px;
+  font-size: 12.5px;
+  color: var(--orbit-ink-tertiary);
+  line-height: 1.35;
+}
+
+/* ---- INTERACTIVE FLEET TOPOLOGY CARD ---- */
+.orbit-topo-card {
+  background: var(--orbit-surface-raised);
+  border-radius: 16px;
+  box-shadow: var(--orbit-shadow-card);
+  overflow: hidden;
+}
+
+.orbit-topo-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 16px;
+  background: var(--orbit-surface-recessed);
+  border-bottom: 1px solid var(--orbit-border-subtle);
+}
+
+.orbit-topo-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--sl-font-mono);
+  font-size: 11.5px;
+  color: var(--orbit-ink-secondary);
+}
+
+.orbit-seg {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--orbit-surface-base);
+  border: 1px solid var(--orbit-border-subtle);
+  gap: 2px;
+}
+
+.orbit-seg-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--orbit-ink-tertiary);
+  font-family: var(--sl-font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  padding: 5px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background-color 140ms var(--orbit-ease), color 140ms var(--orbit-ease);
+}
+
+.orbit-seg-btn:hover {
+  color: var(--orbit-ink-primary);
+}
+
+.orbit-seg-btn[aria-pressed="true"] {
+  background: var(--orbit-action-bg);
+  color: var(--orbit-action-fg);
+}
+
+.orbit-topo-stage {
+  padding: 16px 14px 10px;
+  background: var(--orbit-surface-raised);
+}
+
+.orbit-topo-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.orbit-topo-footer {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 16px;
+  background: var(--orbit-surface-recessed);
+  border-top: 1px solid var(--orbit-border-subtle);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--orbit-ink-secondary);
+}
+
+.orbit-topo-tag {
+  flex-shrink: 0;
+  font-family: var(--sl-font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 5px;
+  background: var(--orbit-success-bg);
+  color: var(--orbit-success);
+  border: 1px solid var(--orbit-success-border);
+  margin-top: 1px;
+}
+
+.orbit-topo-tag[data-tone="warning"] {
+  background: var(--orbit-warning-bg);
+  color: var(--orbit-warning);
+  border-color: var(--orbit-warning-border);
+}
+
+.orbit-topo-tag[data-tone="info"] {
+  background: var(--orbit-info-bg);
+  color: var(--orbit-info);
+  border-color: var(--orbit-info-border);
+}
+
+/* SVG subtle telemetry flow animation */
+@keyframes orbit-dash-flow {
+  to {
+    stroke-dashoffset: -28;
+  }
+}
+
+.orbit-flow-line {
+  stroke-dasharray: 5 5;
+  animation: orbit-dash-flow 1.8s linear infinite;
+}
+
+@keyframes orbit-soft-pulse {
+  0%, 100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+
+.orbit-pulse-ring {
+  animation: orbit-soft-pulse 3.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .orbit-flow-line,
+  .orbit-pulse-ring {
+    animation: none;
+  }
+}
+
+/* ---- PRODUCT SHOWCASE FRAME ---- */
+.orbit-showcase-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.orbit-frame-shell {
+  margin-top: 32px;
+  border-radius: 16px;
+  overflow: hidden;
+  background: var(--orbit-surface-recessed);
+  box-shadow: var(--orbit-shadow-frame);
+}
+
+.orbit-frame-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--orbit-border-subtle);
+  background: var(--orbit-surface-raised);
+  font-family: var(--sl-font-mono);
+  font-size: 11.5px;
+  color: var(--orbit-ink-tertiary);
+}
+
+.orbit-frame-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.orbit-frame-viewport {
+  position: relative;
+  aspect-ratio: 16 / 10;
+  background: var(--orbit-surface-recessed);
+  overflow: hidden;
+}
+
+.orbit-frame-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  transition: opacity 220ms var(--orbit-ease);
+}
+
+.orbit-frame-img[data-visible="false"] {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.orbit-caption-grid {
+  margin-top: 20px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.orbit-caption-item {
+  padding: 14px 16px;
+  border-radius: 10px;
+  background: var(--orbit-surface-raised);
+  border: 1px solid var(--orbit-border-subtle);
+}
+
+.orbit-caption-num {
+  font-family: var(--sl-font-mono);
+  font-size: 11px;
+  color: var(--orbit-ink-faint);
+}
+
+.orbit-caption-title {
+  margin-top: 4px;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--orbit-ink-primary);
+}
+
+.orbit-caption-desc {
+  margin-top: 4px;
+  font-size: 12.5px;
+  line-height: 1.48;
+  color: var(--orbit-ink-tertiary);
+}
+
+/* ---- DIFFERENTIATION MATRIX ---- */
+.orbit-matrix-wrap {
+  margin-top: 36px;
+  border-radius: 14px;
+  border: 1px solid var(--orbit-border-default);
+  background: var(--orbit-surface-raised);
+  overflow-x: auto;
+}
+
+.orbit-matrix {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 720px;
+  font-size: 14px;
+}
+
+.orbit-matrix th,
+.orbit-matrix td {
+  padding: 16px 20px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--orbit-border-subtle);
+}
+
+.orbit-matrix tr:last-child td {
+  border-bottom: none;
+}
+
+.orbit-matrix thead th {
+  font-family: var(--sl-font-mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--orbit-ink-tertiary);
+  background: var(--orbit-surface-recessed);
+}
+
+.orbit-matrix thead th.col-orbit {
+  color: var(--orbit-ink-primary);
+}
+
+.orbit-matrix td.col-dim {
+  font-weight: 600;
+  color: var(--orbit-ink-primary);
+  width: 24%;
+}
+
+.orbit-matrix td.col-other {
+  color: var(--orbit-ink-tertiary);
+  width: 34%;
+}
+
+.orbit-matrix td.col-orbit {
+  color: var(--orbit-ink-primary);
+  background: var(--orbit-surface-base);
+  width: 42%;
+}
+
+.orbit-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--orbit-success-bg);
+  color: var(--orbit-success);
+  font-family: var(--sl-font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  margin-right: 8px;
+  vertical-align: -1px;
+}
+
+/* ---- PILLARS ASYMMETRIC BENTO ---- */
+.orbit-bento {
+  margin-top: 36px;
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.orbit-bento-card {
+  grid-column: span 6;
+  padding: 24px 26px;
+  border-radius: 14px;
+  background: var(--orbit-surface-raised);
+  border: 1px solid var(--orbit-border-default);
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 16px;
+  transition: border-color 160ms var(--orbit-ease);
+}
+
+.orbit-bento-card:hover {
+  border-color: var(--orbit-border-strong);
+}
+
+.orbit-bento-card.span-7 {
+  grid-column: span 7;
+}
+
+.orbit-bento-card.span-5 {
+  grid-column: span 5;
+}
+
+.orbit-bento-card.span-4 {
+  grid-column: span 4;
+}
+
+.orbit-bento-tag {
+  font-family: var(--sl-font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--orbit-ink-tertiary);
+}
+
+.orbit-bento-title {
+  margin: 8px 0 0;
+  font-size: 19px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+  color: var(--orbit-ink-primary);
+}
+
+.orbit-bento-body {
+  margin: 10px 0 0;
+  font-size: 14.5px;
+  line-height: 1.58;
+  color: var(--orbit-ink-secondary);
+}
+
+.orbit-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.orbit-chip {
+  font-family: var(--sl-font-mono);
+  font-size: 11.5px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: var(--orbit-surface-recessed);
+  border: 1px solid var(--orbit-border-subtle);
+  color: var(--orbit-ink-secondary);
+}
+
+.orbit-bento-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13.5px;
+  font-weight: 550;
+  color: var(--orbit-ink-primary);
+  text-decoration: none;
+}
+
+.orbit-bento-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* ---- QUICKSTART TERMINAL ---- */
+.orbit-qs-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.08fr);
+  gap: 36px;
+  align-items: center;
+}
+
+.orbit-terminal {
+  border-radius: 14px;
+  background: var(--orbit-surface-recessed);
+  border: 1px solid var(--orbit-border-default);
+  overflow: hidden;
+  box-shadow: var(--orbit-shadow-card);
+}
+
+.orbit-terminal-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: var(--orbit-surface-raised);
+  border-bottom: 1px solid var(--orbit-border-subtle);
+  font-family: var(--sl-font-mono);
+  font-size: 11.5px;
+  color: var(--orbit-ink-tertiary);
+}
+
+.orbit-copy-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--orbit-border-default);
+  background: var(--orbit-surface-base);
+  color: var(--orbit-ink-secondary);
+  font-family: var(--sl-font-mono);
+  font-size: 11px;
+  cursor: pointer;
+  transition: border-color 140ms var(--orbit-ease), color 140ms var(--orbit-ease);
+}
+
+.orbit-copy-btn:hover {
+  border-color: var(--orbit-border-strong);
+  color: var(--orbit-ink-primary);
+}
+
+.orbit-terminal-code {
+  margin: 0;
+  padding: 18px 20px;
+  font-family: var(--sl-font-mono);
+  font-size: 13px;
+  line-height: 1.72;
+  color: var(--orbit-ink-primary);
+  overflow-x: auto;
+  background: transparent !important;
+  border: none !important;
+}
+
+.orbit-cmd-comment {
+  color: var(--orbit-ink-faint);
+}
+
+.orbit-cmd-prompt {
+  color: var(--orbit-success);
+  user-select: none;
+}
+
+/* ---- FOOTER DOCS LINKS ---- */
+.orbit-footer-band {
+  padding: 44px 0 64px;
+  border-top: 1px solid var(--orbit-border-subtle);
+}
+
+.orbit-footer-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  font-size: 13.5px;
+  color: var(--orbit-ink-tertiary);
+}
+
+.orbit-footer-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px;
+}
+
+.orbit-footer-links a {
+  color: var(--orbit-ink-secondary);
+  text-decoration: none;
+}
+
+.orbit-footer-links a:hover {
+  color: var(--orbit-ink-primary);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* ---- RESPONSIVE ---- */
+@media (max-width: 980px) {
+  .orbit-hero-grid,
+  .orbit-qs-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .orbit-caption-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .orbit-bento-card,
+  .orbit-bento-card.span-7,
+  .orbit-bento-card.span-5,
+  .orbit-bento-card.span-4 {
+    grid-column: span 12;
+  }
+}
+
+@media (max-width: 600px) {
+  .orbit-section {
+    padding: 60px 0;
+  }
+
+  .orbit-telemetry-strip,
+  .orbit-caption-grid {
+    grid-template-columns: 1fr;
+  }
+}

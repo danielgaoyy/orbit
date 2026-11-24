@@ -1,0 +1,37 @@
+# Copy to orbit-pr-review.yml after the base branch contains orbit review-pr.
+# Other repositories can install a trusted Orbit binary in the build step.
+name: Orbit Patrol
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Build the reviewer from the base commit
+        run: cargo build --locked -p orbit-cli
+      # Fork commits are only read as Git objects. Keep pull_request, avoid
+      # pull_request_target, and keep provider credentials out of this job.
+      - name: Fetch PR objects without checking out or executing the PR
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: git -c 'credential.helper=!gh auth git-credential' fetch --no-tags origin "refs/pull/$PR_NUMBER/head"
+      - name: Review the event snapshot
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: target/debug/orbit review-pr --cwd . --base "$BASE_SHA" --head "$HEAD_SHA" --json > "$RUNNER_TEMP/patrol.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orbit-patrol-report
+          path: ${{ runner.temp }}/patrol.json

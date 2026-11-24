@@ -18,6 +18,7 @@ export type SettingsSection =
   | "general"
   | "instructions"
   | "cloud_sync"
+  | "personal_router"
   | "appearance"
   | "shortcuts"
   | "notifications"
@@ -42,6 +43,7 @@ export type SettingsCoreSectionId =
   | "general"
   | "appearance"
   | "notifications_sync"
+  | "personal_router"
   | "hosts"
   | "agents"
   | "usage"
@@ -55,7 +57,6 @@ export type SettingsSubTabId =
   | "add_host"
   | "im_channels"
   | "agents"
-  | "router"
   | "acp"
   | "guardian"
   | "usage"
@@ -147,6 +148,7 @@ const DIRECT_NON_HOST_SECTIONS = new Set<string>([
   "general",
   "instructions",
   "cloud_sync",
+  "personal_router",
   "appearance",
   "shortcuts",
   "notifications",
@@ -374,6 +376,28 @@ export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
       },
     ],
   },
+  {
+    id: "personal_router",
+    group: "app",
+    labelKey: "settings.navPersonalRouter",
+    keywords: [
+      "personal",
+      "agent",
+      "router",
+      "personal router",
+      "personal agent",
+      "hermes",
+      "orchestrator",
+      "chief of staff",
+      "分工师",
+      "总控台",
+      "个人助手",
+      "个人代理",
+      "ルーター",
+      "パーソナル",
+    ],
+    subTabs: [],
+  },
 
   // ── HOST ───────────────────────────────────────────────────────────────────
   {
@@ -551,21 +575,6 @@ export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
           "プロバイダ",
           "ランタイム",
           "モデル",
-        ],
-      },
-      {
-        id: "router",
-        labelKey: "settings.subTabPersonalRouter",
-        requiresHost: true,
-        keywords: [
-          "router",
-          "personal router",
-          "hermes",
-          "orchestrator",
-          "chief of staff",
-          "分工师",
-          "总控台",
-          "ルーター",
         ],
       },
       {
@@ -818,6 +827,9 @@ export function resolveSettingsSectionTarget(
 
   const parsedHost = parseHostSettingsSection(target);
   if (parsedHost) {
+    if (parsedHost.tab === "router") {
+      return "personal_router";
+    }
     return `host:${parsedHost.hostId}:${parsedHost.tab}`;
   }
 
@@ -833,7 +845,7 @@ export function resolveSettingsSectionTarget(
     case "models_agents":
       return defaultHostId ? `host:${defaultHostId}:agents` : "add_host";
     case "router":
-      return defaultHostId ? `host:${defaultHostId}:router` : "add_host";
+      return "personal_router";
     case "acp":
       return defaultHostId ? `host:${defaultHostId}:acp` : "add_host";
     case "guardian":
@@ -886,7 +898,6 @@ export function resolveActiveSettingsLocation(
           section,
         };
       case "agents":
-      case "router":
       case "acp":
       case "guardian":
         return {
@@ -894,6 +905,13 @@ export function resolveActiveSettingsLocation(
           subTab: parsedHost.tab,
           hostId: parsedHost.hostId,
           section,
+        };
+      case "router":
+        return {
+          coreSection: "personal_router",
+          subTab: null,
+          hostId: null,
+          section: "personal_router",
         };
       case "usage":
         return {
@@ -952,6 +970,13 @@ export function resolveActiveSettingsLocation(
         hostId: null,
         section,
       };
+    case "personal_router":
+      return {
+        coreSection: "personal_router",
+        subTab: null,
+        hostId: null,
+        section,
+      };
     case "archived":
       return {
         coreSection: "notifications_sync",
@@ -988,7 +1013,6 @@ export function buildSettingsSectionForTarget(
       case "connection":
       case "im_channels":
       case "agents":
-      case "router":
       case "acp":
       case "guardian":
       case "usage":
@@ -1009,6 +1033,8 @@ export function buildSettingsSectionForTarget(
       return "appearance";
     case "notifications_sync":
       return "notifications";
+    case "personal_router":
+      return "personal_router";
     case "hosts":
       return hostId ? `host:${hostId}:connection` : "add_host";
     case "agents":

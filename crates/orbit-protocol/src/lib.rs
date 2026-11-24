@@ -1803,6 +1803,10 @@ pub enum WireMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
         pairing_uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh_alias: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_daemon_port: Option<u16>,
     },
     ConnectedHostAdded {
         request_id: Uuid,
@@ -2948,6 +2952,42 @@ pub enum WireMessage {
         attempted: u32,
         delivered: u32,
         detail: String,
+    },
+
+    /// Request an online bridge Daemon to open an E2EE tunnel to another registered Connected Host
+    /// reachable from that bridge (including LAN-only or SSH-tunneled nodes).
+    PeerBridgeOpen {
+        request_id: Uuid,
+        bridge_id: Uuid,
+        target_host_id: String,
+    },
+    /// Bridge Daemon opened the upstream `/ws/e2ee` stream and is ready to forward ciphertext.
+    PeerBridgeOpened {
+        request_id: Uuid,
+        bridge_id: Uuid,
+    },
+    /// Opaque Noise_NK E2EE ciphertext frame forwarded across a Peer Bridge.
+    PeerBridgeData {
+        bridge_id: Uuid,
+        payload_b64: String,
+    },
+    /// Either side closed the Peer Bridge stream cleanly or due to an upstream error.
+    PeerBridgeClosed {
+        bridge_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
+    /// Notify other sessions on the same account that Cloud Sync Vault state changed.
+    NotifyFleetVaultChanged {
+        request_id: Uuid,
+        vault_fingerprint: String,
+        revision: u64,
+    },
+    /// Daemon broadcast pushed to other connected clients when another device updates the vault.
+    FleetVaultChanged {
+        vault_fingerprint: String,
+        revision: u64,
     },
 
     RpcError {

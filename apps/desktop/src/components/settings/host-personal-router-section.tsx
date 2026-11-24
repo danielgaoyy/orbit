@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   Bot,
   Check,
+  ChevronRight,
   Copy,
   ExternalLink,
   RefreshCw,
@@ -11,6 +12,12 @@ import {
   Star,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import { useI18n } from "@/lib/i18n";
 import {
   type HermesBridgeBundle,
   type PersonalRouterConfig,
@@ -26,10 +33,17 @@ import { orbitActions } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 interface HostPersonalRouterSectionProps {
-  hostId: string;
+  hostId?: string;
+}
+
+function formatHermesVersion(raw?: string | null): string {
+  const trimmed = (raw ?? "").trim();
+  if (!trimmed) return "ready";
+  return trimmed.replace(/^(?:hermes\s+agent|hermes)\s+/i, "").trim() || trimmed;
 }
 
 export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionProps) {
+  const { t } = useI18n();
   const [status, setStatus] = useState<RouterStatusSnapshot | null>(null);
   const [fleetHosts, setFleetHosts] = useState<RouterHostCapabilities[]>([]);
   const [primarySelection, setPrimarySelection] = useState<PrimaryRouterSelection | null>(null);
@@ -41,6 +55,7 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
   const [bridgeBundle, setBridgeBundle] = useState<HermesBridgeBundle | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [webhookSecretDraft, setWebhookSecretDraft] = useState("");
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   const [draft, setDraft] = useState<PersonalRouterConfig>({
     enabled: false,
@@ -58,29 +73,23 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
     has_external_webhook_secret: false,
   });
 
-  const loadStatus = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const [snap, primary] = await Promise.all([
-        orbitIpc.getPersonalRouterStatus(hostId),
-        orbitIpc.getPrimaryRouterSelection(),
-      ]);
-      setStatus(snap);
-      setDraft(snap.config);
-      setPrimarySelection(primary);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  }, [hostId]);
+  const effectiveHostId =
+    primarySelection?.host_id ??
+    hostId ??
+    fleetHosts.find((h) => h.router_enabled)?.host_id ??
+    fleetHosts.find((h) => h.online)?.host_id ??
+    fleetHosts[0]?.host_id ??
+    null;
 
   const scanFleetHosts = useCallback(async () => {
     setDiscovering(true);
     try {
-      const hosts = await orbitIpc.discoverFleetRouterHosts();
+      const [hosts, primary] = await Promise.all([
+        orbitIpc.discoverFleetRouterHosts(),
+        orbitIpc.getPrimaryRouterSelection(),
+      ]);
       setFleetHosts(hosts);
+      setPrimarySelection(primary);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -88,12 +97,69 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
     }
   }, []);
 
+  const loadStatus = useCallback(async (targetHostId: string | null) => {
+    if (!targetHostId) {
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    try {
+      const snap = await orbitIpc.getPersonalRouterStatus(targetHostId);
+      setStatus(snap);
+      setDraft(snap.config);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
-    void loadStatus();
+    setError(null);
     void scanFleetHosts();
-  }, [loadStatus, scanFleetHosts]);
+  }, [scanFleetHosts]);
+
+  useEffect(() => {
+    void loadStatus(effectiveHostId);
+  }, [effectiveHostId, loadStatus]);
+
+  const handleEngineSwitch = async (value: string) => {
+    if (!effectiveHostId) return;
+    const provider: ProviderKind = value.startsWith("acp:") ? "acp" : (value as ProviderKind);
+    const acpId = value.startsWith("acp:") ? value.slice(4) : null;
+    const nextCfg: PersonalRouterConfig = {
+      ...draft,
+      enabled: true,
+      provider,
+      acp_agent_id: acpId,
+      model: null,
+      effort: null,
+    };
+    setDraft(nextCfg);
+    setSaving(true);
+    setError(null);
+    try {
+      const snap = await orbitIpc.configurePersonalRouter(effectiveHostId, nextCfg, true);
+      setStatus(snap);
+      setDraft(snap.config);
+      if (snap.router_agent?.agent_id) {
+        const nextPrimary = await orbitIpc.setPrimaryRouterSelection({
+          host_id: effectiveHostId,
+          agent_id: snap.router_agent.agent_id,
+          updated_at_ms: Date.now(),
+        });
+        setPrimarySelection(nextPrimary);
+      }
+      void scanFleetHosts();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
 
   const handleSave = async (activate: boolean) => {
+    if (!effectiveHostId) return;
     setSaving(true);
     setError(null);
     try {
@@ -102,7 +168,7 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
         enabled: activate ? true : draft.enabled,
       };
       const snap = await orbitIpc.configurePersonalRouter(
-        hostId,
+        effectiveHostId,
         nextCfg,
         activate,
         webhookSecretDraft.trim() ? webhookSecretDraft.trim() : undefined,
@@ -112,12 +178,12 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
       setWebhookSecretDraft("");
       if (activate && snap.router_agent?.agent_id) {
         const nextPrimary = await orbitIpc.setPrimaryRouterSelection({
-          host_id: hostId,
+          host_id: effectiveHostId,
           agent_id: snap.router_agent.agent_id,
           updated_at_ms: Date.now(),
         });
         setPrimarySelection(nextPrimary);
-        orbitActions.selectAgent(hostId, snap.router_agent.agent_id);
+        orbitActions.selectAgent(effectiveHostId, snap.router_agent.agent_id);
         orbitActions.closeSettings();
       }
       void scanFleetHosts();
@@ -129,6 +195,13 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
   };
 
   const handleSelectPrimaryHost = async (target: RouterHostCapabilities) => {
+    const isAlreadyPrimary = primarySelection?.host_id === target.host_id;
+    if (isAlreadyPrimary && target.active_router_agent_id) {
+      orbitActions.selectAgent(target.host_id, target.active_router_agent_id);
+      orbitActions.closeSettings();
+      return;
+    }
+
     setActivatingHostId(target.host_id);
     setError(null);
     try {
@@ -161,13 +234,11 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
         updated_at_ms: Date.now(),
       });
       setPrimarySelection(nextPrimary);
+      setStatus(snap);
+      setDraft(snap.config);
       if (snap.router_agent?.agent_id) {
         orbitActions.selectAgent(target.host_id, snap.router_agent.agent_id);
         orbitActions.closeSettings();
-      }
-      if (target.host_id === hostId) {
-        setStatus(snap);
-        setDraft(snap.config);
       }
       void scanFleetHosts();
     } catch (err) {
@@ -178,8 +249,9 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
   };
 
   const handleExportBridge = async () => {
+    if (!effectiveHostId) return;
     try {
-      const bundle = await orbitIpc.exportHermesBridgeConfig(hostId);
+      const bundle = await orbitIpc.exportHermesBridgeConfig(effectiveHostId);
       setBridgeBundle(bundle);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -197,31 +269,29 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
   };
 
   return (
-    <div className="space-y-6 pb-8">
+    <div className="space-y-5 pb-8">
       {/* Header */}
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h3 className="text-ink-primary flex items-center gap-2 text-[15px] font-semibold">
             <Sparkles className="text-ink-secondary h-4 w-4" />
-            Personal Router
+            {t("settings.personalAgentTitle")}
           </h3>
           <p className="text-ink-secondary mt-1 text-[12.5px] leading-relaxed">
-            Designate a single primary Hermes or coding harness across your Fleet as your persistent
-            Personal Router. It maintains long-term memory, inspects remote project context across
-            all connected hosts, dispatches Workers asynchronously, and bridges Feishu bidirectionally.
+            {t("settings.personalAgentDesc")}
           </p>
         </div>
-        {status?.router_agent?.agent_id && (
+        {effectiveHostId && status?.router_agent?.agent_id && (
           <Button
             type="button"
             size="sm"
             onClick={() => {
-              orbitActions.selectAgent(hostId, status.router_agent!.agent_id);
+              orbitActions.selectAgent(effectiveHostId, status.router_agent!.agent_id);
               orbitActions.closeSettings();
             }}
           >
             <Bot className="h-3.5 w-3.5" />
-            Open Router Session
+            {t("settings.personalAgentOpenSession")}
           </Button>
         )}
       </div>
@@ -232,18 +302,16 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
         </div>
       )}
 
-      {/* Multi-Host Fleet Primary Router Selector */}
+      {/* One-Click Multi-Host Fleet Selector */}
       <div className="border-border-subtle bg-surface-raised rounded-xl border p-4">
         <div className="flex items-center justify-between gap-2">
           <div>
             <div className="text-ink-primary flex items-center gap-1.5 text-[13px] font-semibold">
               <Server className="text-ink-muted h-3.5 w-3.5" />
-              Primary Router Host Selection (Multi-Host Fleet)
+              {t("settings.personalAgentChooseHost")}
             </div>
             <p className="text-ink-secondary mt-0.5 text-[12px]">
-              Choose which connected host (e.g., always-on remote Mac mini, cloud Devbox, or this
-              machine) runs your canonical Primary Hermes. All clients route here regardless of
-              which machine you are currently on.
+              {t("settings.personalAgentChooseHostDesc")}
             </p>
           </div>
           <Button
@@ -254,14 +322,16 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
             onClick={() => void scanFleetHosts()}
           >
             <RefreshCw className={cn("h-3 w-3", discovering && "animate-spin")} />
-            {discovering ? "Scanning..." : "Scan Fleet"}
+            {discovering
+              ? t("settings.personalAgentScanning")
+              : t("settings.personalAgentScanFleet")}
           </Button>
         </div>
 
         <div className="mt-3 space-y-2">
           {fleetHosts.length === 0 && !discovering && (
             <div className="text-ink-muted py-3 text-center text-[12px]">
-              No connected hosts detected yet.
+              {t("settings.personalAgentNoHosts")}
             </div>
           )}
           {fleetHosts.map((h) => {
@@ -287,15 +357,15 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
                     {isPrimary && (
                       <span className="bg-accent text-ink-primary inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10.5px] font-medium">
                         <Star className="h-2.5 w-2.5 fill-current" />
-                        Primary Router
+                        {t("settings.personalAgentActiveBadge")}
                       </span>
                     )}
                     <span className="bg-surface-recessed text-ink-muted rounded-md px-1.5 py-0.5 text-[10.5px]">
-                      {h.is_local ? "Local" : "Remote"}
+                      {h.is_local ? t("common.local") : t("common.remote")}
                     </span>
                     {h.hermes_installed && (
                       <span className="bg-surface-recessed text-ink-secondary rounded-md px-1.5 py-0.5 font-mono text-[10.5px]">
-                        Hermes {h.hermes_version ? h.hermes_version : "ready"}
+                        Hermes {formatHermesVersion(h.hermes_version)}
                       </span>
                     )}
                     {h.hermes_has_existing_memory && (
@@ -309,9 +379,11 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
                       </span>
                     )}
                   </div>
-                  <div className="text-ink-muted mt-1 text-[11.5px]">
-                    {h.recommendation_reason ?? (h.online ? "Online host" : "Offline")}
-                  </div>
+                  {h.recommendation_reason && (
+                    <div className="text-ink-muted mt-1 text-[11.5px]">
+                      {h.recommendation_reason}
+                    </div>
+                  )}
                 </div>
                 <Button
                   type="button"
@@ -321,12 +393,10 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
                   onClick={() => void handleSelectPrimaryHost(h)}
                 >
                   {isBusy
-                    ? "Activating..."
-                    : isPrimary
-                      ? "Open Primary Router"
-                      : h.hermes_installed
-                        ? "Set as Primary (Hermes)"
-                        : "Set as Primary"}
+                    ? t("settings.personalAgentActivating")
+                    : isPrimary && h.active_router_agent_id
+                      ? t("settings.personalAgentOpenAction")
+                      : t("settings.personalAgentUseAction")}
                 </Button>
               </div>
             );
@@ -334,53 +404,56 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
         </div>
       </div>
 
-      {/* Host Router Configuration */}
-      <div className="border-border-subtle bg-surface-raised space-y-4 rounded-xl border p-4">
-        <div className="text-ink-primary text-[13px] font-semibold">
-          Host Router Policy & Memory Interop
+      {/* Compact Inline Engine Switcher */}
+      {effectiveHostId && (
+        <div className="border-border-subtle bg-surface-raised flex flex-wrap items-center justify-between gap-3 rounded-xl border px-4 py-3">
+          <div className="min-w-0">
+            <div className="text-ink-primary text-[12.5px] font-medium">
+              {t("settings.personalAgentEngineLabel")}
+            </div>
+            <div className="text-ink-muted text-[11.5px]">
+              {t("settings.personalAgentEngineHint")}
+            </div>
+          </div>
+          <select
+            disabled={loading || saving}
+            value={
+              draft.provider === "acp" ? `acp:${draft.acp_agent_id ?? "hermes"}` : draft.provider
+            }
+            onChange={(e) => void handleEngineSwitch(e.target.value)}
+            className="border-border-default bg-surface-base text-ink-primary h-8 min-w-[220px] rounded-lg border px-2.5 text-[12.5px]"
+          >
+            <option value="acp:hermes">Hermes Agent (ACP · Recommended)</option>
+            <option value="claude_code">Claude Code</option>
+            <option value="codex">OpenAI Codex</option>
+            <option value="antigravity">Antigravity (agy)</option>
+          </select>
         </div>
+      )}
 
-        {loading ? (
-          <div className="text-ink-muted py-4 text-[12px]">Loading configuration...</div>
-        ) : (
-          <>
+      {/* Collapsed Advanced Policy, Memory & External Hermes Bridge */}
+      {effectiveHostId && (
+        <Collapsible
+          open={advancedOpen}
+          onOpenChange={setAdvancedOpen}
+          className="border-border-subtle bg-surface-raised rounded-xl border px-4 py-3"
+        >
+          <CollapsibleTrigger className="group/adv text-ink-secondary hover:text-ink-primary flex w-full cursor-pointer items-center justify-between gap-2 text-left text-[12.5px] font-medium outline-none">
+            <span>{t("settings.personalAgentAdvancedOptions")}</span>
+            <ChevronRight className="text-ink-muted size-3.5 shrink-0 transition-transform duration-150 group-data-[panel-open]/adv:rotate-90" />
+          </CollapsibleTrigger>
+
+          <CollapsibleContent className="space-y-4 pt-4">
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <label className="space-y-1">
-                <span className="text-ink-secondary text-[11.5px] font-medium">Router Engine</span>
-                <select
-                  value={
-                    draft.provider === "acp"
-                      ? `acp:${draft.acp_agent_id ?? "hermes"}`
-                      : draft.provider
-                  }
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    if (v.startsWith("acp:")) {
-                      setDraft((d) => ({ ...d, provider: "acp", acp_agent_id: v.slice(4) }));
-                    } else {
-                      setDraft((d) => ({
-                        ...d,
-                        provider: v as ProviderKind,
-                        acp_agent_id: null,
-                      }));
-                    }
-                  }}
-                  className="border-border-default bg-surface-base text-ink-primary h-8 w-full rounded-lg border px-2.5 text-[12.5px]"
-                >
-                  <option value="acp:hermes">Hermes Agent (ACP · Recommended)</option>
-                  <option value="claude_code">Claude Code</option>
-                  <option value="codex">OpenAI Codex</option>
-                  <option value="antigravity">Antigravity (agy)</option>
-                </select>
-              </label>
-
-              <label className="space-y-1">
                 <span className="text-ink-secondary text-[11.5px] font-medium">
-                  Fleet Visibility Scope
+                  {t("settings.personalAgentScopeLabel")}
                 </span>
                 <select
                   value={draft.scope}
-                  onChange={(e) => setDraft((d) => ({ ...d, scope: e.target.value as RouterScope }))}
+                  onChange={(e) =>
+                    setDraft((d) => ({ ...d, scope: e.target.value as RouterScope }))
+                  }
                   className="border-border-default bg-surface-base text-ink-primary h-8 w-full rounded-lg border px-2.5 text-[12.5px]"
                 >
                   <option value="global_fleet">Global Multi-Host Fleet (Recommended)</option>
@@ -388,10 +461,10 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
                 </select>
               </label>
 
-              <label className="space-y-1 sm:col-span-2">
+              <label className="space-y-1">
                 <span className="text-ink-secondary flex items-center gap-1 text-[11.5px] font-medium">
                   <ShieldCheck className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
-                  3-Tier Guardian Pre-Review (Tier-3 High/Critical always requires human approval)
+                  {t("settings.personalAgentGuardianLabel")}
                 </span>
                 <select
                   value={draft.pre_review_mode}
@@ -404,10 +477,10 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
                   className="border-border-default bg-surface-base text-ink-primary h-8 w-full rounded-lg border px-2.5 text-[12.5px]"
                 >
                   <option value="medium_risk_only">
-                    Medium-risk pre-review by Router; High/Critical hard-blocked for Human (Recommended)
+                    Medium-risk pre-review by Router; High/Critical hard-blocked for Human
                   </option>
                   <option value="assist_only">
-                    Assist Only (Router summarizes context; Human resolves all approvals)
+                    Assist Only (Router summarizes; Human resolves all)
                   </option>
                   <option value="disabled">Disabled (All approvals go directly to Human)</option>
                 </select>
@@ -423,18 +496,12 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
                 }
                 className="rounded"
               />
-              <span className="text-ink-primary">
-                Share & interoperate with host{" "}
-                <code className="bg-surface-recessed rounded px-1 font-mono text-[11px]">
-                  ~/.hermes/memories/
-                </code>{" "}
-                and skills
-              </span>
+              <span className="text-ink-primary">{t("settings.personalAgentShareHermesMemory")}</span>
             </label>
 
             <label className="block space-y-1">
               <span className="text-ink-secondary text-[11.5px] font-medium">
-                Custom Routing Discipline (Appended to Router SOUL)
+                {t("settings.personalAgentCustomDiscipline")}
               </span>
               <textarea
                 rows={3}
@@ -453,7 +520,7 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <label className="space-y-1">
                 <span className="text-ink-secondary text-[11.5px] font-medium">
-                  External Hermes Inbound Webhook URL (Optional)
+                  {t("settings.personalAgentWebhookUrl")}
                 </span>
                 <input
                   type="url"
@@ -467,7 +534,7 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
               </label>
               <label className="space-y-1">
                 <span className="text-ink-secondary text-[11.5px] font-medium">
-                  Webhook Bearer Secret{" "}
+                  {t("settings.personalAgentWebhookSecret")}{" "}
                   {draft.has_external_webhook_secret ? "(Configured)" : "(Optional)"}
                 </span>
                 <input
@@ -485,19 +552,9 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
                 type="button"
                 size="sm"
                 disabled={saving}
-                onClick={() => void handleSave(true)}
-              >
-                <Sparkles className="h-3.5 w-3.5" />
-                {saving ? "Activating..." : "Save & Activate Primary Router"}
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={saving}
                 onClick={() => void handleSave(false)}
               >
-                Save Policy Only
+                {t("settings.personalAgentSavePolicy")}
               </Button>
               <Button
                 type="button"
@@ -506,66 +563,66 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
                 onClick={() => void handleExportBridge()}
               >
                 <ExternalLink className="h-3.5 w-3.5" />
-                Export External Hermes MCP Bridge
+                {t("settings.personalAgentExportBridge")}
               </Button>
             </div>
-          </>
-        )}
-      </div>
 
-      {/* External Hermes Bridge Export */}
-      {bridgeBundle && (
-        <div className="border-border-subtle bg-surface-raised space-y-3 rounded-xl border p-4">
-          <div className="text-ink-primary text-[13px] font-semibold">
-            External Hermes Gateway Bidirectional MCP Bridge ({bridgeBundle.host_name})
-          </div>
-          <p className="text-ink-secondary text-[12px]">
-            Add this block to{" "}
-            <code className="bg-surface-recessed rounded px-1 font-mono">
-              ~/.hermes/config.yaml
-            </code>
-            . Any Worker conversation or Mission Workspace created by external Hermes reflects live
-            across Orbit Desktop and Mobile.
-          </p>
-          {[
-            {
-              key: "mcp",
-              title: "1. Orbit Streamable HTTP MCP",
-              body: bridgeBundle.mcp_yaml_snippet,
-            },
-            {
-              key: "toolset",
-              title: "2. Lightweight ACP Toolset Scoping",
-              body: bridgeBundle.acp_toolset_yaml_snippet,
-            },
-          ].map((item) => (
-            <div key={item.key} className="space-y-1">
-              <div className="flex items-center justify-between">
-                <span className="text-ink-secondary text-[11.5px] font-medium">{item.title}</span>
-                <button
-                  type="button"
-                  onClick={() => void copyText(item.key, item.body)}
-                  className="text-ink-muted hover:text-ink-primary inline-flex cursor-pointer items-center gap-1 text-[11.5px]"
-                >
-                  {copiedKey === item.key ? (
-                    <>
-                      <Check className="h-3 w-3 text-emerald-500" />
-                      Copied
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="h-3 w-3" />
-                      Copy
-                    </>
-                  )}
-                </button>
+            {bridgeBundle && (
+              <div className="border-border-subtle bg-surface-base space-y-3 rounded-lg border p-3">
+                <div className="text-ink-primary text-[12.5px] font-semibold">
+                  External Hermes Gateway MCP Bridge ({bridgeBundle.host_name})
+                </div>
+                <p className="text-ink-secondary text-[12px]">
+                  Add this block to{" "}
+                  <code className="bg-surface-recessed rounded px-1 font-mono">
+                    ~/.hermes/config.yaml
+                  </code>
+                  .
+                </p>
+                {[
+                  {
+                    key: "mcp",
+                    title: "1. Orbit Streamable HTTP MCP",
+                    body: bridgeBundle.mcp_yaml_snippet,
+                  },
+                  {
+                    key: "toolset",
+                    title: "2. Lightweight ACP Toolset Scoping",
+                    body: bridgeBundle.acp_toolset_yaml_snippet,
+                  },
+                ].map((item) => (
+                  <div key={item.key} className="space-y-1">
+                    <div className="flex items-center justify-between">
+                      <span className="text-ink-secondary text-[11.5px] font-medium">
+                        {item.title}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => void copyText(item.key, item.body)}
+                        className="text-ink-muted hover:text-ink-primary inline-flex cursor-pointer items-center gap-1 text-[11.5px]"
+                      >
+                        {copiedKey === item.key ? (
+                          <>
+                            <Check className="h-3 w-3 text-emerald-500" />
+                            Copied
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="h-3 w-3" />
+                            Copy
+                          </>
+                        )}
+                      </button>
+                    </div>
+                    <pre className="bg-surface-recessed text-ink-primary overflow-x-auto rounded-lg p-2.5 font-mono text-[11px] leading-relaxed">
+                      {item.body}
+                    </pre>
+                  </div>
+                ))}
               </div>
-              <pre className="bg-surface-recessed text-ink-primary overflow-x-auto rounded-lg p-2.5 font-mono text-[11px] leading-relaxed">
-                {item.body}
-              </pre>
-            </div>
-          ))}
-        </div>
+            )}
+          </CollapsibleContent>
+        </Collapsible>
       )}
     </div>
   );

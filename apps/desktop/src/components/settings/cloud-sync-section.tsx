@@ -5,6 +5,7 @@ import {
   Cloud,
   Copy,
   ExternalLink,
+  Globe,
   KeyRound,
   Lock,
   LogOut,
@@ -90,7 +91,11 @@ export function CloudSyncSection() {
     displayError &&
       /401|bad credentials|expired|revoked|unauthorized/i.test(displayError),
   );
-  const hostsMissingRelay = hosts.filter((h) => !(h.relay_url ?? "").trim());
+  const hostsWithReachableFabric = hosts.filter(
+    (h) => Boolean((h.relay_url ?? "").trim()) || Boolean((h.ssh_alias ?? "").trim()),
+  );
+  const allRemoteHostsLackReachability =
+    hosts.length > 1 && hostsWithReachableFabric.length === 0;
 
   const markCopied = (which: "code" | "key" | "cli", text: string) => {
     if (typeof navigator !== "undefined" && navigator.clipboard) {
@@ -751,12 +756,19 @@ export function CloudSyncSection() {
           </div>
         )}
 
-      {effectiveState === "ready" && hosts.length > 0 && hostsMissingRelay.length > 0 && (
-        <div className="border-signal-warning-border bg-signal-warning-bg text-signal-warning flex items-start gap-2 rounded-[11px] border px-3.5 py-2.5 text-[12px]">
-          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-          <span>
-            {hostsMissingRelay.length} host{hostsMissingRelay.length === 1 ? " has" : "s have"} no Private Relay configured yet — mobile off-LAN connections require configuring &amp; sharing a relay in Host Connection settings.
-          </span>
+      {effectiveState === "ready" && hosts.length > 0 && (
+        <div className="space-y-2">
+          <SettingGroupLabel>{t("settings.fleetNetworkTitle")}</SettingGroupLabel>
+          <SettingCard>
+            <div className="flex items-start gap-2.5 px-4 py-3 text-[12px]">
+              <Globe className="text-muted-foreground mt-0.5 h-4 w-4 shrink-0" />
+              <span className="text-muted-foreground leading-relaxed">
+                {allRemoteHostsLackReachability
+                  ? t("settings.fleetNetworkMissingReachability")
+                  : t("settings.fleetNetworkAutoDesc")}
+              </span>
+            </div>
+          </SettingCard>
         </div>
       )}
 

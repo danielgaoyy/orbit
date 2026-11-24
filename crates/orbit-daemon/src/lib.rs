@@ -923,6 +923,7 @@ fn build_http_router(runtime: Arc<DaemonRuntime>) -> Router {
     Router::new()
         .route("/healthz", get(healthz_handler))
         .route("/ws", get(ws_handler))
+        .route("/ws/e2ee", get(ws_e2ee_handler))
         .route("/mcp/agents", post(crate::mcp::mcp_agents_handler))
         .route(
             "/webhooks/{trigger_id}",
@@ -1506,11 +1507,27 @@ async fn serve_e2ee_relay_tunnel(
     .await
     .map_err(|_| anyhow::anyhow!("timed out sending tunnel attach MAC"))??;
 
+    serve_e2ee_ws_transport(runtime, sink, stream, priv_bytes, tunnel_id, None).await
+}
+
+async fn serve_e2ee_ws_transport<Si, St, E>(
+    runtime: Arc<DaemonRuntime>,
+    mut sink: Si,
+    mut stream: St,
+    priv_bytes: [u8; 32],
+    stream_label: &str,
+    handshake_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> anyhow::Result<()>
+where
+    Si: futures_util::Sink<TungMsg, Error = E> + Unpin + Send + 'static,
+    St: futures_util::Stream<Item = Result<TungMsg, E>> + Unpin + Send + 'static,
+    E: Into<anyhow::Error> + Send + 'static,
+{
     // Fail closed before accepting client Noise handshake if persisted pairing-secret is unavailable.
     if runtime.active_pairing_secret().is_none() {
         warn!(
-            tunnel_id = %tunnel_id,
-            "Rejected Relay E2EE tunnel: persisted pairing-secret is missing or malformed (fail-closed)"
+            stream = %stream_label,
+            "Rejected E2EE stream: persisted pairing-secret is missing or malformed (fail-closed)"
         );
         close_tung_sink_bounded(
             &mut sink,
@@ -1526,10 +1543,10 @@ async fn serve_e2ee_relay_tunnel(
     // Receive Noise NKpsk0 Message 1 from Client
     let msg1 = tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(item) = stream.next().await {
-            match item? {
+            match item.map_err(Into::into)? {
                 TungMsg::Binary(b) => return Ok::<_, anyhow::Error>(b),
                 TungMsg::Ping(p) => {
-                    sink.send(TungMsg::Pong(p)).await?;
+                    sink.send(TungMsg::Pong(p)).await.map_err(Into::into)?;
                 }
                 TungMsg::Pong(_) => {}
                 TungMsg::Close(frame) => {
@@ -1553,8 +1570,8 @@ async fn serve_e2ee_relay_tunnel(
     // take effect immediately with zero race window.
     let Some(expected_secret) = runtime.active_pairing_secret() else {
         warn!(
-            tunnel_id = %tunnel_id,
-            "Rejected Relay E2EE tunnel: persisted pairing-secret is missing or malformed (fail-closed)"
+            stream = %stream_label,
+            "Rejected E2EE stream: persisted pairing-secret is missing or malformed (fail-closed)"
         );
         close_tung_sink_bounded(
             &mut sink,
@@ -1571,9 +1588,9 @@ async fn serve_e2ee_relay_tunnel(
         Ok(accepted) => accepted,
         Err(err) => {
             warn!(
-                tunnel_id = %tunnel_id,
+                stream = %stream_label,
                 error = %err,
-                "Rejected unauthorized Relay E2EE client handshake"
+                "Rejected unauthorized E2EE client handshake"
             );
             close_tung_sink_bounded(
                 &mut sink,
@@ -1592,7 +1609,9 @@ async fn serve_e2ee_relay_tunnel(
         sink.send(TungMsg::Binary(msg2.into())),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("timed out sending Noise msg2"))??;
+    .map_err(|_| anyhow::anyhow!("timed out sending Noise msg2"))
+    .map_err(|e| anyhow::anyhow!(e))?
+    .map_err(Into::into)?;
 
     // Require client key confirmation (first valid encrypted WireMessage) under a bounded timeout
     // BEFORE subscribing to daemon broadcasts or spawning full session tasks.
@@ -1601,8 +1620,8 @@ async fn serve_e2ee_relay_tunnel(
         biased;
         () = wait_for_session_revocation(Arc::clone(&runtime), expected_secret.clone()) => {
             warn!(
-                tunnel_id = %tunnel_id,
-                "Closing Relay E2EE tunnel before first frame: pairing_secret rotated or revoked"
+                stream = %stream_label,
+                "Closing E2EE stream before first frame: pairing_secret rotated or revoked"
             );
             close_tung_sink_bounded(
                 &mut sink,
@@ -1624,15 +1643,16 @@ async fn serve_e2ee_relay_tunnel(
                 Ok(wire) => wire,
                 Err(err) => {
                     warn!(
-                        tunnel_id = %tunnel_id,
+                        stream = %stream_label,
                         error = %err,
-                        "Rejected Relay E2EE tunnel before session start"
+                        "Rejected E2EE stream before session start"
                     );
                     return Err(err);
                 }
             }
         }
     };
+    drop(handshake_permit);
 
     let shared_chan = Arc::new(tokio::sync::Mutex::new(chan));
     let (in_tx, in_rx) = mpsc::channel::<SessionFrame>(256);
@@ -1736,6 +1756,100 @@ async fn serve_e2ee_relay_tunnel(
         }
     }
     Ok(())
+}
+
+static DIRECT_E2EE_HANDSHAKE_SEM: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(32)));
+
+fn axum_msg_to_tung(msg: AxumWsMsg) -> TungMsg {
+    match msg {
+        AxumWsMsg::Text(t) => TungMsg::Text(t.as_str().into()),
+        AxumWsMsg::Binary(b) => TungMsg::Binary(b),
+        AxumWsMsg::Ping(p) => TungMsg::Ping(p),
+        AxumWsMsg::Pong(p) => TungMsg::Pong(p),
+        AxumWsMsg::Close(c) => TungMsg::Close(c.map(|f| TungCloseFrame {
+            code: f.code.into(),
+            reason: f.reason.as_str().into(),
+        })),
+    }
+}
+
+fn tung_msg_to_axum(msg: TungMsg) -> AxumWsMsg {
+    match msg {
+        TungMsg::Text(t) => AxumWsMsg::Text(t.as_str().into()),
+        TungMsg::Binary(b) => AxumWsMsg::Binary(b),
+        TungMsg::Ping(p) => AxumWsMsg::Ping(p),
+        TungMsg::Pong(p) => AxumWsMsg::Pong(p),
+        TungMsg::Close(c) => AxumWsMsg::Close(c.map(|f| axum::extract::ws::CloseFrame {
+            code: u16::from(f.code),
+            reason: f.reason.as_str().into(),
+        })),
+        TungMsg::Frame(_) => AxumWsMsg::Binary(Default::default()),
+    }
+}
+
+/// Direct Noise_NKpsk0 E2EE WebSocket endpoint (`/ws/e2ee`) used by Peer-Bridged multi-hop
+/// tunneling over LAN / SSH so intermediate bridge Daemons never see plaintext.
+async fn ws_e2ee_handler(
+    headers: HeaderMap,
+    State(runtime): State<Arc<DaemonRuntime>>,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Response {
+    if let Err(status) = validate_request_origin(&headers) {
+        warn!(
+            origin = ?headers.get(axum::http::header::ORIGIN),
+            "Rejected /ws/e2ee request due to disallowed Origin header"
+        );
+        return (status, "Forbidden Origin").into_response();
+    }
+    if runtime.active_pairing_secret().is_none() {
+        warn!("Rejected /ws/e2ee upgrade: persisted pairing-secret is missing (fail-closed)");
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+    let Ok(permit) = Arc::clone(&DIRECT_E2EE_HANDSHAKE_SEM).try_acquire_owned() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Busy").into_response();
+    };
+    match ws {
+        Ok(upgrade) => upgrade
+            .max_frame_size(orbit_protocol::MAX_WS_FRAME_BYTES)
+            .max_message_size(orbit_protocol::MAX_WS_FRAME_BYTES)
+            .on_upgrade(move |socket| async move {
+                handle_direct_e2ee_socket(socket, runtime, permit).await;
+            })
+            .into_response(),
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+async fn handle_direct_e2ee_socket(
+    socket: WebSocket,
+    runtime: Arc<DaemonRuntime>,
+    handshake_permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let Ok(priv_bytes) = runtime.keypair.private_bytes() else {
+        return;
+    };
+    let (raw_sink, raw_stream) = socket.split();
+    let sink = Box::pin(futures_util::sink::unfold(
+        raw_sink,
+        |mut s, msg: TungMsg| async move {
+            s.send(tung_msg_to_axum(msg)).await?;
+            Ok::<_, axum::Error>(s)
+        },
+    ));
+    let stream = raw_stream.map(|res| res.map(axum_msg_to_tung));
+    if let Err(err) = serve_e2ee_ws_transport(
+        runtime,
+        sink,
+        stream,
+        priv_bytes,
+        "direct_e2ee",
+        Some(handshake_permit),
+    )
+    .await
+    {
+        tracing::debug!(error = %err, "direct /ws/e2ee session ended");
+    }
 }
 
 // --- Direct Axum WebSocket Handler ---
@@ -1904,11 +2018,19 @@ enum SessionExitReason {
     Revoked,
 }
 
-/// Ensures terminal streaming tasks and side-question tasks are always aborted immediately even
+const MAX_CONCURRENT_PEER_BRIDGES_PER_SESSION: usize = 16;
+
+struct ActivePeerBridge {
+    inbound_tx: mpsc::Sender<Vec<u8>>,
+    task: tokio::task::AbortHandle,
+}
+
+/// Ensures terminal streaming tasks, peer bridges, and side-question tasks are always aborted immediately even
 /// when `run_client_session_loop` is dropped mid-await on secret revocation.
 struct SessionCleanupGuard {
     slot_to_terminal: HashMap<u8, (String, tokio::task::AbortHandle)>,
     active_side_questions: Vec<tokio::task::AbortHandle>,
+    active_peer_bridges: HashMap<Uuid, ActivePeerBridge>,
 }
 
 impl SessionCleanupGuard {
@@ -1916,6 +2038,7 @@ impl SessionCleanupGuard {
         Self {
             slot_to_terminal: HashMap::new(),
             active_side_questions: Vec::new(),
+            active_peer_bridges: HashMap::new(),
         }
     }
 }
@@ -1927,6 +2050,9 @@ impl Drop for SessionCleanupGuard {
         }
         for abort_handle in self.active_side_questions.drain(..) {
             abort_handle.abort();
+        }
+        for (_, bridge) in self.active_peer_bridges.drain() {
+            bridge.task.abort();
         }
     }
 }
@@ -2068,27 +2194,66 @@ async fn run_client_session_loop(
                             use_zstd = true;
                         }
                         cleanup.active_side_questions.retain(|h| !h.is_finished());
-                        if let Some(reply) = handle_wire_rpc(
-                            &runtime,
-                            session_id,
-                            msg,
-                            &mut use_zstd,
-                            &mut subscribed_agents,
-                            &mut subscribed_provider_subagents,
-                            &mut cleanup.slot_to_terminal,
-                            &mut cleanup.active_side_questions,
-                            &out_tx,
-                        )
-                        .await
-                            && out_tx
-                                .send(SessionFrame::Wire {
-                                    msg: reply,
-                                    zstd: use_zstd,
-                                })
+                        cleanup
+                            .active_peer_bridges
+                            .retain(|_, b| !b.task.is_finished());
+                        match msg {
+                            WireMessage::PeerBridgeOpen {
+                                request_id,
+                                bridge_id,
+                                target_host_id,
+                            } => {
+                                handle_peer_bridge_open(
+                                    &runtime,
+                                    &mut cleanup.active_peer_bridges,
+                                    &out_tx,
+                                    use_zstd,
+                                    request_id,
+                                    bridge_id,
+                                    &target_host_id,
+                                )
+                                .await;
+                            }
+                            WireMessage::PeerBridgeData {
+                                bridge_id,
+                                payload_b64,
+                            } => {
+                                handle_peer_bridge_data(
+                                    &mut cleanup.active_peer_bridges,
+                                    bridge_id,
+                                    &payload_b64,
+                                )
+                                .await;
+                            }
+                            WireMessage::PeerBridgeClosed { bridge_id, .. } => {
+                                if let Some(b) = cleanup.active_peer_bridges.remove(&bridge_id) {
+                                    b.task.abort();
+                                }
+                            }
+                            other => {
+                                if let Some(reply) = handle_wire_rpc(
+                                    &runtime,
+                                    session_id,
+                                    other,
+                                    &mut use_zstd,
+                                    &mut subscribed_agents,
+                                    &mut subscribed_provider_subagents,
+                                    &mut cleanup.slot_to_terminal,
+                                    &mut cleanup.active_side_questions,
+                                    &out_tx,
+                                )
                                 .await
-                                .is_err()
-                        {
-                            break;
+                                    && out_tx
+                                        .send(SessionFrame::Wire {
+                                            msg: reply,
+                                            zstd: use_zstd,
+                                        })
+                                        .await
+                                        .is_err()
+                                {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -2217,6 +2382,20 @@ async fn run_client_session_loop(
                     DaemonBroadcast::WorkflowRunEvent(run) => {
                         Some(WireMessage::WorkflowRunEvent { run })
                     }
+                    DaemonBroadcast::FleetVaultChanged {
+                        origin_session_id,
+                        vault_fingerprint,
+                        revision,
+                    } => {
+                        if origin_session_id != session_id {
+                            Some(WireMessage::FleetVaultChanged {
+                                vault_fingerprint,
+                                revision,
+                            })
+                        } else {
+                            None
+                        }
+                    }
                 };
                 if let Some(msg) = maybe_msg
                     && out_tx
@@ -2241,6 +2420,198 @@ async fn run_client_session_loop(
                 }
             }
         }
+    }
+}
+
+async fn handle_peer_bridge_open(
+    runtime: &Arc<DaemonRuntime>,
+    bridges: &mut HashMap<Uuid, ActivePeerBridge>,
+    out_tx: &mpsc::Sender<SessionFrame>,
+    use_zstd: bool,
+    request_id: Uuid,
+    bridge_id: Uuid,
+    target_host_id: &str,
+) {
+    if bridges.len() >= MAX_CONCURRENT_PEER_BRIDGES_PER_SESSION {
+        let _ = out_tx
+            .send(SessionFrame::Wire {
+                msg: rpc_err(
+                    request_id,
+                    "peer_bridge_limit_reached",
+                    "maximum concurrent peer bridges reached for this session",
+                ),
+                zstd: use_zstd,
+            })
+            .await;
+        return;
+    }
+    if bridges.contains_key(&bridge_id) {
+        let _ = out_tx
+            .send(SessionFrame::Wire {
+                msg: rpc_err(request_id, "peer_bridge_duplicate", "duplicate bridge_id"),
+                zstd: use_zstd,
+            })
+            .await;
+        return;
+    }
+
+    // SSRF guard: only bridge to an explicitly registered & enabled Connected Host in store.
+    let target_id = target_host_id.trim().to_string();
+    let row = match runtime.store.get_connected_host_by_host_id(&target_id) {
+        Ok(Some(r)) if r.enabled => r,
+        Ok(Some(_)) => {
+            let _ = out_tx
+                .send(SessionFrame::Wire {
+                    msg: rpc_err(
+                        request_id,
+                        "peer_bridge_disabled",
+                        "target connected host is disabled on bridge daemon",
+                    ),
+                    zstd: use_zstd,
+                })
+                .await;
+            return;
+        }
+        _ => {
+            let _ = out_tx
+                .send(SessionFrame::Wire {
+                    msg: rpc_err(
+                        request_id,
+                        "peer_bridge_not_found",
+                        format!("target host `{target_id}` is not a registered connected host on this daemon"),
+                    ),
+                    zstd: use_zstd,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<Vec<u8>>(128);
+    let tx_out = out_tx.clone();
+    let handle = tokio::spawn(async move {
+        use base64::Engine as _;
+
+        let (ws, ssh_guard) = match crate::connected_hosts::connect_peer_e2ee_ws(&row).await {
+            Ok(conn) => conn,
+            Err(err) => {
+                let _ = tx_out
+                    .send(SessionFrame::Wire {
+                        msg: rpc_err(request_id, "peer_bridge_connect_failed", err),
+                        zstd: use_zstd,
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        if tx_out
+            .send(SessionFrame::Wire {
+                msg: WireMessage::PeerBridgeOpened {
+                    request_id,
+                    bridge_id,
+                },
+                zstd: use_zstd,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let _keep_ssh = ssh_guard;
+        let (mut sink, mut stream) = ws.split();
+        let mut close_reason: Option<String> = None;
+
+        loop {
+            tokio::select! {
+                maybe_in = inbound_rx.recv() => {
+                    let Some(bytes) = maybe_in else {
+                        break;
+                    };
+                    if let Err(err) = sink.send(TungMsg::Binary(bytes.into())).await {
+                        close_reason = Some(format!("upstream send failed: {err}"));
+                        break;
+                    }
+                }
+                maybe_up = stream.next() => {
+                    match maybe_up {
+                        Some(Ok(TungMsg::Binary(bytes))) => {
+                            let payload_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            if tx_out
+                                .send(SessionFrame::Wire {
+                                    msg: WireMessage::PeerBridgeData {
+                                        bridge_id,
+                                        payload_b64,
+                                    },
+                                    zstd: use_zstd,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Some(Ok(TungMsg::Ping(p))) => {
+                            let _ = sink.send(TungMsg::Pong(p)).await;
+                        }
+                        Some(Ok(TungMsg::Pong(_))) => {}
+                        Some(Ok(TungMsg::Close(frame))) => {
+                            close_reason = frame.map(|f| f.reason.to_string()).filter(|s| !s.is_empty());
+                            break;
+                        }
+                        Some(Err(err)) => {
+                            close_reason = Some(format!("upstream recv failed: {err}"));
+                            break;
+                        }
+                        None => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let _ = sink.close().await;
+        let _ = tx_out
+            .send(SessionFrame::Wire {
+                msg: WireMessage::PeerBridgeClosed {
+                    bridge_id,
+                    reason: close_reason,
+                },
+                zstd: use_zstd,
+            })
+            .await;
+    });
+
+    bridges.insert(
+        bridge_id,
+        ActivePeerBridge {
+            inbound_tx,
+            task: handle.abort_handle(),
+        },
+    );
+}
+
+async fn handle_peer_bridge_data(
+    bridges: &mut HashMap<Uuid, ActivePeerBridge>,
+    bridge_id: Uuid,
+    payload_b64: &str,
+) {
+    use base64::Engine as _;
+
+    let Some(bridge) = bridges.get(&bridge_id) else {
+        return;
+    };
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload_b64) else {
+        if let Some(removed) = bridges.remove(&bridge_id) {
+            removed.task.abort();
+        }
+        return;
+    };
+    if bridge.inbound_tx.send(bytes).await.is_err()
+        && let Some(removed) = bridges.remove(&bridge_id)
+    {
+        removed.task.abort();
     }
 }
 
@@ -6060,9 +6431,11 @@ async fn handle_wire_rpc(
             request_id,
             label,
             pairing_uri,
+            ssh_alias,
+            remote_daemon_port,
         } => match runtime
             .connected_hosts
-            .add_from_pairing_uri(label, &pairing_uri)
+            .add_from_pairing_uri_with_transport(label, &pairing_uri, ssh_alias, remote_daemon_port)
             .await
         {
             Ok(host) => Some(WireMessage::ConnectedHostAdded { request_id, host }),
@@ -6861,6 +7234,21 @@ async fn handle_wire_rpc(
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });
             None
+        }
+        WireMessage::NotifyFleetVaultChanged {
+            request_id,
+            vault_fingerprint,
+            revision,
+        } => {
+            let _ = runtime
+                .orchestrator
+                .broadcast_tx
+                .send(DaemonBroadcast::FleetVaultChanged {
+                    origin_session_id: session_id,
+                    vault_fingerprint,
+                    revision,
+                });
+            Some(WireMessage::Ack { request_id })
         }
         _ => None,
     }

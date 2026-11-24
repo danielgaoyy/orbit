@@ -587,6 +587,226 @@ async fn connect_via_relay_with_host_id(
         }
         other => ClientCoreError::Crypto(other),
     })?;
+
+    let (ct_out_tx, mut ct_out_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (ct_in_tx, ct_in_rx) = mpsc::channel::<Vec<u8>>(256);
+
+    tokio::spawn(async move {
+        while let Some(ct) = ct_out_rx.recv().await {
+            if sink.send(Message::Binary(ct.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        while let Some(Ok(msg)) = stream.next().await {
+            match msg {
+                Message::Binary(ct) => {
+                    if ct_in_tx.send(ct.to_vec()).await.is_err() {
+                        break;
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    complete_e2ee_session_tasks(host_id, write_chan, ct_out_tx, ct_in_rx, replica, None).await
+}
+
+/// Connect to a remote LAN-isolated Daemon by tunneling end-to-end encrypted (`Noise_NKpsk0`)
+/// frames through an already-online Peer Bridge Daemon session.
+///
+/// Security: The bridge Daemon ONLY forwards opaque encrypted bytes via `PeerBridgeOpen` /
+/// `PeerBridgeData` and cannot decrypt credentials, prompts, or filesystem contents.
+pub async fn connect_via_peer_bridge(
+    bridge_session: &HostSessionHandle,
+    target_host_id: &str,
+    target_pubkey_b64: &str,
+    target_pairing_secret: &str,
+    replica: Option<Arc<OrbitStore>>,
+) -> Result<HostSessionHandle, ClientCoreError> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let _ = orbit_crypto::derive_e2ee_psk(target_pairing_secret).map_err(|_| {
+        ClientCoreError::Unauthorized(
+            "missing or invalid pairing_secret for peer bridge E2EE authentication".into(),
+        )
+    })?;
+    let pubkey_bytes = decode_key_32(target_pubkey_b64)?;
+    let (hs, msg1) =
+        ClientHandshake::new(&pubkey_bytes, target_pairing_secret).map_err(|e| match e {
+            orbit_crypto::CryptoError::InvalidPairingSecret
+            | orbit_crypto::CryptoError::AuthenticationFailed => {
+                ClientCoreError::Unauthorized(e.to_string())
+            }
+            other => ClientCoreError::Crypto(other),
+        })?;
+
+    let mut bridge_events = bridge_session.subscribe();
+    let request_id = Uuid::new_v4();
+    let bridge_id = Uuid::new_v4();
+    bridge_session
+        .send_wire(WireMessage::PeerBridgeOpen {
+            request_id,
+            bridge_id,
+            target_host_id: target_host_id.to_string(),
+        })
+        .await?;
+
+    // Wait for bridge Daemon to open `/ws/e2ee` stream to target host
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match bridge_events.recv().await {
+                Ok(ClientInboundEvent::Wire(WireMessage::PeerBridgeOpened {
+                    request_id: r,
+                    bridge_id: b,
+                })) if r == request_id && b == bridge_id => return Ok(()),
+                Ok(ClientInboundEvent::Wire(WireMessage::RpcError {
+                    request_id: Some(r),
+                    code,
+                    message,
+                })) if r == request_id => {
+                    return Err(ClientCoreError::Handshake(format!("{code}: {message}")));
+                }
+                Ok(ClientInboundEvent::Disconnected) | Err(_) => {
+                    return Err(ClientCoreError::Unreachable);
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .map_err(|_| ClientCoreError::Handshake("timed out opening peer bridge tunnel".into()))??;
+
+    // Send Noise_NKpsk0 msg1 directly to target Daemon
+    bridge_session
+        .send_wire(WireMessage::PeerBridgeData {
+            bridge_id,
+            payload_b64: STANDARD.encode(&msg1),
+        })
+        .await?;
+
+    // Await Noise msg2 from target Daemon via PeerBridgeData
+    let msg2 = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match bridge_events.recv().await {
+                Ok(ClientInboundEvent::Wire(WireMessage::PeerBridgeData {
+                    bridge_id: b,
+                    payload_b64,
+                })) if b == bridge_id => {
+                    return STANDARD.decode(&payload_b64).map_err(|e| {
+                        ClientCoreError::Handshake(format!("invalid base64 peer bridge msg2: {e}"))
+                    });
+                }
+                Ok(ClientInboundEvent::Wire(WireMessage::PeerBridgeClosed {
+                    bridge_id: b,
+                    reason,
+                })) if b == bridge_id => {
+                    let is_unauth = reason
+                        .as_deref()
+                        .is_some_and(|r| r.to_ascii_lowercase().contains("unauthorized"));
+                    if is_unauth {
+                        return Err(ClientCoreError::Unauthorized(
+                            "peer bridge E2EE authentication rejected by target daemon".into(),
+                        ));
+                    }
+                    return Err(ClientCoreError::Handshake(format!(
+                        "peer bridge closed during E2EE handshake: {}",
+                        reason.unwrap_or_else(|| "closed".to_string())
+                    )));
+                }
+                Ok(ClientInboundEvent::Disconnected) | Err(_) => {
+                    return Err(ClientCoreError::Handshake(
+                        "bridge disconnected during peer E2EE handshake".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .map_err(|_| ClientCoreError::Handshake("peer bridge E2EE handshake timed out".into()))??;
+
+    let write_chan: SecureChannel = hs.finalize(&msg2).map_err(|e| match e {
+        orbit_crypto::CryptoError::InvalidPairingSecret
+        | orbit_crypto::CryptoError::AuthenticationFailed => {
+            ClientCoreError::Unauthorized(e.to_string())
+        }
+        other => ClientCoreError::Crypto(other),
+    })?;
+
+    let (ct_out_tx, mut ct_out_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (ct_in_tx, ct_in_rx) = mpsc::channel::<Vec<u8>>(256);
+
+    let writer_bridge = bridge_session.clone();
+    tokio::spawn(async move {
+        while let Some(ct) = ct_out_rx.recv().await {
+            if writer_bridge
+                .send_wire(WireMessage::PeerBridgeData {
+                    bridge_id,
+                    payload_b64: STANDARD.encode(&ct),
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        let _ = writer_bridge
+            .send_wire(WireMessage::PeerBridgeClosed {
+                bridge_id,
+                reason: None,
+            })
+            .await;
+    });
+
+    tokio::spawn(async move {
+        loop {
+            match bridge_events.recv().await {
+                Ok(ClientInboundEvent::Wire(WireMessage::PeerBridgeData {
+                    bridge_id: b,
+                    payload_b64,
+                })) if b == bridge_id => {
+                    if let Ok(bytes) = STANDARD.decode(&payload_b64)
+                        && ct_in_tx.send(bytes).await.is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(ClientInboundEvent::Wire(WireMessage::PeerBridgeClosed {
+                    bridge_id: b,
+                    ..
+                })) if b == bridge_id => break,
+                Ok(ClientInboundEvent::Disconnected)
+                | Err(tokio::sync::broadcast::error::RecvError::Closed)
+                | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+
+    complete_e2ee_session_tasks(
+        target_host_id,
+        write_chan,
+        ct_out_tx,
+        ct_in_rx,
+        replica,
+        Some(bridge_session.clone()),
+    )
+    .await
+}
+
+async fn complete_e2ee_session_tasks(
+    host_id: &str,
+    write_chan: SecureChannel,
+    ct_out_tx: mpsc::Sender<Vec<u8>>,
+    mut ct_in_rx: mpsc::Receiver<Vec<u8>>,
+    replica: Option<Arc<OrbitStore>>,
+    hold_bridge_session: Option<HostSessionHandle>,
+) -> Result<HostSessionHandle, ClientCoreError> {
     let shared_chan = Arc::new(tokio::sync::Mutex::new(write_chan));
 
     {
@@ -601,7 +821,10 @@ async fn connect_via_relay_with_host_id(
         plain.push(E2EE_FRAME_WIRE);
         plain.extend_from_slice(&z);
         let ct = shared_chan.lock().await.seal_record(&plain)?;
-        sink.send(Message::Binary(ct.into())).await?;
+        ct_out_tx
+            .send(ct)
+            .await
+            .map_err(|_| ClientCoreError::ChannelClosed)?;
     }
 
     let (out_tx, mut out_rx) = mpsc::channel::<OutboundPayload>(256);
@@ -632,6 +855,7 @@ async fn connect_via_relay_with_host_id(
 
     let chan_writer = shared_chan.clone();
     tokio::spawn(async move {
+        let _keep_bridge = hold_bridge_session;
         while let Some(item) = out_rx.recv().await {
             let plain = match item {
                 OutboundPayload::Wire(w) => match w.encode_zstd(3) {
@@ -654,7 +878,7 @@ async fn connect_via_relay_with_host_id(
             let Ok(ct) = chan_writer.lock().await.seal_record(&plain) else {
                 break;
             };
-            if sink.send(Message::Binary(ct.into())).await.is_err() {
+            if ct_out_tx.send(ct).await.is_err() {
                 break;
             }
         }
@@ -664,34 +888,28 @@ async fn connect_via_relay_with_host_id(
     let chan_reader = shared_chan;
     let owned_host_id = host_id.to_string();
     tokio::spawn(async move {
-        while let Some(Ok(msg)) = stream.next().await {
-            match msg {
-                Message::Binary(ct) => {
-                    let Ok(plain) = chan_reader.lock().await.open_record(&ct) else {
-                        break;
-                    };
-                    if plain.is_empty() {
-                        continue;
+        while let Some(ct) = ct_in_rx.recv().await {
+            let Ok(plain) = chan_reader.lock().await.open_record(&ct) else {
+                break;
+            };
+            if plain.is_empty() {
+                continue;
+            }
+            match plain[0] {
+                E2EE_FRAME_WIRE => match WireMessage::decode_zstd(&plain[1..]) {
+                    Ok(wire) => {
+                        sync_to_replica(&owned_host_id, replica.as_deref(), &wire).await;
+                        let _ = events_in.send(ClientInboundEvent::Wire(wire));
                     }
-                    match plain[0] {
-                        E2EE_FRAME_WIRE => match WireMessage::decode_zstd(&plain[1..]) {
-                            Ok(wire) => {
-                                sync_to_replica(&owned_host_id, replica.as_deref(), &wire).await;
-                                let _ = events_in.send(ClientInboundEvent::Wire(wire));
-                            }
-                            Err(err) => {
-                                tracing::warn!(host_id = %owned_host_id, error = %err, compressed_bytes = plain.len(), "failed to decode E2EE zstd wire message");
-                            }
-                        },
-                        E2EE_FRAME_TERMINAL => {
-                            if let Ok(term) = TerminalBinaryFrame::decode(&plain[1..]) {
-                                let _ = events_in.send(ClientInboundEvent::Terminal(term));
-                            }
-                        }
-                        _ => {}
+                    Err(err) => {
+                        tracing::warn!(host_id = %owned_host_id, error = %err, compressed_bytes = plain.len(), "failed to decode E2EE zstd wire message");
+                    }
+                },
+                E2EE_FRAME_TERMINAL => {
+                    if let Ok(term) = TerminalBinaryFrame::decode(&plain[1..]) {
+                        let _ = events_in.send(ClientInboundEvent::Terminal(term));
                     }
                 }
-                Message::Close(_) => break,
                 _ => {}
             }
         }

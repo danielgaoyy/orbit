@@ -589,8 +589,6 @@ export const FleetSidebar = memo(function FleetSidebar() {
             !isDraftNewSession &&
             selectedHostId === activeRouter.hostId &&
             selectedAgentId === activeRouter.agent.agent_id;
-          const targetHostId =
-            primaryRouterHostId ?? selectedHostId ?? fleet.hosts[0]?.host_id ?? null;
 
           return (
             <button
@@ -598,8 +596,8 @@ export const FleetSidebar = memo(function FleetSidebar() {
               onClick={() => {
                 if (activeRouter) {
                   orbitActions.selectAgent(activeRouter.hostId, activeRouter.agent.agent_id);
-                } else if (targetHostId) {
-                  orbitActions.openSettings(`host:${targetHostId}:router`);
+                } else {
+                  orbitActions.openSettings("personal_router");
                 }
               }}
               className={cn(

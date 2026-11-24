@@ -19,8 +19,8 @@ function makeTranslator(dict: MessageDictionary): (key: MessageKey) => string {
   return (key) => dict[key];
 }
 
-describe("Settings IA (3 Domain Groups · 8 Core Sections · 19 Leaf Views)", () => {
-  it("organizes all 19 settings views cleanly across APP, HOST, and WORKSPACE groups", () => {
+describe("Settings IA (3 Domain Groups · 9 Core Sections · 20 Leaf Views)", () => {
+  it("organizes all 20 settings views cleanly across APP, HOST, and WORKSPACE groups", () => {
     assert.deepEqual(
       SETTINGS_NAV_GROUPS.map((g) => g.id),
       ["app", "host", "workspace"],
@@ -32,6 +32,7 @@ describe("Settings IA (3 Domain Groups · 8 Core Sections · 19 Leaf Views)", ()
         "app:general",
         "app:appearance",
         "app:notifications_sync",
+        "app:personal_router",
         "host:hosts",
         "host:agents",
         "host:usage",
@@ -55,13 +56,14 @@ describe("Settings IA (3 Domain Groups · 8 Core Sections · 19 Leaf Views)", ()
       getVisibleSubTabsForSection("notifications_sync", true).map((t) => t.id),
       ["notifications", "cloud_sync", "archived"],
     );
+    assert.deepEqual(getVisibleSubTabsForSection("personal_router", true), []);
     assert.deepEqual(
       getVisibleSubTabsForSection("hosts", true).map((t) => t.id),
       ["connection", "add_host", "im_channels"],
     );
     assert.deepEqual(
       getVisibleSubTabsForSection("agents", true).map((t) => t.id),
-      ["agents", "router", "acp", "guardian"],
+      ["agents", "acp", "guardian"],
     );
     assert.deepEqual(getVisibleSubTabsForSection("usage", true), []);
     assert.deepEqual(
@@ -105,7 +107,9 @@ describe("Settings IA (3 Domain Groups · 8 Core Sections · 19 Leaf Views)", ()
       { target: "providers", expectedSection: `host:${hostId}:agents`, expectedCore: "agents", expectedSubTab: "agents" },
       { target: "models_agents", expectedSection: `host:${hostId}:agents`, expectedCore: "agents", expectedSubTab: "agents" },
       { target: "agents", expectedSection: `host:${hostId}:agents`, expectedCore: "agents", expectedSubTab: "agents" },
-      { target: "router", expectedSection: `host:${hostId}:router`, expectedCore: "agents", expectedSubTab: "router" },
+      { target: "router", expectedSection: "personal_router", expectedCore: "personal_router", expectedSubTab: null },
+      { target: "host:devbox-1:router", expectedSection: "personal_router", expectedCore: "personal_router", expectedSubTab: null },
+      { target: "personal_router", expectedSection: "personal_router", expectedCore: "personal_router", expectedSubTab: null },
       { target: "acp", expectedSection: `host:${hostId}:acp`, expectedCore: "agents", expectedSubTab: "acp" },
       { target: "guardian", expectedSection: `host:${hostId}:guardian`, expectedCore: "agents", expectedSubTab: "guardian" },
       { target: "usage", expectedSection: `host:${hostId}:usage`, expectedCore: "usage", expectedSubTab: null },
@@ -222,9 +226,12 @@ describe("Settings IA (3 Domain Groups · 8 Core Sections · 19 Leaf Views)", ()
     assert.equal(jaUsage[0]?.coreSection, "usage");
     assert.equal(jaUsage[0]?.subTab, null);
 
-    // Hostless mode omits host-only sections & sub-tabs cleanly
+    // Hostless mode omits host-only sections & sub-tabs cleanly while keeping APP-level Personal Agent accessible
     assert.deepEqual(searchSettingsEntries("mcp", { t: tEn, hasHost: false }), []);
     assert.deepEqual(searchSettingsEntries("quotas", { t: tEn, hasHost: false }), []);
+    const hostlessRouter = searchSettingsEntries("hermes", { t: tEn, hasHost: false });
+    assert.equal(hostlessRouter[0]?.coreSection, "personal_router");
+    assert.equal(hostlessRouter[0]?.subTab, null);
     const hostlessAdd = searchSettingsEntries("ssh", { t: tEn, hasHost: false });
     assert.equal(hostlessAdd[0]?.coreSection, "hosts");
     assert.equal(hostlessAdd[0]?.subTab, "add_host");

@@ -1778,6 +1778,7 @@ async fn scenario_11_relay_routed_fleet_mesh_and_direct_mismatch_fallback() {
     let relay_cfg = orbit_relay::RelayConfig {
         listen_addr: relay_addr,
         allowed_pubkeys: std::sync::Arc::new(allow),
+        fleet_token: None,
     };
     let relay_handle = tokio::spawn(async move {
         let _ = orbit_relay::run_relay(relay_cfg).await;

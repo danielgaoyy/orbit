@@ -6715,6 +6715,8 @@ data class FfiAgentCard (
     , 
     var `hasBackgroundTasks`: kotlin.Boolean
     , 
+    var `hasArmedTimers`: kotlin.Boolean
+    , 
     var `isAwaitingPermission`: kotlin.Boolean
     , 
     var `parentAgentId`: kotlin.String?
@@ -6780,6 +6782,7 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
@@ -6814,6 +6817,7 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterString.allocationSize(value.`statusLabel`) +
             FfiConverterBoolean.allocationSize(value.`isRunning`) +
             FfiConverterBoolean.allocationSize(value.`hasBackgroundTasks`) +
+            FfiConverterBoolean.allocationSize(value.`hasArmedTimers`) +
             FfiConverterBoolean.allocationSize(value.`isAwaitingPermission`) +
             FfiConverterOptionalString.allocationSize(value.`parentAgentId`) +
             FfiConverterOptionalString.allocationSize(value.`parentHostId`) +
@@ -6848,6 +6852,7 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterString.write(value.`statusLabel`, buf)
             FfiConverterBoolean.write(value.`isRunning`, buf)
             FfiConverterBoolean.write(value.`hasBackgroundTasks`, buf)
+            FfiConverterBoolean.write(value.`hasArmedTimers`, buf)
             FfiConverterBoolean.write(value.`isAwaitingPermission`, buf)
             FfiConverterOptionalString.write(value.`parentAgentId`, buf)
             FfiConverterOptionalString.write(value.`parentHostId`, buf)
@@ -9820,6 +9825,8 @@ data class FfiHostCard (
     var `pendingApprovalCount`: kotlin.UInt
     , 
     var `supportsServerQueue`: kotlin.Boolean
+    , 
+    var `isLocal`: kotlin.Boolean
     
 ){
     
@@ -9860,6 +9867,7 @@ public object FfiConverterTypeFfiHostCard: FfiConverterRustBuffer<FfiHostCard> {
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -9887,7 +9895,8 @@ public object FfiConverterTypeFfiHostCard: FfiConverterRustBuffer<FfiHostCard> {
             FfiConverterUInt.allocationSize(value.`workspaceCount`) +
             FfiConverterUInt.allocationSize(value.`agentCount`) +
             FfiConverterUInt.allocationSize(value.`pendingApprovalCount`) +
-            FfiConverterBoolean.allocationSize(value.`supportsServerQueue`)
+            FfiConverterBoolean.allocationSize(value.`supportsServerQueue`) +
+            FfiConverterBoolean.allocationSize(value.`isLocal`)
     )
 
     override fun write(value: FfiHostCard, buf: ByteBuffer) {
@@ -9915,6 +9924,7 @@ public object FfiConverterTypeFfiHostCard: FfiConverterRustBuffer<FfiHostCard> {
             FfiConverterUInt.write(value.`agentCount`, buf)
             FfiConverterUInt.write(value.`pendingApprovalCount`, buf)
             FfiConverterBoolean.write(value.`supportsServerQueue`, buf)
+            FfiConverterBoolean.write(value.`isLocal`, buf)
     }
 }
 

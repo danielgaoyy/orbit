@@ -20,6 +20,11 @@ import {
   hostConnectionLabel,
 } from "@/components/settings/settings-primitives";
 import { Button } from "@/components/ui/button";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Input } from "@/components/ui/input";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
@@ -37,6 +42,12 @@ import {
   resolveFleetTargetVersion,
   useOrbitSelector,
 } from "@/state/orbit-store";
+
+function redactRelayForDisplay(url: string): string {
+  return url
+    .replace(/([?&])ft=[^&#]*/gi, "$1ft=***")
+    .replace(/([?&])token=[^&#]*/gi, "$1token=***");
+}
 
 export function HostConnectionSection({ hostId }: { hostId: string }) {
   const { t } = useI18n();
@@ -56,12 +67,14 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const [confirmRemoveOpen, setConfirmRemoveOpen] = useState(false);
   const [pairingQrOpen, setPairingQrOpen] = useState(false);
+  const [relayExpanded, setRelayExpanded] = useState(false);
   const ime = useImeCompositionGuard();
 
   useEffect(() => {
     setRelayInput(host?.relay_url ?? "");
     setRelayStatusMsg(null);
     setShowSshDeploy(false);
+    setRelayExpanded(false);
     setPairingQrOpen(false);
   }, [host?.host_id, host?.relay_url]);
 
@@ -111,7 +124,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
       });
       setRelayInput(url);
       await orbitActions.reloadFleetAndHosts();
-      setRelayStatusMsg(`Active across fleet on ${url}`);
+      setRelayStatusMsg(`Active across fleet on ${redactRelayForDisplay(url)}`);
     } catch (err) {
       setRelayStatusMsg(String(err));
     } finally {
@@ -343,12 +356,29 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
         </SettingCard>
       </div>
 
-      {/* Private E2EE Relay */}
-      <div className="space-y-2">
-        <SettingGroupLabel>Private Relay</SettingGroupLabel>
-        <div className="border-border bg-background/60 space-y-3 rounded-[13px] border p-4">
-          <p className="text-muted-foreground text-[12.5px] leading-relaxed">
-            Route remote traffic through an end-to-end encrypted Noise relay (needed for mobile access off your local network; SSH relay deployment applies across all hosts automatically).
+      {/* Advanced Network & Custom Relay (Collapsed by default; auto-managed across Fleet) */}
+      <Collapsible
+        open={relayExpanded}
+        onOpenChange={setRelayExpanded}
+        className="border-border bg-background/60 rounded-[13px] border px-4 py-3"
+      >
+        <CollapsibleTrigger className="group/relay flex w-full cursor-pointer items-center justify-between gap-2 text-left outline-none">
+          <span className="flex min-w-0 items-center gap-2">
+            <ChevronRight className="text-muted-foreground size-3.5 shrink-0 transition-transform duration-150 group-data-[panel-open]/relay:rotate-90" />
+            <span className="text-foreground text-[12.5px] font-medium">
+              {t("settings.advancedRelayTitle")}
+            </span>
+          </span>
+          <span className="bg-muted text-muted-foreground max-w-[220px] shrink-0 truncate rounded-md px-2 py-0.5 font-mono text-[11px]">
+            {host.relay_url
+              ? redactRelayForDisplay(host.relay_url)
+              : t("settings.advancedRelayAutoBadge")}
+          </span>
+        </CollapsibleTrigger>
+
+        <CollapsibleContent className="space-y-3 pt-3">
+          <p className="text-muted-foreground text-[12px] leading-relaxed">
+            {t("settings.advancedRelayDesc")}
           </p>
 
           <div className="flex flex-wrap gap-2">
@@ -451,8 +481,8 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
               {relayStatusMsg}
             </div>
           )}
-        </div>
-      </div>
+        </CollapsibleContent>
+      </Collapsible>
 
       {/* Danger Zone: Remove host */}
       <SettingCard>

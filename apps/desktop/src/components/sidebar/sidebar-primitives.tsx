@@ -1,8 +1,9 @@
 import { memo, useSyncExternalStore } from "react";
-import { FolderPlus, GitBranch } from "lucide-react";
+import { AlarmClock, FolderPlus, GitBranch } from "lucide-react";
 import {
   type AgentCardView,
   type HostCardView,
+  isAgentTimerWaiting,
 } from "@/lib/orbit-ipc";
 import { useI18n } from "@/lib/i18n";
 import { isLocalHostCard } from "@/lib/projects";
@@ -158,6 +159,19 @@ export const ConversationStatusGlyph = memo(function ConversationStatusGlyph({
   }
   if (isUnread) {
     return <span className="bg-signal-info size-[6px] shrink-0 rounded-full" />;
+  }
+  if (isAgentTimerWaiting(agent)) {
+    return (
+      <span
+        title={t("sidebar.timerArmed")}
+        className="inline-flex shrink-0 items-center justify-center"
+      >
+        <AlarmClock
+          aria-label={t("sidebar.timerArmed")}
+          className="text-ink-faint size-[11.5px] shrink-0 stroke-[1.7]"
+        />
+      </span>
+    );
   }
   if (isWorktree) {
     return (

@@ -23,6 +23,7 @@ export const en = {
   "common.reset": "Reset",
   "common.hide": "Hide",
   "common.local": "Local",
+  "common.remote": "Remote",
   "common.online": "Online",
   "common.offline": "Offline",
   "common.connecting": "Connecting",
@@ -220,6 +221,7 @@ export const en = {
   "sidebar.error": "Error",
   "sidebar.subagentRunning": "Subagent running",
   "sidebar.backgroundTaskRunning": "Background task running",
+  "sidebar.timerArmed": "Timer armed",
   "sidebar.addProject": "Add project",
   "sidebar.addProjectFrom": "Add Project From",
   "sidebar.hostLocal": "Local",
@@ -460,6 +462,7 @@ export const en = {
   "settings.navCapabilities": "Capabilities",
   "settings.navExtensions": "Workspace & Extensions",
   "settings.navNotificationsSync": "Notifications & Sync",
+  "settings.navPersonalRouter": "Personal Agent",
   "settings.subTabGeneral": "General",
   "settings.subTabShortcuts": "Shortcuts",
   "settings.subTabConnectionPairing": "Connection & Pairing",
@@ -999,6 +1002,42 @@ export const en = {
   "overview.stoppedSubagentToast": "Stopped {name}",
   "overview.stopSubagentFailedToast": "Failed to stop: {error}",
   "overview.moreSubagents": "{count} more subagents",
+
+  // Personal Agent & Zero-Config Fleet Network
+  "settings.personalAgentTitle": "Personal Agent",
+  "settings.personalAgentDesc":
+    "Pick one host across your Fleet to run your always-on Personal Agent. It keeps long-term memory, coordinates tasks across all connected machines, and stays independent of whichever host you browse locally.",
+  "settings.personalAgentOpenSession": "Open Session",
+  "settings.personalAgentChooseHost": "Choose Host (Multi-Host Fleet)",
+  "settings.personalAgentChooseHostDesc":
+    "Select where your primary Personal Agent lives. All devices route to it automatically.",
+  "settings.personalAgentScanFleet": "Refresh Fleet",
+  "settings.personalAgentScanning": "Refreshing…",
+  "settings.personalAgentNoHosts": "No connected hosts detected yet.",
+  "settings.personalAgentActiveBadge": "Active",
+  "settings.personalAgentUseAction": "Use as Personal Agent",
+  "settings.personalAgentActivating": "Activating…",
+  "settings.personalAgentOpenAction": "Open Session",
+  "settings.personalAgentEngineLabel": "Engine",
+  "settings.personalAgentEngineHint": "Switches immediately on the active host with recommended defaults.",
+  "settings.personalAgentAdvancedOptions": "Advanced options & external Hermes bridge",
+  "settings.personalAgentScopeLabel": "Fleet Visibility Scope",
+  "settings.personalAgentGuardianLabel": "3-Tier Guardian Pre-Review",
+  "settings.personalAgentShareHermesMemory": "Share host ~/.hermes/memories/ and skills",
+  "settings.personalAgentCustomDiscipline": "Custom Routing Instructions (Appended to SOUL)",
+  "settings.personalAgentWebhookUrl": "External Hermes Inbound Webhook URL (Optional)",
+  "settings.personalAgentWebhookSecret": "Webhook Bearer Secret",
+  "settings.personalAgentSavePolicy": "Save Policy Only",
+  "settings.personalAgentExportBridge": "Export External Hermes MCP Bridge",
+  "settings.fleetNetworkTitle": "Automatic Fleet Network",
+  "settings.fleetNetworkAutoDesc":
+    "Encrypted E2EE relays, SSH tunnels, and multi-hop Peer-Bridges sync automatically across every signed-in device — isolated LAN hosts included.",
+  "settings.fleetNetworkMissingReachability":
+    "Some hosts are currently reachable only on their local LAN. Connect any shared SSH host or Peer-Bridge daemon to reach them off-network.",
+  "settings.advancedRelayTitle": "Advanced Network & Custom Relay",
+  "settings.advancedRelayAutoBadge": "Auto-managed",
+  "settings.advancedRelayDesc":
+    "Managed automatically via Cloud Sync and SSH Peer-Bridges. Expand only if you want to override a custom WebSocket E2EE relay for this host.",
 } as const;
 
 export type MessageKey = keyof typeof en;

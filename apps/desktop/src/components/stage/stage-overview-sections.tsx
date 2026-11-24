@@ -1,5 +1,6 @@
 import { memo, useState, type ReactNode } from "react";
 import {
+  AlarmClock,
   ArrowUpRight,
   Blocks,
   CheckCircle2,
@@ -405,7 +406,7 @@ export const OverviewSection = memo(function OverviewSection({
   collapsed: boolean;
   isRunning?: boolean;
   hasAlert?: boolean;
-  runningTone?: "spinner" | "emerald" | "info";
+  runningTone?: "spinner" | "emerald" | "info" | "timer";
   trailingMeta?: ReactNode;
   headerAction?: ReactNode;
   headerActionVisibility?: "hover" | "always";
@@ -474,6 +475,8 @@ export const OverviewSection = memo(function OverviewSection({
                 <span className="bg-signal-success size-[6px] shrink-0 rounded-full" />
               ) : runningTone === "info" ? (
                 <span className="bg-signal-info size-[6px] shrink-0 rounded-full" />
+              ) : runningTone === "timer" ? (
+                <AlarmClock className="text-ink-faint size-[11.5px] shrink-0 stroke-[1.7]" />
               ) : (
                 <OrbitSpinner size={12} className="text-ink-secondary" />
               )}

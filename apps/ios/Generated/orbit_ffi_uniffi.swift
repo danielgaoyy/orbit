@@ -3690,6 +3690,7 @@ public struct FfiAgentCard: Equatable, Hashable {
     public var statusLabel: String
     public var isRunning: Bool
     public var hasBackgroundTasks: Bool
+    public var hasArmedTimers: Bool
     public var isAwaitingPermission: Bool
     public var parentAgentId: String?
     public var parentHostId: String?
@@ -3711,7 +3712,7 @@ public struct FfiAgentCard: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(agentId: String, workspaceId: String, cwd: String, title: String, provider: FfiProviderKind, providerLabel: String, model: String?, effort: FfiReasoningEffort?, fastMode: Bool, mode: FfiSessionMode, statusLabel: String, isRunning: Bool, hasBackgroundTasks: Bool, isAwaitingPermission: Bool, parentAgentId: String?, parentHostId: String?, archivedAtRfc3339: String?, handle: String?, clusterSuggestion: FfiWorkspaceClusterSuggestion?, worktreeBranch: String?, taskSummary: String?, forkedFromAgentId: String?, forkedAtSeq: UInt64?, acpAgentId: String?, attentionLabel: String?, latestSeq: UInt64, updatedAtRfc3339: String, isPinned: Bool, seenSeq: UInt64, isUnread: Bool, queuedPrompts: [FfiQueuedPrompt]) {
+    public init(agentId: String, workspaceId: String, cwd: String, title: String, provider: FfiProviderKind, providerLabel: String, model: String?, effort: FfiReasoningEffort?, fastMode: Bool, mode: FfiSessionMode, statusLabel: String, isRunning: Bool, hasBackgroundTasks: Bool, hasArmedTimers: Bool, isAwaitingPermission: Bool, parentAgentId: String?, parentHostId: String?, archivedAtRfc3339: String?, handle: String?, clusterSuggestion: FfiWorkspaceClusterSuggestion?, worktreeBranch: String?, taskSummary: String?, forkedFromAgentId: String?, forkedAtSeq: UInt64?, acpAgentId: String?, attentionLabel: String?, latestSeq: UInt64, updatedAtRfc3339: String, isPinned: Bool, seenSeq: UInt64, isUnread: Bool, queuedPrompts: [FfiQueuedPrompt]) {
         self.agentId = agentId
         self.workspaceId = workspaceId
         self.cwd = cwd
@@ -3725,6 +3726,7 @@ public struct FfiAgentCard: Equatable, Hashable {
         self.statusLabel = statusLabel
         self.isRunning = isRunning
         self.hasBackgroundTasks = hasBackgroundTasks
+        self.hasArmedTimers = hasArmedTimers
         self.isAwaitingPermission = isAwaitingPermission
         self.parentAgentId = parentAgentId
         self.parentHostId = parentHostId
@@ -3774,6 +3776,7 @@ public struct FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer {
                 statusLabel: FfiConverterString.read(from: &buf), 
                 isRunning: FfiConverterBool.read(from: &buf), 
                 hasBackgroundTasks: FfiConverterBool.read(from: &buf), 
+                hasArmedTimers: FfiConverterBool.read(from: &buf), 
                 isAwaitingPermission: FfiConverterBool.read(from: &buf), 
                 parentAgentId: FfiConverterOptionString.read(from: &buf), 
                 parentHostId: FfiConverterOptionString.read(from: &buf), 
@@ -3809,6 +3812,7 @@ public struct FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer {
         FfiConverterString.write(value.statusLabel, into: &buf)
         FfiConverterBool.write(value.isRunning, into: &buf)
         FfiConverterBool.write(value.hasBackgroundTasks, into: &buf)
+        FfiConverterBool.write(value.hasArmedTimers, into: &buf)
         FfiConverterBool.write(value.isAwaitingPermission, into: &buf)
         FfiConverterOptionString.write(value.parentAgentId, into: &buf)
         FfiConverterOptionString.write(value.parentHostId, into: &buf)
@@ -7301,10 +7305,11 @@ public struct FfiHostCard: Equatable, Hashable {
     public var agentCount: UInt32
     public var pendingApprovalCount: UInt32
     public var supportsServerQueue: Bool
+    public var isLocal: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(hostId: String, displayName: String, hostname: String, customName: String?, sshAlias: String?, routeMode: FfiHostRouteMode, remoteDaemonPort: UInt16, customDirectEndpoint: String?, viaSshTunnel: Bool, lastPingMs: UInt32?, daemonVersion: String?, daemonProtocolVersion: UInt32?, clientProtocolVersion: UInt32, osArch: String?, daemonPubkeyB64: String, directEndpoints: [String], relayUrl: String?, connectionState: FfiConnectionState, lastError: String?, availableProviders: [FfiProviderKind], workspaceCount: UInt32, agentCount: UInt32, pendingApprovalCount: UInt32, supportsServerQueue: Bool) {
+    public init(hostId: String, displayName: String, hostname: String, customName: String?, sshAlias: String?, routeMode: FfiHostRouteMode, remoteDaemonPort: UInt16, customDirectEndpoint: String?, viaSshTunnel: Bool, lastPingMs: UInt32?, daemonVersion: String?, daemonProtocolVersion: UInt32?, clientProtocolVersion: UInt32, osArch: String?, daemonPubkeyB64: String, directEndpoints: [String], relayUrl: String?, connectionState: FfiConnectionState, lastError: String?, availableProviders: [FfiProviderKind], workspaceCount: UInt32, agentCount: UInt32, pendingApprovalCount: UInt32, supportsServerQueue: Bool, isLocal: Bool) {
         self.hostId = hostId
         self.displayName = displayName
         self.hostname = hostname
@@ -7329,6 +7334,7 @@ public struct FfiHostCard: Equatable, Hashable {
         self.agentCount = agentCount
         self.pendingApprovalCount = pendingApprovalCount
         self.supportsServerQueue = supportsServerQueue
+        self.isLocal = isLocal
     }
 
     
@@ -7370,7 +7376,8 @@ public struct FfiConverterTypeFfiHostCard: FfiConverterRustBuffer {
                 workspaceCount: FfiConverterUInt32.read(from: &buf), 
                 agentCount: FfiConverterUInt32.read(from: &buf), 
                 pendingApprovalCount: FfiConverterUInt32.read(from: &buf), 
-                supportsServerQueue: FfiConverterBool.read(from: &buf)
+                supportsServerQueue: FfiConverterBool.read(from: &buf), 
+                isLocal: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -7399,6 +7406,7 @@ public struct FfiConverterTypeFfiHostCard: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.agentCount, into: &buf)
         FfiConverterUInt32.write(value.pendingApprovalCount, into: &buf)
         FfiConverterBool.write(value.supportsServerQueue, into: &buf)
+        FfiConverterBool.write(value.isLocal, into: &buf)
     }
 }
 

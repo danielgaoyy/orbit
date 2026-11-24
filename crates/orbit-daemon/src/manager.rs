@@ -133,6 +133,11 @@ pub enum DaemonBroadcast {
     GoalRunEvent(orbit_protocol::GoalRunRecord),
     MonitorWatchEvent(orbit_protocol::MonitorWatchRecord),
     WorkflowRunEvent(orbit_protocol::WorkflowRunRecord),
+    FleetVaultChanged {
+        origin_session_id: Uuid,
+        vault_fingerprint: String,
+        revision: u64,
+    },
 }
 
 struct LiveAgentEntry {

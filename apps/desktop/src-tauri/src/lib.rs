@@ -4869,7 +4869,13 @@ async fn transcribe_voice_audio(
 ) -> Result<VoiceTranscriptionResult, String> {
     state
         .core
-        .transcribe_voice_audio(&host_id, pcm16_le_base64, sample_rate_hz, language, agent_id)
+        .transcribe_voice_audio(
+            &host_id,
+            pcm16_le_base64,
+            sample_rate_hz,
+            language,
+            agent_id,
+        )
         .await
         .map_err(format_voice_rpc_error)
 }

@@ -15,6 +15,7 @@ pub mod discovery;
 pub mod fast_copy;
 pub mod finish_subscriptions;
 pub mod git;
+pub mod git_collab;
 pub mod git_write;
 pub mod goals;
 pub mod guardian;
@@ -3395,6 +3396,449 @@ async fn handle_wire_rpc(
                         }
                     }
                     Err((msg, code)) => rpc_err(request_id, code, msg),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitStashList { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved).await {
+                    Ok(auth_cwd) => match crate::git_collab::git_stash_list(&auth_cwd).await {
+                        Ok(res) => WireMessage::GitCollabResponse {
+                            request_id,
+                            cwd,
+                            payload: orbit_protocol::GitCollabQueryResult::StashList(res),
+                        },
+                        Err(e) => rpc_err(request_id, e.code(), e),
+                    },
+                    Err(e) => rpc_err(request_id, "git_mutation_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitStashPush {
+            request_id,
+            cwd,
+            message,
+            include_untracked,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_git_repo_root_mutation(&store, &resolved).await {
+                    Ok(repo_root) => {
+                        match crate::git_collab::git_stash_push(
+                            &repo_root,
+                            message.as_deref(),
+                            include_untracked,
+                        )
+                        .await
+                        {
+                            Ok(res) => {
+                                symbol_index.invalidate(&repo_root);
+                                let mut status = inspect_git_status(&repo_root).await;
+                                status.cwd = cwd.clone();
+                                WireMessage::GitMutationResult {
+                                    request_id,
+                                    cwd,
+                                    result: orbit_protocol::GitMutationOutcome::StashMutated(res),
+                                    status: Some(status),
+                                }
+                            }
+                            Err(e) => rpc_err(request_id, e.code(), e),
+                        }
+                    }
+                    Err((msg, code)) => rpc_err(request_id, code, msg),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitStashApply {
+            request_id,
+            cwd,
+            stash_ref,
+            expected_oid,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_git_repo_root_mutation(&store, &resolved).await {
+                    Ok(repo_root) => {
+                        match crate::git_collab::git_stash_apply(
+                            &repo_root,
+                            &stash_ref,
+                            expected_oid.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(res) => {
+                                symbol_index.invalidate(&repo_root);
+                                let mut status = inspect_git_status(&repo_root).await;
+                                status.cwd = cwd.clone();
+                                WireMessage::GitMutationResult {
+                                    request_id,
+                                    cwd,
+                                    result: orbit_protocol::GitMutationOutcome::StashMutated(res),
+                                    status: Some(status),
+                                }
+                            }
+                            Err(e) => rpc_err(request_id, e.code(), e),
+                        }
+                    }
+                    Err((msg, code)) => rpc_err(request_id, code, msg),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitStashPop {
+            request_id,
+            cwd,
+            stash_ref,
+            expected_oid,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_git_repo_root_mutation(&store, &resolved).await {
+                    Ok(repo_root) => {
+                        match crate::git_collab::git_stash_pop(
+                            &repo_root,
+                            &stash_ref,
+                            expected_oid.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(res) => {
+                                symbol_index.invalidate(&repo_root);
+                                let mut status = inspect_git_status(&repo_root).await;
+                                status.cwd = cwd.clone();
+                                WireMessage::GitMutationResult {
+                                    request_id,
+                                    cwd,
+                                    result: orbit_protocol::GitMutationOutcome::StashMutated(res),
+                                    status: Some(status),
+                                }
+                            }
+                            Err(e) => rpc_err(request_id, e.code(), e),
+                        }
+                    }
+                    Err((msg, code)) => rpc_err(request_id, code, msg),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitStashDrop {
+            request_id,
+            cwd,
+            stash_ref,
+            expected_oid,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_git_repo_root_mutation(&store, &resolved).await {
+                    Ok(repo_root) => {
+                        match crate::git_collab::git_stash_drop(
+                            &repo_root,
+                            &stash_ref,
+                            expected_oid.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(res) => {
+                                let mut status = inspect_git_status(&repo_root).await;
+                                status.cwd = cwd.clone();
+                                WireMessage::GitMutationResult {
+                                    request_id,
+                                    cwd,
+                                    result: orbit_protocol::GitMutationOutcome::StashMutated(res),
+                                    status: Some(status),
+                                }
+                            }
+                            Err(e) => rpc_err(request_id, e.code(), e),
+                        }
+                    }
+                    Err((msg, code)) => rpc_err(request_id, code, msg),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitRebaseStatus { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved).await {
+                    Ok(auth_cwd) => match crate::git_collab::git_rebase_status(&auth_cwd).await {
+                        Ok(res) => WireMessage::GitCollabResponse {
+                            request_id,
+                            cwd,
+                            payload: orbit_protocol::GitCollabQueryResult::RebaseStatus(res),
+                        },
+                        Err(e) => rpc_err(request_id, e.code(), e),
+                    },
+                    Err(e) => rpc_err(request_id, "git_mutation_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitRebaseStart {
+            request_id,
+            cwd,
+            onto_ref,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_git_repo_root_mutation(&store, &resolved).await {
+                    Ok(repo_root) => {
+                        match crate::git_collab::git_rebase_start(&repo_root, &onto_ref).await {
+                            Ok(res) => {
+                                symbol_index.invalidate(&repo_root);
+                                let mut status = inspect_git_status(&repo_root).await;
+                                status.cwd = cwd.clone();
+                                WireMessage::GitMutationResult {
+                                    request_id,
+                                    cwd,
+                                    result: orbit_protocol::GitMutationOutcome::RebaseAction(res),
+                                    status: Some(status),
+                                }
+                            }
+                            Err(e) => rpc_err(request_id, e.code(), e),
+                        }
+                    }
+                    Err((msg, code)) => rpc_err(request_id, code, msg),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitRebaseContinue { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_git_repo_root_mutation(&store, &resolved).await {
+                    Ok(repo_root) => match crate::git_collab::git_rebase_continue(&repo_root).await
+                    {
+                        Ok(res) => {
+                            symbol_index.invalidate(&repo_root);
+                            let mut status = inspect_git_status(&repo_root).await;
+                            status.cwd = cwd.clone();
+                            WireMessage::GitMutationResult {
+                                request_id,
+                                cwd,
+                                result: orbit_protocol::GitMutationOutcome::RebaseAction(res),
+                                status: Some(status),
+                            }
+                        }
+                        Err(e) => rpc_err(request_id, e.code(), e),
+                    },
+                    Err((msg, code)) => rpc_err(request_id, code, msg),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitRebaseAbort { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_git_repo_root_mutation(&store, &resolved).await {
+                    Ok(repo_root) => match crate::git_collab::git_rebase_abort(&repo_root).await {
+                        Ok(res) => {
+                            symbol_index.invalidate(&repo_root);
+                            let mut status = inspect_git_status(&repo_root).await;
+                            status.cwd = cwd.clone();
+                            WireMessage::GitMutationResult {
+                                request_id,
+                                cwd,
+                                result: orbit_protocol::GitMutationOutcome::RebaseAction(res),
+                                status: Some(status),
+                            }
+                        }
+                        Err(e) => rpc_err(request_id, e.code(), e),
+                    },
+                    Err((msg, code)) => rpc_err(request_id, code, msg),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitRebaseSkip {
+            request_id,
+            cwd,
+            expected_step,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_git_repo_root_mutation(&store, &resolved).await {
+                    Ok(repo_root) => {
+                        match crate::git_collab::git_rebase_skip(&repo_root, expected_step).await {
+                            Ok(res) => {
+                                symbol_index.invalidate(&repo_root);
+                                let mut status = inspect_git_status(&repo_root).await;
+                                status.cwd = cwd.clone();
+                                WireMessage::GitMutationResult {
+                                    request_id,
+                                    cwd,
+                                    result: orbit_protocol::GitMutationOutcome::RebaseAction(res),
+                                    status: Some(status),
+                                }
+                            }
+                            Err(e) => rpc_err(request_id, e.code(), e),
+                        }
+                    }
+                    Err((msg, code)) => rpc_err(request_id, code, msg),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitListConflicts { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved).await {
+                    Ok(auth_cwd) => match crate::git_collab::git_list_conflicts(&auth_cwd).await {
+                        Ok(res) => WireMessage::GitCollabResponse {
+                            request_id,
+                            cwd,
+                            payload: orbit_protocol::GitCollabQueryResult::ConflictList(res),
+                        },
+                        Err(e) => rpc_err(request_id, e.code(), e),
+                    },
+                    Err(e) => rpc_err(request_id, "git_mutation_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitResolveConflict {
+            request_id,
+            cwd,
+            path,
+            block_index,
+            resolution,
+            auto_stage,
+            expected_sha256,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            let symbol_index = runtime.symbol_index.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved).await {
+                    Ok(auth_cwd) => {
+                        match crate::git_collab::git_resolve_conflict(
+                            &auth_cwd,
+                            &path,
+                            block_index,
+                            &resolution,
+                            auto_stage,
+                            expected_sha256.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(res) => {
+                                symbol_index.invalidate(&auth_cwd);
+                                let mut status = inspect_git_status(&auth_cwd).await;
+                                status.cwd = cwd.clone();
+                                WireMessage::GitMutationResult {
+                                    request_id,
+                                    cwd,
+                                    result: orbit_protocol::GitMutationOutcome::ConflictResolved(
+                                        res,
+                                    ),
+                                    status: Some(status),
+                                }
+                            }
+                            Err(e) => rpc_err(request_id, e.code(), e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "git_mutation_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitPrStatus { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved).await {
+                    Ok(auth_cwd) => match crate::git_collab::git_pr_status(&auth_cwd).await {
+                        Ok(res) => WireMessage::GitCollabResponse {
+                            request_id,
+                            cwd,
+                            payload: orbit_protocol::GitCollabQueryResult::PrStatus(res),
+                        },
+                        Err(e) => rpc_err(request_id, e.code(), e),
+                    },
+                    Err(e) => rpc_err(request_id, "git_mutation_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::GitGenerateCommitMessage { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match authorize_workspace_mutation_cwd(&store, &resolved).await {
+                    Ok(auth_cwd) => {
+                        match crate::git_collab::git_generate_commit_message(&auth_cwd).await {
+                            Ok(res) => WireMessage::GitCollabResponse {
+                                request_id,
+                                cwd,
+                                payload: orbit_protocol::GitCollabQueryResult::CommitMessage(res),
+                            },
+                            Err(e) => rpc_err(request_id, e.code(), e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "git_mutation_denied", e),
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });

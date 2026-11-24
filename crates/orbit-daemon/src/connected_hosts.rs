@@ -555,6 +555,7 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::GitStatusResponse { request_id, .. }
         | WireMessage::GitDiffResponse { request_id, .. }
         | WireMessage::GitMutationResult { request_id, .. }
+        | WireMessage::GitCollabResponse { request_id, .. }
         | WireMessage::WorkspaceFilesResponse { request_id, .. }
         | WireMessage::WorkspaceSymbolsResponse { request_id, .. }
         | WireMessage::SearchMessagesResult { request_id, .. }

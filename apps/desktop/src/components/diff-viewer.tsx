@@ -18,6 +18,15 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { resolveTokenColor } from "@/lib/code-highlight";
 import { shouldPrefetchOnPointerDown } from "@/lib/file-prefetch";
+import {
+  extractRangeSnippetFromDiffFile,
+  formatLineRangeTag,
+  formatPathLineRange,
+  isLineWithinSelection,
+  normalizeLineRange,
+  resolveDraftLineBounds,
+  type ReviewCommentDraft,
+} from "@/lib/git-collab";
 import { extractFileHunks, type IndexedDiffHunk } from "@/lib/git-patch";
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
@@ -30,19 +39,15 @@ import type {
 import { type DiffLayoutMode, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
-export interface ReviewCommentDraft {
-  id: string;
-  path: string;
-  side: "old" | "new";
-  lineNumber: number | null;
-  code: string;
-  comment: string;
-}
+export type { ReviewCommentDraft };
 
 interface ActiveCommentTarget {
   fileKey: string;
   path: string;
   side: "old" | "new";
+  anchorLine: number | null;
+  startLine: number | null;
+  endLine: number | null;
   lineNumber: number | null;
   code: string;
   anchorKey: string;
@@ -293,6 +298,7 @@ const InlineCommentComposer = memo(function InlineCommentComposer({
   onCancel: () => void;
   onSave: (comment: string) => void;
 }) {
+  const { t } = useI18n();
   const [text, setText] = useState("");
   const commentIme = useImeCompositionGuard();
   const submit = () => {
@@ -302,19 +308,36 @@ const InlineCommentComposer = memo(function InlineCommentComposer({
     setText("");
   };
 
+  const isMultiLine =
+    target.startLine != null &&
+    target.endLine != null &&
+    target.startLine !== target.endLine;
+  const locationLabel = formatPathLineRange(
+    target.path,
+    target.startLine ?? target.lineNumber,
+    target.endLine ?? target.lineNumber,
+    target.side,
+  );
+
   return (
     <div className="border-border bg-elevated/95 border-x border-b px-3 py-2 font-sans">
-      <div className="text-muted-foreground mb-1 flex items-center justify-between text-[11px]">
-        <span className="truncate font-mono">
-          {target.path}
-          {target.lineNumber != null ? `:${target.lineNumber}` : ""} ({target.side})
-        </span>
+      <div className="text-muted-foreground mb-1 flex items-center justify-between gap-2 text-[11px]">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="text-foreground/90 truncate font-mono font-medium">
+            {locationLabel}
+          </span>
+          {!isMultiLine && target.lineNumber != null && (
+            <span className="text-muted-foreground/75 hidden truncate text-[10.5px] sm:inline">
+              {t("review.multiLineHint")}
+            </span>
+          )}
+        </div>
         <button
           type="button"
           onClick={onCancel}
-          className="hover:text-foreground inline-flex h-4 w-4 cursor-pointer items-center justify-center rounded"
+          className="hover:text-foreground inline-flex size-4 shrink-0 cursor-pointer items-center justify-center rounded"
         >
-          <X className="h-3 w-3" />
+          <X className="size-3" />
         </button>
       </div>
       <Textarea
@@ -333,15 +356,15 @@ const InlineCommentComposer = memo(function InlineCommentComposer({
             submit();
           }
         }}
-        placeholder="Add a review comment for the agent… (Enter to save draft)"
+        placeholder={t("review.inlineCommentPlaceholder")}
         className="min-h-[54px] resize-none rounded-[6px] px-2 py-1.5 text-[12px] leading-relaxed"
       />
       <div className="mt-1.5 flex items-center justify-end gap-1.5">
         <Button type="button" variant="ghost" size="xs" onClick={onCancel}>
-          Cancel
+          {t("common.cancel")}
         </Button>
         <Button type="button" size="xs" disabled={!text.trim()} onClick={submit}>
-          Add comment
+          {t("review.addComment")}
         </Button>
       </div>
     </div>
@@ -445,8 +468,63 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
     [onToggleCollapse],
   );
 
+  const handleSelectCommentLine = useCallback(
+    (params: {
+      file: DiffFileView;
+      fileKey: string;
+      side: "old" | "new";
+      lineNumber: number | null;
+      code: string;
+      anchorKey: string;
+      shiftKey: boolean;
+    }) => {
+      const { file, fileKey, side, lineNumber, code, anchorKey, shiftKey } = params;
+      setActiveComment((prev) => {
+        if (
+          shiftKey &&
+          prev &&
+          prev.fileKey === fileKey &&
+          prev.side === side &&
+          prev.anchorLine != null &&
+          lineNumber != null
+        ) {
+          const { startLine, endLine } = normalizeLineRange(prev.anchorLine, lineNumber);
+          const snippet =
+            extractRangeSnippetFromDiffFile(file, side, startLine, endLine) || code;
+          return {
+            fileKey,
+            path: file.path,
+            side,
+            anchorLine: prev.anchorLine,
+            startLine,
+            endLine,
+            lineNumber: endLine,
+            code: snippet,
+            anchorKey: `${side}:${endLine}`,
+          };
+        }
+        return {
+          fileKey,
+          path: file.path,
+          side,
+          anchorLine: lineNumber,
+          startLine: lineNumber,
+          endLine: lineNumber,
+          lineNumber,
+          code,
+          anchorKey,
+        };
+      });
+    },
+    [],
+  );
+
   const commentsByFileAndAnchor = useMemo(() => {
     const byFile = new Map<string, Map<string, ReviewCommentDraft[]>>();
+    const rangesByFile = new Map<
+      string,
+      Array<{ side: "old" | "new"; startLine: number; endLine: number }>
+    >();
     const countByFile = new Map<string, number>();
     for (const c of comments ?? []) {
       countByFile.set(c.path, (countByFile.get(c.path) ?? 0) + 1);
@@ -455,12 +533,27 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
         anchorMap = new Map();
         byFile.set(c.path, anchorMap);
       }
-      const ak = `${c.side}:${c.lineNumber ?? "na"}`;
+      const bounds = resolveDraftLineBounds(c);
+      const anchorLine = bounds.endLine ?? c.lineNumber;
+      const ak = `${c.side}:${anchorLine ?? "na"}`;
       const list = anchorMap.get(ak);
       if (list) list.push(c);
       else anchorMap.set(ak, [c]);
+
+      if (bounds.startLine != null && bounds.endLine != null) {
+        let rangeList = rangesByFile.get(c.path);
+        if (!rangeList) {
+          rangeList = [];
+          rangesByFile.set(c.path, rangeList);
+        }
+        rangeList.push({
+          side: c.side,
+          startLine: bounds.startLine,
+          endLine: bounds.endLine,
+        });
+      }
     }
-    return { byFile, countByFile };
+    return { byFile, rangesByFile, countByFile };
   }, [comments]);
 
   // Flatten all files, headers, hunks, lines, and comments into a single O(1)-virtualized row list
@@ -851,6 +944,15 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
         const side: "old" | "new" = line.kind === "removed" ? "old" : "new";
         const targetLn = side === "old" ? line.old_line : (line.new_line ?? line.old_line);
         const anchorKey = `${side}:${targetLn ?? `idx_${lineIdx}`}`;
+        const inActiveSelection =
+          activeComment?.fileKey === fileKey &&
+          isLineWithinSelection(targetLn, side, activeComment);
+        const inSavedRange =
+          !inActiveSelection &&
+          (commentsByFileAndAnchor.rangesByFile
+            .get(file.path)
+            ?.some((r) => isLineWithinSelection(targetLn, side, r)) ??
+            false);
 
         return (
           <div
@@ -858,16 +960,42 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
               "border-border group selectable-text flex w-full items-start border-x px-2 font-mono text-[12px] leading-[20px]",
               isLastInFile && "rounded-b-lg border-b",
               rowClass,
+              inActiveSelection &&
+                "border-l-2 border-l-sky-500/80 bg-sky-500/[0.08] pl-[6px] dark:border-l-sky-400/80 dark:bg-sky-400/[0.09]",
+              inSavedRange &&
+                "border-l-2 border-l-sky-500/45 pl-[6px] dark:border-l-sky-400/45",
             )}
           >
-            {onOpenFile && line.old_line != null ? (
+            {(onOpenFile || onAddComment) && line.old_line != null ? (
               <button
                 type="button"
-                title={`Open ${file.path} around line ${line.old_line}`}
+                title={
+                  onAddComment
+                    ? t("review.gutterRangeOrOpenTitle", {
+                        path: file.path,
+                        line: line.old_line,
+                      })
+                    : `Open ${file.path} around line ${line.old_line}`
+                }
                 onPointerDown={(e) => {
-                  if (shouldPrefetchOnPointerDown(e)) onPrefetchFile?.(file.path);
+                  if (!e.shiftKey && shouldPrefetchOnPointerDown(e)) onPrefetchFile?.(file.path);
                 }}
-                onClick={() => onOpenFile(file.path, line.old_line)}
+                onClick={(e) => {
+                  if (e.shiftKey && onAddComment) {
+                    e.preventDefault();
+                    handleSelectCommentLine({
+                      file,
+                      fileKey,
+                      side,
+                      lineNumber: targetLn,
+                      code: line.content,
+                      anchorKey,
+                      shiftKey: true,
+                    });
+                    return;
+                  }
+                  onOpenFile?.(file.path, line.old_line);
+                }}
                 className="tabular-nums hover:text-foreground w-8 shrink-0 cursor-pointer pr-1.5 text-right text-[11.5px] text-zinc-400 select-none hover:underline dark:text-zinc-600"
               >
                 {line.old_line}
@@ -877,14 +1005,36 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                 {line.old_line ?? ""}
               </span>
             )}
-            {onOpenFile && line.new_line != null ? (
+            {(onOpenFile || onAddComment) && line.new_line != null ? (
               <button
                 type="button"
-                title={`Open ${file.path} at line ${line.new_line}`}
+                title={
+                  onAddComment
+                    ? t("review.gutterRangeOrOpenTitle", {
+                        path: file.path,
+                        line: line.new_line,
+                      })
+                    : `Open ${file.path} at line ${line.new_line}`
+                }
                 onPointerDown={(e) => {
-                  if (shouldPrefetchOnPointerDown(e)) onPrefetchFile?.(file.path);
+                  if (!e.shiftKey && shouldPrefetchOnPointerDown(e)) onPrefetchFile?.(file.path);
                 }}
-                onClick={() => onOpenFile(file.path, line.new_line)}
+                onClick={(e) => {
+                  if (e.shiftKey && onAddComment) {
+                    e.preventDefault();
+                    handleSelectCommentLine({
+                      file,
+                      fileKey,
+                      side,
+                      lineNumber: targetLn,
+                      code: line.content,
+                      anchorKey,
+                      shiftKey: true,
+                    });
+                    return;
+                  }
+                  onOpenFile?.(file.path, line.new_line);
+                }}
                 className="tabular-nums hover:text-foreground w-8 shrink-0 cursor-pointer pr-2 text-right text-[11.5px] text-zinc-400 select-none hover:underline dark:text-zinc-600"
               >
                 {line.new_line}
@@ -899,15 +1049,16 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                 {onAddComment && (
                   <button
                     type="button"
-                    title="Add review comment on this line"
-                    onClick={() =>
-                      setActiveComment({
+                    title={t("review.commentLineTitle")}
+                    onClick={(e) =>
+                      handleSelectCommentLine({
+                        file,
                         fileKey,
-                        path: file.path,
                         side,
                         lineNumber: targetLn,
                         code: line.content,
                         anchorKey,
+                        shiftKey: e.shiftKey,
                       })
                     }
                     className="inline-flex h-[18px] w-[18px] cursor-pointer items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/15"
@@ -953,6 +1104,23 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
         const { left, right, file, fileKey, rowIdx, isLastInFile } = row;
         const leftAk = `old:${left?.old_line ?? `r_${rowIdx}`}`;
         const rightAk = `new:${right?.new_line ?? `r_${rowIdx}`}`;
+        const savedRanges = commentsByFileAndAnchor.rangesByFile.get(file.path);
+        const leftSelected =
+          Boolean(left) &&
+          activeComment?.fileKey === fileKey &&
+          isLineWithinSelection(left?.old_line, "old", activeComment);
+        const leftSaved =
+          !leftSelected &&
+          Boolean(left) &&
+          (savedRanges?.some((r) => isLineWithinSelection(left?.old_line, "old", r)) ?? false);
+        const rightSelected =
+          Boolean(right) &&
+          activeComment?.fileKey === fileKey &&
+          isLineWithinSelection(right?.new_line, "new", activeComment);
+        const rightSaved =
+          !rightSelected &&
+          Boolean(right) &&
+          (savedRanges?.some((r) => isLineWithinSelection(right?.new_line, "new", r)) ?? false);
 
         return (
           <div
@@ -970,16 +1138,41 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                   : left
                     ? "text-zinc-600 dark:text-zinc-400"
                     : "bg-black/[0.015] dark:bg-white/[0.01]",
+                leftSelected &&
+                  "border-l-2 border-l-sky-500/80 bg-sky-500/[0.08] pl-[4px] dark:border-l-sky-400/80 dark:bg-sky-400/[0.09]",
+                leftSaved && "border-l-2 border-l-sky-500/45 pl-[4px] dark:border-l-sky-400/45",
               )}
             >
-              {onOpenFile && left?.old_line != null ? (
+              {(onOpenFile || onAddComment) && left?.old_line != null ? (
                 <button
                   type="button"
-                  title={`Open ${file.path} around line ${left.old_line}`}
+                  title={
+                    onAddComment
+                      ? t("review.gutterRangeOrOpenTitle", {
+                          path: file.path,
+                          line: left.old_line,
+                        })
+                      : `Open ${file.path} around line ${left.old_line}`
+                  }
                   onPointerDown={(e) => {
-                    if (shouldPrefetchOnPointerDown(e)) onPrefetchFile?.(file.path);
+                    if (!e.shiftKey && shouldPrefetchOnPointerDown(e)) onPrefetchFile?.(file.path);
                   }}
-                  onClick={() => onOpenFile(file.path, left.old_line)}
+                  onClick={(e) => {
+                    if (e.shiftKey && onAddComment) {
+                      e.preventDefault();
+                      handleSelectCommentLine({
+                        file,
+                        fileKey,
+                        side: "old",
+                        lineNumber: left.old_line,
+                        code: left.content,
+                        anchorKey: leftAk,
+                        shiftKey: true,
+                      });
+                      return;
+                    }
+                    onOpenFile?.(file.path, left.old_line);
+                  }}
                   className="tabular-nums hover:text-foreground w-8 shrink-0 cursor-pointer pr-1.5 text-right text-[11.5px] text-zinc-400 select-none hover:underline dark:text-zinc-600"
                 >
                   {left.old_line}
@@ -994,15 +1187,16 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                   {onAddComment && (
                     <button
                       type="button"
-                      title="Comment on old line"
-                      onClick={() =>
-                        setActiveComment({
+                      title={t("review.commentLineTitle")}
+                      onClick={(e) =>
+                        handleSelectCommentLine({
+                          file,
                           fileKey,
-                          path: file.path,
                           side: "old",
                           lineNumber: left.old_line,
                           code: left.content,
                           anchorKey: leftAk,
+                          shiftKey: e.shiftKey,
                         })
                       }
                       className="inline-flex h-[18px] w-[18px] cursor-pointer items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/15"
@@ -1053,16 +1247,42 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                   : right
                     ? "text-zinc-700 dark:text-zinc-300"
                     : "bg-black/[0.015] dark:bg-white/[0.01]",
+                rightSelected &&
+                  "border-l-2 border-l-sky-500/80 bg-sky-500/[0.08] pl-[4px] dark:border-l-sky-400/80 dark:bg-sky-400/[0.09]",
+                rightSaved &&
+                  "border-l-2 border-l-sky-500/45 pl-[4px] dark:border-l-sky-400/45",
               )}
             >
-              {onOpenFile && right?.new_line != null ? (
+              {(onOpenFile || onAddComment) && right?.new_line != null ? (
                 <button
                   type="button"
-                  title={`Open ${file.path} at line ${right.new_line}`}
+                  title={
+                    onAddComment
+                      ? t("review.gutterRangeOrOpenTitle", {
+                          path: file.path,
+                          line: right.new_line,
+                        })
+                      : `Open ${file.path} at line ${right.new_line}`
+                  }
                   onPointerDown={(e) => {
-                    if (shouldPrefetchOnPointerDown(e)) onPrefetchFile?.(file.path);
+                    if (!e.shiftKey && shouldPrefetchOnPointerDown(e)) onPrefetchFile?.(file.path);
                   }}
-                  onClick={() => onOpenFile(file.path, right.new_line)}
+                  onClick={(e) => {
+                    if (e.shiftKey && onAddComment) {
+                      e.preventDefault();
+                      handleSelectCommentLine({
+                        file,
+                        fileKey,
+                        side: "new",
+                        lineNumber: right.new_line,
+                        code: right.content,
+                        anchorKey: rightAk,
+                        shiftKey: true,
+                      });
+                      return;
+                    }
+                    onOpenFile?.(file.path, right.new_line);
+                  }}
                   className="tabular-nums hover:text-foreground w-8 shrink-0 cursor-pointer pr-1.5 text-right text-[11.5px] text-zinc-400 select-none hover:underline dark:text-zinc-600"
                 >
                   {right.new_line}
@@ -1077,15 +1297,16 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
                   {onAddComment && (
                     <button
                       type="button"
-                      title="Comment on new line"
-                      onClick={() =>
-                        setActiveComment({
+                      title={t("review.commentLineTitle")}
+                      onClick={(e) =>
+                        handleSelectCommentLine({
+                          file,
                           fileKey,
-                          path: file.path,
                           side: "new",
                           lineNumber: right.new_line,
                           code: right.content,
                           anchorKey: rightAk,
+                          shiftKey: e.shiftKey,
                         })
                       }
                       className="inline-flex h-[18px] w-[18px] cursor-pointer items-center justify-center rounded hover:bg-black/10 dark:hover:bg-white/15"
@@ -1132,27 +1353,31 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
 
       case "comment_list":
         return (
-          <div className="border-border bg-elevated/80 space-y-1 border-x border-b px-3 py-1.5 font-sans text-[12px]">
-            {row.comments.map((c) => (
-              <div key={c.id} className="flex items-start justify-between gap-2">
-                <div className="text-foreground/90 min-w-0 flex-1 whitespace-pre-wrap break-words">
-                  <span className="text-sky-600 dark:text-sky-400 mr-1.5 text-[10.5px] font-medium uppercase">
-                    Draft ({c.side})
-                  </span>
-                  {c.comment}
+          <div className="border-border bg-elevated/80 flex flex-col gap-1 border-x border-b px-3 py-1.5 font-sans text-[12px]">
+            {row.comments.map((c) => {
+              const bounds = resolveDraftLineBounds(c);
+              const rangeLabel = formatLineRangeTag(bounds.startLine, bounds.endLine, c.side);
+              return (
+                <div key={c.id} className="flex items-start justify-between gap-2">
+                  <div className="text-foreground/90 min-w-0 flex-1 whitespace-pre-wrap break-words">
+                    <span className="text-sky-600 dark:text-sky-400 mr-1.5 font-mono text-[10.5px] font-medium">
+                      {rangeLabel}
+                    </span>
+                    {c.comment}
+                  </div>
+                  {onDeleteComment && (
+                    <button
+                      type="button"
+                      title={t("review.removeComment")}
+                      onClick={() => onDeleteComment(c.id)}
+                      className="text-muted-foreground hover:text-rose-500 inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded"
+                    >
+                      <Trash2 className="size-3" />
+                    </button>
+                  )}
                 </div>
-                {onDeleteComment && (
-                  <button
-                    type="button"
-                    title="Remove comment"
-                    onClick={() => onDeleteComment(c.id)}
-                    className="text-muted-foreground hover:text-rose-500 inline-flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded"
-                  >
-                    <Trash2 className="h-3 w-3" />
-                  </button>
-                )}
-              </div>
-            ))}
+              );
+            })}
           </div>
         );
 
@@ -1165,7 +1390,9 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
               onAddComment?.({
                 path: row.target.path,
                 side: row.target.side,
-                lineNumber: row.target.lineNumber,
+                lineNumber: row.target.endLine ?? row.target.lineNumber,
+                startLine: row.target.startLine,
+                endLine: row.target.endLine,
                 code: row.target.code,
                 comment,
               });

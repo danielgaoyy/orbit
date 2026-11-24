@@ -78,10 +78,13 @@ use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnVie
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
     ArtifactDetail, ArtifactSummary, ConditionalTimerRecord, ContextOccupancyBreakdown,
-    EventTriggerDelivery, ExternalMcpServerRecord, GitCommitResult, GitCreatePrResult,
-    GitMutationOutcome, GitPushResult, GuardianPolicyConfig, HookExecutionRecord, HookScope,
-    LifecycleHookRule, LspCodeAction, LspCompletionItem, LspDiagnostic, LspHoverInfo, LspLocation,
-    LspReferenceLocation, LspServerStatus, LspSymbolInfo, LspWorkspaceEdit, LspWorkspaceEditResult,
+    EventTriggerDelivery, ExternalMcpServerRecord, GitCommitResult, GitConflictListResult,
+    GitConflictResolution, GitCreatePrResult, GitGeneratedCommitMessage, GitMutationOutcome,
+    GitPrStatus, GitPushResult, GitRebaseActionResult, GitRebaseStatus, GitResolveConflictResult,
+    GitStashListResult, GitStashMutationResult, GuardianPolicyConfig, HookExecutionRecord,
+    HookScope, LifecycleHookRule, LspCodeAction, LspCompletionItem, LspDiagnostic, LspHoverInfo,
+    LspLocation, LspReferenceLocation, LspServerStatus, LspSymbolInfo, LspWorkspaceEdit,
+    LspWorkspaceEditResult,
     ManagedSkillRecord, McpProbeResult, OrchestrationConfig, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
     ScheduleTarget, SessionMode, SkillWriteScope, TimerCondition, UsageInsightsSnapshot,
@@ -2049,6 +2052,180 @@ async fn git_create_pr(
             base,
             draft.unwrap_or(false),
         )
+        .await
+}
+
+#[tauri::command]
+async fn git_stash_list(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<GitStashListResult, String> {
+    state.core.git_stash_list_on_host(&host_id, &cwd).await
+}
+
+#[tauri::command]
+async fn git_stash_push(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    message: Option<String>,
+    include_untracked: Option<bool>,
+) -> Result<GitStashMutationResult, String> {
+    state
+        .core
+        .git_stash_push_on_host(&host_id, &cwd, message, include_untracked.unwrap_or(false))
+        .await
+}
+
+#[tauri::command]
+async fn git_stash_apply(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    stash_ref: String,
+    expected_oid: Option<String>,
+) -> Result<GitStashMutationResult, String> {
+    state
+        .core
+        .git_stash_apply_on_host(&host_id, &cwd, stash_ref, expected_oid)
+        .await
+}
+
+#[tauri::command]
+async fn git_stash_pop(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    stash_ref: String,
+    expected_oid: Option<String>,
+) -> Result<GitStashMutationResult, String> {
+    state
+        .core
+        .git_stash_pop_on_host(&host_id, &cwd, stash_ref, expected_oid)
+        .await
+}
+
+#[tauri::command]
+async fn git_stash_drop(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    stash_ref: String,
+    expected_oid: Option<String>,
+) -> Result<GitStashMutationResult, String> {
+    state
+        .core
+        .git_stash_drop_on_host(&host_id, &cwd, stash_ref, expected_oid)
+        .await
+}
+
+#[tauri::command]
+async fn git_rebase_status(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<GitRebaseStatus, String> {
+    state.core.git_rebase_status_on_host(&host_id, &cwd).await
+}
+
+#[tauri::command]
+async fn git_rebase_start(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    onto_ref: String,
+) -> Result<GitRebaseActionResult, String> {
+    state
+        .core
+        .git_rebase_start_on_host(&host_id, &cwd, onto_ref)
+        .await
+}
+
+#[tauri::command]
+async fn git_rebase_continue(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<GitRebaseActionResult, String> {
+    state.core.git_rebase_continue_on_host(&host_id, &cwd).await
+}
+
+#[tauri::command]
+async fn git_rebase_abort(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<GitRebaseActionResult, String> {
+    state.core.git_rebase_abort_on_host(&host_id, &cwd).await
+}
+
+#[tauri::command]
+async fn git_rebase_skip(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    expected_step: Option<u32>,
+) -> Result<GitRebaseActionResult, String> {
+    state
+        .core
+        .git_rebase_skip_on_host(&host_id, &cwd, expected_step)
+        .await
+}
+
+#[tauri::command]
+async fn git_list_conflicts(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<GitConflictListResult, String> {
+    state.core.git_list_conflicts_on_host(&host_id, &cwd).await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn git_resolve_conflict(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+    block_index: Option<u32>,
+    resolution: GitConflictResolution,
+    auto_stage: Option<bool>,
+    expected_sha256: Option<String>,
+) -> Result<GitResolveConflictResult, String> {
+    state
+        .core
+        .git_resolve_conflict_on_host(
+            &host_id,
+            &cwd,
+            path,
+            block_index,
+            resolution,
+            auto_stage.unwrap_or(true),
+            expected_sha256,
+        )
+        .await
+}
+
+#[tauri::command]
+async fn git_pr_status(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<GitPrStatus, String> {
+    state.core.git_pr_status_on_host(&host_id, &cwd).await
+}
+
+#[tauri::command]
+async fn git_generate_commit_message(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<GitGeneratedCommitMessage, String> {
+    state
+        .core
+        .git_generate_commit_message_on_host(&host_id, &cwd)
         .await
 }
 
@@ -4355,6 +4532,20 @@ pub fn run() {
             git_commit,
             git_push,
             git_create_pr,
+            git_stash_list,
+            git_stash_push,
+            git_stash_apply,
+            git_stash_pop,
+            git_stash_drop,
+            git_rebase_status,
+            git_rebase_start,
+            git_rebase_continue,
+            git_rebase_abort,
+            git_rebase_skip,
+            git_list_conflicts,
+            git_resolve_conflict,
+            git_pr_status,
+            git_generate_commit_message,
             start_terminal,
             attach_terminal,
             kill_terminal,

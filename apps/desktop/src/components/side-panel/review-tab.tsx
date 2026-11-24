@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeftRight,
   ArrowUp,
@@ -19,16 +19,21 @@ import {
   Rows3,
   Search,
   Send,
+  Sparkles,
   WrapText,
 } from "lucide-react";
 import { DiffFilesViewer, type ReviewCommentDraft } from "@/components/diff-viewer";
 import { CreatePrDialog } from "@/components/side-panel/create-pr-dialog";
+import { GitConflictResolver } from "@/components/side-panel/git-conflict-resolver";
+import { GitPrStatusBar } from "@/components/side-panel/git-pr-status-bar";
+import { GitStashPopover } from "@/components/side-panel/git-stash-popover";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Textarea } from "@/components/ui/textarea";
+import { formatReviewCommentsPrompt } from "@/lib/git-collab";
 import {
   buildSingleHunkPatch,
   deriveDefaultPrTitle,
@@ -41,8 +46,12 @@ import { modSymbol } from "@/lib/keybindings";
 import {
   orbitIpc,
   type DiffFileView,
+  type GitConflictFile,
   type GitCreatePrResult,
   type GitFileEntry,
+  type GitPrStatus,
+  type GitRebaseStatus,
+  type GitStashEntry,
 } from "@/lib/orbit-ipc";
 import { normalizeProjectPath } from "@/lib/projects";
 import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
@@ -58,6 +67,9 @@ type PendingDiscardTarget =
 
 function statusBadgeClass(status: string): string {
   const s = status.trim().toUpperCase();
+  if (s === "UU" || s === "AA" || s === "DD" || s === "AU" || s === "UA" || s === "DU" || s === "UD") {
+    return "text-rose-600 dark:text-rose-400";
+  }
   if (s === "A" || s === "??") return "text-emerald-600 dark:text-emerald-400";
   if (s === "D") return "text-rose-600 dark:text-rose-400";
   if (s === "M" || s === "R" || s === "E") return "text-amber-600 dark:text-amber-400";
@@ -146,9 +158,33 @@ export const ReviewTab = memo(function ReviewTab({
   const [isPushing, setIsPushing] = useState(false);
   const [prDialogOpen, setPrDialogOpen] = useState(false);
   const [lastCommitSummary, setLastCommitSummary] = useState<string | null>(null);
+  const [isGeneratingCommitMsg, setIsGeneratingCommitMsg] = useState(false);
   const commitIme = useImeCompositionGuard();
 
+  // Deep Git Collaboration Loop state (Stash, Rebase, 3-Way Conflicts, PR CI/Comments)
+  const [stashes, setStashes] = useState<GitStashEntry[]>([]);
+  const [rebaseStatus, setRebaseStatus] = useState<GitRebaseStatus | null>(null);
+  const [conflictFiles, setConflictFiles] = useState<GitConflictFile[]>([]);
+  const [prStatus, setPrStatus] = useState<GitPrStatus | null>(null);
+  const [isLoadingPrStatus, setIsLoadingPrStatus] = useState(false);
+  const collabGenRef = useRef(0);
+  const prGenRef = useRef(0);
+  const mountedRef = useRef(true);
+  const activeScopeRef = useRef({ hostId: selectedHostId, cwd: selectedCwd });
+  activeScopeRef.current = { hostId: selectedHostId, cwd: selectedCwd };
+
   useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      collabGenRef.current += 1;
+      prGenRef.current += 1;
+    };
+  }, []);
+
+  useEffect(() => {
+    collabGenRef.current += 1;
+    prGenRef.current += 1;
     setCollapsedPaths(new Set());
     setViewedPaths(new Set());
     setDraftComments([]);
@@ -163,6 +199,12 @@ export const ReviewTab = memo(function ReviewTab({
     setIsPushing(false);
     setPrDialogOpen(false);
     setLastCommitSummary(null);
+    setIsGeneratingCommitMsg(false);
+    setStashes([]);
+    setRebaseStatus(null);
+    setConflictFiles([]);
+    setPrStatus(null);
+    setIsLoadingPrStatus(false);
   }, [selectedHostId, selectedCwd]);
 
   const isWorkingTreeWritable =
@@ -341,41 +383,162 @@ export const ReviewTab = memo(function ReviewTab({
 
   const handleSubmitReviewComments = useCallback(() => {
     if (draftComments.length === 0) return;
-    const grouped = new Map<string, ReviewCommentDraft[]>();
-    for (const c of draftComments) {
-      const list = grouped.get(c.path);
-      if (list) list.push(c);
-      else grouped.set(c.path, [c]);
-    }
-    const sections: string[] = [
-      `Please address the following ${draftComments.length} code review ${draftComments.length === 1 ? "comment" : "comments"}:`,
-    ];
-    for (const [path, list] of grouped.entries()) {
-      sections.push(`\n### \`${path}\``);
-      for (const item of list) {
-        const loc = item.lineNumber != null ? `L${item.lineNumber}` : item.side;
-        sections.push(`- **${loc}** (\`${item.code.trim().slice(0, 120)}\`):\n  ${item.comment}`);
-      }
-    }
-    orbitActions.promoteSideQuestionToComposer(sections.join("\n"));
+    const prompt = formatReviewCommentsPrompt(draftComments);
+    if (!prompt) return;
+    orbitActions.promoteSideQuestionToComposer(prompt);
     setDraftComments([]);
     orbitActions.showToast(
       t("sidePanel.insertedCommentsToast", { count: draftComments.length }),
     );
   }, [draftComments, t]);
 
+  const isSameActiveScope = useCallback(
+    (reqHostId: string, reqCwd: string) =>
+      mountedRef.current &&
+      activeScopeRef.current.hostId === reqHostId &&
+      activeScopeRef.current.cwd === reqCwd,
+    [],
+  );
+
+  const refreshCollabState = useCallback(async () => {
+    if (!isWorkingTreeWritable || !selectedCwd) return;
+    const reqHostId = selectedHostId;
+    const reqCwd = selectedCwd;
+    const gen = ++collabGenRef.current;
+    const [stashRes, rebaseRes, conflictRes] = await Promise.allSettled([
+      orbitIpc.gitStashList({ hostId: reqHostId, cwd: reqCwd }),
+      orbitIpc.gitRebaseStatus({ hostId: reqHostId, cwd: reqCwd }),
+      orbitIpc.gitListConflicts({ hostId: reqHostId, cwd: reqCwd }),
+    ]);
+    if (collabGenRef.current !== gen || !isSameActiveScope(reqHostId, reqCwd)) return;
+    if (stashRes.status === "fulfilled") {
+      setStashes(stashRes.value.entries);
+    }
+    if (rebaseRes.status === "fulfilled") {
+      setRebaseStatus(rebaseRes.value);
+    }
+    if (conflictRes.status === "fulfilled") {
+      setConflictFiles(conflictRes.value.files);
+    }
+  }, [isWorkingTreeWritable, selectedHostId, selectedCwd, isSameActiveScope]);
+
+  const refreshPrStatus = useCallback(async () => {
+    if (!isWorkingTreeWritable || !selectedCwd) return;
+    const reqHostId = selectedHostId;
+    const reqCwd = selectedCwd;
+    const gen = ++prGenRef.current;
+    setIsLoadingPrStatus(true);
+    try {
+      const status = await orbitIpc.gitPrStatus({
+        hostId: reqHostId,
+        cwd: reqCwd,
+      });
+      if (prGenRef.current === gen && isSameActiveScope(reqHostId, reqCwd)) {
+        setPrStatus(status);
+      }
+    } catch {
+      if (prGenRef.current === gen && isSameActiveScope(reqHostId, reqCwd)) {
+        setPrStatus(null);
+      }
+    } finally {
+      if (prGenRef.current === gen && isSameActiveScope(reqHostId, reqCwd)) {
+        setIsLoadingPrStatus(false);
+      }
+    }
+  }, [isWorkingTreeWritable, selectedHostId, selectedCwd, isSameActiveScope]);
+
+  const gitReviewRevision = gitReview?.revision ?? 0;
+  const gitBranchForPr = gitReview?.status?.branch ?? null;
+
+  useEffect(() => {
+    if (!visible || !isWorkingTreeWritable || !selectedCwd) return;
+    void refreshCollabState();
+  }, [visible, isWorkingTreeWritable, selectedCwd, gitReviewRevision, refreshCollabState]);
+
+  useEffect(() => {
+    if (!visible || !isWorkingTreeWritable || !selectedCwd) return;
+    void refreshPrStatus();
+  }, [visible, isWorkingTreeWritable, selectedCwd, gitBranchForPr, refreshPrStatus]);
+
+  const handleCollabStateChanged = useCallback(async () => {
+    if (!selectedCwd) return;
+    const reqHostId = selectedHostId;
+    const reqCwd = selectedCwd;
+    await orbitActions.refreshGitReview(reqHostId, reqCwd, {
+      path: selectedDiffPath,
+      staged: diffStaged,
+    });
+    if (!isSameActiveScope(reqHostId, reqCwd)) return;
+    await refreshCollabState();
+  }, [
+    selectedHostId,
+    selectedCwd,
+    selectedDiffPath,
+    diffStaged,
+    isSameActiveScope,
+    refreshCollabState,
+  ]);
+
+  const handleGenerateCommitMessage = useCallback(async () => {
+    if (!isWorkingTreeWritable || !selectedCwd || isGeneratingCommitMsg || isCommitting) return;
+    const reqHostId = selectedHostId;
+    const reqCwd = selectedCwd;
+    setIsGeneratingCommitMsg(true);
+    try {
+      const generated = await orbitIpc.gitGenerateCommitMessage({
+        hostId: reqHostId,
+        cwd: reqCwd,
+      });
+      if (!isSameActiveScope(reqHostId, reqCwd)) return;
+      setCommitMessage(generated.message);
+      orbitActions.showToast(t("review.commitMessageGeneratedToast"));
+    } catch (err) {
+      if (!isSameActiveScope(reqHostId, reqCwd)) return;
+      orbitActions.showToast(t("review.gitActionFailedToast", { detail: formatErrorDetail(err) }));
+    } finally {
+      if (isSameActiveScope(reqHostId, reqCwd)) {
+        setIsGeneratingCommitMsg(false);
+      }
+    }
+  }, [
+    isWorkingTreeWritable,
+    selectedHostId,
+    selectedCwd,
+    isGeneratingCommitMsg,
+    isCommitting,
+    isSameActiveScope,
+    t,
+  ]);
+
   const handleRefresh = useCallback(async () => {
     if (isRefreshing || !selectedCwd) return;
+    const reqHostId = selectedHostId;
+    const reqCwd = selectedCwd;
     setIsRefreshing(true);
     try {
-      await orbitActions.refreshGitReview(selectedHostId, selectedCwd, {
+      await orbitActions.refreshGitReview(reqHostId, reqCwd, {
         path: selectedDiffPath,
         staged: diffStaged,
       });
+      if (isWorkingTreeWritable && isSameActiveScope(reqHostId, reqCwd)) {
+        await Promise.allSettled([refreshCollabState(), refreshPrStatus()]);
+      }
     } finally {
-      setIsRefreshing(false);
+      if (isSameActiveScope(reqHostId, reqCwd)) {
+        setIsRefreshing(false);
+      }
     }
-  }, [isRefreshing, selectedHostId, selectedCwd, selectedDiffPath, diffStaged]);
+  }, [
+    isRefreshing,
+    selectedHostId,
+    selectedCwd,
+    selectedDiffPath,
+    diffStaged,
+    isWorkingTreeWritable,
+    isSameActiveScope,
+    refreshCollabState,
+    refreshPrStatus,
+  ]);
 
   const resolveRefreshPath = useCallback(
     (clearSelection: boolean): string | null => {
@@ -734,6 +897,7 @@ export const ReviewTab = memo(function ReviewTab({
         path: resolveRefreshPath(false),
         staged: diffStaged,
       });
+      void refreshPrStatus();
       orbitActions.showToast(
         t("review.pushedToast", {
           branch: result.branch,
@@ -752,12 +916,14 @@ export const ReviewTab = memo(function ReviewTab({
     isPushing,
     diffStaged,
     resolveRefreshPath,
+    refreshPrStatus,
     t,
   ]);
 
   const handlePrCreated = useCallback(
     (result: GitCreatePrResult) => {
       orbitActions.recordSessionPullRequest(result);
+      void refreshPrStatus();
       orbitActions.showToast(
         result.number != null
           ? t("review.prCreatedWithNumberToast", { number: result.number })
@@ -768,7 +934,7 @@ export const ReviewTab = memo(function ReviewTab({
         },
       );
     },
-    [t],
+    [refreshPrStatus, t],
   );
 
   const showApplyToLocal = Boolean(activeWorkspace?.is_worktree);
@@ -902,6 +1068,18 @@ export const ReviewTab = memo(function ReviewTab({
               <Columns2 className="h-[13px] w-[13px]" />
             </button>
           </div>
+
+          {reviewScope === "working_tree" && isWorkingTreeWritable && selectedCwd && (
+            <GitStashPopover
+              hostId={selectedHostId}
+              cwd={selectedCwd}
+              visible={visible}
+              stashes={stashes}
+              hasLocalChanges={statusFiles.length > 0}
+              rebaseInProgress={Boolean(rebaseStatus?.in_progress)}
+              onRefreshAll={handleCollabStateChanged}
+            />
+          )}
 
           {reviewScope === "working_tree" && (
             <button
@@ -1140,6 +1318,28 @@ export const ReviewTab = memo(function ReviewTab({
         </div>
       )}
 
+      {/* Contextual PR CI Checks & Review Comments Bar (auto-hidden when no PR exists) */}
+      {isWorkingTreeWritable && (
+        <GitPrStatusBar
+          prStatus={prStatus}
+          isLoading={isLoadingPrStatus}
+          onRefresh={() => void refreshPrStatus()}
+          onOpenFile={handleOpenFile}
+        />
+      )}
+
+      {/* Contextual Rebase & 3-Way Conflict Resolver (auto-hidden when clean) */}
+      {isWorkingTreeWritable && selectedCwd && (
+        <GitConflictResolver
+          hostId={selectedHostId}
+          cwd={selectedCwd}
+          visible={visible}
+          rebaseStatus={rebaseStatus}
+          conflictFiles={conflictFiles}
+          onStateChanged={handleCollabStateChanged}
+        />
+      )}
+
       {/* Virtualized Diff Stream Body (O(1) DOM nodes regardless of file/line count) */}
       <DiffFilesViewer
         virtualized
@@ -1250,27 +1450,42 @@ export const ReviewTab = memo(function ReviewTab({
           </div>
 
           {commitBarExpanded && (
-            <div className="mt-2 space-y-2">
-              <Textarea
-                rows={2}
-                disabled={isCommitting}
-                value={commitMessage}
-                onChange={(e) => setCommitMessage(e.target.value)}
-                {...commitIme.compositionProps}
-                onKeyDown={(e) => {
-                  if (commitIme.shouldIgnoreKeyDown(e)) return;
-                  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                    e.preventDefault();
-                    void handleCommit();
+            <div className="mt-2 flex flex-col gap-2">
+              <div className="relative">
+                <Textarea
+                  rows={2}
+                  disabled={isCommitting}
+                  value={commitMessage}
+                  onChange={(e) => setCommitMessage(e.target.value)}
+                  {...commitIme.compositionProps}
+                  onKeyDown={(e) => {
+                    if (commitIme.shouldIgnoreKeyDown(e)) return;
+                    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                      e.preventDefault();
+                      void handleCommit();
+                    }
+                  }}
+                  placeholder={
+                    amendCommit
+                      ? t("review.amendPlaceholder", { shortcut: commitShortcutLabel })
+                      : t("review.commitPlaceholder", { shortcut: commitShortcutLabel })
                   }
-                }}
-                placeholder={
-                  amendCommit
-                    ? t("review.amendPlaceholder", { shortcut: commitShortcutLabel })
-                    : t("review.commitPlaceholder", { shortcut: commitShortcutLabel })
-                }
-                className="max-h-[120px] min-h-[52px] resize-y px-2.5 py-1.5 text-[12px] leading-relaxed"
-              />
+                  className="max-h-[120px] min-h-[52px] resize-y py-1.5 pr-8 pl-2.5 text-[12px] leading-relaxed"
+                />
+                <button
+                  type="button"
+                  disabled={isCommitting || isGeneratingCommitMsg || statusFiles.length === 0}
+                  title={t("review.generateCommitMessageTitle")}
+                  onClick={() => void handleGenerateCommitMessage()}
+                  className="text-muted-foreground hover:bg-accent hover:text-foreground absolute top-1.5 right-1.5 inline-flex size-[22px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:pointer-events-none disabled:opacity-35"
+                >
+                  {isGeneratingCommitMsg ? (
+                    <Loader2 className="size-[12px] animate-spin" />
+                  ) : (
+                    <Sparkles className="size-[12px]" />
+                  )}
+                </button>
+              </div>
 
               {!amendCommit && stagedCount === 0 && (
                 <p className="text-muted-foreground text-[11px] leading-snug">

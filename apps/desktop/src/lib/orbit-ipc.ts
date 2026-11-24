@@ -1971,6 +1971,145 @@ export interface GitCreatePrResult {
   title: string;
 }
 
+export interface GitStashEntry {
+  stash_ref: string;
+  index: number;
+  branch?: string | null;
+  message: string;
+  oid?: string | null;
+  short_sha?: string | null;
+  created_at?: string | null;
+}
+
+export interface GitStashListResult {
+  entries: GitStashEntry[];
+}
+
+export interface GitStashMutationResult {
+  action: "push" | "apply" | "pop" | "drop" | string;
+  stash_ref?: string | null;
+  summary: string;
+  had_conflicts: boolean;
+}
+
+export type GitRebaseKind = "none" | "merge" | "apply";
+
+export interface GitRebaseStatus {
+  in_progress: boolean;
+  kind: GitRebaseKind;
+  current_step?: number | null;
+  total_steps?: number | null;
+  head_name?: string | null;
+  onto?: string | null;
+  stopped_message?: string | null;
+  conflicted_files: string[];
+  merge_in_progress: boolean;
+  cherry_pick_in_progress: boolean;
+}
+
+export interface GitRebaseActionResult {
+  action: "start" | "continue" | "abort" | "skip" | string;
+  status: GitRebaseStatus;
+  summary: string;
+}
+
+export interface GitConflictBlock {
+  index: number;
+  start_line: number;
+  end_line: number;
+  ours_label: string;
+  base_label?: string | null;
+  theirs_label: string;
+  ours: string;
+  base?: string | null;
+  theirs: string;
+  context_before: string[];
+  context_after: string[];
+}
+
+export interface GitConflictFile {
+  path: string;
+  blocks: GitConflictBlock[];
+  is_binary: boolean;
+  unmerged_in_index: boolean;
+  total_blocks: number;
+  content_sha256?: string | null;
+}
+
+export interface GitConflictListResult {
+  files: GitConflictFile[];
+}
+
+export type GitConflictResolution =
+  | { strategy: "ours" }
+  | { strategy: "theirs" }
+  | { strategy: "both" }
+  | { strategy: "manual_content"; content: string };
+
+export interface GitResolveConflictResult {
+  path: string;
+  remaining_blocks: number;
+  staged: boolean;
+  summary: string;
+}
+
+export type GitPrAvailability = "available" | "no_pull_request" | "unavailable";
+export type GitCiCheckState = "passing" | "failing" | "pending" | "neutral";
+
+export interface GitPrCheckItem {
+  name: string;
+  state: GitCiCheckState;
+  workflow?: string | null;
+  raw_status?: string | null;
+  raw_conclusion?: string | null;
+  details_url?: string | null;
+}
+
+export interface GitPrReviewComment {
+  id: string;
+  author: string;
+  body: string;
+  path?: string | null;
+  line?: number | null;
+  start_line?: number | null;
+  url?: string | null;
+  created_at?: string | null;
+  is_resolved: boolean;
+  is_outdated: boolean;
+  kind: "review_thread" | "review_summary" | "issue_comment" | string;
+}
+
+export interface GitPrStatus {
+  availability: GitPrAvailability;
+  reason?: string | null;
+  number?: number | null;
+  title?: string | null;
+  url?: string | null;
+  state?: string | null;
+  is_draft: boolean;
+  mergeable?: string | null;
+  review_decision?: string | null;
+  head_ref?: string | null;
+  base_ref?: string | null;
+  checks: GitPrCheckItem[];
+  passing_checks: number;
+  failing_checks: number;
+  pending_checks: number;
+  review_comments: GitPrReviewComment[];
+  unresolved_comment_count: number;
+}
+
+export interface GitGeneratedCommitMessage {
+  message: string;
+  subject: string;
+  body?: string | null;
+  commit_type: string;
+  scope?: string | null;
+  diff_source: "staged" | "working_tree" | string;
+  files_analyzed: number;
+  generator: string;
+}
+
 export type GitMutationOutcome =
   | { kind: "files_staged"; paths: string[]; all: boolean }
   | { kind: "files_unstaged"; paths: string[]; all: boolean }
@@ -1978,7 +2117,10 @@ export type GitMutationOutcome =
   | { kind: "files_discarded"; paths: string[]; include_untracked: boolean }
   | ({ kind: "committed" } & GitCommitResult)
   | ({ kind: "pushed" } & GitPushResult)
-  | ({ kind: "pr_created" } & GitCreatePrResult);
+  | ({ kind: "pr_created" } & GitCreatePrResult)
+  | ({ kind: "stash_mutated" } & GitStashMutationResult)
+  | ({ kind: "rebase_action" } & GitRebaseActionResult)
+  | ({ kind: "conflict_resolved" } & GitResolveConflictResult);
 
 export interface WorkspaceFileView {
   host_id: string;
@@ -4676,6 +4818,233 @@ export const orbitIpc = {
       body: params.body ?? "",
       base: params.base ?? null,
       draft: params.draft ?? false,
+    });
+  },
+
+  gitStashList: async (params: {
+    hostId: string;
+    cwd: string;
+  }): Promise<GitStashListResult> => {
+    if (!isTauriRuntime()) {
+      return { entries: [] };
+    }
+    return invoke<GitStashListResult>("git_stash_list", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+    });
+  },
+
+  gitStashPush: async (params: {
+    hostId: string;
+    cwd: string;
+    message?: string | null;
+    includeUntracked?: boolean;
+  }): Promise<GitStashMutationResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to stash changes.");
+    }
+    return invoke<GitStashMutationResult>("git_stash_push", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      message: params.message ?? null,
+      includeUntracked: params.includeUntracked ?? false,
+    });
+  },
+
+  gitStashApply: async (params: {
+    hostId: string;
+    cwd: string;
+    stashRef: string;
+    expectedOid?: string | null;
+  }): Promise<GitStashMutationResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to apply stashes.");
+    }
+    return invoke<GitStashMutationResult>("git_stash_apply", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      stashRef: params.stashRef,
+      expectedOid: params.expectedOid ?? null,
+    });
+  },
+
+  gitStashPop: async (params: {
+    hostId: string;
+    cwd: string;
+    stashRef: string;
+    expectedOid?: string | null;
+  }): Promise<GitStashMutationResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to pop stashes.");
+    }
+    return invoke<GitStashMutationResult>("git_stash_pop", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      stashRef: params.stashRef,
+      expectedOid: params.expectedOid ?? null,
+    });
+  },
+
+  gitStashDrop: async (params: {
+    hostId: string;
+    cwd: string;
+    stashRef: string;
+    expectedOid?: string | null;
+  }): Promise<GitStashMutationResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to drop stashes.");
+    }
+    return invoke<GitStashMutationResult>("git_stash_drop", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      stashRef: params.stashRef,
+      expectedOid: params.expectedOid ?? null,
+    });
+  },
+
+  gitRebaseStatus: async (params: {
+    hostId: string;
+    cwd: string;
+  }): Promise<GitRebaseStatus> => {
+    if (!isTauriRuntime()) {
+      return {
+        in_progress: false,
+        kind: "none",
+        conflicted_files: [],
+        merge_in_progress: false,
+        cherry_pick_in_progress: false,
+      };
+    }
+    return invoke<GitRebaseStatus>("git_rebase_status", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+    });
+  },
+
+  gitRebaseStart: async (params: {
+    hostId: string;
+    cwd: string;
+    ontoRef: string;
+  }): Promise<GitRebaseActionResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to start rebase.");
+    }
+    return invoke<GitRebaseActionResult>("git_rebase_start", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      ontoRef: params.ontoRef,
+    });
+  },
+
+  gitRebaseContinue: async (params: {
+    hostId: string;
+    cwd: string;
+  }): Promise<GitRebaseActionResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to continue rebase.");
+    }
+    return invoke<GitRebaseActionResult>("git_rebase_continue", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+    });
+  },
+
+  gitRebaseAbort: async (params: {
+    hostId: string;
+    cwd: string;
+  }): Promise<GitRebaseActionResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to abort rebase.");
+    }
+    return invoke<GitRebaseActionResult>("git_rebase_abort", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+    });
+  },
+
+  gitRebaseSkip: async (params: {
+    hostId: string;
+    cwd: string;
+    expectedStep?: number | null;
+  }): Promise<GitRebaseActionResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to skip rebase commit.");
+    }
+    return invoke<GitRebaseActionResult>("git_rebase_skip", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      expectedStep: params.expectedStep ?? null,
+    });
+  },
+
+  gitListConflicts: async (params: {
+    hostId: string;
+    cwd: string;
+  }): Promise<GitConflictListResult> => {
+    if (!isTauriRuntime()) {
+      return { files: [] };
+    }
+    return invoke<GitConflictListResult>("git_list_conflicts", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+    });
+  },
+
+  gitResolveConflict: async (params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+    blockIndex?: number | null;
+    resolution: GitConflictResolution;
+    autoStage?: boolean;
+    expectedSha256?: string | null;
+  }): Promise<GitResolveConflictResult> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to resolve conflicts.");
+    }
+    return invoke<GitResolveConflictResult>("git_resolve_conflict", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      path: params.path,
+      blockIndex: params.blockIndex ?? null,
+      resolution: params.resolution,
+      autoStage: params.autoStage ?? true,
+      expectedSha256: params.expectedSha256 ?? null,
+    });
+  },
+
+  gitPrStatus: async (params: {
+    hostId: string;
+    cwd: string;
+  }): Promise<GitPrStatus> => {
+    if (!isTauriRuntime()) {
+      return {
+        availability: "unavailable",
+        is_draft: false,
+        checks: [],
+        passing_checks: 0,
+        failing_checks: 0,
+        pending_checks: 0,
+        review_comments: [],
+        unresolved_comment_count: 0,
+      };
+    }
+    return invoke<GitPrStatus>("git_pr_status", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+    });
+  },
+
+  gitGenerateCommitMessage: async (params: {
+    hostId: string;
+    cwd: string;
+  }): Promise<GitGeneratedCommitMessage> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to generate commit message.");
+    }
+    return invoke<GitGeneratedCommitMessage>("git_generate_commit_message", {
+      hostId: params.hostId,
+      cwd: params.cwd,
     });
   },
 

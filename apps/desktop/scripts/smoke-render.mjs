@@ -239,6 +239,72 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
             raw_diff: "",
             diff_files: [],
           };
+        case "git_stash_list":
+          return { entries: [] };
+        case "git_stash_push":
+        case "git_stash_apply":
+        case "git_stash_pop":
+        case "git_stash_drop":
+          return {
+            action: cmd.replace("git_stash_", ""),
+            stash_ref: args.stashRef ?? "stash@{0}",
+            summary: "ok",
+            had_conflicts: false,
+          };
+        case "git_rebase_status":
+          return {
+            in_progress: false,
+            kind: "none",
+            conflicted_files: [],
+            merge_in_progress: false,
+            cherry_pick_in_progress: false,
+          };
+        case "git_rebase_start":
+        case "git_rebase_continue":
+        case "git_rebase_abort":
+        case "git_rebase_skip":
+          return {
+            action: cmd.replace("git_rebase_", ""),
+            status: {
+              in_progress: false,
+              kind: "none",
+              conflicted_files: [],
+              merge_in_progress: false,
+              cherry_pick_in_progress: false,
+            },
+            summary: "ok",
+          };
+        case "git_list_conflicts":
+          return { files: [] };
+        case "git_resolve_conflict":
+          return {
+            path: args.path ?? "",
+            remaining_blocks: 0,
+            staged: true,
+            summary: "ok",
+          };
+        case "git_pr_status":
+          return {
+            availability: "no_pull_request",
+            is_draft: false,
+            checks: [],
+            passing_checks: 0,
+            failing_checks: 0,
+            pending_checks: 0,
+            review_comments: [],
+            unresolved_comment_count: 0,
+          };
+        case "git_generate_commit_message":
+          return {
+            message: "chore: update workspace",
+            subject: "chore: update workspace",
+            body: null,
+            commit_type: "chore",
+            scope: null,
+            diff_source: "staged",
+            files_analyzed: 1,
+            generator: "deterministic",
+          };
         case "list_path_rules":
           return {
             host_id: args.hostId ?? "host_smoke_1",

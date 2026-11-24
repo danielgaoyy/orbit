@@ -89,6 +89,17 @@ pub async fn inspect_git_status(cwd: &Path) -> GitStatusSnapshot {
                     });
                 }
             }
+        } else if line.starts_with("u ") {
+            // Unmerged (conflicted) entry: `u XY sub m1 m2 m3 mW h1 h2 h3 path`
+            let parts: Vec<&str> = line.splitn(11, ' ').collect();
+            if parts.len() >= 11 {
+                files.push(GitFileEntry {
+                    path: parts[10].to_string(),
+                    status: parts[1].to_string(),
+                    staged: false,
+                    untracked: false,
+                });
+            }
         }
     }
 
@@ -559,7 +570,7 @@ fn is_same_repo_worktree_file(
 }
 
 #[cfg(unix)]
-fn unix_o_nofollow_flag() -> Option<i32> {
+pub(crate) fn unix_o_nofollow_flag() -> Option<i32> {
     #[cfg(any(
         target_os = "macos",
         target_os = "ios",

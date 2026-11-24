@@ -3,6 +3,7 @@
 pub mod acp;
 pub mod artifacts;
 pub mod browser;
+pub mod git_collab;
 pub mod goals;
 pub mod guardian;
 pub mod handoff;
@@ -24,6 +25,7 @@ pub mod workflows;
 pub use acp::*;
 pub use artifacts::*;
 pub use browser::*;
+pub use git_collab::*;
 pub use goals::*;
 pub use guardian::*;
 pub use handoff::*;
@@ -671,6 +673,9 @@ pub enum GitMutationOutcome {
     Committed(GitCommitResult),
     Pushed(GitPushResult),
     PrCreated(GitCreatePrResult),
+    StashMutated(GitStashMutationResult),
+    RebaseAction(GitRebaseActionResult),
+    ConflictResolved(GitResolveConflictResult),
 }
 
 /// Synchronized follow-up prompt queued on the host daemon for multi-device visibility & offline drain.
@@ -1362,6 +1367,91 @@ pub enum WireMessage {
         result: GitMutationOutcome,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<GitStatusSnapshot>,
+    },
+    GitStashList {
+        request_id: Uuid,
+        cwd: String,
+    },
+    GitStashPush {
+        request_id: Uuid,
+        cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(default)]
+        include_untracked: bool,
+    },
+    GitStashApply {
+        request_id: Uuid,
+        cwd: String,
+        stash_ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_oid: Option<String>,
+    },
+    GitStashPop {
+        request_id: Uuid,
+        cwd: String,
+        stash_ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_oid: Option<String>,
+    },
+    GitStashDrop {
+        request_id: Uuid,
+        cwd: String,
+        stash_ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_oid: Option<String>,
+    },
+    GitRebaseStatus {
+        request_id: Uuid,
+        cwd: String,
+    },
+    GitRebaseStart {
+        request_id: Uuid,
+        cwd: String,
+        onto_ref: String,
+    },
+    GitRebaseContinue {
+        request_id: Uuid,
+        cwd: String,
+    },
+    GitRebaseAbort {
+        request_id: Uuid,
+        cwd: String,
+    },
+    GitRebaseSkip {
+        request_id: Uuid,
+        cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_step: Option<u32>,
+    },
+    GitListConflicts {
+        request_id: Uuid,
+        cwd: String,
+    },
+    GitResolveConflict {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        block_index: Option<u32>,
+        resolution: GitConflictResolution,
+        #[serde(default = "wire_default_true")]
+        auto_stage: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_sha256: Option<String>,
+    },
+    GitPrStatus {
+        request_id: Uuid,
+        cwd: String,
+    },
+    GitGenerateCommitMessage {
+        request_id: Uuid,
+        cwd: String,
+    },
+    GitCollabResponse {
+        request_id: Uuid,
+        cwd: String,
+        payload: GitCollabQueryResult,
     },
     ListWorkspaceFiles {
         request_id: Uuid,
@@ -5508,6 +5598,253 @@ mod tests {
         assert_eq!(committed_json["kind"], "committed");
         assert_eq!(committed_json["commit_sha"], "abc");
         assert_eq!(committed_json["branch"], "main");
+    }
+
+    #[test]
+    fn git_collab_wire_messages_roundtrip_and_preserve_json_shapes() {
+        let req_id = Uuid::new_v4();
+        let stash_list = GitStashListResult {
+            entries: vec![GitStashEntry {
+                stash_ref: "stash@{0}".into(),
+                index: 0,
+                branch: Some("feat/git-collab".into()),
+                message: "WIP savepoint".into(),
+                oid: Some("1234abcdef1234abcdef1234abcdef1234abcdef".into()),
+                short_sha: Some("1234abc".into()),
+                created_at: Some("2026-11-24T12:00:00Z".into()),
+            }],
+        };
+        let rebase_status = GitRebaseStatus {
+            in_progress: true,
+            kind: GitRebaseKind::Merge,
+            current_step: Some(2),
+            total_steps: Some(4),
+            head_name: Some("feat/git-collab".into()),
+            onto: Some("main".into()),
+            stopped_message: Some("feat: add conflict parser".into()),
+            conflicted_files: vec!["src/lib.rs".into()],
+            merge_in_progress: false,
+            cherry_pick_in_progress: false,
+        };
+        let conflict_list = GitConflictListResult {
+            files: vec![GitConflictFile {
+                path: "src/lib.rs".into(),
+                blocks: vec![GitConflictBlock {
+                    index: 0,
+                    start_line: 10,
+                    end_line: 18,
+                    ours_label: "HEAD".into(),
+                    base_label: Some("base".into()),
+                    theirs_label: "feat/other".into(),
+                    ours: "let x = 1;".into(),
+                    base: Some("let x = 0;".into()),
+                    theirs: "let x = 2;".into(),
+                    context_before: vec!["fn main() {".into()],
+                    context_after: vec!["}".into()],
+                }],
+                is_binary: false,
+                unmerged_in_index: true,
+                total_blocks: 1,
+                content_sha256: Some("a".repeat(64)),
+            }],
+        };
+        let pr_status = GitPrStatus {
+            availability: GitPrAvailability::Available,
+            reason: None,
+            number: Some(99),
+            title: Some("Deep Git Collaboration Loop".into()),
+            url: Some("https://github.com/danielgaoyy/orbit/pull/99".into()),
+            state: Some("OPEN".into()),
+            is_draft: false,
+            mergeable: Some("MERGEABLE".into()),
+            review_decision: Some("CHANGES_REQUESTED".into()),
+            head_ref: Some("feat/git-collab".into()),
+            base_ref: Some("main".into()),
+            checks: vec![GitPrCheckItem {
+                name: "cargo test".into(),
+                state: GitCiCheckState::Failing,
+                workflow: Some("CI".into()),
+                raw_status: Some("COMPLETED".into()),
+                raw_conclusion: Some("FAILURE".into()),
+                details_url: Some("https://github.com/danielgaoyy/orbit/actions/runs/1".into()),
+            }],
+            passing_checks: 3,
+            failing_checks: 1,
+            pending_checks: 0,
+            review_comments: vec![GitPrReviewComment {
+                id: "c1".into(),
+                author: "reviewer".into(),
+                body: "Please handle CRLF line endings.".into(),
+                path: Some("crates/orbit-daemon/src/git_collab.rs".into()),
+                line: Some(42),
+                start_line: Some(38),
+                url: Some("https://github.com/danielgaoyy/orbit/pull/99#discussion_r1".into()),
+                created_at: Some("2026-11-24T12:10:00Z".into()),
+                is_resolved: false,
+                is_outdated: false,
+                kind: "review_thread".into(),
+            }],
+            unresolved_comment_count: 1,
+        };
+        let commit_msg = GitGeneratedCommitMessage {
+            message: "feat(daemon): add git_collab module\n\n- Add git_collab.rs (+120/-0)".into(),
+            subject: "feat(daemon): add git_collab module".into(),
+            body: Some("- Add git_collab.rs (+120/-0)".into()),
+            commit_type: "feat".into(),
+            scope: Some("daemon".into()),
+            diff_source: "staged".into(),
+            files_analyzed: 1,
+            generator: "deterministic".into(),
+        };
+
+        let messages = vec![
+            WireMessage::GitStashList {
+                request_id: req_id,
+                cwd: "/repo".into(),
+            },
+            WireMessage::GitStashPush {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                message: Some("checkpoint".into()),
+                include_untracked: true,
+            },
+            WireMessage::GitStashApply {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                stash_ref: "stash@{0}".into(),
+                expected_oid: Some("1234abcdef1234abcdef1234abcdef1234abcdef".into()),
+            },
+            WireMessage::GitStashPop {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                stash_ref: "stash@{0}".into(),
+                expected_oid: Some("1234abcdef1234abcdef1234abcdef1234abcdef".into()),
+            },
+            WireMessage::GitStashDrop {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                stash_ref: "stash@{0}".into(),
+                expected_oid: Some("1234abcdef1234abcdef1234abcdef1234abcdef".into()),
+            },
+            WireMessage::GitRebaseStatus {
+                request_id: req_id,
+                cwd: "/repo".into(),
+            },
+            WireMessage::GitRebaseStart {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                onto_ref: "origin/main".into(),
+            },
+            WireMessage::GitRebaseContinue {
+                request_id: req_id,
+                cwd: "/repo".into(),
+            },
+            WireMessage::GitRebaseAbort {
+                request_id: req_id,
+                cwd: "/repo".into(),
+            },
+            WireMessage::GitRebaseSkip {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                expected_step: Some(2),
+            },
+            WireMessage::GitListConflicts {
+                request_id: req_id,
+                cwd: "/repo".into(),
+            },
+            WireMessage::GitResolveConflict {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                path: "src/lib.rs".into(),
+                block_index: Some(0),
+                resolution: GitConflictResolution::ManualContent {
+                    content: "let x = 3;".into(),
+                },
+                auto_stage: true,
+                expected_sha256: Some("a".repeat(64)),
+            },
+            WireMessage::GitPrStatus {
+                request_id: req_id,
+                cwd: "/repo".into(),
+            },
+            WireMessage::GitGenerateCommitMessage {
+                request_id: req_id,
+                cwd: "/repo".into(),
+            },
+            WireMessage::GitCollabResponse {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                payload: GitCollabQueryResult::StashList(stash_list),
+            },
+            WireMessage::GitCollabResponse {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                payload: GitCollabQueryResult::RebaseStatus(rebase_status.clone()),
+            },
+            WireMessage::GitCollabResponse {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                payload: GitCollabQueryResult::ConflictList(conflict_list),
+            },
+            WireMessage::GitCollabResponse {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                payload: GitCollabQueryResult::PrStatus(pr_status),
+            },
+            WireMessage::GitCollabResponse {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                payload: GitCollabQueryResult::CommitMessage(commit_msg),
+            },
+            WireMessage::GitMutationResult {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                result: GitMutationOutcome::StashMutated(GitStashMutationResult {
+                    action: "push".into(),
+                    stash_ref: Some("stash@{0}".into()),
+                    summary: "Saved working tree".into(),
+                    had_conflicts: false,
+                }),
+                status: None,
+            },
+            WireMessage::GitMutationResult {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                result: GitMutationOutcome::RebaseAction(GitRebaseActionResult {
+                    action: "start".into(),
+                    status: rebase_status,
+                    summary: "Paused on conflicts".into(),
+                }),
+                status: None,
+            },
+            WireMessage::GitMutationResult {
+                request_id: req_id,
+                cwd: "/repo".into(),
+                result: GitMutationOutcome::ConflictResolved(GitResolveConflictResult {
+                    path: "src/lib.rs".into(),
+                    remaining_blocks: 0,
+                    staged: true,
+                    summary: "Resolved and staged src/lib.rs".into(),
+                }),
+                status: None,
+            },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode git collab wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode git collab wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+
+        let res_json = serde_json::to_value(GitConflictResolution::ManualContent {
+            content: "merged".into(),
+        })
+        .expect("serialize resolution");
+        assert_eq!(res_json["strategy"], "manual_content");
+        assert_eq!(res_json["content"], "merged");
     }
 
     #[test]

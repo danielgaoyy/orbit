@@ -27,6 +27,93 @@ pub const CLOUD_VAULT_GIST_DESCRIPTION: &str =
     "Orbit Encrypted Cloud Sync Vault (E2EE — managed by Orbit, do not edit manually)";
 pub const CLOUD_VAULT_SCHEMA_VERSION: u32 = 1;
 
+pub const CLOUD_VAULT_KEY_GIST_FILENAME: &str = "orbit-cloud-vault-key.v1.json";
+pub const CLOUD_VAULT_KEY_GIST_DESCRIPTION: &str = "Orbit Zero-Friction Auto-Unlock Key (GitHub-account bound — delete this gist to revert to manual passphrase only)";
+pub const CLOUD_VAULT_KEY_FORMAT: &str = "orbit-auto-unlock-key-v1";
+pub const CLOUD_SYNC_DEVICE_LINK_PREFIX: &str = "orbit://sync-login";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AutoUnlockKeyEnvelope {
+    pub format: String,
+    pub version: u32,
+    pub key_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salt_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kdf_params: Option<orbit_crypto::VaultKdfParams>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteAutoUnlockKey {
+    pub gist_id: String,
+    pub envelope: AutoUnlockKeyEnvelope,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CloudSyncDeviceLinkPayload {
+    pub v: u32,
+    pub github_access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salt_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kdf_params: Option<orbit_crypto::VaultKdfParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gist_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_gist_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_login: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+}
+
+pub fn encode_device_link_uri(
+    payload: &CloudSyncDeviceLinkPayload,
+) -> Result<String, CloudSyncError> {
+    let json =
+        serde_json::to_vec(payload).map_err(|e| CloudSyncError::InvalidVault(e.to_string()))?;
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, json);
+    Ok(format!("{CLOUD_SYNC_DEVICE_LINK_PREFIX}?v=1&p={b64}"))
+}
+
+pub fn decode_device_link_uri(raw: &str) -> Result<CloudSyncDeviceLinkPayload, CloudSyncError> {
+    let trimmed = raw.trim();
+    let rest = trimmed
+        .strip_prefix(CLOUD_SYNC_DEVICE_LINK_PREFIX)
+        .ok_or_else(|| {
+            CloudSyncError::InvalidVault("Invalid Orbit device link URI prefix".into())
+        })?;
+    let query = rest.strip_prefix('?').ok_or_else(|| {
+        CloudSyncError::InvalidVault("Missing query in Orbit device link URI".into())
+    })?;
+    let mut payload_b64: Option<&str> = None;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=')
+            && k == "p"
+        {
+            payload_b64 = Some(v);
+            break;
+        }
+    }
+    let b64 = payload_b64.ok_or_else(|| {
+        CloudSyncError::InvalidVault("Missing p parameter in device link URI".into())
+    })?;
+    let decoded = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, b64)
+        .or_else(|_| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64))
+        .map_err(|e| CloudSyncError::InvalidVault(format!("invalid base64 in device link: {e}")))?;
+    let payload: CloudSyncDeviceLinkPayload = serde_json::from_slice(&decoded)
+        .map_err(|e| CloudSyncError::InvalidVault(format!("malformed device link payload: {e}")))?;
+    if payload.v != 1 || payload.github_access_token.trim().is_empty() {
+        return Err(CloudSyncError::InvalidVault(
+            "Unsupported or incomplete Orbit device link payload".into(),
+        ));
+    }
+    Ok(payload)
+}
+
 pub const DEFAULT_GITHUB_WEB_BASE: &str = "https://github.com";
 pub const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
 
@@ -145,6 +232,7 @@ pub struct CloudSyncStatusView {
     pub gist_html_url: Option<String>,
     pub remote_vault_exists: bool,
     pub auto_sync_enabled: bool,
+    pub instant_unlock_enabled: bool,
     pub last_synced_at_ms: Option<i64>,
     pub last_vault_revision: u64,
     pub synced_host_count: u32,
@@ -268,6 +356,10 @@ pub struct PersistedCloudSyncConfig {
     pub gist_id: Option<String>,
     #[serde(default)]
     pub gist_html_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_gist_id: Option<String>,
+    #[serde(default)]
+    pub require_manual_passphrase: bool,
     #[serde(default)]
     pub cached_key_b64: Option<String>,
     #[serde(default)]
@@ -307,6 +399,8 @@ impl Default for PersistedCloudSyncConfig {
             github_client_id: None,
             gist_id: None,
             gist_html_url: None,
+            key_gist_id: None,
+            require_manual_passphrase: false,
             cached_key_b64: None,
             cached_salt_b64: None,
             cached_kdf_params: None,
@@ -373,6 +467,7 @@ impl PersistedCloudSyncConfig {
             gist_html_url: self.gist_html_url.clone(),
             remote_vault_exists: self.remote_vault_exists,
             auto_sync_enabled: self.auto_sync_enabled,
+            instant_unlock_enabled: !self.require_manual_passphrase,
             last_synced_at_ms: self.last_synced_at_ms,
             last_vault_revision: self.last_vault_revision,
             synced_host_count: self.synced_host_count,
@@ -1604,19 +1699,34 @@ impl GitHubCloudClient {
         })
     }
 
-    /// Find and download the user's Orbit Encrypted Vault Secret Gist (checking cached `gist_id` first).
-    pub async fn fetch_vault_gist(
+    /// Fetch both encrypted Vault Gist and optional Zero-Friction Auto-Unlock Key Gist.
+    /// Uses cached IDs first and scans `/gists` at most once for any missing gist.
+    pub async fn fetch_vault_and_auto_key(
         &self,
         token: &str,
-        cached_gist_id: Option<&str>,
-    ) -> Result<Option<RemoteVaultGist>, CloudSyncError> {
-        if let Some(gid) = cached_gist_id.map(str::trim).filter(|s| !s.is_empty())
-            && let Some(found) = self.fetch_gist_by_id(token, gid).await?
+        cached_vault_gist_id: Option<&str>,
+        cached_key_gist_id: Option<&str>,
+    ) -> Result<(Option<RemoteVaultGist>, Option<RemoteAutoUnlockKey>), CloudSyncError> {
+        let mut vault = if let Some(gid) = cached_vault_gist_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
         {
-            return Ok(Some(found));
+            self.fetch_gist_by_id(token, gid).await?
+        } else {
+            None
+        };
+        let mut auto_key =
+            if let Some(kid) = cached_key_gist_id.map(str::trim).filter(|s| !s.is_empty()) {
+                self.fetch_auto_unlock_key_by_id(token, kid).await?
+            } else {
+                None
+            };
+
+        if vault.is_some() && auto_key.is_some() {
+            return Ok((vault, auto_key));
         }
 
-        // Scan up to 5 pages (500 gists) for `orbit-cloud-vault.v1.enc.json`
+        // Scan up to 5 pages (500 gists) once for whichever gist is still missing
         for page in 1..=5u32 {
             let url = format!("{}/gists?per_page=100&page={page}", self.api_base);
             let resp = self
@@ -1651,19 +1761,130 @@ impl GitHubCloudClient {
                 break;
             };
             for item in arr {
-                let has_file = item
-                    .get("files")
-                    .and_then(|f| f.as_object())
-                    .is_some_and(|map| map.contains_key(CLOUD_VAULT_GIST_FILENAME));
-                if has_file && let Some(gid) = item.get("id").and_then(|v| v.as_str()) {
-                    return self.fetch_gist_by_id(token, gid).await;
+                let Some(files) = item.get("files").and_then(|f| f.as_object()) else {
+                    continue;
+                };
+                let Some(gid) = item.get("id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if vault.is_none() && files.contains_key(CLOUD_VAULT_GIST_FILENAME) {
+                    vault = self.fetch_gist_by_id(token, gid).await?;
+                }
+                if auto_key.is_none() && files.contains_key(CLOUD_VAULT_KEY_GIST_FILENAME) {
+                    auto_key = self.fetch_auto_unlock_key_by_id(token, gid).await?;
+                }
+                if vault.is_some() && auto_key.is_some() {
+                    return Ok((vault, auto_key));
                 }
             }
             if arr.len() < 100 {
                 break;
             }
         }
-        Ok(None)
+        Ok((vault, auto_key))
+    }
+
+    async fn fetch_auto_unlock_key_by_id(
+        &self,
+        token: &str,
+        gist_id: &str,
+    ) -> Result<Option<RemoteAutoUnlockKey>, CloudSyncError> {
+        let url = format!("{}/gists/{}", self.api_base, gist_id.trim());
+        let resp = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token.trim()))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .map_err(|e| CloudSyncError::Http(e.to_string()))?;
+
+        let status = resp.status();
+        if status.as_u16() == 404 {
+            return Ok(None);
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| CloudSyncError::Http(format!("invalid key gist response: {e}")))?;
+
+        if !status.is_success() {
+            let msg = body
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("failed to fetch auto-unlock key gist")
+                .to_string();
+            return Err(CloudSyncError::GitHubApi {
+                status: status.as_u16(),
+                message: msg,
+            });
+        }
+
+        let Some(file_obj) = body
+            .get("files")
+            .and_then(|f| f.get(CLOUD_VAULT_KEY_GIST_FILENAME))
+        else {
+            return Ok(None);
+        };
+
+        let truncated = file_obj
+            .get("truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let raw_content = if truncated {
+            let raw_url = file_obj
+                .get("raw_url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    CloudSyncError::InvalidVault("truncated key gist missing raw_url".into())
+                })?;
+            let raw_resp = self
+                .http
+                .get(raw_url)
+                .header("Authorization", format!("Bearer {}", token.trim()))
+                .send()
+                .await
+                .map_err(|e| CloudSyncError::Http(e.to_string()))?;
+            raw_resp
+                .text()
+                .await
+                .map_err(|e| CloudSyncError::Http(e.to_string()))?
+        } else {
+            file_obj
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    CloudSyncError::InvalidVault("key gist file missing content".into())
+                })?
+                .to_string()
+        };
+
+        let envelope: AutoUnlockKeyEnvelope = serde_json::from_str(&raw_content)
+            .map_err(|e| CloudSyncError::InvalidVault(format!("malformed auto-unlock key: {e}")))?;
+        if envelope.format != CLOUD_VAULT_KEY_FORMAT || envelope.version != 1 {
+            return Err(CloudSyncError::InvalidVault(format!(
+                "unsupported auto-unlock key format {} v{}",
+                envelope.format, envelope.version
+            )));
+        }
+
+        Ok(Some(RemoteAutoUnlockKey {
+            gist_id: gist_id.trim().to_string(),
+            envelope,
+        }))
+    }
+
+    /// Find and download the user's Orbit Encrypted Vault Secret Gist (checking cached `gist_id` first).
+    pub async fn fetch_vault_gist(
+        &self,
+        token: &str,
+        cached_gist_id: Option<&str>,
+    ) -> Result<Option<RemoteVaultGist>, CloudSyncError> {
+        let (vault, _) = self
+            .fetch_vault_and_auto_key(token, cached_gist_id, None)
+            .await?;
+        Ok(vault)
     }
 
     async fn fetch_gist_by_id(
@@ -1890,6 +2111,158 @@ impl GitHubCloudClient {
             .to_string();
         Ok((id, html_url))
     }
+
+    /// Create or update the companion private Secret Gist holding the Zero-Friction Auto-Unlock Key.
+    pub async fn save_auto_unlock_key_gist(
+        &self,
+        token: &str,
+        existing_key_gist_id: Option<&str>,
+        key: &DerivedVaultKey,
+    ) -> Result<String, CloudSyncError> {
+        let envelope = AutoUnlockKeyEnvelope {
+            format: CLOUD_VAULT_KEY_FORMAT.to_string(),
+            version: 1,
+            key_b64: key.key_b64().to_string(),
+            salt_b64: Some(key.salt_b64.clone()),
+            kdf_params: Some(key.kdf_params),
+            updated_at_ms: now_unix_ms(),
+        };
+        let content = serde_json::to_string_pretty(&envelope)
+            .map_err(|e| CloudSyncError::InvalidVault(e.to_string()))?;
+
+        let (resp, creating) = if let Some(gid) = existing_key_gist_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let url = format!("{}/gists/{gid}", self.api_base);
+            let payload = serde_json::json!({
+                "description": CLOUD_VAULT_KEY_GIST_DESCRIPTION,
+                "files": {
+                    CLOUD_VAULT_KEY_GIST_FILENAME: {
+                        "content": content,
+                    }
+                }
+            });
+            let r = self
+                .http
+                .patch(&url)
+                .header("Authorization", format!("Bearer {}", token.trim()))
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| CloudSyncError::Http(e.to_string()))?;
+            (r, false)
+        } else {
+            let url = format!("{}/gists", self.api_base);
+            let payload = serde_json::json!({
+                "description": CLOUD_VAULT_KEY_GIST_DESCRIPTION,
+                "public": false,
+                "files": {
+                    CLOUD_VAULT_KEY_GIST_FILENAME: {
+                        "content": content,
+                    }
+                }
+            });
+            let r = self
+                .http
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", token.trim()))
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| CloudSyncError::Http(e.to_string()))?;
+            (r, true)
+        };
+
+        let status = resp.status();
+        if !creating && status.as_u16() == 404 {
+            return Box::pin(self.save_auto_unlock_key_gist(token, None, key)).await;
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| CloudSyncError::Http(format!("invalid key gist save response: {e}")))?;
+
+        if !status.is_success() {
+            let msg = body
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("failed to save auto-unlock key gist")
+                .to_string();
+            return Err(CloudSyncError::GitHubApi {
+                status: status.as_u16(),
+                message: msg,
+            });
+        }
+
+        body.get("id")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| CloudSyncError::InvalidVault("key gist save missing id".into()))
+    }
+
+    /// Delete a GitHub Gist by ID (ignores 404 Already Deleted).
+    pub async fn delete_gist(&self, token: &str, gist_id: &str) -> Result<(), CloudSyncError> {
+        let gid = gist_id.trim();
+        if gid.is_empty() {
+            return Ok(());
+        }
+        let url = format!("{}/gists/{gid}", self.api_base);
+        let resp = self
+            .http
+            .delete(&url)
+            .header("Authorization", format!("Bearer {}", token.trim()))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .map_err(|e| CloudSyncError::Http(e.to_string()))?;
+        let status = resp.status();
+        if status.is_success() || status.as_u16() == 404 {
+            return Ok(());
+        }
+        let msg = resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| {
+                v.get("message")
+                    .and_then(|m| m.as_str())
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| "failed to delete gist".to_string());
+        Err(CloudSyncError::GitHubApi {
+            status: status.as_u16(),
+            message: msg,
+        })
+    }
+}
+
+/// Reconstruct a [`DerivedVaultKey`] from the Dual-Gist Auto-Unlock Key envelope, binding the salt
+/// and KDF parameters from the encrypted Vault Gist when available.
+pub fn derived_key_from_auto_unlock(
+    remote_key: &RemoteAutoUnlockKey,
+    remote_vault: Option<&RemoteVaultGist>,
+) -> Result<DerivedVaultKey, CloudSyncError> {
+    let (salt_b64, kdf_params) = if let Some(vault) = remote_vault {
+        (vault.envelope.salt_b64.clone(), vault.envelope.kdf_params)
+    } else {
+        (
+            remote_key
+                .envelope
+                .salt_b64
+                .clone()
+                .unwrap_or_else(orbit_crypto::generate_vault_salt_b64),
+            remote_key.envelope.kdf_params.unwrap_or_default(),
+        )
+    };
+    DerivedVaultKey::from_b64(&remote_key.envelope.key_b64, salt_b64, kdf_params)
+        .map_err(|e| CloudSyncError::InvalidVault(e.to_string()))
 }
 
 /// High-level helper used by both `OrbitAppCore` and `orbit` CLI to decrypt or initialize the remote vault
@@ -2458,5 +2831,81 @@ mod tests {
             Some("wss://relay.example.com?ft=tok_abc")
         );
         assert!(outcome.fleet_network_changed.is_some());
+    }
+
+    #[test]
+    fn device_link_uri_roundtrip_and_validation() {
+        let payload = CloudSyncDeviceLinkPayload {
+            v: 1,
+            github_access_token: "gho_test_token_12345".into(),
+            key_b64: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()),
+            salt_b64: Some(orbit_crypto::generate_vault_salt_b64()),
+            kdf_params: Some(orbit_crypto::VaultKdfParams::default()),
+            gist_id: Some("gist_vault_1".into()),
+            key_gist_id: Some("gist_key_1".into()),
+            github_login: Some("octocat".into()),
+            relay_url: Some("wss://tunnel.trycloudflare.com?ft=tok_xyz".into()),
+        };
+        let uri = encode_device_link_uri(&payload).expect("encode uri");
+        assert!(uri.starts_with(CLOUD_SYNC_DEVICE_LINK_PREFIX));
+        let decoded = decode_device_link_uri(&uri).expect("decode uri");
+        assert_eq!(decoded.github_access_token, "gho_test_token_12345");
+        assert_eq!(decoded.gist_id.as_deref(), Some("gist_vault_1"));
+        assert_eq!(decoded.key_gist_id.as_deref(), Some("gist_key_1"));
+        assert_eq!(
+            decoded.relay_url.as_deref(),
+            Some("wss://tunnel.trycloudflare.com?ft=tok_xyz")
+        );
+
+        assert!(decode_device_link_uri("orbit://pair/abc").is_err());
+
+        let bad_ver = CloudSyncDeviceLinkPayload {
+            v: 99,
+            ..payload.clone()
+        };
+        let bad_ver_uri = encode_device_link_uri(&bad_ver).expect("encode bad ver");
+        assert!(decode_device_link_uri(&bad_ver_uri).is_err());
+
+        let empty_tok = CloudSyncDeviceLinkPayload {
+            github_access_token: "   ".into(),
+            ..payload
+        };
+        let empty_tok_uri = encode_device_link_uri(&empty_tok).expect("encode empty tok");
+        assert!(decode_device_link_uri(&empty_tok_uri).is_err());
+    }
+
+    #[test]
+    fn derived_key_from_auto_unlock_prefers_vault_kdf_metadata() {
+        let key = orbit_crypto::generate_random_vault_key();
+        let vault_salt = orbit_crypto::generate_vault_salt_b64();
+        let remote_key = RemoteAutoUnlockKey {
+            gist_id: "kid_1".into(),
+            envelope: AutoUnlockKeyEnvelope {
+                format: CLOUD_VAULT_KEY_FORMAT.into(),
+                version: 1,
+                key_b64: key.key_b64().to_string(),
+                salt_b64: Some(key.salt_b64.clone()),
+                kdf_params: Some(key.kdf_params),
+                updated_at_ms: 1000,
+            },
+        };
+        let dummy_vault = RemoteVaultGist {
+            gist_id: "vid_1".into(),
+            html_url: String::new(),
+            envelope: EncryptedVaultEnvelope {
+                format: orbit_crypto::CLOUD_VAULT_ENVELOPE_FORMAT.into(),
+                kdf: orbit_crypto::CLOUD_VAULT_KDF.into(),
+                kdf_params: orbit_crypto::VaultKdfParams::default(),
+                salt_b64: vault_salt.clone(),
+                nonce_b64: "AAAAAAAAAAAAAAAA".into(),
+                cipher: orbit_crypto::CLOUD_VAULT_CIPHER.into(),
+                ciphertext_b64: "AAAA".into(),
+                updated_at_ms: 1000,
+            },
+        };
+        let recovered =
+            derived_key_from_auto_unlock(&remote_key, Some(&dummy_vault)).expect("recover key");
+        assert_eq!(recovered.salt_b64, vault_salt);
+        assert_eq!(&*recovered.key_b64(), &*key.key_b64());
     }
 }

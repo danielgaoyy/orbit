@@ -1093,6 +1093,261 @@ pub fn provision_relay_over_ssh(
     )
 }
 
+/// Extract the provisioned Cloudflare Tunnel `wss://...?ft=...` URL from remote setup stdout.
+pub fn parse_cloudflare_tunnel_stdout(stdout: &str, fleet_token: &str) -> Result<String, String> {
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(raw_url) = trimmed.strip_prefix("ORBIT_CF_URL=") {
+            let clean = raw_url.trim().trim_end_matches('/');
+            if clean.is_empty() {
+                continue;
+            }
+            let base = if let Some(host) = clean.strip_prefix("https://") {
+                format!("wss://{host}")
+            } else if let Some(host) = clean.strip_prefix("http://") {
+                format!("wss://{host}")
+            } else if clean.starts_with("wss://") || clean.starts_with("ws://") {
+                clean.to_string()
+            } else {
+                format!("wss://{clean}")
+            };
+            let clean_tok = fleet_token.trim();
+            if clean_tok.is_empty() {
+                return Ok(base);
+            }
+            let sep = if base.contains('?') { '&' } else { '?' };
+            return Ok(format!("{base}{sep}ft={clean_tok}"));
+        }
+    }
+    Err("Cloudflare Tunnel provisioning did not emit a public URL (ORBIT_CF_URL)".to_string())
+}
+
+/// Deploy/update Orbit Relay bound strictly to `127.0.0.1:<relay_port>` on an intranet /
+/// firewall-restricted SSH host and expose it with ZERO inbound open ports via Cloudflare Tunnel.
+/// Secrets (`fleet_token` and optional Named Tunnel `tunnel_token`) are delivered strictly over SSH stdin / `0600` files, never process `argv`.
+#[allow(clippy::too_many_arguments)]
+pub fn provision_cloudflare_tunnel_relay_with_home(
+    home_dir: &Path,
+    alias: &str,
+    relay_port: u16,
+    allowed_pubkeys: &[String],
+    public_hostname: Option<&str>,
+    tunnel_token: Option<&str>,
+) -> Result<String, String> {
+    use std::io::Write as _;
+
+    let fleet_token = load_or_create_fleet_relay_token(home_dir)?;
+
+    let mut unique_keys: Vec<String> = allowed_pubkeys
+        .iter()
+        .map(|k| k.replace('\'', "").trim().to_string())
+        .filter(|k| !k.is_empty())
+        .collect();
+    unique_keys.sort();
+    unique_keys.dedup();
+
+    let pubkey_flags = unique_keys
+        .iter()
+        .map(|k| format!("--allow-pubkey '{k}'"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let clean_hostname = public_hostname
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .trim_start_matches("wss://")
+                .trim_start_matches("ws://")
+                .trim_end_matches('/')
+                .replace('\'', "")
+        });
+    let clean_tunnel_token = tunnel_token
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.replace(['\r', '\n', '\''], ""));
+
+    if clean_hostname.is_some() ^ clean_tunnel_token.is_some() {
+        return Err(
+            "Named Cloudflare Tunnel requires both Public Hostname and Cloudflare Tunnel Token (or leave both blank for an instant Quick Tunnel)."
+                .to_string(),
+        );
+    }
+
+    let tunnel_env_setup = if let (Some(host), Some(tok)) = (&clean_hostname, &clean_tunnel_token) {
+        format!(
+            "mkdir -p \"$HOME/.orbit\" && chmod 700 \"$HOME/.orbit\"\n\
+             umask 077\n\
+             cat > \"$HOME/.orbit/cloudflared-tunnel.env\" <<'ORBIT_CF_TOK_EOF'\n\
+             TUNNEL_TOKEN={tok}\n\
+             ORBIT_CF_TOK_EOF\n\
+             chmod 600 \"$HOME/.orbit/cloudflared-tunnel.env\"\n\
+             ORBIT_TUNNEL_EXEC=\"$CF_BIN tunnel --no-autoupdate --logfile $HOME/.orbit/cloudflared-tunnel.log run\"\n\
+             ORBIT_ENV_LINE=\"EnvironmentFile=$HOME/.orbit/cloudflared-tunnel.env\"\n\
+             ORBIT_NAMED_HOST='{host}'\n"
+        )
+    } else {
+        format!(
+            "mkdir -p \"$HOME/.orbit\" && chmod 700 \"$HOME/.orbit\"\n\
+             rm -f \"$HOME/.orbit/cloudflared-tunnel.env\"\n\
+             ORBIT_TUNNEL_EXEC=\"$CF_BIN tunnel --no-autoupdate --url http://127.0.0.1:{relay_port} --logfile $HOME/.orbit/cloudflared-tunnel.log\"\n\
+             ORBIT_ENV_LINE=\"\"\n\
+             ORBIT_NAMED_HOST=\"\"\n"
+        )
+    };
+
+    let repo = orbit_protocol::configured_github_repo();
+    let remote_script = format!(
+        "set -eu\n\
+         export PATH=\"$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"\n\
+         if ! command -v orbit >/dev/null 2>&1 || orbit --version 2>&1 | grep -q 'GLIBC_' || ! orbit relay up --help 2>&1 | grep -q 'fleet-token-stdin'; then\n\
+           curl -fsSL https://raw.githubusercontent.com/{repo}/main/deploy/install.sh | ORBIT_GITHUB_REPO='{repo}' sh\n\
+         fi\n\
+         orbit relay up --listen 127.0.0.1:{relay_port} {pubkey_flags} --fleet-token-stdin <<'ORBIT_FT_EOF'\n\
+{fleet_token}\n\
+ORBIT_FT_EOF\n\
+         mkdir -p \"$HOME/.local/bin\"\n\
+         CF_BIN=\"$(command -v cloudflared || true)\"\n\
+         if [ -z \"$CF_BIN\" ]; then\n\
+           OS=\"$(uname -s | tr '[:upper:]' '[:lower:]')\"\n\
+           ARCH=\"$(uname -m)\"\n\
+           case \"$ARCH\" in\n\
+             x86_64|amd64) CF_ARCH=amd64 ;;\n\
+             aarch64|arm64) CF_ARCH=arm64 ;;\n\
+             *) echo \"Unsupported CPU arch for cloudflared: $ARCH\" >&2; exit 1 ;;\n\
+           esac\n\
+           if [ \"$OS\" = \"linux\" ]; then\n\
+             curl -fsSL \"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$CF_ARCH\" -o \"$HOME/.local/bin/cloudflared\"\n\
+             chmod 755 \"$HOME/.local/bin/cloudflared\"\n\
+           elif [ \"$OS\" = \"darwin\" ]; then\n\
+             curl -fsSL \"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-$CF_ARCH.tgz\" -o \"/tmp/cloudflared.$$.tgz\"\n\
+             tar -xzf \"/tmp/cloudflared.$$.tgz\" -C \"$HOME/.local/bin\"\n\
+             rm -f \"/tmp/cloudflared.$$.tgz\"\n\
+             chmod 755 \"$HOME/.local/bin/cloudflared\"\n\
+           else\n\
+             echo \"Unsupported OS for auto-installing cloudflared: $OS\" >&2; exit 1\n\
+           fi\n\
+           CF_BIN=\"$HOME/.local/bin/cloudflared\"\n\
+         fi\n\
+         : > \"$HOME/.orbit/cloudflared-tunnel.log\"\n\
+         {tunnel_env_setup}\n\
+         STARTED_SYSTEMD=0\n\
+         if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then\n\
+           mkdir -p \"$HOME/.config/systemd/user\"\n\
+           cat > \"$HOME/.config/systemd/user/orbit-relay-tunnel.service\" <<ORBIT_SVC_EOF\n\
+[Unit]\n\
+Description=Orbit Zero-Port Cloudflare Tunnel Relay\n\
+After=network-online.target\n\
+\n\
+[Service]\n\
+Type=simple\n\
+$ORBIT_ENV_LINE\n\
+ExecStart=$ORBIT_TUNNEL_EXEC\n\
+Restart=always\n\
+RestartSec=3\n\
+StandardOutput=append:$HOME/.orbit/cloudflared-tunnel.log\n\
+StandardError=append:$HOME/.orbit/cloudflared-tunnel.log\n\
+\n\
+[Install]\n\
+WantedBy=default.target\n\
+ORBIT_SVC_EOF\n\
+           systemctl --user daemon-reload\n\
+           systemctl --user enable --now orbit-relay-tunnel.service >/dev/null 2>&1 || true\n\
+           systemctl --user restart orbit-relay-tunnel.service\n\
+           STARTED_SYSTEMD=1\n\
+         fi\n\
+         if [ \"$STARTED_SYSTEMD\" -eq 0 ]; then\n\
+           if [ -f \"$HOME/.orbit/cloudflared-tunnel.pid\" ]; then\n\
+             OLD_PID=\"$(cat \"$HOME/.orbit/cloudflared-tunnel.pid\" 2>/dev/null || true)\"\n\
+             if [ -n \"$OLD_PID\" ]; then kill \"$OLD_PID\" 2>/dev/null || true; fi\n\
+           fi\n\
+           if [ -f \"$HOME/.orbit/cloudflared-tunnel.env\" ]; then\n\
+             set -a; . \"$HOME/.orbit/cloudflared-tunnel.env\"; set +a\n\
+           fi\n\
+           nohup $ORBIT_TUNNEL_EXEC >> \"$HOME/.orbit/cloudflared-tunnel.log\" 2>&1 </dev/null &\n\
+           echo $! > \"$HOME/.orbit/cloudflared-tunnel.pid\"\n\
+         fi\n\
+         if [ -n \"$ORBIT_NAMED_HOST\" ]; then\n\
+           printf 'ORBIT_CF_URL=https://%s\\n' \"$ORBIT_NAMED_HOST\"\n\
+           exit 0\n\
+         fi\n\
+         I=0\n\
+         CF_URL=\"\"\n\
+         while [ \"$I\" -lt 50 ]; do\n\
+           CF_URL=\"$(grep -oE 'https://[a-zA-Z0-9-]+\\.trycloudflare\\.com' \"$HOME/.orbit/cloudflared-tunnel.log\" | tail -n 1 || true)\"\n\
+           if [ -n \"$CF_URL\" ]; then break; fi\n\
+           I=$((I + 1))\n\
+           sleep 0.5\n\
+         done\n\
+         if [ -z \"$CF_URL\" ]; then\n\
+           echo \"Timed out waiting for trycloudflare.com URL in cloudflared-tunnel.log\" >&2\n\
+           tail -n 20 \"$HOME/.orbit/cloudflared-tunnel.log\" >&2 || true\n\
+           exit 1\n\
+         fi\n\
+         printf 'ORBIT_CF_URL=%s\\n' \"$CF_URL\"\n"
+    );
+
+    let mut child = build_ssh_command()
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=15",
+            "--",
+            alias,
+            "sh -s",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to launch ssh: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(remote_script.as_bytes());
+        let _ = stdin.flush();
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("failed waiting for ssh: {e}"))?;
+
+    if !out.status.success() {
+        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("SSH exited with status {}", out.status)
+        } else {
+            detail
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    parse_cloudflare_tunnel_stdout(&stdout, &fleet_token)
+}
+
+/// Deploy/update Orbit on a remote SSH host and expose its Relay via Zero-Port Cloudflare Tunnel.
+pub fn provision_cloudflare_tunnel_relay_over_ssh(
+    alias: &str,
+    relay_port: u16,
+    allowed_pubkeys: &[String],
+    public_hostname: Option<&str>,
+    tunnel_token: Option<&str>,
+) -> Result<String, String> {
+    let home_dir = resolve_user_home()
+        .ok_or_else(|| "cannot resolve user home directory for fleet token storage".to_string())?
+        .join(".orbit");
+    provision_cloudflare_tunnel_relay_with_home(
+        &home_dir,
+        alias,
+        relay_port,
+        allowed_pubkeys,
+        public_hostname,
+        tunnel_token,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalEditorKind {
@@ -3274,5 +3529,32 @@ mod tests {
             "devbox did not reach OnlineDirect with workspaces: {:?}",
             core.host_detail(&card.host_id)
         );
+    }
+
+    #[test]
+    fn parse_cloudflare_tunnel_stdout_normalizes_url_and_appends_fleet_token() {
+        let out = "some log line\nORBIT_CF_URL=https://orbit-mesh-test.trycloudflare.com/\n";
+        let url = parse_cloudflare_tunnel_stdout(out, "ft_secret_123").expect("parse cf url");
+        assert_eq!(
+            url,
+            "wss://orbit-mesh-test.trycloudflare.com?ft=ft_secret_123"
+        );
+
+        let plain = parse_cloudflare_tunnel_stdout("ORBIT_CF_URL=https://relay.my.org", "")
+            .expect("empty token ok");
+        assert_eq!(plain, "wss://relay.my.org");
+
+        assert!(parse_cloudflare_tunnel_stdout("no url emitted", "ft").is_err());
+
+        let err = provision_cloudflare_tunnel_relay_with_home(
+            std::path::Path::new("/tmp"),
+            "devbox",
+            7878,
+            &[],
+            Some("relay.example.com"),
+            None,
+        )
+        .expect_err("half-specified named tunnel must be rejected");
+        assert!(err.contains("Named Cloudflare Tunnel requires both"));
     }
 }

@@ -85,10 +85,10 @@ struct QrPairSheet: View {
                     .foregroundStyle(palette.accentSky)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Sync Existing Hosts via GitHub")
+                    Text("1-Scan Device Link / GitHub Sync")
                         .font(OrbitTypography.body(.semibold))
                         .foregroundStyle(palette.fgPrimary)
-                    Text("Zero-server E2EE sync — import all paired machines without scanning QR codes.")
+                    Text("Scan a Device Link QR from Orbit Desktop — logs in, unlocks, and imports all machines + relays in 1 step.")
                         .font(OrbitTypography.meta(.regular))
                         .foregroundStyle(palette.fgSecondary)
                 }
@@ -139,7 +139,7 @@ struct QrPairSheet: View {
             }
 
             Button {
-                if store.pairHost(uri: uri) {
+                if store.handleScannedOrPastedUri(uri) {
                     detectedClipboardPairUri = nil
                     dismiss()
                 }
@@ -147,7 +147,7 @@ struct QrPairSheet: View {
                 HStack(spacing: OrbitSpacing.xs) {
                     Image(systemName: "link.badge.plus")
                         .font(OrbitTypography.iconSmall)
-                    Text("Pair from Clipboard")
+                    Text("Pair / Link from Clipboard")
                         .font(OrbitTypography.subhead(.semibold))
                 }
                 .foregroundStyle(palette.onPrimary)
@@ -157,7 +157,7 @@ struct QrPairSheet: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Pair from Clipboard")
+            .accessibilityLabel("Pair or Link from Clipboard")
         }
         .padding(OrbitSpacing.md)
         .background(palette.elevated)
@@ -235,7 +235,7 @@ struct QrPairSheet: View {
                 case .ready:
                     ZStack {
                         QrScannerRepresentable(scanGeneration: scanGeneration) { scannedCode in
-                            if store.pairHost(uri: scannedCode) {
+                            if store.handleScannedOrPastedUri(scannedCode) {
                                 dismiss()
                             } else {
                                 scanGeneration &+= 1
@@ -264,7 +264,7 @@ struct QrPairSheet: View {
                             .multilineTextAlignment(.center)
                             .padding(.horizontal, OrbitSpacing.lg)
 
-                        Text("Run `orbit pair` on your machine and paste the `orbit://pair/…` URI below.")
+                        Text("Run `orbit pair` or `orbit sync --export-device-link` on your machine and paste the URI below.")
                             .font(OrbitTypography.meta(.regular))
                             .foregroundStyle(palette.fgMuted)
                             .multilineTextAlignment(.center)
@@ -288,7 +288,7 @@ struct QrPairSheet: View {
     private var manualUriSection: some View {
         VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
             HStack {
-                Text("PAIRING URI")
+                Text("PAIRING OR DEVICE LINK URI")
                     .font(OrbitTypography.meta(.semibold))
                     .foregroundStyle(palette.fgMuted)
 
@@ -300,13 +300,13 @@ struct QrPairSheet: View {
                         detectedClipboardPairUri = clip
                         store.hapticLight()
                     } else {
-                        store.showToast("No orbit://pair URI found in clipboard")
+                        store.showToast("No orbit://pair or orbit://sync-login URI found in clipboard")
                     }
                 } label: {
                     HStack(spacing: OrbitSpacing.xs) {
                         Image(systemName: "doc.on.clipboard")
                             .font(OrbitTypography.iconMicro)
-                        Text("Paste Pairing Code")
+                        Text("Paste URI")
                             .font(OrbitTypography.meta(.semibold))
                     }
                     .foregroundStyle(palette.primary)
@@ -314,10 +314,10 @@ struct QrPairSheet: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Paste Pairing URI from Clipboard")
+                .accessibilityLabel("Paste Pairing or Link URI from Clipboard")
             }
 
-            TextField("orbit://pair/…", text: $manualUri)
+            TextField("orbit://pair/… or orbit://sync-login?…", text: $manualUri)
                 .font(OrbitTypography.code(.regular))
                 .foregroundStyle(palette.fgPrimary)
                 .textInputAutocapitalization(.never)
@@ -332,7 +332,7 @@ struct QrPairSheet: View {
                 )
 
             Button {
-                if store.pairHost(uri: manualUri) {
+                if store.handleScannedOrPastedUri(manualUri) {
                     manualUri = ""
                     dismiss()
                 }

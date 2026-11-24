@@ -3704,7 +3704,7 @@ pub fn derive_session_insights(
                 continue;
             }
             if ag.parent_agent_id.as_deref() == Some(cur.agent_id.as_str()) {
-                let status = if ag.is_running || ag.has_background_tasks {
+                let status = if ag.is_running {
                     ToolCallStatus::Running
                 } else if contains_ascii_case_insensitive(&ag.status_label, "error") {
                     ToolCallStatus::Failed
@@ -4578,6 +4578,7 @@ mod tests {
             status_label: "Waking (cron)".into(),
             is_running: true,
             has_background_tasks: false,
+            has_armed_timers: false,
             has_running_subagents: false,
             is_awaiting_permission: false,
             parent_agent_id: None,
@@ -4752,6 +4753,7 @@ Log: file:///tmp/spoofed.log\n";
             status_label: status_label.into(),
             is_running: running,
             has_background_tasks: false,
+            has_armed_timers: false,
             has_running_subagents: false,
             is_awaiting_permission: false,
             parent_agent_id: parent.map(ToOwned::to_owned),
@@ -4998,6 +5000,7 @@ Log: file:///tmp/spoofed.log\n";
             status_label: status_label.into(),
             is_running: running,
             has_background_tasks: false,
+            has_armed_timers: false,
             has_running_subagents: false,
             is_awaiting_permission: false,
             parent_agent_id: None,
@@ -5205,6 +5208,7 @@ Log: file:///tmp/spoofed.log\n";
             status_label: "1 background task".into(),
             is_running: false,
             has_background_tasks: true,
+            has_armed_timers: true,
             has_running_subagents: false,
             is_awaiting_permission: false,
             parent_agent_id: None,

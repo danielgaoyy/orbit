@@ -70,17 +70,13 @@ function projectScopeKey(hostId: string, cwd: string): string {
   return `${hostId}::${normalizePath(cwd)}`;
 }
 
-function isForegroundRunning(agent: Pick<AgentCardView, "is_running" | "status_label">): boolean {
-  if (!agent.is_running) return false;
+function isForegroundRunning(
+  agent: Pick<AgentCardView, "is_running" | "has_background_tasks" | "status_label">,
+): boolean {
+  if (!agent.is_running || agent.has_background_tasks) return false;
   const label = (agent.status_label || "").trim().toLowerCase();
   if (!label) return true;
   return !label.startsWith("waiting") && !label.startsWith("background");
-}
-
-function isBackgroundWaiting(agent: Pick<AgentCardView, "is_running" | "status_label">): boolean {
-  if (!agent.is_running) return false;
-  const label = (agent.status_label || "").trim().toLowerCase();
-  return label.startsWith("waiting") || label.startsWith("background");
 }
 
 export function isSidebarAgentArchived(
@@ -132,7 +128,7 @@ export function buildRunningParentThreadKeys(
     for (const ag of detail.agents) {
       managedAgentsById.set(ag.agent_id, ag);
       if (!ag.parent_agent_id || isSidebarAgentArchived(hid, ag, archivedThreads)) continue;
-      if (ag.is_running || isBackgroundWaiting(ag) || ag.is_awaiting_permission) {
+      if (isForegroundRunning(ag) || ag.is_awaiting_permission) {
         const parentHostId = ag.parent_host_id || hid;
         keys.add(threadKey(parentHostId, ag.parent_agent_id));
       }
@@ -162,9 +158,7 @@ export function buildRunningParentThreadKeys(
         if (managedChild) {
           if (
             !managedChild.archived_at_rfc3339 &&
-            (managedChild.is_running ||
-              isBackgroundWaiting(managedChild) ||
-              managedChild.is_awaiting_permission)
+            (isForegroundRunning(managedChild) || managedChild.is_awaiting_permission)
           ) {
             keys.add(tlKey);
             break;

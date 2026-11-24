@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useState } from "react";
 import {
+  AlarmClock,
   AlertTriangle,
   ArrowUpRight,
   Check,
@@ -27,6 +28,8 @@ import { useImeCompositionGuard } from "@/lib/ime";
 import {
   type RichBlockView,
   type WorkspaceEventRecord,
+  isAgentForegroundRunning,
+  isAgentTimerWaiting,
   orbitIpc,
   semanticAgentTabLabel,
 } from "@/lib/orbit-ipc";
@@ -452,7 +455,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
     setEditingGoal(false);
   };
 
-  const runningPeersCount = peers.filter((p) => p.is_running).length;
+  const runningPeersCount = peers.filter((p) => isAgentForegroundRunning(p)).length;
   const effectiveGoal = workspace?.mission_goal?.trim() || parsedDoc.extractedGoal || "";
 
   return (
@@ -630,7 +633,9 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
               {peers.map((peer) => {
                 const isFocused = peer.agent_id === selectedAgentId;
                 const handle = semanticAgentTabLabel(peer);
-                const statusText = peer.is_running
+                const peerForegroundRunning = isAgentForegroundRunning(peer);
+                const peerTimerArmed = !peerForegroundRunning && isAgentTimerWaiting(peer);
+                const statusText = peerForegroundRunning
                   ? "Running"
                   : peer.is_awaiting_permission
                     ? "Approval"
@@ -650,8 +655,10 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                       onClick={() => orbitActions.selectAgent(hostId, peer.agent_id)}
                       className="flex min-w-0 flex-1 cursor-pointer items-start gap-2.5 text-left"
                     >
-                      {peer.is_running ? (
+                      {peerForegroundRunning ? (
                         <Loader2 className="text-foreground/70 mt-0.5 h-[13px] w-[13px] shrink-0 animate-spin" />
+                      ) : peerTimerArmed ? (
+                        <AlarmClock className="text-ink-faint mt-0.5 h-[12.5px] w-[12.5px] shrink-0 stroke-[1.7]" />
                       ) : (
                         <ProviderIcon
                           provider={peer.provider}
@@ -664,7 +671,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                           <span
                             className={cn(
                               "rounded-full px-1.5 py-[1px] text-[10px] font-medium",
-                              peer.is_running
+                              peerForegroundRunning
                                 ? "bg-foreground/[0.07] text-foreground/80"
                                 : peer.is_awaiting_permission
                                   ? "bg-amber-500/15 text-amber-700 dark:text-amber-300"

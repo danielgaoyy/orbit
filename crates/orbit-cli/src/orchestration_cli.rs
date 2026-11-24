@@ -1864,6 +1864,8 @@ pub async fn cmd_host(
                     request_id: req_id,
                     label,
                     pairing_uri,
+                    ssh_alias: None,
+                    remote_daemon_port: None,
                 },
                 15,
             )

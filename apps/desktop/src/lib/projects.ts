@@ -213,6 +213,9 @@ export function matchesProjectDirectory(directories: string[], cwd: string): boo
  * where native OS folder pickers (`NSOpenPanel` / `zenity` / `FolderBrowserDialog`) apply directly.
  */
 export function isLocalHostCard(host: HostCardView): boolean {
+  if (typeof host.is_local === "boolean") {
+    return host.is_local;
+  }
   if (
     host.via_ssh_tunnel ||
     Boolean(host.ssh_alias) ||

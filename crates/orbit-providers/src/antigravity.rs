@@ -3951,6 +3951,7 @@ enum WakeupStep {
 const WAKEUP_ERROR_STALL_TIMEOUT: Duration = Duration::from_secs(90);
 const WAKEUP_ERROR_EXHAUSTED_TIMEOUT: Duration = Duration::from_secs(15);
 const WAKEUP_ERROR_EXHAUSTED_COUNT: u32 = 8;
+const WAKEUP_IDLE_SETTLE_GRACE: Duration = Duration::from_secs(3);
 const SELF_HEAL_GRACE_PERIOD: Duration = Duration::from_secs(4);
 const MAX_CONSECUTIVE_SELF_HEALS: u32 = 3;
 const IN_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -3961,6 +3962,18 @@ fn is_one_shot_timer_expired(expires_at: Option<DateTime<Utc>>, now: DateTime<Ut
         .is_some_and(|exp| now > exp + chrono::Duration::seconds(ONE_SHOT_TIMER_EXPIRY_GRACE_SECS))
 }
 
+fn is_timer_bg_description(desc: Option<&str>) -> bool {
+    let Some(raw) = desc else {
+        return false;
+    };
+    let lower = raw.to_ascii_lowercase();
+    lower.contains("timer")
+        || lower.contains("schedule")
+        || lower.contains("cron")
+        || lower.contains("alarm")
+        || lower.contains("wakeup")
+}
+
 #[derive(Debug, Clone)]
 struct BgTaskInfo {
     task_id: String,
@@ -3968,6 +3981,7 @@ struct BgTaskInfo {
     log_path: Option<String>,
     meta: Option<BackgroundTaskInfo>,
     expires_at: Option<DateTime<Utc>>,
+    is_timer: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -4025,6 +4039,11 @@ impl BackgroundTaskTracker {
         if self.finished_tasks.contains(&task_id) {
             return;
         }
+        let meta_is_timer = expires_at.is_some()
+            || meta
+                .as_ref()
+                .and_then(|m| m.label.as_deref())
+                .is_some_and(|l| is_timer_bg_description(Some(l)));
         let entry = self
             .tasks
             .entry(task_id.clone())
@@ -4034,7 +4053,11 @@ impl BackgroundTaskTracker {
                 log_path: None,
                 meta: None,
                 expires_at: None,
+                is_timer: false,
             });
+        if meta_is_timer {
+            entry.is_timer = true;
+        }
         if call_id.is_some() {
             entry.call_id = call_id;
         }
@@ -4111,7 +4134,13 @@ impl BackgroundTaskTracker {
 
     fn waiting_source_label(&self) -> String {
         let n = self.tasks.len();
-        if n == 1 {
+        if n > 0 && self.tasks.values().all(|t| t.is_timer) {
+            if n == 1 {
+                "waiting:1 timer".to_string()
+            } else {
+                format!("waiting:{n} timers")
+            }
+        } else if n == 1 {
             "waiting:1 background task".to_string()
         } else {
             format!("waiting:{n} background tasks")
@@ -5636,6 +5665,7 @@ struct AgyTranscriptMonitor {
     last_error_message: Option<String>,
     in_progress_thinking_lens: HashMap<u64, usize>,
     last_in_progress_heartbeat: Option<Instant>,
+    last_wakeup_activity_at: Option<Instant>,
     seen_undelivered_files: HashSet<PathBuf>,
     last_checked_path: Option<PathBuf>,
     last_checked_mtime: Option<std::time::SystemTime>,
@@ -5674,6 +5704,7 @@ impl AgyTranscriptMonitor {
             last_error_message: None,
             in_progress_thinking_lens: HashMap::new(),
             last_in_progress_heartbeat: None,
+            last_wakeup_activity_at: None,
             seen_undelivered_files: HashSet::new(),
             last_checked_path: None,
             last_checked_mtime: None,
@@ -5736,14 +5767,39 @@ impl AgyTranscriptMonitor {
         self.last_error_message = None;
         self.in_progress_thinking_lens.clear();
         self.last_in_progress_heartbeat = None;
+        self.last_wakeup_activity_at = None;
         bg_deltas
     }
 
     fn poll_post_turn_wakeup(&mut self) -> Vec<WakeupStep> {
         let mut bg_deltas = Vec::new();
         let mut out = self.read_new_lines(false, &mut bg_deltas);
-        self.check_error_stall(&mut out, Instant::now());
+        let now = Instant::now();
+        self.check_error_stall(&mut out, now);
+        self.check_wakeup_idle_settle(&mut out, now);
         out
+    }
+
+    /// When a post-turn wakeup arms a background timer/task (e.g. `schedule`) and finishes its
+    /// tool call without a trailing empty-tool `PLANNER_RESPONSE(DONE)`, settle cleanly once
+    /// no pending tool calls remain so the conversation returns to talkable `waiting:*` state.
+    fn check_wakeup_idle_settle(&mut self, out: &mut Vec<WakeupStep>, now: Instant) {
+        if self.always_active
+            || !self.in_wakeup
+            || !self.pending_tools.is_empty()
+            || self.active_bg_tasks.is_empty()
+            || self.consecutive_errors != 0
+        {
+            return;
+        }
+        let Some(last_act) = self.last_wakeup_activity_at else {
+            return;
+        };
+        if now.saturating_duration_since(last_act) >= WAKEUP_IDLE_SETTLE_GRACE {
+            self.in_wakeup = false;
+            self.last_wakeup_activity_at = None;
+            out.push(WakeupStep::Settled);
+        }
     }
 
     /// Scan `<brain_dir>/.system_generated/messages/undelivered/` for `MESSAGE_PRIORITY_LOW`
@@ -6334,6 +6390,7 @@ impl AgyTranscriptMonitor {
                     self.last_error_at = None;
                     self.last_error_message = None;
                     self.last_in_progress_heartbeat = Some(Instant::now());
+                    self.last_wakeup_activity_at = Some(Instant::now());
                     out.push(WakeupStep::Started {
                         source: if self.always_active {
                             "message".into()
@@ -6386,6 +6443,7 @@ impl AgyTranscriptMonitor {
                 self.last_error_at = None;
                 self.last_error_message = None;
                 self.last_in_progress_heartbeat = Some(Instant::now());
+                self.last_wakeup_activity_at = Some(Instant::now());
                 if let Some(th) = step.get("thinking").and_then(|v| v.as_str())
                     && !th.trim().is_empty()
                 {
@@ -6407,6 +6465,7 @@ impl AgyTranscriptMonitor {
                     .unwrap_or_default();
                 if calls.is_empty() && status == "DONE" {
                     self.in_wakeup = false;
+                    self.last_wakeup_activity_at = None;
                     self.pending_tools.clear();
                     out.push(WakeupStep::Settled);
                 } else {
@@ -6432,6 +6491,7 @@ impl AgyTranscriptMonitor {
                 self.last_error_at = None;
                 self.last_error_message = None;
                 self.last_in_progress_heartbeat = Some(Instant::now());
+                self.last_wakeup_activity_at = Some(Instant::now());
                 let (cid, orig_detail) = self.pending_tools.remove(0);
                 let detail = attach_transcript_tool_result(orig_detail, content);
                 if status == "RUNNING"
@@ -10885,5 +10945,140 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
         let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    fn background_task_tracker_labels_timers_separately_from_bash_tasks() {
+        let mut tracker = BackgroundTaskTracker::default();
+        tracker.record_started_with_expiry(
+            "s1/task-1".into(),
+            None,
+            None,
+            Some(BackgroundTaskInfo {
+                task_id: Some("s1/task-1".into()),
+                label: Some("Timer: 5m, Prompt: Check status".into()),
+                log_path: None,
+            }),
+            Some(Utc::now() + chrono::Duration::minutes(5)),
+        );
+        assert_eq!(tracker.waiting_source_label(), "waiting:1 timer");
+
+        tracker.record_started_with_expiry(
+            "s1/task-2".into(),
+            None,
+            None,
+            Some(BackgroundTaskInfo {
+                task_id: Some("s1/task-2".into()),
+                label: Some("Cron: */5 * * * *".into()),
+                log_path: None,
+            }),
+            None,
+        );
+        assert_eq!(tracker.waiting_source_label(), "waiting:2 timers");
+
+        // Adding a non-timer background task switches label to generic background tasks
+        tracker.record_started(
+            "s1/task-3".into(),
+            None,
+            None,
+            Some(BackgroundTaskInfo {
+                task_id: Some("s1/task-3".into()),
+                label: Some("ffmpeg render".into()),
+                log_path: None,
+            }),
+        );
+        assert_eq!(tracker.waiting_source_label(), "waiting:3 background tasks");
+    }
+
+    #[test]
+    fn wakeup_monitor_settles_idle_timer_without_trailing_done_planner_step() {
+        let dir = std::env::temp_dir().join(format!(
+            "orbit_wake_settle_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let logs = dir.join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        let full_path = logs.join("transcript_full.jsonl");
+        let sess = "sess_wake_settle";
+
+        let content = [
+            json!({
+                "step_index": 1,
+                "type": "USER_INPUT",
+                "status": "DONE",
+                "content": "Wait 5m then check"
+            }),
+            json!({
+                "step_index": 2,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "content": "",
+                "tool_calls": [{ "id": "call_sched_1", "name": "schedule", "args": { "DurationSeconds": 300, "Prompt": "check" } }]
+            }),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n";
+        std::fs::write(&full_path, &content).expect("write");
+
+        let mut monitor = AgyTranscriptMonitor::from_brain_dir_with_session(dir.clone(), sess);
+        monitor.sync_silent();
+        assert!(!monitor.in_wakeup);
+
+        // Append wakeup + schedule re-arm without trailing PLANNER_RESPONSE(DONE)
+        let append = [
+            json!({
+                "step_index": 3,
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "content": "[SYSTEM_MESSAGE]\nTimer fired"
+            }),
+            json!({
+                "step_index": 4,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "content": "",
+                "tool_calls": [{ "id": "call_sched_2", "name": "schedule", "args": { "DurationSeconds": 120, "Prompt": "check again" } }]
+            }),
+            json!({
+                "step_index": 5,
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": format!("Tool is running as a background task with task id: {sess}/task-88\nTask Description: Timer: 2m")
+            }),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n";
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&full_path)
+            .expect("open append");
+        std::io::Write::write_all(&mut f, append.as_bytes()).expect("append");
+
+        let steps = monitor.poll_post_turn_wakeup();
+        assert!(
+            steps
+                .iter()
+                .any(|s| matches!(s, WakeupStep::Started { .. }))
+        );
+        assert!(monitor.in_wakeup);
+        assert!(monitor.pending_tools.is_empty());
+        assert!(!monitor.active_bg_tasks.is_empty());
+
+        // Simulate idle grace elapsed -> monitor settles back to waiting:timer state
+        let mut settled_out = Vec::new();
+        monitor.check_wakeup_idle_settle(
+            &mut settled_out,
+            Instant::now() + WAKEUP_IDLE_SETTLE_GRACE + Duration::from_secs(1),
+        );
+        assert!(!monitor.in_wakeup);
+        assert!(settled_out.iter().any(|s| matches!(s, WakeupStep::Settled)));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -900,8 +900,31 @@ pub fn resolve_ssh_effective_target(
     (resolved_host, resolved_user, resolved_port)
 }
 
+/// Load or create a persistent 256-bit shared fleet admission token at `<home_dir>/fleet-relay-token` (`0600`).
+pub fn load_or_create_fleet_relay_token(home_dir: &Path) -> Result<String, String> {
+    let path = home_dir.join("fleet-relay-token");
+    if let Ok(raw) = fs::read_to_string(&path) {
+        let tok = raw.trim().to_string();
+        if tok.len() >= 16 && !tok.chars().any(char::is_whitespace) {
+            return Ok(tok);
+        }
+    }
+    let token = orbit_crypto::generate_pairing_secret();
+    fs::create_dir_all(home_dir)
+        .map_err(|e| format!("failed to create {}: {e}", home_dir.display()))?;
+    fs::write(&path, format!("{token}\n"))
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(token)
+}
+
 /// Deploy/update Orbit on a remote SSH host bound strictly to `127.0.0.1:<relay_port>`,
 /// install a restricted `authorized_keys` tunnel key, and return the canonical `ssh+relay://...` URL.
+/// Credentials (`fleet_token`) are piped exclusively over SSH stdin, never passed in process `argv`.
 #[allow(clippy::too_many_arguments)]
 pub fn provision_ssh_tunnel_relay_with_home(
     home_dir: &Path,
@@ -913,7 +936,10 @@ pub fn provision_ssh_tunnel_relay_with_home(
     allowed_pubkeys: &[String],
     tag_owner: &str,
 ) -> Result<String, String> {
+    use std::io::Write as _;
+
     let tunnel_key = load_or_create_ssh_tunnel_key(home_dir)?;
+    let fleet_token = load_or_create_fleet_relay_token(home_dir)?;
 
     let mut unique_keys: Vec<String> = allowed_pubkeys
         .iter()
@@ -937,27 +963,35 @@ pub fn provision_ssh_tunnel_relay_with_home(
 
     let repo = orbit_protocol::configured_github_repo();
     let remote_script = format!(
-        "set -eu; \
-         export PATH=\"$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"; \
-         if ! command -v orbit >/dev/null 2>&1 || orbit --version 2>&1 | grep -q 'GLIBC_' || ! orbit relay --help 2>&1 | grep -q 'allow'; then \
-           curl -fsSL https://raw.githubusercontent.com/{repo}/main/deploy/install.sh | ORBIT_GITHUB_REPO='{repo}' sh; \
-         fi; \
-         orbit relay up --listen 127.0.0.1:{relay_port} {pubkey_flags}; \
-         mkdir -p \"$HOME/.ssh\" && chmod 700 \"$HOME/.ssh\"; \
-         touch \"$HOME/.ssh/authorized_keys\" && chmod 600 \"$HOME/.ssh/authorized_keys\"; \
-         (grep -Fv ' {tag}' \"$HOME/.ssh/authorized_keys\" || true) > \"$HOME/.ssh/authorized_keys.orbit.tmp\"; \
-         printf '%s\\n' '{restricted_line}' >> \"$HOME/.ssh/authorized_keys.orbit.tmp\"; \
-         mv \"$HOME/.ssh/authorized_keys.orbit.tmp\" \"$HOME/.ssh/authorized_keys\" && chmod 600 \"$HOME/.ssh/authorized_keys\"; \
-         printf 'ORBIT_SSH_USER=%s\\n' \"$(whoami)\"; \
-         find /etc/ssh -maxdepth 1 -name 'ssh_host_*_key.pub' -type f 2>/dev/null | while IFS= read -r pubf; do \
-           if [ -r \"$pubf\" ]; then \
-             line=\"$(cat \"$pubf\" 2>/dev/null || true)\"; \
-             if [ -n \"$line\" ]; then printf 'ORBIT_HOST_PUBKEY=%s\\n' \"$line\"; fi; \
-           fi; \
-         done || true"
+        "set -eu\n\
+         export PATH=\"$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"\n\
+         if ! command -v orbit >/dev/null 2>&1 || orbit --version 2>&1 | grep -q 'GLIBC_' || ! orbit relay --help 2>&1 | grep -q 'allow'; then\n\
+           curl -fsSL https://raw.githubusercontent.com/{repo}/main/deploy/install.sh | ORBIT_GITHUB_REPO='{repo}' sh\n\
+         fi\n\
+         if orbit relay up --help 2>&1 | grep -q 'fleet-token-stdin'; then\n\
+           orbit relay up --listen 127.0.0.1:{relay_port} {pubkey_flags} --fleet-token-stdin <<'ORBIT_FT_EOF'\n\
+{fleet_token}\n\
+ORBIT_FT_EOF\n\
+           printf 'ORBIT_FLEET_TOKEN_SUPPORTED=1\\n'\n\
+         else\n\
+           orbit relay up --listen 127.0.0.1:{relay_port} {pubkey_flags}\n\
+           printf 'ORBIT_FLEET_TOKEN_SUPPORTED=0\\n'\n\
+         fi\n\
+         mkdir -p \"$HOME/.ssh\" && chmod 700 \"$HOME/.ssh\"\n\
+         touch \"$HOME/.ssh/authorized_keys\" && chmod 600 \"$HOME/.ssh/authorized_keys\"\n\
+         (grep -Fv ' {tag}' \"$HOME/.ssh/authorized_keys\" || true) > \"$HOME/.ssh/authorized_keys.orbit.tmp\"\n\
+         printf '%s\\n' '{restricted_line}' >> \"$HOME/.ssh/authorized_keys.orbit.tmp\"\n\
+         mv \"$HOME/.ssh/authorized_keys.orbit.tmp\" \"$HOME/.ssh/authorized_keys\" && chmod 600 \"$HOME/.ssh/authorized_keys\"\n\
+         printf 'ORBIT_SSH_USER=%s\\n' \"$(whoami)\"\n\
+         find /etc/ssh -maxdepth 1 -name 'ssh_host_*_key.pub' -type f 2>/dev/null | while IFS= read -r pubf; do\n\
+           if [ -r \"$pubf\" ]; then\n\
+             line=\"$(cat \"$pubf\" 2>/dev/null || true)\"\n\
+             if [ -n \"$line\" ]; then printf 'ORBIT_HOST_PUBKEY=%s\\n' \"$line\"; fi\n\
+           fi\n\
+         done || true\n"
     );
 
-    let out = build_ssh_command()
+    let mut child = build_ssh_command()
         .args([
             "-o",
             "BatchMode=yes",
@@ -965,11 +999,23 @@ pub fn provision_ssh_tunnel_relay_with_home(
             "StrictHostKeyChecking=accept-new",
             "-o",
             "ConnectTimeout=12",
+            "--",
             alias,
-            &remote_script,
+            "sh -s",
         ])
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("failed to launch ssh: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(remote_script.as_bytes());
+        let _ = stdin.flush();
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("failed waiting for ssh: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -984,6 +1030,7 @@ pub fn provision_ssh_tunnel_relay_with_home(
 
     let mut remote_user: Option<String> = None;
     let mut host_key_fps_b64: Vec<String> = Vec::new();
+    let mut fleet_token_supported = false;
     for line in stdout.lines() {
         let trimmed = line.trim();
         if let Some(u) = trimmed.strip_prefix("ORBIT_SSH_USER=") {
@@ -991,6 +1038,8 @@ pub fn provision_ssh_tunnel_relay_with_home(
             if !clean.is_empty() {
                 remote_user = Some(clean.to_string());
             }
+        } else if trimmed == "ORBIT_FLEET_TOKEN_SUPPORTED=1" {
+            fleet_token_supported = true;
         } else if let Some(pub_line) = trimmed.strip_prefix("ORBIT_HOST_PUBKEY=")
             && let Ok(fp) = compute_openssh_pubkey_sha256_b64(pub_line.trim())
             && !host_key_fps_b64.contains(&fp)
@@ -1008,6 +1057,11 @@ pub fn provision_ssh_tunnel_relay_with_home(
         relay_port,
         key_seed_b64: tunnel_key.seed_b64,
         host_key_fps_b64,
+        fleet_token: if fleet_token_supported {
+            Some(fleet_token)
+        } else {
+            None
+        },
     };
     Ok(spec.to_uri())
 }

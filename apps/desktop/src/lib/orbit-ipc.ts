@@ -630,6 +630,7 @@ export interface HostCardView {
   display_name: string;
   hostname: string;
   custom_name: string | null;
+  is_local?: boolean;
   ssh_alias: string | null;
   route_mode: HostRouteMode;
   remote_daemon_port: number;
@@ -1178,6 +1179,7 @@ export interface AgentCardView {
   status_label: string;
   is_running: boolean;
   has_background_tasks?: boolean;
+  has_armed_timers?: boolean;
   has_running_subagents?: boolean;
   is_awaiting_permission: boolean;
   parent_agent_id: string | null;
@@ -1217,7 +1219,11 @@ export function isAgentBackgroundWaiting(
     return agent.has_background_tasks;
   }
   const lbl = agent.status_label.trim();
-  return /^running\s*\(.*background task/i.test(lbl) || /^background task$/i.test(lbl);
+  return (
+    /^waiting\b/i.test(lbl) ||
+    /^running\s*\(.*background task/i.test(lbl) ||
+    /^background task$/i.test(lbl)
+  );
 }
 
 /**
@@ -1232,6 +1238,23 @@ export function isAgentForegroundRunning(
 ): boolean {
   if (!agent) return false;
   return Boolean(agent.is_running) && !isAgentBackgroundWaiting(agent);
+}
+
+/**
+ * Returns true when an agent currently has armed background timers/schedules/conditional waits
+ * while otherwise idle (so UI can show a restrained AlarmClock glyph without a spinner).
+ */
+export function isAgentTimerWaiting(
+  agent:
+    | Pick<AgentCardView, "has_armed_timers" | "has_background_tasks" | "status_label">
+    | null
+    | undefined,
+): boolean {
+  if (!agent) return false;
+  if (typeof agent.has_armed_timers === "boolean") {
+    return agent.has_armed_timers;
+  }
+  return isAgentBackgroundWaiting(agent);
 }
 
 export interface QuotaWindow {

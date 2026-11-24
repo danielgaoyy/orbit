@@ -643,6 +643,7 @@ pub struct FfiHostCard {
     pub agent_count: u32,
     pub pending_approval_count: u32,
     pub supports_server_queue: bool,
+    pub is_local: bool,
 }
 
 impl From<HostCardView> for FfiHostCard {
@@ -672,6 +673,7 @@ impl From<HostCardView> for FfiHostCard {
             agent_count: v.agent_count,
             pending_approval_count: v.pending_approval_count,
             supports_server_queue: v.supports_server_queue,
+            is_local: v.is_local,
         }
     }
 }
@@ -1358,6 +1360,7 @@ pub struct FfiAgentCard {
     pub status_label: String,
     pub is_running: bool,
     pub has_background_tasks: bool,
+    pub has_armed_timers: bool,
     pub is_awaiting_permission: bool,
     pub parent_agent_id: Option<String>,
     pub parent_host_id: Option<String>,
@@ -1402,6 +1405,7 @@ impl From<AgentCardView> for FfiAgentCard {
             status_label: v.status_label,
             is_running: v.is_running,
             has_background_tasks: v.has_background_tasks,
+            has_armed_timers: v.has_armed_timers,
             is_awaiting_permission: v.is_awaiting_permission,
             parent_agent_id: v.parent_agent_id,
             parent_host_id: v.parent_host_id,

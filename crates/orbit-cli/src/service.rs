@@ -76,27 +76,38 @@ pub async fn preflight_probe_relay(relay_base: &str, pubkey: &str) -> RelayProbe
     let path_and_query = format!("/v1/daemon/probe?pubkey={pubkey}");
 
     let probe_res: Result<(u16, String), String> = match endpoint {
-        orbit_relay_transport::RelayEndpoint::DirectWs(base_url) => {
-            let http_base = if let Some(rest) = base_url.strip_prefix("wss://") {
+        orbit_relay_transport::RelayEndpoint::DirectWs(raw_base) => {
+            let (clean_base, fleet_token) =
+                match orbit_relay_transport::split_direct_relay_url(&raw_base) {
+                    Ok(v) => v,
+                    Err(e) => return RelayProbeOutcome::Unreachable(e.to_string()),
+                };
+            let http_base = if let Some(rest) = clean_base.strip_prefix("wss://") {
                 format!("https://{rest}")
-            } else if let Some(rest) = base_url.strip_prefix("ws://") {
+            } else if let Some(rest) = clean_base.strip_prefix("ws://") {
                 format!("http://{rest}")
             } else {
-                base_url
+                clean_base
             };
             let url = format!("{}{}", http_base.trim_end_matches('/'), path_and_query);
             match reqwest::Client::builder()
                 .timeout(Duration::from_secs(6))
                 .build()
             {
-                Ok(client) => match client.get(&url).send().await {
-                    Ok(resp) => {
-                        let status = resp.status().as_u16();
-                        let body = resp.text().await.unwrap_or_default();
-                        Ok((status, body))
+                Ok(client) => {
+                    let mut req = client.get(&url);
+                    if let Some(tok) = fleet_token.as_deref() {
+                        req = req.bearer_auth(tok);
                     }
-                    Err(e) => Err(e.to_string()),
-                },
+                    match req.send().await {
+                        Ok(resp) => {
+                            let status = resp.status().as_u16();
+                            let body = resp.text().await.unwrap_or_default();
+                            Ok((status, body))
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
                 Err(e) => Err(e.to_string()),
             }
         }
@@ -1084,6 +1095,7 @@ mod tests {
         let cfg = RelayConfig {
             listen_addr: addr,
             allowed_pubkeys: Arc::new(allowed),
+            fleet_token: None,
         };
         tokio::spawn(async move {
             let _ = run_relay(cfg).await;

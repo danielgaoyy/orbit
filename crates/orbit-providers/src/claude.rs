@@ -1241,7 +1241,7 @@ async fn run_claude_actor(
                                     "task_started" => {
                                         let task_type = val.get("task_type").and_then(|v| v.as_str()).unwrap_or("local_agent");
                                         let skip_transcript = val.get("skip_transcript").and_then(|v| v.as_bool()).unwrap_or(false);
-                                        if task_type == "local_bash" {
+                                        if let Some(bg_kind) = classify_claude_background_task_type(task_type) {
                                             let task_id = val
                                                 .get("task_id")
                                                 .or_else(|| val.get("tool_use_id"))
@@ -1276,13 +1276,23 @@ async fn run_claude_actor(
                                                 let detail = tool_cache
                                                     .get(&call_id)
                                                     .cloned()
-                                                    .unwrap_or_else(|| ToolCallDetail::Shell {
-                                                        command: desc
-                                                            .clone()
-                                                            .unwrap_or_else(|| "Background command".into()),
-                                                        cwd: None,
-                                                        exit_code: None,
-                                                        output_preview: None,
+                                                    .unwrap_or_else(|| match bg_kind {
+                                                        ClaudeBgTaskKind::Shell => ToolCallDetail::Shell {
+                                                            command: desc
+                                                                .clone()
+                                                                .unwrap_or_else(|| "Background command".into()),
+                                                            cwd: None,
+                                                            exit_code: None,
+                                                            output_preview: None,
+                                                        },
+                                                        ClaudeBgTaskKind::Timer => ToolCallDetail::Generic {
+                                                            tool_name: "schedule".to_string(),
+                                                            arguments_json: serde_json::json!({
+                                                                "task_type": task_type,
+                                                                "description": desc,
+                                                            })
+                                                            .to_string(),
+                                                        },
                                                     });
                                                 tool_cache.insert(call_id.clone(), detail.clone());
                                                 bg_tool_use_to_task.insert(call_id.clone(), task_id.clone());
@@ -3619,5 +3629,53 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[test]
+    fn classify_claude_background_task_types_separates_timers_and_monitors_from_subagents() {
+        assert_eq!(
+            classify_claude_background_task_type("local_bash"),
+            Some(ClaudeBgTaskKind::Shell)
+        );
+        for timer_type in [
+            "local_timer",
+            "timer",
+            "cron",
+            "schedule",
+            "monitor",
+            "local_monitor",
+        ] {
+            assert_eq!(
+                classify_claude_background_task_type(timer_type),
+                Some(ClaudeBgTaskKind::Timer),
+                "{timer_type} must not be classified as a running subagent"
+            );
+        }
+        assert_eq!(classify_claude_background_task_type("local_agent"), None);
+        assert_eq!(classify_claude_background_task_type("local_workflow"), None);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeBgTaskKind {
+    Shell,
+    Timer,
+}
+
+fn classify_claude_background_task_type(task_type: &str) -> Option<ClaudeBgTaskKind> {
+    let lower = task_type.trim().to_ascii_lowercase();
+    if lower == "local_bash" {
+        Some(ClaudeBgTaskKind::Shell)
+    } else if matches!(
+        lower.as_str(),
+        "local_timer" | "timer" | "cron" | "schedule" | "monitor" | "local_monitor"
+    ) || lower.contains("timer")
+        || lower.contains("cron")
+        || lower.contains("schedule")
+        || lower.contains("monitor")
+    {
+        Some(ClaudeBgTaskKind::Timer)
+    } else {
+        None
     }
 }

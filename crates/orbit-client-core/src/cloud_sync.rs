@@ -43,6 +43,9 @@ pub const DEFAULT_GITHUB_CLIENT_ID: &str = match option_env!("ORBIT_GITHUB_CLIEN
 pub const KV_CLOUD_SYNC_CONFIG: &str = "cloud_sync_config_v1";
 pub const KV_CLOUD_SYNC_META: &str = "cloud_sync_meta_v1";
 pub const KV_CLOUD_SYNC_PREFS: &str = "cloud_sync_prefs_v1";
+pub const KV_CLOUD_SYNC_FLEET_NET: &str = "cloud_sync_fleet_network_v1";
+
+const MAX_BRIDGE_HOSTS_PER_HOST: usize = 16;
 
 const USER_AGENT: &str = concat!("Orbit-CloudSync/", env!("CARGO_PKG_VERSION"));
 
@@ -164,6 +167,19 @@ pub struct CloudSyncResultView {
     pub gist_html_url: Option<String>,
 }
 
+/// Shared account-level Fleet Network fabric metadata synced across all logged-in devices.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncedFleetNetwork {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_relay_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_relay_host_id: Option<String>,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+}
+
 /// Encrypted payload stored inside the GitHub Secret Gist (serialized as JSON, compressed, AES-256-GCM encrypted).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CloudVaultPayload {
@@ -180,6 +196,8 @@ pub struct CloudVaultPayload {
     pub project_order_updated_at_ms: i64,
     #[serde(default)]
     pub preferences: HashMap<String, SyncedPreferenceEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_network: Option<SyncedFleetNetwork>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +225,8 @@ pub struct SyncedHostEntry {
     pub custom_direct_endpoint: Option<String>,
     #[serde(default)]
     pub os_arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bridge_host_ids: Vec<String>,
     pub updated_at_ms: i64,
     #[serde(default)]
     pub deleted_at_ms: Option<i64>,
@@ -268,6 +288,8 @@ pub struct PersistedCloudSyncConfig {
     pub synced_host_count: u32,
     #[serde(default)]
     pub synced_project_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_etag: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -295,6 +317,7 @@ impl Default for PersistedCloudSyncConfig {
             remote_vault_exists: false,
             synced_host_count: 0,
             synced_project_count: 0,
+            last_etag: None,
         }
     }
 }
@@ -423,6 +446,7 @@ pub struct VaultMergeOutcome {
     pub projects_updated_count: u32,
     pub projects_removed_count: u32,
     pub preferences_updated_count: u32,
+    pub fleet_network_changed: Option<SyncedFleetNetwork>,
 }
 
 pub fn now_unix_ms() -> i64 {
@@ -525,9 +549,28 @@ pub fn synced_host_from_local(rec: &LocalHostSyncRecord) -> SyncedHostEntry {
         remote_daemon_port: rec.profile.meta.remote_daemon_port,
         custom_direct_endpoint: rec.profile.meta.custom_direct_endpoint.clone(),
         os_arch: rec.os_arch.clone(),
+        bridge_host_ids: normalize_bridge_host_ids(
+            &rec.profile.meta.bridge_host_ids,
+            &rec.profile.host_id,
+        ),
         updated_at_ms: rec.updated_at_ms,
         deleted_at_ms: None,
     }
+}
+
+pub fn normalize_bridge_host_ids(ids: &[String], target_host_id: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in ids {
+        let clean = raw.trim();
+        if clean.is_empty() || clean == target_host_id || out.iter().any(|x| x == clean) {
+            continue;
+        }
+        out.push(clean.to_string());
+        if out.len() >= MAX_BRIDGE_HOSTS_PER_HOST {
+            break;
+        }
+    }
+    out
 }
 
 pub fn stored_host_from_synced(entry: &SyncedHostEntry) -> StoredHostProfile {
@@ -545,6 +588,7 @@ pub fn stored_host_from_synced(entry: &SyncedHostEntry) -> StoredHostProfile {
             remote_daemon_port: entry.remote_daemon_port,
             custom_direct_endpoint: entry.custom_direct_endpoint.clone(),
             pairing_secret_updated_at_ms: entry.pairing_secret_updated_at_ms,
+            bridge_host_ids: normalize_bridge_host_ids(&entry.bridge_host_ids, &entry.host_id),
         },
     }
 }
@@ -606,6 +650,7 @@ fn hosts_content_equal(a: &SyncedHostEntry, b: &SyncedHostEntry) -> bool {
         && a.route_mode == b.route_mode
         && a.remote_daemon_port == b.remote_daemon_port
         && a.custom_direct_endpoint == b.custom_direct_endpoint
+        && a.bridge_host_ids == b.bridge_host_ids
         && a.deleted_at_ms == b.deleted_at_ms
 }
 
@@ -614,6 +659,47 @@ fn projects_content_equal(a: &SyncedProjectEntry, b: &SyncedProjectEntry) -> boo
         && a.name == b.name
         && a.directories == b.directories
         && a.deleted_at_ms == b.deleted_at_ms
+}
+
+/// Deterministic SHA-256 fingerprint of a decrypted `CloudVaultPayload` (used for live change gossip).
+pub fn vault_fingerprint(payload: &CloudVaultPayload) -> String {
+    use sha2::{Digest, Sha256};
+
+    let bytes = serde_json::to_vec(payload).unwrap_or_default();
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn union_bridge_host_ids(target_host_id: &str, a: &[String], b: &[String]) -> Vec<String> {
+    let mut combined = Vec::with_capacity(a.len() + b.len());
+    combined.extend_from_slice(a);
+    combined.extend_from_slice(b);
+    normalize_bridge_host_ids(&combined, target_host_id)
+}
+
+fn push_unique_relay_url(list: &mut Vec<String>, candidate: &str) {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let canon =
+        orbit_relay_transport::normalize_relay_url(trimmed).unwrap_or_else(|_| trimmed.to_string());
+    // Prefer variant carrying `?ft=`/`&ft=` if base matches an existing entry without token
+    let canon_has_ft = canon.contains("?ft=") || canon.contains("&ft=");
+    let canon_base = canon.split('?').next().unwrap_or(&canon);
+    if let Some(existing) = list
+        .iter_mut()
+        .find(|u| u.split('?').next().unwrap_or(u) == canon_base)
+    {
+        let existing_has_ft = existing.contains("?ft=") || existing.contains("&ft=");
+        if canon_has_ft && !existing_has_ft {
+            *existing = canon;
+        }
+        return;
+    }
+    if list.len() < 16 {
+        list.push(canon);
+    }
 }
 
 /// Deterministic per-entity LWW merge between the decrypted remote vault and current local state.
@@ -627,6 +713,30 @@ pub fn merge_cloud_vault(
     local_meta: &CloudSyncLocalMeta,
     now_ms: i64,
 ) -> VaultMergeOutcome {
+    merge_cloud_vault_with_network(
+        remote,
+        local_hosts,
+        local_projects,
+        local_project_order,
+        local_preferences,
+        local_meta,
+        None,
+        now_ms,
+    )
+}
+
+/// Deterministic per-entity LWW merge including account-wide `SyncedFleetNetwork` convergence.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_cloud_vault_with_network(
+    remote: Option<&CloudVaultPayload>,
+    local_hosts: &[LocalHostSyncRecord],
+    local_projects: &[StoredClientProject],
+    local_project_order: &[String],
+    local_preferences: &HashMap<String, SyncedPreferenceEntry>,
+    local_meta: &CloudSyncLocalMeta,
+    local_fleet_network: Option<&SyncedFleetNetwork>,
+    now_ms: i64,
+) -> VaultMergeOutcome {
     let mut merged = CloudVaultPayload {
         schema_version: CLOUD_VAULT_SCHEMA_VERSION,
         revision: remote.map(|r| r.revision).unwrap_or(0),
@@ -636,6 +746,7 @@ pub fn merge_cloud_vault(
         project_order: Vec::new(),
         project_order_updated_at_ms: 0,
         preferences: HashMap::new(),
+        fleet_network: None,
     };
 
     let mut needs_push = remote.is_none();
@@ -680,6 +791,7 @@ pub fn merge_cloud_vault(
                 remote_daemon_port: None,
                 custom_direct_endpoint: None,
                 os_arch: None,
+                bridge_host_ids: Vec::new(),
                 updated_at_ms: del_ts,
                 deleted_at_ms: Some(del_ts),
             }),
@@ -700,6 +812,7 @@ pub fn merge_cloud_vault(
                 remote_daemon_port: None,
                 custom_direct_endpoint: None,
                 os_arch: None,
+                bridge_host_ids: Vec::new(),
                 updated_at_ms: del_ts,
                 deleted_at_ms: Some(del_ts),
             }),
@@ -720,6 +833,8 @@ pub fn merge_cloud_vault(
                         r.clone()
                     } else {
                         let mut combined = r.clone();
+                        combined.bridge_host_ids =
+                            union_bridge_host_ids(&host_id, &r.bridge_host_ids, &l.bridge_host_ids);
                         if l.deleted_at_ms.is_none() {
                             let (sec, sec_ts) = merge_host_pairing_secret(r, &l, true);
                             combined.pairing_secret = sec;
@@ -746,6 +861,8 @@ pub fn merge_cloud_vault(
                         l
                     } else {
                         let mut combined = l.clone();
+                        combined.bridge_host_ids =
+                            union_bridge_host_ids(&host_id, &l.bridge_host_ids, &r.bridge_host_ids);
                         if r.deleted_at_ms.is_none() {
                             let (sec, sec_ts) = merge_host_pairing_secret(r, &l, false);
                             combined.pairing_secret = sec;
@@ -761,7 +878,7 @@ pub fn merge_cloud_vault(
                         combined
                     }
                 } else {
-                    // Equal timestamp: if both active and content differs, union endpoints, prefer richer metadata,
+                    // Equal timestamp: if both active and content differs, union endpoints/bridges, prefer richer metadata,
                     // and resolve pairing_secret independently by `pairing_secret_updated_at_ms`.
                     if r.deleted_at_ms.is_none() && l.deleted_at_ms.is_none() {
                         let mut combined = r.clone();
@@ -772,6 +889,8 @@ pub fn merge_cloud_vault(
                             }
                         }
                         combined.direct_endpoints = eps;
+                        combined.bridge_host_ids =
+                            union_bridge_host_ids(&host_id, &r.bridge_host_ids, &l.bridge_host_ids);
                         if combined.relay_url.is_none() {
                             combined.relay_url = l.relay_url.clone();
                         }
@@ -1000,6 +1119,85 @@ pub fn merge_cloud_vault(
         merged.preferences.insert(key, winner);
     }
 
+    // 5. Merge Account Fleet Network Fabric (`primary_relay_url` + union of known relays)
+    let r_net = remote.and_then(|r| r.fleet_network.as_ref());
+    let l_net = local_fleet_network;
+    let mut merged_net = match (r_net, l_net) {
+        (Some(rn), Some(ln)) => {
+            if ln.updated_at_ms > rn.updated_at_ms {
+                ln.clone()
+            } else {
+                rn.clone()
+            }
+        }
+        (Some(rn), None) => rn.clone(),
+        (None, Some(ln)) => ln.clone(),
+        (None, None) => SyncedFleetNetwork::default(),
+    };
+    let mut all_relays = Vec::new();
+    if let Some(ref primary) = merged_net.primary_relay_url {
+        push_unique_relay_url(&mut all_relays, primary);
+    }
+    if let Some(rn) = r_net {
+        if let Some(ref p) = rn.primary_relay_url {
+            push_unique_relay_url(&mut all_relays, p);
+        }
+        for u in &rn.relay_urls {
+            push_unique_relay_url(&mut all_relays, u);
+        }
+    }
+    if let Some(ln) = l_net {
+        if let Some(ref p) = ln.primary_relay_url {
+            push_unique_relay_url(&mut all_relays, p);
+        }
+        for u in &ln.relay_urls {
+            push_unique_relay_url(&mut all_relays, u);
+        }
+    }
+    let mut active_host_keys: Vec<&String> = merged.hosts.keys().collect();
+    active_host_keys.sort();
+    for hid in active_host_keys {
+        if let Some(host) = merged.hosts.get(hid)
+            && host.deleted_at_ms.is_none()
+            && let Some(ref u) = host.relay_url
+        {
+            push_unique_relay_url(&mut all_relays, u);
+        }
+    }
+    if let Some(ref cur_primary) = merged_net.primary_relay_url {
+        let cur_base = cur_primary.split('?').next().unwrap_or(cur_primary);
+        if let Some(upgraded) = all_relays
+            .iter()
+            .find(|u| u.split('?').next().unwrap_or(u) == cur_base)
+        {
+            merged_net.primary_relay_url = Some(upgraded.clone());
+        }
+    } else if let Some(first) = all_relays.first() {
+        merged_net.primary_relay_url = Some(first.clone());
+        if merged_net.updated_at_ms == 0 {
+            merged_net.updated_at_ms = now_ms;
+        }
+    }
+    merged_net.relay_urls = all_relays;
+
+    let merged_net_opt = if merged_net.primary_relay_url.is_some()
+        || !merged_net.relay_urls.is_empty()
+        || merged_net.primary_relay_host_id.is_some()
+    {
+        Some(merged_net)
+    } else {
+        None
+    };
+    if merged_net_opt.as_ref() != r_net {
+        needs_push = true;
+    }
+    let fleet_network_changed = if merged_net_opt.as_ref() != l_net {
+        merged_net_opt.clone()
+    } else {
+        None
+    };
+    merged.fleet_network = merged_net_opt;
+
     if needs_push {
         merged.revision = merged.revision.saturating_add(1);
     }
@@ -1020,7 +1218,26 @@ pub fn merge_cloud_vault(
         projects_updated_count,
         projects_removed_count,
         preferences_updated_count,
+        fleet_network_changed,
     }
+}
+
+pub fn load_fleet_network_from_store(store: &OrbitStore) -> Option<SyncedFleetNetwork> {
+    store
+        .get_client_kv(KV_CLOUD_SYNC_FLEET_NET)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+}
+
+pub fn save_fleet_network_to_store(
+    store: &OrbitStore,
+    network: &SyncedFleetNetwork,
+) -> Result<(), CloudSyncError> {
+    let raw = serde_json::to_string(network).map_err(|e| CloudSyncError::Storage(e.to_string()))?;
+    store
+        .set_client_kv(KV_CLOUD_SYNC_FLEET_NET, &raw, now_unix_ms())
+        .map_err(|e| CloudSyncError::Storage(e.to_string()))
 }
 
 // --- Persistence Helpers (SQLite `client_kv` + Headless CLI `~/.orbit/cloud-sync.json`) ---
@@ -1133,6 +1350,16 @@ pub struct RemoteVaultGist {
     pub gist_id: String,
     pub html_url: String,
     pub envelope: EncryptedVaultEnvelope,
+}
+
+#[derive(Debug, Clone)]
+pub enum GistConditionalFetch {
+    NotModified,
+    Updated {
+        gist: Box<RemoteVaultGist>,
+        etag: Option<String>,
+    },
+    NotFound,
 }
 
 #[derive(Debug, Clone)]
@@ -1444,21 +1671,60 @@ impl GitHubCloudClient {
         token: &str,
         gist_id: &str,
     ) -> Result<Option<RemoteVaultGist>, CloudSyncError> {
+        match self
+            .fetch_gist_by_id_conditional(token, gist_id, None)
+            .await?
+        {
+            GistConditionalFetch::Updated { gist, .. } => Ok(Some(*gist)),
+            GistConditionalFetch::NotModified | GistConditionalFetch::NotFound => Ok(None),
+        }
+    }
+
+    /// Fetch the user's Cloud Sync Vault Gist using `If-None-Match` (`ETag`) conditional requests
+    /// so instant polling costs zero payload decryption and preserves GitHub API rate limit on HTTP 304.
+    pub async fn fetch_vault_gist_conditional(
+        &self,
+        token: &str,
+        gist_id: &str,
+        if_none_match: Option<&str>,
+    ) -> Result<GistConditionalFetch, CloudSyncError> {
+        self.fetch_gist_by_id_conditional(token, gist_id, if_none_match)
+            .await
+    }
+
+    async fn fetch_gist_by_id_conditional(
+        &self,
+        token: &str,
+        gist_id: &str,
+        if_none_match: Option<&str>,
+    ) -> Result<GistConditionalFetch, CloudSyncError> {
         let url = format!("{}/gists/{}", self.api_base, gist_id.trim());
-        let resp = self
+        let mut req = self
             .http
             .get(&url)
             .header("Authorization", format!("Bearer {}", token.trim()))
             .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        if let Some(etag) = if_none_match.map(str::trim).filter(|s| !s.is_empty()) {
+            req = req.header("If-None-Match", etag);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| CloudSyncError::Http(e.to_string()))?;
 
         let status = resp.status();
-        if status.as_u16() == 404 {
-            return Ok(None);
+        if status.as_u16() == 304 {
+            return Ok(GistConditionalFetch::NotModified);
         }
+        if status.as_u16() == 404 {
+            return Ok(GistConditionalFetch::NotFound);
+        }
+        let etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned);
         let body: serde_json::Value = resp
             .json()
             .await
@@ -1480,7 +1746,7 @@ impl GitHubCloudClient {
             .get("files")
             .and_then(|f| f.get(CLOUD_VAULT_GIST_FILENAME))
         else {
-            return Ok(None);
+            return Ok(GistConditionalFetch::NotFound);
         };
 
         let html_url = body
@@ -1523,11 +1789,14 @@ impl GitHubCloudClient {
             .map_err(|e| CloudSyncError::InvalidVault(format!("malformed vault envelope: {e}")))?;
         validate_envelope_header(&envelope)?;
 
-        Ok(Some(RemoteVaultGist {
-            gist_id: gist_id.trim().to_string(),
-            html_url,
-            envelope,
-        }))
+        Ok(GistConditionalFetch::Updated {
+            gist: Box::new(RemoteVaultGist {
+                gist_id: gist_id.trim().to_string(),
+                html_url,
+                envelope,
+            }),
+            etag,
+        })
     }
 
     /// Create or update the user's Orbit Encrypted Vault Secret Gist.
@@ -1761,6 +2030,7 @@ mod tests {
                 remote_daemon_port: Some(6868),
                 custom_direct_endpoint: None,
                 os_arch: Some("macos/aarch64".into()),
+                bridge_host_ids: Vec::new(),
                 updated_at_ms: 2000,
                 deleted_at_ms: None,
             },
@@ -1781,6 +2051,7 @@ mod tests {
                 remote_daemon_port: Some(6868),
                 custom_direct_endpoint: None,
                 os_arch: None,
+                bridge_host_ids: Vec::new(),
                 updated_at_ms: 1500,
                 deleted_at_ms: None,
             },
@@ -1801,6 +2072,7 @@ mod tests {
                 remote_daemon_port: None,
                 custom_direct_endpoint: None,
                 os_arch: None,
+                bridge_host_ids: Vec::new(),
                 updated_at_ms: 2500,
                 deleted_at_ms: Some(2500),
             },
@@ -1881,6 +2153,7 @@ mod tests {
                 remote_daemon_port: Some(6868),
                 custom_direct_endpoint: None,
                 os_arch: None,
+                bridge_host_ids: Vec::new(),
                 updated_at_ms: 2000,
                 deleted_at_ms: None,
             },
@@ -1940,6 +2213,7 @@ mod tests {
                 remote_daemon_port: Some(6868),
                 custom_direct_endpoint: None,
                 os_arch: None,
+                bridge_host_ids: Vec::new(),
                 updated_at_ms: 4000,
                 deleted_at_ms: None,
             },
@@ -2068,6 +2342,7 @@ mod tests {
                 remote_daemon_port: Some(6868),
                 custom_direct_endpoint: None,
                 os_arch: None,
+                bridge_host_ids: Vec::new(),
                 updated_at_ms: 9000,
                 deleted_at_ms: None,
             },
@@ -2081,6 +2356,7 @@ mod tests {
             project_order: vec![],
             project_order_updated_at_ms: 0,
             preferences: HashMap::new(),
+            fleet_network: None,
         };
 
         let local = LocalHostSyncRecord {
@@ -2118,5 +2394,69 @@ mod tests {
             merged.pairing_secret_updated_at_ms, 1000,
             "empty remote entry must NEVER stamp older non-empty secret with newer timestamp 9000"
         );
+    }
+
+    #[test]
+    fn merge_with_network_propagates_primary_relay_and_unions_bridge_host_ids() {
+        let mut r_host = sample_local_host(
+            "host_isolated",
+            "lan-worker",
+            vec!["ws://192.168.10.20:6868/ws"],
+            None,
+            2000,
+        );
+        r_host.profile.meta.bridge_host_ids = vec!["bridge_b".into()];
+        let mut remote = CloudVaultPayload {
+            schema_version: CLOUD_VAULT_SCHEMA_VERSION,
+            revision: 4,
+            updated_at_ms: 2000,
+            fleet_network: Some(SyncedFleetNetwork {
+                primary_relay_url: Some("wss://relay.example.com?ft=tok_abc".into()),
+                relay_urls: vec!["wss://relay.example.com?ft=tok_abc".into()],
+                primary_relay_host_id: Some("bridge_b".into()),
+                updated_at_ms: 2000,
+            }),
+            ..Default::default()
+        };
+        remote
+            .hosts
+            .insert("host_isolated".into(), synced_host_from_local(&r_host));
+
+        let mut local_isolated = sample_local_host(
+            "host_isolated",
+            "lan-worker",
+            vec!["ws://192.168.10.20:6868/ws"],
+            None,
+            1000,
+        );
+        local_isolated.profile.meta.bridge_host_ids = vec!["bridge_a".into()];
+
+        let outcome = merge_cloud_vault_with_network(
+            Some(&remote),
+            &[local_isolated],
+            &[],
+            &[],
+            &HashMap::new(),
+            &CloudSyncLocalMeta::default(),
+            None,
+            3000,
+        );
+        let merged_isolated = &outcome.merged.hosts["host_isolated"];
+        assert!(
+            merged_isolated
+                .bridge_host_ids
+                .contains(&"bridge_a".to_string())
+        );
+        assert!(
+            merged_isolated
+                .bridge_host_ids
+                .contains(&"bridge_b".to_string())
+        );
+        let net = outcome.merged.fleet_network.expect("fleet network");
+        assert_eq!(
+            net.primary_relay_url.as_deref(),
+            Some("wss://relay.example.com?ft=tok_abc")
+        );
+        assert!(outcome.fleet_network_changed.is_some());
     }
 }

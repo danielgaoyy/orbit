@@ -1562,7 +1562,8 @@ public final class OrbitIosStore: ObservableObject {
             workspaceCount: 1,
             agentCount: 1,
             pendingApprovalCount: 0,
-            supportsServerQueue: true
+            supportsServerQueue: true,
+            isLocal: false
         )
         let demoCard = FfiAgentCard(
             agentId: demoAgentId,
@@ -1578,6 +1579,7 @@ public final class OrbitIosStore: ObservableObject {
             statusLabel: "Working",
             isRunning: true,
             hasBackgroundTasks: false,
+            hasArmedTimers: false,
             isAwaitingPermission: false,
             parentAgentId: nil,
             parentHostId: nil,

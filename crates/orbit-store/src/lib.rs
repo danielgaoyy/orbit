@@ -81,6 +81,9 @@ pub struct StoredHostMeta {
     pub custom_direct_endpoint: Option<String>,
     #[serde(default)]
     pub pairing_secret_updated_at_ms: i64,
+    /// Peer `host_id`s able to bridge to this host (e.g. for LAN-isolated nodes).
+    #[serde(default)]
+    pub bridge_host_ids: Vec<String>,
 }
 
 /// Persisted remote/local host profile stored in the client's local SQLite replica.

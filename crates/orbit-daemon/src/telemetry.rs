@@ -34,8 +34,11 @@ pub fn start(endpoint: &str) -> anyhow::Result<(LogLayer, Arc<Exporter>)> {
         matches!(url.scheme(), "http" | "https"),
         "invalid OTLP endpoint scheme"
     );
-    let path = format!("{}/v1/logs", url.path().trim_end_matches('/'));
-    url.set_path(&path);
+    let trimmed_path = url.path().trim_end_matches('/');
+    if !trimmed_path.ends_with("/v1/logs") {
+        let path = format!("{trimmed_path}/v1/logs");
+        url.set_path(&path);
+    }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .redirect(reqwest::redirect::Policy::none())
@@ -74,9 +77,15 @@ pub fn start(endpoint: &str) -> anyhow::Result<(LogLayer, Arc<Exporter>)> {
 impl Exporter {
     pub async fn flush_and_shutdown(&self) {
         let mut worker = self.worker.lock().await;
-        if let Some(task) = worker.take() {
-            let _ = self.tx.send(Item::Shutdown).await;
-            let _ = task.await;
+        if let Some(mut task) = worker.take() {
+            let _ =
+                tokio::time::timeout(Duration::from_secs(1), self.tx.send(Item::Shutdown)).await;
+            if tokio::time::timeout(Duration::from_secs(5), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
         }
     }
 }

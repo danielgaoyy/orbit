@@ -5903,19 +5903,23 @@ impl AgentOrchestrator {
                 Ok((ag, pct, last_prompt))
             })
             .await?;
-        let mut recent = self.last_compaction.lock().await;
-        let pending = self.pending_permissions.read().await;
-        let busy = pending.keys().any(|(aid, _)| aid == agent_id)
-            || self.pending_questions.read().await.contains_key(agent_id)
-            || self
-                .evaluating_permissions
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .iter()
-                .any(|(aid, _)| aid == agent_id);
-        let cooldown = recent.get(agent_id).is_some_and(|(t, seq)| {
-            *seq == last_prompt || t.elapsed() < std::time::Duration::from_secs(300)
-        });
+        let busy = {
+            let pending = self.pending_permissions.read().await;
+            pending.keys().any(|(aid, _)| aid == agent_id)
+                || self.pending_questions.read().await.contains_key(agent_id)
+                || self
+                    .evaluating_permissions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .iter()
+                    .any(|(aid, _)| aid == agent_id)
+        };
+        let cooldown = {
+            let recent = self.last_compaction.lock().await;
+            recent.get(agent_id).is_some_and(|(t, seq)| {
+                *seq == last_prompt || t.elapsed() < std::time::Duration::from_secs(300)
+            })
+        };
         anyhow::ensure!(
             crate::usage::may_compact(
                 &agent.status,
@@ -5934,10 +5938,7 @@ impl AgentOrchestrator {
         let aid = agent_id.to_string();
         let native = matches!(
             agent.provider,
-            ProviderKind::Codex
-                | ProviderKind::ClaudeCode
-                | ProviderKind::Pi
-                | ProviderKind::Antigravity
+            ProviderKind::Codex | ProviderKind::ClaudeCode | ProviderKind::Pi
         );
         if native {
             tx.try_send(DriverCommand::SendPrompt {
@@ -5948,7 +5949,6 @@ impl AgentOrchestrator {
                 message_ids: Vec::new(),
             })?;
         } else {
-            drop(pending);
             self.stop_and_wait_driver(agent_id).await;
             let id = agent_id.to_owned();
             self.try_store(move |s| s.clear_context_for_handoff(&id))
@@ -5958,7 +5958,10 @@ impl AgentOrchestrator {
                 .await
                 .remove(agent_id);
         }
-        recent.insert(aid.clone(), (std::time::Instant::now(), last_prompt));
+        self.last_compaction
+            .lock()
+            .await
+            .insert(aid.clone(), (std::time::Instant::now(), last_prompt));
         let ev = self
             .try_store(move |s| -> anyhow::Result<_> {
                 s.append_audit_event(
@@ -9380,7 +9383,7 @@ pub fn set_orbit_exe_override(path: PathBuf) {
     let _ = ORBIT_EXE_OVERRIDE.set(path);
 }
 
-fn resolve_orbit_exe() -> PathBuf {
+pub(crate) fn resolve_orbit_exe() -> PathBuf {
     if let Some(overridden) = ORBIT_EXE_OVERRIDE.get()
         && overridden.is_file()
     {

@@ -1989,7 +1989,7 @@ async fn execute_command_hook(
         Ok(b) => b,
         Err(e) => return on_error(e.to_string(), String::new(), None),
     };
-    let (mut cmd, plan) = match boundary.command(original, cwd.unwrap_or(home_dir)) {
+    let (mut cmd, plan) = match boundary.command_optional_cwd(original, cwd, home_dir) {
         Ok(c) => c,
         Err(e) => return on_error(e, String::new(), None),
     };

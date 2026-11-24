@@ -61,6 +61,27 @@ fn invalid(text: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, text)
 }
 
+fn canonicalize_with_ancestor(path: &Path) -> Option<PathBuf> {
+    if let Ok(real) = path.canonicalize() {
+        return Some(real);
+    }
+    let mut missing = Vec::new();
+    let mut cur = path;
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            missing.push(name.to_os_string());
+        }
+        if let Ok(mut real_parent) = parent.canonicalize() {
+            for comp in missing.into_iter().rev() {
+                real_parent.push(comp);
+            }
+            return Some(real_parent);
+        }
+        cur = parent;
+    }
+    None
+}
+
 pub fn denied_paths(policy: &SandboxPolicy) -> io::Result<BTreeSet<PathBuf>> {
     let home = PathBuf::from(
         env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
@@ -80,7 +101,7 @@ pub fn denied_paths(policy: &SandboxPolicy) -> io::Result<BTreeSet<PathBuf>> {
             return Err(invalid("denied paths must be absolute"));
         }
         paths.insert(path.clone());
-        if let Ok(real) = path.canonicalize() {
+        if let Some(real) = canonicalize_with_ancestor(&path) {
             paths.insert(real);
         }
     }
@@ -114,7 +135,9 @@ fn sbpl(policy: &SandboxPolicy, cwd: &Path, port: Option<u16>) -> io::Result<Str
             s.replace('\\', "\\\\").replace('"', "\\\"")
         ))
     }
-    let mut p = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
+    let mut p = String::from(
+        "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write-data (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\"))\n",
+    );
     let mut roots = writable(policy, cwd)?;
     if policy.mode == SandboxMode::WorkspaceWrite {
         roots.insert(fs::canonicalize("/tmp")?);
@@ -147,6 +170,8 @@ fn bubblewrap_args(
     policy: &SandboxPolicy,
     cwd: &Path,
     port: Option<u16>,
+    bridge_socket: Option<&Path>,
+    bridge_exe: Option<&Path>,
 ) -> io::Result<Vec<OsString>> {
     let mut args: Vec<OsString> = [
         "--die-with-parent",
@@ -189,14 +214,19 @@ fn bubblewrap_args(
             args.extend(["--ro-bind".into(), "/dev/null".into(), path.into()]);
         }
     }
-    if let Some(port) = port {
-        let socket = format!("/tmp/orbit-egress-{port}/socket");
+    if port.is_some() {
+        let socket =
+            bridge_socket.ok_or_else(|| invalid("missing sandbox egress bridge socket"))?;
+        let exe = match bridge_exe {
+            Some(p) => p.to_path_buf(),
+            None => env::current_exe()?,
+        };
         args.extend([
             "--ro-bind".into(),
-            socket.into(),
+            socket.as_os_str().into(),
             "/tmp/.orbit-egress.sock".into(),
             "--ro-bind".into(),
-            env::current_exe()?.into(),
+            exe.into(),
             "/tmp/.orbit-net-bridge".into(),
         ]);
     }
@@ -231,6 +261,19 @@ impl SandboxCommand {
         policy: Option<&SandboxPolicy>,
         proxy: Option<&str>,
     ) -> io::Result<Self> {
+        Self::prepare_with_bridge(program, args, cwd, policy, proxy, None, None)
+    }
+
+    pub fn prepare_with_bridge(
+        program: &std::ffi::OsStr,
+        args: Vec<OsString>,
+        cwd: &Path,
+        policy: Option<&SandboxPolicy>,
+        proxy: Option<&str>,
+        bridge_socket: Option<&Path>,
+        bridge_exe: Option<&Path>,
+    ) -> io::Result<Self> {
+        let _ = (bridge_socket, bridge_exe);
         let mut cmd = Self {
             program: program.into(),
             args,
@@ -292,7 +335,7 @@ impl SandboxCommand {
                     "sandbox requires bubblewrap (bwrap)",
                 )
             })?;
-            let mut prefix = bubblewrap_args(policy, cwd, port)?;
+            let mut prefix = bubblewrap_args(policy, cwd, port, bridge_socket, bridge_exe)?;
             prefix.push(cmd.program);
             prefix.append(&mut cmd.args);
             cmd.program = bin.into();
@@ -413,6 +456,20 @@ mod tests {
                 .status
                 .success()
         );
+        let dev_null = SandboxCommand::prepare(
+            "/bin/sh".as_ref(),
+            vec!["-c".into(), "echo ok > /dev/null".into()],
+            &path,
+            Some(&SandboxPolicy {
+                mode: SandboxMode::StrictReadOnly,
+                ..policy.clone()
+            }),
+            None,
+        )?;
+        assert!(
+            dev_null.command().output().await?.status.success(),
+            "StrictReadOnly must allow writing data to /dev/null"
+        );
         Ok(())
     }
     #[test]
@@ -424,15 +481,37 @@ mod tests {
             mac.contains("localhost:32111")
                 && mac.contains("/.ssh")
                 && mac.contains("(deny network*)")
+                && mac.contains("(literal \"/dev/null\")")
         );
-        let b = bubblewrap_args(&policy, &cwd, None)?;
+        let b = bubblewrap_args(&policy, &cwd, None, None, None)?;
         assert!(b.contains(&"--unshare-net".into()) && b.contains(&"--bind".into()));
+        let b_net = bubblewrap_args(
+            &policy,
+            &cwd,
+            Some(32111),
+            Some(Path::new("/run/orbit/egress.sock")),
+            Some(Path::new("/usr/local/bin/orbit")),
+        )?;
+        assert!(b_net.contains(&"/run/orbit/egress.sock".into()));
+        assert!(b_net.contains(&"/usr/local/bin/orbit".into()));
         let strict = SandboxPolicy {
             mode: SandboxMode::StrictReadOnly,
             ..policy
         };
         assert!(!sbpl(&strict, &cwd, None)?.contains("(allow file-write*"));
-        assert!(!bubblewrap_args(&strict, &cwd, None)?.contains(&"--bind".into()));
+        assert!(!bubblewrap_args(&strict, &cwd, None, None, None)?.contains(&"--bind".into()));
+
+        // P0-5: Non-existent denied path under symlinked ancestor resolves canonical path too.
+        let dir = tempfile::tempdir()?;
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(dir.path(), &link)?;
+        let missing = link.join("nonexistent-secret.json");
+        let p2 = SandboxPolicy {
+            denied_read_paths: vec![missing.to_string_lossy().into()],
+            ..Default::default()
+        };
+        let denied = denied_paths(&p2)?;
+        assert!(denied.contains(&dir.path().canonicalize()?.join("nonexistent-secret.json")));
         Ok(())
     }
 }

@@ -65,16 +65,21 @@ pub async fn bundle(rt: &Arc<DaemonRuntime>) -> anyhow::Result<Value> {
             "providers":info.available_providers,"lsp":lsp,"sandbox":orbit_shim::probe_sandbox_support(),"sqlite_integrity_ok":store.integrity_ok()?,
             "audit":store.verify_audit_chain(store.audit_verifying_key().as_ref())?,"logs_newest_first":log_summary(&String::from_utf8_lossy(&raw))}))
     }).await??;
-    let mut sockets = tokio::fs::read_dir(rt.home_dir.join("shims")).await?;
     let mut total = 0;
     let mut healthy = 0;
-    while let Some(e) = sockets.next_entry().await? {
-        if e.path().extension().is_some_and(|s| s == "sock") {
-            total += 1;
-            if orbit_shim::shim_socket_reachable(&e.path()).await {
-                healthy += 1;
+    match tokio::fs::read_dir(rt.home_dir.join("shims")).await {
+        Ok(mut sockets) => {
+            while let Some(e) = sockets.next_entry().await? {
+                if e.path().extension().is_some_and(|s| s == "sock") {
+                    total += 1;
+                    if orbit_shim::shim_socket_reachable(&e.path()).await {
+                        healthy += 1;
+                    }
+                }
             }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
     result["shim_sockets"] = json!({"total":total,"healthy":healthy});
     result["relay_connected"] = json!(rt.relay_connected.load(Ordering::Relaxed));
@@ -89,6 +94,7 @@ pub fn write_private(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
     write(file.as_file_mut())?;
     file.flush()?;

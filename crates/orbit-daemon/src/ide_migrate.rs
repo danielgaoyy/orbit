@@ -157,11 +157,13 @@ fn collect(
         }
     }
     let mut configs = match source {
-        "claude" => vec![
-            folder.join("settings.json"),
-            folder.join("mcp.json"),
-            base.join(if project { ".mcp.json" } else { ".claude.json" }),
-        ],
+        "claude" => {
+            let mut list = vec![folder.join("settings.json"), folder.join("mcp.json")];
+            if !project {
+                list.push(base.join(".claude.json"));
+            }
+            list
+        }
         "codex" => vec![folder.join("config.toml")],
         "antigravity" => vec![folder.join("mcp_config.json")],
         _ => vec![folder.join("mcp.json")],
@@ -169,15 +171,19 @@ fn collect(
     for path in configs.drain(..) {
         confined(base, &path)?;
         let Some(bytes) = read(&path)? else { continue };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            tracing::warn!(path = %path.display(), "skipping non-UTF8 IDE migration config");
+            continue;
+        };
         let servers = if source == "codex" {
-            mcp_servers::parse_codex_toml_mcp_servers(std::str::from_utf8(&bytes)?, &path)
+            mcp_servers::parse_codex_toml_mcp_servers(text, &path)
         } else {
-            let mut v: Value = if source == "vscode" {
-                json5::from_str(std::str::from_utf8(&bytes)?)
-                    .with_context(|| format!("invalid {}", path.display()))?
-            } else {
-                serde_json::from_slice(&bytes)
-                    .with_context(|| format!("invalid {}", path.display()))?
+            let mut v: Value = match json5::from_str(text) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    tracing::warn!(path = %path.display(), %err, "skipping malformed IDE migration config");
+                    continue;
+                }
             };
             if source == "vscode" {
                 v = json!({"mcpServers":v.get("servers")});
@@ -185,7 +191,13 @@ fn collect(
             mcp_servers::parse_json_mcp_servers_value(&v, McpServerScope::OrbitUser, &path, true)
         };
         for server in servers {
-            let v = mcp_servers::migration_value(&server).map_err(anyhow::Error::msg)?;
+            let v = match mcp_servers::migration_value(&server) {
+                Ok(val) => val,
+                Err(err) => {
+                    tracing::warn!(server = %server.name, %err, "skipping invalid MCP server entry during migration");
+                    continue;
+                }
+            };
             out.push(Candidate {
                 source,
                 kind: "mcp",

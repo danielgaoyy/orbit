@@ -440,7 +440,9 @@ impl AcpCallbackHost {
         let live_pgid_bg = Arc::clone(&live_pgid);
         let waiters_bg = Arc::clone(&waiters);
         let reply_tx_bg = self.reply_tx.clone();
+        let sandbox_profile_bg = plan.profile;
         let task = tokio::spawn(async move {
+            let _sandbox_profile = sandbox_profile_bg;
             let out_ring_1 = Arc::clone(&output_bg);
             let mut stdout_reader = tokio::spawn(async move {
                 if let Some(mut s) = stdout {

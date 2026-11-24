@@ -11,7 +11,8 @@ use sha2::{Digest, Sha256};
 pub(super) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS security_audit_chain (
 seq INTEGER PRIMARY KEY AUTOINCREMENT, timestamp_ms INTEGER NOT NULL, category TEXT NOT NULL,
 action TEXT NOT NULL, actor TEXT NOT NULL, host_id TEXT, agent_id TEXT, outcome TEXT NOT NULL,
-details_json TEXT NOT NULL, prev_hash TEXT NOT NULL, entry_hash TEXT NOT NULL, checkpoint_sig TEXT);";
+details_json TEXT NOT NULL, prev_hash TEXT NOT NULL, entry_hash TEXT NOT NULL, checkpoint_sig TEXT);
+CREATE INDEX IF NOT EXISTS idx_audit_category_outcome ON security_audit_chain(category, outcome);";
 
 #[derive(Debug, Serialize)]
 pub struct AuditEntry {

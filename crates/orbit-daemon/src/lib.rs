@@ -527,9 +527,10 @@ fn open_signed_store(
     let mut digest = sha2::Sha256::new();
     digest.update(b"orbit/audit-ed25519/v1");
     digest.update(*zeroize::Zeroizing::new(keypair.private_bytes()?));
+    let key_bytes = zeroize::Zeroizing::new(<[u8; 32]>::from(digest.finalize()));
     store.set_audit_identity(
         keypair.host_id()?,
-        ed25519_dalek::SigningKey::from_bytes(&digest.finalize().into()),
+        ed25519_dalek::SigningKey::from_bytes(&key_bytes),
     )?;
     Ok(store)
 }
@@ -539,11 +540,21 @@ pub async fn run_tool_shim(
     socket: &Path,
     mut spec: orbit_shim::ShimSpawnSpec,
 ) -> anyhow::Result<()> {
+    struct CleanupPathsGuard(Vec<PathBuf>);
+    impl Drop for CleanupPathsGuard {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    let mut early_cleanup = CleanupPathsGuard(spec.cleanup_paths.clone());
     let Some(policy) = spec
         .sandbox
         .clone()
         .filter(|p| p.mode != orbit_protocol::SandboxMode::Off)
     else {
+        early_cleanup.0.clear();
         return Ok(orbit_shim::run_shim(socket, spec).await?);
     };
     let home = spec
@@ -558,24 +569,42 @@ pub async fn run_tool_shim(
     })
     .await??;
     let agent = spec.env.get("ORBIT_AGENT_ID").cloned();
-    let _proxy = if policy.allow_network && spec.egress_proxy_url.is_none() {
+    let proxy = if policy.allow_network && spec.egress_proxy_url.is_none() {
         let proxy = egress_proxy::start(policy, store.clone(), agent.clone()).await?;
         spec.egress_proxy_url = Some(proxy.url.clone());
         Some(proxy)
     } else {
         None
     };
-    let result = orbit_shim::run_shim(socket, spec).await;
+    let bridge_socket = proxy
+        .as_ref()
+        .and_then(|p| p.bridge_socket())
+        .map(Path::to_path_buf);
+    let orbit_exe = crate::manager::resolve_orbit_exe();
+    early_cleanup.0.clear();
+    let result = orbit_shim::run_shim_with_bridge(
+        socket,
+        spec,
+        bridge_socket.as_deref(),
+        Some(orbit_exe.as_path()),
+    )
+    .await;
     if result.is_err() {
-        store.append_audit_event(
-            "sandbox",
-            "launch",
-            "shim",
-            agent.as_deref(),
-            "block",
-            &serde_json::Value::Null,
-        )?;
+        let store_bg = store.clone();
+        let agent_bg = agent.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = store_bg.append_audit_event(
+                "sandbox",
+                "launch",
+                "shim",
+                agent_bg.as_deref(),
+                "block",
+                &serde_json::Value::Null,
+            );
+        })
+        .await;
     }
+    drop(proxy);
     Ok(result?)
 }
 
@@ -8773,24 +8802,76 @@ async fn handle_wire_rpc(
                 Err(e) => rpc_err(request_id, "compaction", e),
             },
         ),
-        WireMessage::GetSandboxConfig { request_id } => Some(WireMessage::SandboxConfig {
-            request_id,
-            sandbox_policy: DaemonPersistedConfig::load(&runtime.home_dir).sandbox_policy,
-        }),
+        WireMessage::GetSandboxConfig { request_id } => {
+            let home = runtime.home_dir.clone();
+            Some(
+                match tokio::task::spawn_blocking(move || {
+                    DaemonPersistedConfig::load(&home).sandbox_policy
+                })
+                .await
+                {
+                    Ok(sandbox_policy) => WireMessage::SandboxConfig {
+                        request_id,
+                        sandbox_policy,
+                    },
+                    Err(e) => rpc_err(request_id, "sandbox_config", e),
+                },
+            )
+        }
         WireMessage::UpdateSandboxConfig {
             request_id,
             sandbox_policy,
-        } => Some(
-            match DaemonPersistedConfig::update(&runtime.home_dir, |c| {
-                c.sandbox_policy = sandbox_policy.clone()
-            }) {
-                Ok(()) => WireMessage::SandboxConfig {
-                    request_id,
-                    sandbox_policy,
+        } => {
+            if let Some(ref policy) = sandbox_policy {
+                let bad_path = policy
+                    .writable_roots
+                    .iter()
+                    .chain(policy.denied_read_paths.iter())
+                    .any(|p| p.trim().is_empty() || p.chars().any(char::is_control));
+                if bad_path {
+                    return Some(rpc_err(
+                        request_id,
+                        "sandbox_config",
+                        "sandbox paths must be non-empty and free of control characters",
+                    ));
+                }
+            }
+            let home = runtime.home_dir.clone();
+            let store = runtime.store.clone();
+            let policy_to_save = sandbox_policy.clone();
+            Some(
+                match tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    DaemonPersistedConfig::update(&home, |c| {
+                        c.sandbox_policy = policy_to_save.clone();
+                    })?;
+                    let mode_label = policy_to_save
+                        .as_ref()
+                        .map(|p| format!("{:?}", p.mode))
+                        .unwrap_or_else(|| "None".to_string());
+                    let _ = store.append_audit_event(
+                        "sandbox",
+                        "update_config",
+                        "client",
+                        None,
+                        "allow",
+                        &serde_json::json!({
+                            "mode": mode_label,
+                            "allow_network": policy_to_save.as_ref().is_some_and(|p| p.allow_network),
+                        }),
+                    );
+                    Ok(())
+                })
+                .await
+                {
+                    Ok(Ok(())) => WireMessage::SandboxConfig {
+                        request_id,
+                        sandbox_policy,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "sandbox_config", e),
+                    Err(e) => rpc_err(request_id, "sandbox_config", e),
                 },
-                Err(e) => rpc_err(request_id, "sandbox_config", e),
-            },
-        ),
+            )
+        }
         WireMessage::GetAuditChainStatus { request_id } => {
             let s = runtime.store.clone();
             Some(

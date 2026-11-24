@@ -129,11 +129,23 @@ pub(super) mod native {
         );
         Ok(sid.to_owned())
     }
+    fn canonical_windows_path(path: &Path) -> std::io::Result<PathBuf> {
+        let canon = path.canonicalize()?;
+        let s = canon.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            Ok(PathBuf::from(format!(r"\\{rest}")))
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            Ok(PathBuf::from(rest))
+        } else {
+            Ok(canon)
+        }
+    }
     fn task_name(sid: &str, home: &Path) -> String {
-        use std::hash::{DefaultHasher, Hash, Hasher};
-        let mut hash = DefaultHasher::new();
-        home.hash(&mut hash);
-        format!("Orbit-Daemon-{sid}-{:016x}", hash.finish())
+        use sha2::{Digest, Sha256};
+        let norm = home.to_string_lossy().to_ascii_lowercase();
+        let digest = Sha256::digest(norm.as_bytes());
+        let short = hex::encode(&digest[..8]);
+        format!("Orbit-Daemon-{sid}-{short}")
     }
     fn marker(home: &Path, role: ServiceRole) -> PathBuf {
         home.join(format!("{}.supervisor", role.unit_name()))
@@ -144,7 +156,7 @@ pub(super) mod native {
         home: &Path,
         service: bool,
     ) -> anyhow::Result<String> {
-        let home = home.canonicalize()?;
+        let home = canonical_windows_path(home)?;
         let marker = marker(&home, role);
         let is_scm = role == ServiceRole::Relay
             || service
@@ -172,6 +184,7 @@ pub(super) mod native {
                 .arg("/grant")
                 .arg(format!(r"NT SERVICE\{name}:(OI)(CI)M")))?;
             run(Command::new(&sc).args(failure_args(role)))?;
+            run(Command::new(&sc).args(["failureflag", name, "1"]))?;
             if fs::read_to_string(&marker).is_ok_and(|v| v == "task") {
                 let name = task_name(&sid()?, &home);
                 let sch = tool("schtasks.exe");
@@ -229,7 +242,7 @@ pub(super) mod native {
         anyhow::bail!("Windows service stop timed out")
     }
     pub fn stop(role: ServiceRole, home: &Path) -> anyhow::Result<()> {
-        let home = home.canonicalize()?;
+        let home = canonical_windows_path(home)?;
         let file = marker(&home, role);
         match fs::read_to_string(&file) {
             Ok(v) if v == "scm" => {
@@ -274,7 +287,7 @@ pub(super) mod native {
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
         })?;
-        let report = |state, code| {
+        let report = |state, code, wait_hint| {
             handler.set_service_status(ServiceStatus {
                 service_type: ServiceType::OWN_PROCESS,
                 current_state: state,
@@ -285,7 +298,7 @@ pub(super) mod native {
                 },
                 exit_code: ServiceExitCode::Win32(code),
                 checkpoint: 0,
-                wait_hint: Duration::ZERO,
+                wait_hint,
                 process_id: None,
             })
         };
@@ -293,7 +306,7 @@ pub(super) mod native {
             .thread_stack_size(8 * 1024 * 1024)
             .enable_all()
             .build()?;
-        report(ServiceState::Running, 0)?;
+        report(ServiceState::Running, 0, Duration::ZERO)?;
         let result = rt.block_on(async {
             let exporter = crate::setup_logging(home, *role == ServiceRole::Daemon)?;
             match role {
@@ -308,6 +321,7 @@ pub(super) mod native {
                     };
                     orbit_daemon::run_daemon_until(config, exporter, async {
                         let _ = rx.await;
+                        let _ = report(ServiceState::StopPending, 0, Duration::from_secs(15));
                     })
                     .await
                 }
@@ -322,12 +336,19 @@ pub(super) mod native {
                     };
                     tokio::select! {
                         result = orbit_relay::run_relay(config) => result,
-                        _ = rx => Ok(()),
+                        _ = rx => {
+                            let _ = report(ServiceState::StopPending, 0, Duration::from_secs(15));
+                            Ok(())
+                        }
                     }
                 }
             }
         });
-        report(ServiceState::Stopped, u32::from(result.is_err()))?;
+        report(
+            ServiceState::Stopped,
+            u32::from(result.is_err()),
+            Duration::ZERO,
+        )?;
         result
     }
 }

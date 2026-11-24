@@ -1949,21 +1949,35 @@ pub async fn spawn_detached_shim(
 }
 
 /// Entrypoint invoked by `orbit shim --socket <path>` (with `ShimSpawnSpec` JSON piped over stdin).
-pub async fn run_shim(socket_path: &Path, mut spec: ShimSpawnSpec) -> Result<(), ShimError> {
+pub async fn run_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), ShimError> {
+    run_shim_with_bridge(socket_path, spec, None, None).await
+}
+
+pub async fn run_shim_with_bridge(
+    socket_path: &Path,
+    mut spec: ShimSpawnSpec,
+    bridge_socket: Option<&Path>,
+    bridge_exe: Option<&Path>,
+) -> Result<(), ShimError> {
+    struct EarlyCleanupGuard(Vec<PathBuf>);
+    impl Drop for EarlyCleanupGuard {
+        fn drop(&mut self) {
+            if !self.0.is_empty() {
+                unlink_cleanup_paths(&self.0);
+            }
+        }
+    }
+    let mut early_cleanup = EarlyCleanupGuard(spec.cleanup_paths.clone());
     validate_spawn_spec(&spec)?;
-    let plan = match sandbox::SandboxCommand::prepare(
+    let plan = sandbox::SandboxCommand::prepare_with_bridge(
         spec.program.as_ref(),
         spec.args.iter().map(Into::into).collect(),
         &spec.cwd,
         spec.sandbox.as_ref(),
         spec.egress_proxy_url.as_deref(),
-    ) {
-        Ok(plan) => plan,
-        Err(e) => {
-            unlink_cleanup_paths(&spec.cleanup_paths);
-            return Err(e.into());
-        }
-    };
+        bridge_socket,
+        bridge_exe,
+    )?;
     spec.program = plan
         .program
         .into_string()
@@ -1988,6 +2002,8 @@ pub async fn run_shim(socket_path: &Path, mut spec: ShimSpawnSpec) -> Result<(),
     if let Some(path) = plan.profile {
         spec.cleanup_paths.push(path.keep().map_err(|e| e.error)?);
     }
+    // Ownership of `cleanup_paths` now passes to run_stdio_shim / run_pty_shim.
+    early_cleanup.0.clear();
     match spec.mode {
         ShimMode::Stdio => run_stdio_shim(socket_path, spec).await,
         ShimMode::Pty { cols, rows } => run_pty_shim(socket_path, spec, cols, rows).await,

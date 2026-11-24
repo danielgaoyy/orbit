@@ -660,13 +660,27 @@ fn setup_logging(
         .then(|| {
             std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .ok()
-                .or_else(|| DaemonPersistedConfig::load(home_dir).telemetry_endpoint)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    DaemonPersistedConfig::load(home_dir)
+                        .telemetry_endpoint
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                })
         })
         .flatten();
     let log_layer = if let Some(endpoint) = endpoint {
-        let (layer, handle) = orbit_daemon::telemetry::start(&endpoint)?;
-        exporter = Some(handle);
-        Some(layer)
+        match orbit_daemon::telemetry::start(&endpoint) {
+            Ok((layer, handle)) => {
+                exporter = Some(handle);
+                Some(layer)
+            }
+            Err(err) => {
+                eprintln!("warning: ignoring invalid OTLP telemetry endpoint `{endpoint}`: {err}");
+                None
+            }
+        }
     } else {
         None
     };
@@ -692,6 +706,9 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     let server = resolve_server_url(&home_dir, cli.server);
 
     let initialize_logging = !matches!(cli.command, Commands::Mcp { .. });
+    #[cfg(target_os = "linux")]
+    let initialize_logging =
+        initialize_logging && !matches!(cli.command, Commands::SandboxBridge { .. });
     #[cfg(windows)]
     let initialize_logging =
         initialize_logging && !matches!(cli.command, Commands::ServiceRun { .. });

@@ -2186,7 +2186,7 @@ async fn probe_stdio_mcp(
     };
     let mut original = Command::new(&resolved);
     original.args(args);
-    let (mut cmd, plan) = match boundary.command(original, cwd.unwrap_or(orbit_home)) {
+    let (mut cmd, plan) = match boundary.command_optional_cwd(original, cwd, orbit_home) {
         Ok(c) => c,
         Err(e) => return fail(e),
     };
@@ -2888,7 +2888,7 @@ async fn invoke_stdio_mcp_method(
         .map_err(|e| e.to_string())?;
     let mut original = Command::new(&resolved);
     original.args(args);
-    let (mut cmd, plan) = boundary.command(original, cwd.unwrap_or(orbit_home))?;
+    let (mut cmd, plan) = boundary.command_optional_cwd(original, cwd, orbit_home)?;
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

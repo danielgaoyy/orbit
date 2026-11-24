@@ -5,11 +5,12 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hyper::{body::Incoming, service::service_fn};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use orbit_protocol::SandboxPolicy;
 use orbit_store::OrbitStore;
 use std::{
     net::{IpAddr, SocketAddr},
+    path::Path,
     sync::Arc,
     time::Duration,
 };
@@ -24,7 +25,19 @@ pub(crate) struct SessionProxy {
     listener: JoinHandle<()>,
     shutdown: tokio::sync::watch::Sender<()>,
     #[cfg(target_os = "linux")]
-    _bridge: LinuxBridge,
+    bridge: LinuxBridge,
+}
+impl SessionProxy {
+    pub fn bridge_socket(&self) -> Option<&Path> {
+        #[cfg(target_os = "linux")]
+        {
+            Some(&self.bridge.socket_path)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
 }
 impl Drop for SessionProxy {
     fn drop(&mut self) {
@@ -34,8 +47,14 @@ impl Drop for SessionProxy {
 }
 
 fn domain_matches(pattern: &str, host: &str) -> bool {
-    let p = pattern.trim_end_matches('.').to_ascii_lowercase();
-    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    let p = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if let (Ok(p_ip), Ok(h_ip)) = (
+        p.trim_matches(['[', ']']).parse::<IpAddr>(),
+        h.trim_matches(['[', ']']).parse::<IpAddr>(),
+    ) {
+        return p_ip == h_ip;
+    }
     if let Some(suffix) = p.strip_prefix("*.") {
         h.strip_suffix(suffix)
             .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1)
@@ -159,8 +178,17 @@ where
                             match tokio::time::timeout(Duration::from_secs(20),forward(req,s,dial)).await{
                                 Ok(r)=>r,Err(_)=>response(StatusCode::GATEWAY_TIMEOUT)
                             })}});
-                        let _=tokio::time::timeout(Duration::from_secs(600),hyper::server::conn::http1::Builder::new()
-                            .keep_alive(false).max_buf_size(32768).serve_connection(TokioIo::new(stream),service).with_upgrades()).await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(600),
+                            hyper::server::conn::http1::Builder::new()
+                                .timer(TokioTimer::new())
+                                .header_read_timeout(Duration::from_secs(10))
+                                .keep_alive(false)
+                                .max_buf_size(32768)
+                                .serve_connection(TokioIo::new(stream), service)
+                                .with_upgrades(),
+                        )
+                        .await;
                     });
                 }
             }
@@ -171,21 +199,21 @@ where
         listener: task,
         shutdown,
         #[cfg(target_os = "linux")]
-        _bridge: bridge,
+        bridge,
     })
 }
 #[cfg(target_os = "linux")]
 struct LinuxBridge {
     task: JoinHandle<()>,
-    dir: std::path::PathBuf,
+    socket_path: std::path::PathBuf,
+    _dir: tempfile::TempDir,
 }
 #[cfg(target_os = "linux")]
 impl LinuxBridge {
     fn bind(port: u16) -> std::io::Result<Self> {
-        use std::os::unix::fs::DirBuilderExt;
-        let dir = std::path::PathBuf::from(format!("/tmp/orbit-egress-{port}"));
-        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
-        let socket = tokio::net::UnixListener::bind(dir.join("socket"))?;
+        let dir = tempfile::Builder::new().prefix("orbit-egress-").tempdir()?;
+        let socket_path = dir.path().join("socket");
+        let socket = tokio::net::UnixListener::bind(&socket_path)?;
         let task = tokio::spawn(async move {
             let mut tasks = tokio::task::JoinSet::new();
             loop {
@@ -198,15 +226,17 @@ impl LinuxBridge {
                 }
             }
         });
-        Ok(Self { task, dir })
+        Ok(Self {
+            task,
+            socket_path,
+            _dir: dir,
+        })
     }
 }
 #[cfg(target_os = "linux")]
 impl Drop for LinuxBridge {
     fn drop(&mut self) {
         self.task.abort();
-        let _ = std::fs::remove_file(self.dir.join("socket"));
-        let _ = std::fs::remove_dir(&self.dir);
     }
 }
 fn response(status: StatusCode) -> Response<Body> {
@@ -262,25 +292,30 @@ where
         s.record("block", "address", Some(host)).await;
         return response(StatusCode::FORBIDDEN);
     }
+    let tunnel_permit = if connect {
+        match s.tunnels.clone().try_acquire_owned() {
+            Ok(p) => Some(p),
+            Err(_) => return response(StatusCode::SERVICE_UNAVAILABLE),
+        }
+    } else {
+        None
+    };
     if !s.record("allow", "policy", Some(host)).await {
         return response(StatusCode::SERVICE_UNAVAILABLE);
     }
     let Ok(stream) = dial(resolved).await else {
         return response(StatusCode::BAD_GATEWAY);
     };
-    relay_request(req, auth, stream, connect, s).await
+    relay_request(req, auth, stream, tunnel_permit, s).await
 }
 async fn relay_request(
     mut req: Request<Incoming>,
     auth: Authority,
     mut stream: TcpStream,
-    connect: bool,
+    tunnel_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     session: Arc<Session>,
 ) -> Response<Body> {
-    if connect {
-        let Ok(permit) = session.tunnels.clone().try_acquire_owned() else {
-            return response(StatusCode::SERVICE_UNAVAILABLE);
-        };
+    if let Some(permit) = tunnel_permit {
         let mut shutdown = session.shutdown.clone();
         let upgrade = hyper::upgrade::on(&mut req);
         tokio::spawn(async move {
@@ -337,7 +372,13 @@ async fn relay_request(
     else {
         return response(StatusCode::BAD_GATEWAY);
     };
-    tokio::spawn(conn);
+    let mut shutdown = session.shutdown.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = shutdown.changed() => {}
+            _ = tokio::time::timeout(Duration::from_secs(30), conn) => {}
+        }
+    });
     sender
         .send_request(req)
         .await

@@ -637,7 +637,8 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::ImChannelTestResponse { request_id, .. }
         | WireMessage::PushDevicesSnapshot { request_id, .. }
         | WireMessage::PushTestResponse { request_id, .. }
-        | WireMessage::PeerBridgeOpened { request_id, .. } => Some(*request_id),
+        | WireMessage::PeerBridgeOpened { request_id, .. }
+        | WireMessage::PreviewTunnelOpened { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }
         | WireMessage::ArtifactDeleted { request_id, .. }
@@ -1451,6 +1452,15 @@ mod tests {
                 screenshot_base64: None,
                 text_excerpt: None,
                 captcha_detected: false,
+                picked_element: None,
+            }),
+            Some(req_id)
+        );
+        assert_eq!(
+            extract_response_request_id(&WireMessage::PreviewTunnelOpened {
+                request_id: req_id,
+                tunnel_id: Uuid::new_v4(),
+                target_port: 5173,
             }),
             Some(req_id)
         );

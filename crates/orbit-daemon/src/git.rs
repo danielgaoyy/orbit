@@ -620,7 +620,7 @@ pub(crate) fn unix_o_nofollow_flag() -> Option<i32> {
 /// Open a canonicalized regular file with `O_NOFOLLOW` (where supported) and verify via `fstat`
 /// on the opened handle + pre/post `symlink_metadata` `(dev, ino)` identity checks that no
 /// symlink swap occurred between containment validation and open.
-async fn open_validated_regular_file_async(
+pub(crate) async fn open_validated_regular_file_async(
     canonical: &Path,
     trimmed: &str,
 ) -> Result<(tokio::fs::File, std::fs::Metadata), String> {

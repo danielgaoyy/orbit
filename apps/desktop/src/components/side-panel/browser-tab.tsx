@@ -7,10 +7,12 @@ import {
   Camera,
   ChevronDown,
   ChevronUp,
+  Crosshair,
   ExternalLink,
   Globe,
   History,
   Layers,
+  Loader2,
   Maximize2,
   Monitor,
   Play,
@@ -21,7 +23,12 @@ import {
 } from "lucide-react";
 import { Select } from "@/components/ui/select";
 import { useI18n } from "@/lib/i18n";
-import { orbitIpc } from "@/lib/orbit-ipc";
+import {
+  type PickedElementBox,
+  type RemotePreviewTunnelView,
+  type WorkspaceScriptInfo,
+  orbitIpc,
+} from "@/lib/orbit-ipc";
 import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -70,7 +77,78 @@ function normalizeAddressInput(raw: string): string {
   return sanitizeHttpUrl(`https://${trimmed}`);
 }
 
-const EMPTY_LOCAL_URLS: readonly string[] = [];
+const EMPTY_LOCAL_URLS: readonly string[] = Object.freeze([]);
+const EMPTY_SCRIPTS_MAP: Readonly<Record<string, readonly WorkspaceScriptInfo[]>> = Object.freeze(
+  {},
+);
+
+function extractProxyHost(rawUrl: string | null | undefined): string | null {
+  if (!rawUrl) return null;
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase();
+    return host.endsWith(".localhost") ? host : null;
+  } catch {
+    return null;
+  }
+}
+
+interface MatchedRemoteService {
+  port: number;
+  proxyHost: string | null;
+  serviceName: string;
+}
+
+function matchRemotePreviewService(
+  rawUrl: string,
+  runningServices: readonly WorkspaceScriptInfo[],
+): MatchedRemoteService | null {
+  if (!rawUrl || runningServices.length === 0) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  const portNum = parsed.port ? Number.parseInt(parsed.port, 10) : 0;
+
+  for (const svc of runningServices) {
+    if (svc.port == null || svc.port <= 0) continue;
+    const svcProxyHost = extractProxyHost(svc.proxy_url);
+    if (svcProxyHost && hostname === svcProxyHost) {
+      return { port: svc.port, proxyHost: svcProxyHost, serviceName: svc.name };
+    }
+  }
+  if (
+    portNum > 0 &&
+    (hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "0.0.0.0" ||
+      hostname === "::1" ||
+      hostname === "[::1]")
+  ) {
+    for (const svc of runningServices) {
+      if (svc.port === portNum) {
+        return {
+          port: svc.port,
+          proxyHost: extractProxyHost(svc.proxy_url),
+          serviceName: svc.name,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+function applyTunnelOrigin(originalUrl: string, tunnelLocalUrl: string): string {
+  try {
+    const orig = new URL(originalUrl);
+    const tun = new URL(tunnelLocalUrl);
+    return `${tun.origin}${orig.pathname}${orig.search}${orig.hash}`;
+  } catch {
+    return tunnelLocalUrl;
+  }
+}
 
 function isLocalUrl(url: string): boolean {
   try {
@@ -134,6 +212,12 @@ export const BrowserTab = memo(function BrowserTab({
   const hostBrowser = useOrbitSelector((s) =>
     s.selectedHostId ? (s.browserByHost[s.selectedHostId] ?? null) : null,
   );
+  const hostScriptsByWorkspace = useOrbitSelector((s) =>
+    s.selectedHostId
+      ? (s.hostDetails[s.selectedHostId]?.workspace_scripts ?? EMPTY_SCRIPTS_MAP)
+      : EMPTY_SCRIPTS_MAP,
+  );
+  const selectedWorkspaceCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
 
   const initialUrl = sanitizeHttpUrl(tab.url ?? "");
   const [mode, setMode] = useState<BrowserPanelMode>("preview");
@@ -149,11 +233,107 @@ export const BrowserTab = memo(function BrowserTab({
   const [stageWidth, setStageWidth] = useState(0);
   const [auditOpen, setAuditOpen] = useState(false);
   const [consoleOpen, setConsoleOpen] = useState(false);
+  const [pickElementMode, setPickElementMode] = useState(false);
+  const [pickedHighlight, setPickedHighlight] = useState<{
+    box: PickedElementBox;
+    viewportWidth: number;
+    viewportHeight: number;
+  } | null>(null);
+  const [remoteTunnel, setRemoteTunnel] = useState<{
+    key: string;
+    view: RemotePreviewTunnelView;
+  } | null>(null);
+  const [remoteTunnelOpeningKey, setRemoteTunnelOpeningKey] = useState<string | null>(null);
 
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const addressInputRef = useRef<HTMLInputElement | null>(null);
+  const highlightTimerRef = useRef<number | null>(null);
   const activeUrl = navState.idx >= 0 ? sanitizeHttpUrl(navState.entries[navState.idx] ?? "") : "";
+
+  const isRemoteHost = Boolean(
+    hostCard &&
+      (!hostCard.is_local ||
+        Boolean(hostCard.ssh_alias) ||
+        !hostCard.direct_endpoints.some(
+          (e) => e.includes("127.0.0.1") || e.includes("localhost"),
+        )),
+  );
+
+  const runningServices = useMemo(() => {
+    const list: WorkspaceScriptInfo[] = [];
+    for (const scripts of Object.values(hostScriptsByWorkspace)) {
+      for (const s of scripts) {
+        if (s.kind === "service" && s.status === "running" && s.port != null && s.port > 0) {
+          list.push(s);
+        }
+      }
+    }
+    return list;
+  }, [hostScriptsByWorkspace]);
+
+  const matchedRemoteService = useMemo(
+    () => (isRemoteHost ? matchRemotePreviewService(activeUrl, runningServices) : null),
+    [isRemoteHost, activeUrl, runningServices],
+  );
+
+  const remoteTunnelKey =
+    selectedHostId && matchedRemoteService
+      ? `${selectedHostId}::${matchedRemoteService.port}::${matchedRemoteService.proxyHost ?? ""}`
+      : null;
+
+  useEffect(() => {
+    if (!visible || !remoteTunnelKey || !selectedHostId || !matchedRemoteService) {
+      setRemoteTunnelOpeningKey(null);
+      return;
+    }
+    if (remoteTunnel?.key === remoteTunnelKey) {
+      setRemoteTunnelOpeningKey(null);
+      return;
+    }
+    let cancelled = false;
+    setRemoteTunnelOpeningKey(remoteTunnelKey);
+    void orbitIpc
+      .openRemotePreviewTunnel(
+        selectedHostId,
+        matchedRemoteService.port,
+        matchedRemoteService.proxyHost,
+      )
+      .then((view) => {
+        if (cancelled) return;
+        setRemoteTunnel({ key: remoteTunnelKey, view });
+        setRemoteTunnelOpeningKey(null);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setRemoteTunnelOpeningKey(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    visible,
+    remoteTunnelKey,
+    selectedHostId,
+    matchedRemoteService?.port,
+    matchedRemoteService?.proxyHost,
+    remoteTunnel?.key,
+  ]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    return () => {
+      if (highlightTimerRef.current !== null) {
+        window.clearTimeout(highlightTimerRef.current);
+      }
+    };
+  }, []);
+
+  const activeRemoteTunnel =
+    remoteTunnelKey && remoteTunnel?.key === remoteTunnelKey ? remoteTunnel.view : null;
+  const resolvedPreviewUrl =
+    activeRemoteTunnel?.is_tunneled && activeUrl
+      ? applyTunnelOrigin(activeUrl, activeRemoteTunnel.local_url)
+      : activeUrl;
 
   const cdpSessions = hostBrowser?.sessions ?? [];
   const activeCdpSession = useMemo(() => {
@@ -197,6 +377,13 @@ export const BrowserTab = memo(function BrowserTab({
     }
   }, [activeCdpSession?.session_id, activeCdpSession?.url]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Reset element picker mode whenever leaving CDP mode or losing the active session
+  useEffect(() => {
+    if (!isCdpMode || !activeCdpSession) {
+      setPickElementMode(false);
+    }
+  }, [isCdpMode, activeCdpSession?.session_id]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Clear loading spinner if a blocked/unreachable origin never triggers iframe `onLoad`
   useEffect(() => {
     if (!isLoading) return;
@@ -220,6 +407,9 @@ export const BrowserTab = memo(function BrowserTab({
     setIsLoading(true);
   }, [tab.url]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const resolvedWorkspaceRoot =
+    selectedWorkspaceCwd && selectedWorkspaceCwd !== "~" ? selectedWorkspaceCwd : null;
+
   const runCdpNavigateAndCapture = async (url: string) => {
     if (!selectedHostId) return;
     if (!activeCdpSession) {
@@ -227,6 +417,7 @@ export const BrowserTab = memo(function BrowserTab({
         hostId: selectedHostId,
         agentId: selectedAgentId ?? null,
         initialUrl: url,
+        workspaceRoot: resolvedWorkspaceRoot,
       });
       return;
     }
@@ -366,6 +557,52 @@ export const BrowserTab = memo(function BrowserTab({
 
     const x = Math.round((localX / renderedW) * activeCdpSession.viewport_width);
     const y = Math.round((localY / renderedH) * activeCdpSession.viewport_height);
+    if (pickElementMode) {
+      const vpW = activeCdpSession.viewport_width;
+      const vpH = activeCdpSession.viewport_height;
+      void (async () => {
+        const pickRes = await orbitActions.executeBrowserAction(
+          selectedHostId,
+          activeCdpSession.session_id,
+          { kind: "pick_element", x, y },
+        );
+        const picked = pickRes?.picked_element;
+        if (!picked) {
+          orbitActions.showToast(t("sidePanel.pickElementFailed"));
+          return;
+        }
+        const labelTarget = picked.selector || `<${picked.tag}>`;
+        orbitActions.addContextMention({
+          id: `el_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+          kind: "dom_element",
+          selector: picked.selector,
+          tag: picked.tag,
+          textPreview: picked.text_preview,
+          attributes: picked.attributes,
+          computedBox: picked.computed_box ?? null,
+          outerHtmlExcerpt: picked.outer_html_excerpt,
+          pageUrl: picked.page_url || activeCdpSession.url,
+        });
+        setPickElementMode(false);
+        if (picked.computed_box && vpW > 0 && vpH > 0) {
+          setPickedHighlight({
+            box: picked.computed_box,
+            viewportWidth: vpW,
+            viewportHeight: vpH,
+          });
+          if (highlightTimerRef.current !== null) {
+            window.clearTimeout(highlightTimerRef.current);
+          }
+          highlightTimerRef.current = window.setTimeout(() => {
+            setPickedHighlight(null);
+            highlightTimerRef.current = null;
+          }, 1_600);
+        }
+        orbitActions.showToast(t("sidePanel.pickedElementToast", { target: labelTarget }));
+      })();
+      return;
+    }
+
     void (async () => {
       const clickRes = await orbitActions.executeBrowserAction(
         selectedHostId,
@@ -382,7 +619,9 @@ export const BrowserTab = memo(function BrowserTab({
   };
 
   const openPopout = () => {
-    const target = isCdpMode ? sanitizeHttpUrl(activeCdpSession?.url ?? "") : activeUrl;
+    const target = isCdpMode
+      ? sanitizeHttpUrl(activeCdpSession?.url ?? "")
+      : resolvedPreviewUrl;
     if (!target) return;
     void orbitIpc.openBrowserPopoutWindow(target, target).catch((err) => {
       orbitActions.showToast(String(err));
@@ -390,7 +629,9 @@ export const BrowserTab = memo(function BrowserTab({
   };
 
   const openExternal = () => {
-    const target = isCdpMode ? sanitizeHttpUrl(activeCdpSession?.url ?? "") : activeUrl;
+    const target = isCdpMode
+      ? sanitizeHttpUrl(activeCdpSession?.url ?? "")
+      : resolvedPreviewUrl;
     if (!target) return;
     void orbitIpc.openExternalBrowserUrl(target).catch((err) => {
       orbitActions.showToast(String(err));
@@ -404,27 +645,28 @@ export const BrowserTab = memo(function BrowserTab({
   );
 
   const suggestedUrls = useMemo(() => {
-    const merged = new Set<string>(detectedUrls);
+    const merged = new Set<string>();
+    for (const svc of runningServices) {
+      const u = svc.proxy_url?.trim() || (svc.port ? `http://localhost:${svc.port}` : "");
+      if (u) merged.add(u);
+    }
+    for (const detected of detectedUrls) {
+      merged.add(detected);
+    }
     for (const fallback of QUICK_LOCAL_PORTS) {
       merged.add(fallback);
     }
     return Array.from(merged).slice(0, 6);
-  }, [detectedUrls]);
+  }, [runningServices, detectedUrls]);
 
   const presetScale =
     presetWidth !== null && stageWidth > 32
       ? Math.min(1, (stageWidth - 32) / presetWidth)
       : 1;
-  const isRemoteHost =
-    Boolean(hostCard) &&
-    (Boolean(hostCard?.ssh_alias) ||
-      !hostCard?.direct_endpoints.some(
-        (e) => e.includes("127.0.0.1") || e.includes("localhost"),
-      ));
 
   const effectiveExternalUrl = isCdpMode
     ? sanitizeHttpUrl(activeCdpSession?.url ?? "")
-    : activeUrl;
+    : resolvedPreviewUrl;
 
   return (
     <div
@@ -433,7 +675,10 @@ export const BrowserTab = memo(function BrowserTab({
         !visible && "hidden",
       )}
       onKeyDown={(e) => {
-        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "l") {
+        if (e.key === "Escape" && pickElementMode) {
+          e.preventDefault();
+          setPickElementMode(false);
+        } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "l") {
           e.preventDefault();
           addressInputRef.current?.focus();
           addressInputRef.current?.select();
@@ -571,6 +816,22 @@ export const BrowserTab = memo(function BrowserTab({
           <div className="flex shrink-0 items-center gap-0.5">
             <button
               type="button"
+              title={t("sidePanel.pickElement")}
+              aria-label={t("sidePanel.pickElement")}
+              aria-pressed={pickElementMode}
+              disabled={!activeCdpSession || cdpBusy || isReadOnlyOverlay}
+              onClick={() => setPickElementMode((v) => !v)}
+              className={cn(
+                "inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:cursor-default disabled:opacity-35",
+                pickElementMode
+                  ? "bg-foreground text-background"
+                  : "text-muted-foreground hover:text-foreground hover:bg-accent",
+              )}
+            >
+              <Crosshair className="h-[13px] w-[13px]" />
+            </button>
+            <button
+              type="button"
               title={t("sidePanel.refreshSnapshot")}
               disabled={!activeCdpSession || cdpBusy}
               onClick={captureCdpScreenshot}
@@ -583,6 +844,7 @@ export const BrowserTab = memo(function BrowserTab({
               title={t("sidePanel.closeCdpSession")}
               disabled={!activeCdpSession || cdpBusy || !selectedHostId}
               onClick={() => {
+                setPickElementMode(false);
                 if (selectedHostId && activeCdpSession) {
                   void orbitActions.closeBrowserSession(
                     selectedHostId,
@@ -692,6 +954,23 @@ export const BrowserTab = memo(function BrowserTab({
         </div>
       )}
 
+      {/* Active Pick Element Mode Hint Strip */}
+      {isCdpMode && activeCdpSession && pickElementMode && (
+        <div className="border-border bg-elevated/80 text-foreground flex shrink-0 items-center justify-between gap-2 border-b px-2.5 py-1 text-[11px]">
+          <div className="flex min-w-0 items-center gap-1.5">
+            <Crosshair className="text-signal-info h-3 w-3 shrink-0" />
+            <span className="truncate">{t("sidePanel.pickElementActive")}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setPickElementMode(false)}
+            className="text-muted-foreground hover:text-foreground shrink-0 cursor-pointer rounded px-1.5 py-0.5 text-[11px] transition-colors"
+          >
+            Esc
+          </button>
+        </div>
+      )}
+
       {/* Collapsible Console Errors Strip */}
       {isCdpMode && activeCdpSession && consoleOpen && (
         <div className="border-border bg-canvas/90 max-h-28 shrink-0 overflow-y-auto border-b px-3 py-1.5 font-mono text-[11px]">
@@ -762,6 +1041,7 @@ export const BrowserTab = memo(function BrowserTab({
                       hostId: selectedHostId,
                       agentId: selectedAgentId ?? null,
                       initialUrl: normalized || null,
+                      workspaceRoot: resolvedWorkspaceRoot,
                     });
                   }}
                   className="bg-foreground text-background hover:opacity-90 inline-flex cursor-pointer items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-medium transition-opacity disabled:cursor-default disabled:opacity-45"
@@ -800,15 +1080,30 @@ export const BrowserTab = memo(function BrowserTab({
           ) : (
             <div className="bg-muted/25 relative flex min-h-full flex-1 flex-col items-center justify-center p-3">
               {activeCdpSession.last_screenshot_base64 ? (
-                <img
-                  src={`data:image/png;base64,${activeCdpSession.last_screenshot_base64}`}
-                  alt={activeCdpSession.title || activeCdpSession.url}
-                  onClick={handleScreenshotClick}
-                  className={cn(
-                    "border-border max-h-full max-w-full rounded-lg border bg-white object-contain shadow-sm",
-                    !cdpBusy && !isReadOnlyOverlay ? "cursor-crosshair" : "cursor-default",
+                <div className="relative inline-flex max-h-full max-w-full items-center justify-center">
+                  <img
+                    src={`data:image/png;base64,${activeCdpSession.last_screenshot_base64}`}
+                    alt={activeCdpSession.title || activeCdpSession.url}
+                    onClick={handleScreenshotClick}
+                    className={cn(
+                      "block max-h-full max-w-full rounded-lg border bg-white object-contain shadow-sm transition-colors",
+                      pickElementMode ? "border-signal-info/70" : "border-border",
+                      !cdpBusy && !isReadOnlyOverlay ? "cursor-crosshair" : "cursor-default",
+                    )}
+                  />
+                  {pickedHighlight && (
+                    <div
+                      aria-hidden
+                      style={{
+                        left: `${Math.max(0, Math.min(100, (pickedHighlight.box.x / pickedHighlight.viewportWidth) * 100))}%`,
+                        top: `${Math.max(0, Math.min(100, (pickedHighlight.box.y / pickedHighlight.viewportHeight) * 100))}%`,
+                        width: `${Math.max(0.5, Math.min(100, (pickedHighlight.box.width / pickedHighlight.viewportWidth) * 100))}%`,
+                        height: `${Math.max(0.5, Math.min(100, (pickedHighlight.box.height / pickedHighlight.viewportHeight) * 100))}%`,
+                      }}
+                      className="border-signal-info bg-signal-info/15 pointer-events-none absolute rounded-sm border-[1.5px] transition-opacity duration-200"
+                    />
                   )}
-                />
+                </div>
               ) : (
                 <div className="text-muted-foreground flex flex-col items-center gap-2 text-[12px]">
                   <span>Session ready at {activeCdpSession.url}</span>
@@ -898,18 +1193,32 @@ export const BrowserTab = memo(function BrowserTab({
                 }
                 className="relative flex shrink-0 flex-1"
               >
-                <iframe
-                  ref={iframeRef}
-                  key={`${activeUrl}::${reloadNonce}`}
-                  src={activeUrl}
-                  title={`Preview ${activeUrl}`}
-                  onLoad={() => setIsLoading(false)}
-                  sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads"
-                  className={cn(
-                    "h-full w-full flex-1 border-0 bg-white",
-                    isReadOnlyOverlay && "pointer-events-none select-none",
-                  )}
-                />
+                {isRemoteHost &&
+                matchedRemoteService &&
+                !activeRemoteTunnel &&
+                remoteTunnelOpeningKey === remoteTunnelKey ? (
+                  <div className="bg-canvas text-muted-foreground flex h-full w-full flex-1 flex-col items-center justify-center gap-2 text-[12px]">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    <span>
+                      {t("sidePanel.remoteTunnelOpening", {
+                        host: hostCard?.display_name ?? selectedHostId ?? "",
+                      })}
+                    </span>
+                  </div>
+                ) : (
+                  <iframe
+                    ref={iframeRef}
+                    key={`${resolvedPreviewUrl}::${reloadNonce}`}
+                    src={resolvedPreviewUrl}
+                    title={`Preview ${activeUrl}`}
+                    onLoad={() => setIsLoading(false)}
+                    sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads"
+                    className={cn(
+                      "h-full w-full flex-1 border-0 bg-white",
+                      isReadOnlyOverlay && "pointer-events-none select-none",
+                    )}
+                  />
+                )}
               </div>
 
               {/* Dedicated Top Stacking Layer Reserved for Future Automation Read-Only Animations */}
@@ -976,15 +1285,35 @@ export const BrowserTab = memo(function BrowserTab({
         </div>
       )}
 
-      {/* Host Context Footnote when Connected to Remote Host */}
+      {/* Host Context Footnote & Automatic Remote E2EE Tunnel Status */}
       {!isCdpMode && selectedHostId && activeUrl && isLocalUrl(activeUrl) && hostCard && isRemoteHost && (
-        <div className="border-border bg-sidebar/80 text-muted-foreground flex items-center justify-between border-t px-3 py-1 text-[11px]">
-          <span>
-            Preview loads from your local machine; forward remote ports via SSH if serving on{" "}
-            {hostCard.display_name}.
-          </span>
+        <div className="border-border bg-sidebar/80 text-muted-foreground flex items-center justify-between gap-2 border-t px-3 py-1 text-[11px]">
+          <div className="flex min-w-0 items-center gap-1.5">
+            {remoteTunnelOpeningKey && remoteTunnelOpeningKey === remoteTunnelKey ? (
+              <>
+                <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
+                <span className="truncate">
+                  {t("sidePanel.remoteTunnelOpening", { host: hostCard.display_name })}
+                </span>
+              </>
+            ) : activeRemoteTunnel?.is_tunneled ? (
+              <>
+                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" />
+                <span className="truncate font-mono tabular-nums">
+                  {t("sidePanel.remoteTunnelActive", {
+                    host: hostCard.display_name,
+                    localUrl: activeRemoteTunnel.local_url.replace(/^https?:\/\//, ""),
+                  })}
+                </span>
+              </>
+            ) : (
+              <span className="truncate">
+                {t("sidePanel.remoteTunnelFallback", { host: hostCard.display_name })}
+              </span>
+            )}
+          </div>
           {presetWidth !== null && presetScale < 1 && (
-            <span className="tabular-nums font-mono">{Math.round(presetScale * 100)}%</span>
+            <span className="shrink-0 font-mono tabular-nums">{Math.round(presetScale * 100)}%</span>
           )}
         </div>
       )}

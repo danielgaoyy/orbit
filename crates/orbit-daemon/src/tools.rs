@@ -6,6 +6,7 @@
 //! prefixes, while keeping 100% backward compatibility in `execute_tool` for all legacy tool names.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -310,10 +311,18 @@ pub fn list_tool_definitions_for_caller(
 
 fn tool_pack_for_canonical_name(canonical_name: &str) -> McpToolPack {
     match canonical_name {
-        "browser_open" | "browser_snapshot" | "browser_screenshot" | "browser_click"
-        | "browser_type" | "browser_scroll" | "browser_close" | "orbit_browser" => {
-            McpToolPack::Browser
-        }
+        "browser_open"
+        | "browser_snapshot"
+        | "browser_screenshot"
+        | "browser_click"
+        | "browser_type"
+        | "browser_scroll"
+        | "browser_press_key"
+        | "browser_select_option"
+        | "browser_upload_file"
+        | "browser_pick_element"
+        | "browser_close"
+        | "orbit_browser" => McpToolPack::Browser,
         "create_schedule" | "list_schedules" | "inspect_schedule" | "pause_schedule"
         | "resume_schedule" | "update_schedule" | "schedule_logs" | "run_schedule_once"
         | "delete_schedule" | "create_heartbeat" | "delete_heartbeat" | "orbit_schedule" => {
@@ -423,6 +432,10 @@ fn resolve_composite_dispatch(name: &str, args: &Value) -> anyhow::Result<&'stat
             "click" => Ok("browser_click"),
             "type" => Ok("browser_type"),
             "scroll" => Ok("browser_scroll"),
+            "press_key" => Ok("browser_press_key"),
+            "select_option" => Ok("browser_select_option"),
+            "upload_file" => Ok("browser_upload_file"),
+            "pick_element" => Ok("browser_pick_element"),
             "close" => Ok("browser_close"),
             other => anyhow::bail!("unsupported `orbit_browser` action `{other}`"),
         },
@@ -3369,21 +3382,21 @@ async fn execute_tool_inner(
                     &session_id,
                 )
                 .await?;
-                let (mut session, elements, _screenshot_base64, text_excerpt, captcha_detected) =
-                    execute_browser_action_tool(
-                        rt,
-                        target_host.as_deref(),
-                        &session_id,
-                        BrowserActionRequest::Navigate { url: target_url },
-                    )
-                    .await?;
-                session.last_screenshot_base64 = None;
+                let mut out = execute_browser_action_tool(
+                    rt,
+                    target_host.as_deref(),
+                    caller_agent_id,
+                    &session_id,
+                    BrowserActionRequest::Navigate { url: target_url },
+                )
+                .await?;
+                out.session.last_screenshot_base64 = None;
                 return Ok(json!({
                     "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
-                    "session": session,
-                    "elements": elements,
-                    "text_excerpt": text_excerpt,
-                    "captcha_detected": captcha_detected,
+                    "session": out.session,
+                    "elements": out.elements,
+                    "text_excerpt": out.text_excerpt,
+                    "captcha_detected": out.captcha_detected,
                 }));
             }
 
@@ -3400,6 +3413,10 @@ async fn execute_tool_inner(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
+            let workspace_root = owner_agent_id
+                .as_deref()
+                .and_then(|aid| rt.store.get_agent(aid).ok().flatten())
+                .map(|a| a.cwd);
 
             let mut session = if let Some(ref remote_host_id) = target_host {
                 let req_id = Uuid::new_v4();
@@ -3415,6 +3432,7 @@ async fn execute_tool_inner(
                             headless,
                             viewport_width,
                             viewport_height,
+                            workspace_root,
                         },
                         Duration::from_secs(30),
                     )
@@ -3434,6 +3452,7 @@ async fn execute_tool_inner(
                         headless,
                         viewport_width,
                         viewport_height,
+                        workspace_root: workspace_root.map(PathBuf::from),
                     })
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -3455,21 +3474,21 @@ async fn execute_tool_inner(
                 &session_id,
             )
             .await?;
-            let (mut session, elements, _screenshot_base64, text_excerpt, captcha_detected) =
-                execute_browser_action_tool(
-                    rt,
-                    target_host.as_deref(),
-                    &session_id,
-                    BrowserActionRequest::Snapshot,
-                )
-                .await?;
-            session.last_screenshot_base64 = None;
+            let mut out = execute_browser_action_tool(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+                BrowserActionRequest::Snapshot,
+            )
+            .await?;
+            out.session.last_screenshot_base64 = None;
             Ok(json!({
                 "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
-                "session": session,
-                "elements": elements,
-                "text_excerpt": text_excerpt,
-                "captcha_detected": captcha_detected,
+                "session": out.session,
+                "elements": out.elements,
+                "text_excerpt": out.text_excerpt,
+                "captcha_detected": out.captcha_detected,
             }))
         }
 
@@ -3486,22 +3505,22 @@ async fn execute_tool_inner(
                 &session_id,
             )
             .await?;
-            let (mut session, elements, screenshot_base64, text_excerpt, captcha_detected) =
-                execute_browser_action_tool(
-                    rt,
-                    target_host.as_deref(),
-                    &session_id,
-                    BrowserActionRequest::Screenshot { full_page },
-                )
-                .await?;
-            session.last_screenshot_base64 = None;
+            let mut out = execute_browser_action_tool(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+                BrowserActionRequest::Screenshot { full_page },
+            )
+            .await?;
+            out.session.last_screenshot_base64 = None;
             Ok(json!({
                 "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
-                "session": session,
-                "elements": elements,
-                "screenshot_base64": screenshot_base64,
-                "text_excerpt": text_excerpt,
-                "captcha_detected": captcha_detected,
+                "session": out.session,
+                "elements": out.elements,
+                "screenshot_base64": out.screenshot_base64,
+                "text_excerpt": out.text_excerpt,
+                "captcha_detected": out.captcha_detected,
             }))
         }
 
@@ -3517,21 +3536,21 @@ async fn execute_tool_inner(
                 &session_id,
             )
             .await?;
-            let (mut session, elements, _screenshot_base64, text_excerpt, captcha_detected) =
-                execute_browser_action_tool(
-                    rt,
-                    target_host.as_deref(),
-                    &session_id,
-                    BrowserActionRequest::Click { ref_id, x, y },
-                )
-                .await?;
-            session.last_screenshot_base64 = None;
+            let mut out = execute_browser_action_tool(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+                BrowserActionRequest::Click { ref_id, x, y },
+            )
+            .await?;
+            out.session.last_screenshot_base64 = None;
             Ok(json!({
                 "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
-                "session": session,
-                "elements": elements,
-                "text_excerpt": text_excerpt,
-                "captcha_detected": captcha_detected,
+                "session": out.session,
+                "elements": out.elements,
+                "text_excerpt": out.text_excerpt,
+                "captcha_detected": out.captcha_detected,
             }))
         }
 
@@ -3547,25 +3566,25 @@ async fn execute_tool_inner(
                 &session_id,
             )
             .await?;
-            let (mut session, elements, _screenshot_base64, text_excerpt, captcha_detected) =
-                execute_browser_action_tool(
-                    rt,
-                    target_host.as_deref(),
-                    &session_id,
-                    BrowserActionRequest::Type {
-                        ref_id,
-                        text,
-                        submit,
-                    },
-                )
-                .await?;
-            session.last_screenshot_base64 = None;
+            let mut out = execute_browser_action_tool(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+                BrowserActionRequest::Type {
+                    ref_id,
+                    text,
+                    submit,
+                },
+            )
+            .await?;
+            out.session.last_screenshot_base64 = None;
             Ok(json!({
                 "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
-                "session": session,
-                "elements": elements,
-                "text_excerpt": text_excerpt,
-                "captcha_detected": captcha_detected,
+                "session": out.session,
+                "elements": out.elements,
+                "text_excerpt": out.text_excerpt,
+                "captcha_detected": out.captcha_detected,
             }))
         }
 
@@ -3580,21 +3599,200 @@ async fn execute_tool_inner(
                 &session_id,
             )
             .await?;
-            let (mut session, elements, _screenshot_base64, text_excerpt, captcha_detected) =
-                execute_browser_action_tool(
-                    rt,
-                    target_host.as_deref(),
-                    &session_id,
-                    BrowserActionRequest::Scroll { delta_x, delta_y },
-                )
-                .await?;
-            session.last_screenshot_base64 = None;
+            let mut out = execute_browser_action_tool(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+                BrowserActionRequest::Scroll { delta_x, delta_y },
+            )
+            .await?;
+            out.session.last_screenshot_base64 = None;
             Ok(json!({
                 "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
-                "session": session,
-                "elements": elements,
-                "text_excerpt": text_excerpt,
-                "captcha_detected": captcha_detected,
+                "session": out.session,
+                "elements": out.elements,
+                "text_excerpt": out.text_excerpt,
+                "captcha_detected": out.captcha_detected,
+            }))
+        }
+
+        "browser_press_key" => {
+            let session_id = str_arg(args, "session_id")?;
+            let key = str_arg(args, "key")?;
+            let modifiers = args
+                .get("modifiers")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let ref_id = opt_str(args, "ref_id");
+            authorize_browser_session_access(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+            )
+            .await?;
+            let mut out = execute_browser_action_tool(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+                BrowserActionRequest::PressKey {
+                    key,
+                    modifiers,
+                    ref_id,
+                },
+            )
+            .await?;
+            out.session.last_screenshot_base64 = None;
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "session": out.session,
+                "elements": out.elements,
+                "text_excerpt": out.text_excerpt,
+                "captcha_detected": out.captcha_detected,
+            }))
+        }
+
+        "browser_select_option" => {
+            let session_id = str_arg(args, "session_id")?;
+            let ref_id = opt_str(args, "ref_id");
+            let selector = opt_str(args, "selector");
+            let value = opt_str(args, "value");
+            let label = opt_str(args, "label");
+            let index = args
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok());
+            authorize_browser_session_access(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+            )
+            .await?;
+            let mut out = execute_browser_action_tool(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+                BrowserActionRequest::SelectOption {
+                    ref_id,
+                    selector,
+                    value,
+                    label,
+                    index,
+                },
+            )
+            .await?;
+            out.session.last_screenshot_base64 = None;
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "session": out.session,
+                "elements": out.elements,
+                "text_excerpt": out.text_excerpt,
+                "captcha_detected": out.captcha_detected,
+            }))
+        }
+
+        "browser_upload_file" => {
+            let session_id = str_arg(args, "session_id")?;
+            let ref_id = opt_str(args, "ref_id");
+            let selector = opt_str(args, "selector");
+            let mut files: Vec<String> = args
+                .get("files")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if files.is_empty()
+                && let Some(single) = opt_str(args, "file")
+            {
+                files.push(single);
+            }
+            if files.is_empty() {
+                anyhow::bail!(
+                    "`files` (array of workspace file paths) is required for upload_file"
+                );
+            }
+            authorize_browser_session_access(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+            )
+            .await?;
+            let mut out = execute_browser_action_tool(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+                BrowserActionRequest::UploadFile {
+                    ref_id,
+                    selector,
+                    files,
+                },
+            )
+            .await?;
+            out.session.last_screenshot_base64 = None;
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "session": out.session,
+                "elements": out.elements,
+                "text_excerpt": out.text_excerpt,
+                "captcha_detected": out.captcha_detected,
+            }))
+        }
+
+        "browser_pick_element" => {
+            let session_id = str_arg(args, "session_id")?;
+            let x = args.get("x").and_then(Value::as_f64);
+            let y = args.get("y").and_then(Value::as_f64);
+            let selector = opt_str(args, "selector");
+            let ref_id = opt_str(args, "ref_id");
+            let interactive = args
+                .get("interactive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            authorize_browser_session_access(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+            )
+            .await?;
+            let mut out = execute_browser_action_tool(
+                rt,
+                target_host.as_deref(),
+                caller_agent_id,
+                &session_id,
+                BrowserActionRequest::PickElement {
+                    x,
+                    y,
+                    selector,
+                    ref_id,
+                    interactive,
+                },
+            )
+            .await?;
+            out.session.last_screenshot_base64 = None;
+            Ok(json!({
+                "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
+                "session": out.session,
+                "elements": out.elements,
+                "text_excerpt": out.text_excerpt,
+                "captcha_detected": out.captcha_detected,
+                "picked_element": out.picked_element,
             }))
         }
 
@@ -4124,20 +4322,22 @@ async fn authorize_browser_session_access(
     Ok(())
 }
 
-type BrowserToolActionResult = (
-    orbit_protocol::BrowserSessionSummary,
-    Vec<orbit_protocol::BrowserElementRef>,
-    Option<String>,
-    Option<String>,
-    bool,
-);
+struct BrowserToolActionOutput {
+    session: orbit_protocol::BrowserSessionSummary,
+    elements: Vec<orbit_protocol::BrowserElementRef>,
+    screenshot_base64: Option<String>,
+    text_excerpt: Option<String>,
+    captcha_detected: bool,
+    picked_element: Option<orbit_protocol::PickedElementInfo>,
+}
 
 async fn execute_browser_action_tool(
     rt: &DaemonRuntime,
     remote_host_id: Option<&str>,
+    caller_agent_id: Option<&str>,
     session_id: &str,
     action: BrowserActionRequest,
-) -> anyhow::Result<BrowserToolActionResult> {
+) -> anyhow::Result<BrowserToolActionOutput> {
     if let Some(remote_id) = remote_host_id {
         let req_id = Uuid::new_v4();
         match rt
@@ -4160,32 +4360,61 @@ async fn execute_browser_action_tool(
                 screenshot_base64,
                 text_excerpt,
                 captcha_detected,
+                picked_element,
                 ..
-            } => Ok((
+            } => Ok(BrowserToolActionOutput {
                 session,
                 elements,
                 screenshot_base64,
                 text_excerpt,
                 captcha_detected,
-            )),
+                picked_element,
+            }),
             WireMessage::RpcError { message, .. } => {
                 anyhow::bail!("remote host `{remote_id}` error: {message}")
             }
             _ => anyhow::bail!("unexpected remote reply to browser action"),
         }
     } else {
+        let mut extra_roots: Vec<PathBuf> = Vec::new();
+        let owner_agent_id = rt
+            .browser
+            .get_session_owner(session_id)
+            .await
+            .ok()
+            .flatten()
+            .or_else(|| {
+                caller_agent_id
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            });
+        if let Some(aid) = owner_agent_id
+            && let Ok(Some(agent)) = rt.store.get_agent(&aid)
+        {
+            extra_roots.push(PathBuf::from(&agent.cwd));
+            if !agent.workspace_id.is_empty()
+                && let Ok(Some(ws)) = rt.store.get_workspace(&agent.workspace_id)
+            {
+                extra_roots.push(PathBuf::from(&ws.cwd));
+                if let Some(ref src) = ws.source_cwd {
+                    extra_roots.push(PathBuf::from(src));
+                }
+            }
+        }
         let outcome = rt
             .browser
-            .execute_action(session_id, action)
+            .execute_action_with_allowed_roots(session_id, action, &extra_roots)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok((
-            outcome.session,
-            outcome.elements,
-            outcome.screenshot_base64,
-            outcome.text_excerpt,
-            outcome.captcha_detected,
-        ))
+        Ok(BrowserToolActionOutput {
+            session: outcome.session,
+            elements: outcome.elements,
+            screenshot_base64: outcome.screenshot_base64,
+            text_excerpt: outcome.text_excerpt,
+            captcha_detected: outcome.captcha_detected,
+            picked_element: outcome.picked_element,
+        })
     }
 }
 
@@ -4683,16 +4912,25 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
             pack: McpToolPack::Browser,
             def: ToolDefinition {
                 name: "orbit_browser",
-                description: "Pure-Rust CDP browser automation (`open`, `snapshot`, `screenshot`, `click`, `type`, `scroll`, `close`) with SSRF & CAPTCHA guards.",
+                description: "Pure-Rust CDP browser automation (`open`, `snapshot`, `screenshot`, `click`, `type`, `scroll`, `press_key`, `select_option`, `upload_file`, `pick_element`, `close`) with SSRF, upload-confinement & CAPTCHA guards.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["open", "snapshot", "screenshot", "click", "type", "scroll", "close"] },
+                        "action": { "type": "string", "enum": ["open", "snapshot", "screenshot", "click", "type", "scroll", "press_key", "select_option", "upload_file", "pick_element", "close"] },
                         "session_id": { "type": "string" },
                         "url": { "type": "string" },
                         "ref_id": { "type": "string" },
+                        "selector": { "type": "string" },
                         "text": { "type": "string" },
                         "submit": { "type": "boolean" },
+                        "key": { "type": "string" },
+                        "modifiers": { "type": "array", "items": { "type": "string" } },
+                        "value": { "type": "string" },
+                        "label": { "type": "string" },
+                        "index": { "type": "integer" },
+                        "files": { "type": "array", "items": { "type": "string" } },
+                        "file": { "type": "string" },
+                        "interactive": { "type": "boolean" },
                         "x": { "type": "number" },
                         "y": { "type": "number" },
                         "delta_x": { "type": "number" },

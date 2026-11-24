@@ -334,6 +334,32 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
             bindings: [],
             base_webhook_url: "http://127.0.0.1:6868",
           };
+        case "list_browser_sessions":
+          return {
+            host_id: args.hostId ?? "host_smoke_1",
+            sessions: [],
+            policy: {
+              enabled: true,
+              headless: true,
+              allow_localhost: true,
+              allowed_domains: [],
+              blocked_domains: [],
+              block_password_inputs: true,
+              max_sessions: 4,
+            },
+            chrome_binary: null,
+          };
+        case "open_remote_preview_tunnel":
+          return {
+            host_id: args.hostId ?? "host_smoke_1",
+            target_port: args.targetPort ?? 5173,
+            proxy_host: args.proxyHost ?? null,
+            local_port: args.targetPort ?? 5173,
+            local_url: "http://127.0.0.1:" + (args.targetPort ?? 5173),
+            is_tunneled: false,
+          };
+        case "close_remote_preview_tunnel":
+          return true;
         default:
           return null;
       }

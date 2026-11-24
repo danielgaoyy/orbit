@@ -955,6 +955,9 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         if (x.kind === "skill" && item.kind === "skill") {
           return x.slug.toLowerCase() === item.slug.toLowerCase();
         }
+        if (x.kind === "dom_element" && item.kind === "dom_element") {
+          return x.selector === item.selector && x.pageUrl === item.pageUrl;
+        }
         return false;
       });
       if (duplicate) return;
@@ -1614,6 +1617,17 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
                 container: ctx.container ?? null,
                 language: ctx.language,
                 snippet: ctx.snippet ?? resolvedSymbolSnippets.get(ctx.id) ?? null,
+              };
+            case "dom_element":
+              return {
+                kind: "dom_element",
+                selector: ctx.selector,
+                tag: ctx.tag,
+                text_preview: ctx.textPreview,
+                attributes: ctx.attributes,
+                computed_box: ctx.computedBox ?? null,
+                outer_html_excerpt: ctx.outerHtmlExcerpt,
+                page_url: ctx.pageUrl,
               };
           }
         });

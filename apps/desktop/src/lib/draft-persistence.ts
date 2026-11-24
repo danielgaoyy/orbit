@@ -93,6 +93,17 @@ export type PersistedContextItem =
       slug: string;
       label: string;
       description?: string;
+    }
+  | {
+      id: string;
+      kind: "dom_element";
+      selector: string;
+      tag: string;
+      textPreview: string;
+      attributes: Record<string, string>;
+      computedBox?: { x: number; y: number; width: number; height: number } | null;
+      outerHtmlExcerpt: string;
+      pageUrl: string;
     };
 
 export interface PersistedScopeDraft {
@@ -476,6 +487,56 @@ function normalizeContextItem(
       item.description = truncateUtf8(raw.description.trim(), 256);
     }
     return item;
+  }
+
+  if (raw.kind === "dom_element") {
+    if (typeof raw.selector !== "string" || raw.selector.trim().length === 0) return null;
+    const tag =
+      typeof raw.tag === "string" && raw.tag.trim().length > 0
+        ? truncateUtf8(raw.tag.trim(), 48)
+        : "element";
+    const attrs: Record<string, string> = {};
+    if (isPlainRecord(raw.attributes)) {
+      let count = 0;
+      for (const [k, v] of Object.entries(raw.attributes)) {
+        if (count >= 20) break;
+        if (typeof v === "string") {
+          attrs[truncateUtf8(k, 64)] = truncateUtf8(v, 200);
+          count += 1;
+        }
+      }
+    }
+    let computedBox: { x: number; y: number; width: number; height: number } | null = null;
+    if (
+      isPlainRecord(raw.computedBox) &&
+      typeof raw.computedBox.x === "number" &&
+      typeof raw.computedBox.y === "number" &&
+      typeof raw.computedBox.width === "number" &&
+      typeof raw.computedBox.height === "number" &&
+      Number.isFinite(raw.computedBox.x) &&
+      Number.isFinite(raw.computedBox.y) &&
+      Number.isFinite(raw.computedBox.width) &&
+      Number.isFinite(raw.computedBox.height)
+    ) {
+      computedBox = {
+        x: raw.computedBox.x,
+        y: raw.computedBox.y,
+        width: raw.computedBox.width,
+        height: raw.computedBox.height,
+      };
+    }
+    return {
+      id,
+      kind: "dom_element",
+      selector: truncateUtf8(raw.selector.trim(), 240),
+      tag,
+      textPreview: typeof raw.textPreview === "string" ? truncateUtf8(raw.textPreview, 240) : "",
+      attributes: attrs,
+      computedBox,
+      outerHtmlExcerpt:
+        typeof raw.outerHtmlExcerpt === "string" ? truncateUtf8(raw.outerHtmlExcerpt, 600) : "",
+      pageUrl: typeof raw.pageUrl === "string" ? truncateUtf8(raw.pageUrl, 512) : "",
+    };
   }
 
   return null;

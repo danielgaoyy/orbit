@@ -1,21 +1,28 @@
 //! Worktree full lifecycle, `.worktreeinclude` safe copier, `orbit.json` / `paseo.json`
 //! setup/teardown/scripts runtime, dynamic port allocation, and `*.localhost` HTTP reverse proxy.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::net::TcpListener;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::{Request, Response, StatusCode};
+use axum::http::header::{self, HeaderMap, HeaderName, HeaderValue};
+use axum::http::{Request, Response, StatusCode, Uri};
+use hyper_util::rt::TokioIo;
 use orbit_protocol::{
     WorkspaceScriptInfo, WorkspaceScriptKind, WorkspaceScriptStatus, WorkspaceSetupProgress,
     WorkspaceSetupStatus, WorktreeCreateMode,
 };
 use serde::Deserialize;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::process::Command;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use crate::fast_copy::{
     CopyMethod, copy_dir_cow_within, copy_file_cow_within, resolve_symlink_target_safe,
@@ -966,18 +973,57 @@ pub fn build_service_proxy_host(
 
 #[derive(Debug, Clone)]
 pub struct RunningScriptState {
+    pub instance_id: Uuid,
     pub info: WorkspaceScriptInfo,
     pub proxy_host: Option<String>,
+    cancel_tx: watch::Sender<bool>,
 }
+
+/// Live authorization handle bound to a specific running workspace service instance.
+///
+/// Automatically invalidated when the service stops, restarts, or its terminal exits so active
+/// keep-alive tunnels and upgraded WebSockets cannot reconnect to an unrelated loopback process.
+#[derive(Debug, Clone)]
+pub struct AuthorizedPreviewService {
+    pub instance_id: Uuid,
+    pub workspace_id: String,
+    pub script_name: String,
+    pub target_port: u16,
+    pub proxy_host: Option<String>,
+    pub advertised_port: Option<u16>,
+    cancel_rx: watch::Receiver<bool>,
+}
+
+impl AuthorizedPreviewService {
+    pub fn cancel_receiver(&self) -> watch::Receiver<bool> {
+        self.cancel_rx.clone()
+    }
+}
+
+/// Expected client-facing preview authority (`Host` and `Origin` origin-tuple boundary).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewAuthority {
+    /// Direct daemon `*.localhost` reverse proxy (`<slug>.localhost[:expected_port]`).
+    DotLocalhost {
+        host: String,
+        expected_port: Option<u16>,
+    },
+    /// Remote E2EE preview tunnel forwarded via a local loopback listener
+    /// (`127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>`, or `<slug>.localhost[:port]`).
+    Tunnel { proxy_host: Option<String> },
+}
+
+/// Upstream TCP connect timeout for local workspace service proxying.
+const SERVICE_PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Daemon-owned registry of running workspace scripts & `*.localhost` service reverse-proxy routes.
 #[derive(Default)]
 pub struct WorkspaceScriptRegistry {
     /// Keyed by `(workspace_id, script_name)`
     running: RwLock<HashMap<(String, String), RunningScriptState>>,
-    /// Keyed by lowercase `Host` without port (e.g. `web--feat-auth--orbit.localhost`) -> target loopback port
-    proxy_routes: RwLock<HashMap<String, u16>>,
-    http_client: reqwest::Client,
+    /// Keyed by lowercase `Host` without port (e.g. `web--feat-auth--orbit.localhost`)
+    /// -> `(workspace_id, script_name)` owning that route.
+    proxy_routes: RwLock<HashMap<String, (String, String)>>,
 }
 
 impl WorkspaceScriptRegistry {
@@ -985,11 +1031,6 @@ impl WorkspaceScriptRegistry {
         Arc::new(Self {
             running: RwLock::new(HashMap::new()),
             proxy_routes: RwLock::new(HashMap::new()),
-            http_client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .no_proxy()
-                .build()
-                .unwrap_or_default(),
         })
     }
 
@@ -1030,16 +1071,29 @@ impl WorkspaceScriptRegistry {
         info: WorkspaceScriptInfo,
         proxy_host: Option<String>,
     ) {
-        if let (Some(host), Some(port)) = (&proxy_host, info.port) {
-            self.proxy_routes
-                .write()
-                .await
-                .insert(host.to_ascii_lowercase(), port);
+        let key = (workspace_id.to_string(), script_name.to_string());
+        let (cancel_tx, _) = watch::channel(false);
+        let new_state = RunningScriptState {
+            instance_id: Uuid::new_v4(),
+            info,
+            proxy_host: proxy_host.map(|h| h.trim().to_ascii_lowercase()),
+            cancel_tx,
+        };
+
+        let mut running = self.running.write().await;
+        let mut routes = self.proxy_routes.write().await;
+        if let Some(prev) = running.remove(&key) {
+            let _ = prev.cancel_tx.send(true);
+            if let Some(ref prev_host) = prev.proxy_host
+                && routes.get(prev_host).is_some_and(|owner| owner == &key)
+            {
+                routes.remove(prev_host);
+            }
         }
-        self.running.write().await.insert(
-            (workspace_id.to_string(), script_name.to_string()),
-            RunningScriptState { info, proxy_host },
-        );
+        if let (Some(host), Some(_port)) = (&new_state.proxy_host, new_state.info.port) {
+            routes.insert(host.clone(), key.clone());
+        }
+        running.insert(key, new_state);
     }
 
     pub async fn unregister(
@@ -1047,18 +1101,40 @@ impl WorkspaceScriptRegistry {
         workspace_id: &str,
         script_name: &str,
     ) -> Option<RunningScriptState> {
-        let removed = self
-            .running
-            .write()
-            .await
-            .remove(&(workspace_id.to_string(), script_name.to_string()));
-        if let Some(ref st) = removed
-            && let Some(ref host) = st.proxy_host
-        {
-            self.proxy_routes
-                .write()
-                .await
-                .remove(&host.to_ascii_lowercase());
+        let key = (workspace_id.to_string(), script_name.to_string());
+        let mut running = self.running.write().await;
+        let mut routes = self.proxy_routes.write().await;
+        let removed = running.remove(&key);
+        if let Some(ref st) = removed {
+            let _ = st.cancel_tx.send(true);
+            if let Some(ref host) = st.proxy_host
+                && routes.get(host).is_some_and(|owner| owner == &key)
+            {
+                routes.remove(host);
+            }
+        }
+        removed
+    }
+
+    pub async fn unregister_by_terminal_id(&self, terminal_id: &str) -> Vec<RunningScriptState> {
+        let mut running = self.running.write().await;
+        let mut routes = self.proxy_routes.write().await;
+        let matching_keys: Vec<(String, String)> = running
+            .iter()
+            .filter(|(_, st)| st.info.terminal_id.as_deref() == Some(terminal_id))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut removed = Vec::with_capacity(matching_keys.len());
+        for key in matching_keys {
+            if let Some(st) = running.remove(&key) {
+                let _ = st.cancel_tx.send(true);
+                if let Some(ref host) = st.proxy_host
+                    && routes.get(host).is_some_and(|owner| owner == &key)
+                {
+                    routes.remove(host);
+                }
+                removed.push(st);
+            }
         }
         removed
     }
@@ -1084,69 +1160,703 @@ impl WorkspaceScriptRegistry {
         removed
     }
 
-    pub async fn resolve_proxy_port(&self, host_header: &str) -> Option<u16> {
-        let host_no_port = host_header
-            .split(':')
-            .next()
-            .unwrap_or(host_header)
-            .trim()
-            .to_ascii_lowercase();
-        self.proxy_routes.read().await.get(&host_no_port).copied()
+    /// Resolve a `Host` header to a live authorized `*.localhost` workspace service instance.
+    pub async fn resolve_proxy_service(
+        &self,
+        host_header: &str,
+    ) -> Option<AuthorizedPreviewService> {
+        let (host_lower, _) = parse_http_host_header(host_header)?;
+        let running = self.running.read().await;
+        let routes = self.proxy_routes.read().await;
+        let key = routes.get(&host_lower)?;
+        let st = running.get(key)?;
+        if st.info.kind != WorkspaceScriptKind::Service
+            || st.info.status != WorkspaceScriptStatus::Running
+        {
+            return None;
+        }
+        let target_port = st.info.port?;
+        Some(AuthorizedPreviewService {
+            instance_id: st.instance_id,
+            workspace_id: key.0.clone(),
+            script_name: key.1.clone(),
+            target_port,
+            proxy_host: st.proxy_host.clone(),
+            advertised_port: st
+                .info
+                .proxy_url
+                .as_deref()
+                .and_then(parse_nonzero_url_port),
+            cancel_rx: st.cancel_tx.subscribe(),
+        })
     }
 
-    /// Forward an HTTP request arriving for a registered `*.localhost` service host.
-    pub async fn proxy_http_request(&self, port: u16, req: Request<Body>) -> Response<Body> {
-        let method = req.method().clone();
-        let path_q = req
-            .uri()
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
-        let target_url = format!("http://127.0.0.1:{port}{path_q}");
+    pub async fn resolve_proxy_port(&self, host_header: &str) -> Option<u16> {
+        self.resolve_proxy_service(host_header)
+            .await
+            .map(|auth| auth.target_port)
+    }
 
-        let mut builder = self.http_client.request(method, &target_url);
-        for (k, v) in req.headers() {
-            if k.as_str().eq_ignore_ascii_case("host") {
-                continue;
+    /// Strictly validate whether a remote preview tunnel may target `(target_port, proxy_host)`
+    /// and bind authorization to the exact running service instance.
+    ///
+    /// Security boundary: ONLY loopback ports owned by currently running registered workspace
+    /// services on this daemon are permitted — zero arbitrary localhost SSRF.
+    pub async fn resolve_allowed_preview_service(
+        &self,
+        target_port: u16,
+        proxy_host: Option<&str>,
+    ) -> Option<AuthorizedPreviewService> {
+        if let Some(raw_host) = proxy_host.map(str::trim).filter(|s| !s.is_empty()) {
+            let auth = self.resolve_proxy_service(raw_host).await?;
+            if target_port != 0 && auth.target_port != target_port {
+                return None;
             }
-            builder = builder.header(k, v);
+            return Some(auth);
         }
-        let body_bytes = match axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024).await {
-            Ok(b) => b,
-            Err(_) => {
-                return Response::builder()
-                    .status(StatusCode::PAYLOAD_TOO_LARGE)
-                    .body(Body::from("request body too large"))
-                    .unwrap_or_else(|_| Response::new(Body::empty()));
+        if target_port == 0 {
+            return None;
+        }
+        let running = self.running.read().await;
+        running.iter().find_map(|((ws, name), st)| {
+            (st.info.kind == WorkspaceScriptKind::Service
+                && st.info.status == WorkspaceScriptStatus::Running
+                && st.info.port == Some(target_port))
+            .then(|| AuthorizedPreviewService {
+                instance_id: st.instance_id,
+                workspace_id: ws.clone(),
+                script_name: name.clone(),
+                target_port,
+                proxy_host: st.proxy_host.clone(),
+                advertised_port: st
+                    .info
+                    .proxy_url
+                    .as_deref()
+                    .and_then(parse_nonzero_url_port),
+                cancel_rx: st.cancel_tx.subscribe(),
+            })
+        })
+    }
+
+    pub async fn resolve_allowed_preview_port(
+        &self,
+        target_port: u16,
+        proxy_host: Option<&str>,
+    ) -> Option<u16> {
+        self.resolve_allowed_preview_service(target_port, proxy_host)
+            .await
+            .map(|auth| auth.target_port)
+    }
+
+    /// Re-verify that the exact authorized service instance is still running and owns its port.
+    pub async fn is_service_instance_live(&self, auth: &AuthorizedPreviewService) -> bool {
+        if *auth.cancel_rx.borrow() {
+            return false;
+        }
+        let running = self.running.read().await;
+        running
+            .get(&(auth.workspace_id.clone(), auth.script_name.clone()))
+            .is_some_and(|st| {
+                st.instance_id == auth.instance_id
+                    && st.info.kind == WorkspaceScriptKind::Service
+                    && st.info.status == WorkspaceScriptStatus::Running
+                    && st.info.port == Some(auth.target_port)
+            })
+    }
+
+    /// Forward an HTTP/SSE or RFC 6455 WebSocket upgrade request to a registered local service
+    /// with strict authority validation, live service re-verification, and zero-buffering streaming.
+    pub async fn proxy_http_request_authorized(
+        &self,
+        auth: &AuthorizedPreviewService,
+        authority: &PreviewAuthority,
+        req: Request<Body>,
+    ) -> Response<Body> {
+        if !self.is_service_instance_live(auth).await {
+            return proxy_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Preview service is no longer running",
+            );
+        }
+        if is_websocket_upgrade_request(req.headers()) {
+            self.proxy_websocket_upgrade(auth, authority, req).await
+        } else {
+            self.proxy_streaming_http(auth, authority, req).await
+        }
+    }
+
+    /// Serve an arbitrary bidirectional byte stream (e.g. a remote E2EE preview tunnel) as an
+    /// HTTP/1.1 + WebSocket-upgrade reverse proxy strictly pinned to a live workspace service
+    /// instance. Re-verifies service ownership before every upstream connect and immediately
+    /// aborts the tunnel when the service stops or exits.
+    pub async fn serve_preview_tunnel_io<IO>(
+        self: Arc<Self>,
+        auth: AuthorizedPreviewService,
+        io: IO,
+    ) where
+        IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let authority = PreviewAuthority::Tunnel {
+            proxy_host: auth.proxy_host.clone(),
+        };
+        let mut cancel_rx = auth.cancel_receiver();
+        let scripts = Arc::clone(&self);
+        let svc_auth = auth.clone();
+        let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+            let scripts = Arc::clone(&scripts);
+            let auth = svc_auth.clone();
+            let authority = authority.clone();
+            async move {
+                let mapped = req.map(Body::new);
+                Ok::<_, Infallible>(
+                    scripts
+                        .proxy_http_request_authorized(&auth, &authority, mapped)
+                        .await,
+                )
+            }
+        });
+        let conn = hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(io), svc)
+            .with_upgrades();
+        tokio::select! {
+            res = conn => {
+                if let Err(err) = res {
+                    debug!(
+                        target_port = auth.target_port,
+                        error = %err,
+                        "Remote preview tunnel HTTP/WS connection ended"
+                    );
+                }
+            }
+            _ = wait_service_cancelled(&mut cancel_rx) => {
+                debug!(
+                    target_port = auth.target_port,
+                    workspace_id = %auth.workspace_id,
+                    script_name = %auth.script_name,
+                    "Remote preview tunnel cancelled because backing service exited"
+                );
+            }
+        }
+    }
+
+    async fn proxy_websocket_upgrade(
+        &self,
+        auth: &AuthorizedPreviewService,
+        authority: &PreviewAuthority,
+        mut req: Request<Body>,
+    ) -> Response<Body> {
+        let port = auth.target_port;
+        let client_upgrade = hyper::upgrade::on(&mut req);
+
+        // Validate Host/Origin and strip Forwarded/X-Forwarded-* BEFORE touching loopback.
+        let upstream_req = match build_upstream_request(req, port, authority, true) {
+            Ok(r) => r,
+            Err((status, msg)) => return proxy_error_response(status, &msg),
+        };
+
+        // Re-verify live service ownership immediately before upstream TCP connect.
+        if !self.is_service_instance_live(auth).await {
+            return proxy_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Preview service is no longer running",
+            );
+        }
+
+        let tcp = match connect_local_upstream(port).await {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+
+        let (mut sender, conn) =
+            match hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await {
+                Ok(pair) => pair,
+                Err(err) => {
+                    return bad_gateway_response(
+                        port,
+                        &format!("WebSocket upstream handshake failed: {err}"),
+                    );
+                }
+            };
+        tokio::spawn(async move {
+            if let Err(err) = conn.with_upgrades().await {
+                debug!(port, error = %err, "WebSocket proxy upstream connection closed");
+            }
+        });
+
+        let mut upstream_resp = match sender.send_request(upstream_req).await {
+            Ok(r) => r,
+            Err(err) => {
+                return bad_gateway_response(
+                    port,
+                    &format!("WebSocket upgrade request failed: {err}"),
+                );
             }
         };
-        if !body_bytes.is_empty() {
-            builder = builder.body(body_bytes);
+
+        if upstream_resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+            return build_streaming_downstream_response(upstream_resp);
         }
 
-        match builder.send().await {
-            Ok(upstream) => {
-                let status = upstream.status();
-                let headers = upstream.headers().clone();
-                let bytes = upstream.bytes().await.unwrap_or_default();
-                let mut resp = Response::builder().status(status);
-                for (k, v) in &headers {
-                    if k.as_str().eq_ignore_ascii_case("transfer-encoding") {
-                        continue;
+        let upstream_upgrade = hyper::upgrade::on(&mut upstream_resp);
+        let mut resp_builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+        for (name, value) in upstream_resp.headers() {
+            resp_builder = resp_builder.header(name, value);
+        }
+
+        let mut cancel_rx = auth.cancel_receiver();
+        tokio::spawn(async move {
+            match tokio::try_join!(client_upgrade, upstream_upgrade) {
+                Ok((client_upgraded, upstream_upgraded)) => {
+                    let mut client_io = TokioIo::new(client_upgraded);
+                    let mut upstream_io = TokioIo::new(upstream_upgraded);
+                    tokio::select! {
+                        res = tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io) => {
+                            if let Err(err) = res {
+                                debug!(port, error = %err, "WebSocket proxy tunnel terminated");
+                            }
+                        }
+                        _ = wait_service_cancelled(&mut cancel_rx) => {
+                            debug!(port, "WebSocket proxy tunnel aborted because backing service exited");
+                        }
                     }
-                    resp = resp.header(k, v);
+                    let _ = client_io.shutdown().await;
+                    let _ = upstream_io.shutdown().await;
                 }
-                resp.body(Body::from(bytes))
-                    .unwrap_or_else(|_| Response::new(Body::empty()))
+                Err(err) => {
+                    debug!(port, error = %err, "WebSocket upgrade completion failed");
+                }
             }
-            Err(e) => Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!(
-                    "Orbit service proxy upstream error on 127.0.0.1:{port}: {e}"
-                )))
-                .unwrap_or_else(|_| Response::new(Body::empty())),
+        });
+
+        resp_builder
+            .body(Body::empty())
+            .unwrap_or_else(|_| Response::new(Body::empty()))
+    }
+
+    async fn proxy_streaming_http(
+        &self,
+        auth: &AuthorizedPreviewService,
+        authority: &PreviewAuthority,
+        req: Request<Body>,
+    ) -> Response<Body> {
+        let port = auth.target_port;
+        // Validate Host/Origin and strip Forwarded/X-Forwarded-* BEFORE touching loopback.
+        let upstream_req = match build_upstream_request(req, port, authority, false) {
+            Ok(r) => r,
+            Err((status, msg)) => return proxy_error_response(status, &msg),
+        };
+
+        // Re-verify live service ownership immediately before upstream TCP connect.
+        if !self.is_service_instance_live(auth).await {
+            return proxy_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Preview service is no longer running",
+            );
+        }
+
+        let tcp = match connect_local_upstream(port).await {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+
+        let (mut sender, conn) = match hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+            .await
+        {
+            Ok(pair) => pair,
+            Err(err) => {
+                return bad_gateway_response(port, &format!("HTTP upstream init failed: {err}"));
+            }
+        };
+        tokio::spawn(async move {
+            if let Err(err) = conn.await {
+                debug!(port, error = %err, "HTTP proxy upstream connection closed");
+            }
+        });
+
+        match sender.send_request(upstream_req).await {
+            Ok(upstream_resp) => build_streaming_downstream_response(upstream_resp),
+            Err(err) => bad_gateway_response(port, &err.to_string()),
         }
     }
+}
+
+async fn wait_service_cancelled(cancel_rx: &mut watch::Receiver<bool>) {
+    if *cancel_rx.borrow() {
+        return;
+    }
+    while cancel_rx.changed().await.is_ok() {
+        if *cancel_rx.borrow() {
+            return;
+        }
+    }
+}
+
+fn parse_nonzero_url_port(url: &str) -> Option<u16> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    parsed.port().filter(|&p| p > 0)
+}
+
+/// Strictly parse an HTTP `Host` header into `(lowercase_host, optional_nonzero_port)`.
+pub(crate) fn parse_http_host_header(raw: &str) -> Option<(String, Option<u16>)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed != raw
+        || trimmed.chars().any(|c| {
+            c.is_ascii_whitespace() || c.is_control() || matches!(c, '/' | '?' | '#' | '@' | '\\')
+        })
+    {
+        return None;
+    }
+
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let host_part = &rest[..close];
+        if host_part.is_empty() {
+            return None;
+        }
+        let after = &rest[close + 1..];
+        let port = if after.is_empty() {
+            None
+        } else {
+            let p_str = after.strip_prefix(':')?;
+            if p_str.is_empty() || !p_str.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let p: u16 = p_str.parse().ok()?;
+            if p == 0 {
+                return None;
+            }
+            Some(p)
+        };
+        return Some((host_part.to_ascii_lowercase(), port));
+    }
+
+    let (host_part, port) = if let Some((h, p_str)) = trimmed.split_once(':') {
+        if p_str.is_empty() || p_str.contains(':') || !p_str.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let p: u16 = p_str.parse().ok()?;
+        if p == 0 {
+            return None;
+        }
+        (h, Some(p))
+    } else {
+        (trimmed, None)
+    };
+
+    if host_part.is_empty()
+        || host_part.ends_with('.')
+        || !host_part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+    {
+        return None;
+    }
+    Some((host_part.to_ascii_lowercase(), port))
+}
+
+fn validate_single_host_authority(
+    headers: &HeaderMap,
+    authority: &PreviewAuthority,
+) -> Result<(String, u16), (StatusCode, String)> {
+    let mut host_iter = headers.get_all(header::HOST).iter();
+    let Some(first_host) = host_iter.next() else {
+        return Err((StatusCode::BAD_REQUEST, "Missing Host header".to_string()));
+    };
+    if host_iter.next().is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Multiple Host headers are not allowed".to_string(),
+        ));
+    }
+    let Ok(raw_host) = first_host.to_str() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid non-UTF8 Host header".to_string(),
+        ));
+    };
+    let Some((host_lower, opt_port)) = parse_http_host_header(raw_host) else {
+        return Err((StatusCode::BAD_REQUEST, "Malformed Host header".to_string()));
+    };
+    let effective_port = opt_port.unwrap_or(80);
+
+    match authority {
+        PreviewAuthority::DotLocalhost {
+            host: expected_host,
+            expected_port,
+        } => {
+            if host_lower != expected_host.to_ascii_lowercase() {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Host header does not match preview authority".to_string(),
+                ));
+            }
+            if let Some(exp_p) = *expected_port
+                && exp_p > 0
+                && effective_port != exp_p
+            {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Host port does not match advertised preview authority".to_string(),
+                ));
+            }
+            Ok((host_lower, effective_port))
+        }
+        PreviewAuthority::Tunnel { proxy_host } => {
+            let matches_loopback = matches!(host_lower.as_str(), "127.0.0.1" | "localhost" | "::1");
+            let matches_proxy_host = proxy_host
+                .as_deref()
+                .is_some_and(|expected| host_lower == expected.to_ascii_lowercase());
+            if !matches_loopback && !matches_proxy_host {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Host header is not permitted for this preview tunnel".to_string(),
+                ));
+            }
+            Ok((host_lower, effective_port))
+        }
+    }
+}
+
+async fn connect_local_upstream(port: u16) -> Result<TcpStream, Response<Body>> {
+    match tokio::time::timeout(
+        SERVICE_PROXY_CONNECT_TIMEOUT,
+        TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => {
+            let _ = stream.set_nodelay(true);
+            Ok(stream)
+        }
+        Ok(Err(err)) => Err(bad_gateway_response(port, &err.to_string())),
+        Err(_) => Err(bad_gateway_response(
+            port,
+            "timed out connecting to upstream service",
+        )),
+    }
+}
+
+fn proxy_error_response(status: StatusCode, detail: &str) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .body(Body::from(detail.to_string()))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+fn bad_gateway_response(port: u16, detail: &str) -> Response<Body> {
+    proxy_error_response(
+        StatusCode::BAD_GATEWAY,
+        &format!("Orbit service proxy upstream error on 127.0.0.1:{port}: {detail}"),
+    )
+}
+
+fn header_contains_token(headers: &HeaderMap, name: &HeaderName, token: &str) -> bool {
+    headers.get_all(name).iter().any(|val| {
+        val.to_str().ok().is_some_and(|s| {
+            s.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case(token))
+        })
+    })
+}
+
+pub(crate) fn is_websocket_upgrade_request(headers: &HeaderMap) -> bool {
+    header_contains_token(headers, &header::UPGRADE, "websocket")
+        && header_contains_token(headers, &header::CONNECTION, "upgrade")
+}
+
+fn collect_connection_header_tokens(headers: &HeaderMap) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    for val in headers.get_all(header::CONNECTION) {
+        if let Ok(s) = val.to_str() {
+            for part in s.split(',') {
+                let norm = part.trim().to_ascii_lowercase();
+                if !norm.is_empty() {
+                    tokens.insert(norm);
+                }
+            }
+        }
+    }
+    tokens
+}
+
+fn is_hop_by_hop_header(name_lower: &str, connection_tokens: &HashSet<String>) -> bool {
+    matches!(
+        name_lower,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailers"
+            | "transfer-encoding"
+            | "upgrade"
+    ) || connection_tokens.contains(name_lower)
+}
+
+/// Safely rewrite `Origin` to `http://localhost:<target_port>` ONLY when it matches the exact
+/// validated preview authority origin tuple `(http, authority_host, authority_port)`.
+///
+/// Sibling loopback ports, other `*.localhost` subdomains, HTTPS mismatches, and external origins
+/// are NEVER rewritten.
+pub(crate) fn rewrite_preview_origin_for_upstream(
+    raw_origin: &str,
+    authority_host: &str,
+    authority_port: u16,
+    target_port: u16,
+) -> Option<String> {
+    let trimmed = raw_origin.trim();
+    if trimmed.is_empty() || trimmed != raw_origin {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(trimmed).ok()?;
+    if parsed.scheme() != "http" {
+        return None;
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.path(), "" | "/")
+    {
+        return None;
+    }
+    let origin_host = parsed
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let origin_port = parsed.port_or_known_default()?;
+    if origin_host == authority_host.to_ascii_lowercase() && origin_port == authority_port {
+        Some(format!("http://localhost:{target_port}"))
+    } else {
+        None
+    }
+}
+
+fn build_upstream_request(
+    req: Request<Body>,
+    port: u16,
+    authority: &PreviewAuthority,
+    preserve_upgrade_headers: bool,
+) -> Result<Request<Body>, (StatusCode, String)> {
+    let (parts, body) = req.into_parts();
+    let (auth_host, auth_port) = validate_single_host_authority(&parts.headers, authority)?;
+
+    if parts.headers.get_all(header::ORIGIN).iter().count() > 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Multiple Origin headers are not allowed".to_string(),
+        ));
+    }
+
+    let path_q = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let upstream_uri: Uri = path_q.parse().map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid upstream request URI `{path_q}`: {e}"),
+        )
+    })?;
+
+    let mut builder = Request::builder()
+        .method(parts.method)
+        .uri(upstream_uri)
+        .version(axum::http::Version::HTTP_11);
+
+    let connection_tokens = if preserve_upgrade_headers {
+        HashSet::new()
+    } else {
+        collect_connection_header_tokens(&parts.headers)
+    };
+
+    for (name, value) in &parts.headers {
+        let lower = name.as_str().to_ascii_lowercase();
+        if lower == "host" || lower == "forwarded" || lower.starts_with("x-forwarded-") {
+            continue;
+        }
+        if !preserve_upgrade_headers && is_hop_by_hop_header(&lower, &connection_tokens) {
+            continue;
+        }
+        if lower == "origin" {
+            let Ok(raw_origin) = value.to_str() else {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Invalid non-UTF8 Origin header".to_string(),
+                ));
+            };
+            if let Some(rewritten) =
+                rewrite_preview_origin_for_upstream(raw_origin, &auth_host, auth_port, port)
+            {
+                if let Ok(hv) = HeaderValue::from_str(&rewritten) {
+                    builder = builder.header(header::ORIGIN, hv);
+                }
+                continue;
+            }
+            if preserve_upgrade_headers {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "WebSocket Origin does not match preview authority".to_string(),
+                ));
+            }
+            // For non-upgrade HTTP requests, never spoof a mismatched Origin as localhost.
+            builder = builder.header(name, value);
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+
+    if let Ok(host_hv) = HeaderValue::from_str(&format!("localhost:{port}")) {
+        builder = builder.header(header::HOST, host_hv);
+    }
+
+    let final_body = if preserve_upgrade_headers {
+        Body::empty()
+    } else {
+        body
+    };
+    builder.body(final_body).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Orbit service proxy upstream error on 127.0.0.1:{port}: failed to build upstream proxy request: {e}"
+            ),
+        )
+    })
+}
+
+fn build_streaming_downstream_response(
+    upstream_resp: Response<hyper::body::Incoming>,
+) -> Response<Body> {
+    let (parts, body) = upstream_resp.into_parts();
+    let connection_tokens = collect_connection_header_tokens(&parts.headers);
+    let is_sse = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"));
+
+    let mut resp = Response::builder().status(parts.status);
+    let mut has_cache_control = false;
+    for (name, value) in &parts.headers {
+        let lower = name.as_str().to_ascii_lowercase();
+        if is_hop_by_hop_header(&lower, &connection_tokens) {
+            continue;
+        }
+        if lower == "cache-control" {
+            has_cache_control = true;
+        }
+        resp = resp.header(name, value);
+    }
+    if is_sse && !has_cache_control {
+        resp = resp.header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    }
+    resp.body(Body::new(body))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
 #[cfg(test)]
@@ -1460,5 +2170,685 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn origin_rewrite_matches_exact_preview_authority_and_rejects_siblings() {
+        // Exact authority match (`*.localhost:<port>` and local tunnel `127.0.0.1:<port>`).
+        assert_eq!(
+            rewrite_preview_origin_for_upstream(
+                "http://web--feat--orbit.localhost:6868",
+                "web--feat--orbit.localhost",
+                6868,
+                5173,
+            )
+            .as_deref(),
+            Some("http://localhost:5173")
+        );
+        assert_eq!(
+            rewrite_preview_origin_for_upstream(
+                "http://127.0.0.1:54321",
+                "127.0.0.1",
+                54321,
+                3000,
+            )
+            .as_deref(),
+            Some("http://localhost:3000")
+        );
+        assert_eq!(
+            rewrite_preview_origin_for_upstream("http://[::1]:6868", "::1", 6868, 8080).as_deref(),
+            Some("http://localhost:8080")
+        );
+
+        // Sibling loopback port MUST be rejected (no cross-port localhost origin spoofing!).
+        assert_eq!(
+            rewrite_preview_origin_for_upstream("http://127.0.0.1:9999", "127.0.0.1", 54321, 3000,),
+            None
+        );
+        assert_eq!(
+            rewrite_preview_origin_for_upstream(
+                "http://127.0.0.1:6868",
+                "web--feat--orbit.localhost",
+                6868,
+                5173,
+            ),
+            None
+        );
+        // Sibling `*.localhost` subdomain or mismatched port MUST be rejected!
+        assert_eq!(
+            rewrite_preview_origin_for_upstream(
+                "http://other--feat--orbit.localhost:6868",
+                "web--feat--orbit.localhost",
+                6868,
+                5173,
+            ),
+            None
+        );
+        assert_eq!(
+            rewrite_preview_origin_for_upstream(
+                "http://web--feat--orbit.localhost:9999",
+                "web--feat--orbit.localhost",
+                6868,
+                5173,
+            ),
+            None
+        );
+        assert_eq!(
+            rewrite_preview_origin_for_upstream("http://localhost:54321", "127.0.0.1", 54321, 3000,),
+            None
+        );
+        // Scheme mismatch & cross-site origins MUST be rejected!
+        assert_eq!(
+            rewrite_preview_origin_for_upstream(
+                "https://web--feat--orbit.localhost:6868",
+                "web--feat--orbit.localhost",
+                6868,
+                5173,
+            ),
+            None
+        );
+        assert_eq!(
+            rewrite_preview_origin_for_upstream(
+                "https://evil.example",
+                "web--feat--orbit.localhost",
+                6868,
+                5173,
+            ),
+            None
+        );
+        assert_eq!(
+            rewrite_preview_origin_for_upstream(
+                "http://localhost.evil.example:6868",
+                "web--feat--orbit.localhost",
+                6868,
+                5173,
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_websocket_upgrade_full_duplex_hmr_and_origin_rewrite() {
+        use axum::Router;
+        use axum::extract::ws::{Message as AxumWsMsg, WebSocketUpgrade};
+        use axum::routing::get;
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{
+            Error as TungErr, Message as TungMsg, client::IntoClientRequest,
+            http::HeaderValue as TungHeaderValue,
+        };
+
+        // 1. Upstream HMR-like WebSocket echo server checking Origin rewrite, subprotocol &
+        //    absence of client-supplied Forwarded / X-Forwarded-* headers.
+        let observed_origin = Arc::new(tokio::sync::Mutex::new(None::<String>));
+        let observed_forwarded = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let obs_bg = Arc::clone(&observed_origin);
+        let fwd_bg = Arc::clone(&observed_forwarded);
+        let upstream_app = Router::new().route(
+            "/ws",
+            get(move |headers: HeaderMap, ws: WebSocketUpgrade| {
+                let obs = Arc::clone(&obs_bg);
+                let fwd = Arc::clone(&fwd_bg);
+                async move {
+                    if let Some(orig) = headers
+                        .get(header::ORIGIN)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string)
+                    {
+                        *obs.lock().await = Some(orig);
+                    }
+                    let mut leaked_fwd = Vec::new();
+                    for (name, _) in &headers {
+                        let lower = name.as_str().to_ascii_lowercase();
+                        if lower == "forwarded" || lower.starts_with("x-forwarded-") {
+                            leaked_fwd.push(lower);
+                        }
+                    }
+                    *fwd.lock().await = leaked_fwd;
+                    ws.protocols(["vite-hmr"])
+                        .on_upgrade(|mut socket| async move {
+                            while let Some(Ok(msg)) = socket.recv().await {
+                                match msg {
+                                    AxumWsMsg::Text(txt) => {
+                                        let reply = format!("echo:{txt}");
+                                        if socket.send(AxumWsMsg::Text(reply.into())).await.is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    AxumWsMsg::Binary(bin) => {
+                                        if socket.send(AxumWsMsg::Binary(bin)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    AxumWsMsg::Close(_) => break,
+                                    _ => {}
+                                }
+                            }
+                        })
+                }
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream ws");
+        let upstream_port = upstream_listener
+            .local_addr()
+            .expect("upstream addr")
+            .port();
+        let upstream_handle = tokio::spawn(async move {
+            let _ = axum::serve(upstream_listener, upstream_app).await;
+        });
+
+        // 2. Bind proxy listener first so we register the exact advertised port.
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let proxy_port = proxy_listener.local_addr().expect("proxy addr").port();
+
+        let scripts = WorkspaceScriptRegistry::new();
+        let proxy_host = build_service_proxy_host("web", None, "orbit");
+        scripts
+            .register_running(
+                "ws_1",
+                "web",
+                WorkspaceScriptInfo {
+                    workspace_id: "ws_1".into(),
+                    name: "web".into(),
+                    command: "npm run dev".into(),
+                    kind: WorkspaceScriptKind::Service,
+                    status: WorkspaceScriptStatus::Running,
+                    terminal_id: Some("term_1".into()),
+                    port: Some(upstream_port),
+                    proxy_url: Some(format!("http://{proxy_host}:{proxy_port}")),
+                    last_error: None,
+                },
+                Some(proxy_host.clone()),
+            )
+            .await;
+
+        let proxy_scripts = Arc::clone(&scripts);
+        let proxy_app = Router::new().fallback(move |req: Request<Body>| {
+            let reg = Arc::clone(&proxy_scripts);
+            async move {
+                let mut host_iter = req.headers().get_all(header::HOST).iter();
+                let first_host = host_iter.next();
+                if host_iter.next().is_some() {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::empty())
+                        .unwrap_or_else(|_| Response::new(Body::empty()));
+                }
+                if let Some(h) = first_host.and_then(|v| v.to_str().ok())
+                    && let Some(auth) = reg.resolve_proxy_service(h).await
+                {
+                    let authority = PreviewAuthority::DotLocalhost {
+                        host: auth.proxy_host.clone().unwrap_or_default(),
+                        expected_port: auth.advertised_port,
+                    };
+                    return reg
+                        .proxy_http_request_authorized(&auth, &authority, req)
+                        .await;
+                }
+                Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::empty())
+                    .unwrap_or_else(|_| Response::new(Body::empty()))
+            }
+        });
+        let proxy_handle = tokio::spawn(async move {
+            let _ = axum::serve(proxy_listener, proxy_app).await;
+        });
+
+        // 3. Reject WebSocket upgrades with sibling loopback port Origin (403 Forbidden)!
+        let mut sibling_origin_req = format!("ws://127.0.0.1:{proxy_port}/ws")
+            .into_client_request()
+            .expect("sibling req");
+        sibling_origin_req.headers_mut().insert(
+            "host",
+            TungHeaderValue::from_str(&format!("{proxy_host}:{proxy_port}")).expect("host"),
+        );
+        sibling_origin_req.headers_mut().insert(
+            "origin",
+            TungHeaderValue::from_str("http://127.0.0.1:9999").expect("sibling origin"),
+        );
+        let sibling_err = tokio_tungstenite::connect_async(sibling_origin_req)
+            .await
+            .expect_err("sibling loopback origin must be rejected");
+        assert!(
+            matches!(sibling_err, TungErr::Http(ref resp) if resp.status().as_u16() == 403),
+            "expected HTTP 403 for sibling loopback origin, got {sibling_err:?}"
+        );
+
+        // Reject WebSocket upgrade with another `*.localhost` subdomain Origin (403 Forbidden)!
+        let mut sibling_sub_req = format!("ws://127.0.0.1:{proxy_port}/ws")
+            .into_client_request()
+            .expect("sibling sub req");
+        sibling_sub_req.headers_mut().insert(
+            "host",
+            TungHeaderValue::from_str(&format!("{proxy_host}:{proxy_port}")).expect("host"),
+        );
+        sibling_sub_req.headers_mut().insert(
+            "origin",
+            TungHeaderValue::from_str(&format!("http://other--orbit.localhost:{proxy_port}"))
+                .expect("sibling sub origin"),
+        );
+        let sub_err = tokio_tungstenite::connect_async(sibling_sub_req)
+            .await
+            .expect_err("sibling *.localhost origin must be rejected");
+        assert!(
+            matches!(sub_err, TungErr::Http(ref resp) if resp.status().as_u16() == 403),
+            "expected HTTP 403 for sibling *.localhost origin, got {sub_err:?}"
+        );
+
+        // 4. Connect over WebSocket targeting exact `*.localhost:<proxy_port>` with spoofed
+        //    Forwarded / X-Forwarded-* headers — verify Origin rewrite AND header stripping!
+        let mut ws_req = format!("ws://127.0.0.1:{proxy_port}/ws")
+            .into_client_request()
+            .expect("ws req");
+        ws_req.headers_mut().insert(
+            "host",
+            TungHeaderValue::from_str(&format!("{proxy_host}:{proxy_port}")).expect("host"),
+        );
+        ws_req.headers_mut().insert(
+            "origin",
+            TungHeaderValue::from_str(&format!("http://{proxy_host}:{proxy_port}"))
+                .expect("origin"),
+        );
+        ws_req.headers_mut().insert(
+            "sec-websocket-protocol",
+            TungHeaderValue::from_static("vite-hmr"),
+        );
+        ws_req.headers_mut().insert(
+            "forwarded",
+            TungHeaderValue::from_static("for=1.2.3.4;proto=https"),
+        );
+        ws_req
+            .headers_mut()
+            .insert("x-forwarded-for", TungHeaderValue::from_static("1.2.3.4"));
+        ws_req.headers_mut().insert(
+            "x-forwarded-host",
+            TungHeaderValue::from_static("evil.example"),
+        );
+        ws_req
+            .headers_mut()
+            .insert("x-forwarded-proto", TungHeaderValue::from_static("https"));
+
+        let (mut ws_stream, ws_resp) = tokio_tungstenite::connect_async(ws_req)
+            .await
+            .expect("connect ws through *.localhost proxy");
+        assert_eq!(ws_resp.status().as_u16(), 101);
+        assert_eq!(
+            ws_resp
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|v| v.to_str().ok()),
+            Some("vite-hmr")
+        );
+        assert_eq!(
+            observed_origin.lock().await.as_deref(),
+            Some(format!("http://localhost:{upstream_port}").as_str())
+        );
+        assert!(
+            observed_forwarded.lock().await.is_empty(),
+            "client-supplied Forwarded / X-Forwarded-* headers must be stripped, saw: {:?}",
+            observed_forwarded.lock().await
+        );
+
+        // Bidirectional text frame
+        ws_stream
+            .send(TungMsg::Text("hmr-ping".into()))
+            .await
+            .expect("send text");
+        let reply1 = ws_stream.next().await.expect("recv1").expect("ok1");
+        assert_eq!(reply1, TungMsg::Text("echo:hmr-ping".into()));
+
+        // Bidirectional binary frame
+        let payload = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        ws_stream
+            .send(TungMsg::Binary(payload.clone().into()))
+            .await
+            .expect("send bin");
+        let reply2 = ws_stream.next().await.expect("recv2").expect("ok2");
+        assert_eq!(reply2, TungMsg::Binary(payload.into()));
+
+        let _ = ws_stream.close(None).await;
+        upstream_handle.abort();
+        proxy_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_sse_streams_incremental_chunks_without_buffering_until_eof() {
+        use axum::Router;
+        use axum::routing::get;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (sse_tx, sse_rx) = tokio::sync::mpsc::channel::<Result<String, Infallible>>(4);
+        let sse_rx_slot = Arc::new(tokio::sync::Mutex::new(Some(sse_rx)));
+        let upstream_app = Router::new().route(
+            "/events",
+            get(move || {
+                let slot = Arc::clone(&sse_rx_slot);
+                async move {
+                    let rx = slot.lock().await.take();
+                    let body = match rx {
+                        Some(mut rx) => Body::from_stream(async_stream_from_mpsc(&mut rx)),
+                        None => Body::empty(),
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(body)
+                        .unwrap_or_else(|_| Response::new(Body::empty()))
+                }
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind sse upstream");
+        let upstream_port = upstream_listener.local_addr().expect("sse addr").port();
+        let upstream_handle = tokio::spawn(async move {
+            let _ = axum::serve(upstream_listener, upstream_app).await;
+        });
+
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind sse proxy");
+        let proxy_port = proxy_listener.local_addr().expect("sse proxy addr").port();
+
+        let scripts = WorkspaceScriptRegistry::new();
+        let proxy_host = "sse--orbit.localhost".to_string();
+        scripts
+            .register_running(
+                "ws_sse",
+                "sse",
+                WorkspaceScriptInfo {
+                    workspace_id: "ws_sse".into(),
+                    name: "sse".into(),
+                    command: "dev".into(),
+                    kind: WorkspaceScriptKind::Service,
+                    status: WorkspaceScriptStatus::Running,
+                    terminal_id: Some("term_sse".into()),
+                    port: Some(upstream_port),
+                    proxy_url: Some(format!("http://{proxy_host}:{proxy_port}")),
+                    last_error: None,
+                },
+                Some(proxy_host.clone()),
+            )
+            .await;
+
+        let proxy_scripts = Arc::clone(&scripts);
+        let proxy_app = Router::new().fallback(move |req: Request<Body>| {
+            let reg = Arc::clone(&proxy_scripts);
+            async move {
+                if let Some(h) = req
+                    .headers()
+                    .get(header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    && let Some(auth) = reg.resolve_proxy_service(h).await
+                {
+                    let authority = PreviewAuthority::DotLocalhost {
+                        host: auth.proxy_host.clone().unwrap_or_default(),
+                        expected_port: auth.advertised_port,
+                    };
+                    return reg
+                        .proxy_http_request_authorized(&auth, &authority, req)
+                        .await;
+                }
+                Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::empty())
+                    .unwrap_or_else(|_| Response::new(Body::empty()))
+            }
+        });
+        let proxy_handle = tokio::spawn(async move {
+            let _ = axum::serve(proxy_listener, proxy_app).await;
+        });
+
+        // Push event 1 BEFORE closing upstream stream (keep `sse_tx` alive!).
+        sse_tx
+            .send(Ok("data: hmr-ready\n\n".to_string()))
+            .await
+            .expect("send chunk 1");
+
+        let mut client = TcpStream::connect(("127.0.0.1", proxy_port))
+            .await
+            .expect("connect proxy");
+        client
+            .write_all(
+                format!(
+                    "GET /events HTTP/1.1\r\nHost: {proxy_host}:{proxy_port}\r\nAccept: text/event-stream\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write GET");
+
+        // Chunk 1 MUST arrive immediately WITHOUT waiting for upstream EOF!
+        let mut received = String::new();
+        let mut buf = [0u8; 2048];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !received.contains("data: hmr-ready") {
+            let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !rem.is_zero(),
+                "timed out waiting for first SSE chunk: {received:?}"
+            );
+            let n = tokio::time::timeout(rem, client.read(&mut buf))
+                .await
+                .expect("read chunk 1 before EOF")
+                .expect("read ok");
+            assert!(n > 0, "stream closed prematurely before chunk 1");
+            received.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        assert!(
+            received
+                .to_ascii_lowercase()
+                .contains("cache-control: no-cache"),
+            "SSE response must enforce Cache-Control: no-cache; got: {received}"
+        );
+
+        // Now push chunk 2 and close stream cleanly.
+        sse_tx
+            .send(Ok("data: hmr-update\n\n".to_string()))
+            .await
+            .expect("send chunk 2");
+        drop(sse_tx);
+
+        let deadline2 = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !received.contains("data: hmr-update") {
+            let rem = deadline2.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !rem.is_zero(),
+                "timed out waiting for second SSE chunk: {received:?}"
+            );
+            let n = tokio::time::timeout(rem, client.read(&mut buf))
+                .await
+                .expect("read chunk 2")
+                .expect("read ok");
+            if n == 0 {
+                break;
+            }
+            received.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        assert!(received.contains("data: hmr-update"));
+
+        upstream_handle.abort();
+        proxy_handle.abort();
+    }
+
+    fn async_stream_from_mpsc(
+        rx: &mut tokio::sync::mpsc::Receiver<Result<String, Infallible>>,
+    ) -> impl futures_util::Stream<Item = Result<String, Infallible>> + Send + 'static {
+        let (tx_placeholder, mut owned_rx) = tokio::sync::mpsc::channel(1);
+        std::mem::swap(rx, &mut owned_rx);
+        drop(tx_placeholder);
+        futures_util::stream::unfold(owned_rx, |mut rx| async move {
+            let item = rx.recv().await?;
+            Some((item, rx))
+        })
+    }
+
+    #[tokio::test]
+    async fn remote_preview_tunnel_enforces_service_allowlist_and_streams_over_duplex() {
+        use axum::Router;
+        use axum::routing::get;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let leaked_fwd = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let leaked_bg = Arc::clone(&leaked_fwd);
+        let upstream_app = Router::new().route(
+            "/ping",
+            get(move |headers: HeaderMap| {
+                let leaked = Arc::clone(&leaked_bg);
+                async move {
+                    let mut bad = Vec::new();
+                    for (name, _) in &headers {
+                        let lower = name.as_str().to_ascii_lowercase();
+                        if lower == "forwarded" || lower.starts_with("x-forwarded-") {
+                            bad.push(lower);
+                        }
+                    }
+                    *leaked.lock().await = bad;
+                    "pong-from-remote-service"
+                }
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind remote service");
+        let upstream_port = upstream_listener.local_addr().expect("addr").port();
+        let upstream_handle = tokio::spawn(async move {
+            let _ = axum::serve(upstream_listener, upstream_app).await;
+        });
+
+        let scripts = WorkspaceScriptRegistry::new();
+        // Arbitrary unregistered port MUST be forbidden (zero SSRF).
+        assert_eq!(
+            scripts
+                .resolve_allowed_preview_port(upstream_port, None)
+                .await,
+            None
+        );
+        assert_eq!(scripts.resolve_allowed_preview_port(6379, None).await, None);
+        assert_eq!(
+            scripts
+                .resolve_allowed_preview_port(0, Some("unregistered.localhost"))
+                .await,
+            None
+        );
+
+        let proxy_host = "app--remote.localhost".to_string();
+        scripts
+            .register_running(
+                "ws_r",
+                "app",
+                WorkspaceScriptInfo {
+                    workspace_id: "ws_r".into(),
+                    name: "app".into(),
+                    command: "npm run dev".into(),
+                    kind: WorkspaceScriptKind::Service,
+                    status: WorkspaceScriptStatus::Running,
+                    terminal_id: Some("term_r".into()),
+                    port: Some(upstream_port),
+                    proxy_url: Some(format!("http://{proxy_host}:6868")),
+                    last_error: None,
+                },
+                Some(proxy_host.clone()),
+            )
+            .await;
+
+        let auth = scripts
+            .resolve_allowed_preview_service(upstream_port, None)
+            .await
+            .expect("running service must resolve");
+        assert_eq!(auth.target_port, upstream_port);
+        assert_eq!(
+            scripts
+                .resolve_allowed_preview_port(0, Some(&proxy_host))
+                .await,
+            Some(upstream_port)
+        );
+        // Mismatched port + host MUST be rejected!
+        assert_eq!(
+            scripts
+                .resolve_allowed_preview_port(upstream_port.wrapping_add(1), Some(&proxy_host))
+                .await,
+            None
+        );
+
+        // Verify `serve_preview_tunnel_io` forwards HTTP over a keep-alive duplex stream,
+        // strips Forwarded/X-Forwarded-*, rejects foreign Host, and aborts immediately when the
+        // backing workspace service exits!
+        let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let srv_scripts = Arc::clone(&scripts);
+        let srv_task = tokio::spawn(srv_scripts.serve_preview_tunnel_io(auth.clone(), server_io));
+
+        // 1. Valid keep-alive request with spoofed Forwarded / X-Forwarded-* headers.
+        client_io
+            .write_all(
+                b"GET /ping HTTP/1.1\r\nHost: 127.0.0.1:54321\r\nForwarded: for=9.9.9.9\r\nX-Forwarded-Host: evil.example\r\n\r\n",
+            )
+            .await
+            .expect("write tunnel GET 1");
+        let mut resp1 = String::new();
+        let mut buf = [0u8; 2048];
+        while !resp1.contains("pong-from-remote-service") {
+            let n = tokio::time::timeout(Duration::from_secs(2), client_io.read(&mut buf))
+                .await
+                .expect("read resp1 timeout")
+                .expect("read resp1 ok");
+            assert!(n > 0, "unexpected EOF on resp1: {resp1}");
+            resp1.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        assert!(resp1.contains("200 OK"), "unexpected tunnel resp: {resp1}");
+        assert!(
+            leaked_fwd.lock().await.is_empty(),
+            "Forwarded / X-Forwarded-* must be stripped in tunnel HTTP: {:?}",
+            leaked_fwd.lock().await
+        );
+
+        // 2. Foreign Host header on the same keep-alive connection MUST be rejected (403).
+        client_io
+            .write_all(b"GET /ping HTTP/1.1\r\nHost: evil.example\r\n\r\n")
+            .await
+            .expect("write foreign host GET");
+        let n_bad = tokio::time::timeout(Duration::from_secs(2), client_io.read(&mut buf))
+            .await
+            .expect("read 403 timeout")
+            .expect("read 403 ok");
+        let resp_bad = String::from_utf8_lossy(&buf[..n_bad]);
+        assert!(
+            resp_bad.contains("403 Forbidden"),
+            "foreign Host in tunnel must return 403, got: {resp_bad}"
+        );
+
+        // 3. Backing service exits (`unregister_by_terminal_id`): keep-alive tunnel MUST
+        //    terminate immediately and further requests cannot reach upstream!
+        let stopped = scripts.unregister_by_terminal_id("term_r").await;
+        assert_eq!(stopped.len(), 1);
+        assert!(!scripts.is_service_instance_live(&auth).await);
+        assert_eq!(
+            scripts
+                .resolve_allowed_preview_port(upstream_port, None)
+                .await,
+            None
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), srv_task)
+            .await
+            .expect("serve_preview_tunnel_io must cancel immediately when service exits")
+            .expect("srv_task clean exit");
+        let mut eof_buf = [0u8; 64];
+        let eof_n = tokio::time::timeout(Duration::from_secs(2), client_io.read(&mut eof_buf))
+            .await
+            .expect("client EOF after cancel")
+            .expect("read ok");
+        assert_eq!(
+            eof_n, 0,
+            "open keep-alive tunnel must reach EOF on service exit"
+        );
+
+        upstream_handle.abort();
     }
 }

@@ -631,6 +631,8 @@ pub struct CreateBrowserSessionRequest {
     pub viewport_width: Option<u32>,
     #[serde(default)]
     pub viewport_height: Option<u32>,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -652,6 +654,20 @@ pub struct BrowserActionResponseView {
     pub text_excerpt: Option<String>,
     #[serde(default)]
     pub captcha_detected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picked_element: Option<orbit_protocol::PickedElementInfo>,
+}
+
+/// Active local loopback forwarder pointing to a running workspace service on a remote host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemotePreviewTunnelView {
+    pub host_id: String,
+    pub target_port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_host: Option<String>,
+    pub local_port: u16,
+    pub local_url: String,
+    pub is_tunneled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

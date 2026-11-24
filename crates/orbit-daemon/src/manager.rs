@@ -1607,13 +1607,14 @@ impl AgentOrchestrator {
             )
             .await?;
 
+        let terminal_id = term.terminal_id;
         let info = WorkspaceScriptInfo {
             workspace_id: workspace_id.to_string(),
             name: script_name.to_string(),
             command: entry.command,
             kind,
             status: WorkspaceScriptStatus::Running,
-            terminal_id: Some(term.terminal_id),
+            terminal_id: Some(terminal_id.clone()),
             port: assigned_port,
             proxy_url,
             last_error: None,
@@ -1621,6 +1622,16 @@ impl AgentOrchestrator {
         self.scripts
             .register_running(workspace_id, script_name, info.clone(), proxy_host)
             .await;
+        if !self.live_terminals.read().await.contains_key(&terminal_id)
+            && let Some(mut exited) = self.scripts.unregister(workspace_id, script_name).await
+        {
+            exited.info.status = WorkspaceScriptStatus::Stopped;
+            exited.info.terminal_id = None;
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::WorkspaceScriptUpdated(exited.info.clone()));
+            return Ok(exited.info);
+        }
         let _ = self
             .broadcast_tx
             .send(DaemonBroadcast::WorkspaceScriptUpdated(info.clone()));
@@ -6588,6 +6599,13 @@ impl AgentOrchestrator {
             let _ = out_tx.send(PtyBroadcast::Closed);
             mgr.live_terminals.write().await.remove(&tid);
             let _ = mgr.store.delete_terminal(&tid);
+            for mut stopped in mgr.scripts.unregister_by_terminal_id(&tid).await {
+                stopped.info.status = WorkspaceScriptStatus::Stopped;
+                stopped.info.terminal_id = None;
+                let _ = mgr
+                    .broadcast_tx
+                    .send(DaemonBroadcast::WorkspaceScriptUpdated(stopped.info));
+            }
         });
     }
 
@@ -6683,6 +6701,13 @@ impl AgentOrchestrator {
     pub async fn kill_terminal(&self, terminal_id: &str) -> anyhow::Result<()> {
         if let Some(live) = self.live_terminals.write().await.remove(terminal_id) {
             let _ = live.shim_tx.send(PtyAction::Kill).await;
+        }
+        for mut stopped in self.scripts.unregister_by_terminal_id(terminal_id).await {
+            stopped.info.status = WorkspaceScriptStatus::Stopped;
+            stopped.info.terminal_id = None;
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::WorkspaceScriptUpdated(stopped.info));
         }
         self.store.delete_terminal(terminal_id)?;
         Ok(())

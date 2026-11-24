@@ -1633,6 +1633,23 @@ export interface BrowserSessionSummary {
   updated_at_ms: number;
 }
 
+export interface PickedElementBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface PickedElementInfo {
+  selector: string;
+  tag: string;
+  text_preview: string;
+  attributes: Record<string, string>;
+  computed_box?: PickedElementBox | null;
+  outer_html_excerpt: string;
+  page_url: string;
+}
+
 export type BrowserActionRequest =
   | { kind: "navigate"; url: string }
   | { kind: "snapshot" }
@@ -1641,7 +1658,30 @@ export type BrowserActionRequest =
   | { kind: "type"; ref_id?: string | null; text: string; submit?: boolean }
   | { kind: "scroll"; delta_x: number; delta_y: number }
   | { kind: "back" }
-  | { kind: "reload" };
+  | { kind: "reload" }
+  | { kind: "press_key"; key: string; modifiers?: string[]; ref_id?: string | null }
+  | {
+      kind: "select_option";
+      ref_id?: string | null;
+      selector?: string | null;
+      value?: string | null;
+      label?: string | null;
+      index?: number | null;
+    }
+  | {
+      kind: "upload_file";
+      ref_id?: string | null;
+      selector?: string | null;
+      files: string[];
+    }
+  | {
+      kind: "pick_element";
+      x?: number | null;
+      y?: number | null;
+      selector?: string | null;
+      ref_id?: string | null;
+      interactive?: boolean;
+    };
 
 export interface BrowserSessionsSnapshotView {
   host_id: string;
@@ -1657,6 +1697,16 @@ export interface BrowserActionResponseView {
   screenshot_base64?: string | null;
   text_excerpt?: string | null;
   captcha_detected?: boolean;
+  picked_element?: PickedElementInfo | null;
+}
+
+export interface RemotePreviewTunnelView {
+  host_id: string;
+  target_port: number;
+  proxy_host?: string | null;
+  local_port: number;
+  local_url: string;
+  is_tunneled: boolean;
 }
 
 export interface InlineSpanView {
@@ -2748,6 +2798,16 @@ export type ComposerContextInput =
       container?: string | null;
       language: string;
       snippet?: string | null;
+    }
+  | {
+      kind: "dom_element";
+      selector: string;
+      tag: string;
+      text_preview: string;
+      attributes: Record<string, string>;
+      computed_box?: PickedElementBox | null;
+      outer_html_excerpt: string;
+      page_url: string;
     };
 
 export interface ComposerQuoteInput {
@@ -6502,6 +6562,7 @@ export const orbitIpc = {
     headless?: boolean | null;
     viewportWidth?: number | null;
     viewportHeight?: number | null;
+    workspaceRoot?: string | null;
   }): Promise<BrowserSessionSummary> => {
     return invoke<BrowserSessionSummary>("create_browser_session", {
       hostId: req.hostId,
@@ -6510,6 +6571,7 @@ export const orbitIpc = {
       headless: req.headless ?? null,
       viewportWidth: req.viewportWidth ?? null,
       viewportHeight: req.viewportHeight ?? null,
+      workspaceRoot: req.workspaceRoot ?? null,
     });
   },
 
@@ -6542,6 +6604,41 @@ export const orbitIpc = {
     return invoke<BrowserSessionsSnapshotView>("update_browser_policy", {
       hostId,
       policy,
+    });
+  },
+
+  openRemotePreviewTunnel: async (
+    hostId: string,
+    targetPort: number,
+    proxyHost?: string | null,
+  ): Promise<RemotePreviewTunnelView> => {
+    if (!isTauriRuntime()) {
+      return {
+        host_id: hostId,
+        target_port: targetPort,
+        proxy_host: proxyHost ?? null,
+        local_port: targetPort,
+        local_url: `http://127.0.0.1:${targetPort}`,
+        is_tunneled: false,
+      };
+    }
+    return invoke<RemotePreviewTunnelView>("open_remote_preview_tunnel", {
+      hostId,
+      targetPort,
+      proxyHost: proxyHost ?? null,
+    });
+  },
+
+  closeRemotePreviewTunnel: async (
+    hostId: string,
+    targetPort: number,
+    proxyHost?: string | null,
+  ): Promise<boolean> => {
+    if (!isTauriRuntime()) return false;
+    return invoke<boolean>("close_remote_preview_tunnel", {
+      hostId,
+      targetPort,
+      proxyHost: proxyHost ?? null,
     });
   },
 

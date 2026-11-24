@@ -986,30 +986,60 @@ fn build_http_router(runtime: Arc<DaemonRuntime>) -> Router {
             )),
         )
         .merge(im_webhook_routes)
-        .fallback(service_reverse_proxy_fallback)
+        .fallback(not_found_fallback)
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&runtime),
+            service_reverse_proxy_host_middleware,
+        ))
         .with_state(runtime)
 }
 
-async fn service_reverse_proxy_fallback(
+/// Intercept requests targeting a registered `*.localhost` workspace service BEFORE daemon routes
+/// (`/ws`, `/healthz`, etc.) so Webpack/Vite/Next.js HMR endpoints on `/ws` proxy cleanly.
+async fn service_reverse_proxy_host_middleware(
     State(runtime): State<Arc<DaemonRuntime>>,
     req: Request<Body>,
+    next: axum::middleware::Next,
 ) -> Response {
-    if let Some(host_val) = req
-        .headers()
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        && let Some(target_port) = runtime
+    let mut host_iter = req.headers().get_all(axum::http::header::HOST).iter();
+    let first_host = host_iter.next();
+    if host_iter.next().is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Multiple Host headers are not allowed",
+        )
+            .into_response();
+    }
+    if let Some(host_val) = first_host.and_then(|v| v.to_str().ok())
+        && let Some(auth) = runtime
             .orchestrator
             .scripts
-            .resolve_proxy_port(host_val)
+            .resolve_proxy_service(host_val)
             .await
     {
+        let listen_port = *runtime.listen_port.read().await;
+        let expected_port = auth
+            .advertised_port
+            .or_else(|| (listen_port > 0).then_some(listen_port));
+        let expected_host = auth.proxy_host.clone().unwrap_or_else(|| {
+            crate::workspace_runtime::parse_http_host_header(host_val)
+                .map(|(h, _)| h)
+                .unwrap_or_else(|| host_val.to_ascii_lowercase())
+        });
+        let authority = crate::workspace_runtime::PreviewAuthority::DotLocalhost {
+            host: expected_host,
+            expected_port,
+        };
         return runtime
             .orchestrator
             .scripts
-            .proxy_http_request(target_port, req)
+            .proxy_http_request_authorized(&auth, &authority, req)
             .await;
     }
+    next.run(req).await
+}
+
+async fn not_found_fallback() -> Response {
     (StatusCode::NOT_FOUND, "Not Found").into_response()
 }
 
@@ -2073,18 +2103,81 @@ enum SessionExitReason {
 }
 
 const MAX_CONCURRENT_PEER_BRIDGES_PER_SESSION: usize = 16;
+const MAX_CONCURRENT_PREVIEW_TUNNELS_PER_SESSION: usize = 64;
+const MAX_PREVIEW_TUNNEL_FRAME_BYTES: usize = 512 * 1024;
+const MAX_PREVIEW_TUNNEL_INBOUND_FRAMES: usize = 64;
+const MAX_PREVIEW_TUNNEL_INBOUND_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SESSION_PREVIEW_TUNNEL_BYTES: usize = 32 * 1024 * 1024;
 
 struct ActivePeerBridge {
     inbound_tx: mpsc::Sender<Vec<u8>>,
     task: tokio::task::AbortHandle,
 }
 
-/// Ensures terminal streaming tasks, peer bridges, and side-question tasks are always aborted immediately even
-/// when `run_client_session_loop` is dropped mid-await on secret revocation.
+/// RAII-accounted preview tunnel payload chunk. Dropping the chunk (either after writing to the
+/// duplex stream or when a tunnel/session is aborted) automatically refunds both per-tunnel and
+/// per-session byte budgets with zero leaks.
+struct QueuedPreviewBytes {
+    data: Vec<u8>,
+    len: usize,
+    tunnel_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    session_bytes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for QueuedPreviewBytes {
+    fn drop(&mut self) {
+        saturating_atomic_sub(&self.tunnel_bytes, self.len);
+        saturating_atomic_sub(&self.session_bytes, self.len);
+    }
+}
+
+fn try_reserve_atomic_budget(
+    counter: &std::sync::atomic::AtomicUsize,
+    amount: usize,
+    limit: usize,
+) -> bool {
+    counter
+        .fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |cur| {
+                let next = cur.checked_add(amount)?;
+                (next <= limit).then_some(next)
+            },
+        )
+        .is_ok()
+}
+
+fn saturating_atomic_sub(counter: &std::sync::atomic::AtomicUsize, amount: usize) {
+    let _ = counter.fetch_update(
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+        |cur| Some(cur.saturating_sub(amount)),
+    );
+}
+
+struct ActivePreviewTunnel {
+    inbound_tx: mpsc::Sender<QueuedPreviewBytes>,
+    queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    task: tokio::task::AbortHandle,
+}
+
+struct AbortTaskOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Ensures terminal streaming tasks, peer bridges, preview tunnels, and side-question tasks are
+/// always aborted immediately even when `run_client_session_loop` is dropped mid-await on secret revocation.
 struct SessionCleanupGuard {
     slot_to_terminal: HashMap<u8, (String, tokio::task::AbortHandle)>,
     active_side_questions: Vec<tokio::task::AbortHandle>,
     active_peer_bridges: HashMap<Uuid, ActivePeerBridge>,
+    active_preview_tunnels: HashMap<Uuid, ActivePreviewTunnel>,
+    preview_session_queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SessionCleanupGuard {
@@ -2093,6 +2186,8 @@ impl SessionCleanupGuard {
             slot_to_terminal: HashMap::new(),
             active_side_questions: Vec::new(),
             active_peer_bridges: HashMap::new(),
+            active_preview_tunnels: HashMap::new(),
+            preview_session_queued_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -2107,6 +2202,9 @@ impl Drop for SessionCleanupGuard {
         }
         for (_, bridge) in self.active_peer_bridges.drain() {
             bridge.task.abort();
+        }
+        for (_, tunnel) in self.active_preview_tunnels.drain() {
+            tunnel.task.abort();
         }
     }
 }
@@ -2251,6 +2349,9 @@ async fn run_client_session_loop(
                         cleanup
                             .active_peer_bridges
                             .retain(|_, b| !b.task.is_finished());
+                        cleanup
+                            .active_preview_tunnels
+                            .retain(|_, t| !t.task.is_finished());
                         match msg {
                             WireMessage::PeerBridgeOpen {
                                 request_id,
@@ -2282,6 +2383,42 @@ async fn run_client_session_loop(
                             WireMessage::PeerBridgeClosed { bridge_id, .. } => {
                                 if let Some(b) = cleanup.active_peer_bridges.remove(&bridge_id) {
                                     b.task.abort();
+                                }
+                            }
+                            WireMessage::PreviewTunnelOpen {
+                                request_id,
+                                tunnel_id,
+                                target_port,
+                                proxy_host,
+                            } => {
+                                handle_preview_tunnel_open(
+                                    &runtime,
+                                    &mut cleanup.active_preview_tunnels,
+                                    &out_tx,
+                                    use_zstd,
+                                    request_id,
+                                    tunnel_id,
+                                    target_port,
+                                    proxy_host.as_deref(),
+                                )
+                                .await;
+                            }
+                            WireMessage::PreviewTunnelData {
+                                tunnel_id,
+                                payload_b64,
+                            } => {
+                                handle_preview_tunnel_data(
+                                    &mut cleanup.active_preview_tunnels,
+                                    &cleanup.preview_session_queued_bytes,
+                                    &out_tx,
+                                    use_zstd,
+                                    tunnel_id,
+                                    &payload_b64,
+                                );
+                            }
+                            WireMessage::PreviewTunnelClose { tunnel_id, .. } => {
+                                if let Some(t) = cleanup.active_preview_tunnels.remove(&tunnel_id) {
+                                    t.task.abort();
                                 }
                             }
                             other => {
@@ -2666,6 +2803,314 @@ async fn handle_peer_bridge_data(
         && let Some(removed) = bridges.remove(&bridge_id)
     {
         removed.task.abort();
+    }
+}
+
+fn send_session_frame_nonblocking(out_tx: &mpsc::Sender<SessionFrame>, frame: SessionFrame) {
+    match out_tx.try_send(frame) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(deferred)) => {
+            let tx = out_tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(deferred).await;
+            });
+        }
+    }
+}
+
+async fn wait_preview_service_cancelled(cancel_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    if *cancel_rx.borrow() {
+        return;
+    }
+    while cancel_rx.changed().await.is_ok() {
+        if *cancel_rx.borrow() {
+            return;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_preview_tunnel_open(
+    runtime: &Arc<DaemonRuntime>,
+    tunnels: &mut HashMap<Uuid, ActivePreviewTunnel>,
+    out_tx: &mpsc::Sender<SessionFrame>,
+    use_zstd: bool,
+    request_id: Uuid,
+    tunnel_id: Uuid,
+    target_port: u16,
+    proxy_host: Option<&str>,
+) {
+    tunnels.retain(|_, t| !t.task.is_finished());
+
+    if tunnels.len() >= MAX_CONCURRENT_PREVIEW_TUNNELS_PER_SESSION {
+        send_session_frame_nonblocking(
+            out_tx,
+            SessionFrame::Wire {
+                msg: rpc_err(
+                    request_id,
+                    "preview_tunnel_limit_reached",
+                    "maximum concurrent preview tunnels reached for this session",
+                ),
+                zstd: use_zstd,
+            },
+        );
+        return;
+    }
+    if tunnels.contains_key(&tunnel_id) {
+        send_session_frame_nonblocking(
+            out_tx,
+            SessionFrame::Wire {
+                msg: rpc_err(
+                    request_id,
+                    "preview_tunnel_duplicate",
+                    "duplicate tunnel_id",
+                ),
+                zstd: use_zstd,
+            },
+        );
+        return;
+    }
+
+    // Strict SSRF allowlist: ONLY loopback ports owned by a currently running registered
+    // workspace service instance on this daemon may be tunneled.
+    let Some(auth) = runtime
+        .orchestrator
+        .scripts
+        .resolve_allowed_preview_service(target_port, proxy_host)
+        .await
+    else {
+        send_session_frame_nonblocking(
+            out_tx,
+            SessionFrame::Wire {
+                msg: rpc_err(
+                    request_id,
+                    "preview_tunnel_forbidden",
+                    format!(
+                        "preview port {target_port} is not owned by a running registered workspace service on this host"
+                    ),
+                ),
+                zstd: use_zstd,
+            },
+        );
+        return;
+    };
+
+    let resolved_port = auth.target_port;
+    let (inbound_tx, mut inbound_rx) =
+        mpsc::channel::<QueuedPreviewBytes>(MAX_PREVIEW_TUNNEL_INBOUND_FRAMES);
+    let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let scripts = Arc::clone(&runtime.orchestrator.scripts);
+    let tx_out = out_tx.clone();
+
+    let handle = tokio::spawn(async move {
+        use base64::Engine as _;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        if tx_out
+            .send(SessionFrame::Wire {
+                msg: WireMessage::PreviewTunnelOpened {
+                    request_id,
+                    tunnel_id,
+                    target_port: resolved_port,
+                },
+                zstd: use_zstd,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let mut cancel_rx = auth.cancel_receiver();
+        let (bridge_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(scripts.serve_preview_tunnel_io(auth, server_io));
+        let _server_guard = AbortTaskOnDrop(server_task.abort_handle());
+
+        let (mut bridge_reader, mut bridge_writer) = tokio::io::split(bridge_io);
+
+        // Separate write and read pumps so a stalled writer never starves upstream reads and
+        // outbound WS backpressure never starves inbound writes.
+        let mut write_task = tokio::spawn(async move {
+            while let Some(chunk) = inbound_rx.recv().await {
+                if let Err(err) = bridge_writer.write_all(&chunk.data).await {
+                    return Err(format!("preview tunnel write failed: {err}"));
+                }
+                drop(chunk);
+            }
+            let _ = bridge_writer.shutdown().await;
+            Ok::<(), String>(())
+        });
+        let _write_guard = AbortTaskOnDrop(write_task.abort_handle());
+
+        let tx_out_read = tx_out.clone();
+        let mut read_task = tokio::spawn(async move {
+            let mut read_buf = vec![0u8; 32 * 1024];
+            loop {
+                match bridge_reader.read(&mut read_buf).await {
+                    Ok(0) => return Ok::<(), String>(()),
+                    Ok(n) => {
+                        let payload_b64 =
+                            base64::engine::general_purpose::STANDARD.encode(&read_buf[..n]);
+                        if tx_out_read
+                            .send(SessionFrame::Wire {
+                                msg: WireMessage::PreviewTunnelData {
+                                    tunnel_id,
+                                    payload_b64,
+                                },
+                                zstd: use_zstd,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return Err("session outbound closed".to_string());
+                        }
+                    }
+                    Err(err) => return Err(format!("preview tunnel read failed: {err}")),
+                }
+            }
+        });
+        let _read_guard = AbortTaskOnDrop(read_task.abort_handle());
+
+        let mut write_done = false;
+        let close_reason: Option<String> = loop {
+            tokio::select! {
+                read_res = &mut read_task => {
+                    break match read_res {
+                        Ok(Ok(())) => None,
+                        Ok(Err(err)) => Some(err),
+                        Err(_) => Some("preview tunnel read task aborted".to_string()),
+                    };
+                }
+                write_res = &mut write_task, if !write_done => {
+                    write_done = true;
+                    match write_res {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => break Some(err),
+                        Err(_) => break Some("preview tunnel write task aborted".to_string()),
+                    }
+                }
+                _ = wait_preview_service_cancelled(&mut cancel_rx) => {
+                    break Some("preview service stopped".to_string());
+                }
+            }
+        };
+
+        drop(_write_guard);
+        drop(_read_guard);
+        drop(_server_guard);
+
+        let _ = tx_out
+            .send(SessionFrame::Wire {
+                msg: WireMessage::PreviewTunnelClose {
+                    tunnel_id,
+                    reason: close_reason,
+                },
+                zstd: use_zstd,
+            })
+            .await;
+    });
+
+    tunnels.insert(
+        tunnel_id,
+        ActivePreviewTunnel {
+            inbound_tx,
+            queued_bytes,
+            task: handle.abort_handle(),
+        },
+    );
+}
+
+/// Strictly non-blocking preview tunnel inbound dispatcher.
+///
+/// NEVER awaits a slow tunnel; enforces per-tunnel frame cap (`MAX_PREVIEW_TUNNEL_INBOUND_FRAMES`),
+/// per-tunnel byte cap (`MAX_PREVIEW_TUNNEL_INBOUND_BYTES`), and session-wide byte cap
+/// (`MAX_SESSION_PREVIEW_TUNNEL_BYTES`). Any overflow or malformed/empty frame closes only the
+/// offending tunnel without stalling RPCs, terminals, or peer closes.
+fn handle_preview_tunnel_data(
+    tunnels: &mut HashMap<Uuid, ActivePreviewTunnel>,
+    session_queued_bytes: &Arc<std::sync::atomic::AtomicUsize>,
+    out_tx: &mpsc::Sender<SessionFrame>,
+    use_zstd: bool,
+    tunnel_id: Uuid,
+    payload_b64: &str,
+) {
+    use base64::Engine as _;
+
+    let close_tunnel = |tunnels: &mut HashMap<Uuid, ActivePreviewTunnel>, reason: &str| {
+        if let Some(removed) = tunnels.remove(&tunnel_id) {
+            removed.task.abort();
+        }
+        send_session_frame_nonblocking(
+            out_tx,
+            SessionFrame::Wire {
+                msg: WireMessage::PreviewTunnelClose {
+                    tunnel_id,
+                    reason: Some(reason.to_string()),
+                },
+                zstd: use_zstd,
+            },
+        );
+    };
+
+    if !tunnels.contains_key(&tunnel_id) {
+        return;
+    }
+    if payload_b64.is_empty() {
+        close_tunnel(tunnels, "empty preview tunnel frame");
+        return;
+    }
+    if payload_b64.len() > (MAX_PREVIEW_TUNNEL_FRAME_BYTES / 3 + 2) * 4 {
+        close_tunnel(tunnels, "preview tunnel frame exceeds size limit");
+        return;
+    }
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload_b64) else {
+        close_tunnel(tunnels, "invalid preview tunnel base64 payload");
+        return;
+    };
+    let len = bytes.len();
+    if len == 0 {
+        close_tunnel(tunnels, "empty preview tunnel frame");
+        return;
+    }
+    if len > MAX_PREVIEW_TUNNEL_FRAME_BYTES {
+        close_tunnel(tunnels, "preview tunnel frame exceeds size limit");
+        return;
+    }
+
+    let send_err_reason = {
+        let Some(tunnel) = tunnels.get(&tunnel_id) else {
+            return;
+        };
+        if !try_reserve_atomic_budget(&tunnel.queued_bytes, len, MAX_PREVIEW_TUNNEL_INBOUND_BYTES) {
+            Some("preview tunnel byte buffer overflow")
+        } else if !try_reserve_atomic_budget(
+            session_queued_bytes,
+            len,
+            MAX_SESSION_PREVIEW_TUNNEL_BYTES,
+        ) {
+            saturating_atomic_sub(&tunnel.queued_bytes, len);
+            Some("session preview tunnel byte budget exceeded")
+        } else {
+            let chunk = QueuedPreviewBytes {
+                data: bytes,
+                len,
+                tunnel_bytes: Arc::clone(&tunnel.queued_bytes),
+                session_bytes: Arc::clone(session_queued_bytes),
+            };
+            match tunnel.inbound_tx.try_send(chunk) {
+                Ok(()) => None,
+                Err(mpsc::error::TrySendError::Full(_dropped_chunk)) => {
+                    Some("preview tunnel frame queue overflow")
+                }
+                Err(mpsc::error::TrySendError::Closed(_dropped_chunk)) => {
+                    Some("preview tunnel closed")
+                }
+            }
+        }
+    };
+
+    if let Some(reason) = send_err_reason {
+        close_tunnel(tunnels, reason);
     }
 }
 
@@ -6221,11 +6666,28 @@ async fn handle_wire_rpc(
             headless,
             viewport_width,
             viewport_height,
+            workspace_root,
         } => {
             let browser = Arc::clone(&runtime.browser);
+            let store = Arc::clone(&runtime.store);
             let tx = out_tx.clone();
             let zstd = *use_zstd;
             tokio::spawn(async move {
+                // Security: when owned by an agent, ALWAYS bind workspace_root authoritatively
+                // from the agent's recorded `cwd` so callers cannot widen upload confinement.
+                let resolved_root = if let Some(ref aid) = agent_id {
+                    store
+                        .get_agent(aid)
+                        .ok()
+                        .flatten()
+                        .map(|a| PathBuf::from(a.cwd))
+                } else {
+                    workspace_root
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                };
                 let reply = match browser
                     .create_session(CreateBrowserSessionSpec {
                         agent_id,
@@ -6233,6 +6695,7 @@ async fn handle_wire_rpc(
                         headless,
                         viewport_width,
                         viewport_height,
+                        workspace_root: resolved_root,
                     })
                     .await
                 {
@@ -6253,10 +6716,28 @@ async fn handle_wire_rpc(
             action,
         } => {
             let browser = Arc::clone(&runtime.browser);
+            let store = Arc::clone(&runtime.store);
             let tx = out_tx.clone();
             let zstd = *use_zstd;
             tokio::spawn(async move {
-                let reply = match browser.execute_action(&session_id, action).await {
+                let mut extra_roots: Vec<PathBuf> = Vec::new();
+                if let Ok(Some(owner_agent_id)) = browser.get_session_owner(&session_id).await
+                    && let Ok(Some(agent)) = store.get_agent(&owner_agent_id)
+                {
+                    extra_roots.push(PathBuf::from(&agent.cwd));
+                    if !agent.workspace_id.is_empty()
+                        && let Ok(Some(ws)) = store.get_workspace(&agent.workspace_id)
+                    {
+                        extra_roots.push(PathBuf::from(&ws.cwd));
+                        if let Some(ref src) = ws.source_cwd {
+                            extra_roots.push(PathBuf::from(src));
+                        }
+                    }
+                }
+                let reply = match browser
+                    .execute_action_with_allowed_roots(&session_id, action, &extra_roots)
+                    .await
+                {
                     Ok(outcome) => WireMessage::BrowserActionResponse {
                         request_id,
                         session: outcome.session,
@@ -6264,6 +6745,7 @@ async fn handle_wire_rpc(
                         screenshot_base64: outcome.screenshot_base64,
                         text_excerpt: outcome.text_excerpt,
                         captcha_detected: outcome.captcha_detected,
+                        picked_element: outcome.picked_element,
                     },
                     Err(e) => rpc_err(request_id, "execute_browser_action_failed", e),
                 };
@@ -10504,5 +10986,151 @@ mod self_upgrade_tests {
         );
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn preview_tunnel_overflow_closes_tunnel_nonblockingly_and_refunds_budget() {
+        use base64::Engine as _;
+
+        let session_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (out_tx, mut out_rx) = mpsc::channel::<SessionFrame>(16);
+
+        // 1. Frame queue overflow on a stalled tunnel closes non-blockingly and refunds bytes.
+        {
+            let tid = Uuid::new_v4();
+            let (inbound_tx, inbound_rx) =
+                mpsc::channel::<QueuedPreviewBytes>(MAX_PREVIEW_TUNNEL_INBOUND_FRAMES);
+            let stalled_task = tokio::spawn(std::future::pending::<()>());
+            let mut tunnels = HashMap::new();
+            tunnels.insert(
+                tid,
+                ActivePreviewTunnel {
+                    inbound_tx,
+                    queued_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    task: stalled_task.abort_handle(),
+                },
+            );
+
+            let frame_b64 = base64::engine::general_purpose::STANDARD.encode(b"chunk-16-bytes!!");
+            for _ in 0..MAX_PREVIEW_TUNNEL_INBOUND_FRAMES {
+                handle_preview_tunnel_data(
+                    &mut tunnels,
+                    &session_bytes,
+                    &out_tx,
+                    false,
+                    tid,
+                    &frame_b64,
+                );
+            }
+            assert!(tunnels.contains_key(&tid));
+            assert_eq!(
+                session_bytes.load(std::sync::atomic::Ordering::Acquire),
+                MAX_PREVIEW_TUNNEL_INBOUND_FRAMES * 16
+            );
+
+            // 65th frame MUST NOT block and MUST close & evict only the stalled tunnel.
+            handle_preview_tunnel_data(
+                &mut tunnels,
+                &session_bytes,
+                &out_tx,
+                false,
+                tid,
+                &frame_b64,
+            );
+            assert!(
+                !tunnels.contains_key(&tid),
+                "overflowed tunnel must be evicted immediately"
+            );
+            let close_frame = out_rx.try_recv().expect("PreviewTunnelClose emitted");
+            match close_frame {
+                SessionFrame::Wire {
+                    msg:
+                        WireMessage::PreviewTunnelClose {
+                            tunnel_id,
+                            reason: Some(reason),
+                        },
+                    ..
+                } => {
+                    assert_eq!(tunnel_id, tid);
+                    assert!(reason.contains("overflow"), "unexpected reason: {reason}");
+                }
+                _ => panic!("expected PreviewTunnelClose wire frame on overflow"),
+            }
+            // Dropping the stalled receiver refunds every queued byte cleanly.
+            drop(inbound_rx);
+            assert_eq!(session_bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+        }
+
+        // 2. Per-tunnel 4 MiB byte budget overflow closes non-blockingly and refunds bytes.
+        {
+            let tid = Uuid::new_v4();
+            let (inbound_tx, inbound_rx) =
+                mpsc::channel::<QueuedPreviewBytes>(MAX_PREVIEW_TUNNEL_INBOUND_FRAMES);
+            let stalled_task = tokio::spawn(std::future::pending::<()>());
+            let mut tunnels = HashMap::new();
+            tunnels.insert(
+                tid,
+                ActivePreviewTunnel {
+                    inbound_tx,
+                    queued_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    task: stalled_task.abort_handle(),
+                },
+            );
+
+            let big_b64 = base64::engine::general_purpose::STANDARD
+                .encode(vec![0xABu8; MAX_PREVIEW_TUNNEL_FRAME_BYTES]);
+            let max_frames_in_4mib =
+                MAX_PREVIEW_TUNNEL_INBOUND_BYTES / MAX_PREVIEW_TUNNEL_FRAME_BYTES;
+            for _ in 0..max_frames_in_4mib {
+                handle_preview_tunnel_data(
+                    &mut tunnels,
+                    &session_bytes,
+                    &out_tx,
+                    false,
+                    tid,
+                    &big_b64,
+                );
+            }
+            assert!(tunnels.contains_key(&tid));
+            handle_preview_tunnel_data(&mut tunnels, &session_bytes, &out_tx, false, tid, &big_b64);
+            assert!(!tunnels.contains_key(&tid));
+            let close_frame = out_rx.try_recv().expect("byte-budget close emitted");
+            assert!(matches!(
+                close_frame,
+                SessionFrame::Wire {
+                    msg: WireMessage::PreviewTunnelClose { tunnel_id, reason: Some(ref r) },
+                    ..
+                } if tunnel_id == tid && r.contains("byte buffer overflow")
+            ));
+            drop(inbound_rx);
+            assert_eq!(session_bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+        }
+
+        // 3. Empty PreviewTunnelData frame is rejected and closes the tunnel cleanly.
+        {
+            let tid = Uuid::new_v4();
+            let (inbound_tx, _inbound_rx) =
+                mpsc::channel::<QueuedPreviewBytes>(MAX_PREVIEW_TUNNEL_INBOUND_FRAMES);
+            let stalled_task = tokio::spawn(std::future::pending::<()>());
+            let mut tunnels = HashMap::new();
+            tunnels.insert(
+                tid,
+                ActivePreviewTunnel {
+                    inbound_tx,
+                    queued_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    task: stalled_task.abort_handle(),
+                },
+            );
+            handle_preview_tunnel_data(&mut tunnels, &session_bytes, &out_tx, false, tid, "");
+            assert!(!tunnels.contains_key(&tid));
+            let close_frame = out_rx.try_recv().expect("empty-frame close emitted");
+            assert!(matches!(
+                close_frame,
+                SessionFrame::Wire {
+                    msg: WireMessage::PreviewTunnelClose { tunnel_id, reason: Some(ref r) },
+                    ..
+                } if tunnel_id == tid && r.contains("empty")
+            ));
+        }
     }
 }

@@ -3460,6 +3460,7 @@ async fn list_browser_sessions(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn create_browser_session(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -3468,6 +3469,7 @@ async fn create_browser_session(
     headless: Option<bool>,
     viewport_width: Option<u32>,
     viewport_height: Option<u32>,
+    workspace_root: Option<String>,
 ) -> Result<orbit_protocol::BrowserSessionSummary, String> {
     state
         .core
@@ -3478,6 +3480,7 @@ async fn create_browser_session(
             headless,
             viewport_width,
             viewport_height,
+            workspace_root,
         })
         .await
 }
@@ -3521,6 +3524,31 @@ async fn update_browser_policy(
         .core
         .update_browser_policy_on_host(&host_id, policy)
         .await
+}
+
+#[tauri::command]
+async fn open_remote_preview_tunnel(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    target_port: u16,
+    proxy_host: Option<String>,
+) -> Result<orbit_client_core::contract::RemotePreviewTunnelView, String> {
+    state
+        .core
+        .open_remote_preview_tunnel(&host_id, target_port, proxy_host)
+        .await
+}
+
+#[tauri::command]
+fn close_remote_preview_tunnel(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    target_port: u16,
+    proxy_host: Option<String>,
+) -> Result<bool, String> {
+    state
+        .core
+        .close_remote_preview_tunnel(&host_id, target_port, proxy_host)
 }
 
 #[tauri::command]
@@ -4635,6 +4663,8 @@ pub fn run() {
             execute_browser_action,
             close_browser_session,
             update_browser_policy,
+            open_remote_preview_tunnel,
+            close_remote_preview_tunnel,
             start_batch_fanout,
             start_dag_workflow,
             start_best_of_n,

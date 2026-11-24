@@ -220,6 +220,17 @@ export type ContextMentionItem =
       slug: string;
       label: string;
       description?: string;
+    }
+  | {
+      id: string;
+      kind: "dom_element";
+      selector: string;
+      tag: string;
+      textPreview: string;
+      attributes: Record<string, string>;
+      computedBox?: { x: number; y: number; width: number; height: number } | null;
+      outerHtmlExcerpt: string;
+      pageUrl: string;
     };
 
 export interface TerminalTabSession {

@@ -718,6 +718,20 @@ pub enum ComposerContextInput {
         #[serde(default)]
         snippet: Option<String>,
     },
+    DomElement {
+        selector: String,
+        tag: String,
+        #[serde(default)]
+        text_preview: String,
+        #[serde(default)]
+        attributes: std::collections::BTreeMap<String, String>,
+        #[serde(default)]
+        computed_box: Option<orbit_protocol::PickedElementBox>,
+        #[serde(default)]
+        outer_html_excerpt: String,
+        #[serde(default)]
+        page_url: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1328,6 +1342,69 @@ pub fn compose_prompt(
                     escape_xml_attr(clean_path),
                     escape_xml_attr(clean_kind),
                     escape_xml_attr(clean_name),
+                ));
+            }
+            ComposerContextInput::DomElement {
+                selector,
+                tag,
+                text_preview,
+                attributes,
+                computed_box,
+                outer_html_excerpt,
+                page_url,
+            } => {
+                let clean_selector = selector.trim();
+                let clean_tag = if tag.trim().is_empty() {
+                    "element"
+                } else {
+                    tag.trim()
+                };
+                let short_label = if clean_selector.is_empty() {
+                    format!("@element <{clean_tag}>")
+                } else {
+                    format!("@element {}", clip_utf8_prefix(clean_selector, 48))
+                };
+                badges.push(PromptBadge {
+                    kind: "element".into(),
+                    label: short_label,
+                    path: (!page_url.trim().is_empty()).then_some(page_url.trim().to_string()),
+                });
+                let box_attr = computed_box
+                    .as_ref()
+                    .map(|b| {
+                        format!(
+                            " box=\"{:.0},{:.0} {:.0}x{:.0}\"",
+                            b.x, b.y, b.width, b.height
+                        )
+                    })
+                    .unwrap_or_default();
+                let mut lines: Vec<String> = Vec::new();
+                if !text_preview.trim().is_empty() {
+                    lines.push(format!(
+                        "Text: {}",
+                        clip_utf8_prefix(text_preview.trim(), 240)
+                    ));
+                }
+                if !attributes.is_empty() {
+                    let attrs_str = attributes
+                        .iter()
+                        .take(16)
+                        .map(|(k, v)| format!("{k}={:?}", clip_utf8_prefix(v, 120)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    lines.push(format!("Attributes: {attrs_str}"));
+                }
+                if !outer_html_excerpt.trim().is_empty() {
+                    let clipped = clip_utf8_prefix(outer_html_excerpt.trim(), 600);
+                    let fence = dynamic_backtick_fence(clipped);
+                    lines.push(format!("{fence}html\n{clipped}\n{fence}"));
+                }
+                let body = lines.join("\n");
+                context_blocks.push(format!(
+                    "<DOM_ELEMENT selector=\"{}\" tag=\"{}\" page_url=\"{}\"{box_attr}>\n{body}\n</DOM_ELEMENT>",
+                    escape_xml_attr(clean_selector),
+                    escape_xml_attr(clean_tag),
+                    escape_xml_attr(page_url.trim()),
                 ));
             }
         }
@@ -2346,6 +2423,55 @@ mod tests {
                 .badges
                 .iter()
                 .any(|b| b.kind == "symbol" && b.label == "@run")
+        );
+    }
+
+    #[test]
+    fn compose_prompt_renders_dom_element_chip_and_block() {
+        let mut attrs = std::collections::BTreeMap::new();
+        attrs.insert("id".into(), "checkout-btn".into());
+        attrs.insert("data-testid".into(), "checkout".into());
+        let composed = compose_prompt(
+            &ComposePromptRequest {
+                provider: ProviderKind::ClaudeCode,
+                raw_text: "Make this button disabled while submitting.".into(),
+                explicit_directive: None,
+                host_id: None,
+                cwd: None,
+                contexts: vec![ComposerContextInput::DomElement {
+                    selector: "button#checkout-btn".into(),
+                    tag: "button".into(),
+                    text_preview: "Pay now".into(),
+                    attributes: attrs,
+                    computed_box: Some(orbit_protocol::PickedElementBox {
+                        x: 24.0,
+                        y: 80.0,
+                        width: 140.0,
+                        height: 36.0,
+                    }),
+                    outer_html_excerpt: "<button id=\"checkout-btn\">Pay now</button>".into(),
+                    page_url: "http://localhost:5173/cart".into(),
+                }],
+                quotes: Vec::new(),
+                pastes: Vec::new(),
+            },
+            None,
+            None,
+        );
+
+        assert!(composed.badges.iter().any(|b| {
+            b.kind == "element"
+                && b.label == "@element button#checkout-btn"
+                && b.path.as_deref() == Some("http://localhost:5173/cart")
+        }));
+        assert!(composed.wire_prompt.contains(
+            "<DOM_ELEMENT selector=\"button#checkout-btn\" tag=\"button\" page_url=\"http://localhost:5173/cart\" box=\"24,80 140x36\">"
+        ));
+        assert!(composed.wire_prompt.contains("Text: Pay now"));
+        assert!(
+            composed
+                .wire_prompt
+                .contains("<button id=\"checkout-btn\">Pay now</button>")
         );
     }
 }

@@ -63,10 +63,10 @@ pub use crate::contract::{
     ForkAgentRequest, ForkAgentResultView, InstructionFileContentView, InstructionFileSavedView,
     InstructionFilesSnapshotView, LifecycleHooksSnapshotView, ListInstructionFilesRequest,
     MatchPathRulesRequest, MatchedPathRulesView, PathRulesSnapshotView,
-    PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RenameWorkspaceEntryRequest,
-    SaveInstructionFileRequest, SearchMessagesRequest, SearchMessagesResponse,
-    SelectBestOfNWinnerRequest, StartBatchFanoutRequest, StartBestOfNRequest,
-    StartDagWorkflowRequest, StartGoalRunRequest, StartMonitorWatchRequest,
+    PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RemotePreviewTunnelView,
+    RenameWorkspaceEntryRequest, SaveInstructionFileRequest, SearchMessagesRequest,
+    SearchMessagesResponse, SelectBestOfNWinnerRequest, StartBatchFanoutRequest,
+    StartBestOfNRequest, StartDagWorkflowRequest, StartGoalRunRequest, StartMonitorWatchRequest,
     StopMonitorWatchRequest, UpsertArtifactRequest, UpsertEventTriggerRequest,
     UpsertExternalMcpServerRequest, UpsertPathRuleRequest, WorkspaceEntryMutationResultView,
     WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
@@ -1028,6 +1028,104 @@ type PendingSymbolSearchTx =
 type PendingMessageSearchTx =
     tokio::sync::oneshot::Sender<Result<Vec<RemoteMessageSearchHit>, String>>;
 
+const MAX_PREVIEW_TUNNEL_QUEUED_FRAMES: usize = 64;
+const MAX_PREVIEW_TUNNEL_QUEUED_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PREVIEW_TUNNEL_INBOUND_FRAME_BYTES: usize = 512 * 1024;
+const PREVIEW_TUNNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct AbortPreviewTaskOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortPreviewTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct ClientQueuedPreviewBytes {
+    data: Vec<u8>,
+    len: usize,
+    queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for ClientQueuedPreviewBytes {
+    fn drop(&mut self) {
+        let _ = self.queued_bytes.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |cur| Some(cur.saturating_sub(self.len)),
+        );
+    }
+}
+
+struct PreviewTunnelSink {
+    tx: tokio::sync::mpsc::Sender<ClientQueuedPreviewBytes>,
+    queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    cancel_tx: tokio::sync::watch::Sender<bool>,
+}
+
+struct TrackedPreviewConnection {
+    request_id: Uuid,
+    abort_handle: tokio::task::AbortHandle,
+}
+
+#[derive(Default)]
+struct PreviewListenerConnections {
+    closed: bool,
+    conns: HashMap<Uuid, TrackedPreviewConnection>,
+}
+
+struct ActivePreviewListener {
+    session_gen: u64,
+    target_port: u16,
+    proxy_host: Option<String>,
+    local_port: u16,
+    local_url: String,
+    session: HostSessionHandle,
+    runtime: tokio::runtime::Handle,
+    connections: Arc<std::sync::Mutex<PreviewListenerConnections>>,
+    task: tokio::task::AbortHandle,
+}
+
+impl ActivePreviewListener {
+    fn shutdown_connections(&self) -> Vec<(Uuid, Uuid)> {
+        self.task.abort();
+        let mut closed = Vec::new();
+        if let Ok(mut guard) = self.connections.lock() {
+            guard.closed = true;
+            for (tunnel_id, entry) in guard.conns.drain() {
+                entry.abort_handle.abort();
+                closed.push((entry.request_id, tunnel_id));
+            }
+        }
+        closed
+    }
+
+    fn notify_remote_close(&self, tunnel_ids: Vec<Uuid>, reason: &'static str) {
+        if tunnel_ids.is_empty() {
+            return;
+        }
+        let session = self.session.clone();
+        self.runtime.spawn(async move {
+            for tunnel_id in tunnel_ids {
+                let _ = session
+                    .send_wire(WireMessage::PreviewTunnelClose {
+                        tunnel_id,
+                        reason: Some(reason.to_string()),
+                    })
+                    .await;
+            }
+        });
+    }
+}
+
+impl Drop for ActivePreviewListener {
+    fn drop(&mut self) {
+        let closed = self.shutdown_connections();
+        let tunnel_ids: Vec<Uuid> = closed.into_iter().map(|(_, tid)| tid).collect();
+        self.notify_remote_close(tunnel_ids, "listener_closed");
+    }
+}
+
 type PendingGitMutationTx =
     tokio::sync::oneshot::Sender<Result<(GitMutationOutcome, bool), String>>;
 
@@ -1165,6 +1263,9 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<BrowserSessionSummary, String>>>,
     pending_browser_actions:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<BrowserActionResponseView, String>>>,
+    pending_preview_tunnels: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<u16, String>>>,
+    active_preview_tunnels: HashMap<Uuid, PreviewTunnelSink>,
+    active_preview_listeners: HashMap<(u16, Option<String>), ActivePreviewListener>,
     pending_workflow_updates:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<WorkflowRunRecord, String>>>,
     pending_workflow_lists:
@@ -1353,6 +1454,9 @@ impl HostMemoryState {
             pending_browser_snapshots: HashMap::new(),
             pending_browser_sessions: HashMap::new(),
             pending_browser_actions: HashMap::new(),
+            pending_preview_tunnels: HashMap::new(),
+            active_preview_tunnels: HashMap::new(),
+            active_preview_listeners: HashMap::new(),
             pending_workflow_updates: HashMap::new(),
             pending_workflow_lists: HashMap::new(),
             pending_im_channels: HashMap::new(),
@@ -5644,6 +5748,7 @@ impl OrbitAppCore {
         let mut host_sync_to_apply: Option<(HostSyncState, bool)> = None;
         let mut flush_terminal_frames: Option<(HostSessionHandle, VecDeque<TerminalBinaryFrame>)> =
             None;
+        let mut preview_tunnels_to_close: Vec<(HostSessionHandle, Uuid, &'static str)> = Vec::new();
         let mut migrated_opt_pref: Option<(String, String)> = None;
         let mut rewound_seen_reset: Option<(String, u64)> = None;
         let mut adopted_daemon_relay = false;
@@ -7384,6 +7489,7 @@ impl OrbitAppCore {
                     screenshot_base64,
                     text_excerpt,
                     captcha_detected,
+                    picked_element,
                 } => {
                     if let Some(tx) = state.pending_browser_actions.remove(&request_id) {
                         let _ = tx.send(Ok(BrowserActionResponseView {
@@ -7393,8 +7499,34 @@ impl OrbitAppCore {
                             screenshot_base64,
                             text_excerpt,
                             captcha_detected,
+                            picked_element,
                         }));
                     }
+                }
+                WireMessage::PreviewTunnelOpened {
+                    request_id,
+                    target_port,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_preview_tunnels.remove(&request_id) {
+                        let _ = tx.send(Ok(target_port));
+                    }
+                }
+                WireMessage::PreviewTunnelData {
+                    tunnel_id,
+                    payload_b64,
+                } => {
+                    if let Err(reason) = enqueue_client_preview_tunnel_data(
+                        &mut state.active_preview_tunnels,
+                        tunnel_id,
+                        &payload_b64,
+                    ) && let Some(handle) = state.session.clone()
+                    {
+                        preview_tunnels_to_close.push((handle, tunnel_id, reason));
+                    }
+                }
+                WireMessage::PreviewTunnelClose { tunnel_id, .. } => {
+                    state.active_preview_tunnels.remove(&tunnel_id);
                 }
                 WireMessage::WorkflowRunsSnapshot { request_id, runs } => {
                     if let Some(tx) = state.pending_workflow_lists.remove(&request_id) {
@@ -7771,6 +7903,10 @@ impl OrbitAppCore {
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_preview_tunnels.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_workflow_updates.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
@@ -8109,6 +8245,18 @@ impl OrbitAppCore {
             self.runtime.spawn(async move {
                 for frame in pending_frames {
                     let _ = handle.send_terminal(frame).await;
+                }
+            });
+        }
+        if !preview_tunnels_to_close.is_empty() {
+            self.runtime.spawn(async move {
+                for (handle, tunnel_id, reason) in preview_tunnels_to_close {
+                    let _ = handle
+                        .send_wire(WireMessage::PreviewTunnelClose {
+                            tunnel_id,
+                            reason: Some(reason.to_string()),
+                        })
+                        .await;
                 }
             });
         }
@@ -18525,6 +18673,7 @@ impl OrbitAppCore {
                     headless: req.headless,
                     viewport_width: req.viewport_width,
                     viewport_height: req.viewport_height,
+                    workspace_root: req.workspace_root,
                 })
                 .await
             {
@@ -18739,6 +18888,325 @@ impl OrbitAppCore {
         res_rx
             .await
             .map_err(|_| "UpdateBrowserPolicy task cancelled".to_string())?
+    }
+
+    /// Open (or reuse) an automatic local loopback preview forwarder for a running workspace
+    /// service on a remote connected Orbit host over the existing Noise_NK E2EE session.
+    ///
+    /// Local hosts return their direct local URL (`is_tunneled = false`). Remote hosts validate
+    /// the strict workspace-service allowlist on the daemon before binding `127.0.0.1:0`.
+    pub async fn open_remote_preview_tunnel(
+        self: &Arc<Self>,
+        host_id: &str,
+        target_port: u16,
+        proxy_host: Option<String>,
+    ) -> Result<RemotePreviewTunnelView, String> {
+        let host_id_owned = host_id.to_string();
+        let norm_proxy_host = proxy_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split(':').next().unwrap_or(s).trim().to_ascii_lowercase());
+
+        // 1. Check local host fast-path and existing active listener cache.
+        let (session, session_gen) = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id_owned)
+                .ok_or_else(|| format!("host `{host_id_owned}` not found"))?;
+            if h.is_local {
+                let matched_proxy = h
+                    .workspace_scripts
+                    .values()
+                    .flatten()
+                    .find(|s| {
+                        s.port == Some(target_port)
+                            || (norm_proxy_host.is_some()
+                                && s.proxy_url.as_deref().is_some_and(|u| {
+                                    norm_proxy_host.as_deref().is_some_and(|ph| u.contains(ph))
+                                }))
+                    })
+                    .and_then(|s| s.proxy_url.clone());
+                let local_url =
+                    matched_proxy.unwrap_or_else(|| format!("http://127.0.0.1:{target_port}"));
+                return Ok(RemotePreviewTunnelView {
+                    host_id: host_id_owned,
+                    target_port,
+                    proxy_host: norm_proxy_host,
+                    local_port: target_port,
+                    local_url,
+                    is_tunneled: false,
+                });
+            }
+            let key = (target_port, norm_proxy_host.clone());
+            if let Some(existing) = h.active_preview_listeners.get(&key)
+                && existing.session_gen == h.session_gen
+                && !existing.task.is_finished()
+            {
+                return Ok(RemotePreviewTunnelView {
+                    host_id: host_id_owned,
+                    target_port: existing.target_port,
+                    proxy_host: existing.proxy_host.clone(),
+                    local_port: existing.local_port,
+                    local_url: existing.local_url.clone(),
+                    is_tunneled: true,
+                });
+            }
+            let sess = h
+                .session
+                .clone()
+                .ok_or_else(|| format!("host `{host_id_owned}` is currently offline"))?;
+            (sess, h.session_gen)
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            // 2. Preflight-verify allowlist on remote daemon via PreviewTunnelOpen + immediate close.
+            let probe_req_id = Uuid::new_v4();
+            let probe_tunnel_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id_owned) {
+                    Some(h) if h.session.is_some() && h.session_gen == session_gen => {
+                        h.pending_preview_tunnels.insert(probe_req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before opening preview tunnel".to_string()),
+                    None => Some(format!("host `{host_id_owned}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::PreviewTunnelOpen {
+                    request_id: probe_req_id,
+                    tunnel_id: probe_tunnel_id,
+                    target_port,
+                    proxy_host: norm_proxy_host.clone(),
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id_owned)
+                {
+                    h.pending_preview_tunnels.remove(&probe_req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send PreviewTunnelOpen: {e}")));
+                return;
+            }
+            let resolved_port = match await_preview_tunnel_open_ack(
+                &core,
+                &host_id_owned,
+                &session,
+                probe_req_id,
+                probe_tunnel_id,
+                ack_rx,
+                PREVIEW_TUNNEL_OPEN_TIMEOUT,
+            )
+            .await
+            {
+                Ok(port) => {
+                    let _ = session
+                        .send_wire(WireMessage::PreviewTunnelClose {
+                            tunnel_id: probe_tunnel_id,
+                            reason: Some("preflight".to_string()),
+                        })
+                        .await;
+                    port
+                }
+                Err(err) => {
+                    let _ = res_tx.send(Err(err));
+                    return;
+                }
+            };
+
+            // 3. Bind ephemeral loopback-only listener and spawn E2EE stream multiplexer.
+            let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = res_tx.send(Err(format!(
+                        "failed to bind local loopback preview listener: {e}"
+                    )));
+                    return;
+                }
+            };
+            let local_port = match listener.local_addr() {
+                Ok(addr) => addr.port(),
+                Err(e) => {
+                    let _ = res_tx.send(Err(format!(
+                        "failed to read local preview listener port: {e}"
+                    )));
+                    return;
+                }
+            };
+            let local_url = format!("http://127.0.0.1:{local_port}");
+
+            let connections =
+                Arc::new(std::sync::Mutex::new(PreviewListenerConnections::default()));
+            let accept_core = Arc::clone(&core);
+            let accept_host_id = host_id_owned.clone();
+            let accept_session = session.clone();
+            let accept_proxy_host = norm_proxy_host.clone();
+            let accept_connections = Arc::clone(&connections);
+            let accept_task = tokio::spawn(async move {
+                loop {
+                    let (stream, _) = match listener.accept().await {
+                        Ok(pair) => pair,
+                        Err(_) => break,
+                    };
+                    let _ = stream.set_nodelay(true);
+                    let request_id = Uuid::new_v4();
+                    let tunnel_id = Uuid::new_v4();
+
+                    let conn_core = Arc::clone(&accept_core);
+                    let conn_host_id = accept_host_id.clone();
+                    let conn_session = accept_session.clone();
+                    let conn_proxy_host = accept_proxy_host.clone();
+                    let conn_tracker = Arc::clone(&accept_connections);
+                    let conn_handle = tokio::spawn(async move {
+                        pump_remote_preview_connection(
+                            conn_core,
+                            conn_host_id,
+                            session_gen,
+                            conn_session,
+                            request_id,
+                            tunnel_id,
+                            resolved_port,
+                            conn_proxy_host,
+                            conn_tracker,
+                            stream,
+                        )
+                        .await;
+                    });
+                    let abort_handle = conn_handle.abort_handle();
+                    let closed_now = match accept_connections.lock() {
+                        Ok(mut guard) => {
+                            if guard.closed {
+                                true
+                            } else {
+                                guard.conns.insert(
+                                    tunnel_id,
+                                    TrackedPreviewConnection {
+                                        request_id,
+                                        abort_handle: abort_handle.clone(),
+                                    },
+                                );
+                                false
+                            }
+                        }
+                        Err(_) => true,
+                    };
+                    if closed_now {
+                        abort_handle.abort();
+                        break;
+                    }
+                }
+            });
+
+            let view = RemotePreviewTunnelView {
+                host_id: host_id_owned.clone(),
+                target_port: resolved_port,
+                proxy_host: norm_proxy_host.clone(),
+                local_port,
+                local_url: local_url.clone(),
+                is_tunneled: true,
+            };
+
+            let runtime_handle = core.runtime.handle().clone();
+            if let Ok(mut guard) = core.hosts.write() {
+                if let Some(h) = guard.get_mut(&host_id_owned)
+                    && h.session_gen == session_gen
+                {
+                    let key = (target_port, norm_proxy_host.clone());
+                    let new_listener = ActivePreviewListener {
+                        session_gen,
+                        target_port: resolved_port,
+                        proxy_host: norm_proxy_host,
+                        local_port,
+                        local_url,
+                        session: session.clone(),
+                        runtime: runtime_handle,
+                        connections,
+                        task: accept_task.abort_handle(),
+                    };
+                    if let Some(prev) = h.active_preview_listeners.insert(key, new_listener) {
+                        let closed = prev.shutdown_connections();
+                        let mut closed_tids = Vec::with_capacity(closed.len());
+                        for (req_id, tid) in closed {
+                            h.pending_preview_tunnels.remove(&req_id);
+                            h.active_preview_tunnels.remove(&tid);
+                            closed_tids.push(tid);
+                        }
+                        prev.notify_remote_close(closed_tids, "listener_replaced");
+                    }
+                    let _ = res_tx.send(Ok(view));
+                } else {
+                    accept_task.abort();
+                    if let Ok(mut cg) = connections.lock() {
+                        cg.closed = true;
+                        for (_, entry) in cg.conns.drain() {
+                            entry.abort_handle.abort();
+                        }
+                    }
+                    let _ = res_tx.send(Err(
+                        "Host session changed before preview tunnel became active".to_string(),
+                    ));
+                }
+            } else {
+                accept_task.abort();
+                if let Ok(mut cg) = connections.lock() {
+                    cg.closed = true;
+                    for (_, entry) in cg.conns.drain() {
+                        entry.abort_handle.abort();
+                    }
+                }
+                let _ = res_tx.send(Err("host state lock poisoned".to_string()));
+            }
+        });
+        res_rx
+            .await
+            .map_err(|_| "open_remote_preview_tunnel task cancelled".to_string())?
+    }
+
+    /// Close an active remote preview loopback listener for `(host_id, target_port, proxy_host)`.
+    pub fn close_remote_preview_tunnel(
+        &self,
+        host_id: &str,
+        target_port: u16,
+        proxy_host: Option<String>,
+    ) -> Result<bool, String> {
+        let norm_proxy_host = proxy_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split(':').next().unwrap_or(s).trim().to_ascii_lowercase());
+        let mut guard = self
+            .hosts
+            .write()
+            .map_err(|_| "host state lock poisoned".to_string())?;
+        let Some(h) = guard.get_mut(host_id) else {
+            return Ok(false);
+        };
+        let key = (target_port, norm_proxy_host);
+        if let Some(removed) = h.active_preview_listeners.remove(&key) {
+            let closed = removed.shutdown_connections();
+            let mut closed_tids = Vec::with_capacity(closed.len());
+            for (req_id, tid) in closed {
+                h.pending_preview_tunnels.remove(&req_id);
+                h.active_preview_tunnels.remove(&tid);
+                closed_tids.push(tid);
+            }
+            removed.notify_remote_close(closed_tids, "listener_closed");
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     async fn dispatch_workflow_update_rpc(
@@ -21109,6 +21577,13 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     for (_, tx) in h.pending_browser_actions.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
+    for (_, tx) in h.pending_preview_tunnels.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    h.active_preview_tunnels.clear();
+    for (_, listener) in h.active_preview_listeners.drain() {
+        let _ = listener.shutdown_connections();
+    }
     for (_, tx) in h.pending_workflow_updates.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
@@ -21151,6 +21626,306 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     h.pending_daemon_upgrades.clear();
     for (_, tx) in h.pending_upgrade_terminals.drain() {
         let _ = tx.send(Err(reason.to_string()));
+    }
+}
+
+fn enqueue_client_preview_tunnel_data(
+    active_tunnels: &mut HashMap<Uuid, PreviewTunnelSink>,
+    tunnel_id: Uuid,
+    payload_b64: &str,
+) -> Result<(), &'static str> {
+    use base64::Engine as _;
+
+    if !active_tunnels.contains_key(&tunnel_id) {
+        return Ok(());
+    }
+    let fail = |tunnels: &mut HashMap<Uuid, PreviewTunnelSink>, reason: &'static str| {
+        if let Some(removed) = tunnels.remove(&tunnel_id) {
+            let _ = removed.cancel_tx.send(true);
+        }
+        Err(reason)
+    };
+
+    if payload_b64.is_empty() {
+        return fail(active_tunnels, "empty preview tunnel frame");
+    }
+    if payload_b64.len() > (MAX_PREVIEW_TUNNEL_INBOUND_FRAME_BYTES / 3 + 2) * 4 {
+        return fail(active_tunnels, "preview tunnel frame exceeds size limit");
+    }
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload_b64) else {
+        return fail(active_tunnels, "invalid preview tunnel base64 payload");
+    };
+    let len = bytes.len();
+    if len == 0 {
+        return fail(active_tunnels, "empty preview tunnel frame");
+    }
+    if len > MAX_PREVIEW_TUNNEL_INBOUND_FRAME_BYTES {
+        return fail(active_tunnels, "preview tunnel frame exceeds size limit");
+    }
+
+    let send_err = {
+        let Some(sink) = active_tunnels.get(&tunnel_id) else {
+            return Ok(());
+        };
+        let reserved = sink
+            .queued_bytes
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |cur| {
+                    let next = cur.checked_add(len)?;
+                    (next <= MAX_PREVIEW_TUNNEL_QUEUED_BYTES).then_some(next)
+                },
+            )
+            .is_ok();
+        if !reserved {
+            Some("preview tunnel byte buffer overflow")
+        } else {
+            let chunk = ClientQueuedPreviewBytes {
+                data: bytes,
+                len,
+                queued_bytes: Arc::clone(&sink.queued_bytes),
+            };
+            match sink.tx.try_send(chunk) {
+                Ok(()) => None,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    Some("preview tunnel frame queue overflow")
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    Some("preview tunnel closed")
+                }
+            }
+        }
+    };
+
+    if let Some(reason) = send_err {
+        return fail(active_tunnels, reason);
+    }
+    Ok(())
+}
+
+fn cleanup_failed_preview_tunnel_open(
+    core: &Arc<OrbitAppCore>,
+    host_id: &str,
+    request_id: Uuid,
+    tunnel_id: Uuid,
+) {
+    if let Ok(mut guard) = core.hosts.write()
+        && let Some(h) = guard.get_mut(host_id)
+    {
+        h.pending_preview_tunnels.remove(&request_id);
+        h.active_preview_tunnels.remove(&tunnel_id);
+    }
+}
+
+async fn await_preview_tunnel_open_ack(
+    core: &Arc<OrbitAppCore>,
+    host_id: &str,
+    session: &HostSessionHandle,
+    request_id: Uuid,
+    tunnel_id: Uuid,
+    ack_rx: tokio::sync::oneshot::Receiver<Result<u16, String>>,
+    timeout: Duration,
+) -> Result<u16, String> {
+    match tokio::time::timeout(timeout, ack_rx).await {
+        Ok(Ok(Ok(port))) => Ok(port),
+        Ok(Ok(Err(err))) => {
+            cleanup_failed_preview_tunnel_open(core, host_id, request_id, tunnel_id);
+            Err(err)
+        }
+        Ok(Err(_)) => {
+            cleanup_failed_preview_tunnel_open(core, host_id, request_id, tunnel_id);
+            let _ = session
+                .send_wire(WireMessage::PreviewTunnelClose {
+                    tunnel_id,
+                    reason: Some("open_abandoned".to_string()),
+                })
+                .await;
+            Err("Host disconnected while opening remote preview service tunnel".to_string())
+        }
+        Err(_) => {
+            cleanup_failed_preview_tunnel_open(core, host_id, request_id, tunnel_id);
+            let _ = session
+                .send_wire(WireMessage::PreviewTunnelClose {
+                    tunnel_id,
+                    reason: Some("open_timeout".to_string()),
+                })
+                .await;
+            Err("Timed out verifying remote preview service tunnel".to_string())
+        }
+    }
+}
+
+async fn wait_client_tunnel_cancelled(cancel_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    if *cancel_rx.borrow() {
+        return;
+    }
+    while cancel_rx.changed().await.is_ok() {
+        if *cancel_rx.borrow() {
+            return;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pump_remote_preview_connection(
+    core: Arc<OrbitAppCore>,
+    host_id: String,
+    session_gen: u64,
+    session: HostSessionHandle,
+    request_id: Uuid,
+    tunnel_id: Uuid,
+    target_port: u16,
+    proxy_host: Option<String>,
+    connections: Arc<std::sync::Mutex<PreviewListenerConnections>>,
+    stream: tokio::net::TcpStream,
+) {
+    use base64::Engine as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    let (down_tx, mut down_rx) =
+        tokio::sync::mpsc::channel::<ClientQueuedPreviewBytes>(MAX_PREVIEW_TUNNEL_QUEUED_FRAMES);
+    let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+
+    let registered = match core.hosts.write() {
+        Ok(mut guard) => match guard.get_mut(&host_id) {
+            Some(h) if h.session.is_some() && h.session_gen == session_gen => {
+                h.pending_preview_tunnels.insert(request_id, ack_tx);
+                h.active_preview_tunnels.insert(
+                    tunnel_id,
+                    PreviewTunnelSink {
+                        tx: down_tx,
+                        queued_bytes: Arc::clone(&queued_bytes),
+                        cancel_tx,
+                    },
+                );
+                true
+            }
+            _ => false,
+        },
+        Err(_) => false,
+    };
+    if !registered {
+        if let Ok(mut guard) = connections.lock() {
+            guard.conns.remove(&tunnel_id);
+        }
+        return;
+    }
+
+    if session
+        .send_wire(WireMessage::PreviewTunnelOpen {
+            request_id,
+            tunnel_id,
+            target_port,
+            proxy_host,
+        })
+        .await
+        .is_err()
+    {
+        cleanup_failed_preview_tunnel_open(&core, &host_id, request_id, tunnel_id);
+        if let Ok(mut guard) = connections.lock() {
+            guard.conns.remove(&tunnel_id);
+        }
+        return;
+    }
+
+    if await_preview_tunnel_open_ack(
+        &core,
+        &host_id,
+        &session,
+        request_id,
+        tunnel_id,
+        ack_rx,
+        PREVIEW_TUNNEL_OPEN_TIMEOUT,
+    )
+    .await
+    .is_err()
+    {
+        if let Ok(mut guard) = connections.lock() {
+            guard.conns.remove(&tunnel_id);
+        }
+        return;
+    }
+
+    let (mut tcp_reader, mut tcp_writer) = stream.into_split();
+
+    let mut write_task = tokio::spawn(async move {
+        while let Some(chunk) = down_rx.recv().await {
+            if tcp_writer.write_all(&chunk.data).await.is_err() {
+                return Err(());
+            }
+            drop(chunk);
+        }
+        let _ = tcp_writer.shutdown().await;
+        Ok::<(), ()>(())
+    });
+    let _write_guard = AbortPreviewTaskOnDrop(write_task.abort_handle());
+
+    let read_session = session.clone();
+    let mut read_task = tokio::spawn(async move {
+        let mut read_buf = vec![0u8; 32 * 1024];
+        loop {
+            match tcp_reader.read(&mut read_buf).await {
+                Ok(0) => return Ok::<(), ()>(()),
+                Ok(n) => {
+                    let payload_b64 =
+                        base64::engine::general_purpose::STANDARD.encode(&read_buf[..n]);
+                    if read_session
+                        .send_wire(WireMessage::PreviewTunnelData {
+                            tunnel_id,
+                            payload_b64,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Err(());
+                    }
+                }
+                Err(_) => return Err(()),
+            }
+        }
+    });
+    let _read_guard = AbortPreviewTaskOnDrop(read_task.abort_handle());
+
+    let mut read_done = false;
+    let cancelled_by_overflow = loop {
+        tokio::select! {
+            write_res = &mut write_task => {
+                let _ = write_res;
+                break false;
+            }
+            read_res = &mut read_task, if !read_done => {
+                read_done = true;
+                if !matches!(read_res, Ok(Ok(()))) {
+                    break false;
+                }
+            }
+            _ = wait_client_tunnel_cancelled(&mut cancel_rx) => {
+                break true;
+            }
+        }
+    };
+
+    drop(_write_guard);
+    drop(_read_guard);
+
+    if let Ok(mut guard) = core.hosts.write()
+        && let Some(h) = guard.get_mut(&host_id)
+    {
+        h.active_preview_tunnels.remove(&tunnel_id);
+    }
+    if let Ok(mut guard) = connections.lock() {
+        guard.conns.remove(&tunnel_id);
+    }
+    if !cancelled_by_overflow {
+        let _ = session
+            .send_wire(WireMessage::PreviewTunnelClose {
+                tunnel_id,
+                reason: None,
+            })
+            .await;
     }
 }
 
@@ -29808,5 +30583,276 @@ mod tests {
             }
             other => panic!("unexpected outbound payload: {other:?}"),
         }
+    }
+
+    #[test]
+    fn client_preview_tunnel_bounded_queue_rejects_empty_and_overflow_and_refunds_bytes() {
+        use base64::Engine as _;
+
+        // 1. Empty frame rejected + cancels tunnel.
+        {
+            let tid = Uuid::new_v4();
+            let (tx, _rx) = tokio::sync::mpsc::channel(MAX_PREVIEW_TUNNEL_QUEUED_FRAMES);
+            let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let mut active = HashMap::new();
+            active.insert(
+                tid,
+                PreviewTunnelSink {
+                    tx,
+                    queued_bytes,
+                    cancel_tx,
+                },
+            );
+            let err = enqueue_client_preview_tunnel_data(&mut active, tid, "")
+                .expect_err("empty frame must fail");
+            assert!(err.contains("empty"));
+            assert!(!active.contains_key(&tid));
+            assert!(*cancel_rx.borrow());
+        }
+
+        // 2. Frame count cap (64 frames) rejects 65th frame non-blockingly and refunds bytes on drop.
+        {
+            let tid = Uuid::new_v4();
+            let (tx, rx) = tokio::sync::mpsc::channel(MAX_PREVIEW_TUNNEL_QUEUED_FRAMES);
+            let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let mut active = HashMap::new();
+            active.insert(
+                tid,
+                PreviewTunnelSink {
+                    tx,
+                    queued_bytes: Arc::clone(&queued_bytes),
+                    cancel_tx,
+                },
+            );
+            let b64 = base64::engine::general_purpose::STANDARD.encode(b"01234567");
+            for _ in 0..MAX_PREVIEW_TUNNEL_QUEUED_FRAMES {
+                enqueue_client_preview_tunnel_data(&mut active, tid, &b64)
+                    .expect("within frame cap");
+            }
+            assert_eq!(
+                queued_bytes.load(std::sync::atomic::Ordering::Acquire),
+                MAX_PREVIEW_TUNNEL_QUEUED_FRAMES * 8
+            );
+            let err = enqueue_client_preview_tunnel_data(&mut active, tid, &b64)
+                .expect_err("65th frame must overflow");
+            assert!(err.contains("frame queue overflow"));
+            assert!(!active.contains_key(&tid));
+            assert!(*cancel_rx.borrow());
+            drop(rx);
+            assert_eq!(queued_bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+        }
+
+        // 3. Byte cap (4 MiB) rejects overflow before hitting frame cap.
+        {
+            let tid = Uuid::new_v4();
+            let (tx, rx) = tokio::sync::mpsc::channel(MAX_PREVIEW_TUNNEL_QUEUED_FRAMES);
+            let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let mut active = HashMap::new();
+            active.insert(
+                tid,
+                PreviewTunnelSink {
+                    tx,
+                    queued_bytes: Arc::clone(&queued_bytes),
+                    cancel_tx,
+                },
+            );
+            let b64 = base64::engine::general_purpose::STANDARD
+                .encode(vec![0xCDu8; MAX_PREVIEW_TUNNEL_INBOUND_FRAME_BYTES]);
+            let max_chunks =
+                MAX_PREVIEW_TUNNEL_QUEUED_BYTES / MAX_PREVIEW_TUNNEL_INBOUND_FRAME_BYTES;
+            for _ in 0..max_chunks {
+                enqueue_client_preview_tunnel_data(&mut active, tid, &b64)
+                    .expect("within byte cap");
+            }
+            let err = enqueue_client_preview_tunnel_data(&mut active, tid, &b64)
+                .expect_err("exceeding 4 MiB byte cap must overflow");
+            assert!(err.contains("byte buffer overflow"));
+            assert!(!active.contains_key(&tid));
+            assert!(*cancel_rx.borrow());
+            drop(rx);
+            assert_eq!(queued_bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn client_preview_tunnel_open_timeout_and_listener_close_send_remote_close() {
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("open core");
+        let (session_handle, mut out_rx) = crate::HostSessionHandle::new_test_channel();
+        let host_id = "h_preview_cleanup";
+        {
+            let mut hosts = core.hosts.write().expect("write hosts");
+            let mut h = HostMemoryState::new(SavedHostProfile {
+                host_id: host_id.to_string(),
+                hostname: "remote-devbox".to_string(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 6868,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk_preview".to_string(),
+                direct_endpoints: vec![],
+                relay_url: Some("wss://relay.example".to_string()),
+                pairing_secret: "secret".to_string(),
+                pairing_secret_updated_at_ms: 0,
+                state: HostConnectionState::OnlineRelay,
+            });
+            h.session = Some(session_handle.clone());
+            hosts.insert(host_id.to_string(), h);
+        }
+
+        // 1. Open timeout MUST clean up maps AND send PreviewTunnelClose { reason: "open_timeout" }.
+        let timeout_req_id = Uuid::new_v4();
+        let timeout_tid = Uuid::new_v4();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let (down_tx, _down_rx) = tokio::sync::mpsc::channel(4);
+        let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
+        {
+            let mut hosts = core.hosts.write().expect("write hosts");
+            let h = hosts.get_mut(host_id).expect("host");
+            h.pending_preview_tunnels.insert(timeout_req_id, ack_tx);
+            h.active_preview_tunnels.insert(
+                timeout_tid,
+                PreviewTunnelSink {
+                    tx: down_tx,
+                    queued_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    cancel_tx,
+                },
+            );
+        }
+
+        let err = core
+            .runtime
+            .block_on(await_preview_tunnel_open_ack(
+                &core,
+                host_id,
+                &session_handle,
+                timeout_req_id,
+                timeout_tid,
+                ack_rx,
+                Duration::from_millis(25),
+            ))
+            .expect_err("timed-out open must return Err");
+        assert!(err.contains("Timed out"));
+        {
+            let hosts = core.hosts.read().expect("read hosts");
+            let h = hosts.get(host_id).expect("host");
+            assert!(!h.pending_preview_tunnels.contains_key(&timeout_req_id));
+            assert!(!h.active_preview_tunnels.contains_key(&timeout_tid));
+        }
+        let close_msg = core.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+                .await
+                .expect("PreviewTunnelClose sent on timeout")
+                .expect("channel open")
+        });
+        assert!(
+            matches!(
+                close_msg,
+                crate::OutboundPayload::Wire(WireMessage::PreviewTunnelClose {
+                    tunnel_id,
+                    reason: Some(ref r),
+                }) if tunnel_id == timeout_tid && r == "open_timeout"
+            ),
+            "unexpected open-timeout wire frame: {close_msg:?}"
+        );
+
+        // 2. Closing a listener MUST abort all tracked active connections AND send
+        //    PreviewTunnelClose for every active tunnel_id!
+        let req1 = Uuid::new_v4();
+        let tid1 = Uuid::new_v4();
+        let req2 = Uuid::new_v4();
+        let tid2 = Uuid::new_v4();
+        let (accept_handle, conn1_handle, conn2_handle) = core.runtime.block_on(async {
+            let accept = tokio::spawn(std::future::pending::<()>()).abort_handle();
+            let c1 = tokio::spawn(std::future::pending::<()>()).abort_handle();
+            let c2 = tokio::spawn(std::future::pending::<()>()).abort_handle();
+            (accept, c1, c2)
+        });
+        let connections = Arc::new(std::sync::Mutex::new(PreviewListenerConnections {
+            closed: false,
+            conns: HashMap::from([
+                (
+                    tid1,
+                    TrackedPreviewConnection {
+                        request_id: req1,
+                        abort_handle: conn1_handle.clone(),
+                    },
+                ),
+                (
+                    tid2,
+                    TrackedPreviewConnection {
+                        request_id: req2,
+                        abort_handle: conn2_handle.clone(),
+                    },
+                ),
+            ]),
+        }));
+        {
+            let mut hosts = core.hosts.write().expect("write hosts");
+            let h = hosts.get_mut(host_id).expect("host");
+            for tid in [tid1, tid2] {
+                let (dtx, _drx) = tokio::sync::mpsc::channel(4);
+                let (ctx, _crx) = tokio::sync::watch::channel(false);
+                h.active_preview_tunnels.insert(
+                    tid,
+                    PreviewTunnelSink {
+                        tx: dtx,
+                        queued_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                        cancel_tx: ctx,
+                    },
+                );
+            }
+            h.active_preview_listeners.insert(
+                (5173, Some("web--app.localhost".to_string())),
+                ActivePreviewListener {
+                    session_gen: h.session_gen,
+                    target_port: 5173,
+                    proxy_host: Some("web--app.localhost".to_string()),
+                    local_port: 54321,
+                    local_url: "http://127.0.0.1:54321".to_string(),
+                    session: session_handle.clone(),
+                    runtime: core.runtime.handle().clone(),
+                    connections,
+                    task: accept_handle.clone(),
+                },
+            );
+        }
+
+        let closed = core
+            .close_remote_preview_tunnel(host_id, 5173, Some("web--app.localhost".to_string()))
+            .expect("close listener");
+        assert!(closed);
+
+        let mut closed_tids = std::collections::HashSet::new();
+        core.runtime.block_on(async {
+            for _ in 0..2 {
+                let msg = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+                    .await
+                    .expect("listener close frame")
+                    .expect("channel open");
+                match msg {
+                    crate::OutboundPayload::Wire(WireMessage::PreviewTunnelClose {
+                        tunnel_id,
+                        reason: Some(ref r),
+                    }) if r == "listener_closed" => {
+                        closed_tids.insert(tunnel_id);
+                    }
+                    other => panic!("unexpected listener close payload: {other:?}"),
+                }
+            }
+            tokio::task::yield_now().await;
+        });
+        assert!(closed_tids.contains(&tid1));
+        assert!(closed_tids.contains(&tid2));
+        assert!(accept_handle.is_finished());
+        assert!(conn1_handle.is_finished());
+        assert!(conn2_handle.is_finished());
+        let hosts = core.hosts.read().expect("read hosts");
+        let h = hosts.get(host_id).expect("host");
+        assert!(!h.active_preview_tunnels.contains_key(&tid1));
+        assert!(!h.active_preview_tunnels.contains_key(&tid2));
     }
 }

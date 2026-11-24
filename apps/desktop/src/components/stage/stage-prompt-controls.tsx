@@ -14,6 +14,7 @@ import {
   Check,
   ChevronRight,
   Copy,
+  Crosshair,
   FileCode2,
   FileDiff,
   FileImage,
@@ -110,6 +111,8 @@ function resolvePromptBadgeIcon(badge: PromptBadge): LucideIcon {
       return Music;
     case "quote":
       return Quote;
+    case "element":
+      return Crosshair;
     case "paste": {
       const cleanName = badge.label.split("·")[0]?.trim() ?? "";
       return cleanName.includes(".") ? resolveSemanticFileIcon(cleanName) : FileText;

@@ -1481,6 +1481,7 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
       headless?: boolean | null;
       viewportWidth?: number | null;
       viewportHeight?: number | null;
+      workspaceRoot?: string | null;
     }): Promise<BrowserSessionSummary | null> {
       if (!req.hostId) return null;
       const seq = (browserReqSeqByHost.get(req.hostId) ?? 0) + 1;

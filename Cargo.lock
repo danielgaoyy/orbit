@@ -2209,6 +2209,8 @@ dependencies = [
  "chrono-tz",
  "ed25519-dalek",
  "futures-util",
+ "hyper",
+ "hyper-util",
  "orbit-crypto",
  "orbit-protocol",
  "orbit-providers",

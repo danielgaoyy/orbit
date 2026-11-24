@@ -2,6 +2,7 @@ import { memo, useEffect, useState } from "react";
 import {
   Check,
   Copy,
+  Crosshair,
   FileDiff,
   FileText,
   Film,
@@ -399,6 +400,49 @@ export const ContextTray = memo(function ContextTray({
                 <button
                   type="button"
                   aria-label={t("composer.removeSkillAria", { slug: item.slug })}
+                  onClick={() => orbitActions.removeContextMention(item.id)}
+                  className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-[5px] transition-colors"
+                >
+                  <X className="size-3" />
+                </button>
+              </span>
+            );
+          }
+
+          if (item.kind === "dom_element") {
+            const shortSel = item.selector || `<${item.tag}>`;
+            const detailLines = [
+              `Selector: ${item.selector}`,
+              `Tag: <${item.tag}>`,
+              item.pageUrl ? `URL: ${item.pageUrl}` : "",
+              item.computedBox
+                ? `Box: (${Math.round(item.computedBox.x)}, ${Math.round(item.computedBox.y)}) ${Math.round(item.computedBox.width)}×${Math.round(item.computedBox.height)}`
+                : "",
+              item.textPreview ? `Text: ${item.textPreview}` : "",
+              item.outerHtmlExcerpt ? `\n${item.outerHtmlExcerpt}` : "",
+            ]
+              .filter(Boolean)
+              .join("\n");
+            return (
+              <span
+                key={item.id}
+                title={item.pageUrl ? `${shortSel} — ${item.pageUrl}` : shortSel}
+                className="orbit-pill-enter border-border-default bg-surface-recessed text-ink-primary hover:bg-accent inline-flex max-w-72 items-center gap-1 rounded-lg border py-0.5 pr-1 pl-2 text-[13px] transition-colors"
+              >
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCopiedPaste(false);
+                    setPreviewPaste({ label: `@element ${shortSel}`, content: detailLines });
+                  }}
+                  className="flex min-w-0 cursor-pointer items-center gap-1.5 py-0.5 text-left"
+                >
+                  <Crosshair className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
+                  <span className="truncate font-mono font-medium">{shortSel}</span>
+                </button>
+                <button
+                  type="button"
+                  aria-label={t("composer.removeAttachmentAria", { name: shortSel })}
                   onClick={() => orbitActions.removeContextMention(item.id)}
                   className="text-ink-muted hover:text-ink-primary hover:bg-accent inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-[5px] transition-colors"
                 >

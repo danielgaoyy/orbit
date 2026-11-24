@@ -3110,6 +3110,8 @@ pub enum WireMessage {
         viewport_width: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         viewport_height: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_root: Option<String>,
     },
     BrowserSessionUpdated {
         request_id: Uuid,
@@ -3131,6 +3133,8 @@ pub enum WireMessage {
         text_excerpt: Option<String>,
         #[serde(default)]
         captcha_detected: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        picked_element: Option<PickedElementInfo>,
     },
     CloseBrowserSession {
         request_id: Uuid,
@@ -3328,6 +3332,33 @@ pub enum WireMessage {
     /// Either side closed the Peer Bridge stream cleanly or due to an upstream error.
     PeerBridgeClosed {
         bridge_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
+    /// Request a remote Orbit daemon to open a strictly allowlisted loopback preview tunnel
+    /// targeting a running registered workspace service (HTTP/SSE/WebSocket HMR).
+    PreviewTunnelOpen {
+        request_id: Uuid,
+        tunnel_id: Uuid,
+        target_port: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proxy_host: Option<String>,
+    },
+    /// Daemon validated the target service port and opened the preview tunnel stream.
+    PreviewTunnelOpened {
+        request_id: Uuid,
+        tunnel_id: Uuid,
+        target_port: u16,
+    },
+    /// Raw stream bytes carried across an established preview tunnel over the existing E2EE session.
+    PreviewTunnelData {
+        tunnel_id: Uuid,
+        payload_b64: String,
+    },
+    /// Either side closed the preview tunnel stream cleanly or due to an upstream error.
+    PreviewTunnelClose {
+        tunnel_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },

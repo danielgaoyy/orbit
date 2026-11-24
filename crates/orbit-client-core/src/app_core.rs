@@ -19,24 +19,25 @@ use orbit_protocol::{
     ArtifactDetail, ArtifactSummary, AttentionState, BackgroundTaskInfo, BrowserPolicyConfig,
     BrowserSessionSummary, ConditionalTimerRecord, ConditionalTimerState, ConnectedHostSummary,
     ContextOccupancyBreakdown, DirectoryEntry, DiscoveredProject, EventTriggerDelivery,
-    ExternalMcpServerRecord, GitCollabQueryResult, GitCommitResult, GitConflictListResult,
-    GitConflictResolution, GitCreatePrResult, GitGeneratedCommitMessage, GitMutationOutcome,
-    GitPrStatus, GitPushResult, GitRebaseActionResult, GitRebaseStatus, GitResolveConflictResult,
-    GitStashListResult, GitStashMutationResult, GitStatusSnapshot, GoalRunRecord,
-    GuardianAssessment, GuardianAuditEntry, GuardianPolicyConfig, HookExecutionRecord, HookScope,
-    HostProjectEntry, HostSyncState, ImChannelRecord, ImPlatform, ImThreadBinding, KeepAwakeStatus,
-    LifecycleHookRule, LspCodeAction, LspCompletionItem, LspDiagnostic, LspHoverInfo, LspLocation,
+    ExternalMcpServerRecord, FimConfig, GitCollabQueryResult, GitCommitResult,
+    GitConflictListResult, GitConflictResolution, GitCreatePrResult, GitGeneratedCommitMessage,
+    GitMutationOutcome, GitPrStatus, GitPushResult, GitRebaseActionResult, GitRebaseStatus,
+    GitResolveConflictResult, GitStashListResult, GitStashMutationResult, GitStatusSnapshot,
+    GoalRunRecord, GuardianAssessment, GuardianAuditEntry, GuardianPolicyConfig,
+    HookExecutionRecord, HookScope, HostProjectEntry, HostSyncState, ImChannelRecord, ImPlatform,
+    ImThreadBinding, InlineEditInput, InlineEditResult, KeepAwakeStatus, LifecycleHookRule,
+    LspCodeAction, LspCompletionItem, LspDiagnostic, LspHoverInfo, LspLocation,
     LspReferenceLocation, LspServerStatus, LspSymbolInfo, LspWorkspaceEdit, LspWorkspaceEditResult,
     ManagedSkillRecord, McpProbeResult, McpResourceContent, McpToolCallOutcome, ModelOption,
     MonitorWatchRecord, OrchestrationConfig, OrchestrationSkillInfo, PathScopedRule,
     PendingPermissionSummary, PermissionCheckpointRef, PermissionRuleRecord, PlanApprovalAction,
-    PlanApprovalPayload, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot,
-    ProviderSubagentDescriptor, ProviderSubagentEvent, PushDeviceRecord, PushPlatform,
-    PushPreferences, QuestionItem, QueuedPromptView, ReasoningEffort, RemoteMessageSearchHit,
-    ResolvePermissionsBatchResult, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec,
-    ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame, TerminalSummary,
-    TimelineEvent, TimelineOutlinePrompt, TimelinePayload, TimerCondition, ToolCallDetail,
-    ToolCallStatus, UpsertPermissionRuleInput, UsageInsightsSnapshot, WireMessage,
+    PlanApprovalPayload, PrPatrolReport, PromptBadge, ProviderKind, ProviderModelCatalog,
+    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent, PushDeviceRecord,
+    PushPlatform, PushPreferences, QuestionItem, QueuedPromptView, ReasoningEffort,
+    RemoteMessageSearchHit, ResolvePermissionsBatchResult, RuleTriggerMode, ScheduleRunRecord,
+    ScheduleSpec, ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame,
+    TerminalSummary, TimelineEvent, TimelineOutlinePrompt, TimelinePayload, TimerCondition,
+    ToolCallDetail, ToolCallStatus, UpsertPermissionRuleInput, UsageInsightsSnapshot, WireMessage,
     WorkflowRunRecord, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind,
     WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo,
     WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
@@ -16584,6 +16585,129 @@ impl OrbitAppCore {
         res_rx
             .await
             .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    /// Fetch the policy for this host, allowing concurrent config reads and writes.
+    pub async fn get_fim_config(&self, host_id: &str) -> Result<FimConfig, String> {
+        self.fim_config_rpc(host_id, None).await
+    }
+    pub async fn update_fim_config(
+        &self,
+        host_id: &str,
+        config: FimConfig,
+    ) -> Result<FimConfig, String> {
+        self.fim_config_rpc(host_id, Some(config)).await
+    }
+    async fn fim_config_rpc(
+        &self,
+        host_id: &str,
+        config: Option<FimConfig>,
+    ) -> Result<FimConfig, String> {
+        let id = Uuid::new_v4();
+        let msg = match config {
+            Some(config) => WireMessage::UpdateFimConfig {
+                request_id: id,
+                config,
+            },
+            None => WireMessage::GetFimConfig { request_id: id },
+        };
+        match self
+            .require_online_session(host_id)?
+            .request_for(
+                msg,
+                Duration::from_secs(10),
+                Some(id),
+                |w| matches!(w,WireMessage::FimConfigState{request_id,..} if *request_id==id),
+            )
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            WireMessage::FimConfigState { config, .. } => Ok(config),
+            _ => Err("Unexpected FIM configuration response".into()),
+        }
+    }
+    pub async fn predict_inline_edit(
+        &self,
+        host_id: &str,
+        input: InlineEditInput,
+    ) -> Result<InlineEditResult, String> {
+        let id = Uuid::new_v4();
+        let InlineEditInput {
+            cwd,
+            file_path,
+            language,
+            prefix,
+            suffix,
+            cursor_line,
+            cursor_col,
+        } = input;
+        let msg = WireMessage::PredictInlineEdit {
+            request_id: id,
+            cwd,
+            file_path,
+            language,
+            prefix,
+            suffix,
+            cursor_line,
+            cursor_col,
+        };
+        match self
+            .require_online_session(host_id)?
+            .request_for(
+                msg,
+                Duration::from_secs(7),
+                Some(id),
+                |w| matches!(w,WireMessage::InlineEditPrediction{request_id,..} if *request_id==id),
+            )
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            WireMessage::InlineEditPrediction {
+                request_id,
+                completion,
+                latency_ms,
+                source,
+            } => Ok(InlineEditResult {
+                request_id,
+                completion,
+                latency_ms,
+                source,
+            }),
+            _ => Err("Unexpected FIM prediction response".into()),
+        }
+    }
+    pub async fn run_pr_patrol(
+        &self,
+        host_id: &str,
+        cwd: String,
+        base_ref: Option<String>,
+        head_ref: Option<String>,
+        pr_number: Option<u64>,
+        post_github_comments: bool,
+    ) -> Result<PrPatrolReport, String> {
+        let id = Uuid::new_v4();
+        let msg = WireMessage::RunPrPatrol {
+            request_id: id,
+            cwd,
+            base_ref,
+            head_ref,
+            pr_number,
+            post_github_comments,
+        };
+        match self
+            .require_online_session(host_id)?
+            .request_for(
+                msg,
+                Duration::from_secs(130),
+                Some(id),
+                |w| matches!(w,WireMessage::PrPatrolCompleted{request_id,..} if *request_id==id),
+            )
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            WireMessage::PrPatrolCompleted { report, .. } => Ok(report),
+            _ => Err("Unexpected PR Patrol response".into()),
+        }
     }
 
     /// Fetch Guardian auto-approval policy and recent audit entries from any connected host.

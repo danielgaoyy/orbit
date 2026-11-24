@@ -78,14 +78,15 @@ use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnVie
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
     ArtifactDetail, ArtifactSummary, ConditionalTimerRecord, ContextOccupancyBreakdown,
-    EventTriggerDelivery, ExternalMcpServerRecord, GitCommitResult, GitConflictListResult,
-    GitConflictResolution, GitCreatePrResult, GitGeneratedCommitMessage, GitMutationOutcome,
-    GitPrStatus, GitPushResult, GitRebaseActionResult, GitRebaseStatus, GitResolveConflictResult,
-    GitStashListResult, GitStashMutationResult, GuardianPolicyConfig, HookExecutionRecord,
-    HookScope, LifecycleHookRule, LspCodeAction, LspCompletionItem, LspDiagnostic, LspHoverInfo,
-    LspLocation, LspReferenceLocation, LspServerStatus, LspSymbolInfo, LspWorkspaceEdit,
-    LspWorkspaceEditResult, ManagedSkillRecord, McpProbeResult, McpResourceContent,
-    McpToolCallOutcome, OrchestrationConfig, PermissionRuleRecord, PromptBadge, ProviderKind,
+    EventTriggerDelivery, ExternalMcpServerRecord, FimConfig, GitCommitResult,
+    GitConflictListResult, GitConflictResolution, GitCreatePrResult, GitGeneratedCommitMessage,
+    GitMutationOutcome, GitPrStatus, GitPushResult, GitRebaseActionResult, GitRebaseStatus,
+    GitResolveConflictResult, GitStashListResult, GitStashMutationResult, GuardianPolicyConfig,
+    HookExecutionRecord, HookScope, InlineEditInput, InlineEditResult, LifecycleHookRule,
+    LspCodeAction, LspCompletionItem, LspDiagnostic, LspHoverInfo, LspLocation,
+    LspReferenceLocation, LspServerStatus, LspSymbolInfo, LspWorkspaceEdit, LspWorkspaceEditResult,
+    ManagedSkillRecord, McpProbeResult, McpResourceContent, McpToolCallOutcome,
+    OrchestrationConfig, PermissionRuleRecord, PrPatrolReport, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ResolvePermissionsBatchResult,
     ScheduleRunRecord, ScheduleTarget, SessionMode, SkillWriteScope, TimerCondition,
     UpsertPermissionRuleInput, UsageInsightsSnapshot, WorkspaceBoardSnapshot, WorkspaceEventRecord,
@@ -3206,6 +3207,51 @@ async fn test_event_trigger(
 }
 
 #[tauri::command]
+async fn get_fim_config(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<FimConfig, String> {
+    state.core.get_fim_config(&host_id).await
+}
+#[tauri::command]
+async fn update_fim_config(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    config: FimConfig,
+) -> Result<FimConfig, String> {
+    state.core.update_fim_config(&host_id, config).await
+}
+#[tauri::command]
+async fn predict_inline_edit(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    input: InlineEditInput,
+) -> Result<InlineEditResult, String> {
+    state.core.predict_inline_edit(&host_id, input).await
+}
+#[tauri::command]
+async fn run_pr_patrol(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    base_ref: Option<String>,
+    head_ref: Option<String>,
+    pr_number: Option<u64>,
+    post_github_comments: bool,
+) -> Result<PrPatrolReport, String> {
+    state
+        .core
+        .run_pr_patrol(
+            &host_id,
+            cwd,
+            base_ref,
+            head_ref,
+            pr_number,
+            post_github_comments,
+        )
+        .await
+}
+#[tauri::command]
 async fn get_guardian_config(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -4740,6 +4786,10 @@ pub fn run() {
             list_conditional_timers,
             cancel_conditional_timer,
             fire_conditional_timer_now,
+            get_fim_config,
+            update_fim_config,
+            predict_inline_edit,
+            run_pr_patrol,
             get_guardian_config,
             update_guardian_config,
             list_permission_rules,

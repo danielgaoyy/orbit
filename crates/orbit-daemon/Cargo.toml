@@ -36,3 +36,7 @@ zeroize.workspace = true
 vt100.workspace = true
 reqwest.workspace = true
 notify.workspace = true
+regex = "1"
+rustc_lexer = "0.1"
+tempfile = "3"
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }

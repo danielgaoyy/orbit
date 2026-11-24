@@ -139,3 +139,7 @@ cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- 
 # 4. iOS Swift parse verification against generated UniFFI bindings
 swiftc -parse apps/ios/Generated/orbit_ffi_uniffi.swift $(find apps/ios/Sources -name '*.swift' | sort)
 ```
+
+### Editor predictions and pull request reviews
+
+The desktop commands `get_fim_config`, `update_fim_config`, `predict_inline_edit` and `run_pr_patrol` take a host ID. Prediction takes an `input: InlineEditInput` object and returns the completion, source, request ID and elapsed milliseconds. Patrol accepts `cwd`, optional base/head refs and PR number, and an explicit posting flag. Both use correlated replies on the selected host session. See [the daemon contract](architecture/daemon-shim-providers.md).

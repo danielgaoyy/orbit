@@ -57,3 +57,9 @@
 - **跨主机 Relay 配置传播**：
   - 通过 `WireMessage::ConfigureHostRelay` 与 `apply_relay_to_fleet` 同步各主机的 Relay 地址并写入云端加密 Vault，使脱离局域网的移动端无需回到 Mac 旁也能与已配置机群重建连接。
   - **必跑验证**：改动连接池、Relay 配置分发或移动网络切换逻辑必跑 `pitfall_04`。
+
+## Inline prediction and PR Patrol
+
+FIM is off by default. Each host stores its policy in `fim-config.json` under Orbit home. `GetFimConfig` and `UpdateFimConfig` return `FimConfigState`. The optional wire `request_id` correlates concurrent configuration calls. A prediction accepts up to 16 KiB before the cursor and 8 KiB after it. The daemon sends that text to the configured Ollama or OpenAI-compatible endpoint, or to the isolated CLI when fallback is enabled and the endpoint is absent. The timeout covers DNS, transport and inference. Subtle and eager control client scheduling.
+
+`RunPrPatrol` compares immutable commits from their merge base. The daemon reads base-commit rules, reviews added lines, and verifies candidates against head blobs. The report records the resolved commits, skipped files, discovery method and discarded candidates. An authenticated Claude Code CLI with an empty tool list, strict MCP configuration, and safe mode can assist discovery and independently assess model-only claims. The read-only static pass also works offline. Posting requires the PR number and the reviewed PR revisions. Each inline comment carries a stable marker. See [the opt-in CI template](../../.github/workflows/orbit-pr-review.yml.example).

@@ -1137,6 +1137,108 @@ pub struct RemoteMessageSearchHit {
     pub cwd: String,
 }
 
+/// Host-scoped inline completion policy. Subtle and eager scheduling belong to the editor.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FimMode {
+    #[default]
+    Off,
+    Subtle,
+    Eager,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FimConfig {
+    pub mode: FimMode,
+    pub endpoint_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key_env: Option<String>,
+    pub max_tokens: u32,
+    pub timeout_ms: u64,
+    pub allow_fast_cli_fallback: bool,
+}
+
+impl Default for FimConfig {
+    fn default() -> Self {
+        Self {
+            mode: FimMode::Off,
+            endpoint_url: None,
+            model: None,
+            api_key_env: None,
+            max_tokens: 128,
+            timeout_ms: 1800,
+            allow_fast_cli_fallback: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InlineEditInput {
+    pub cwd: String,
+    pub file_path: String,
+    pub language: Option<String>,
+    pub prefix: String,
+    pub suffix: String,
+    pub cursor_line: u32,
+    pub cursor_col: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InlineEditResult {
+    pub request_id: Uuid,
+    pub completion: String,
+    pub latency_ms: u64,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum PrPatrolSeverity {
+    P0,
+    P1,
+    P2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrPatrolCategory {
+    Security,
+    Correctness,
+    Concurrency,
+    Performance,
+    Maintainability,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrPatrolFinding {
+    pub id: String,
+    pub severity: PrPatrolSeverity,
+    pub category: PrPatrolCategory,
+    pub file_path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub title: String,
+    pub summary: String,
+    pub evidence: String,
+    pub suggested_fix: String,
+    pub verified_by_stage2: bool,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrPatrolReport {
+    pub repo_root: String,
+    pub base_ref: String,
+    pub head_ref: String,
+    pub pr_number: Option<u64>,
+    pub files_reviewed: u32,
+    pub candidates_found: u32,
+    pub findings: Vec<PrPatrolFinding>,
+    pub dropped_false_positives: u32,
+    pub summary: String,
+    pub duration_ms: u64,
+}
+
 /// Client-to-Daemon and Daemon-to-Client RPC envelope over WebSocket / E2EE Relay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -3027,6 +3129,50 @@ pub enum WireMessage {
         timer: ConditionalTimerRecord,
     },
 
+    GetFimConfig {
+        #[serde(default, skip_serializing_if = "Uuid::is_nil")]
+        request_id: Uuid,
+    },
+    UpdateFimConfig {
+        #[serde(default, skip_serializing_if = "Uuid::is_nil")]
+        request_id: Uuid,
+        config: FimConfig,
+    },
+    FimConfigState {
+        #[serde(default, skip_serializing_if = "Uuid::is_nil")]
+        request_id: Uuid,
+        config: FimConfig,
+    },
+    PredictInlineEdit {
+        request_id: Uuid,
+        cwd: String,
+        file_path: String,
+        language: Option<String>,
+        prefix: String,
+        suffix: String,
+        cursor_line: u32,
+        cursor_col: u32,
+    },
+    InlineEditPrediction {
+        request_id: Uuid,
+        completion: String,
+        latency_ms: u64,
+        source: String,
+    },
+    RunPrPatrol {
+        request_id: Uuid,
+        cwd: String,
+        base_ref: Option<String>,
+        head_ref: Option<String>,
+        pr_number: Option<u64>,
+        #[serde(default)]
+        post_github_comments: bool,
+    },
+    PrPatrolCompleted {
+        request_id: Uuid,
+        report: PrPatrolReport,
+    },
+
     // Guardian AI Risk-Assessment Auto-Approval Policy & Audit Log
     GetGuardianConfig {
         request_id: Uuid,
@@ -3621,6 +3767,31 @@ impl TerminalBinaryFrame {
 mod tests {
     use super::*;
 
+    #[test]
+    fn fim_default_wire_is_opt_in_and_accepts_uncorrelated_clients() -> Result<(), serde_json::Error>
+    {
+        let msg = serde_json::from_str::<WireMessage>(r#"{"op":"get_fim_config"}"#)?;
+        assert_eq!(
+            serde_json::to_value(msg)?,
+            serde_json::json!({"op":"get_fim_config"})
+        );
+        let msg = serde_json::from_str::<WireMessage>(r#"{"op":"update_fim_config","config":{}}"#)?;
+        let WireMessage::UpdateFimConfig { request_id, config } = msg else {
+            panic!("Unexpected config message");
+        };
+        assert!(request_id.is_nil());
+        assert_eq!(config, FimConfig::default());
+        assert_eq!(
+            (
+                config.mode,
+                config.max_tokens,
+                config.timeout_ms,
+                config.allow_fast_cli_fallback
+            ),
+            (FimMode::Off, 128, 1800, false)
+        );
+        Ok(())
+    }
     #[test]
     fn timeline_catchup_accepts_legacy_and_omits_empty_outlines() {
         let legacy = serde_json::json!({

@@ -210,6 +210,20 @@ enum RelayAction {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Review a pull request or a local three-dot commit range with Orbit Patrol.
+    ReviewPr {
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        #[arg(long)]
+        base: Option<String>,
+        #[arg(long)]
+        head: Option<String>,
+        #[arg(long)]
+        pr: Option<u64>,
+        /// Submit verified findings as inline comments on this PR.
+        #[arg(long, requires = "pr")]
+        post: bool,
+    },
     /// Inspect current host environment, identity keypair, Relay attachment, and installed AI CLIs.
     Doctor,
 
@@ -626,6 +640,37 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     }
 
     match cli.command {
+        Commands::ReviewPr {
+            cwd,
+            base,
+            head,
+            pr,
+            post,
+        } => {
+            let report = if explicit_server.is_some() || via_relay {
+                let client = connect_cli_server(&home_dir, &server, via_relay).await?;
+                let id = Uuid::new_v4();
+                let response=client.request_for(WireMessage::RunPrPatrol{request_id:id,cwd:cwd.display().to_string(),base_ref:base,head_ref:head,pr_number:pr,post_github_comments:post},Duration::from_secs(130),Some(id),|w|matches!(w,WireMessage::PrPatrolCompleted{request_id,..} if *request_id==id)).await?;
+                let WireMessage::PrPatrolCompleted { report, .. } = response else {
+                    anyhow::bail!("Unexpected PR Patrol response");
+                };
+                report
+            } else {
+                orbit_daemon::pr_patrol::run(&cwd, base.as_deref(), head.as_deref(), pr, post)
+                    .await?
+            };
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", report.summary);
+                for f in report.findings {
+                    println!(
+                        "[{:?}] {}:{} {}\n  {}",
+                        f.severity, f.file_path, f.start_line, f.title, f.suggested_fix
+                    );
+                }
+            }
+        }
         Commands::Doctor => {
             set_snapshot_orbit_home(&home_dir);
             let _ = resolve_login_shell_env().await;

@@ -373,6 +373,33 @@ pub async fn run_hardened_guardian_prompt(
     prompt: String,
     timeout_ms: u64,
 ) -> Result<String, String> {
+    run_isolated_prompt(provider, model, prompt, timeout_ms, &[]).await
+}
+
+/// Complete untrusted editor or PR text using a CLI with an explicit empty tool set.
+/// Extra CLI switches apply only to these calls. Older unsupported CLIs fail closed.
+pub async fn run_tool_free_prompt(
+    model: Option<String>,
+    prompt: String,
+    timeout_ms: u64,
+) -> Result<String, String> {
+    run_isolated_prompt(
+        ProviderKind::ClaudeCode,
+        model,
+        prompt,
+        timeout_ms,
+        &["--strict-mcp-config", "--safe-mode"],
+    )
+    .await
+}
+
+async fn run_isolated_prompt(
+    provider: ProviderKind,
+    model: Option<String>,
+    prompt: String,
+    timeout_ms: u64,
+    extra_flags: &[&str],
+) -> Result<String, String> {
     if prompt.trim().is_empty() {
         return Err("Guardian LLM prompt cannot be empty".to_string());
     }
@@ -397,12 +424,14 @@ pub async fn run_hardened_guardian_prompt(
     })?;
 
     let iso_dir = IsolatedGuardianTempDir::create()?;
-    let spec = build_hardened_guardian_command_spec(
+    let mut spec = build_hardened_guardian_command_spec(
         provider,
         &executable,
         &iso_dir.path,
         model.as_deref(),
     )?;
+    spec.args
+        .extend(extra_flags.iter().map(|arg| arg.to_string()));
     let bounded_ms = timeout_ms.clamp(1_000, 20_000);
 
     let fut = run_hardened_guardian_spec(spec, prompt);

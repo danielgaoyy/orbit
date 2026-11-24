@@ -73,3 +73,5 @@ In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight
 
 **硬性禁止**在未同步更新 GitHub Branch Ruleset 的情况下修改或删除 `ci.yml` 中的任何必填 Check 名称！
 若需增删或重命名 `rust-quality-and-unit`、`e2e-regression-matrix` 标签或 `desktop-frontend-build`，**必须在同一 PR 合入前后同步调整 GitHub Ruleset `protect-main-and-master`（ID `27444583`）的 `required_status_checks`**，否则所有 PR 将被永久挂起。
+
+[Orbit Patrol’s opt-in workflow](../../.github/workflows/orbit-pr-review.yml.example) runs on read-only pull request events. It builds the reviewer at the trusted base SHA and reads the fork head as Git objects. Download the JSON report from the run artifacts.

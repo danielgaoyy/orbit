@@ -193,6 +193,8 @@ impl ManagedAcpTerminal {
 /// Dropping `AcpCallbackHost` immediately terminates and cleans up every remaining terminal
 /// process group spawned by the session so zero orphan processes can leak.
 pub struct AcpCallbackHost {
+    pub(crate) policy: Option<orbit_protocol::SandboxPolicy>,
+    pub(crate) proxy: Option<String>,
     workspace_root: PathBuf,
     terminals: HashMap<String, Arc<ManagedAcpTerminal>>,
     reply_tx: mpsc::Sender<String>,
@@ -213,6 +215,8 @@ impl AcpCallbackHost {
         let (reply_tx, reply_rx) = mpsc::channel(128);
         (
             Self {
+                policy: None,
+                proxy: None,
                 workspace_root,
                 terminals: HashMap::new(),
                 reply_tx,
@@ -245,8 +249,9 @@ impl AcpCallbackHost {
             "fs/read_text_file" => {
                 let root = self.workspace_root.clone();
                 let params_owned = params.clone();
+                let policy = self.policy.clone();
                 let res = tokio::task::spawn_blocking(move || {
-                    handle_fs_read_text_file(&root, &params_owned)
+                    read_with_policy(&root, &params_owned, policy.as_ref())
                 })
                 .await
                 .unwrap_or_else(|e| {
@@ -260,8 +265,9 @@ impl AcpCallbackHost {
             "fs/write_text_file" => {
                 let root = self.workspace_root.clone();
                 let params_owned = params.clone();
+                let policy = self.policy.clone();
                 let res = tokio::task::spawn_blocking(move || {
-                    handle_fs_write_text_file(&root, &params_owned)
+                    write_with_policy(&root, &params_owned, policy.as_ref())
                 })
                 .await
                 .unwrap_or_else(|e| {
@@ -377,7 +383,20 @@ impl AcpCallbackHost {
 
         let user_env = parse_terminal_env(params.get("env"))?;
 
-        let mut cmd = build_terminal_command(command, explicit_args.as_deref());
+        let original = build_terminal_command(command, explicit_args.as_deref());
+        let plan = orbit_shim::sandbox::SandboxCommand::prepare(
+            original.as_std().get_program(),
+            original.as_std().get_args().map(Into::into).collect(),
+            &resolved_cwd,
+            self.policy.as_ref(),
+            self.proxy.as_deref(),
+        )
+        .map_err(|e| (JSONRPC_INTERNAL_ERROR, e.to_string()))?;
+        let mut cmd = if self.policy.is_some() {
+            plan.command()
+        } else {
+            original
+        };
         cmd.current_dir(&resolved_cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -401,6 +420,7 @@ impl AcpCallbackHost {
             }
         }
 
+        plan.apply_env(&mut cmd);
         let mut child = cmd.spawn().map_err(|e| {
             (
                 JSONRPC_INTERNAL_ERROR,
@@ -1077,11 +1097,37 @@ fn resolve_confined_dir(
     Ok(current)
 }
 
+fn check_policy_path(
+    policy: Option<&orbit_protocol::SandboxPolicy>,
+    path: &Path,
+    write: bool,
+) -> Result<(), (i64, String)> {
+    if let Some(p) = policy.filter(|p| p.mode != orbit_protocol::SandboxMode::Off)
+        && ((write && p.mode == orbit_protocol::SandboxMode::StrictReadOnly)
+            || orbit_shim::sandbox::denied_paths(p)
+                .map_err(|e| (JSONRPC_PERMISSION_DENIED, e.to_string()))?
+                .iter()
+                .any(|d| path.starts_with(d)))
+    {
+        return Err((
+            JSONRPC_PERMISSION_DENIED,
+            "host sandbox policy denied filesystem access".into(),
+        ));
+    }
+    Ok(())
+}
 /// Handle ACP `fs/read_text_file` with strict workspace confinement, ARM64-safe `O_NOFOLLOW` +
 /// `(dev, ino)` symlink-swap defense, 4 MiB read cap, and optional 1-based `line` & `limit`.
 pub fn handle_fs_read_text_file(
     workspace_root: &Path,
     params: &Value,
+) -> Result<Value, (i64, String)> {
+    read_with_policy(workspace_root, params, None)
+}
+fn read_with_policy(
+    workspace_root: &Path,
+    params: &Value,
+    policy: Option<&orbit_protocol::SandboxPolicy>,
 ) -> Result<Value, (i64, String)> {
     let raw_path = params.get("path").and_then(Value::as_str).ok_or_else(|| {
         (
@@ -1143,6 +1189,7 @@ pub fn handle_fs_read_text_file(
         }
     }
 
+    check_policy_path(policy, &current, false)?;
     let lmeta_before = fs::symlink_metadata(&current).map_err(|e| {
         (
             JSONRPC_RESOURCE_NOT_FOUND,
@@ -1289,6 +1336,13 @@ pub fn handle_fs_write_text_file(
     workspace_root: &Path,
     params: &Value,
 ) -> Result<Value, (i64, String)> {
+    write_with_policy(workspace_root, params, None)
+}
+fn write_with_policy(
+    workspace_root: &Path,
+    params: &Value,
+    policy: Option<&orbit_protocol::SandboxPolicy>,
+) -> Result<Value, (i64, String)> {
     let raw_path = params.get("path").and_then(Value::as_str).ok_or_else(|| {
         (
             JSONRPC_INVALID_PARAMS,
@@ -1337,6 +1391,13 @@ pub fn handle_fs_write_text_file(
         )
     })?;
 
+    check_policy_path(
+        policy,
+        &segments
+            .iter()
+            .fold(canonical_root.clone(), |p, s| p.join(s)),
+        true,
+    )?;
     // Walk/create parent directories strictly inside `canonical_root`, rejecting escaping symlinks & `.git`.
     let mut parent_dir = canonical_root.clone();
     for seg in parent_segments {

@@ -342,6 +342,8 @@ fn build_pi_spawn_spec(
     }
 
     ShimSpawnSpec {
+        sandbox: cfg.sandbox.clone(),
+        egress_proxy_url: None,
         shim_id: format!("pi_{}", cfg.agent_id),
         mode: ShimMode::Stdio,
         program: cfg.executable.to_string_lossy().to_string(),
@@ -633,6 +635,9 @@ async fn build_pi_prompt_command_async(
     prompt: &str,
     attachments_dir: Option<&Path>,
 ) -> String {
+    if cmd_type == "prompt" && prompt.trim() == "/compact" {
+        return json!({"id":cmd_id,"type":"compact"}).to_string();
+    }
     let (enriched, images) =
         build_pi_prompt_payload_async(prompt.to_string(), attachments_dir.map(Path::to_path_buf))
             .await;
@@ -1571,7 +1576,8 @@ async fn run_pi_actor(
                         let Ok(val) = serde_json::from_str::<Value>(&line) else {
                             continue;
                         };
-                        let ev_type = val.get("type").and_then(Value::as_str).unwrap_or("");
+                        let mut ev_type = val.get("type").and_then(Value::as_str).unwrap_or("");
+                        if ev_type=="response" && val.get("command").and_then(Value::as_str)==Some("compact") && val["success"]==true{ev_type="agent_end";}
                         match ev_type {
                             "response" => {
                                 let cmd_name =
@@ -1584,7 +1590,7 @@ async fn run_pi_actor(
                                         .and_then(Value::as_str)
                                         .unwrap_or("Pi RPC command failed")
                                         .to_string();
-                                    if cmd_name == "prompt" {
+                                    if matches!(cmd_name,"prompt"|"compact") {
                                         seg_state.finalize_all_messages(&evt_tx).await;
                                         let failed_tid = active_turn_id.take();
                                         let dropped_ids =
@@ -2230,6 +2236,8 @@ mod tests {
         seq_tracker: Arc<AtomicU64>,
     ) -> SessionLaunchConfig {
         SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: agent_id.to_string(),
             provider: ProviderKind::Pi,
             executable: script.to_path_buf(),

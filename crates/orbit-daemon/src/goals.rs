@@ -303,6 +303,7 @@ impl Drop for AbortOnDrop {
 
 /// Unified pure-Rust Goal verification loop and streaming Monitor engine.
 pub struct GoalMonitorEngine {
+    home_dir: std::sync::OnceLock<PathBuf>,
     store: Arc<OrbitStore>,
     broadcast_tx: broadcast::Sender<DaemonBroadcast>,
     keep_awake: Arc<KeepAwakeManager>,
@@ -327,13 +328,15 @@ impl GoalMonitorEngine {
         delivery: Arc<AgentMessageDelivery>,
         keep_awake: Arc<KeepAwakeManager>,
     ) -> Arc<Self> {
-        Self::with_sink_and_config(
+        let engine = Self::with_sink_and_config(
             store,
             orchestrator.broadcast_tx.clone(),
             keep_awake,
             DeliveryWakeupSink::new(delivery),
             EngineConfig::default(),
-        )
+        );
+        let _ = engine.home_dir.set(orchestrator.home_dir().into());
+        engine
     }
 
     pub fn with_sink_and_config(
@@ -344,6 +347,7 @@ impl GoalMonitorEngine {
         config: EngineConfig,
     ) -> Arc<Self> {
         Arc::new(Self {
+            home_dir: Default::default(),
             store,
             broadcast_tx,
             keep_awake,
@@ -1095,7 +1099,9 @@ impl GoalMonitorEngine {
                 .map_err(|e| format!("failed to update goal status: {e}"))?;
             self.emit_goal_event(&goal);
 
+            let boundary = self.boundary().await?;
             let outcome = run_verify_command(
+                &boundary,
                 &authorized_cwd,
                 &verify_cmd,
                 self.config.verify_timeout,
@@ -1588,6 +1594,14 @@ impl GoalMonitorEngine {
         Ok(())
     }
 
+    async fn boundary(&self) -> Result<crate::sandbox::Boundary, String> {
+        match self.home_dir.get() {
+            Some(home) => crate::sandbox::Boundary::load(home, None)
+                .await
+                .map_err(|e| e.to_string()),
+            None => Ok(Default::default()),
+        }
+    }
     async fn run_command_stream_monitor(
         self: Arc<Self>,
         mut watch: MonitorWatchRecord,
@@ -1608,11 +1622,27 @@ impl GoalMonitorEngine {
             None => None,
         };
 
-        let mut cmd = tokio::process::Command::new(&command);
-        cmd.args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let mut original = tokio::process::Command::new(&command);
+        original.args(&args);
+        let boundary = match self.boundary().await {
+            Ok(b) => b,
+            Err(e) => {
+                self.mark_monitor_error(&mut watch, &e);
+                return;
+            }
+        };
+        let (mut cmd, plan) = match boundary.command(original, &authorized_cwd) {
+            Ok(c) => c,
+            Err(e) => {
+                self.mark_monitor_error(&mut watch, &e);
+                return;
+            }
+        };
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         configure_isolated_child(&mut cmd, &authorized_cwd);
+        if let Some(p) = plan.as_ref() {
+            p.apply_env(&mut cmd);
+        }
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -2110,15 +2140,30 @@ struct VerifyCommandOutcome {
 }
 
 async fn run_verify_command(
+    boundary: &crate::sandbox::Boundary,
     authorized_cwd: &Path,
     command_str: &str,
     timeout: Duration,
     child_pgid: Arc<std::sync::Mutex<Option<u32>>>,
 ) -> VerifyCommandOutcome {
-    let mut cmd = crate::platform::build_shell_command(command_str, false);
+    let (mut cmd, plan) = match boundary.command(
+        crate::platform::build_shell_command(command_str, false),
+        authorized_cwd,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            return VerifyCommandOutcome {
+                exit_code: -1,
+                output_tail: e,
+            };
+        }
+    };
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     configure_isolated_child(&mut cmd, authorized_cwd);
+    if let Some(p) = plan.as_ref() {
+        p.apply_env(&mut cmd);
+    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,

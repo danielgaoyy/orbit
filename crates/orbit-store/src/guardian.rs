@@ -33,7 +33,21 @@ pub(crate) fn migrate_guardian_schema(conn: &Connection) -> Result<(), StoreErro
 impl OrbitStore {
     /// Persist a Guardian audit entry and trim older rows beyond the rolling retention cap.
     pub fn record_guardian_audit(&self, entry: &GuardianAuditEntry) -> Result<(), StoreError> {
-        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut guard = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let conn = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        self.audit_insert(
+            &conn,
+            "guardian",
+            &entry.assessment.classifier_tier,
+            "guardian",
+            Some(&entry.agent_id),
+            match entry.assessment.decision {
+                orbit_protocol::GuardianDecision::AutoAllow => "allow",
+                orbit_protocol::GuardianDecision::AutoDeny => "deny",
+                orbit_protocol::GuardianDecision::RequireHuman => "review",
+            },
+            &serde_json::Value::Null,
+        )?;
         let assessment_json = serde_json::to_string(&entry.assessment)?;
         let decided_at_ms = i64::try_from(entry.decided_at_ms).unwrap_or(i64::MAX);
         conn.execute(
@@ -63,6 +77,7 @@ impl OrbitStore {
             ",
             params![MAX_PERSISTED_GUARDIAN_AUDITS],
         )?;
+        conn.commit()?;
         Ok(())
     }
 

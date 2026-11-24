@@ -27,6 +27,16 @@ Orbit is designed around defense-in-depth and zero-knowledge infrastructure:
   - Custom ACP agent environment overrides block dynamic-linker and runtime-injection variables (`LD_PRELOAD`, `DYLD_*`, `NODE_OPTIONS`, `ORBIT_*`, etc.).
   - Rust crates enforce `unsafe_code = "deny"` workspace-wide.
 
+## Tool sandbox and security history
+
+A host can set `sandbox_policy` in `$ORBIT_HOME/config.json` or through the authenticated sandbox configuration RPC. Existing sessions retain their launch policy. Every enabled policy protects SSH, AWS, GnuPG, Kubernetes and Orbit host credentials. macOS uses Seatbelt. Linux requires working bubblewrap user and network namespaces. The Windows backend removes credential environment variables and sets workspace-local temporary directories. Its filesystem and network restrictions are cooperative. `orbit doctor` reports the available backend and kernel enforcement.
+
+Outbound HTTP and CONNECT authenticate to a session-local proxy. The proxy gives deny rules precedence, checks every DNS answer for non-public addresses and dials the selected address directly. Linux forwards the isolated namespace's loopback listener through a Unix socket. A detached shim owns its provider's proxy for the child lifetime.
+
+Security events in `security_audit_chain` link to the preceding SHA-256 digest. Each host entry has an Ed25519 signature using a domain-separated signing seed derived from the host identity. `orbit audit verify` checks sequence continuity, payloads, signatures and SQLite's sequence high-water mark. `orbit audit export --output events.jsonl` writes an ordered copy. Independent retention of exports provides evidence across complete database rollbacks.
+
+`GET /metrics` requires a loopback peer, an accepted Origin and the active pairing secret as a bearer token. The endpoint emits aggregate counts. Diagnostic bundles export allowlisted configuration and per-line log severity. OTLP sends static event metadata.
+
 ## Reporting a Vulnerability
 
 **Please do not report security vulnerabilities in public GitHub issues or pull requests.**

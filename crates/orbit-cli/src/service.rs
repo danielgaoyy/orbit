@@ -1,8 +1,14 @@
-use std::fs::{self, File};
+#[cfg(any(windows, test))]
+mod windows;
+use std::fs;
+#[cfg(not(windows))]
+use std::fs::File;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+#[cfg(windows)]
+pub(crate) use windows::native::dispatch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceRole {
@@ -39,6 +45,7 @@ impl ServiceRole {
         }
     }
 
+    #[cfg(not(windows))]
     pub fn pid_file(self, home_dir: &Path) -> PathBuf {
         home_dir.join(format!("{}.pid", self.subcommand_arg()))
     }
@@ -326,6 +333,17 @@ pub async fn install_and_start_service(
     expected_port: u16,
     expected_host_id: Option<&str>,
 ) -> anyhow::Result<String> {
+    install_supervised(role, home_dir, expected_port, expected_host_id, false).await
+}
+pub async fn install_supervised(
+    role: ServiceRole,
+    home_dir: &Path,
+    expected_port: u16,
+    expected_host_id: Option<&str>,
+    service: bool,
+) -> anyhow::Result<String> {
+    #[cfg(not(windows))]
+    anyhow::ensure!(!service, "--service selects the Windows SCM supervisor");
     fs::create_dir_all(home_dir.join("logs"))?;
     let exe = resolve_self_exe()?;
     let service_path_env = build_service_path_env();
@@ -339,8 +357,15 @@ pub async fn install_and_start_service(
         install_macos_launch_agent(role, &exe, home_dir, &service_path_env)?;
         format!("launchd ({})", role.launchd_label())
     } else {
-        start_detached_pid_service(role, &exe, home_dir, &service_path_env)?;
-        format!("background daemon ({})", role.pid_file(home_dir).display())
+        #[cfg(windows)]
+        {
+            windows::native::install(role, &exe, home_dir, service)?
+        }
+        #[cfg(not(windows))]
+        {
+            start_detached_pid_service(role, &exe, home_dir, &service_path_env)?;
+            format!("background daemon ({})", role.pid_file(home_dir).display())
+        }
     };
 
     if !wait_until_healthy_for_host(expected_port, expected_host_id, Duration::from_secs(4)).await {
@@ -356,6 +381,17 @@ pub async fn install_and_start_service(
 
 /// Stop a background `daemon` or `relay` service if running.
 pub fn stop_service(role: ServiceRole, home_dir: &Path) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        windows::native::stop(role, home_dir)
+    }
+    #[cfg(not(windows))]
+    {
+        stop_unix_service(role, home_dir)
+    }
+}
+#[cfg(not(windows))]
+fn stop_unix_service(role: ServiceRole, home_dir: &Path) -> anyhow::Result<()> {
     let use_os_supervisor = is_default_orbit_home(home_dir);
     if use_os_supervisor && cfg!(target_os = "linux") && has_user_systemd() {
         let unit = format!("{}.service", role.unit_name());
@@ -638,6 +674,7 @@ fn install_macos_launch_agent(
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn start_detached_pid_service(
     role: ServiceRole,
     exe: &Path,
@@ -677,6 +714,7 @@ fn start_detached_pid_service(
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn stop_pid_file_process(pid_file: &Path) {
     if let Ok(raw) = fs::read_to_string(pid_file) {
         let pid = raw.trim();

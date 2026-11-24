@@ -293,6 +293,7 @@ pub struct AgentOrchestrator {
     turn_usage_recorded: RwLock<std::collections::HashSet<String>>,
     /// Most recent provider-reported instantaneous single-call context telemetry per `agent_id`
     /// for accurate context occupancy without multi-step turn-sum inflation.
+    last_compaction: tokio::sync::Mutex<HashMap<String, (std::time::Instant, u64)>>,
     last_call_prompt_occupancy: RwLock<HashMap<String, orbit_store::AgentContextTelemetry>>,
     /// Enqueue timestamps (`message_id -> queued_at_ms`) for wait/settlement telemetry (capped at 4096 entries).
     notification_queued_at: RwLock<HashMap<String, i64>>,
@@ -420,6 +421,7 @@ impl AgentOrchestrator {
             conflict_cooldowns: RwLock::new(HashMap::new()),
             suppress_auto_drain: RwLock::new(std::collections::HashSet::new()),
             turn_usage_recorded: RwLock::new(std::collections::HashSet::new()),
+            last_compaction: Default::default(),
             last_call_prompt_occupancy: RwLock::new(HashMap::new()),
             notification_queued_at: RwLock::new(HashMap::new()),
             organizing_locks: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
@@ -5876,6 +5878,116 @@ impl AgentOrchestrator {
         .await
     }
 
+    pub async fn compact_agent(&self, agent_id: &str, threshold: Option<u8>) -> anyhow::Result<()> {
+        let id = agent_id.to_owned();
+        let home = self.home_dir.clone();
+        let telemetry = self.latest_single_call_prompt_tokens(agent_id).await;
+        let (agent, pct, last_prompt) = self
+            .try_store(move |s| -> anyhow::Result<_> {
+                let ag = s
+                    .get_agent(&id)?
+                    .ok_or_else(|| anyhow::anyhow!("unknown agent"))?;
+                let pct = if threshold.is_some() {
+                    crate::usage::compute_context_occupancy(
+                        s,
+                        &home,
+                        &crate::resolve_user_home(),
+                        &id,
+                        telemetry,
+                    )?
+                    .occupancy_percent
+                } else {
+                    100.
+                };
+                let last_prompt = s.latest_user_prompt_seq(&id)?;
+                Ok((ag, pct, last_prompt))
+            })
+            .await?;
+        let mut recent = self.last_compaction.lock().await;
+        let pending = self.pending_permissions.read().await;
+        let busy = pending.keys().any(|(aid, _)| aid == agent_id)
+            || self.pending_questions.read().await.contains_key(agent_id)
+            || self
+                .evaluating_permissions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .any(|(aid, _)| aid == agent_id);
+        let cooldown = recent.get(agent_id).is_some_and(|(t, seq)| {
+            *seq == last_prompt || t.elapsed() < std::time::Duration::from_secs(300)
+        });
+        anyhow::ensure!(
+            crate::usage::may_compact(
+                &agent.status,
+                busy || agent.attention == AttentionState::Permission,
+                cooldown,
+                pct,
+                threshold
+            ) && agent.archived_at.is_none()
+                && agent.queued_prompts.is_empty(),
+            "agent is ineligible for compaction"
+        );
+        let tx = self
+            .live_agent_tx(agent_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("agent is offline"))?;
+        let aid = agent_id.to_string();
+        let native = matches!(
+            agent.provider,
+            ProviderKind::Codex
+                | ProviderKind::ClaudeCode
+                | ProviderKind::Pi
+                | ProviderKind::Antigravity
+        );
+        if native {
+            tx.try_send(DriverCommand::SendPrompt {
+                turn_id: Uuid::new_v4().to_string(),
+                prompt: "/compact".into(),
+                behavior: ActiveTurnBehavior::Queue,
+                origin: PromptOrigin::Agent,
+                message_ids: Vec::new(),
+            })?;
+        } else {
+            drop(pending);
+            self.stop_and_wait_driver(agent_id).await;
+            let id = agent_id.to_owned();
+            self.try_store(move |s| s.clear_context_for_handoff(&id))
+                .await?;
+            self.last_call_prompt_occupancy
+                .write()
+                .await
+                .remove(agent_id);
+        }
+        recent.insert(aid.clone(), (std::time::Instant::now(), last_prompt));
+        let ev = self
+            .try_store(move |s| -> anyhow::Result<_> {
+                s.append_audit_event(
+                    "compaction",
+                    "dispatch",
+                    "daemon",
+                    Some(&aid),
+                    "requested",
+                    &serde_json::Value::Null,
+                )?;
+                Ok(s.append_timeline_event(
+                    &aid,
+                    1,
+                    None,
+                    TimelinePayload::Notice {
+                        level: "compaction".into(),
+                        message: if native {
+                            "Compaction requested".into()
+                        } else {
+                            "Context compacted for summary handoff on the next turn".into()
+                        },
+                    },
+                )?)
+            })
+            .await?;
+        let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+        Ok(())
+    }
+
     pub async fn summarize_agent(self: &Arc<Self>, agent_id: &str) -> anyhow::Result<AgentSummary> {
         crate::workspace_organizer::summarize_agent_context(self, agent_id).await
     }
@@ -6949,7 +7061,21 @@ impl AgentOrchestrator {
             None
         };
 
+        let boundary = crate::sandbox::Boundary::for_shim(
+            &self.home_dir,
+            Some(&summary.agent_id),
+            !matches!(
+                summary.provider,
+                ProviderKind::ClaudeCode
+                    | ProviderKind::Codex
+                    | ProviderKind::Antigravity
+                    | ProviderKind::Pi
+            ),
+        )
+        .await?;
         let handle = spawn_provider_session(SessionLaunchConfig {
+            sandbox: boundary.policy.clone(),
+            egress_proxy_url: boundary.url(),
             agent_id: summary.agent_id.clone(),
             provider: summary.provider,
             executable,
@@ -6997,6 +7123,7 @@ impl AgentOrchestrator {
         let shim_seq_bg = Arc::clone(&shim_seq_tracker);
 
         let ingest_task = tokio::spawn(async move {
+            let _boundary = boundary;
             const STREAM_COALESCE_WINDOW: std::time::Duration =
                 std::time::Duration::from_millis(65);
             let mut stream_buf = StreamingEventBuffer::default();
@@ -7286,6 +7413,8 @@ impl AgentOrchestrator {
                 }
                 let store_bg = Arc::clone(&self.store);
                 let aid_bg = agent_id.to_string();
+                let home = self.home_dir.clone();
+                let broadcast = self.broadcast_tx.clone();
                 tokio::task::spawn_blocking(move || {
                     if let Some(telemetry) = telemetry_opt {
                         let _ = store_bg.upsert_agent_context_telemetry(&aid_bg, telemetry);
@@ -7299,15 +7428,18 @@ impl AgentOrchestrator {
                             .filter(|m| !m.trim().is_empty())
                             .unwrap_or(&provider_slug)
                             .to_string();
-                        let (estimated_cost_usd, cache_savings_usd) =
-                            crate::usage::estimate_turn_cost_usd(
-                                &provider_slug,
-                                &effective_model,
+                        let (estimated_cost_usd, cache_savings_usd) = crate::usage::estimate_at(
+                            Some(&home),
+                            &provider_slug,
+                            &effective_model,
+                            [
                                 input_tokens,
                                 output_tokens,
                                 cache_read_tokens,
                                 cache_write_tokens,
-                            );
+                            ],
+                            last_call_prompt_tokens.unwrap_or(input_tokens),
+                        );
                         let entry = orbit_protocol::UsageLedgerEntry {
                             id: format!("ul_{}", Uuid::new_v4().simple()),
                             agent_id: aid_bg,
@@ -7322,7 +7454,11 @@ impl AgentOrchestrator {
                             cache_savings_usd,
                             recorded_at_ms,
                         };
-                        let _ = store_bg.record_usage_entry(&entry);
+                        if let Err(err) =
+                            crate::usage::record_cost(&store_bg, &home, &entry, &broadcast)
+                        {
+                            tracing::warn!(%err,"Failed to persist usage");
+                        }
                     }
                 });
                 return;
@@ -7410,6 +7546,7 @@ impl AgentOrchestrator {
         let mut should_drain_queued_prompt = false;
         let mut should_mark_finished = false;
         let mut completed_running_turn = false;
+        let mut compact_after_idle = false;
         let mut preempted_running_turn = false;
         let payload = match evt {
             DriverEvent::StatusChanged(status) => {
@@ -7435,6 +7572,9 @@ impl AgentOrchestrator {
                 let mut next_attention: Option<AttentionState> = None;
                 match &status {
                     AgentStatus::Idle => {
+                        compact_after_idle = was_running_turn
+                            && !self.has_pending_permissions(agent_id).await
+                            && !self.pending_questions.read().await.contains_key(agent_id);
                         self.clear_pending_requests(agent_id).await;
                         let suppressed = self.suppress_auto_drain.write().await.remove(agent_id);
                         if (was_foreground_busy || was_awaiting_permission) && !suppressed {
@@ -8567,6 +8707,20 @@ impl AgentOrchestrator {
         if let Some(ag) = seq_bump_ag {
             let _ = self.broadcast_tx.send(DaemonBroadcast::AgentUpdated(ag));
         }
+        if compact_after_idle && drained_prompt.is_none() {
+            let mgr = Arc::clone(self);
+            let id = agent_id.to_owned();
+            tokio::spawn(async move {
+                let home = mgr.home_dir.clone();
+                if let Ok(Some(threshold)) = tokio::task::spawn_blocking(move || {
+                    crate::DaemonPersistedConfig::load(&home).auto_compact_threshold_pct
+                })
+                .await
+                {
+                    let _ = mgr.compact_agent(&id, Some(threshold)).await;
+                }
+            });
+        }
         if let Some(ag) = status_ag_opt {
             let auto_arch = ag.auto_archive && ag.archived_at.is_none() && drained_prompt.is_none();
             let ws_id = ag.workspace_id.clone();
@@ -8589,6 +8743,8 @@ impl AgentOrchestrator {
                     let store_bg = Arc::clone(&self.store);
                     let aid_bg = agent_id.to_string();
                     let cwd_bg = ag.cwd.clone();
+                    let home = self.home_dir.clone();
+                    let broadcast = self.broadcast_tx.clone();
                     let provider_slug = ag.provider.slug().to_string();
                     let effective_model = ag
                         .model
@@ -8626,13 +8782,12 @@ impl AgentOrchestrator {
                                 crate::usage::estimate_fallback_turn_tokens(slice);
                             if input_tokens > 0 || output_tokens > 0 {
                                 let (estimated_cost_usd, cache_savings_usd) =
-                                    crate::usage::estimate_turn_cost_usd(
+                                    crate::usage::estimate_at(
+                                        Some(&home),
                                         &provider_slug,
                                         &effective_model,
+                                        [input_tokens, output_tokens, 0, 0],
                                         input_tokens,
-                                        output_tokens,
-                                        0,
-                                        0,
                                     );
                                 let entry = orbit_protocol::UsageLedgerEntry {
                                     id: format!("ul_{}", Uuid::new_v4().simple()),
@@ -8648,7 +8803,11 @@ impl AgentOrchestrator {
                                     cache_savings_usd,
                                     recorded_at_ms: Utc::now().timestamp_millis(),
                                 };
-                                let _ = store_bg.record_usage_entry(&entry);
+                                if let Err(err) =
+                                    crate::usage::record_cost(&store_bg, &home, &entry, &broadcast)
+                                {
+                                    tracing::warn!(%err,"Failed to persist usage");
+                                }
                             }
                         }
                     });
@@ -8956,7 +9115,13 @@ impl AgentOrchestrator {
             (shell.clone(), Vec::new())
         };
 
+        let boundary = crate::sandbox::Boundary::for_shim(&self.home_dir, None, false).await?;
+        if boundary.policy.is_some() {
+            env.insert("ORBIT_HOME".into(), self.home_dir.to_string_lossy().into());
+        }
         let spec = ShimSpawnSpec {
+            sandbox: boundary.policy.clone(),
+            egress_proxy_url: None,
             shim_id: format!("pty_{term_id}"),
             mode: ShimMode::Pty { cols, rows },
             program,

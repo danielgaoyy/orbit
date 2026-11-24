@@ -1216,6 +1216,69 @@ impl Default for MemoryEmbeddingConfig {
     }
 }
 
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxMode {
+    Off,
+    #[default]
+    WorkspaceWrite,
+    StrictReadOnly,
+}
+
+pub const SANDBOX_CREDENTIAL_PATHS: &[&str] = &[
+    "~/.ssh",
+    "~/.aws",
+    "~/.gnupg",
+    "~/.kube",
+    "~/.orbit/pairing-secret",
+    "~/.orbit/daemon.json",
+    "~/.orbit/config.json",
+    "~/.orbit/host-keypair.json",
+];
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SandboxPolicy {
+    pub mode: SandboxMode,
+    pub writable_roots: Vec<String>,
+    /// Additional exclusions. Platform wrappers always add the host credential paths.
+    pub denied_read_paths: Vec<String>,
+    pub allow_network: bool,
+    pub allowed_domains: Vec<String>,
+    pub denied_domains: Vec<String>,
+}
+
+impl Default for SandboxPolicy {
+    fn default() -> Self {
+        Self {
+            mode: SandboxMode::WorkspaceWrite,
+            writable_roots: Vec::new(),
+            denied_read_paths: SANDBOX_CREDENTIAL_PATHS
+                .iter()
+                .map(|p| (*p).into())
+                .collect(),
+            allow_network: false,
+            allowed_domains: Vec::new(),
+            denied_domains: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditChainVerification {
+    pub verified_entries: u64,
+    pub broken_seq: Option<u64>,
+    pub signed_checkpoints: u64,
+}
+
+#[derive(Debug, Clone, Default, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationConflict {
+    #[default]
+    Skip,
+    Overwrite,
+    Rename,
+}
 /// Client-to-Daemon and Daemon-to-Client RPC envelope over WebSocket / E2EE Relay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -3060,6 +3123,63 @@ pub enum WireMessage {
         server_id: String,
     },
 
+    GetSandboxConfig {
+        request_id: Uuid,
+    },
+    UpdateSandboxConfig {
+        request_id: Uuid,
+        sandbox_policy: Option<SandboxPolicy>,
+    },
+    SandboxConfig {
+        request_id: Uuid,
+        sandbox_policy: Option<SandboxPolicy>,
+    },
+    GetAuditChainStatus {
+        request_id: Uuid,
+    },
+    AuditChainStatus {
+        request_id: Uuid,
+        verification: AuditChainVerification,
+    },
+    ExportAuditChain {
+        request_id: Uuid,
+        #[serde(default)]
+        after_seq: u64,
+    },
+    AuditChainExport {
+        request_id: Uuid,
+        jsonl: String,
+        next_after_seq: Option<u64>,
+    },
+    ExportDiagnosticBundle {
+        request_id: Uuid,
+    },
+    DiagnosticBundleReady {
+        request_id: Uuid,
+        bundle: serde_json::Value,
+    },
+    CompactAgentContext {
+        request_id: Uuid,
+        agent_id: String,
+    },
+    InspectExternalIdeMigration {
+        request_id: Uuid,
+        from: Option<String>,
+        cwd: Option<String>,
+        #[serde(default)]
+        conflict: MigrationConflict,
+    },
+    ExecuteExternalIdeMigration {
+        request_id: Uuid,
+        from: Option<String>,
+        cwd: Option<String>,
+        #[serde(default)]
+        conflict: MigrationConflict,
+    },
+    ExternalIdeMigrationResult {
+        request_id: Uuid,
+        items: serde_json::Value,
+    },
     // Usage Insights, Cost Ledger & Context Occupancy Telemetry
     GetUsageInsights {
         request_id: Uuid,

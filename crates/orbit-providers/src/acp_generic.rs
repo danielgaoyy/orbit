@@ -135,6 +135,8 @@ async fn spawn_fresh_acp_shim(
 
     let env = build_acp_spawn_env(cfg, spec);
     let shim_spec = ShimSpawnSpec {
+        sandbox: cfg.sandbox.clone(),
+        egress_proxy_url: None,
         shim_id: format!("acp_{}", cfg.agent_id),
         mode: ShimMode::Stdio,
         program: resolved_bin.to_string_lossy().to_string(),
@@ -962,6 +964,8 @@ async fn run_acp_actor(
     let mut recovered_missing_session = false;
     let (mut acp_cb_host, mut acp_cb_reply_rx) =
         crate::acp_callbacks::AcpCallbackHost::new(std::path::PathBuf::from(&cfg.cwd));
+    acp_cb_host.policy = cfg.sandbox.clone();
+    acp_cb_host.proxy = cfg.egress_proxy_url.clone();
 
     loop {
         tokio::select! {
@@ -2827,6 +2831,8 @@ done
         // Launch an in-process `orbit_shim` hosting our mock ACP CLI
         let shim_sock_bg = sock_path.clone();
         let shim_spec = ShimSpawnSpec {
+            sandbox: None,
+            egress_proxy_url: None,
             shim_id: "acp_test_agent".into(),
             mode: ShimMode::Stdio,
             program: mock_bin.to_string_lossy().to_string(),
@@ -2866,6 +2872,8 @@ done
 
         let seq_tracker = Arc::new(AtomicU64::new(0));
         let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_acp_test".into(),
             provider: orbit_protocol::ProviderKind::Acp,
             executable: mock_bin.clone(),
@@ -3140,6 +3148,8 @@ done
     #[test]
     fn spawn_env_precedence_and_error_heuristics() {
         let mut cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_env".into(),
             provider: orbit_protocol::ProviderKind::Acp,
             executable: PathBuf::from("/bin/echo"),
@@ -3330,6 +3340,8 @@ done
 
         let shim_sock_bg = sock_path.clone();
         let shim_spec = ShimSpawnSpec {
+            sandbox: None,
+            egress_proxy_url: None,
             shim_id: "acp_edge".into(),
             mode: ShimMode::Stdio,
             program: mock_bin.to_string_lossy().to_string(),
@@ -3366,6 +3378,8 @@ done
             enabled: true,
         };
         let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_edge".into(),
             provider: orbit_protocol::ProviderKind::Acp,
             executable: mock_bin.clone(),
@@ -3729,6 +3743,8 @@ done
             enabled: true,
         };
         let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
             agent_id: "ag_acpg_deliv".into(),
             provider: orbit_protocol::ProviderKind::Acp,
             executable: PathBuf::from("/bin/true"),

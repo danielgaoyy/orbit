@@ -33,6 +33,9 @@ tokio-tungstenite.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+
 [dev-dependencies]
 russh.workspace = true
 orbit-store.workspace = true

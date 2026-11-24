@@ -178,7 +178,9 @@ impl StoreError {
     }
 }
 
+pub mod audit_chain;
 pub struct OrbitStore {
+    audit_identity: std::sync::OnceLock<(String, ed25519_dalek::SigningKey)>,
     conn: Mutex<Connection>,
 }
 
@@ -555,7 +557,12 @@ impl OrbitStore {
         workflows::migrate_workflows_schema(&conn)?;
         im_channels::migrate_im_channels_schema(&conn)?;
         push::migrate_push_schema(&conn)?;
+        conn.execute_batch(audit_chain::SCHEMA)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS spend_budget_alerts(period TEXT PRIMARY KEY)",
+        )?;
         Ok(Self {
+            audit_identity: Default::default(),
             conn: Mutex::new(conn),
         })
     }
@@ -1066,6 +1073,26 @@ impl OrbitStore {
         Ok(())
     }
 
+    pub fn latest_user_prompt_seq(&self, agent_id: &str) -> Result<u64, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        Ok(conn.query_row("SELECT COALESCE(MAX(seq),0) FROM timeline_events WHERE agent_id=? AND event_type='user_prompt'",[agent_id],|r|r.get(0))?)
+    }
+
+    pub fn clear_context_for_handoff(&self, agent_id: &str) -> Result<(), StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE agents SET persistence_ref=NULL WHERE agent_id=?",
+            [agent_id],
+        )?;
+        tx.execute(
+            "DELETE FROM agent_context_telemetry WHERE agent_id=?",
+            [agent_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn set_persistence_ref(&self, agent_id: &str, pref: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.execute(
@@ -1245,6 +1272,17 @@ impl OrbitStore {
         let payload_json = serde_json::to_string(&payload)?;
         let event_type = payload_event_type(&payload);
         let ckey = coalesce_key(&payload);
+        if let TimelinePayload::PermissionResolved { decision, .. } = &payload {
+            self.audit_insert(
+                &tx,
+                "permission",
+                "resolve",
+                "daemon",
+                Some(agent_id),
+                decision,
+                &serde_json::Value::Null,
+            )?;
+        }
 
         if matches!(payload, TimelinePayload::AssistantThinking { .. })
             && let Some(ref key_val) = ckey

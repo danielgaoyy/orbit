@@ -8,6 +8,9 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+tracing-subscriber.workspace = true
+tempfile = "3"
+json5 = "1"
 orbit-protocol.workspace = true
 orbit-crypto.workspace = true
 orbit-relay-transport.workspace = true

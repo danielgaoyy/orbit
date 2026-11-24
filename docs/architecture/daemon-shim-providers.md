@@ -78,3 +78,17 @@ Core Pack 提供一个 `orbit_memory`，由调用 Agent 的工作目录确定作
   }
 }
 ```
+
+## Host security and operations
+
+The optional `sandbox_policy` in `config.json` applies to new agent processes, PTYs, ACP terminals, command hooks, goal commands and local MCP stdio servers. Authenticated clients can read and replace it with `GetSandboxConfig` and `UpdateSandboxConfig`. Modes are `off`, `workspace_write` and `strict_read_only`. An omitted policy preserves legacy execution. Network access defaults to disabled. When enabled, `allowed_domains` and `denied_domains` accept exact hosts and `*.example.com`. Explicit read exclusions extend the mandatory credential exclusions.
+
+`GetAuditChainStatus` verifies the signed host history. `ExportAuditChain` returns ascending JSONL pages and a continuation sequence. `ExportDiagnosticBundle` returns redacted JSON directly to the authenticated caller. `orbit doctor --bundle PATH` also works on a stopped host. Local OpenMetrics scraping uses the paired HTTP bearer credential. Enable OTLP log batches with `OTEL_EXPORTER_OTLP_ENDPOINT` or `telemetry_endpoint` in the host configuration. The exporter appends `/v1/logs` to the collector base URL. `ORBIT_LOG_FORMAT=json` enables structured local logs.
+
+Model prices are estimates in USD per million tokens. At settlement the host reloads optional `model-pricing.json` entries keyed by model or `provider/model`. Each entry contains `input_per_mtok`, `output_per_mtok`, `cache_read_per_mtok`, `cache_write_per_mtok` and `context_window_tokens`. The Gemini Pro table uses a 200K input boundary. GPT-5.4 uses its published 272K boundary. Set positive `daily_budget_usd` and `monthly_budget_usd` in `config.json` for UTC-period notifications. `auto_compact_threshold_pct` accepts 50 through 95. Omitting it disables automatic compaction. `CompactAgentContext` requests compaction for a specific idle agent.
+
+`orbit migrate` previews local CLI and IDE imports. `--apply` writes the files in the report. `--from` selects Claude Code, Codex, Antigravity, Cursor or VS Code. `--cwd` selects the project. `--conflict skip|overwrite|rename` resolves name conflicts. The authenticated inspection and execution RPCs authorize project paths against the host's registered workspaces. Project MCP entries stay in project scope. The import report contains names and paths only.
+
+On Windows, `orbit daemon up` registers an interactive-token task for the current Windows user. `orbit daemon up --service` and `orbit relay up` install LocalService SCM services with restart recovery. Service installation requires permission to manage the SCM. The SCM Stop handler signals the daemon shutdown path so detached shims can continue running.
+
+Built-in token estimates use standard API rates. Local model overrides take precedence for negotiated contracts and regional deployments. [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing), [GPT-5.4 pricing](https://developers.openai.com/api/docs/models/gpt-5.4), [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing), [DeepSeek pricing](https://api-docs.deepseek.com/quick_start/pricing/), [Qwen pricing](https://www.alibabacloud.com/help/en/model-studio/model-pricing).

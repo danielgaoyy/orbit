@@ -725,6 +725,8 @@ async fn detached_orbit_shim_isolates_process_group_hides_argv_secrets_and_survi
     let cleanup_file = runtime_dir.join("claude-mcp-detached-test.json");
     std::fs::write(&cleanup_file, "{\"secret\":true}").expect("write cleanup file");
     let spec = orbit_shim::ShimSpawnSpec {
+        sandbox: None,
+        egress_proxy_url: None,
         shim_id: "detached_survival_test".into(),
         mode: orbit_shim::ShimMode::Stdio,
         program: "/bin/cat".into(),

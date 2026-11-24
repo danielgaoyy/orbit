@@ -15,7 +15,7 @@ use orbit_store::{AgentContextTelemetry, OrbitStore, QuotaSampleRecord, StoreErr
 use crate::rules::estimate_tokens;
 
 /// Per-model token pricing (USD per 1M tokens) and context window size.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
 pub struct ModelPricing {
     pub input_per_mtok: f64,
     pub output_per_mtok: f64,
@@ -30,6 +30,67 @@ pub fn pricing_for_model(provider: &str, model: &str) -> ModelPricing {
     let p = provider.trim().to_ascii_lowercase();
     let is_1m = m.contains("1m") || m.contains("[1m]");
 
+    let rate = |input, output, read, write, window| ModelPricing {
+        input_per_mtok: input,
+        output_per_mtok: output,
+        cache_read_per_mtok: read,
+        cache_write_per_mtok: write,
+        context_window_tokens: window,
+    };
+    if ["ollama", "lmstudio", "lm-studio", "lm_studio"]
+        .iter()
+        .any(|local| p == *local || m.starts_with(&format!("{local}/")))
+    {
+        return rate(0., 0., 0., 0., 128_000);
+    }
+    let version = m.replace('.', "-");
+    if version.contains("opus-4-5") || version.contains("opus-4-6") || version.contains("opus-4-7")
+    {
+        return rate(
+            5.,
+            25.,
+            0.5,
+            6.25,
+            if is_1m || version.contains("4-6") || version.contains("4-7") {
+                1_000_000
+            } else {
+                200_000
+            },
+        );
+    }
+    if version.contains("sonnet-4-6") {
+        return rate(3., 15., 0.3, 3.75, 1_000_000);
+    }
+    if m.contains("gpt-5.4") && !m.contains("mini") && !m.contains("nano") {
+        return rate(2.5, 15., 0.25, 2.5, 1_050_000);
+    }
+    if m.contains("gpt-5.4-mini") {
+        return rate(0.75, 4.5, 0.075, 0.75, 400_000);
+    }
+    if m.contains("gpt-5.4-nano") {
+        return rate(0.2, 1.25, 0.02, 0.2, 400_000);
+    }
+    if m.contains("qwen3-coder-plus") {
+        return rate(1., 5., 0.1, 1., 1_000_000);
+    }
+    if m.contains("qwen3-coder-flash") {
+        return rate(0.3, 1.5, 0.03, 0.3, 1_000_000);
+    }
+    if m.contains("gpt-5.2") {
+        return rate(1.75, 14., 0.175, 1.75, 400_000);
+    }
+    if m.contains("gemini-3") && m.contains("flash") {
+        return rate(0.5, 3., 0.05, 0.5, 1_000_000);
+    }
+    if m.contains("gemini-3") && m.contains("pro") {
+        return rate(2., 12., 0.2, 2., 1_000_000);
+    }
+    if m.contains("deepseek-v4-pro") {
+        return rate(1.32, 3.96, 0.044, 1.32, 1_000_000);
+    }
+    if m.contains("deepseek-flash") {
+        return rate(0.30, 1.20, 0.006, 0.30, 1_000_000);
+    }
     // Anthropic Claude family
     if m.contains("opus") {
         return ModelPricing {
@@ -71,11 +132,11 @@ pub fn pricing_for_model(provider: &str, model: &str) -> ModelPricing {
     }
     if m.contains("gpt-5") || m.contains("codex") {
         return ModelPricing {
-            input_per_mtok: 2.50,
+            input_per_mtok: 1.25,
             output_per_mtok: 10.0,
-            cache_read_per_mtok: 0.25,
-            cache_write_per_mtok: 2.50,
-            context_window_tokens: 272_000,
+            cache_read_per_mtok: 0.125,
+            cache_write_per_mtok: 1.25,
+            context_window_tokens: 400_000,
         };
     }
     if m.contains("o4-mini") || m.contains("o3-mini") {
@@ -219,6 +280,19 @@ pub fn pricing_for_model(provider: &str, model: &str) -> ModelPricing {
     }
 }
 
+pub(crate) fn may_compact(
+    status: &orbit_protocol::AgentStatus,
+    pending: bool,
+    recent: bool,
+    pct: f64,
+    threshold: Option<u8>,
+) -> bool {
+    matches!(status, orbit_protocol::AgentStatus::Idle)
+        && !pending
+        && !recent
+        && threshold.is_none_or(|t| (50..=95).contains(&t) && pct >= f64::from(t))
+}
+
 /// Return the nominal context window size in tokens for `(provider, model)`.
 pub fn context_window_for_model(provider: &str, model: &str) -> u64 {
     pricing_for_model(provider, model).context_window_tokens
@@ -233,7 +307,101 @@ pub fn estimate_turn_cost_usd(
     cache_read_tokens: u64,
     cache_write_tokens: u64,
 ) -> (f64, f64) {
-    let pricing = pricing_for_model(provider, model);
+    estimate_at(
+        None,
+        provider,
+        model,
+        [
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+        ],
+        input_tokens,
+    )
+}
+
+fn model_override(home: &Path, provider: &str, model: &str) -> Option<ModelPricing> {
+    let bytes = std::fs::read(home.join("model-pricing.json")).ok()?;
+    let map = serde_json::from_slice::<HashMap<String, ModelPricing>>(&bytes).ok()?;
+    let rate = map
+        .get(&format!("{provider}/{model}"))
+        .or_else(|| map.get(model))?;
+    (rate.context_window_tokens > 0
+        && [
+            rate.input_per_mtok,
+            rate.output_per_mtok,
+            rate.cache_read_per_mtok,
+            rate.cache_write_per_mtok,
+        ]
+        .iter()
+        .all(|v| v.is_finite() && *v >= 0.))
+    .then_some(*rate)
+}
+
+/// Load a host-local exact model override for each settled usage record.
+pub fn estimate_at(
+    home: Option<&Path>,
+    provider: &str,
+    model: &str,
+    tokens: [u64; 4],
+    prompt_tokens: u64,
+) -> (f64, f64) {
+    let [
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+    ] = tokens;
+    let mut pricing = pricing_for_model(provider, model);
+    let id = model.to_ascii_lowercase();
+    if pricing.input_per_mtok > 0. && id.contains("qwen3-coder") {
+        let rates = if id.contains("plus") {
+            [(1., 5.), (1.8, 9.), (3., 15.), (6., 60.)]
+        } else {
+            [(0.3, 1.5), (0.5, 2.5), (0.8, 4.), (1.6, 9.6)]
+        };
+        let tier = [32_768, 131_072, 262_144]
+            .iter()
+            .filter(|&&cap| prompt_tokens > cap)
+            .count();
+        (pricing.input_per_mtok, pricing.output_per_mtok) = rates[tier];
+        pricing.cache_read_per_mtok = pricing.input_per_mtok * 0.1;
+    }
+    if pricing.input_per_mtok > 0.
+        && prompt_tokens > 200_000
+        && id.contains("sonnet")
+        && id.contains("1m")
+        && !id.contains("4-6")
+        && !id.contains("4.6")
+    {
+        pricing.input_per_mtok *= 2.;
+        pricing.output_per_mtok *= 1.5;
+        pricing.cache_read_per_mtok *= 2.;
+        pricing.cache_write_per_mtok *= 2.;
+    }
+    if pricing.input_per_mtok > 0.
+        && prompt_tokens > 200_000
+        && id.contains("gemini")
+        && id.contains("pro")
+    {
+        pricing.input_per_mtok *= 2.;
+        pricing.output_per_mtok = if id.contains("gemini-3") { 18. } else { 15. };
+        pricing.cache_read_per_mtok = pricing.input_per_mtok * 0.1;
+    }
+    if pricing.input_per_mtok > 0.
+        && prompt_tokens > 272_000
+        && id.contains("gpt-5.4")
+        && !id.contains("mini")
+        && !id.contains("nano")
+    {
+        pricing.input_per_mtok *= 2.;
+        pricing.output_per_mtok *= 1.5;
+        pricing.cache_read_per_mtok *= 2.;
+    }
+    if let Some(custom) = home.and_then(|h| model_override(h, provider, model)) {
+        pricing = custom;
+    }
     let cost = (input_tokens as f64 * pricing.input_per_mtok
         + output_tokens as f64 * pricing.output_per_mtok
         + cache_read_tokens as f64 * pricing.cache_read_per_mtok
@@ -243,6 +411,52 @@ pub fn estimate_turn_cost_usd(
         * (pricing.input_per_mtok - pricing.cache_read_per_mtok).max(0.0))
         / 1_000_000.0;
     (cost.max(0.0), savings.max(0.0))
+}
+
+pub(crate) fn record_cost(
+    store: &OrbitStore,
+    home: &Path,
+    entry: &orbit_protocol::UsageLedgerEntry,
+    tx: &tokio::sync::broadcast::Sender<crate::manager::DaemonBroadcast>,
+) -> Result<(), StoreError> {
+    use chrono::Datelike;
+    store.record_usage_entry(entry)?;
+    let cfg = crate::DaemonPersistedConfig::load(home);
+    let Some(now) = DateTime::from_timestamp_millis(entry.recorded_at_ms) else {
+        return Ok(());
+    };
+    for (label, limit, start) in [
+        ("daily", cfg.daily_budget_usd, Some(now.date_naive())),
+        (
+            "monthly",
+            cfg.monthly_budget_usd,
+            now.date_naive().with_day(1),
+        ),
+    ] {
+        if let (Some(limit), Some(start)) = (limit, start)
+            && let Some(midnight) = start.and_hms_opt(0, 0, 0)
+            && store.claim_budget_alert(
+                &format!("{label}/{start}"),
+                midnight.and_utc().timestamp_millis(),
+                entry.recorded_at_ms.saturating_add(1),
+                limit,
+            )?
+        {
+            let event = store.append_timeline_event(
+                &entry.agent_id,
+                1,
+                None,
+                TimelinePayload::Notice {
+                    level: "warning".into(),
+                    message: format!(
+                        "Host {label} spend reached the ${limit:.2} soft limit (UTC)."
+                    ),
+                },
+            )?;
+            let _ = tx.send(crate::manager::DaemonBroadcast::TimelineLive(event));
+        }
+    }
+    Ok(())
 }
 
 /// Convert live `ProviderQuotaSnapshot`s into persistable `QuotaSampleRecord`s.
@@ -857,6 +1071,19 @@ pub fn compute_context_occupancy(
         .filter(|m| !m.trim().is_empty())
         .unwrap_or(provider_slug);
 
+    let effective_telemetry =
+        if let Some(rate) = model_override(orbit_home, provider_slug, model_name) {
+            let mut t = effective_telemetry.unwrap_or(AgentContextTelemetry {
+                prompt_tokens: 0,
+                context_window_tokens: None,
+                recorded_at_ms: 0,
+            });
+            t.context_window_tokens
+                .get_or_insert(rate.context_window_tokens);
+            Some(t)
+        } else {
+            effective_telemetry
+        };
     let expanded_cwd = crate::expand_host_path(&agent.cwd);
     let cwd_opt = if expanded_cwd.is_dir() {
         Some(expanded_cwd.as_path())
@@ -913,6 +1140,69 @@ mod tests {
     use orbit_protocol::{AgentStatus, ToolCallStatus, UsageLedgerEntry};
 
     #[test]
+    fn budget_alert_claim_is_durable_and_period_scoped() -> anyhow::Result<()> {
+        let store = OrbitStore::open_in_memory()?;
+        let entry = UsageLedgerEntry {
+            id: "cost".into(),
+            agent_id: "agent".into(),
+            workspace_cwd: ".".into(),
+            provider: "test".into(),
+            model: "test".into(),
+            input_tokens: 1,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            estimated_cost_usd: 4.0,
+            cache_savings_usd: 0.,
+            recorded_at_ms: 100,
+        };
+        store.record_usage_entry(&entry)?;
+        assert!(!store.claim_budget_alert("daily/1", 0, 200, 5.)?);
+        assert!(store.claim_budget_alert("daily/1", 0, 200, 4.)?);
+        assert!(!store.claim_budget_alert("daily/1", 0, 200, 4.)?);
+        assert!(store.claim_budget_alert("monthly/1", 0, 200, 4.)?);
+        assert!(!store.claim_budget_alert("daily/2", 200, 300, 4.)?);
+        Ok(())
+    }
+    #[test]
+    fn compaction_requires_idle_clear_and_outside_cooldown() {
+        let ok = |p, r| may_compact(&AgentStatus::Idle, p, r, 80., Some(80));
+        assert!(ok(false, false));
+        assert!(!ok(true, false));
+        assert!(!ok(false, true));
+        assert!(!may_compact(
+            &AgentStatus::AwaitingPermission {
+                turn_id: "t".into(),
+                request_id: "p".into()
+            },
+            false,
+            false,
+            95.,
+            Some(50)
+        ));
+    }
+    #[test]
+    fn pricing_overrides_reload_and_tiers_apply() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let price = |home| {
+            estimate_at(
+                home,
+                "test",
+                "gemini-2.5-pro",
+                [1_000_000, 0, 0, 0],
+                200_001,
+            )
+            .0
+        };
+        assert_eq!(price(Some(dir.path())), 2.5);
+        for input in [8, 3] {
+            std::fs::write(dir.path().join("model-pricing.json"),serde_json::json!({"gemini-2.5-pro":{"input_per_mtok":input,"output_per_mtok":1,"cache_read_per_mtok":1,"cache_write_per_mtok":1,"context_window_tokens":200000}}).to_string())?;
+            assert_eq!(price(Some(dir.path())), f64::from(input));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn pricing_and_cache_savings_across_providers() {
         // Claude Sonnet 4.5: $3/M in, $15/M out, $0.30/M cache read, $3.75/M cache write
         let (cost, saved) = estimate_turn_cost_usd(
@@ -936,19 +1226,19 @@ mod tests {
             1_000_000
         );
 
-        // Codex GPT-5.4: $2.50/M in, $10/M out, $0.25/M cache read
+        // Codex GPT-5.4: $2.50/M in, $15/M out, $0.25/M cache read
         let (codex_cost, codex_saved) =
             estimate_turn_cost_usd("codex", "gpt-5.4", 200_000, 50_000, 400_000, 0);
-        // Expected cost = 0.50 + 0.50 + 0.10 = 1.10
-        assert!((codex_cost - 1.10).abs() < 1e-6, "codex cost={codex_cost}");
+        // Expected cost = 0.50 + 0.75 + 0.10 = 1.35
+        assert!((codex_cost - 1.35).abs() < 1e-6, "codex cost={codex_cost}");
         // Expected savings = 0.4M * (2.50 - 0.25) = 0.90
         assert!(
             (codex_saved - 0.90).abs() < 1e-6,
             "codex saved={codex_saved}"
         );
-        assert_eq!(context_window_for_model("codex", "gpt-5.4"), 272_000);
+        assert_eq!(context_window_for_model("codex", "gpt-5.4"), 1_050_000);
 
-        // Gemini 2.5 Pro: $1.25/M in, $10/M out, $0.3125/M cache read, 1M window
+        // Gemini 2.5 Pro long context: $2.50/M in, $15/M out, $0.25/M cache read
         let (gem_cost, gem_saved) = estimate_turn_cost_usd(
             "antigravity",
             "gemini-2.5-pro",
@@ -957,11 +1247,8 @@ mod tests {
             1_000_000,
             0,
         );
-        assert!((gem_cost - 2.5625).abs() < 1e-6, "gemini cost={gem_cost}");
-        assert!(
-            (gem_saved - 0.9375).abs() < 1e-6,
-            "gemini saved={gem_saved}"
-        );
+        assert!((gem_cost - 4.25).abs() < 1e-6, "gemini cost={gem_cost}");
+        assert!((gem_saved - 2.25).abs() < 1e-6, "gemini saved={gem_saved}");
         assert_eq!(
             context_window_for_model("antigravity", "gemini-2.5-pro"),
             1_000_000

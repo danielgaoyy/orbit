@@ -130,6 +130,20 @@ fn sanitize_non_negative_f64(value: f64) -> f64 {
 
 impl OrbitStore {
     /// Persist a turn-level token & cost ledger row and prune rows older than 90 days.
+    pub fn claim_budget_alert(
+        &self,
+        period: &str,
+        start: i64,
+        end: i64,
+        budget: f64,
+    ) -> Result<bool, StoreError> {
+        if !budget.is_finite() || budget <= 0. {
+            return Ok(false);
+        }
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        Ok(conn.execute("INSERT OR IGNORE INTO spend_budget_alerts(period) SELECT ?1 WHERE (SELECT COALESCE(SUM(estimated_cost_usd),0) FROM usage_ledger WHERE recorded_at_ms>=?2 AND recorded_at_ms<?3)>=?4",params![period,start,end,budget])?>0)
+    }
+
     pub fn record_usage_entry(&self, entry: &UsageLedgerEntry) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction()?;

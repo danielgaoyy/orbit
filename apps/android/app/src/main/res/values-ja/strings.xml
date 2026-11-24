@@ -1,0 +1,248 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Orbit</string>
+
+    <!-- ナビゲーションとシェル -->
+    <string name="nav_overview">概要</string>
+    <string name="nav_new_session">新規会話</string>
+    <string name="nav_search">検索</string>
+    <string name="nav_global_search">全体検索</string>
+    <string name="nav_files">ファイル</string>
+    <string name="nav_diff_review">差分レビュー</string>
+    <string name="nav_hide_diff_review">差分を隠す</string>
+    <string name="nav_full_diff">全画面 Diff</string>
+    <string name="nav_terminal">ターミナル</string>
+    <string name="nav_side_question">サイド質問 (/btw)</string>
+    <string name="nav_workspace_board">ボードとピア</string>
+    <string name="nav_automations">自動化</string>
+    <string name="nav_personal_router">パーソナルエージェント &amp; Mesh</string>
+    <string name="nav_archived">アーカイブ済み</string>
+    <string name="nav_settings">設定</string>
+    <string name="nav_pair_host">ホストをペアリング</string>
+    <string name="nav_fork_conversation">会話を分岐</string>
+    <string name="nav_export_transcript">ログをエクスポート</string>
+    <string name="nav_archive">アーカイブ</string>
+    <string name="nav_open_folder">フォルダを開く</string>
+    <string name="nav_copy_path">パスをコピー</string>
+    <string name="nav_open_drawer">サイドバーを開く</string>
+    <string name="nav_more_actions">その他の操作</string>
+    <string name="nav_close">閉じる</string>
+    <string name="nav_back">戻る</string>
+    <string name="nav_refresh">更新</string>
+    <string name="nav_cancel">キャンセル</string>
+    <string name="nav_confirm">確認</string>
+    <string name="nav_copy">コピー</string>
+    <string name="nav_copied">コピーしました</string>
+    <string name="nav_save">保存</string>
+    <string name="nav_delete">削除</string>
+
+    <!-- グローバル概要 (パーソナルエージェント) -->
+    <string name="overview_title">パーソナルエージェント</string>
+    <string name="overview_status_calm">すべて静穏 · %1$d 台の%2$sがオンライン</string>
+    <string name="overview_status_working">%1$d 件の%2$sが稼働中 · %3$d 台オンライン</string>
+    <string name="overview_status_attention">%1$d 件の%2$sが承認待ちです</string>
+    <string name="overview_status_offline">フリートがオフライン — タップして再接続</string>
+    <string name="overview_status_empty">ホストをペアリングして開始しましょう</string>
+    <string name="overview_host_singular">ホスト</string>
+    <string name="overview_host_plural">ホスト</string>
+    <string name="overview_agent_singular">エージェント</string>
+    <string name="overview_agent_plural">エージェント</string>
+    <string name="overview_decision_singular">承認事項</string>
+    <string name="overview_decision_plural">承認事項</string>
+    <string name="overview_needs_decision">確認が必要</string>
+    <string name="overview_batch_approve_safe">安全な %1$d 件を一括承認</string>
+    <string name="overview_batch_approve_hint">読み取り専用・安全な検査のみ対象。編集や計画承認は常に手動確認が必要です。</string>
+    <string name="overview_live_fleet">ライブフリート</string>
+    <string name="overview_active_sessions">稼働中のセッション</string>
+    <string name="overview_no_active_sessions">現在稼働中のエージェントはありません。</string>
+    <string name="overview_router_badge">ルーター</string>
+    <string name="overview_router_configure">ルーター設定</string>
+    <string name="overview_composer_placeholder">パーソナルエージェントに指示を送信…</string>
+    <string name="overview_reconnect">再接続</string>
+
+    <!-- ステージ・ページネーション・系譜・配信・オフライン -->
+    <string name="stage_hero_prompt">次は何を作りますか？</string>
+    <string name="stage_unpaired_title">Orbit フリート</string>
+    <string name="stage_unpaired_subtitle">Claude Code・Codex・Antigravity を統合管理するゼロ知識 E2EE コントロールプレーン。</string>
+    <string name="stage_connect_local">ローカルデーモンに接続</string>
+    <string name="stage_load_older">以前のターンを読み込む</string>
+    <string name="stage_loading_older">履歴を読み込み中…</string>
+    <string name="stage_scroll_bottom">最下部へスクロール</string>
+    <string name="stage_offline_banner">%1$s はオフラインです</string>
+    <string name="stage_connecting_banner">%1$s に再接続中…</string>
+    <string name="stage_lineage_parent">親スレッド</string>
+    <string name="stage_lineage_subagents">サブエージェント</string>
+    <string name="stage_lineage_peers">ピア</string>
+    <string name="stage_delivery_queued">待機中</string>
+    <string name="stage_delivery_dispatched">配信済み</string>
+    <string name="stage_delivery_settled">完了</string>
+    <string name="stage_delivery_dropped">破棄</string>
+    <string name="stage_interrupt_deliver">中断して配信</string>
+    <string name="stage_dismiss_error">エラーを閉じる</string>
+
+    <!-- プランシェルフとレビューカード -->
+    <string name="plan_shelf_title">実行プラン</string>
+    <string name="plan_review_title">実装プランの確認</string>
+    <string name="plan_tab_preview">プレビュー</string>
+    <string name="plan_tab_edit">編集</string>
+    <string name="plan_feedback_placeholder">修正依頼やフィードバック（任意）…</string>
+    <string name="plan_approve_build">承認してビルド</string>
+    <string name="plan_request_changes">修正を依頼</string>
+    <string name="plan_dismiss">却下</string>
+
+    <!-- コンポーザーと Codex スタイル音声入力 -->
+    <string name="composer_placeholder">何でも質問 · @ で参照 · / でコマンド</string>
+    <string name="composer_voice_start">音声入力を開始</string>
+    <string name="composer_voice_stop">音声入力を終了</string>
+    <string name="composer_voice_cancel">音声入力をキャンセル</string>
+    <string name="composer_voice_listening">聞き取り中…</string>
+    <string name="composer_voice_unavailable">この端末では音声認識を利用できません</string>
+    <string name="composer_voice_permission_denied">音声入力にはマイク権限が必要です</string>
+    <string name="composer_send">送信</string>
+    <string name="composer_queue">キューに追加</string>
+    <string name="composer_stop">停止</string>
+    <string name="composer_add_attachment">添付を追加</string>
+    <string name="composer_photos">写真</string>
+    <string name="composer_camera">カメラ</string>
+    <string name="composer_files">ファイル</string>
+    <string name="composer_fast">高速</string>
+    <string name="composer_access_permissions">アクセス権限</string>
+
+    <!-- Raw PTY ターミナル -->
+    <string name="terminal_mode_raw">Raw</string>
+    <string name="terminal_mode_line">行入力</string>
+    <string name="terminal_raw_hint">直接 VT100 入力が有効 — 画面をタップして入力</string>
+    <string name="terminal_line_hint">シェルコマンドを入力…</string>
+    <string name="terminal_connecting">リモート Shim PTY に接続中…</string>
+    <string name="terminal_quote">引用</string>
+
+    <!-- ファイルエクスプローラーとコードビューアー -->
+    <string name="files_title">ワークスペースファイル</string>
+    <string name="files_search_placeholder">パスで絞り込み…</string>
+    <string name="files_touched_section">セッションで変更</string>
+    <string name="files_all_section">リポジトリファイル</string>
+    <string name="files_empty">ファイルがまだ読み込まれていません。</string>
+    <string name="files_loading">ファイルを読み込み中…</string>
+    <string name="files_truncated">%1$d バイトで省略されました</string>
+    <string name="files_quote_composer">コンポーザーに引用</string>
+
+    <!-- Git レビューと書き込み -->
+    <string name="git_unstaged">未ステージ</string>
+    <string name="git_staged">ステージ済み</string>
+    <string name="git_stage_all">すべてステージ</string>
+    <string name="git_unstage_all">ステージ解除</string>
+    <string name="git_stage_file">ステージ</string>
+    <string name="git_unstage_file">解除</string>
+    <string name="git_commit">コミット</string>
+    <string name="git_commit_placeholder">コミットメッセージ…</string>
+    <string name="git_generate_commit">自動生成</string>
+    <string name="git_amend">直前のコミットを修正 (amend)</string>
+    <string name="git_pr_section">Pull Request</string>
+    <string name="git_create_pr">PR を作成</string>
+    <string name="git_pr_title_placeholder">PR タイトル…</string>
+    <string name="git_pr_body_placeholder">変更の概要…</string>
+    <string name="git_pr_draft">ドラフト PR として作成</string>
+    <string name="git_conflicts_banner">%1$d 件の競合ファイル</string>
+    <string name="git_resolve_ours">自分を採用</string>
+    <string name="git_resolve_theirs">相手を採用</string>
+    <string name="git_stash_save">スタッシュ保存</string>
+    <string name="git_stash_pop">スタッシュ適用</string>
+
+    <!-- クロスホスト全体検索 -->
+    <string name="search_title">クロスホスト検索</string>
+    <string name="search_placeholder">全ペアリング済みホストのメッセージを検索…</string>
+    <string name="search_include_remote">リモートデーモンも含める</string>
+    <string name="search_empty_prompt">フリート全体の会話・ツール出力・承認履歴を横断検索します。</string>
+    <string name="search_no_results">一致するメッセージが見つかりませんでした。</string>
+    <string name="search_remote_summary">%1$d 台のリモートホストを検索</string>
+
+    <!-- 自動化 -->
+    <string name="auto_tab_schedules">スケジュール</string>
+    <string name="auto_tab_timers">タイマー</string>
+    <string name="auto_tab_goals">ゴール</string>
+    <string name="auto_tab_monitors">監視</string>
+    <string name="auto_tab_workflows">ワークフロー</string>
+    <string name="auto_tab_hooks">ルール</string>
+    <string name="auto_start_goal">ゴール開始</string>
+    <string name="auto_start_monitor">新規監視</string>
+    <string name="auto_new_rule">ルール追加</string>
+    <string name="auto_guardian_title">Guardian 自動レビュー</string>
+
+    <!-- パーソナルルーターと Fleet Mesh -->
+    <string name="router_title">パーソナルエージェント &amp; Mesh</string>
+    <string name="router_section">パーソナルルーター</string>
+    <string name="router_mesh_section">Fleet Mesh ピア</string>
+    <string name="router_activate">ルーターを有効化</string>
+    <string name="router_pause">ルーターを一時停止</string>
+    <string name="router_scope_global">グローバルフリート</string>
+    <string name="router_scope_local">ローカルホストのみ</string>
+    <string name="router_mesh_empty">このホストには Mesh ピアが登録されていません。</string>
+
+    <!-- ゼロパスフレーズクラウド同期とデバイスリンク QR -->
+    <string name="sync_title">クラウド同期</string>
+    <string name="sync_instant_unlock">パスフレーズ不要の即時ロック解除</string>
+    <string name="sync_instant_unlock_desc">ハードウェア保護セッションで自動復号し、パスフレーズ入力を省きます。</string>
+    <string name="sync_device_link_title">別端末をリンク (1スキャン QR)</string>
+    <string name="sync_device_link_desc">別の端末の Orbit でこの QR コードを読み取ると、同期済みフリートに即座に参加できます。</string>
+    <string name="sync_show_qr">デバイスリンク QR を表示</string>
+    <string name="sync_hide_qr">QR を隠す</string>
+    <string name="sync_copy_link">リンク URI をコピー</string>
+    <string name="sync_scan_device_link">デバイスリンク QR をスキャン</string>
+
+    <!-- プッシュ通知とエクスポート -->
+    <string name="push_section_title">プッシュ通知 (FCM)</string>
+    <string name="push_test_button">テスト通知を送信</string>
+    <string name="push_registered_devices">登録済み端末 %1$d 台</string>
+    <string name="export_format_title">ログをエクスポート</string>
+    <string name="export_markdown">Markdown (.md)</string>
+    <string name="export_json">JSON (.json)</string>
+    <string name="export_html">HTML (.html)</string>
+    <string name="recent_sessions">最近のセッション</string>
+    <string name="plan_switch_mode">実行モード</string>
+    <string name="mode_default">標準</string>
+    <string name="mode_accept_edits">編集を許可</string>
+    <string name="files_conflict">ホスト上でファイルが変更されました。開き直して最新版を確認してください。</string>
+    <string name="git_changes">Git の変更</string>
+    <string name="git_push_terminal">ターミナルでプッシュを確認</string>
+    <string name="triggers">トリガー</string>
+    <string name="hooks">フック</string>
+    <string name="start_workflow">ワークフローを開始</string>
+    <string name="new_trigger">タイマートリガーを作成</string>
+    <string name="automation_name">名前</string>
+    <string name="automation_prompt">プロンプト</string>
+    <string name="duration_seconds">待ち時間（秒）</string>
+    <string name="log_path">ログファイルのパス</string>
+    <string name="voice_open_overview">概要を開く</string>
+    <string name="voice_open_search">グローバル検索を開く</string>
+    <string name="terminal_busy">ターミナルの入力バッファーがいっぱいです</string>
+    <string name="create_hooks_file">プロジェクトのフックファイルを作成</string>
+    <string name="sync_qr_failed">デバイスリンクを生成できませんでした。同期状態を確認して再試行してください。</string>
+
+    <!-- 外部ディープリンク確認 -->
+    <string name="deeplink_confirm_pair_title">外部リンクからホストをペアリングしますか？</string>
+    <string name="deeplink_confirm_pair_body">外部リンクが %1$s とのペアリングを要求しています。ご自身のワークステーションから開始した場合のみ続行してください。</string>
+    <string name="deeplink_confirm_sync_title">クラウド同期アカウントを切り替えますか？</string>
+    <string name="deeplink_confirm_sync_body">この外部デバイスリンク（%1$s）を取り込むと、クラウド同期アカウントが切り替わり、ローカルのペアリング済みホストがそのアカウントの暗号化ボルトへ統合・アップロードされます。信頼できるリンクの場合のみ続行してください。</string>
+    <string name="deeplink_confirm_sync_action">取り込んで切替</string>
+
+    <!-- 概要・検索・Git・自動化の追加項目 -->
+    <string name="overview_router_setup_toast">先にパーソナルルーターホストを設定して有効にしてください。</string>
+    <string name="overview_risk_safe">低リスク · 安全</string>
+    <string name="overview_risk_level">%1$s リスク</string>
+    <string name="search_remote_failed_summary">%1$d 台のリモートホストを検索 · %2$d 台失敗</string>
+    <string name="git_stashes_section">スタッシュ</string>
+    <string name="auto_empty_goals_title">稼働中のゴールはありません</string>
+    <string name="auto_empty_goals_subtitle">このホストで実行中の自律ゴールがここに表示されます。</string>
+    <string name="auto_empty_monitors_title">稼働中の監視はありません</string>
+    <string name="auto_empty_monitors_subtitle">ログ監視やヘルスチェックを開始するとここに表示されます。</string>
+    <string name="auto_guardian_enabled">Guardian 自動レビューを有効化</string>
+    <string name="auto_guardian_read_only">読み取り専用ツールを自動承認</string>
+    <string name="auto_guardian_tests">ワークスペーステストを自動承認</string>
+    <string name="auto_guardian_max_risk">上限: %1$s</string>
+    <string name="auto_rules_empty">ホストまたはプロジェクトの権限ルールはまだ設定されていません。</string>
+    <string name="auto_rule_pattern_label">コマンド接頭辞またはパターン</string>
+    <string name="auto_rule_allow">許可</string>
+    <string name="auto_rule_deny">拒否</string>
+    <string name="auto_rule_scope_project">プロジェクト</string>
+    <string name="auto_rule_scope_host">ホスト全体</string>
+</resources>

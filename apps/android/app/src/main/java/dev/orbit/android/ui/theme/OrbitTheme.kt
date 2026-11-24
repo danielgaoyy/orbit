@@ -65,175 +65,94 @@ enum class OrbitAppearanceMode(
     }
 }
 
-@Immutable
-data class OrbitColors(
-    val isDark: Boolean,
-    val canvas: Color,
-    val drawer: Color,
-    val elevated: Color,
-    val code: Color,
-    val fgPrimary: Color,
-    val fgSecondary: Color,
-    val fgMuted: Color,
-    val hairline: Color,
-    val primary: Color,
-    val onPrimary: Color,
-    val directAdded: Color,
-    val relay: Color,
-    val warning: Color,
-    val dangerRemoved: Color,
-    val userBubble: Color,
-    val subtleFill: Color,
-    val diffAddedBg: Color,
-    val diffRemovedBg: Color,
-    val diffHunkBg: Color,
-)
-
-val LightOrbitColors = OrbitColors(
-    isDark = false,
-    canvas = Color(0xFFFFFFFF),
-    drawer = Color(0xFFF4F4F6),
-    elevated = Color(0xFFFFFFFF),
-    code = Color(0xFFF4F4F6),
-    fgPrimary = Color(0xFF121314),
-    fgSecondary = Color(0xFF5A5C60),
-    fgMuted = Color(0xFF8B8E94),
-    hairline = Color(0x13000000),
-    primary = Color(0xFF141416),
-    onPrimary = Color(0xFFFFFFFF),
-    directAdded = Color(0xFF059669),
-    relay = Color(0xFF7C3AED),
-    warning = Color(0xFFD97706),
-    dangerRemoved = Color(0xFFE11D48),
-    userBubble = Color(0xFFFFFFFF),
-    subtleFill = Color(0x0E000000),
-    diffAddedBg = Color(0x18059669),
-    diffRemovedBg = Color(0x18E11D48),
-    diffHunkBg = Color(0x14141416),
-)
-
-val GraphiteDarkOrbitColors = OrbitColors(
-    isDark = true,
-    canvas = Color(0xFF191A1C),
-    drawer = Color(0xFF111214),
-    elevated = Color(0xFF212326),
-    code = Color(0xFF131416),
-    fgPrimary = Color(0xFFECEDEF),
-    fgSecondary = Color(0xFF989A9D),
-    fgMuted = Color(0xFF686B70),
-    hairline = Color(0x14FFFFFF),
-    primary = Color(0xFFF4F4F6),
-    onPrimary = Color(0xFF141416),
-    directAdded = Color(0xFF34D399),
-    relay = Color(0xFFA78BFA),
-    warning = Color(0xFFFBBF24),
-    dangerRemoved = Color(0xFFFB7185),
-    userBubble = Color(0xFF212326),
-    subtleFill = Color(0x14FFFFFF),
-    diffAddedBg = Color(0x2234D399),
-    diffRemovedBg = Color(0x22FB7185),
-    diffHunkBg = Color(0x1EFFFFFF),
-)
-
-val OledPureOrbitColors = OrbitColors(
-    isDark = true,
-    canvas = Color(0xFF000000),
-    drawer = Color(0xFF08090B),
-    elevated = Color(0xFF121317),
-    code = Color(0xFF0A0B0E),
-    fgPrimary = Color(0xFFF4F4F6),
-    fgSecondary = Color(0xFF989A9D),
-    fgMuted = Color(0xFF63666B),
-    hairline = Color(0x1CFFFFFF),
-    primary = Color(0xFFF4F4F6),
-    onPrimary = Color(0xFF000000),
-    directAdded = Color(0xFF34D399),
-    relay = Color(0xFFA78BFA),
-    warning = Color(0xFFFBBF24),
-    dangerRemoved = Color(0xFFFB7185),
-    userBubble = Color(0xFF121317),
-    subtleFill = Color(0x16FFFFFF),
-    diffAddedBg = Color(0x2434D399),
-    diffRemovedBg = Color(0x24FB7185),
-    diffHunkBg = Color(0x20FFFFFF),
-)
-
 /**
- * STRICT 4-TIER TYPOGRAPHY SCALE (18sp / 15sp / 13sp / 12sp ONLY).
- * All composables MUST consume styles from [OrbitTypography] and never set inline fontSize.
+ * STRICT INTEGER TYPOGRAPHY SCALE aligned with `.interface-design/system.md`:
+ * - hero:    24sp / 30sp (-0.45sp tracking) — calm overview / empty-state hero
+ * - title:   18sp / 24sp (-0.30sp tracking) — sheet headers & section anchors
+ * - body:    15sp / 24sp                    — T1 Reading prose & composer input
+ * - subhead: 13sp / 19sp                    — T2 Interface controls, rows, traces
+ * - meta:    11sp / 15sp (tnum)             — T3 Meta timestamps, badges, eyebrows
+ * - code:    12sp / 18sp (Monospace, tnum)  — Code blocks, diffs, PTY terminal
  */
 @Immutable
 data class OrbitTypographyScale(
+    val hero: TextStyle = TextStyle(
+        fontSize = 24.sp,
+        fontWeight = FontWeight.SemiBold,
+        lineHeight = 30.sp,
+        letterSpacing = (-0.45).sp,
+    ),
     val title: TextStyle = TextStyle(
         fontSize = 18.sp,
         fontWeight = FontWeight.SemiBold,
         lineHeight = 24.sp,
+        letterSpacing = (-0.3).sp,
     ),
     val body: TextStyle = TextStyle(
         fontSize = 15.sp,
         fontWeight = FontWeight.Normal,
-        lineHeight = 22.sp,
+        lineHeight = 24.sp,
     ),
     val bodyMedium: TextStyle = TextStyle(
         fontSize = 15.sp,
         fontWeight = FontWeight.Medium,
-        lineHeight = 22.sp,
+        lineHeight = 24.sp,
     ),
     val bodySemiBold: TextStyle = TextStyle(
         fontSize = 15.sp,
         fontWeight = FontWeight.SemiBold,
-        lineHeight = 22.sp,
+        lineHeight = 24.sp,
     ),
     val subhead: TextStyle = TextStyle(
         fontSize = 13.sp,
         fontWeight = FontWeight.Normal,
-        lineHeight = 18.sp,
+        lineHeight = 19.sp,
     ),
     val subheadMedium: TextStyle = TextStyle(
         fontSize = 13.sp,
         fontWeight = FontWeight.Medium,
-        lineHeight = 18.sp,
+        lineHeight = 19.sp,
     ),
     val subheadSemiBold: TextStyle = TextStyle(
         fontSize = 13.sp,
         fontWeight = FontWeight.SemiBold,
-        lineHeight = 18.sp,
+        lineHeight = 19.sp,
     ),
     val subheadTabular: TextStyle = TextStyle(
         fontSize = 13.sp,
         fontWeight = FontWeight.Medium,
-        lineHeight = 18.sp,
+        lineHeight = 19.sp,
         fontFeatureSettings = "tnum",
     ),
     val meta: TextStyle = TextStyle(
-        fontSize = 12.sp,
+        fontSize = 11.sp,
         fontWeight = FontWeight.Normal,
-        lineHeight = 16.sp,
+        lineHeight = 15.sp,
         fontFeatureSettings = "tnum",
     ),
     val metaMedium: TextStyle = TextStyle(
-        fontSize = 12.sp,
+        fontSize = 11.sp,
         fontWeight = FontWeight.Medium,
-        lineHeight = 16.sp,
+        lineHeight = 15.sp,
         fontFeatureSettings = "tnum",
     ),
     val metaSemiBold: TextStyle = TextStyle(
-        fontSize = 12.sp,
+        fontSize = 11.sp,
         fontWeight = FontWeight.SemiBold,
-        lineHeight = 16.sp,
+        lineHeight = 15.sp,
         fontFeatureSettings = "tnum",
     ),
     val code: TextStyle = TextStyle(
         fontSize = 12.sp,
         fontWeight = FontWeight.Normal,
-        lineHeight = 16.sp,
+        lineHeight = 18.sp,
         fontFamily = FontFamily.Monospace,
         fontFeatureSettings = "tnum",
     ),
     val codeMedium: TextStyle = TextStyle(
         fontSize = 12.sp,
         fontWeight = FontWeight.Medium,
-        lineHeight = 16.sp,
+        lineHeight = 18.sp,
         fontFamily = FontFamily.Monospace,
         fontFeatureSettings = "tnum",
     ),
@@ -242,7 +161,7 @@ data class OrbitTypographyScale(
 val OrbitTypography = OrbitTypographyScale()
 
 /**
- * STRICT 4dp SPATIAL GRID (4 / 8 / 12 / 16 / 24 / 32).
+ * STRICT 4dp SPATIAL GRID (4 / 8 / 12 / 16 / 20 / 24 / 32).
  */
 object OrbitSpacing {
     val hairline = 0.5.dp
@@ -250,12 +169,25 @@ object OrbitSpacing {
     val sm = 8.dp
     val md = 12.dp
     val lg = 16.dp
+    val section = 20.dp
     val xl = 24.dp
     val xxl = 32.dp
     val touchTarget = 48.dp
     val topBarHeight = 52.dp
     val iconSm = 16.dp
     val iconMd = 18.dp
+}
+
+/**
+ * Concentric radius scale matching Desktop (`4 / 6 / 8 / 12 / 16 / 20`).
+ */
+object OrbitRadius {
+    val xs = 4.dp
+    val sm = 6.dp
+    val md = 8.dp
+    val lg = 12.dp
+    val xl = 16.dp
+    val composer = 20.dp
 }
 
 val LocalOrbitColors = staticCompositionLocalOf { GraphiteDarkOrbitColors }
@@ -309,15 +241,27 @@ fun OrbitTheme(
         darkColorScheme(
             primary = palette.primary,
             onPrimary = palette.onPrimary,
+            primaryContainer = palette.subtleFill,
+            onPrimaryContainer = palette.fgPrimary,
+            secondary = palette.fgSecondary,
+            onSecondary = palette.canvas,
+            secondaryContainer = palette.subtleFill,
+            onSecondaryContainer = palette.fgPrimary,
+            tertiary = palette.fgSecondary,
+            onTertiary = palette.canvas,
+            surfaceTint = palette.fgPrimary,
+            surfaceVariant = palette.surfaceRecessed,
             background = palette.canvas,
             onBackground = palette.fgPrimary,
             surface = palette.elevated,
+            surfaceContainerLowest = palette.surfaceRecessed,
+            surfaceContainerLow = palette.canvas,
             surfaceContainer = palette.elevated,
-            surfaceContainerLow = palette.drawer,
-            surfaceContainerHigh = palette.elevated,
+            surfaceContainerHigh = palette.surfaceOverlay,
+            surfaceContainerHighest = palette.surfaceOverlay,
             onSurface = palette.fgPrimary,
             onSurfaceVariant = palette.fgSecondary,
-            outline = palette.hairline,
+            outline = palette.borderDefault,
             outlineVariant = palette.hairline,
             error = palette.dangerRemoved,
         )
@@ -325,15 +269,27 @@ fun OrbitTheme(
         lightColorScheme(
             primary = palette.primary,
             onPrimary = palette.onPrimary,
+            primaryContainer = palette.subtleFill,
+            onPrimaryContainer = palette.fgPrimary,
+            secondary = palette.fgSecondary,
+            onSecondary = palette.canvas,
+            secondaryContainer = palette.subtleFill,
+            onSecondaryContainer = palette.fgPrimary,
+            tertiary = palette.fgSecondary,
+            onTertiary = palette.canvas,
+            surfaceTint = palette.fgPrimary,
+            surfaceVariant = palette.surfaceRecessed,
             background = palette.canvas,
             onBackground = palette.fgPrimary,
             surface = palette.elevated,
+            surfaceContainerLowest = palette.surfaceRecessed,
+            surfaceContainerLow = palette.canvas,
             surfaceContainer = palette.elevated,
-            surfaceContainerLow = palette.drawer,
-            surfaceContainerHigh = palette.elevated,
+            surfaceContainerHigh = palette.surfaceOverlay,
+            surfaceContainerHighest = palette.surfaceOverlay,
             onSurface = palette.fgPrimary,
             onSurfaceVariant = palette.fgSecondary,
-            outline = palette.hairline,
+            outline = palette.borderDefault,
             outlineVariant = palette.hairline,
             error = palette.dangerRemoved,
         )

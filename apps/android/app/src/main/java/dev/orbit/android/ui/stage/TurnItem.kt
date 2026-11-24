@@ -63,6 +63,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -104,11 +105,12 @@ fun TurnItem(
     turn: FfiStageTurn,
     isTurnActive: Boolean,
     activeCwd: String,
-    describeStep: (FfiTimelineItem) -> FfiToolStepDescriptor?,
+    describeStep: suspend (FfiTimelineItem) -> FfiToolStepDescriptor?,
     onOpenDiffFile: (String) -> Unit,
     onQuoteDiffLine: (path: String, lineLabel: String, content: String) -> Unit,
     onCopyAssistantReply: (String) -> Unit,
     onQuoteAssistantReply: (String) -> Unit = {},
+    onInterruptDeliver: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val active = isTurnActive
@@ -120,6 +122,9 @@ fun TurnItem(
         modifier = modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(OrbitSpacing.md),
     ) {
+        (turn.agentMessage as? FfiTimelineItem.AgentMessage)?.let {
+            AgentMessageBody(it, onInterruptDeliver = onInterruptDeliver)
+        }
         // 1. User Prompt Bubble (or compact-only divider suppression)
         if (isCompactionOnly) {
             CompactionDividerRow(label = "Context compacted")
@@ -136,6 +141,7 @@ fun TurnItem(
                 describeStep = describeStep,
                 onOpenDiffFile = onOpenDiffFile,
                 onQuoteDiffLine = onQuoteDiffLine,
+                onInterruptDeliver = onInterruptDeliver,
             )
         } else {
             if (turn.foldedSteps.isNotEmpty()) {
@@ -145,6 +151,7 @@ fun TurnItem(
                     describeStep = describeStep,
                     onOpenDiffFile = onOpenDiffFile,
                     onQuoteDiffLine = onQuoteDiffLine,
+                    onInterruptDeliver = onInterruptDeliver,
                 )
             }
 
@@ -541,9 +548,10 @@ private fun stepStableKey(item: FfiTimelineItem): String = when (item) {
 private fun SettledWorkTrajectory(
     turn: FfiStageTurn,
     activeCwd: String,
-    describeStep: (FfiTimelineItem) -> FfiToolStepDescriptor?,
+    describeStep: suspend (FfiTimelineItem) -> FfiToolStepDescriptor?,
     onOpenDiffFile: (String) -> Unit,
     onQuoteDiffLine: (path: String, lineLabel: String, content: String) -> Unit,
+    onInterruptDeliver: (() -> Unit)? = null,
 ) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
@@ -603,6 +611,7 @@ private fun SettledWorkTrajectory(
                 describeStep = describeStep,
                 onOpenDiffFile = onOpenDiffFile,
                 onQuoteDiffLine = onQuoteDiffLine,
+                onInterruptDeliver = onInterruptDeliver,
                 modifier = Modifier.padding(top = OrbitSpacing.xs),
             )
         }
@@ -621,9 +630,10 @@ private fun LiveTurnSegments(
     turn: FfiStageTurn,
     isTurnActive: Boolean,
     activeCwd: String,
-    describeStep: (FfiTimelineItem) -> FfiToolStepDescriptor?,
+    describeStep: suspend (FfiTimelineItem) -> FfiToolStepDescriptor?,
     onOpenDiffFile: (String) -> Unit,
     onQuoteDiffLine: (path: String, lineLabel: String, content: String) -> Unit,
+    onInterruptDeliver: (() -> Unit)? = null,
 ) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
@@ -716,6 +726,7 @@ private fun LiveTurnSegments(
                                 describeStep = describeStep,
                                 onOpenDiffFile = onOpenDiffFile,
                                 onQuoteDiffLine = onQuoteDiffLine,
+                                onInterruptDeliver = onInterruptDeliver,
                                 modifier = Modifier.padding(top = OrbitSpacing.xs),
                             )
                         }
@@ -728,6 +739,7 @@ private fun LiveTurnSegments(
                                 describeStep = describeStep,
                                 onOpenDiffFile = onOpenDiffFile,
                                 onQuoteDiffLine = onQuoteDiffLine,
+                                onInterruptDeliver = onInterruptDeliver,
                                 modifier = Modifier.padding(top = OrbitSpacing.xs),
                             )
                         }
@@ -745,10 +757,7 @@ private fun LiveTurnSegments(
 
                 is FfiTurnLiveSegment.AgentMessage -> {
                     (seg.item as? FfiTimelineItem.AgentMessage)?.let { msg ->
-                        MarkdownBlocks(
-                            blocks = msg.blocks,
-                            fallbackText = msg.text,
-                        )
+                        AgentMessageBody(msg, onInterruptDeliver = onInterruptDeliver)
                     }
                 }
 
@@ -774,9 +783,10 @@ private fun LiveTurnSegments(
 private fun HairlineStepRail(
     steps: List<FfiTimelineItem>,
     activeCwd: String,
-    describeStep: (FfiTimelineItem) -> FfiToolStepDescriptor?,
+    describeStep: suspend (FfiTimelineItem) -> FfiToolStepDescriptor?,
     onOpenDiffFile: (String) -> Unit,
     onQuoteDiffLine: (path: String, lineLabel: String, content: String) -> Unit,
+    onInterruptDeliver: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val colors = OrbitTheme.colors
@@ -807,6 +817,7 @@ private fun HairlineStepRail(
                         describeStep = describeStep,
                         onOpenDiffFile = onOpenDiffFile,
                         onQuoteDiffLine = onQuoteDiffLine,
+                        onInterruptDeliver = onInterruptDeliver,
                     )
                 }
             }
@@ -839,9 +850,10 @@ private fun StepRow(
     item: FfiTimelineItem,
     stableKey: String,
     activeCwd: String,
-    describeStep: (FfiTimelineItem) -> FfiToolStepDescriptor?,
+    describeStep: suspend (FfiTimelineItem) -> FfiToolStepDescriptor?,
     onOpenDiffFile: (String) -> Unit,
     onQuoteDiffLine: (path: String, lineLabel: String, content: String) -> Unit,
+    onInterruptDeliver: (() -> Unit)? = null,
 ) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
@@ -917,7 +929,16 @@ private fun StepRow(
         }
 
         is FfiTimelineItem.ToolCall -> {
-            val descriptor = remember(item, activeCwd) { describeStep(item) }
+            val descriptorState by produceState<FfiToolStepDescriptor?>(
+                initialValue = item.stepDescriptor,
+                key1 = item,
+                key2 = activeCwd,
+            ) {
+                if (value == null) {
+                    value = describeStep(item)
+                }
+            }
+            val descriptor = descriptorState
             val stepKind = descriptor?.kind
             val verb = descriptor?.verb?.takeIf { it.isNotBlank() } ?: "Run"
             val targetRaw = descriptor?.target?.takeIf { it.isNotBlank() } ?: item.summaryTitle
@@ -1041,10 +1062,7 @@ private fun StepRow(
             )
         }
         is FfiTimelineItem.AgentMessage -> {
-            MarkdownBlocks(
-                blocks = item.blocks,
-                fallbackText = item.text,
-            )
+            AgentMessageBody(item, onInterruptDeliver = onInterruptDeliver)
         }
         is FfiTimelineItem.PermissionRequest,
         is FfiTimelineItem.QuestionRequest,

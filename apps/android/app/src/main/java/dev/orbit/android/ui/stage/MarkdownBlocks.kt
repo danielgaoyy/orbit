@@ -633,7 +633,7 @@ private fun MarkdownTableSurface(
     }
 }
 
-private fun buildHighlightedLine(line: FfiHighlightedLine, fallbackFg: Color): AnnotatedString =
+internal fun buildHighlightedLine(line: FfiHighlightedLine, fallbackFg: Color): AnnotatedString =
     buildAnnotatedString {
         line.tokens.forEach { tok ->
             pushStyle(

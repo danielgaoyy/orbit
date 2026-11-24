@@ -108,6 +108,7 @@ fun GitDiffBottomSheet(
     isRefreshing: Boolean,
     onRefresh: () -> Unit,
     onPullRefresh: () -> Unit,
+    onWrite: () -> Unit,
     onSetStagedMode: (Boolean) -> Unit,
     onSelectPath: (String?) -> Unit,
     onQuoteLine: (path: String, lineLabel: String, content: String) -> Unit,
@@ -134,6 +135,7 @@ fun GitDiffBottomSheet(
             selectedPath = selectedPath,
             isRefreshing = isRefreshing,
             onPullRefresh = onPullRefresh,
+            onWrite = onWrite,
             onSetStagedMode = onSetStagedMode,
             onSelectPath = onSelectPath,
             onQuoteLine = onQuoteLine,
@@ -160,6 +162,7 @@ fun GitDiffInspectorPane(
     isRefreshing: Boolean,
     onRefresh: () -> Unit,
     onPullRefresh: () -> Unit,
+    onWrite: () -> Unit,
     onSetStagedMode: (Boolean) -> Unit,
     onSelectPath: (String?) -> Unit,
     onQuoteLine: (path: String, lineLabel: String, content: String) -> Unit,
@@ -187,6 +190,7 @@ fun GitDiffInspectorPane(
             selectedPath = selectedPath,
             isRefreshing = isRefreshing,
             onPullRefresh = onPullRefresh,
+            onWrite = onWrite,
             onSetStagedMode = onSetStagedMode,
             onSelectPath = onSelectPath,
             onQuoteLine = onQuoteLine,
@@ -211,6 +215,7 @@ private fun DiffInspectorBody(
     selectedPath: String?,
     isRefreshing: Boolean,
     onPullRefresh: () -> Unit,
+    onWrite: () -> Unit,
     onSetStagedMode: (Boolean) -> Unit,
     onSelectPath: (String?) -> Unit,
     onQuoteLine: (path: String, lineLabel: String, content: String) -> Unit,
@@ -293,6 +298,9 @@ private fun DiffInspectorBody(
             }
 
             Row(verticalAlignment = Alignment.CenterVertically) {
+                if (gitReview?.isGitRepo == true) androidx.compose.material3.TextButton(onClick = onWrite) {
+                    Text(androidx.compose.ui.res.stringResource(dev.orbit.android.R.string.git_changes))
+                }
                 Box(
                     modifier = Modifier
                         .size(OrbitSpacing.touchTarget)

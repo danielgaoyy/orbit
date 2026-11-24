@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -40,6 +41,7 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -86,6 +88,7 @@ private val DeveloperKeys = listOf(
     DevKeySpec("ALT", isStickyAlt = true),
     DevKeySpec("^C", "\u0003"),
     DevKeySpec("^D", "\u0004"),
+    DevKeySpec("^Z", "\u001A"),
     DevKeySpec("^L", "\u000C"),
     DevKeySpec("↑", "\u001B[A"),
     DevKeySpec("↓", "\u001B[B"),
@@ -110,6 +113,9 @@ fun PtyTerminalSheet(
     onKillTerminal: (String) -> Unit,
     onViewportMeasured: (cols: Int, rows: Int) -> Unit,
     onSendKeys: (String) -> Unit,
+    onSendBytes: (ByteArray) -> Unit,
+    initialLine: String,
+    inlineDeck: Boolean,
     onCopiedOutput: () -> Unit,
     onQuoteTerminal: () -> Unit,
     onDismiss: () -> Unit,
@@ -124,7 +130,9 @@ fun PtyTerminalSheet(
 
     var stickyCtrl by remember { mutableStateOf(false) }
     var stickyAlt by remember { mutableStateOf(false) }
-    var inputLine by remember { mutableStateOf("") }
+    var inputLine by remember { mutableStateOf(initialLine) }
+    var raw by remember { mutableStateOf(initialLine.isBlank()) }
+    var focusRequest by remember { mutableIntStateOf(0) }
 
     val visibleSnapshotText = remember(screen) {
         screen?.rowsData.orEmpty()
@@ -148,16 +156,11 @@ fun PtyTerminalSheet(
         charW to rowH
     }
 
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState,
-        containerColor = colors.elevated,
-        contentColor = colors.fgPrimary,
-    ) {
+    val terminalContent: @Composable () -> Unit = {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .fillMaxHeight(0.88f)
+                .fillMaxHeight(if (inlineDeck) 1f else 0.88f)
                 .imePadding()
                 .navigationBarsPadding(),
         ) {
@@ -169,6 +172,9 @@ fun PtyTerminalSheet(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
             ) {
+                if (inlineDeck) androidx.compose.material3.TextButton(onClick = onDismiss) {
+                    Text(androidx.compose.ui.res.stringResource(dev.orbit.android.R.string.nav_close))
+                }
                 Row(
                     modifier = Modifier
                         .weight(1f)
@@ -337,6 +343,7 @@ fun PtyTerminalSheet(
                     .fillMaxWidth()
                     .padding(horizontal = OrbitSpacing.lg, vertical = OrbitSpacing.sm)
                     .clip(RoundedCornerShape(OrbitSpacing.md))
+                    .clickable(enabled = raw) { focusRequest++ }
                     .background(termBg, RoundedCornerShape(OrbitSpacing.md))
                     .border(OrbitSpacing.hairline, colors.hairline, RoundedCornerShape(OrbitSpacing.md))
                     .onSizeChanged { size ->
@@ -390,12 +397,15 @@ fun PtyTerminalSheet(
                 horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                androidx.compose.material3.TextButton(onClick = { raw = !raw; stickyCtrl = false; stickyAlt = false }) {
+                    Text(androidx.compose.ui.res.stringResource(if (raw) dev.orbit.android.R.string.terminal_mode_raw else dev.orbit.android.R.string.terminal_mode_line))
+                }
                 DeveloperKeys.forEach { key ->
                     val latched = (key.isStickyCtrl && stickyCtrl) || (key.isStickyAlt && stickyAlt)
                     val keyShape = RoundedCornerShape(OrbitSpacing.sm)
                     Box(
                         modifier = Modifier
-                            .heightIn(min = 38.dp)
+                            .heightIn(min = 48.dp)
                             .clip(keyShape)
                             .background(
                                 if (latched) colors.primary else colors.subtleFill,
@@ -408,7 +418,13 @@ fun PtyTerminalSheet(
                                     key.isStickyCtrl -> stickyCtrl = !stickyCtrl
                                     key.isStickyAlt -> stickyAlt = !stickyAlt
                                     key.sequence != null -> {
-                                        onSendKeys(key.sequence)
+                                        onSendBytes(
+                                            OrbitVt100Encoder.encodeDeveloperKey(
+                                                sequence = key.sequence,
+                                                ctrlLatched = stickyCtrl,
+                                                altLatched = stickyAlt,
+                                            )
+                                        )
                                         stickyCtrl = false
                                         stickyAlt = false
                                     }
@@ -426,102 +442,124 @@ fun PtyTerminalSheet(
                 }
             }
 
-            // Direct Shell Input Row
-            val inputShape = RoundedCornerShape(OrbitSpacing.md)
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(
-                        start = OrbitSpacing.lg,
-                        end = OrbitSpacing.lg,
-                        top = OrbitSpacing.xs,
-                        bottom = OrbitSpacing.sm,
-                    ),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
-            ) {
-                Box(
+            if (raw) {
+                Box(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable { focusRequest++ }.padding(horizontal = 16.dp),
+                    contentAlignment = Alignment.CenterStart) {
+                    RawTerminalInputBridge(focusRequest, stickyCtrl, stickyAlt, onSendBytes,
+                        { stickyCtrl = false; stickyAlt = false }, Modifier.size(1.dp))
+                    Text(androidx.compose.ui.res.stringResource(dev.orbit.android.R.string.terminal_raw_hint), style = typography.meta)
+                }
+            } else {
+                // Direct Shell Input Row
+                val inputShape = RoundedCornerShape(OrbitSpacing.md)
+                Row(
                     modifier = Modifier
-                        .weight(1f)
-                        .heightIn(min = 44.dp)
-                        .background(colors.code, inputShape)
-                        .border(OrbitSpacing.hairline, colors.hairline, inputShape)
-                        .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.sm),
-                    contentAlignment = Alignment.CenterStart,
+                        .fillMaxWidth()
+                        .padding(
+                            start = OrbitSpacing.lg,
+                            end = OrbitSpacing.lg,
+                            top = OrbitSpacing.xs,
+                            bottom = OrbitSpacing.sm,
+                        ),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
                 ) {
-                    if (inputLine.isEmpty()) {
-                        val hint = when {
-                            stickyCtrl -> "CTRL + key..."
-                            stickyAlt -> "ALT + key..."
-                            else -> "Type shell command..."
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 44.dp)
+                            .background(colors.code, inputShape)
+                            .border(OrbitSpacing.hairline, colors.hairline, inputShape)
+                            .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.sm),
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
+                        if (inputLine.isEmpty()) {
+                            val hint = when {
+                                stickyCtrl -> "CTRL + key..."
+                                stickyAlt -> "ALT + key..."
+                                else -> "Type shell command..."
+                            }
+                            Text(
+                                text = hint,
+                                style = typography.code,
+                                color = if (stickyCtrl || stickyAlt) colors.primary else colors.fgMuted,
+                            )
                         }
-                        Text(
-                            text = hint,
-                            style = typography.code,
-                            color = if (stickyCtrl || stickyAlt) colors.primary else colors.fgMuted,
+                        BasicTextField(
+                            value = inputLine,
+                            onValueChange = { next ->
+                                if ((stickyCtrl || stickyAlt) && next.length == 1 && inputLine.isEmpty()) {
+                                    val ch = next[0]
+                                    val seq = when {
+                                        stickyCtrl && ch.uppercaseChar() in 'A'..'Z' -> {
+                                            ((ch.uppercaseChar().code - 64).toChar()).toString()
+                                        }
+                                        stickyAlt -> "\u001B$ch"
+                                        else -> next
+                                    }
+                                    onSendKeys(seq)
+                                    stickyCtrl = false
+                                    stickyAlt = false
+                                    inputLine = ""
+                                } else {
+                                    inputLine = next
+                                }
+                            },
+                            textStyle = typography.code.copy(color = colors.fgPrimary),
+                            cursorBrush = SolidColor(colors.primary),
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(
+                                capitalization = KeyboardCapitalization.None,
+                                autoCorrectEnabled = false,
+                                keyboardType = KeyboardType.Ascii,
+                                imeAction = ImeAction.Send,
+                            ),
+                            keyboardActions = KeyboardActions(
+                                onSend = {
+                                    onSendKeys("$inputLine\r")
+                                    inputLine = ""
+                                }
+                            ),
+                            modifier = Modifier.fillMaxWidth(),
                         )
                     }
-                    BasicTextField(
-                        value = inputLine,
-                        onValueChange = { next ->
-                            if ((stickyCtrl || stickyAlt) && next.length == 1 && inputLine.isEmpty()) {
-                                val ch = next[0]
-                                val seq = when {
-                                    stickyCtrl && ch.uppercaseChar() in 'A'..'Z' -> {
-                                        ((ch.uppercaseChar().code - 64).toChar()).toString()
-                                    }
-                                    stickyAlt -> "\u001B$ch"
-                                    else -> next
-                                }
-                                onSendKeys(seq)
-                                stickyCtrl = false
-                                stickyAlt = false
-                                inputLine = ""
-                            } else {
-                                inputLine = next
-                            }
-                        },
-                        textStyle = typography.code.copy(color = colors.fgPrimary),
-                        cursorBrush = SolidColor(colors.primary),
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(
-                            capitalization = KeyboardCapitalization.None,
-                            autoCorrectEnabled = false,
-                            keyboardType = KeyboardType.Ascii,
-                            imeAction = ImeAction.Send,
-                        ),
-                        keyboardActions = KeyboardActions(
-                            onSend = {
+
+                    Box(
+                        modifier = Modifier
+                            .size(OrbitSpacing.touchTarget)
+                            .clip(inputShape)
+                            .background(colors.primary, inputShape)
+                            .clickable {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                 onSendKeys("$inputLine\r")
                                 inputLine = ""
-                            }
-                        ),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-
-                Box(
-                    modifier = Modifier
-                        .size(OrbitSpacing.touchTarget)
-                        .clip(inputShape)
-                        .background(colors.primary, inputShape)
-                        .clickable {
-                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onSendKeys("$inputLine\r")
-                            inputLine = ""
-                        },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Outlined.KeyboardReturn,
-                        contentDescription = "Send Enter",
-                        tint = colors.onPrimary,
-                        modifier = Modifier.size(OrbitSpacing.iconMd),
-                    )
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Outlined.KeyboardReturn,
+                            contentDescription = "Send Enter",
+                            tint = colors.onPrimary,
+                            modifier = Modifier.size(OrbitSpacing.iconMd),
+                        )
+                    }
                 }
             }
         }
     }
+    if (inlineDeck) {
+        terminalContent()
+    } else {
+        ModalBottomSheet(
+            onDismissRequest = onDismiss,
+            sheetState = sheetState,
+            containerColor = colors.elevated,
+            contentColor = colors.fgPrimary,
+        ) {
+            terminalContent()
+        }
+    }
+
 }
 
 private fun buildTerminalRowString(

@@ -11,20 +11,34 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.orbit.android.BuildConfig
+import dev.orbit.android.notifications.ExternalDeepLinkDisposition
+import dev.orbit.android.notifications.OrbitDeepLinkAction
+import dev.orbit.android.notifications.OrbitDeepLinkSecurityPolicy
 import dev.orbit.android.notifications.OrbitFirebaseMessagingBridge
 import dev.orbit.android.notifications.OrbitNotificationHelper
+import dev.orbit.android.notifications.OrbitPushRouter
+import dev.orbit.android.notifications.PendingDeepLinkConfirmation
+import dev.orbit.android.notifications.PendingDeepLinkKind
 import dev.orbit.android.ui.sheets.SideQuestionEntry
 import dev.orbit.android.ui.theme.OrbitAppearanceMode
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import uniffi.orbit_ffi_uniffi.ConnectedHostSummary
+import uniffi.orbit_ffi_uniffi.ConversationSearchHit
+import uniffi.orbit_ffi_uniffi.DagStepSpec
 import uniffi.orbit_ffi_uniffi.FfiAgentCard
 import uniffi.orbit_ffi_uniffi.FfiAgentStage
 import uniffi.orbit_ffi_uniffi.FfiAgentStageDelta
@@ -61,13 +75,17 @@ import uniffi.orbit_ffi_uniffi.FfiMentionCandidate
 import uniffi.orbit_ffi_uniffi.FfiMentionRankRequest
 import uniffi.orbit_ffi_uniffi.FfiModelSelectionRequest
 import uniffi.orbit_ffi_uniffi.FfiOrbitException
+import uniffi.orbit_ffi_uniffi.FfiPermissionRequestId
 import uniffi.orbit_ffi_uniffi.FfiPromptBadge
 import uniffi.orbit_ffi_uniffi.FfiProviderKind
 import uniffi.orbit_ffi_uniffi.FfiProviderModelCatalog
 import uniffi.orbit_ffi_uniffi.FfiProviderModelSpec
+import uniffi.orbit_ffi_uniffi.FfiPushDevicesSnapshot
+import uniffi.orbit_ffi_uniffi.FfiPushPlatform
 import uniffi.orbit_ffi_uniffi.FfiPushRegistrationStatus
 import uniffi.orbit_ffi_uniffi.FfiQuestionItem
 import uniffi.orbit_ffi_uniffi.FfiReasoningEffort
+import uniffi.orbit_ffi_uniffi.FfiRegisterPushDeviceRequest
 import uniffi.orbit_ffi_uniffi.FfiRenderDiagramRequest
 import uniffi.orbit_ffi_uniffi.FfiRenderDiagramView
 import uniffi.orbit_ffi_uniffi.FfiResolvedModelSelection
@@ -84,9 +102,32 @@ import uniffi.orbit_ffi_uniffi.FfiThreadPrefSeed
 import uniffi.orbit_ffi_uniffi.FfiTimelineItem
 import uniffi.orbit_ffi_uniffi.FfiToolCallDetail
 import uniffi.orbit_ffi_uniffi.FfiToolStepDescriptor
+import uniffi.orbit_ffi_uniffi.FfiWorkspaceFile
+import uniffi.orbit_ffi_uniffi.GitConflictFile
+import uniffi.orbit_ffi_uniffi.GitConflictResolution
+import uniffi.orbit_ffi_uniffi.GitPrStatus
+import uniffi.orbit_ffi_uniffi.GitStashEntry
+import uniffi.orbit_ffi_uniffi.GuardianAuditEntry
+import uniffi.orbit_ffi_uniffi.GuardianConfigSnapshotView
+import uniffi.orbit_ffi_uniffi.GuardianPolicyConfig
+import uniffi.orbit_ffi_uniffi.GuardianRiskLevel
 import uniffi.orbit_ffi_uniffi.MobileCoreListener
+import uniffi.orbit_ffi_uniffi.MonitorKind
 import uniffi.orbit_ffi_uniffi.OrbitMobileCore
+import uniffi.orbit_ffi_uniffi.PermissionRuleRecord
+import uniffi.orbit_ffi_uniffi.PersonalRouterConfig
+import uniffi.orbit_ffi_uniffi.PlanApprovalAction
+import uniffi.orbit_ffi_uniffi.PushPreferences
+import uniffi.orbit_ffi_uniffi.RouterHostCapabilities
+import uniffi.orbit_ffi_uniffi.RouterStatusSnapshot
+import uniffi.orbit_ffi_uniffi.SearchMessagesRequest
 import uniffi.orbit_ffi_uniffi.SideQuestionListener
+import uniffi.orbit_ffi_uniffi.StartDagWorkflowRequest
+import uniffi.orbit_ffi_uniffi.StartGoalRunRequest
+import uniffi.orbit_ffi_uniffi.StartMonitorWatchRequest
+import uniffi.orbit_ffi_uniffi.TimerCondition
+import uniffi.orbit_ffi_uniffi.UpdatePushPreferencesRequest
+import uniffi.orbit_ffi_uniffi.UpsertPermissionRuleInput
 import uniffi.orbit_ffi_uniffi.defaultEffortDescription
 import uniffi.orbit_ffi_uniffi.fallbackProviderCatalog
 import uniffi.orbit_ffi_uniffi.formatCatalogModelLabel
@@ -95,6 +136,8 @@ import uniffi.orbit_ffi_uniffi.resolveSupportedEffortForModel
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 @Immutable
 data class QuotedDiffSnippet(
@@ -223,6 +266,18 @@ enum class OrbitSidebarThreadFilter(val label: String) {
 }
 
 @Immutable
+data class OverviewPendingDecision(
+    val hostId: String,
+    val hostName: String,
+    val agentId: String,
+    val agentTitle: String,
+    val permission: FfiTimelineItem.PermissionRequest,
+    val isSafeLowRisk: Boolean,
+    val isPlanApproval: Boolean,
+    val riskLevel: GuardianRiskLevel? = null,
+)
+
+@Immutable
 data class OrbitUiState(
     val appearanceMode: OrbitAppearanceMode = OrbitAppearanceMode.SYSTEM,
     val isPermanentDrawerCollapsed: Boolean = false,
@@ -268,8 +323,33 @@ data class OrbitUiState(
     val cloudSyncBusy: Boolean = false,
     val cloudSyncError: String? = null,
     val pushRegistrationStatus: FfiPushRegistrationStatus? = null,
+    val pushDevicesSnapshot: FfiPushDevicesSnapshot? = null,
+    val showGlobalOverview: Boolean = true,
+    val fleetSessions: List<Pair<String, FfiAgentCard>> = emptyList(),
+    val overviewPendingDecisions: List<OverviewPendingDecision> = emptyList(),
+    val stageHasOlderTurns: Boolean = false,
+    val stageOldestLoadedSeq: ULong = 0uL,
+    val stageAuxRevision: ULong = 0uL,
+    val isLoadingOlderTurns: Boolean = false,
+    val gitPrStatus: GitPrStatus? = null,
+    val gitConflicts: List<GitConflictFile> = emptyList(),
+    val gitStashes: List<GitStashEntry> = emptyList(),
+    val gitMutationBusy: Boolean = false,
+    val generatedCommitMessage: String? = null,
+    val routerHosts: List<RouterHostCapabilities> = emptyList(),
+    val routerStatus: RouterStatusSnapshot? = null,
+    val fleetMeshSnapshot: Map<String, List<ConnectedHostSummary>> = emptyMap(),
+    val isLoadingRouterMesh: Boolean = false,
+    val globalSearchQuery: String = "",
+    val globalSearchHits: List<ConversationSearchHit> = emptyList(),
+    val globalSearchRemoteQueried: UInt = 0u,
+    val globalSearchRemoteFailed: UInt = 0u,
+    val isSearchingGlobal: Boolean = false,
+    val permissionRules: List<PermissionRuleRecord> = emptyList(),
+    val guardianSnapshot: GuardianConfigSnapshotView? = null,
     val pendingSheetTriggerId: Long = 0L,
     val pendingSheetTrigger: String? = null,
+    val pendingDeepLinkConfirmation: PendingDeepLinkConfirmation? = null,
     val lastError: String? = null,
     val toastMessage: String? = null,
 ) {
@@ -293,7 +373,7 @@ data class OrbitUiState(
     val activeSideQuestionDraft: String
         get() = sideQuestionDraftsByScope[activeSideQuestionScopeKey].orEmpty()
     val selectedHost: FfiHostCard?
-        get() = hostDetail?.host ?: hosts.firstOrNull { it.hostId == selectedHostId }
+        get() = hostDetail?.host?.takeIf { it.hostId == selectedHostId } ?: hosts.firstOrNull { it.hostId == selectedHostId }
 
     val activeAgent: FfiAgentCard?
         get() = if (selectedAgentId == null) {
@@ -616,6 +696,18 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         }
     }
 
+    private val terminalInput = kotlinx.coroutines.channels.Channel<Triple<String, UByte, ByteArray>>(256)
+    init {
+        viewModelScope.launch(Dispatchers.IO) {
+            for ((host, slot, bytes) in terminalInput) {
+                runCatching {
+                    val activeCore = checkNotNull(core ?: coreReady.await()) { "Orbit core is not ready" }
+                    activeCore.sendTerminalBytes(host, slot, bytes)
+                }.onFailure { postToast(extractErrorMessage(it, "Terminal input failed")) }
+            }
+        }
+    }
+
     private val listener = object : MobileCoreListener {
         override fun onCoreEvent(event: FfiCoreEvent) {
             viewModelScope.launch(Dispatchers.IO) {
@@ -625,10 +717,9 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     }
 
     init {
-        val dbFile = File(application.filesDir, "orbit_android_v3.sqlite")
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val instance = OrbitMobileCore.openWithOptions(dbFile.absolutePath, true)
+                val instance = OrbitRepository.openMobileCore(application)
                 core = instance
 
                 if (!prefs.getBoolean(KEY_MIGRATED_THREAD_PREFS_V1, false)) {
@@ -872,6 +963,11 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
 
         // Debug/automation launch extras are strictly restricted to debug builds so third-party apps
         // cannot inject PTY commands or UI state into the exported MainActivity in release builds.
+        if (intent.hasExtra("google.message_id") || intent.hasExtra("gcm.message_id")) {
+            val fields = listOf("event_kind", "host_id", "agent_id", "deep_link", "kind")
+                .mapNotNull { key -> intent.getStringExtra(key)?.let { key to it } }.toMap()
+            OrbitPushRouter.parsePayload(fields)?.let { handleDeepLinkUri(it.deepLink) }
+        }
         if (!BuildConfig.DEBUG) return
 
         // 2. Immediate zero-flash theme (`--es orbit_theme <system|light|dark>`)
@@ -1003,35 +1099,44 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     }
 
     fun handleDeepLinkUri(uriString: String?) {
-        val trimmed = uriString?.trim().orEmpty()
-        if (trimmed.isEmpty()) return
-        if (trimmed.startsWith("orbit://pair", ignoreCase = true)) {
-            pairHost(trimmed)
+        val disposition = OrbitDeepLinkSecurityPolicy.resolveExternalAction(uriString) ?: run {
+            val trimmed = uriString?.trim().orEmpty()
+            if (trimmed.startsWith("orbit://open", ignoreCase = true)) {
+                postToast("Invalid session link")
+            }
             return
         }
-        val parsed = runCatching { Uri.parse(trimmed) }.getOrNull() ?: return
-        if (parsed.scheme.equals("orbit", ignoreCase = true) &&
-            parsed.host.equals("open", ignoreCase = true)
-        ) {
-            val hostParam = parsed.getQueryParameter("host")?.trim().orEmpty()
-            val agentParam = parsed.getQueryParameter("agent")?.trim().orEmpty()
-            if (hostParam.isNotEmpty() && !SAFE_DEEP_LINK_ID_REGEX.matches(hostParam)) {
-                postToast("Invalid host link")
-                return
+        when (disposition) {
+            is ExternalDeepLinkDisposition.RequireConfirmation -> {
+                _state.update { it.copy(pendingDeepLinkConfirmation = disposition.confirmation) }
             }
-            if (agentParam.isNotEmpty() && !SAFE_DEEP_LINK_ID_REGEX.matches(agentParam)) {
-                postToast("Invalid session link")
-                return
-            }
-            if (hostParam.isNotEmpty() && agentParam.isNotEmpty()) {
-                openThreadFromDeepLink(hostParam, agentParam)
-            } else if (hostParam.isNotEmpty()) {
-                openHostFromDeepLink(hostParam)
+            is ExternalDeepLinkDisposition.ImmediateNavigate -> when (val action = disposition.action) {
+                is OrbitDeepLinkAction.OpenThread -> openThreadFromDeepLink(action.hostId, action.agentId)
+                is OrbitDeepLinkAction.OpenHost -> openHostFromDeepLink(action.hostId, action.eventKind)
+                is OrbitDeepLinkAction.PairHost,
+                is OrbitDeepLinkAction.ImportDeviceLink -> Unit
             }
         }
     }
 
-    private fun openHostFromDeepLink(hostId: String) {
+    fun confirmPendingDeepLink() {
+        var confirmed: PendingDeepLinkConfirmation? = null
+        _state.update { prev ->
+            confirmed = prev.pendingDeepLinkConfirmation
+            prev.copy(pendingDeepLinkConfirmation = null)
+        }
+        val pending = confirmed ?: return
+        when (pending.kind) {
+            PendingDeepLinkKind.PAIR_HOST -> pairHost(pending.uri)
+            PendingDeepLinkKind.IMPORT_CLOUD_SYNC_DEVICE_LINK -> importCloudSyncDeviceLinkUri(pending.uri)
+        }
+    }
+
+    fun dismissPendingDeepLink() {
+        _state.update { it.copy(pendingDeepLinkConfirmation = null) }
+    }
+
+    private fun openHostFromDeepLink(hostId: String, kind: dev.orbit.android.notifications.OrbitPushEventKind?) {
         viewModelScope.launch(Dispatchers.IO) {
             val readyCore = core ?: coreReady.await() ?: return@launch
             reloadFleetInternal()
@@ -1042,6 +1147,9 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             }
             pendingDeepLink = null
             selectHost(hostId)
+            if (kind in setOf(dev.orbit.android.notifications.OrbitPushEventKind.GOAL_FINISHED,
+                    dev.orbit.android.notifications.OrbitPushEventKind.TIMER_FIRED)) requestSheet("automations")
+            else openGlobalOverview()
             runCatching { readyCore.connectHost(hostId) }
         }
     }
@@ -1061,6 +1169,12 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             _state.update { prev ->
                 prev.copy(
                     selectedHostId = hostId,
+                    showGlobalOverview = false,
+                    hostDetail = prev.hostDetail?.takeIf { it.host.hostId == hostId },
+                    gitReview = null,
+                    terminalScreen = null,
+                    pushDevicesSnapshot = null,
+                    agentStage = null,
                     selectedAgentId = agentId,
                     isNewSessionMode = false,
                     lastError = null,
@@ -1068,8 +1182,10 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             }
             runCatching { readyCore.connectHost(hostId) }
             reloadHostDetailInternal(hostId)
+            // `reloadHostDetailInternal` already opens and loads the stage when the deep-link target matches.
+            val stillPending = pendingDeepLink == (hostId to agentId)
             val hasAgent = _state.value.hostDetail?.agents?.any { it.agentId == agentId } == true
-            if (hasAgent) {
+            if (stillPending && hasAgent) {
                 pendingDeepLink = null
                 runCatching { readyCore.openAgentTimeline(hostId, agentId) }
                 reloadStageInternal(hostId, agentId)
@@ -1135,6 +1251,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         var deepLinkMissingToast = false
         val activeDeepLink = pendingDeepLink?.takeIf { it.first == hostId }
         _state.update { prev ->
+            if (prev.selectedHostId != hostId) return@update prev
             // Remap optimistic agent IDs once daemon confirms real session ID
             val remappedAgentId = prev.selectedAgentId?.let { currentId ->
                 detail.replacedOptimisticAgents[currentId] ?: currentId
@@ -1355,52 +1472,27 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         }
     }
 
-    private fun mergeStageDelta(prevStage: FfiAgentStage?, hostId: String, agentId: String, delta: FfiAgentStageDelta): FfiAgentStage {
-        val sameStage = prevStage != null &&
-            prevStage.hostId == hostId &&
-            (prevStage.agent?.agentId ?: agentId) == agentId
-        return if (!delta.reset && sameStage && delta.replaceFromTurnIndex.toInt() <= prevStage!!.turns.size) {
-            val prefixCount = delta.replaceFromTurnIndex.toInt()
-            val mergedTurns = prevStage.turns.take(prefixCount) + delta.changedTurns
-            FfiAgentStage(
-                revision = delta.revision,
-                hostId = delta.hostId,
-                agent = delta.agent ?: prevStage.agent,
-                turns = mergedTurns,
-                pendingPermissions = delta.pendingPermissions,
-                pendingQuestions = delta.pendingQuestions,
-                sessionTurnDiffs = delta.sessionTurnDiffs,
-                insights = delta.insights,
-                latestSeq = delta.latestSeq,
-            )
-        } else {
-            FfiAgentStage(
-                revision = delta.revision,
-                hostId = delta.hostId,
-                agent = delta.agent,
-                turns = delta.changedTurns,
-                pendingPermissions = delta.pendingPermissions,
-                pendingQuestions = delta.pendingQuestions,
-                sessionTurnDiffs = delta.sessionTurnDiffs,
-                insights = delta.insights,
-                latestSeq = delta.latestSeq,
-            )
-        }
-    }
-
     private fun reloadStageInternal(hostId: String, agentId: String) {
-        val prevStage = _state.value.agentStage
+        val prevState = _state.value
+        val prevStage = prevState.agentStage
         val sameStage = prevStage != null &&
             prevStage.hostId == hostId &&
-            (prevStage.agent?.agentId ?: _state.value.selectedAgentId) == agentId
+            (prevStage.agent?.agentId ?: prevState.selectedAgentId) == agentId
         val sinceRev = if (sameStage) prevStage!!.revision else 0uL
-        var delta = runCatching { core?.agentStageDelta(hostId, agentId, sinceRev) }.getOrNull() ?: return
+        val sinceAuxRev = if (sameStage && prevState.stageAuxRevision > 0uL) prevState.stageAuxRevision else null
+        var delta = runCatching {
+            core?.agentStageDeltaWithAux(hostId, agentId, sinceRev, sinceAuxRev)
+        }.getOrNull() ?: return
         if (!delta.reset && sinceRev > 0uL && prevStage != null && delta.replaceFromTurnIndex.toInt() > prevStage.turns.size) {
-            delta = runCatching { core?.agentStageDelta(hostId, agentId, 0uL) }.getOrNull() ?: delta
+            delta = runCatching { core?.agentStageDeltaWithAux(hostId, agentId, 0uL, null) }.getOrNull() ?: delta
         }
-        val stage = mergeStageDelta(prevStage, hostId, agentId, delta)
+        val merged = StageDeltaReducer.merge(prevStage, hostId, agentId, delta)
+        val stage = merged.stage
 
         _state.update { prev ->
+            if (prev.selectedHostId != hostId || prev.selectedAgentId != agentId || prev.isNewSessionMode) return@update prev
+            if (prev.agentStage?.hostId == hostId && prev.agentStage.agent?.agentId == agentId &&
+                prev.agentStage.revision > stage.revision) return@update prev
             val ag = stage.agent
             val nextComposer = if (ag != null) {
                 prev.composer.copy(
@@ -1415,6 +1507,10 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             }
             prev.copy(
                 agentStage = stage,
+                stageHasOlderTurns = merged.hasOlderTurns,
+                stageOldestLoadedSeq = merged.oldestLoadedSeq,
+                stageAuxRevision = merged.auxRevision,
+                isLoadingOlderTurns = prev.isLoadingOlderTurns && merged.hasOlderTurns && merged.oldestLoadedSeq == prev.stageOldestLoadedSeq,
                 activeCwd = ag?.cwd ?: prev.activeCwd,
                 composer = nextComposer,
             )
@@ -1455,6 +1551,10 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 isNewSessionMode = false,
                 agentStage = null,
                 gitReview = null,
+                hostDetail = null,
+                workspaceFiles = emptyList(),
+                pushDevicesSnapshot = null,
+                activeCwd = "~",
                 terminalScreen = null,
                 lastError = null,
             )
@@ -1564,6 +1664,10 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     fun pairHost(uri: String, onSuccess: (() -> Unit)? = null) {
         val trimmed = uri.trim()
         if (trimmed.isEmpty()) return
+        if (trimmed.startsWith("orbit://sync-login", ignoreCase = true)) {
+            importCloudSyncDeviceLinkUri(trimmed, onSuccess)
+            return
+        }
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val readyCore = core ?: coreReady.await()
@@ -1575,6 +1679,9 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 _state.update { it.copy(lastError = null) }
                 reloadFleetInternal()
                 selectHost(card.hostId)
+                OrbitFirebaseMessagingBridge.loadPersistedToken(getApplication())?.let { token ->
+                    registerPushToken(OrbitFirebaseMessagingBridge.PLATFORM_ANDROID_FCM, token)
+                }
                 postToast("Paired ${card.displayName}")
                 onSuccess?.let { viewModelScope.launch(Dispatchers.Main) { it() } }
             } catch (t: Throwable) {
@@ -1651,39 +1758,63 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         pendingDeepLink = null
         val nextCwd = cwd?.trim()?.takeIf { it.isNotBlank() } ?: _state.value.activeCwd
         prefs.edit().putString(KEY_LAST_CWD, nextCwd).apply()
+        val prevSnapshot = _state.value
+        val targetProvider = provider ?: prevSnapshot.composer.provider
+        val saved = draftSelectionsByProvider[targetProvider]
+        val desiredModel = if (hasUserCustomizedDraftModel && prevSnapshot.composer.provider == targetProvider) {
+            prevSnapshot.composer.model
+        } else {
+            saved?.first
+        }
+        val desiredEffort = if (hasUserCustomizedDraftModel && prevSnapshot.composer.provider == targetProvider) {
+            prevSnapshot.composer.effort
+        } else {
+            saved?.second
+        }
+        val selectionGen = modelSelectionGeneration.incrementAndGet()
         _state.update { prev ->
-            val targetProvider = provider ?: prev.composer.provider
-            val saved = draftSelectionsByProvider[targetProvider]
-            val (nextModel, nextEffort) = syncDefaultModelAndEffort(
-                detail = prev.hostDetail,
-                provider = targetProvider,
-                desiredModel = if (hasUserCustomizedDraftModel && prev.composer.provider == targetProvider) {
-                    prev.composer.model
-                } else {
-                    saved?.first
-                },
-                desiredEffort = if (hasUserCustomizedDraftModel && prev.composer.provider == targetProvider) {
-                    prev.composer.effort
-                } else {
-                    saved?.second
-                },
-            )
             val nextComposer = prev.composer.copy(
                 provider = targetProvider,
-                model = nextModel,
-                effort = nextEffort,
+                model = desiredModel,
+                effort = desiredEffort,
             )
             prev.copy(
                 selectedAgentId = null,
                 isNewSessionMode = true,
+                showGlobalOverview = false,
                 agentStage = null,
+                stageHasOlderTurns = false,
+                stageOldestLoadedSeq = 0uL,
+                stageAuxRevision = 0uL,
                 activeCwd = nextCwd,
                 composer = nextComposer,
                 lastError = null,
             )
         }
-        val hostId = _state.value.selectedHostId ?: return
+        val hostId = _state.value.selectedHostId
         viewModelScope.launch(Dispatchers.IO) {
+            val (resolvedModel, resolvedEffort) = syncDefaultModelAndEffort(
+                detail = _state.value.hostDetail,
+                provider = targetProvider,
+                desiredModel = desiredModel,
+                desiredEffort = desiredEffort,
+            )
+            if (modelSelectionGeneration.get() == selectionGen) {
+                draftSelectionsByProvider[targetProvider] = resolvedModel to resolvedEffort
+                _state.update { prev ->
+                    if (!prev.isNewSessionMode || prev.composer.provider != targetProvider) {
+                        prev
+                    } else {
+                        prev.copy(
+                            composer = prev.composer.copy(
+                                model = resolvedModel,
+                                effort = resolvedEffort,
+                            )
+                        )
+                    }
+                }
+            }
+            if (hostId == null) return@launch
             runCatching { core?.fetchWorkspaceFiles(hostId, nextCwd) }
             runCatching { core?.fetchGitStatus(hostId, nextCwd) }
             runCatching { core?.fetchGitDiff(hostId, nextCwd, null, _state.value.gitStagedMode) }
@@ -1736,6 +1867,12 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             prev.copy(
                 selectedAgentId = agentId,
                 isNewSessionMode = false,
+                showGlobalOverview = false,
+                agentStage = prev.agentStage?.takeIf { it.hostId == hostId && it.agent?.agentId == agentId },
+                isLoadingOlderTurns = false,
+                stageHasOlderTurns = false,
+                stageOldestLoadedSeq = 0uL,
+                stageAuxRevision = 0uL,
                 lastError = null,
             )
         }
@@ -1817,7 +1954,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { core?.fetchWorkspaceFiles(hostId, cur.activeCwd) }
             val files = runCatching { core?.workspaceFiles(hostId, cur.activeCwd) }.getOrNull().orEmpty()
-            _state.update { it.copy(workspaceFiles = files) }
+            _state.update { if (it.selectedHostId == hostId && it.activeCwd == cur.activeCwd) it.copy(workspaceFiles = files) else it }
         }
     }
 
@@ -1875,20 +2012,15 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         return resolvedModel to resolvedEffort
     }
 
+    private val modelSelectionGeneration = AtomicLong(0L)
+
     fun switchDraftProvider(provider: FfiProviderKind) {
         val prev = _state.value
         draftSelectionsByProvider[prev.composer.provider] =
             prev.composer.model to prev.composer.effort
         hasUserCustomizedDraftModel = true
         val saved = draftSelectionsByProvider[provider]
-        val (nextModel, nextEffort) = syncDefaultModelAndEffort(
-            detail = prev.hostDetail,
-            provider = provider,
-            desiredModel = saved?.first,
-            desiredEffort = saved?.second,
-        )
-        draftSelectionsByProvider[provider] = nextModel to nextEffort
-        selectProviderModelAndEffort(provider, nextModel, nextEffort)
+        selectProviderModelAndEffort(provider, saved?.first, saved?.second)
     }
 
     fun selectEffort(effort: FfiReasoningEffort) {
@@ -1902,46 +2034,49 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         effort: FfiReasoningEffort?,
     ) {
         val prev = _state.value
-        val resolvedFromCore = resolvedModelSelection(
-            hostId = prev.selectedHostId,
-            provider = provider,
-            desiredModel = model,
-            desiredEffort = effort,
-        )
-        val resolvedModel: String?
-        val resolvedEffort: FfiReasoningEffort?
-        if (resolvedFromCore != null) {
-            resolvedModel = resolvedFromCore.selectedModelId
-            resolvedEffort = resolvedFromCore.selectedEffort
-        } else {
-            val catalog = OrbitFormatters.catalogFor(prev.hostDetail, provider)
-            val spec = catalog.models.firstOrNull { it.id == model }
-                ?: catalog.models.firstOrNull { it.isDefault }
-                ?: catalog.models.firstOrNull()
-            resolvedModel = model
-            resolvedEffort = OrbitFormatters.resolveEffort(spec, effort, catalog.configuredDefaultEffort)
-        }
-        if (prev.isNewSessionMode || prev.selectedAgentId == null) {
+        val gen = modelSelectionGeneration.incrementAndGet()
+        val isDraft = prev.isNewSessionMode || prev.selectedAgentId == null
+        if (isDraft) {
             hasUserCustomizedDraftModel = true
-            draftSelectionsByProvider[provider] = resolvedModel to resolvedEffort
+            draftSelectionsByProvider[provider] = model to effort
         }
 
         _state.update {
             it.copy(
                 composer = it.composer.copy(
                     provider = provider,
-                    model = resolvedModel,
-                    effort = resolvedEffort,
+                    model = model,
+                    effort = effort,
                 )
             )
         }
 
-        val hostId = prev.selectedHostId ?: return
-        val agentId = prev.selectedAgentId ?: return
-        if (prev.isNewSessionMode) return
+        val hostId = prev.selectedHostId
+        val agentId = prev.selectedAgentId
+        val activeProvider = prev.activeAgent?.provider
+        val detailSnapshot = prev.hostDetail
 
         viewModelScope.launch(Dispatchers.IO) {
-            val activeProvider = prev.activeAgent?.provider
+            val (resolvedModel, resolvedEffort) = syncDefaultModelAndEffort(
+                detail = detailSnapshot,
+                provider = provider,
+                desiredModel = model,
+                desiredEffort = effort,
+            )
+            if (modelSelectionGeneration.get() != gen) return@launch
+            if (isDraft) {
+                draftSelectionsByProvider[provider] = resolvedModel to resolvedEffort
+            }
+            _state.update {
+                it.copy(
+                    composer = it.composer.copy(
+                        provider = provider,
+                        model = resolvedModel,
+                        effort = resolvedEffort,
+                    )
+                )
+            }
+            if (hostId == null || agentId == null || prev.isNewSessionMode) return@launch
             if (activeProvider != null && activeProvider != provider) {
                 runCatching { core?.switchAgentProvider(hostId, agentId, provider, resolvedModel, resolvedEffort, null) }
             } else {
@@ -2084,26 +2219,31 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun filterSlashCommands(query: String): List<FfiSlashCommand> {
+    suspend fun filterSlashCommands(query: String): List<FfiSlashCommand> {
         val q = query.trim()
         if (q.isEmpty()) return _state.value.slashCommands
-        return runCatching { core?.slashCommands(FfiClientPlatform.ANDROID, q) }.getOrNull()
-            ?: _state.value.slashCommands
+        return withContext(Dispatchers.IO) {
+            runCatching { core?.slashCommands(FfiClientPlatform.ANDROID, q) }.getOrNull()
+                ?: _state.value.slashCommands
+        }
     }
 
-    fun rankMentionCandidates(query: String, limit: UInt = 11u): List<FfiMentionCandidate> {
+    suspend fun rankMentionCandidates(query: String, limit: UInt = 11u): List<FfiMentionCandidate> {
         val cur = _state.value
         val hostId = cur.selectedHostId ?: return emptyList()
-        return runCatching {
-            core?.rankMentionCandidates(
-                FfiMentionRankRequest(
-                    hostId = hostId,
-                    cwd = cur.activeCwd,
-                    query = query,
-                    limit = limit,
+        val cwd = cur.activeCwd
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                core?.rankMentionCandidates(
+                    FfiMentionRankRequest(
+                        hostId = hostId,
+                        cwd = cwd,
+                        query = query,
+                        limit = limit,
+                    )
                 )
-            )
-        }.getOrNull().orEmpty()
+            }.getOrNull().orEmpty()
+        }
     }
 
     fun executeSlashCommand(
@@ -2172,26 +2312,26 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             postToast("Start an active session first to compact context")
             return
         }
-        val composed = composePromptViaCore(
-            hostId = hostId,
-            activeCwd = cur.activeCwd,
-            provider = cur.activeAgent?.provider ?: cur.composer.provider,
-            gitReview = cur.gitReview,
-            gitStagedMode = cur.gitStagedMode,
-            terminalScreen = cur.terminalScreen,
-            text = extraFocus.trim(),
-            mentionedFiles = emptyList(),
-            stagedAttachments = emptyList(),
-            inlineMentions = emptyList(),
-            includeGitDiff = false,
-            includeStagedDiff = false,
-            includeTerminal = false,
-            activeSlashCommand = "/compact",
-            quotedSnippets = emptyList(),
-        ) ?: return
-        runningAgentKeys.add(agentQueueKey(hostId, agentId))
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                val composed = composePromptViaCore(
+                    hostId = hostId,
+                    activeCwd = cur.activeCwd,
+                    provider = cur.activeAgent?.provider ?: cur.composer.provider,
+                    gitReview = cur.gitReview,
+                    gitStagedMode = cur.gitStagedMode,
+                    terminalScreen = cur.terminalScreen,
+                    text = extraFocus.trim(),
+                    mentionedFiles = emptyList(),
+                    stagedAttachments = emptyList(),
+                    inlineMentions = emptyList(),
+                    includeGitDiff = false,
+                    includeStagedDiff = false,
+                    includeTerminal = false,
+                    activeSlashCommand = "/compact",
+                    quotedSnippets = emptyList(),
+                ) ?: return@launch
+                runningAgentKeys.add(agentQueueKey(hostId, agentId))
                 core?.sendPromptWithMeta(
                     hostId = hostId,
                     agentId = agentId,
@@ -2472,130 +2612,158 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         }.getOrNull()
     }
 
+    private val isDispatchingPrompt = AtomicBoolean(false)
+
+    private fun clearSubmittedDraftIfUnchanged(
+        draft: ComposerDraftState,
+        clearAttachments: Boolean,
+        toast: String? = null,
+    ) {
+        _state.update { prev ->
+            val nextComposer = if (prev.composer.text == draft.text && prev.composer.activeSlashCommand == draft.activeSlashCommand) {
+                if (clearAttachments) {
+                    prev.composer.copy(
+                        text = "",
+                        mentionedFiles = emptyList(),
+                        stagedAttachments = emptyList(),
+                        inlineMentions = emptyList(),
+                        includeGitDiff = false,
+                        includeStagedDiff = false,
+                        includeTerminal = false,
+                        activeSlashCommand = null,
+                        quotedSnippets = emptyList(),
+                    )
+                } else {
+                    prev.composer.copy(text = "", activeSlashCommand = null)
+                }
+            } else {
+                prev.composer
+            }
+            if (toast != null) prev.copy(composer = nextComposer, toastMessage = toast)
+            else prev.copy(composer = nextComposer)
+        }
+    }
+
     fun enqueueComposerPrompt() {
         val cur = _state.value
         val hostId = cur.selectedHostId ?: return
         val draft = cur.composer
         if (!draft.canSend) return
-
-        val preview = composePromptViaCore(
-            hostId = hostId,
-            activeCwd = cur.activeCwd,
-            provider = cur.activeAgent?.provider ?: draft.provider,
-            gitReview = cur.gitReview,
-            gitStagedMode = cur.gitStagedMode,
-            terminalScreen = cur.terminalScreen,
-            text = draft.text,
-            mentionedFiles = draft.mentionedFiles,
-            stagedAttachments = draft.stagedAttachments,
-            inlineMentions = draft.inlineMentions,
-            includeGitDiff = draft.includeGitDiff,
-            includeStagedDiff = draft.includeStagedDiff,
-            includeTerminal = draft.includeTerminal,
-            activeSlashCommand = draft.activeSlashCommand,
-            quotedSnippets = draft.quotedSnippets,
-        ) ?: return
-        if (preview.isEmpty) return
-        if (preview.isBtw) {
-            _state.update { prev ->
-                prev.copy(composer = prev.composer.copy(text = "", activeSlashCommand = null))
-            }
-            requestSheet("btw")
-            preview.btwQuestion?.trim()?.takeIf { it.isNotEmpty() }?.let { submitSideQuestion(it) }
-            return
-        }
-        preview.fastModeAction?.let { action ->
-            _state.update { prev ->
-                prev.copy(composer = prev.composer.copy(text = "", activeSlashCommand = null))
-            }
-            when (action) {
-                FfiFastModeSlashAction.TOGGLE -> toggleFastMode()
-                FfiFastModeSlashAction.ENABLE -> setFastMode(true)
-                FfiFastModeSlashAction.DISABLE -> setFastMode(false)
-            }
-            return
-        }
-        if (preview.isFork) {
-            _state.update { prev ->
-                prev.copy(composer = prev.composer.copy(text = "", activeSlashCommand = null))
-            }
-            forkActiveAgent(
-                worktree = preview.forkWorktree,
-                branch = preview.forkBranch,
-                title = null,
-                initialPrompt = preview.forkPrompt,
-            )
-            return
-        }
-        if (preview.isCompact) {
-            _state.update { prev ->
-                prev.copy(
-                    composer = prev.composer.copy(
-                        text = "",
-                        activeSlashCommand = null,
-                    )
-                )
-            }
-            submitSlashCompact(preview.displayPrompt)
-            return
-        }
-
         val agentId = cur.selectedAgentId?.takeIf { !cur.isNewSessionMode } ?: run {
             submitComposerPrompt()
             return
         }
+        if (!isDispatchingPrompt.compareAndSet(false, true)) return
 
-        val item = QueuedPromptItem(
-            text = draft.text,
-            previewText = preview.displayPrompt.lineSequence().firstOrNull()?.trim().orEmpty()
-                .ifBlank { preview.badges.joinToString(" ") { it.label } },
-            mentionedFiles = draft.mentionedFiles,
-            stagedAttachments = draft.stagedAttachments,
-            inlineMentions = draft.inlineMentions,
-            includeGitDiff = draft.includeGitDiff,
-            includeStagedDiff = draft.includeStagedDiff,
-            includeTerminal = draft.includeTerminal,
-            activeSlashCommand = draft.activeSlashCommand,
-            quotedSnippets = draft.quotedSnippets,
-        )
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val preview = composePromptViaCore(
+                    hostId = hostId,
+                    activeCwd = cur.activeCwd,
+                    provider = cur.activeAgent?.provider ?: draft.provider,
+                    gitReview = cur.gitReview,
+                    gitStagedMode = cur.gitStagedMode,
+                    terminalScreen = cur.terminalScreen,
+                    text = draft.text,
+                    mentionedFiles = draft.mentionedFiles,
+                    stagedAttachments = draft.stagedAttachments,
+                    inlineMentions = draft.inlineMentions,
+                    includeGitDiff = draft.includeGitDiff,
+                    includeStagedDiff = draft.includeStagedDiff,
+                    includeTerminal = draft.includeTerminal,
+                    activeSlashCommand = draft.activeSlashCommand,
+                    quotedSnippets = draft.quotedSnippets,
+                ) ?: return@launch
+                if (preview.isEmpty) return@launch
+                if (preview.isBtw) {
+                    clearSubmittedDraftIfUnchanged(draft, clearAttachments = false)
+                    requestSheet("btw")
+                    preview.btwQuestion?.trim()?.takeIf { it.isNotEmpty() }?.let { submitSideQuestion(it) }
+                    return@launch
+                }
+                preview.fastModeAction?.let { action ->
+                    clearSubmittedDraftIfUnchanged(draft, clearAttachments = false)
+                    when (action) {
+                        FfiFastModeSlashAction.TOGGLE -> toggleFastMode()
+                        FfiFastModeSlashAction.ENABLE -> setFastMode(true)
+                        FfiFastModeSlashAction.DISABLE -> setFastMode(false)
+                    }
+                    return@launch
+                }
+                if (preview.isFork) {
+                    clearSubmittedDraftIfUnchanged(draft, clearAttachments = false)
+                    forkActiveAgent(
+                        worktree = preview.forkWorktree,
+                        branch = preview.forkBranch,
+                        title = null,
+                        initialPrompt = preview.forkPrompt,
+                    )
+                    return@launch
+                }
+                if (preview.isCompact) {
+                    clearSubmittedDraftIfUnchanged(draft, clearAttachments = false)
+                    submitSlashCompact(preview.displayPrompt)
+                    return@launch
+                }
 
-        val key = agentQueueKey(hostId, agentId)
-        val useServerQueue = cur.selectedHost?.supportsServerQueue == true
-        if (!useServerQueue) {
-            runningAgentKeys.add(key)
-        }
+                val item = QueuedPromptItem(
+                    text = draft.text,
+                    previewText = preview.displayPrompt.lineSequence().firstOrNull()?.trim().orEmpty()
+                        .ifBlank { preview.badges.joinToString(" ") { it.label } },
+                    mentionedFiles = draft.mentionedFiles,
+                    stagedAttachments = draft.stagedAttachments,
+                    inlineMentions = draft.inlineMentions,
+                    includeGitDiff = draft.includeGitDiff,
+                    includeStagedDiff = draft.includeStagedDiff,
+                    includeTerminal = draft.includeTerminal,
+                    activeSlashCommand = draft.activeSlashCommand,
+                    quotedSnippets = draft.quotedSnippets,
+                )
 
-        _state.update { prev ->
-            val updatedList = prev.queuedPromptsByAgent[key].orEmpty() + item
-            prev.copy(
-                queuedPromptsByAgent = prev.queuedPromptsByAgent + (key to updatedList),
-                composer = prev.composer.copy(
-                    text = "",
-                    mentionedFiles = emptyList(),
-                    stagedAttachments = emptyList(),
-                    inlineMentions = emptyList(),
-                    includeGitDiff = false,
-                    includeStagedDiff = false,
-                    includeTerminal = false,
-                    activeSlashCommand = null,
-                    quotedSnippets = emptyList(),
-                ),
-                toastMessage = "Queued next prompt",
-            )
-        }
+                val key = agentQueueKey(hostId, agentId)
+                val useServerQueue = cur.selectedHost?.supportsServerQueue == true
+                if (!useServerQueue) {
+                    runningAgentKeys.add(key)
+                }
 
-        if (useServerQueue) {
-            viewModelScope.launch(Dispatchers.IO) {
-                runCatching {
-                    core?.enqueuePrompt(
-                        hostId = hostId,
-                        agentId = agentId,
-                        prompt = preview.wirePrompt,
-                        displayPrompt = preview.displayPrompt,
-                        badges = preview.badges,
-                        queueId = item.id,
+                _state.update { prev ->
+                    val updatedList = prev.queuedPromptsByAgent[key].orEmpty() + item
+                    val nextComposer = if (prev.composer.text == draft.text && prev.composer.activeSlashCommand == draft.activeSlashCommand) {
+                        prev.composer.copy(
+                            text = "",
+                            mentionedFiles = emptyList(),
+                            stagedAttachments = emptyList(),
+                            inlineMentions = emptyList(),
+                            includeGitDiff = false,
+                            includeStagedDiff = false,
+                            includeTerminal = false,
+                            activeSlashCommand = null,
+                            quotedSnippets = emptyList(),
+                        )
+                    } else {
+                        prev.composer
+                    }
+                    prev.copy(
+                        queuedPromptsByAgent = prev.queuedPromptsByAgent + (key to updatedList),
+                        composer = nextComposer,
+                        toastMessage = "Queued next prompt",
                     )
                 }
+
+                if (useServerQueue) {
+                    runCatching {
+                        core?.enqueuePrompt(
+                            hostId = hostId,
+                            agentId = agentId,
+                            prompt = preview.wirePrompt,
+                            displayPrompt = preview.displayPrompt,
+                            badges = preview.badges,
+                            queueId = item.id,
+                        )
+                    }
+                }
+            } finally {
+                isDispatchingPrompt.set(false)
             }
         }
     }
@@ -2767,103 +2935,15 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         val hostId = cur.selectedHostId ?: return
         val draft = cur.composer
         if (!draft.canSend) return
-
-        val preview = composePromptViaCore(
-            hostId = hostId,
-            activeCwd = cur.activeCwd,
-            provider = cur.activeAgent?.provider ?: draft.provider,
-            gitReview = cur.gitReview,
-            gitStagedMode = cur.gitStagedMode,
-            terminalScreen = cur.terminalScreen,
-            text = draft.text,
-            mentionedFiles = draft.mentionedFiles,
-            stagedAttachments = draft.stagedAttachments,
-            inlineMentions = draft.inlineMentions,
-            includeGitDiff = draft.includeGitDiff,
-            includeStagedDiff = draft.includeStagedDiff,
-            includeTerminal = draft.includeTerminal,
-            activeSlashCommand = draft.activeSlashCommand,
-            quotedSnippets = draft.quotedSnippets,
-        ) ?: return
-        if (preview.isEmpty) return
-        if (preview.isBtw) {
-            _state.update { prev ->
-                prev.copy(composer = prev.composer.copy(text = "", activeSlashCommand = null))
-            }
-            requestSheet("btw")
-            preview.btwQuestion?.trim()?.takeIf { it.isNotEmpty() }?.let { submitSideQuestion(it) }
-            return
-        }
-        preview.fastModeAction?.let { action ->
-            _state.update { prev ->
-                prev.copy(composer = prev.composer.copy(text = "", activeSlashCommand = null))
-            }
-            when (action) {
-                FfiFastModeSlashAction.TOGGLE -> toggleFastMode()
-                FfiFastModeSlashAction.ENABLE -> setFastMode(true)
-                FfiFastModeSlashAction.DISABLE -> setFastMode(false)
-            }
-            return
-        }
-        if (preview.isFork) {
-            _state.update { prev ->
-                prev.copy(composer = prev.composer.copy(text = "", activeSlashCommand = null))
-            }
-            forkActiveAgent(
-                worktree = preview.forkWorktree,
-                branch = preview.forkBranch,
-                title = null,
-                initialPrompt = preview.forkPrompt,
-            )
-            return
-        }
-        if (preview.isCompact) {
-            _state.update { prev ->
-                prev.copy(
-                    composer = prev.composer.copy(
-                        text = "",
-                        activeSlashCommand = null,
-                    )
-                )
-            }
-            submitSlashCompact(preview.displayPrompt)
-            return
-        }
-
-        // Clear composer text & transient attachments immediately for responsive feel
-        _state.update { prev ->
-            prev.copy(
-                composer = prev.composer.copy(
-                    text = "",
-                    mentionedFiles = emptyList(),
-                    stagedAttachments = emptyList(),
-                    inlineMentions = emptyList(),
-                    includeGitDiff = false,
-                    includeStagedDiff = false,
-                    includeTerminal = false,
-                    activeSlashCommand = null,
-                    quotedSnippets = emptyList(),
-                )
-            )
-        }
+        if (!isDispatchingPrompt.compareAndSet(false, true)) return
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val needsGitDiff = draft.activeSlashCommand.equals("/review", ignoreCase = true) ||
-                    draft.text.trim().lowercase().startsWith("/review") ||
-                    draft.includeGitDiff || draft.includeStagedDiff ||
-                    draft.inlineMentions.any { it.kind == "git_diff" && draft.text.contains(it.token) }
-                var effectiveReview = cur.gitReview
-                if (needsGitDiff && (effectiveReview == null || !OrbitFormatters.pathsEquivalent(effectiveReview.cwd, cur.activeCwd))) {
-                    runCatching { core?.fetchGitStatus(hostId, cur.activeCwd) }
-                    runCatching { core?.fetchGitDiff(hostId, cur.activeCwd, null, draft.includeStagedDiff || cur.gitStagedMode) }
-                    effectiveReview = runCatching { core?.gitReview(hostId, cur.activeCwd, null) }.getOrNull() ?: effectiveReview
-                }
-                val composed = composePromptViaCore(
+                val preview = composePromptViaCore(
                     hostId = hostId,
                     activeCwd = cur.activeCwd,
                     provider = cur.activeAgent?.provider ?: draft.provider,
-                    gitReview = effectiveReview,
+                    gitReview = cur.gitReview,
                     gitStagedMode = cur.gitStagedMode,
                     terminalScreen = cur.terminalScreen,
                     text = draft.text,
@@ -2876,6 +2956,70 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                     activeSlashCommand = draft.activeSlashCommand,
                     quotedSnippets = draft.quotedSnippets,
                 ) ?: return@launch
+                if (preview.isEmpty) return@launch
+                if (preview.isBtw) {
+                    clearSubmittedDraftIfUnchanged(draft, clearAttachments = false)
+                    requestSheet("btw")
+                    preview.btwQuestion?.trim()?.takeIf { it.isNotEmpty() }?.let { submitSideQuestion(it) }
+                    return@launch
+                }
+                preview.fastModeAction?.let { action ->
+                    clearSubmittedDraftIfUnchanged(draft, clearAttachments = false)
+                    when (action) {
+                        FfiFastModeSlashAction.TOGGLE -> toggleFastMode()
+                        FfiFastModeSlashAction.ENABLE -> setFastMode(true)
+                        FfiFastModeSlashAction.DISABLE -> setFastMode(false)
+                    }
+                    return@launch
+                }
+                if (preview.isFork) {
+                    clearSubmittedDraftIfUnchanged(draft, clearAttachments = false)
+                    forkActiveAgent(
+                        worktree = preview.forkWorktree,
+                        branch = preview.forkBranch,
+                        title = null,
+                        initialPrompt = preview.forkPrompt,
+                    )
+                    return@launch
+                }
+                if (preview.isCompact) {
+                    clearSubmittedDraftIfUnchanged(draft, clearAttachments = false)
+                    submitSlashCompact(preview.displayPrompt)
+                    return@launch
+                }
+
+                // Clear composer text & transient attachments before network dispatch
+                clearSubmittedDraftIfUnchanged(draft, clearAttachments = true)
+
+                val needsGitDiff = draft.activeSlashCommand.equals("/review", ignoreCase = true) ||
+                    draft.text.trim().lowercase().startsWith("/review") ||
+                    draft.includeGitDiff || draft.includeStagedDiff ||
+                    draft.inlineMentions.any { it.kind == "git_diff" && draft.text.contains(it.token) }
+                var effectiveReview = cur.gitReview
+                val composed = if (needsGitDiff && (effectiveReview == null || !OrbitFormatters.pathsEquivalent(effectiveReview.cwd, cur.activeCwd))) {
+                    runCatching { core?.fetchGitStatus(hostId, cur.activeCwd) }
+                    runCatching { core?.fetchGitDiff(hostId, cur.activeCwd, null, draft.includeStagedDiff || cur.gitStagedMode) }
+                    effectiveReview = runCatching { core?.gitReview(hostId, cur.activeCwd, null) }.getOrNull() ?: effectiveReview
+                    composePromptViaCore(
+                        hostId = hostId,
+                        activeCwd = cur.activeCwd,
+                        provider = cur.activeAgent?.provider ?: draft.provider,
+                        gitReview = effectiveReview,
+                        gitStagedMode = cur.gitStagedMode,
+                        terminalScreen = cur.terminalScreen,
+                        text = draft.text,
+                        mentionedFiles = draft.mentionedFiles,
+                        stagedAttachments = draft.stagedAttachments,
+                        inlineMentions = draft.inlineMentions,
+                        includeGitDiff = draft.includeGitDiff,
+                        includeStagedDiff = draft.includeStagedDiff,
+                        includeTerminal = draft.includeTerminal,
+                        activeSlashCommand = draft.activeSlashCommand,
+                        quotedSnippets = draft.quotedSnippets,
+                    ) ?: preview
+                } else {
+                    preview
+                }
 
                 val targetAgentId = cur.selectedAgentId?.takeIf { !cur.isNewSessionMode }
                 if (targetAgentId == null) {
@@ -2922,6 +3066,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 }
             } catch (t: Throwable) {
                 _state.update { it.copy(lastError = extractErrorMessage(t, "Failed to send prompt")) }
+            } finally {
+                isDispatchingPrompt.set(false)
             }
         }
     }
@@ -2977,11 +3123,28 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun describeStep(item: FfiTimelineItem): FfiToolStepDescriptor? {
+    private val stepDescriptorCache = LruCache<String, FfiToolStepDescriptor>(256)
+
+    suspend fun describeStep(item: FfiTimelineItem): FfiToolStepDescriptor? {
         if (item is FfiTimelineItem.ToolCall && item.stepDescriptor != null) {
             return item.stepDescriptor
         }
-        return runCatching { core?.describeToolItem(item, _state.value.activeCwd) }.getOrNull()
+        val cwd = _state.value.activeCwd
+        val cacheKey = if (item is FfiTimelineItem.ToolCall) {
+            "$cwd::${item.callId}::${item.seq}::${item.status.name}"
+        } else {
+            null
+        }
+        if (cacheKey != null) {
+            stepDescriptorCache.get(cacheKey)?.let { return it }
+        }
+        val described = withContext(Dispatchers.IO) {
+            runCatching { core?.describeToolItem(item, cwd) }.getOrNull()
+        }
+        if (cacheKey != null && described != null) {
+            stepDescriptorCache.put(cacheKey, described)
+        }
+        return described
     }
 
     // --- Git Diff Inspector ---
@@ -2998,7 +3161,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             runCatching { core?.fetchGitDiff(hostId, cwd, null, staged) }
             val review = runCatching { core?.gitReview(hostId, cwd, null) }.getOrNull()
             if (review != null) {
-                _state.update { it.copy(gitReview = review) }
+                _state.update { if (it.selectedHostId == hostId && it.activeCwd == cwd) it.copy(gitReview = review) else it }
             }
         }
     }
@@ -3132,11 +3295,13 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun sendTerminalBytes(bytes: ByteArray, slot: UByte = 1u) {
-        val hostId = _state.value.selectedHostId ?: return
+    fun sendTerminalBytes(bytes: ByteArray) {
+        val current = _state.value
+        val hostId = current.selectedHostId ?: return
+        val slot: UByte = current.hostDetail?.takeIf { it.host.hostId == hostId }?.activeTerminalSlot?.coerceAtLeast(1u) ?: 1u
         if (bytes.isEmpty()) return
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { core?.sendTerminalBytes(hostId, slot, bytes) }
+        if (terminalInput.trySend(Triple(hostId, slot, bytes)).isFailure) {
+            postToast(getApplication<Application>().getString(dev.orbit.android.R.string.terminal_busy))
         }
     }
 
@@ -3187,6 +3352,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             runCatching { core?.listWorkflowRuns(hostId, true) }
             reloadHostDetailIfSelected(hostId)
         }
+        refreshPermissionRulesAndGuardian()
     }
 
     fun createSchedule(
@@ -3672,6 +3838,10 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     }
 
     fun exportActiveTranscriptMarkdown() {
+        exportActiveTranscript(FfiExportFormat.MARKDOWN)
+    }
+
+    fun exportActiveTranscript(format: FfiExportFormat) {
         val cur = _state.value
         val hostId = cur.selectedHostId ?: return
         val agentId = cur.selectedAgentId?.takeIf { !cur.isNewSessionMode } ?: run {
@@ -3686,14 +3856,13 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                     hostId = hostId,
                     agentId = agentId,
                     options = FfiExportOptions(
-                        format = FfiExportFormat.MARKDOWN,
+                        format = format,
                         includeThinking = false,
                         includeToolCalls = true,
                         includeTimestamps = true,
                     ),
                 )
                 val exportDir = File(app.cacheDir, "orbit_exports").apply { mkdirs() }
-                // Prune stale export artifacts so cacheDir does not grow unbounded.
                 val nowMs = System.currentTimeMillis()
                 exportDir.listFiles()
                     ?.sortedByDescending { it.lastModified() }
@@ -3703,15 +3872,20 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                         }
                     }
 
+                val ext = when (format) {
+                    FfiExportFormat.MARKDOWN -> "md"
+                    FfiExportFormat.JSON -> "json"
+                    FfiExportFormat.HTML -> "html"
+                }
                 val sanitizedStem = exported.suggestedFilename
                     .substringAfterLast('/')
                     .substringAfterLast('\\')
                     .replace(Regex("[^A-Za-z0-9._-]"), "_")
                     .trimStart('.')
-                    .removeSuffix(".md")
+                    .removeSuffix(".$ext")
                     .ifBlank { "orbit_transcript" }
                     .take(80)
-                val safeName = "$sanitizedStem.md"
+                val safeName = "$sanitizedStem.$ext"
                 val outFile = File(exportDir, safeName)
                 require(outFile.canonicalFile.parentFile == exportDir.canonicalFile) {
                     "Refused unsafe export path"
@@ -3722,8 +3896,13 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                     "${app.packageName}.fileprovider",
                     outFile,
                 )
+                val fallbackMime = when (format) {
+                    FfiExportFormat.MARKDOWN -> "text/markdown"
+                    FfiExportFormat.JSON -> "application/json"
+                    FfiExportFormat.HTML -> "text/html"
+                }
                 val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                    type = exported.mimeType.ifBlank { "text/markdown" }
+                    type = exported.mimeType.ifBlank { fallbackMime }
                     putExtra(Intent.EXTRA_STREAM, uri)
                     putExtra(Intent.EXTRA_SUBJECT, safeName)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -3928,28 +4107,927 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         }
     }
 
-    // --- Push Notification Registration Bridge ---
+    // --- Zero-Passphrase Cloud Sync & 1-Scan Device Link QR ---
+
+    fun setCloudManualPassphraseMode(requireManual: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core?.cloudSyncSetManualPassphraseMode(requireManual) }
+                .onSuccess { st ->
+                    if (st != null) {
+                        _state.update { it.copy(cloudSyncStatus = st) }
+                    }
+                }
+                .onFailure { t ->
+                    _state.update { it.copy(cloudSyncError = extractErrorMessage(t, "Failed to update unlock mode")) }
+                }
+        }
+    }
+
+    suspend fun exportCloudSyncDeviceLinkUri(): String = withContext(Dispatchers.IO) {
+        checkNotNull(core ?: coreReady.await()).cloudSyncExportDeviceLinkUri()
+    }
+
+    fun importCloudSyncDeviceLinkUri(uri: String, onSuccess: (() -> Unit)? = null) {
+        val clean = uri.trim()
+        if (clean.isEmpty()) return
+        _state.update { it.copy(cloudSyncBusy = true, cloudSyncError = null) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val readyCore = core ?: coreReady.await() ?: throw IllegalStateException("Orbit core not ready")
+                val res = readyCore.cloudSyncImportDeviceLinkUri(clean)
+                val st = runCatching { readyCore.cloudSyncStatus() }.getOrNull()
+                _state.update {
+                    it.copy(
+                        cloudSyncStatus = st ?: it.cloudSyncStatus,
+                        cloudSyncBusy = false,
+                        cloudSyncError = null,
+                    )
+                }
+                reloadFleetInternal()
+                _state.value.selectedHostId?.let { reloadHostDetailInternal(it) }
+                postToast("Device linked · rev #${res.vaultRevision}")
+                onSuccess?.let { viewModelScope.launch(Dispatchers.Main) { it() } }
+            } catch (t: Throwable) {
+                val msg = extractErrorMessage(t, "Failed to import Device Link URI")
+                _state.update { it.copy(cloudSyncBusy = false, cloudSyncError = msg, lastError = msg) }
+            }
+        }
+    }
+
+    // --- Real Push Notification Device Registration (`registerPushDevice` UniFFI RPC) ---
+
+    private val registrationMutex = kotlinx.coroutines.sync.Mutex()
+    private val registeredHostTokens = mutableMapOf<String, String>()
 
     fun registerPushToken(platform: String, token: String) {
+        val cleanToken = token.trim()
+        if (cleanToken.isEmpty()) return
         viewModelScope.launch(Dispatchers.IO) {
             val activeCore = core ?: coreReady.await() ?: return@launch
-            runCatching { activeCore.registerPushToken(platform, token) }
-                .onSuccess { st ->
-                    _state.update { it.copy(pushRegistrationStatus = st) }
+            val app = getApplication<Application>()
+            val deviceId = OrbitRepository.getOrCreateDeviceId(app)
+            val deviceName = OrbitRepository.deviceDisplayName()
+            // Persist local push token metadata first
+            runCatching { activeCore.registerPushToken(platform, cleanToken) }
+                .onSuccess { st -> _state.update { it.copy(pushRegistrationStatus = st) } }
+            // Register across all paired hosts via canonical daemon RPC `registerPushDevice`
+            val hostIds = _state.value.hosts.map { it.hostId }
+            val req = FfiRegisterPushDeviceRequest(
+                deviceId = deviceId,
+                platform = FfiPushPlatform.FCM,
+                deviceName = deviceName,
+                deviceToken = cleanToken,
+                sandbox = BuildConfig.DEBUG,
+                liveActivityToken = null,
+            )
+            registrationMutex.withLock {
+                hostIds.forEach { hostId ->
+                    if (registeredHostTokens[hostId] != cleanToken) {
+                        runCatching { activeCore.registerPushDevice(hostId, req) }.onSuccess { snapshot ->
+                            registeredHostTokens[hostId] = cleanToken
+                            _state.update { if (it.selectedHostId == hostId) it.copy(pushDevicesSnapshot = snapshot) else it }
+                        }
+                    }
                 }
+            }
+        }
+    }
+
+    fun refreshPushDevices(hostId: String? = _state.value.selectedHostId) {
+        val targetHost = hostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val activeCore = core ?: return@launch
+            runCatching { activeCore.listPushDevices(targetHost) }
+                .onSuccess { snap -> _state.update { if (it.selectedHostId == targetHost) it.copy(pushDevicesSnapshot = snap) else it } }
+        }
+    }
+
+    fun updateHostPushPreferences(prefsUpdate: PushPreferences) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val activeCore = core ?: return@launch
+            runCatching {
+                activeCore.updatePushPreferences(
+                    hostId = hostId,
+                    req = UpdatePushPreferencesRequest(
+                        preferences = prefsUpdate,
+                        gatewayAuthToken = null,
+                        keepExistingGatewayToken = true,
+                    ),
+                )
+            }.onSuccess { snap ->
+                _state.update { it.copy(pushDevicesSnapshot = snap) }
+                postToast("Push preferences saved")
+            }.onFailure { t ->
+                postToast(extractErrorMessage(t, "Failed to save push preferences"))
+            }
+        }
+    }
+
+    fun sendTestPushNotification() {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val activeCore = core ?: return@launch
+            val deviceId = OrbitRepository.getOrCreateDeviceId(getApplication())
+            runCatching { activeCore.testPushNotification(hostId, deviceId) }
+                .onSuccess { res -> postToast(res.detail.ifBlank { "Test push sent (${res.delivered}/${res.attempted})" }) }
+                .onFailure { t -> postToast(extractErrorMessage(t, "Test push failed")) }
         }
     }
 
     fun unregisterPushToken() {
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching { core?.unregisterPushToken(OrbitFirebaseMessagingBridge.PLATFORM_ANDROID_FCM) }
+            val activeCore = core
+            val deviceId = OrbitRepository.getOrCreateDeviceId(getApplication())
+            _state.value.hosts.forEach { host ->
+                runCatching { activeCore?.unregisterPushDevice(host.hostId, deviceId) }
+            }
+            registrationMutex.withLock { registeredHostTokens.clear() }
+            runCatching { activeCore?.unregisterPushToken(OrbitFirebaseMessagingBridge.PLATFORM_ANDROID_FCM) }
             OrbitFirebaseMessagingBridge.clearToken(getApplication())
-            val st = runCatching { core?.pushRegistrationStatus() }.getOrNull()
-            _state.update { it.copy(pushRegistrationStatus = st) }
+            val st = runCatching { activeCore?.pushRegistrationStatus() }.getOrNull()
+            _state.update { it.copy(pushRegistrationStatus = st, pushDevicesSnapshot = null) }
+        }
+    }
+
+    // --- Global Overview, Safe Batch Approvals & Personal Agent Dispatch ---
+
+    fun openGlobalOverview() {
+        _state.update { it.copy(showGlobalOverview = true, lastError = null) }
+        refreshRouterAndMesh()
+        refreshOverviewPendingDecisions()
+    }
+
+    fun closeGlobalOverview() {
+        _state.update { it.copy(showGlobalOverview = false) }
+    }
+
+    private val overviewGeneration = AtomicLong()
+    private val guardianAuditCache = ConcurrentHashMap<String, Pair<Long, List<GuardianAuditEntry>>>()
+
+    fun refreshOverviewPendingDecisions() {
+        val generation = overviewGeneration.incrementAndGet()
+        viewModelScope.launch(Dispatchers.IO) {
+            val activeCore = core ?: return@launch
+            val cur = _state.value
+            val hostNameById = cur.hosts.associate { it.hostId to it.displayName }
+
+            val perHostResults = coroutineScope {
+                cur.hosts.map { host ->
+                    async(Dispatchers.IO) {
+                        val detail = runCatching { activeCore.hostDetail(host.hostId) }.getOrNull()
+                            ?: return@async (emptyList<Pair<String, FfiAgentCard>>() to emptyList<OverviewPendingDecision>())
+                        val hostSessions = detail.agents
+                            .filter { it.archivedAtRfc3339 == null }
+                            .map { host.hostId to it }
+                        val awaitingAgents = detail.agents.filter { it.isAwaitingPermission }
+                        val audits = if (awaitingAgents.isNotEmpty()) {
+                            val nowMs = SystemClock.elapsedRealtime()
+                            val cached = guardianAuditCache[host.hostId]
+                            if (cached != null && (nowMs - cached.first) < GUARDIAN_AUDIT_CACHE_TTL_MS) {
+                                cached.second
+                            } else {
+                                val fetched = withTimeoutOrNull(GUARDIAN_CONFIG_RPC_TIMEOUT_MS) {
+                                    runCatching { activeCore.getGuardianConfig(host.hostId).recentAudits }.getOrNull()
+                                }
+                                if (fetched != null) {
+                                    guardianAuditCache[host.hostId] = nowMs to fetched
+                                    fetched
+                                } else {
+                                    cached?.second.orEmpty()
+                                }
+                            }
+                        } else {
+                            emptyList()
+                        }
+
+                        val hostDecisions = mutableListOf<OverviewPendingDecision>()
+                        awaitingAgents.forEach { agent ->
+                            val delta = runCatching {
+                                activeCore.agentStageDelta(host.hostId, agent.agentId, 0uL)
+                            }.getOrNull() ?: return@forEach
+                            delta.pendingPermissions
+                                .filterIsInstance<FfiTimelineItem.PermissionRequest>()
+                                .filter { it.resolvedDecision == null }
+                                .forEach { perm ->
+                                    val assessment = audits
+                                        .filter { it.agentId == agent.agentId && it.requestId == perm.requestId }
+                                        .maxByOrNull { it.decidedAtMs }
+                                        ?.assessment
+                                    hostDecisions.add(
+                                        OverviewPendingDecision(
+                                            hostId = host.hostId,
+                                            hostName = hostNameById[host.hostId] ?: host.hostId,
+                                            agentId = agent.agentId,
+                                            agentTitle = agent.title.ifBlank {
+                                                OrbitFormatters.providerLabel(agent.provider)
+                                            },
+                                            permission = perm,
+                                            isSafeLowRisk = OverviewSafetyReducer.isSafeLowRiskBatchCandidate(
+                                                perm,
+                                                assessment,
+                                            ),
+                                            isPlanApproval = PlanApprovalReducer.detectPlanApproval(perm) != null,
+                                            riskLevel = assessment?.riskLevel,
+                                        )
+                                    )
+                                }
+                        }
+                        hostSessions to hostDecisions
+                    }
+                }.awaitAll()
+            }
+
+            val sessions = mutableListOf<Pair<String, FfiAgentCard>>()
+            val collected = mutableListOf<OverviewPendingDecision>()
+            val seenKeys = HashSet<Triple<String, String, String>>()
+            perHostResults.forEach { (hostSessions, hostDecisions) ->
+                sessions.addAll(hostSessions)
+                hostDecisions.forEach { decision ->
+                    val key = Triple(decision.hostId, decision.agentId, decision.permission.requestId)
+                    if (seenKeys.add(key)) {
+                        collected.add(decision)
+                    }
+                }
+            }
+            val recent = sessions.sortedByDescending { it.second.updatedAtRfc3339 }
+            _state.update {
+                if (overviewGeneration.get() == generation) {
+                    it.copy(overviewPendingDecisions = collected, fleetSessions = recent)
+                } else {
+                    it
+                }
+            }
+        }
+    }
+
+    fun resolvePermissionForHost(
+        hostId: String,
+        agentId: String,
+        requestId: String,
+        decision: String,
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                guardianAuditCache.remove(hostId)
+                core?.resolvePermission(hostId, agentId, requestId, decision)
+                reloadFleetInternal()
+                reloadHostDetailInternal(hostId)
+                if (_state.value.selectedHostId == hostId && _state.value.selectedAgentId == agentId) {
+                    reloadStageInternal(hostId, agentId)
+                }
+                refreshOverviewPendingDecisions()
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to resolve approval"))
+            }
+        }
+    }
+
+    fun selectHostAndAgent(hostId: String, agentId: String) {
+        _state.update { it.copy(showGlobalOverview = false) }
+        if (_state.value.selectedHostId == hostId) {
+            selectAgent(agentId)
+        } else {
+            openThreadFromDeepLink(hostId, agentId)
+        }
+    }
+
+    fun resolvePermissionsBatchSafe(
+        hostId: String,
+        permissionsByAgent: List<Pair<String, FfiTimelineItem.PermissionRequest>>,
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val activeCore = core ?: return@launch
+                guardianAuditCache.remove(hostId)
+                val audits = activeCore.getGuardianConfig(hostId).recentAudits
+                val safeItems = permissionsByAgent.groupBy { it.first }.flatMap { (agentId, rows) ->
+                    val requested = rows.map { it.second.requestId }.toSet()
+                    activeCore.agentStageDelta(hostId, agentId, 0uL).pendingPermissions
+                        .filterIsInstance<FfiTimelineItem.PermissionRequest>()
+                        .filter { p ->
+                            p.requestId in requested && OverviewSafetyReducer.isSafeLowRiskBatchCandidate(p,
+                                audits.filter { it.agentId == agentId && it.requestId == p.requestId }
+                                    .maxByOrNull { it.decidedAtMs }?.assessment)
+                        }.map { FfiPermissionRequestId(agentId, it.requestId) }
+                }
+                if (safeItems.isEmpty()) {
+                    refreshOverviewPendingDecisions()
+                    return@launch
+                }
+                val res = activeCore.resolvePermissionsBatch(hostId, safeItems, "allow")
+                reloadFleetInternal()
+                reloadHostDetailInternal(hostId)
+                _state.value.selectedAgentId?.let { aid ->
+                    if (_state.value.selectedHostId == hostId) reloadStageInternal(hostId, aid)
+                }
+                refreshOverviewPendingDecisions()
+                postToast("Approved ${res.resolvedCount} safe requests")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Batch approval failed"))
+            }
+        }
+    }
+
+    fun resolvePlanApproval(
+        requestId: String,
+        action: PlanApprovalAction,
+        originalMarkdown: String,
+        draftMarkdown: String,
+        feedback: String,
+        buildMode: uniffi.orbit_ffi_uniffi.SessionMode = uniffi.orbit_ffi_uniffi.SessionMode.Default,
+    ) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val agentId = cur.selectedAgentId ?: return
+        val payload = PlanApprovalReducer.buildSubmitPayload(
+            action = action,
+            originalMarkdown = originalMarkdown,
+            draftMarkdown = draftMarkdown,
+            feedback = feedback,
+        )
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core?.resolvePlanApproval(
+                    hostId = hostId,
+                    agentId = agentId,
+                    permissionRequestId = requestId,
+                    action = payload.action,
+                    editedPlanMarkdown = payload.editedPlanMarkdown,
+                    feedback = payload.feedback,
+                    targetMode = payload.targetMode?.let { buildMode },
+                )
+                reloadStageInternal(hostId, agentId)
+                reloadHostDetailInternal(hostId)
+            } catch (t: Throwable) {
+                _state.update { it.copy(lastError = extractErrorMessage(t, "Failed to resolve plan approval")) }
+            }
+        }
+    }
+
+    fun sendPersonalAgentPrompt(promptText: String, onSent: () -> Unit) {
+        val trimmed = promptText.trim()
+        if (trimmed.isEmpty()) return
+        val cur = _state.value
+        val routerHost = cur.routerHosts.firstOrNull { it.activeRouterAgentId != null && it.online }
+            ?: cur.routerHosts.firstOrNull { it.routerEnabled && it.online }
+        val activeRouterAgentId = routerHost?.activeRouterAgentId
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val activeCore = core ?: throw IllegalStateException("Orbit core not ready")
+                if (routerHost == null || activeRouterAgentId == null) {
+                    postToast(
+                        getApplication<Application>()
+                            .getString(dev.orbit.android.R.string.overview_router_setup_toast)
+                    )
+                    requestSheet("router")
+                    return@launch
+                }
+                activeCore.sendPrompt(routerHost.hostId, activeRouterAgentId, trimmed)
+                withContext(Dispatchers.Main) {
+                    onSent()
+                    selectHostAndAgent(routerHost.hostId, activeRouterAgentId)
+                }
+            } catch (t: Throwable) {
+                _state.update { it.copy(lastError = extractErrorMessage(t, "Failed to send to Personal Agent")) }
+            }
+        }
+    }
+
+    // --- Tail Pagination & Delivery Interruption ---
+
+    fun loadOlderTimeline(limitEvents: UInt = 80u) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val agentId = cur.selectedAgentId?.takeIf { !cur.isNewSessionMode } ?: return
+        if (cur.isLoadingOlderTurns || !cur.stageHasOlderTurns) return
+        _state.update { it.copy(isLoadingOlderTurns = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val loadedMore = core?.loadOlderAgentTimeline(hostId, agentId, limitEvents) ?: false
+                reloadStageInternal(hostId, agentId)
+                if (loadedMore) delay(8_000) // Remote pages arrive via TimelineChanged after the RPC returns.
+                _state.update {
+                    if (it.selectedHostId == hostId && it.selectedAgentId == agentId && it.stageOldestLoadedSeq == cur.stageOldestLoadedSeq)
+                        it.copy(isLoadingOlderTurns = false) else it
+                }
+            } catch (t: Throwable) {
+                _state.update { it.copy(isLoadingOlderTurns = false) }
+                postToast(extractErrorMessage(t, "Failed to load earlier history"))
+            }
+        }
+    }
+
+    fun interruptAgentAndContinue() {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val agentId = cur.selectedAgentId?.takeIf { !cur.isNewSessionMode } ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core?.interruptAgentAndContinue(hostId, agentId) }
+                .onSuccess {
+                    reloadStageInternal(hostId, agentId)
+                    postToast("Interrupted & delivering queued message")
+                }
+                .onFailure { t ->
+                    postToast(extractErrorMessage(t, "Failed to interrupt & deliver"))
+                }
+        }
+    }
+
+    // --- File Explorer & Syntax-Highlighted Code Viewer ---
+
+    suspend fun readFile(host: String, cwd: String, path: String): FfiWorkspaceFile = withContext(Dispatchers.IO) {
+        checkNotNull(core ?: coreReady.await()).readWorkspaceFile(host, cwd, path)
+    }
+
+    suspend fun createProjectHooks(host: String, cwd: String) = withContext(Dispatchers.IO) {
+        checkNotNull(core).createWorkspaceEntry(uniffi.orbit_ffi_uniffi.FfiCreateWorkspaceEntryRequest(
+            host, cwd, ".orbit/hooks.json", false, """{"version":1,"hooks":[]}"""))
+    }
+
+    suspend fun providerTimeline(host: String, parent: String, id: String, open: Boolean) = withContext(Dispatchers.IO) {
+        val activeCore = checkNotNull(core)
+        if (open) activeCore.openProviderSubagentTimeline(host, parent, id)
+        activeCore.providerSubagentTimeline(host, parent, id)
+    }
+
+    suspend fun saveFile(file: FfiWorkspaceFile, text: String): Boolean = withContext(Dispatchers.IO) {
+        require(file.writable && !file.truncated && !file.etag.isNullOrEmpty())
+        val result = checkNotNull(core).writeWorkspaceFile(uniffi.orbit_ffi_uniffi.FfiWriteWorkspaceFileRequest(
+            file.hostId, file.cwd, file.path, text, file.etag, false))
+        result.conflict == null
+    }
+
+    // --- Git Write Operations (Stage, Unstage, Commit, Generate Message, PR, Conflicts, Stash) ---
+
+    fun refreshGitExtras() {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        viewModelScope.launch(Dispatchers.IO) {
+            val activeCore = core ?: return@launch
+            val pr = runCatching { activeCore.gitPrStatus(hostId, cwd) }.getOrNull()
+            val conflicts = runCatching { activeCore.gitConflicts(hostId, cwd).files }.getOrDefault(emptyList())
+            val stashes = runCatching { activeCore.gitStashList(hostId, cwd).entries }.getOrDefault(emptyList())
+            _state.update {
+                if (it.selectedHostId != hostId || it.activeCwd != cwd) return@update it
+                it.copy(
+                    gitPrStatus = pr,
+                    gitConflicts = conflicts,
+                    gitStashes = stashes,
+                )
+            }
+        }
+    }
+
+    fun gitStagePaths(paths: List<String>, all: Boolean) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        _state.update { it.copy(gitMutationBusy = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                checkNotNull(core).gitStagePaths(hostId, cwd, paths, all)
+                loadGitReview(cwd = cwd, path = cur.gitSelectedPath)
+                postToast(if (all) "Staged all changes" else "Staged ${paths.size} file(s)")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to stage files"))
+            } finally {
+                _state.update { it.copy(gitMutationBusy = false) }
+            }
+        }
+    }
+
+    fun gitUnstagePaths(paths: List<String>, all: Boolean) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        _state.update { it.copy(gitMutationBusy = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                checkNotNull(core).gitUnstagePaths(hostId, cwd, paths, all)
+                loadGitReview(cwd = cwd, path = cur.gitSelectedPath)
+                postToast(if (all) "Unstaged all changes" else "Unstaged ${paths.size} file(s)")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to unstage files"))
+            } finally {
+                _state.update { it.copy(gitMutationBusy = false) }
+            }
+        }
+    }
+
+    fun gitGenerateCommitMessage() {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        _state.update { it.copy(gitMutationBusy = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val res = checkNotNull(core).gitGenerateCommitMessage(hostId, cwd)
+                _state.update { if (it.selectedHostId == hostId && it.activeCwd == cwd) it.copy(generatedCommitMessage = res.message, gitMutationBusy = false) else it.copy(gitMutationBusy = false) }
+            } catch (t: Throwable) {
+                _state.update { it.copy(gitMutationBusy = false) }
+                postToast(extractErrorMessage(t, "Failed to generate commit message"))
+            }
+        }
+    }
+
+    fun consumeGeneratedCommitMessage() {
+        _state.update { it.copy(generatedCommitMessage = null) }
+    }
+
+    fun gitCommit(message: String, amend: Boolean = false, onCommitted: () -> Unit = {}) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        val trimmed = message.trim()
+        if (trimmed.isEmpty()) return
+        _state.update { it.copy(gitMutationBusy = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val res = checkNotNull(core).gitCommit(hostId, cwd, trimmed, amend)
+                loadGitReview(cwd = cwd, path = cur.gitSelectedPath)
+                refreshGitExtras()
+                postToast("Committed ${res.shortSha}")
+                withContext(Dispatchers.Main) { onCommitted() }
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Git commit failed"))
+            } finally {
+                _state.update { it.copy(gitMutationBusy = false) }
+            }
+        }
+    }
+
+    fun gitCreatePr(title: String, body: String, base: String?, draft: Boolean, onCreated: () -> Unit = {}) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        if (title.isBlank()) return
+        _state.update { it.copy(gitMutationBusy = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val res = checkNotNull(core).gitCreatePr(hostId, cwd, title.trim(), body.trim(), base?.trim()?.ifEmpty { null }, draft)
+                refreshGitExtras()
+                postToast("Created PR #${res.number}".trim())
+                withContext(Dispatchers.Main) { onCreated() }
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to create Pull Request"))
+            } finally {
+                _state.update { it.copy(gitMutationBusy = false) }
+            }
+        }
+    }
+
+    fun gitResolveConflict(path: String, resolution: GitConflictResolution, expectedSha256: String?) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        _state.update { it.copy(gitMutationBusy = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core?.gitResolveConflict(hostId, cwd, path, null, resolution, true, expectedSha256)
+                loadGitReview(cwd = cwd, path = cur.gitSelectedPath)
+                refreshGitExtras()
+                postToast("Resolved conflict in ${OrbitFormatters.shortPath(path)}")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to resolve conflict"))
+            } finally {
+                _state.update { it.copy(gitMutationBusy = false) }
+            }
+        }
+    }
+
+    fun gitStashSave(message: String? = null, includeUntracked: Boolean = true) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        _state.update { it.copy(gitMutationBusy = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core?.gitStashSave(hostId, cwd, message?.trim()?.ifEmpty { null }, includeUntracked)
+                loadGitReview(cwd = cwd, path = cur.gitSelectedPath)
+                refreshGitExtras()
+                postToast("Saved working tree to stash")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to stash changes"))
+            } finally {
+                _state.update { it.copy(gitMutationBusy = false) }
+            }
+        }
+    }
+
+    fun gitStashPop(stashRef: String, expectedOid: String?) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val cwd = cur.activeCwd
+        _state.update { it.copy(gitMutationBusy = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core?.gitStashPop(hostId, cwd, stashRef, expectedOid)
+                loadGitReview(cwd = cwd, path = cur.gitSelectedPath)
+                refreshGitExtras()
+                postToast("Popped $stashRef")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to pop stash"))
+            } finally {
+                _state.update { it.copy(gitMutationBusy = false) }
+            }
+        }
+    }
+
+    // --- Automations Creation, Permission Rules (Hooks) & Guardian ---
+
+    fun startGoalRun(objective: String, criteria: List<String>, verifyCommand: String?, maxIterations: UInt?) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val agentId = cur.selectedAgentId ?: cur.hostDetail?.agents?.firstOrNull()?.agentId ?: run {
+            postToast("Open or create a session first to start a Goal")
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core?.startGoal(
+                    StartGoalRunRequest(
+                        hostId = hostId,
+                        agentId = agentId,
+                        objective = objective.trim(),
+                        criteria = criteria.filter { it.isNotBlank() },
+                        verifyCommand = verifyCommand?.trim()?.ifEmpty { null },
+                        maxIterations = maxIterations,
+                        maxDurationSecs = null,
+                    )
+                )
+                refreshAutomations()
+                postToast("Goal started")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to start goal"))
+            }
+        }
+    }
+
+    fun createMonitorWatch(name: String, kind: MonitorKind, expiresInSecs: ULong? = null) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val agentId = cur.selectedAgentId ?: cur.hostDetail?.agents?.firstOrNull()?.agentId ?: run {
+            postToast("Open or create a session first to add a Monitor")
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core?.createMonitor(
+                    StartMonitorWatchRequest(
+                        hostId = hostId,
+                        agentId = agentId,
+                        name = name.trim(),
+                        kind = kind,
+                        expiresInSecs = expiresInSecs,
+                    )
+                )
+                refreshAutomations()
+                postToast("Monitor created")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to create monitor"))
+            }
+        }
+    }
+
+    fun createConditionalTimer(durationSecs: ULong, prompt: String, condition: TimerCondition = TimerCondition.Never) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val agentId = cur.selectedAgentId ?: cur.hostDetail?.agents?.firstOrNull()?.agentId ?: run {
+            postToast("Open a session first to arm a timer")
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core?.createTimer(hostId, agentId, durationSecs, prompt.trim(), condition)
+                refreshAutomations()
+                postToast("Timer armed")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to create timer"))
+            }
+        }
+    }
+
+    fun startSimpleDagWorkflow(name: String, prompt: String) {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val step = DagStepSpec(
+                    stepId = "step_1",
+                    name = name.trim(),
+                    dependsOn = emptyList(),
+                    promptTemplate = prompt.trim(),
+                    provider = OrbitFfiTypeBridge.toProviderKind(cur.composer.provider),
+                    model = cur.composer.model,
+                    isolatedWorktree = false,
+                    retryCount = 0u,
+                    timeoutSecs = 900uL,
+                )
+                core?.startWorkflow(
+                    StartDagWorkflowRequest(
+                        hostId = hostId,
+                        name = name.trim(),
+                        cwd = cur.activeCwd,
+                        steps = listOf(step),
+                        defaultProvider = OrbitFfiTypeBridge.toProviderKind(cur.composer.provider),
+                        defaultMode = OrbitFfiTypeBridge.toSessionMode(cur.composer.mode),
+                        maxConcurrency = 1u,
+                    )
+                )
+                refreshAutomations()
+                postToast("Workflow launched")
+            } catch (t: Throwable) {
+                postToast(extractErrorMessage(t, "Failed to launch workflow"))
+            }
+        }
+    }
+
+    fun refreshPermissionRulesAndGuardian() {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val rules = runCatching { core?.listPermissionRules(hostId, cur.activeCwd) }.getOrNull().orEmpty()
+            val guardian = runCatching { core?.getGuardianConfig(hostId) }.getOrNull()
+            _state.update { it.copy(permissionRules = rules, guardianSnapshot = guardian) }
+        }
+    }
+
+    fun upsertPermissionRule(rule: UpsertPermissionRuleInput) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core?.upsertPermissionRule(hostId, rule) }
+                .onSuccess {
+                    refreshPermissionRulesAndGuardian()
+                    postToast("Rule saved")
+                }
+                .onFailure { t -> postToast(extractErrorMessage(t, "Failed to save rule")) }
+        }
+    }
+
+    fun deletePermissionRule(ruleId: String) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core?.deletePermissionRule(hostId, ruleId) }
+                .onSuccess {
+                    refreshPermissionRulesAndGuardian()
+                    postToast("Rule removed")
+                }
+                .onFailure { t -> postToast(extractErrorMessage(t, "Failed to remove rule")) }
+        }
+    }
+
+    fun updateGuardianConfig(config: GuardianPolicyConfig) {
+        val hostId = _state.value.selectedHostId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core?.updateGuardianConfig(hostId, config) }
+                .onSuccess { snap ->
+                    guardianAuditCache.remove(hostId)
+                    _state.update { it.copy(guardianSnapshot = snap) }
+                    postToast("Guardian policy updated")
+                }
+                .onFailure { t -> postToast(extractErrorMessage(t, "Failed to update Guardian policy")) }
+        }
+    }
+
+    // --- Personal Router & Fleet Mesh ---
+
+    fun refreshRouterAndMesh(requestedHost: String? = null) {
+        _state.update { it.copy(isLoadingRouterMesh = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val activeCore = core ?: run {
+                _state.update { it.copy(isLoadingRouterMesh = false) }
+                return@launch
+            }
+            val routerHosts = runCatching { activeCore.discoverFleetRouterHosts() }.getOrDefault(emptyList())
+            val primaryHostId = requestedHost ?: routerHosts.firstOrNull { it.routerEnabled && it.online }?.hostId
+                ?: _state.value.selectedHostId
+                ?: routerHosts.firstOrNull()?.hostId
+            val routerStatus = primaryHostId?.let { hid ->
+                runCatching { activeCore.getRouterConfig(hid) }.getOrNull()
+            }
+            val mesh = runCatching { activeCore.getFleetMeshSnapshot() }.getOrDefault(emptyMap())
+            _state.update {
+                it.copy(
+                    routerHosts = routerHosts,
+                    routerStatus = routerStatus,
+                    fleetMeshSnapshot = mesh,
+                    isLoadingRouterMesh = false,
+                )
+            }
+        }
+    }
+
+    fun updatePersonalRouterConfig(
+        hostId: String,
+        config: PersonalRouterConfig,
+        activate: Boolean,
+    ) {
+        _state.update { it.copy(isLoadingRouterMesh = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val snap = core?.updateRouterConfig(hostId, config, null, activate)
+                _state.update { it.copy(routerStatus = snap ?: it.routerStatus, isLoadingRouterMesh = false) }
+                refreshRouterAndMesh()
+                postToast(if (config.enabled) "Personal Router updated" else "Personal Router paused")
+            } catch (t: Throwable) {
+                _state.update { it.copy(isLoadingRouterMesh = false) }
+                postToast(extractErrorMessage(t, "Failed to update Personal Router"))
+            }
+        }
+    }
+
+    fun toggleMeshPeer(hostId: String, registrationId: String, label: String?, enabled: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core?.updateMeshPeer(hostId, registrationId, label, enabled) }
+                .onSuccess {
+                    refreshRouterAndMesh()
+                    postToast(if (enabled) "Mesh peer enabled" else "Mesh peer disabled")
+                }
+                .onFailure { t -> postToast(extractErrorMessage(t, "Failed to update mesh peer")) }
+        }
+    }
+
+    // --- Global Cross-Host Search (Local FTS5 + Remote Daemons) ---
+
+    private val searchGeneration = java.util.concurrent.atomic.AtomicLong()
+
+    fun runGlobalSearch(query: String, includeRemote: Boolean = true) {
+        val generation = searchGeneration.incrementAndGet()
+        val trimmed = query.trim()
+        _state.update { it.copy(globalSearchQuery = query) }
+        if (trimmed.length < 2) {
+            _state.update {
+                it.copy(
+                    globalSearchHits = emptyList(),
+                    globalSearchRemoteQueried = 0u,
+                    globalSearchRemoteFailed = 0u,
+                    isSearchingGlobal = false,
+                )
+            }
+            return
+        }
+        _state.update { it.copy(isSearchingGlobal = true, globalSearchHits = emptyList()) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val activeCore = checkNotNull(core ?: coreReady.await())
+                if (includeRemote) {
+                    val res = activeCore.searchMessagesRemote(
+                        SearchMessagesRequest(
+                            query = trimmed,
+                            hostId = null,
+                            agentId = null,
+                            limit = 40u,
+                        )
+                    )
+                    _state.update {
+                        if (searchGeneration.get() != generation) return@update it
+                        it.copy(
+                            globalSearchHits = res.hits,
+                            globalSearchRemoteQueried = res.remoteHostsQueried,
+                            globalSearchRemoteFailed = res.remoteHostsFailed,
+                            isSearchingGlobal = false,
+                        )
+                    }
+                } else {
+                    val localHits = activeCore.searchMessages(trimmed, 40u).map { h ->
+                        ConversationSearchHit(
+                            hostId = h.hostId,
+                            hostName = h.hostName,
+                            agentId = h.agentId,
+                            seq = h.seq,
+                            turnId = null,
+                            role = h.role,
+                            title = h.title,
+                            projectName = h.projectName,
+                            snippet = h.snippet,
+                            updatedAtRfc3339 = h.updatedAtRfc3339,
+                            isRemote = false,
+                            isUnloaded = false,
+                        )
+                    }
+                    _state.update {
+                        if (searchGeneration.get() != generation) return@update it
+                        it.copy(
+                            globalSearchHits = localHits,
+                            globalSearchRemoteQueried = 0u,
+                            globalSearchRemoteFailed = 0u,
+                            isSearchingGlobal = false,
+                        )
+                    }
+                }
+            } catch (t: Throwable) {
+                if (searchGeneration.get() != generation) return@launch
+                _state.update { it.copy(isSearchingGlobal = false) }
+                postToast(extractErrorMessage(t, "Search failed"))
+            }
         }
     }
 
     override fun onCleared() {
+        terminalInput.close()
         cloudSyncPollJob?.cancel()
         OrbitFirebaseMessagingBridge.detachTokenListener()
         networkObserver.stop()
@@ -3966,6 +5044,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         private const val KEY_PINNED_THREAD_KEYS = "pinned_thread_keys"
         private const val KEY_MIGRATED_THREAD_PREFS_V1 = "migrated_thread_prefs_v1"
         private const val KEY_DRAFT_USE_WORKTREE = "draft_use_worktree"
+        private const val GUARDIAN_AUDIT_CACHE_TTL_MS = 15_000L
+        private const val GUARDIAN_CONFIG_RPC_TIMEOUT_MS = 2_500L
         private val SAFE_DEEP_LINK_ID_REGEX = Regex("^[A-Za-z0-9_.:-]{1,128}$")
 
         const val EXTRA_PAIR_URI = "orbit_pair_uri"

@@ -96,6 +96,7 @@ import kotlin.math.roundToInt
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsSheet(
+    onRouter: () -> Unit,
     appearanceMode: OrbitAppearanceMode,
     hosts: List<FfiHostCard>,
     selectedHostId: String?,
@@ -240,6 +241,7 @@ fun SettingsSheet(
                     quotas = quotas,
                     cloudSyncStatus = cloudSyncStatus,
                     pushRegistrationStatus = pushRegistrationStatus,
+                    onRouter = onRouter,
                     onSelectAppearance = onSelectAppearance,
                     onInspectHost = { inspectedHostId = it },
                     onOpenPairHost = {
@@ -267,6 +269,7 @@ private fun SettingsRootPane(
     quotas: List<FfiProviderQuota>,
     cloudSyncStatus: FfiCloudSyncStatus?,
     pushRegistrationStatus: FfiPushRegistrationStatus?,
+    onRouter: () -> Unit,
     onSelectAppearance: (OrbitAppearanceMode) -> Unit,
     onInspectHost: (String) -> Unit,
     onOpenPairHost: () -> Unit,
@@ -288,6 +291,7 @@ private fun SettingsRootPane(
         verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xl),
     ) {
         // 1. Appearance (Strictly System / Light / Dark — M3 SingleChoiceSegmentedButtonRow)
+        TextButton(onClick = onRouter) { Text(androidx.compose.ui.res.stringResource(dev.orbit.android.R.string.nav_personal_router)) }
         Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs + 2.dp)) {
             Text(
                 text = "Appearance",

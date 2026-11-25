@@ -2587,7 +2587,7 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
       hostId: string,
       workspaceId: string,
       keepAgentsUnclassified = false,
-      opts?: { emptyDelete?: boolean },
+      opts?: { emptyDelete?: boolean; rethrow?: boolean },
     ): Promise<void> {
       try {
         await orbitIpc.archiveWorkspace(hostId, workspaceId, keepAgentsUnclassified);
@@ -2601,6 +2601,9 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
         );
       } catch (err) {
         notifyToast(t("store.failedUpdateGroup", { detail: String(err) }));
+        if (opts?.rethrow) {
+          throw err;
+        }
       }
     },
 

@@ -18,7 +18,7 @@
 - **Native 驱动**（`crates/orbit-providers/src/`）：
   - `claude.rs`（`stream-json` 控制协议，私钥 MCP 配置写入 `$ORBIT_HOME/runtime/claude-mcp-*.json` `0600`）
   - `codex.rs`（`app-server` JSON-RPC 2.0）
-  - `antigravity.rs` + `agy_watcher.rs`（`agy` ACP stdio + 字节偏移 `transcript_full.jsonl` 流：进程级单实例 `notify` 非递归叶子目录事件监听替代 200ms 轮询、`wakeup_idle_settled` / `has_in_progress_planner` 迟到唤醒回复零丢包恢复、以及 `PostWakeupAcpReplayFilter` + `session/load` `0ms` 非阻塞清空的跨轮 ACP 重放幂等去重）
+  - `antigravity.rs` + `agy_watcher.rs`（`agy` ACP stdio + 字节偏移 `transcript_full.jsonl` 流：进程级单实例 `notify` 托管于独立 `orbit-agy-watcher` 控制线程与无锁路由表隔离以根除 `notify` 回调与 `watch()`/`unwatch()` 间的 AB-BA 死锁、非递归叶子目录事件监听替代 200ms 轮询、`wakeup_idle_settled` / `has_in_progress_planner` 迟到唤醒回复零丢包恢复、`persisted_initializing` 跨重启重连脱离卡死并补发未送达提示、以及 `PostWakeupAcpReplayFilter` + `session/load` `0ms` 非阻塞清空的跨轮 ACP 重放幂等去重）
   - `pi.rs`（`pi-rpc`，私钥 MCP 配置写入 `$ORBIT_HOME/runtime/mcp-pi-*.json` `0600`，经环境变量与 `cleanup_paths` 托管，零 `argv` 凭据泄露）
 - **通用 ACP 生态与客户端回调**：`acp_registry.rs`、`acp_providers.rs`、`acp_generic.rs`、`acp_callbacks.rs` 与 `readiness.rs`（34+ ACP Agent 目录，统一通过 `acp_callbacks::AcpCallbackHost` 声明并实现工作区隔离的 `fs/read_text_file`、`fs/write_text_file` 及独立进程组 `terminal/*` 回调，支持 `Drop` 自动清理）。
 - **Daemon 异步隔离、OS 文件监听与 SEP-1865 MCP Apps**：
@@ -42,7 +42,7 @@
      - 服务端队列自动冲刷（`Idle` / `waiting:*` 触发）必须按顺序执行：① 复核无人类闸门、未被 `suppress_auto_drain` 抑制且仍为前台空闲；② 预检 `PrePromptSubmit` Hook（拦截时保留队列项并写入时间线告警）；③ 经 `get_or_resume_driver` 确保驱动存活后再原子消费 SQLite 队列行；④ 若最终派发瞬时失败，通过 `requeue_agent_prompt_front` 原位回插队首，严禁静默丢消息。
   3. 新增保队列中断 `DriverCommand::InterruptAndDrainQueue`（对应 `WireMessage::InterruptTurn { preserve_queue: true }`）：在人类判定上游长考停滞时终止当前卡死轮，但**保留**所有已排队消息继续冲刷；硬停止（`DriverCommand::Interrupt`）则取消当前轮并丢弃驱动内未投递队列（且仅在存在活跃轮/闸门时设置 `suppress_auto_drain`）。
   4. 全 6 个 Provider 驱动统一通过 `DriverEvent::PromptDeliveryUpdated` 上报权威状态流 `Queued -> Dispatched -> Settled / Dropped`（`Settled` 必须在 `StatusChanged(Idle)` 之前发射），由 `AgentOrchestrator` 持久化隐私安全日志（仅含 ID / turn ID / 时长）与时间线状态更新事件。
-  - **必跑验证**：改动此区域必跑 `pitfall_01`、`pitfall_02`、`pitfall_06`、`pitfall_08`、`pitfall_09`、`pitfall_11`、`pitfall_12`、`pitfall_13`（见 `docs/engineering/testing-and-ci.md`）。
+  - **必跑验证**：改动此区域必跑 `pitfall_01`、`pitfall_02`、`pitfall_06`、`pitfall_08`、`pitfall_09`、`pitfall_11`、`pitfall_12`、`pitfall_13`、`pitfall_14`（见 `docs/engineering/testing-and-ci.md`）。
 
 ---
 

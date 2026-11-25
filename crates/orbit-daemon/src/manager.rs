@@ -918,6 +918,7 @@ impl AgentOrchestrator {
                 continue;
             }
             let was_running = ag.status.is_foreground_busy();
+            let was_initializing = matches!(ag.status, AgentStatus::Initializing);
 
             if surviving_sock.is_some()
                 && let Ok((executable, _)) = self
@@ -940,6 +941,38 @@ impl AgentOrchestrator {
                     .await
                     .is_ok()
                 {
+                    if was_initializing {
+                        let aid_notice = ag.agent_id.clone();
+                        if let Ok(Some(ev)) = self
+                            .with_store(move |s| {
+                                let recent = s.fetch_recent_timeline(&aid_notice, 5).ok()?;
+                                let latest_non_status = recent.iter().rev().find(|ev| {
+                                    !matches!(ev.payload, TimelinePayload::StatusChanged { .. })
+                                });
+                                if matches!(
+                                    latest_non_status.map(|ev| &ev.payload),
+                                    Some(TimelinePayload::UserPrompt { .. })
+                                ) {
+                                    let notice = TimelinePayload::Notice {
+                                        level: "warning".into(),
+                                        message: "Daemon restarted while this session was still initializing; the previous message was not delivered. Please resend it.".into(),
+                                    };
+                                    if let Ok((ev, true)) = s.append_timeline_event_deduped(
+                                        &aid_notice,
+                                        1,
+                                        None,
+                                        notice,
+                                    ) {
+                                        return Some(ev);
+                                    }
+                                }
+                                None
+                            })
+                            .await
+                        {
+                            let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+                        }
+                    }
                     info!(agent_id = %ag.agent_id, "Reattached surviving agent shim across daemon restart");
                     continue;
                 }
@@ -7406,6 +7439,7 @@ impl AgentOrchestrator {
             AgentStatus::AutonomousWakeup { source, .. }
                 if source.trim().starts_with("waiting:")
         );
+        let persisted_initializing = matches!(&summary.status, AgentStatus::Initializing);
 
         let shim_seq_tracker = Arc::new(AtomicU64::new(
             shim_after_seq.filter(|&seq| seq < u64::MAX).unwrap_or(0),
@@ -7463,6 +7497,7 @@ impl AgentOrchestrator {
             fallback_handoff_context,
             persisted_running_bg_tasks,
             persisted_bg_wait,
+            persisted_initializing,
             acp_agent_id: summary.acp_agent_id.clone(),
             acp_spec,
         })
@@ -7940,6 +7975,9 @@ impl AgentOrchestrator {
                 let was_running_turn = prev
                     .as_ref()
                     .is_some_and(|a| matches!(a.status, AgentStatus::Running { .. }));
+                let was_initializing = prev
+                    .as_ref()
+                    .is_some_and(|a| matches!(a.status, AgentStatus::Initializing));
                 let was_foreground_busy =
                     prev.as_ref().is_some_and(|a| a.status.is_foreground_busy());
                 let was_awaiting_permission = prev
@@ -7962,7 +8000,7 @@ impl AgentOrchestrator {
                         if was_running_turn {
                             completed_running_turn = true;
                         }
-                        if was_foreground_busy {
+                        if was_foreground_busy && !was_initializing {
                             should_touch_activity = true;
                             if prev.as_ref().is_some_and(|a| !a.background) {
                                 should_mark_finished = true;

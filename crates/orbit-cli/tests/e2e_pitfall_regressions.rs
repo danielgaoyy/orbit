@@ -9,28 +9,33 @@
 //! 8. Multi-agent non-interrupting subagent/peer delivery, thinking-stall progress telemetry, queue-preserving interrupt, and human preemption ordering
 //! 9. Antigravity interrupt/steer rollback handoff, empty-queue InterruptAndDrainQueue, multi-command shell isolation, native subagent live foreground polling + cancel + restart seq preservation, stderr notices, session_info_update title, and preempted-turn usage ledger
 //! 10. Non-blocking pruned workspace watcher + async CreateAgent + optimistic/Initializing cancel settlement
-//! 11. Antigravity open-RPC background wait settles streaming reply into waiting state & wakes on timer without stall
-//! 12. Antigravity OS event-driven wakeup watcher recovers late PLANNER_RESPONSE after idle settle & deduplicates ACP replay on next prompt
-//! 13. Cross-provider alignment: Claude bgwait_* Stage persistence + Codex synthetic plan gate Queue-Strip flush (zero deadlock) + Option A Steer during pending permission
+//! 11. Antigravity open-RPC background timer/task wait settles reply into `Waiting for 1 timer` and wakes cleanly on timer completion without false stall
+//! 12. Antigravity event-driven brain watcher, late post-turn wakeup reply recovery past 3s idle settle, and post-wakeup ACP replay deduplication
+//! 13. Antigravity brain watcher deadlock freedom under concurrent FS/watch churn, Initializing reattach recovery, and confirmed workspace archive ACK
+//! 14. Cross-provider alignment: Claude bgwait_* Stage persistence + Codex synthetic plan gate Queue-Strip flush (zero deadlock) + Option A Steer during pending permission
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
 use orbit_client_core::app_core::{OrbitAppCore, TimelineItemView};
 use orbit_client_core::contract::AgentStageDeltaRequest;
+use orbit_client_core::sidebar::{SidebarProjectSort, SidebarThreadFilter};
 use orbit_client_core::stage::TurnLiveSegmentView;
 use orbit_client_core::{HostConnectionState, connect_via_relay};
 use orbit_daemon::manager::DaemonBroadcast;
 use orbit_daemon::{DaemonRuntime, spawn_embedded_daemon};
 use orbit_protocol::{
-    AgentMessageDeliveryStatus, AgentSummary, AttentionState, ProviderKind, ProviderSubagentStatus,
-    SessionMode, TimelinePayload, ToolCallDetail, ToolCallStatus, WorkspaceSetupStatus,
-    WorkspaceSummary,
+    AgentMessageDeliveryStatus, AgentStatus, AgentSummary, AttentionState, ProviderKind,
+    ProviderSubagentStatus, SessionMode, TimelinePayload, ToolCallDetail, ToolCallStatus,
+    WorkspaceIsolation, WorkspaceSetupStatus, WorkspaceSummary,
 };
 use orbit_relay::{RelayConfig, run_relay};
+use orbit_store::OrbitStore;
 use uuid::Uuid;
 
 #[cfg(unix)]
@@ -4796,7 +4801,7 @@ async fn pitfall_12_antigravity_event_driven_wakeup_late_reply_and_acp_replay_de
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pitfall_13_cross_provider_bg_wait_synthetic_plan_gate_and_permission_steer() {
+async fn pitfall_14_cross_provider_bg_wait_synthetic_plan_gate_and_permission_steer() {
     install_mock_script(
         &MOCK_CLAUDE_PATH,
         ProviderKind::ClaudeCode,
@@ -4996,4 +5001,351 @@ async fn pitfall_13_cross_provider_bg_wait_synthetic_plan_gate_and_permission_st
 
     drop_core(core).await;
     drop(rt);
+}
+
+// ============================================================================
+// PITFALL 13: AgyBrainWatcher Deadlock Freedom + Initializing Reattach + Archive ACK
+// ============================================================================
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pitfall_13_antigravity_watcher_no_deadlock_initializing_reattach_and_archive_ack() {
+    install_mock_script(
+        &MOCK_ANTIGRAVITY_PATH,
+        ProviderKind::Antigravity,
+        "mock_agy_reg.py",
+        MOCK_ANTIGRAVITY_SCRIPT,
+    );
+    let agy_data_dir = base_tmp_dir()
+        .join(format!("orb_reg_mocks_{}", std::process::id()))
+        .join("agy_data");
+    std::fs::create_dir_all(&agy_data_dir).expect("mkdir agy_data");
+    orbit_providers::antigravity::set_agy_data_dir_override(Some(agy_data_dir.clone()));
+
+    let home = new_temp_dir("p13_h");
+    let work = new_temp_dir("p13_w");
+    init_git_repo(&work);
+    let work_str = work.to_string_lossy().to_string();
+
+    // Part A: Boot Daemon #1 in an isolated Tokio runtime, start an Antigravity session,
+    // wait until its detached shim is live (`Idle`), then tear down Daemon #1 cleanly
+    // without killing the detached shim.
+    let home_rt1 = home.to_path_buf();
+    let work_rt1 = work_str.clone();
+    let agent_id = tokio::task::spawn_blocking(move || -> String {
+        let rt1_tokio = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build rt1");
+        let agent_id = rt1_tokio.block_on(async {
+            let (addr, rt1) = spawn_embedded_daemon(home_rt1.clone(), None)
+                .await
+                .expect("spawn daemon 1");
+            let uri = rt1
+                .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+                .expect("offer 1")
+                .to_qr_uri()
+                .expect("uri 1");
+            let (core1, host_id1) = open_and_connect_core(home_rt1.join("c13_1.db"), uri).await;
+
+            core1.create_agent(
+                &host_id1,
+                &work_rt1,
+                ProviderKind::Antigravity,
+                SessionMode::FullAccess,
+                "",
+                None,
+            );
+            assert!(
+                wait_until(Duration::from_secs(12), || {
+                    let store = Arc::clone(&rt1.store);
+                    async move {
+                        store
+                            .list_agents_filtered(None, false, false, None)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .any(|a| {
+                                a.provider == ProviderKind::Antigravity
+                                    && a.status == AgentStatus::Idle
+                            })
+                    }
+                })
+                .await,
+                "initial Antigravity agent must reach Idle with live shim"
+            );
+            let aid = rt1
+                .store
+                .list_agents_filtered(None, false, false, None)
+                .expect("list agents")
+                .into_iter()
+                .find(|a| a.provider == ProviderKind::Antigravity)
+                .expect("agent present")
+                .agent_id;
+
+            drop_core(core1).await;
+            drop(rt1);
+            aid
+        });
+        rt1_tokio.shutdown_timeout(Duration::from_millis(200));
+        agent_id
+    })
+    .await
+    .expect("daemon 1 thread");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Simulate a daemon restart occurring mid-`Initializing` right after an initial `UserPrompt`
+    // was persisted to SQLite before the driver received it.
+    {
+        let store = OrbitStore::open(home.join("orbit.db")).expect("open orbit.db");
+        store
+            .update_agent_status(&agent_id, &AgentStatus::Initializing)
+            .expect("set Initializing");
+        store
+            .append_timeline_event(
+                &agent_id,
+                1,
+                Some("turn_lost_init"),
+                TimelinePayload::UserPrompt {
+                    message_id: "u_lost_init".into(),
+                    text: "LOST_INIT_PROMPT".into(),
+                    badges: vec![],
+                },
+            )
+            .expect("append unanswered user prompt");
+    }
+
+    // Boot Daemon #2 on the same `$ORBIT_HOME`: it must reattach the surviving shim, transition
+    // out of `Initializing` to `Idle`, surface the recovery warning Notice, and accept prompts.
+    let (addr2, rt2) = spawn_embedded_daemon(home.to_path_buf(), None)
+        .await
+        .expect("spawn daemon 2");
+    let uri2 = rt2
+        .build_pairing_offer(vec![format!("ws://{addr2}/ws")], None)
+        .expect("offer 2")
+        .to_qr_uri()
+        .expect("uri 2");
+    let (core2, host_id2) = open_and_connect_core(home.join("c13_2.db"), uri2).await;
+    core2.open_agent_timeline(&host_id2, &agent_id);
+
+    assert!(
+        wait_until(Duration::from_secs(12), || {
+            let store = Arc::clone(&rt2.store);
+            let c = Arc::clone(&core2);
+            let hid = host_id2.clone();
+            let aid = agent_id.clone();
+            async move {
+                let db_idle = store
+                    .get_agent(&aid)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|a| a.status == AgentStatus::Idle);
+                let stage = c.agent_stage(&hid, &aid);
+                let has_warning = collect_stage_items(&stage).iter().any(|it| {
+                    matches!(
+                        it,
+                        TimelineItemView::Notice { level, message, .. }
+                            if level == "warning"
+                                && message.contains("Daemon restarted while this session was still initializing")
+                    )
+                });
+                db_idle && has_warning
+            }
+        })
+        .await,
+        "reattached Initializing session must recover to Idle and emit recovery Notice"
+    );
+
+    core2.send_prompt(&host_id2, &agent_id, "ECHO=POST_REATTACH_OK");
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let c = Arc::clone(&core2);
+            let hid = host_id2.clone();
+            let aid = agent_id.clone();
+            async move { stage_settled_with_text(&c, &hid, &aid, "REPLY=POST_REATTACH_OK") }
+        })
+        .await,
+        "reattached session must accept and reply to new prompts after recovery"
+    );
+
+    // Part B: Curated workspace creation + confirmed Archive Group ACK & error propagation.
+    core2.create_mission_workspace(
+        &host_id2,
+        &work_str,
+        "P13 Archive Target".into(),
+        Some("Verify confirmed archive RPC".into()),
+        WorkspaceIsolation::Local,
+        None,
+        None,
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let c = Arc::clone(&core2);
+            let hid = host_id2.clone();
+            async move {
+                let sb = c.fleet_sidebar(
+                    SidebarProjectSort::Recent,
+                    SidebarThreadFilter::All,
+                    "",
+                    Some(hid.as_str()),
+                    None,
+                    None,
+                );
+                sb.projects
+                    .iter()
+                    .any(|p| p.workspaces.iter().any(|w| w.title == "P13 Archive Target"))
+            }
+        })
+        .await,
+        "created curated workspace must appear in sidebar"
+    );
+    let ws_id = core2
+        .fleet_sidebar(
+            SidebarProjectSort::Recent,
+            SidebarThreadFilter::All,
+            "",
+            Some(host_id2.as_str()),
+            None,
+            None,
+        )
+        .projects
+        .into_iter()
+        .flat_map(|p| p.workspaces)
+        .find(|w| w.title == "P13 Archive Target")
+        .expect("workspace present")
+        .workspace_id;
+
+    core2
+        .archive_workspace_confirmed(&host_id2, &ws_id, false)
+        .await
+        .expect("archive_workspace_confirmed must succeed with Ack");
+
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            let c = Arc::clone(&core2);
+            let hid = host_id2.clone();
+            let target_ws = ws_id.clone();
+            async move {
+                let sb = c.fleet_sidebar(
+                    SidebarProjectSort::Recent,
+                    SidebarThreadFilter::All,
+                    "",
+                    Some(hid.as_str()),
+                    None,
+                    None,
+                );
+                !sb.projects
+                    .iter()
+                    .any(|p| p.workspaces.iter().any(|w| w.workspace_id == target_ws))
+            }
+        })
+        .await,
+        "archived curated workspace must disappear from sidebar"
+    );
+
+    let err = core2
+        .archive_workspace_confirmed(&host_id2, "ws_nonexistent_p13", false)
+        .await
+        .expect_err("archiving nonexistent workspace must surface RpcError");
+    assert!(
+        err.to_lowercase().contains("not found"),
+        "expected not found error, got: {err}"
+    );
+
+    // Part C: Concurrent OS write flood in brain dir on 2-worker runtime must never deadlock
+    // either Agy prompts or confirmed workspace archive RPCs.
+    let stop_flood = Arc::new(AtomicBool::new(false));
+    let flood_flag = Arc::clone(&stop_flood);
+    let flood_brain = agy_data_dir.join("brain");
+    let flood_handle = std::thread::spawn(move || {
+        let mut seq = 0u64;
+        while !flood_flag.load(Ordering::Relaxed) {
+            let churn_dir =
+                flood_brain.join(format!("p13_flood_{}/.system_generated/logs", seq % 4));
+            let _ = std::fs::create_dir_all(&churn_dir);
+            let file_path = churn_dir.join("transcript_full.jsonl");
+            if let Ok(mut fh) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file_path)
+            {
+                let _ = writeln!(fh, "{{\"step\":{seq}}}");
+            }
+            if seq.is_multiple_of(20) {
+                let _ = std::fs::remove_dir_all(flood_brain.join(format!("p13_flood_{}", seq % 4)));
+            }
+            seq = seq.saturating_add(1);
+        }
+    });
+
+    let part_c_res = tokio::time::timeout(Duration::from_secs(12), async {
+        core2.create_mission_workspace(
+            &host_id2,
+            &work_str,
+            "P13 Flood Workspace".into(),
+            None,
+            WorkspaceIsolation::Local,
+            None,
+            None,
+        );
+        core2.send_prompt(&host_id2, &agent_id, "ECHO=UNDER_WATCH_FLOOD_OK");
+
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                let c = Arc::clone(&core2);
+                let hid = host_id2.clone();
+                let aid = agent_id.clone();
+                async move {
+                    let ws_ready = c
+                        .fleet_sidebar(
+                            SidebarProjectSort::Recent,
+                            SidebarThreadFilter::All,
+                            "",
+                            Some(hid.as_str()),
+                            None,
+                            None,
+                        )
+                        .projects
+                        .iter()
+                        .any(|p| {
+                            p.workspaces
+                                .iter()
+                                .any(|w| w.title == "P13 Flood Workspace")
+                        });
+                    ws_ready
+                        && stage_settled_with_text(&c, &hid, &aid, "REPLY=UNDER_WATCH_FLOOD_OK")
+                }
+            })
+            .await,
+            "prompt and workspace creation must finish promptly during brain watcher write flood"
+        );
+
+        let flood_ws_id = core2
+            .fleet_sidebar(
+                SidebarProjectSort::Recent,
+                SidebarThreadFilter::All,
+                "",
+                Some(host_id2.as_str()),
+                None,
+                None,
+            )
+            .projects
+            .into_iter()
+            .flat_map(|p| p.workspaces)
+            .find(|w| w.title == "P13 Flood Workspace")
+            .expect("flood workspace")
+            .workspace_id;
+
+        core2
+            .archive_workspace_confirmed(&host_id2, &flood_ws_id, false)
+            .await
+            .expect("archive_workspace_confirmed during brain watcher flood must succeed");
+    })
+    .await;
+
+    stop_flood.store(true, Ordering::Relaxed);
+    let _ = flood_handle.join();
+    part_c_res.expect("Part C timed out under AgyBrainWatcher concurrent flood");
+
+    drop_core(core2).await;
+    drop(rt2);
 }

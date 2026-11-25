@@ -531,7 +531,7 @@ async fn run_codex_actor(
             model: resolved_model.clone(),
         })
         .await;
-    if !is_reattached {
+    if !is_reattached || cfg.persisted_initializing {
         let _ = evt_tx
             .send(DriverEvent::StatusChanged(AgentStatus::Idle))
             .await;
@@ -3569,6 +3569,7 @@ mod tests {
             fallback_handoff_context: None,
             persisted_running_bg_tasks: Vec::new(),
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         }
@@ -4164,6 +4165,7 @@ mod tests {
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -4421,6 +4423,7 @@ mod tests {
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };

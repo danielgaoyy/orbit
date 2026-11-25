@@ -44,7 +44,7 @@ orbit sync --mesh
 ```
 
 ### 2. Sync on Desktop / iOS / Android
-Open **Settings → Cloud Sync**, sign in with the same GitHub account, and enter your **Sync Passphrase** (or generated **Recovery Key**) once. All paired hosts, pinned projects, manual order, and preferences appear automatically — no pairing codes required.
+Open **Settings → Cloud Sync** and click **Sign in with GitHub** (Desktop automatically copies the verification code to your clipboard, opens GitHub in your browser, accelerates polling when you return, and brings Orbit back to focus on approval) — or expand **Import from signed-in device** to paste an `orbit://sync-login` Device Link URI. With Dual-Gist Instant Unlock enabled by default, all paired hosts, pinned projects, manual order, and preferences appear automatically (or enter your **Sync Passphrase** / **Recovery Key** if manual passphrase mode is enabled).
 
 ## Mobile replica storage
 

@@ -464,6 +464,12 @@ export interface StageRunningSubagentRef {
   provider_subagent_id?: string | null;
 }
 
+export interface CloudSyncDeviceFlowState extends GitHubDeviceFlowStartView {
+  startedAtMs: number;
+  expiresAtMs: number;
+  clipboardCopied: boolean;
+}
+
 export interface OrbitUiState {
   fleet: FleetOverviewView;
   fleetHydrated: boolean;
@@ -603,7 +609,7 @@ export interface OrbitUiState {
   pathRulesByScope: Record<string, PathRulesSnapshotView>;
   cloudSyncBusy: boolean;
   cloudSyncError: string | null;
-  cloudSyncDeviceFlow: GitHubDeviceFlowStartView | null;
+  cloudSyncDeviceFlow: CloudSyncDeviceFlowState | null;
   cloudSyncLastResult: CloudSyncResultView | null;
 
   // Pure-Rust LSP Language Servers & File Diagnostics

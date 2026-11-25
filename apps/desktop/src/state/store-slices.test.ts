@@ -4,6 +4,12 @@ import path from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  formatDeviceFlowCountdown,
+  waitForNextDevicePoll,
+  type DevicePollDocumentLike,
+  type DevicePollWindowLike,
+} from "./cloud-sync-device-poll.ts";
+import {
   ALL_TOPICS_MASK,
   STATE_KEY_TOPIC,
   STORE_TOPICS,
@@ -385,5 +391,170 @@ describe("Modular store slices & stage extraction contract (B2-07)", () => {
         `Expected stage module ${modFile} to exist`,
       );
     }
+  });
+});
+
+function createFakePollHarness(startMs: number) {
+  let nowMs = startMs;
+  let nextTimerId = 1;
+  const timers = new Map<number, { fireAt: number; cb: () => void; delayMs: number }>();
+  const focusListeners = new Set<() => void>();
+  const visibilityListeners = new Set<() => void>();
+  let visibilityState: DocumentVisibilityState = "hidden";
+
+  const win: DevicePollWindowLike = {
+    addEventListener(_type, listener) {
+      focusListeners.add(listener);
+    },
+    removeEventListener(_type, listener) {
+      focusListeners.delete(listener);
+    },
+    setTimeout(handler, timeoutMs) {
+      const id = nextTimerId++;
+      timers.set(id, { fireAt: nowMs + timeoutMs, cb: handler, delayMs: timeoutMs });
+      return id as unknown as ReturnType<typeof setTimeout>;
+    },
+    clearTimeout(timerId) {
+      timers.delete(timerId as unknown as number);
+    },
+  };
+
+  const doc: DevicePollDocumentLike = {
+    get visibilityState() {
+      return visibilityState;
+    },
+    addEventListener(_type, listener) {
+      visibilityListeners.add(listener);
+    },
+    removeEventListener(_type, listener) {
+      visibilityListeners.delete(listener);
+    },
+  };
+
+  return {
+    win,
+    doc,
+    now: () => nowMs,
+    advance(ms: number, runTimers = true) {
+      nowMs += ms;
+      if (!runTimers) return;
+      for (const [id, entry] of [...timers.entries()]) {
+        if (entry.fireAt <= nowMs) {
+          timers.delete(id);
+          entry.cb();
+        }
+      }
+    },
+    fireFocus() {
+      for (const listener of [...focusListeners]) listener();
+    },
+    setVisibility(next: DocumentVisibilityState) {
+      visibilityState = next;
+      for (const listener of [...visibilityListeners]) listener();
+    },
+    activeTimerDelays: () => [...timers.values()].map((t) => t.delayMs),
+    listenerCounts: () => ({ focus: focusListeners.size, visibility: visibilityListeners.size }),
+    activeTimerCount: () => timers.size,
+  };
+}
+
+describe("GitHub Device Flow polling & countdown", () => {
+  it("formats remaining milliseconds as mm:ss", () => {
+    assert.equal(formatDeviceFlowCountdown(900_000), "15:00");
+    assert.equal(formatDeviceFlowCountdown(65_000), "01:05");
+    assert.equal(formatDeviceFlowCountdown(1_200), "00:02");
+    assert.equal(formatDeviceFlowCountdown(0), "00:00");
+    assert.equal(formatDeviceFlowCountdown(-5_000), "00:00");
+  });
+
+  it("wakes immediately on window focus when background timer was throttled past minIntervalMs", async () => {
+    const h = createFakePollHarness(10_000);
+    const pending = waitForNextDevicePoll({
+      minIntervalMs: 5_000,
+      lastPollAtMs: 10_000,
+      deadlineMs: 910_000,
+      now: h.now,
+      win: h.win,
+      doc: h.doc,
+    });
+    assert.deepEqual(h.activeTimerDelays(), [5_000]);
+
+    // Simulate OS background throttling: 7s elapsed without firing the throttled timer
+    h.advance(7_000, false);
+    h.fireFocus();
+
+    const reason = await pending;
+    assert.equal(reason, "focus");
+    assert.deepEqual(h.listenerCounts(), { focus: 0, visibility: 0 });
+    assert.equal(h.activeTimerCount(), 0);
+  });
+
+  it("respects minIntervalMs and slow_down cooldown even when window refocuses early", async () => {
+    const h = createFakePollHarness(10_000);
+    let resolved: string | null = null;
+    const pending = waitForNextDevicePoll({
+      minIntervalMs: 10_000,
+      lastPollAtMs: 10_000,
+      deadlineMs: 910_000,
+      now: h.now,
+      win: h.win,
+      doc: h.doc,
+    }).then((r) => {
+      resolved = r;
+      return r;
+    });
+
+    // User returns to Orbit after only 3s of a 10s slow_down cooldown
+    h.advance(3_000, false);
+    h.setVisibility("visible");
+    await Promise.resolve();
+
+    // Must NOT have polled early; timer is cleanly rescheduled to the exact 7s remaining cooldown
+    assert.equal(resolved, null);
+    assert.deepEqual(h.activeTimerDelays(), [7_000]);
+
+    // Advance remaining 7s -> resolves cleanly
+    h.advance(7_000, true);
+    assert.equal(await pending, "focus");
+    assert.deepEqual(h.listenerCounts(), { focus: 0, visibility: 0 });
+  });
+
+  it("aborts immediately and removes all listeners and timers on cancel", async () => {
+    const h = createFakePollHarness(10_000);
+    const controller = new AbortController();
+    const pending = waitForNextDevicePoll({
+      minIntervalMs: 5_000,
+      lastPollAtMs: 10_000,
+      deadlineMs: 910_000,
+      signal: controller.signal,
+      now: h.now,
+      win: h.win,
+      doc: h.doc,
+    });
+
+    assert.deepEqual(h.listenerCounts(), { focus: 1, visibility: 1 });
+    assert.equal(h.activeTimerCount(), 1);
+
+    controller.abort();
+    assert.equal(await pending, "aborted");
+    assert.deepEqual(h.listenerCounts(), { focus: 0, visibility: 0 });
+    assert.equal(h.activeTimerCount(), 0);
+  });
+
+  it("resolves expired when deadline is reached before next poll", async () => {
+    const h = createFakePollHarness(10_000);
+    const pending = waitForNextDevicePoll({
+      minIntervalMs: 5_000,
+      lastPollAtMs: 10_000,
+      deadlineMs: 12_000,
+      now: h.now,
+      win: h.win,
+      doc: h.doc,
+    });
+
+    assert.deepEqual(h.activeTimerDelays(), [2_000]);
+    h.advance(2_000, true);
+    assert.equal(await pending, "expired");
+    assert.deepEqual(h.listenerCounts(), { focus: 0, visibility: 0 });
   });
 });

@@ -101,21 +101,26 @@ export async function exerciseLocalSettings(cdp) {
   });
   await open();
 
-  await waitFor("full-window Settings and macOS titlebar clearance", () => {
+  await waitFor("centered floating Settings modal with 240px rail and close button", () => {
     const shell = document.querySelector('[data-slot="settings-view"]');
     const rect = shell?.getBoundingClientRect();
     const rail = shell?.querySelector("aside");
-    const drag = shell?.querySelector("[data-tauri-drag-region]")?.getBoundingClientRect();
-    const back = window.smokeFindControl("button", "Back to app")?.getBoundingClientRect();
-    return rect?.left === 0 && rect.top === 0 && rect.width === innerWidth &&
-      rect.height === innerHeight && rail?.getBoundingClientRect().width === 240 &&
-      drag?.top === 0 && drag.height >= 40 && back && (back.top >= 40 || back.left >= 76);
+    const close = window.smokeFindControl('[data-slot="settings-view"] button', "Close settings");
+    return shell?.getAttribute("role") === "dialog" &&
+      shell.getAttribute("aria-modal") === "true" &&
+      rect && rect.left > 0 && rect.top > 0 &&
+      rect.right < innerWidth && rect.bottom < innerHeight &&
+      rail?.getBoundingClientRect().width === 240 && Boolean(close);
   });
-  const railFits = await evaluate(() => [...document.querySelectorAll("[data-settings-section]")].every((btn) => {
-    const box = btn.getBoundingClientRect();
-    return box.top >= 0 && box.bottom <= innerHeight;
-  }));
-  assert.ok(railFits, "All 16 destinations should fit in a 14-inch viewport");
+  const railFits = await evaluate(() => {
+    const shellRect = document.querySelector('[data-slot="settings-view"]')?.getBoundingClientRect();
+    if (!shellRect) return false;
+    return [...document.querySelectorAll("[data-settings-section]")].every((btn) => {
+      const box = btn.getBoundingClientRect();
+      return box.top >= shellRect.top && box.bottom <= shellRect.bottom;
+    });
+  });
+  assert.ok(railFits, "All 16 destinations should fit inside the Settings modal rail at a 14-inch viewport");
   assert.equal(await evaluate(() => document.documentElement.classList.contains("dark")), false);
   const destinations = await evaluate(() =>
     [...document.querySelectorAll("[data-settings-section]")].map((button) => button.dataset.settingsSection));
@@ -180,9 +185,13 @@ export async function exerciseLocalSettings(cdp) {
 
   await go("im_channels");
   await click('[data-slot="settings-view"] button', "Add Channel");
-  await waitFor("480px channel drawer", () => {
+  await waitFor("480px channel drawer contained inside Settings dialog", () => {
+    const shell = document.querySelector('[data-slot="settings-view"]')?.getBoundingClientRect();
     const box = document.querySelector('[data-slot="setting-drawer"]')?.getBoundingClientRect();
-    return box?.width === 480 && Math.abs(box.right - innerWidth) < 1;
+    return Boolean(shell && box) && box.width === 480 &&
+      Math.abs(box.right - shell.right) < 2 &&
+      Math.abs(box.top - shell.top) < 2 &&
+      Math.abs(box.bottom - shell.bottom) < 2;
   });
   await key("Escape", "Escape");
   await waitFor("drawer closes, Settings stays open", () =>

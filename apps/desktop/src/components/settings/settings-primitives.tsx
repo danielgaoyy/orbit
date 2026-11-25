@@ -307,6 +307,8 @@ export function SettingNavRow(props: ResourceRowProps & { onClick: () => void })
   return <SettingResourceRow {...props} />;
 }
 
+export const SettingsDrawerPortalContext = createContext<HTMLElement | null>(null);
+
 export function SettingDrawer({
   open,
   onOpenChange,
@@ -322,13 +324,23 @@ export function SettingDrawer({
   description?: ReactNode;
   children: ReactNode;
 }) {
+  const portalContainer = useContext(SettingsDrawerPortalContext);
+  const contained = Boolean(portalContainer);
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange} onOpenChangeComplete={onOpenChangeComplete}>
-      <Dialog.Portal>
-        <Dialog.Backdrop className="settings-drawer-scrim bg-ink-primary/15 fixed inset-0 z-50" />
+      <Dialog.Portal container={portalContainer ?? undefined}>
+        <Dialog.Backdrop
+          className={cn(
+            "settings-drawer-scrim bg-ink-primary/15 inset-0 z-50",
+            contained ? "absolute" : "fixed",
+          )}
+        />
         <Dialog.Popup
           data-slot="setting-drawer"
-          className="settings-drawer border-border-default bg-surface-overlay text-ink-primary fixed inset-y-0 right-0 z-50 flex w-[480px] max-w-full flex-col border-l text-[13px] outline-none"
+          className={cn(
+            "settings-drawer border-border-default bg-surface-overlay text-ink-primary inset-y-0 right-0 z-50 flex w-[480px] max-w-full flex-col border-l text-[13px] outline-none",
+            contained ? "absolute shadow-xl" : "fixed",
+          )}
         >
           <header className="border-border-subtle flex items-start gap-4 border-b p-5">
             <div className="min-w-0 flex-1">

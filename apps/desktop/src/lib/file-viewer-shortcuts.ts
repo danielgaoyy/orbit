@@ -4,7 +4,7 @@ export const SIDEBAR_SELECTOR = '[data-orbit-sidebar="true"]';
 export const STAGE_SELECTOR = '[data-orbit-stage="true"]';
 export const COMPOSER_INPUT_SELECTOR = '[data-orbit-composer-input="true"]';
 export const SETTINGS_ESCAPE_OVERLAY_SELECTOR =
-  '[data-slot="dialog-content"], [role="dialog"], [role="alertdialog"], [data-slot="popover-content"], [role="menu"], [role="listbox"]';
+  '[data-slot="dialog-content"], [role="dialog"]:not([data-slot="settings-view"]), [role="alertdialog"], [data-slot="popover-content"], [role="menu"], [role="listbox"]';
 
 export type FileViewerShortcutAction = "find" | "toggle_edit" | "save" | "close_find" | null;
 

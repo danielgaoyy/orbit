@@ -1042,13 +1042,16 @@ html.orbit-linux .animate-spin {
   }
 }
 
-/* Settings has one scrolling canvas per page. Keep its rail usable at laptop heights. */
-.settings-rail-group + .settings-rail-group {
-  margin-top: clamp(6px, 1.6vh, 16px);
+/* Settings modal keeps all 16 flat destinations scannable inside the dialog rail. */
+.settings-rail-group [data-settings-section] {
+  height: 28px;
 }
-@media (max-height: 740px) {
+.settings-rail-group + .settings-rail-group {
+  margin-top: clamp(6px, 1.2vh, 12px);
+}
+@media (max-height: 820px) {
   .settings-rail-group [data-settings-section] { height: 26px; }
-  .settings-rail-group + .settings-rail-group { margin-top: 5px; }
+  .settings-rail-group + .settings-rail-group { margin-top: 6px; }
 }
 .settings-view [data-setting-id] { scroll-margin-block: 24px; }
 .settings-view [data-modified="true"] { box-shadow: inset 2px 0 var(--ink-muted); }
@@ -1070,8 +1073,10 @@ html.orbit-linux .animate-spin {
   opacity: 0.55;
 }
 @media (prefers-reduced-motion: no-preference) {
-  .settings-view { animation: orbit-backdrop-in 170ms var(--ease-panel); }
-  .settings-view[data-closing] { animation: orbit-backdrop-out 160ms var(--ease-exit) forwards; }
+  .settings-backdrop { animation: orbit-backdrop-in 185ms var(--ease-out-quart); }
+  .settings-backdrop[data-closing] { animation: orbit-backdrop-out 155ms var(--ease-exit) forwards; }
+  .settings-dialog { animation: orbit-modal-card-in 200ms var(--ease-out-expo); }
+  .settings-dialog[data-closing] { animation: orbit-modal-card-out 155ms var(--ease-exit) forwards; }
   .settings-drawer { transition: transform 180ms var(--ease-panel), opacity 160ms var(--ease-panel); }
   .settings-drawer[data-starting-style], .settings-drawer[data-ending-style] { transform: translateX(100%); opacity: 0; }
   .settings-drawer-scrim { transition: opacity 160ms var(--ease-panel); }

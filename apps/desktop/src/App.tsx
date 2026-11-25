@@ -345,12 +345,12 @@ function MainDesktopApp() {
   return (
     <TooltipProvider>
       <MarkdownThemeProvider isDark={isDarkTheme}>
-        {/* Dedicated Full-Window Settings Center (`⌘,`) with Smooth Enter/Exit */}
+        {/* Centered Floating Settings Modal (`⌘,`) with Smooth Enter/Exit */}
         {settingsMounted && (
           <PanelErrorBoundary
             panelName="Settings"
             resetKey={`${activeView}:${settingsSection}`}
-            className="bg-canvas fixed inset-0 z-40"
+            className="fixed inset-0 z-40"
           >
             <SettingsView closing={settingsClosing} />
           </PanelErrorBoundary>
@@ -491,27 +491,25 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
 
       <div inert={isSettingsOpen} className="bg-surface-base text-ink-primary relative flex h-screen w-screen overflow-clip">
         {/* Single Stationary Titlebar Sidebar Toggle (`⌘B`) — optically centered with macOS traffic lights */}
-        {!isSettingsOpen && (
-          <div
-            className={cn(
-              "pointer-events-none fixed top-0 z-30 flex h-[40px] items-center",
-              isMac ? "left-[80px] translate-y-[1px]" : "left-[12px]",
-            )}
+        <div
+          className={cn(
+            "pointer-events-none fixed top-0 z-30 flex h-[40px] items-center",
+            isMac ? "left-[80px] translate-y-[1px]" : "left-[12px]",
+          )}
+        >
+          <IconButton
+            size="md"
+            tooltip={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
+            shortcut={toggleSidebarShortcut}
+            onClick={() => orbitActions.toggleSidebar()}
+            className="pointer-events-auto"
           >
-            <IconButton
-              size="md"
-              tooltip={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
-              shortcut={toggleSidebarShortcut}
-              onClick={() => orbitActions.toggleSidebar()}
-              className="pointer-events-auto"
-            >
-              <PanelLeft className="size-[16px] stroke-[1.75]" />
-            </IconButton>
-          </div>
-        )}
+            <PanelLeft className="size-[16px] stroke-[1.75]" />
+          </IconButton>
+        </div>
 
         {/* Single Stationary Top-Right Side Panel Toggle (`⌘\`) */}
-        {!isSettingsOpen && hasSelectedHost && (
+        {hasSelectedHost && (
           <div
             className={cn(
               "pointer-events-none fixed top-0 right-[10px] z-30 flex h-[40px] items-center",

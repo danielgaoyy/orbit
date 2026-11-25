@@ -1,6 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import {
-  ArrowLeft,
   BarChart3,
   Bell,
   Blocks,
@@ -53,6 +52,7 @@ import {
   HostStatusIndicator,
   ModifiedSettingsContext,
   SettingPageHeader,
+  SettingsDrawerPortalContext,
   settingsHostTransport,
 } from "./settings-primitives";
 import { ShortcutsSection } from "./shortcuts-section";
@@ -127,10 +127,7 @@ function ScopeBar({
 }) {
   const { t } = useI18n();
   return (
-    <div
-      data-slot="settings-scope-bar"
-      className="border-border-subtle flex h-[40px] shrink-0 items-center border-b px-6"
-    >
+    <div data-slot="settings-scope-bar" className="flex min-w-0 items-center">
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button
@@ -239,9 +236,10 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
   const scoped = scopedPages.has(coreSection);
   const splitEditor = coreSection === "instructions_memory" && subTab !== "rules" && subTab !== "memory";
 
-  const back = useRef<HTMLButtonElement>(null);
+  const closeBtn = useRef<HTMLButtonElement>(null);
   const search = useRef<HTMLInputElement>(null);
   const canvas = useRef<HTMLDivElement>(null);
+  const [dialogHost, setDialogHost] = useState<HTMLDivElement | null>(null);
   const [query, setQuery] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [jump, setJump] = useState<{ section: typeof section; id: string } | null>(null);
@@ -277,7 +275,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
   };
 
   useLayoutEffect(() => {
-    back.current?.focus({ preventScroll: true });
+    closeBtn.current?.focus({ preventScroll: true });
   }, []);
   useLayoutEffect(() => {
     if (canvas.current) canvas.current.scrollTop = 0;
@@ -396,190 +394,216 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
     }
   };
 
+  const showScopeBar =
+    scoped &&
+    orderedHosts.length > 0 &&
+    (orderedHosts.length > 1 || !isLocalHostCard(orderedHosts[0]));
+
   return (
     <ModifiedSettingsContext.Provider value={preferences}>
-      <div
-        data-slot="settings-view"
-        data-closing={closing || undefined}
-        inert={closing}
-        aria-label={t("common.settings")}
-        className="settings-view bg-surface-base text-ink-primary fixed inset-0 z-40 flex flex-col overflow-hidden text-[13px] select-none"
-      >
-        {isMacDesktop() && <div data-tauri-drag-region className="h-[40px] shrink-0" />}
-        <div className="flex min-h-0 flex-1">
-          <aside className="border-border-subtle flex w-[240px] max-w-[42vw] shrink-0 flex-col border-r px-[12px] pt-2">
-            <Button
-              ref={back}
-              variant="ghost"
-              onClick={() => orbitActions.closeSettings()}
-              className="mb-3 w-full justify-start px-2.5"
-            >
-              <ArrowLeft className="size-[15px]" />
-              <span>{t("settings.backToApp")}</span>
-              <Kbd variant="subtle" size="xs" className="ml-auto text-[11px]">
-                Esc
-              </Kbd>
-            </Button>
-            <div className="relative mb-3 flex items-center">
-              <Search
-                aria-hidden
-                className="text-ink-muted pointer-events-none absolute left-2.5 size-[14px]"
-              />
-              <Input
-                ref={search}
-                aria-label={t("settings.searchAria")}
-                placeholder={t("settings.searchPlaceholder")}
-                value={query}
-                onChange={(event) => updateQuery(event.target.value)}
-                onKeyDown={searchKeys}
-                aria-controls={searching ? "settings-results" : undefined}
-                aria-activedescendant={searching && selected >= 0 ? `settings-result-${selected}` : undefined}
-                className={cn(
-                  "h-[32px] pl-[28px] text-[13px] shadow-none",
-                  query ? "pr-[52px]" : "pr-[64px]",
-                )}
-              />
-              <div className="absolute right-[4px] flex items-center gap-0.5">
-                {query ? (
+      <SettingsDrawerPortalContext.Provider value={dialogHost}>
+        <div
+          data-slot="settings-backdrop"
+          data-closing={closing || undefined}
+          inert={closing}
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !hasOpenSettingsBlockingOverlay()) {
+              orbitActions.closeSettings();
+            }
+          }}
+          className="settings-backdrop fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-5 select-none dark:bg-black/55"
+        >
+          <div
+            ref={setDialogHost}
+            role="dialog"
+            aria-modal="true"
+            aria-label={t("common.settings")}
+            data-slot="settings-view"
+            data-closing={closing || undefined}
+            className="settings-view settings-dialog border-border-default bg-surface-base text-ink-primary floating-surface relative flex h-[min(820px,88vh)] w-[min(1180px,92vw)] overflow-hidden rounded-[16px] border text-[13px]"
+          >
+            <aside className="border-border-subtle flex w-[240px] max-w-[38vw] shrink-0 flex-col border-r px-[12px] pt-[14px]">
+              <div className="text-ink-primary px-2 pb-2.5 text-[15px] leading-[20px] font-semibold tracking-[-0.015em]">
+                {t("common.settings")}
+              </div>
+              <div className="relative mb-2.5 flex items-center">
+                <Search
+                  aria-hidden
+                  className="text-ink-muted pointer-events-none absolute left-2.5 size-[14px]"
+                />
+                <Input
+                  ref={search}
+                  aria-label={t("settings.searchAria")}
+                  placeholder={t("settings.searchPlaceholder")}
+                  value={query}
+                  onChange={(event) => updateQuery(event.target.value)}
+                  onKeyDown={searchKeys}
+                  aria-controls={searching ? "settings-results" : undefined}
+                  aria-activedescendant={searching && selected >= 0 ? `settings-result-${selected}` : undefined}
+                  className={cn(
+                    "h-[30px] pl-[28px] text-[13px] shadow-none",
+                    query ? "pr-[52px]" : "pr-[64px]",
+                  )}
+                />
+                <div className="absolute right-[4px] flex items-center gap-0.5">
+                  {query ? (
+                    <IconButton
+                      size="xs"
+                      tooltip={t("settings.clearSearch")}
+                      onClick={() => {
+                        updateQuery("");
+                        search.current?.focus();
+                      }}
+                    >
+                      <X />
+                    </IconButton>
+                  ) : (
+                    <Kbd variant="subtle" size="xs" className="text-[11px]">
+                      {modSymbol()}F
+                    </Kbd>
+                  )}
                   <IconButton
                     size="xs"
-                    tooltip={t("settings.clearSearch")}
+                    tooltip={t("settings.showModified")}
+                    aria-pressed={filtered}
+                    active={filtered}
                     onClick={() => {
-                      updateQuery("");
+                      updateQuery(
+                        filtered ? query.replace(modifiedFilter, " ").trim() : ("@modified " + query).trim(),
+                      );
                       search.current?.focus();
                     }}
                   >
-                    <X />
+                    <ListFilter />
                   </IconButton>
-                ) : (
-                  <Kbd variant="subtle" size="xs" className="text-[11px]">
-                    {modSymbol()}F
-                  </Kbd>
-                )}
-                <IconButton
-                  size="xs"
-                  tooltip={t("settings.showModified")}
-                  aria-pressed={filtered}
-                  active={filtered}
-                  onClick={() => {
-                    updateQuery(
-                      filtered ? query.replace(modifiedFilter, " ").trim() : ("@modified " + query).trim(),
-                    );
-                    search.current?.focus();
-                  }}
-                >
-                  <ListFilter />
-                </IconButton>
-              </div>
-            </div>
-            <nav
-              aria-label={t("common.settings")}
-              className="orbit-native-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain pb-3"
-            >
-              {searching ? (
-                <div id="settings-results">
-                  <p className="text-ink-muted px-2 pb-1 text-[11px] font-semibold">
-                    {t("settings.searchResultsLabel")}
-                  </p>
-                  {results.map((result, index) => {
-                    const label = t(result.labelKey);
-                    return (
-                      <div key={result.id} className="group/result flex items-center">
-                        <ListRow
-                          id={`settings-result-${index}`}
-                          selected={index === selected}
-                          subtitle={result.parentLabelKey && t(result.parentLabelKey)}
-                          onMouseEnter={() => setSelectedIndex(index)}
-                          onClick={() => selectResult(result)}
-                        >
-                          {label}
-                        </ListRow>
-                        {result.settingId && preferences.modifiedIds.has(result.settingId) && (
-                          <IconButton
-                            size="xs"
-                            aria-label={t("settings.resetNamed", { name: label })}
-                            onClick={() => preferences.reset(result.settingId!)}
-                          >
-                            <RotateCcw />
-                          </IconButton>
-                        )}
-                      </div>
-                    );
-                  })}
-                  {!results.length && (
-                    <p className="text-ink-muted px-2 py-3 text-[13px]">{t("settings.noMatches")}</p>
-                  )}
                 </div>
-              ) : (
-                SETTINGS_NAV_GROUPS.map((group) => (
-                  <section key={group.id} className="settings-rail-group">
-                    <h2 className="text-ink-muted px-2 pb-1 text-[11px] leading-[16px] font-semibold tracking-[0.05em] uppercase">
-                      {t(group.labelKey)}
-                    </h2>
-                    {SETTINGS_CORE_SECTIONS.filter((item) => item.group === group.id).map((item) => {
-                      const Icon = icons[item.id];
+              </div>
+              <nav
+                aria-label={t("common.settings")}
+                className="orbit-native-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain pb-3"
+              >
+                {searching ? (
+                  <div id="settings-results">
+                    <p className="text-ink-muted px-2 pb-1 text-[11px] font-semibold">
+                      {t("settings.searchResultsLabel")}
+                    </p>
+                    {results.map((result, index) => {
+                      const label = t(result.labelKey);
                       return (
-                        <ListRow
-                          key={item.id}
-                          data-settings-section={item.id}
-                          selected={coreSection === item.id}
-                          aria-current={coreSection === item.id ? "page" : undefined}
-                          leading={<Icon className="size-[15px] stroke-[1.7]" />}
-                          onClick={() => navigate(item.id)}
-                        >
-                          {t(item.labelKey)}
-                        </ListRow>
+                        <div key={result.id} className="group/result flex items-center">
+                          <ListRow
+                            id={`settings-result-${index}`}
+                            selected={index === selected}
+                            subtitle={result.parentLabelKey && t(result.parentLabelKey)}
+                            onMouseEnter={() => setSelectedIndex(index)}
+                            onClick={() => selectResult(result)}
+                          >
+                            {label}
+                          </ListRow>
+                          {result.settingId && preferences.modifiedIds.has(result.settingId) && (
+                            <IconButton
+                              size="xs"
+                              aria-label={t("settings.resetNamed", { name: label })}
+                              onClick={() => preferences.reset(result.settingId!)}
+                            >
+                              <RotateCcw />
+                            </IconButton>
+                          )}
+                        </div>
                       );
                     })}
-                  </section>
-                ))
-              )}
-            </nav>
-          </aside>
-          <main className="flex min-h-0 min-w-0 flex-1 flex-col">
-            {scoped &&
-              orderedHosts.length > 0 &&
-              (orderedHosts.length > 1 || !isLocalHostCard(orderedHosts[0])) && (
-                <ScopeBar
-                  hosts={orderedHosts}
-                  activeHost={activeHost}
-                  onChange={(id) => {
-                    setPickedHostId(id);
-                    if (instructionsTarget) orbitActions.setInstructionsTarget(null);
-                    navigate(subTab ?? coreSection, id);
-                  }}
-                />
-              )}
-            <div
-              ref={canvas}
-              data-settings-canvas=""
-              tabIndex={-1}
-              className={cn(
-                "orbit-native-scroll min-h-0 flex-1 px-[clamp(16px,4vw,56px)] pt-[24px] pb-[32px] outline-none",
-                splitEditor ? "flex flex-col overflow-hidden" : "overflow-y-auto overscroll-contain",
-              )}
-            >
+                    {!results.length && (
+                      <p className="text-ink-muted px-2 py-3 text-[13px]">{t("settings.noMatches")}</p>
+                    )}
+                  </div>
+                ) : (
+                  SETTINGS_NAV_GROUPS.map((group) => (
+                    <section key={group.id} className="settings-rail-group">
+                      <h2 className="text-ink-muted px-2 pb-1 text-[11px] leading-[16px] font-semibold tracking-[0.05em] uppercase">
+                        {t(group.labelKey)}
+                      </h2>
+                      {SETTINGS_CORE_SECTIONS.filter((item) => item.group === group.id).map((item) => {
+                        const Icon = icons[item.id];
+                        return (
+                          <ListRow
+                            key={item.id}
+                            data-settings-section={item.id}
+                            selected={coreSection === item.id}
+                            aria-current={coreSection === item.id ? "page" : undefined}
+                            leading={<Icon className="size-[15px] stroke-[1.7]" />}
+                            onClick={() => navigate(item.id)}
+                          >
+                            {t(item.labelKey)}
+                          </ListRow>
+                        );
+                      })}
+                    </section>
+                  ))
+                )}
+              </nav>
+            </aside>
+            <main className="flex min-h-0 min-w-0 flex-1 flex-col">
               <div
                 className={cn(
-                  "mx-auto w-full",
-                  splitEditor
-                    ? "flex min-h-0 flex-1 flex-col"
-                    : widePages.has(coreSection)
-                      ? "max-w-[960px]"
-                      : "max-w-[720px]",
+                  "flex h-[44px] shrink-0 items-center justify-between gap-3 px-5",
+                  showScopeBar && "border-border-subtle border-b",
                 )}
               >
-                <PanelErrorBoundary
-                  key={`${coreSection}:${scoped || coreSection === "hosts" ? hostId : ""}`}
-                  panelName={pageLabel}
+                {showScopeBar ? (
+                  <ScopeBar
+                    hosts={orderedHosts}
+                    activeHost={activeHost}
+                    onChange={(id) => {
+                      setPickedHostId(id);
+                      if (instructionsTarget) orbitActions.setInstructionsTarget(null);
+                      navigate(subTab ?? coreSection, id);
+                    }}
+                  />
+                ) : (
+                  <div />
+                )}
+                <IconButton
+                  ref={closeBtn}
+                  size="md"
+                  tooltip={t("settings.closeSettings")}
+                  shortcut="Esc"
+                  onClick={() => orbitActions.closeSettings()}
                 >
-                  {renderPage()}
-                </PanelErrorBoundary>
+                  <X className="size-[15px]" />
+                </IconButton>
               </div>
-            </div>
-          </main>
+              <div
+                ref={canvas}
+                data-settings-canvas=""
+                tabIndex={-1}
+                className={cn(
+                  "orbit-native-scroll min-h-0 flex-1 px-[clamp(20px,3vw,40px)] pb-[32px] outline-none",
+                  showScopeBar ? "pt-[20px]" : "pt-[4px]",
+                  splitEditor ? "flex flex-col overflow-hidden" : "overflow-y-auto overscroll-contain",
+                )}
+              >
+                <div
+                  className={cn(
+                    "mx-auto w-full",
+                    splitEditor
+                      ? "flex min-h-0 flex-1 flex-col"
+                      : widePages.has(coreSection)
+                        ? "max-w-[880px]"
+                        : "max-w-[680px]",
+                  )}
+                >
+                  <PanelErrorBoundary
+                    key={`${coreSection}:${scoped || coreSection === "hosts" ? hostId : ""}`}
+                    panelName={pageLabel}
+                  >
+                    {renderPage()}
+                  </PanelErrorBoundary>
+                </div>
+              </div>
+            </main>
+          </div>
         </div>
-      </div>
+      </SettingsDrawerPortalContext.Provider>
     </ModifiedSettingsContext.Provider>
   );
 }

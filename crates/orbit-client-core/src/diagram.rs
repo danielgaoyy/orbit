@@ -1003,7 +1003,7 @@ fn compute_graphviz_geometry_bounds(svg: &str) -> Option<(f32, f32, f32, f32)> {
         } else if starts_with_ascii_ci(tag, "<polygon") || starts_with_ascii_ci(tag, "<polyline") {
             if let Some(pts) = extract_attr_value_ci(tag, "points") {
                 let nums = extract_float_sequence(pts);
-                for pair in nums.chunks_exact(2) {
+                for pair in nums.as_chunks::<2>().0 {
                     include_point(pair[0], pair[1]);
                 }
             }
@@ -1012,7 +1012,7 @@ fn compute_graphviz_geometry_bounds(svg: &str) -> Option<(f32, f32, f32, f32)> {
         {
             // `layout-rs` emits absolute `M x y`, `L x y`, `C x1 y1 x2 y2 x y` path commands.
             let nums = extract_float_sequence(d);
-            for pair in nums.chunks_exact(2) {
+            for pair in nums.as_chunks::<2>().0 {
                 include_point(pair[0], pair[1]);
             }
         }
@@ -2977,7 +2977,7 @@ mod tests {
             edge_count += 1;
             if let Some(d) = extract_attr_value_ci(tag, "d") {
                 let coords = extract_float_sequence(d);
-                let xs: Vec<f32> = coords.chunks_exact(2).map(|p| p[0]).collect();
+                let xs: Vec<f32> = coords.as_chunks::<2>().0.iter().map(|p| p[0]).collect();
                 for win in xs.windows(2) {
                     assert!(
                         win[1] + 2.0 >= win[0],

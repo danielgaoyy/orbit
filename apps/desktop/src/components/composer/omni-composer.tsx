@@ -1758,6 +1758,7 @@ export const OmniComposer = memo(function OmniComposer({
     try {
       await session.start({
         language: voiceLang,
+        deviceId: orbitActions.getSnapshot().voiceInputDeviceId,
         onLevel: (lvl) => setVoiceLevel(lvl),
         onInterimTranscript: (txt) => setVoiceInterimText(txt),
       });

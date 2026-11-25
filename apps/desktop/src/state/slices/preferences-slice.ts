@@ -309,6 +309,15 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
     },
 
 
+    setVoiceInputDeviceId(deviceId: string | null): void {
+      const normalized =
+        typeof deviceId === "string" && deviceId.trim().length > 0 && deviceId !== "default"
+          ? deviceId.trim()
+          : null;
+      setState((s) => ({ ...s, voiceInputDeviceId: normalized }), true);
+    },
+
+
     setTerminalPrefs(_patch: {
       fontSize?: number;
       cursorStyle?: TerminalCursorStyle;

@@ -17,6 +17,7 @@ export const preferenceDefaults = {
   coalesceExploration: true,
   worktreeBranchPrefix: "auto",
   preferredEditor: null,
+  voiceInputDeviceId: null,
   terminalFontSize: 13,
   terminalCursorStyle: "bar",
   terminalScrollback: 5000,

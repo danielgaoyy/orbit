@@ -85,6 +85,67 @@ function decodeBase64ToBytes(b64: string): Uint8Array {
   return bytes;
 }
 
+export interface AudioInputDeviceInfo {
+  deviceId: string;
+  label: string;
+}
+
+export async function listAudioInputDevices(): Promise<{
+  devices: AudioInputDeviceInfo[];
+  needsPermission: boolean;
+  supported: boolean;
+}> {
+  if (typeof navigator === "undefined" || !navigator.mediaDevices?.enumerateDevices) {
+    return { devices: [], needsPermission: false, supported: false };
+  }
+  const all = await navigator.mediaDevices.enumerateDevices();
+  const seen = new Set<string>();
+  const devices: AudioInputDeviceInfo[] = [];
+  let hasUnlabeledInput = false;
+
+  for (const dev of all) {
+    if (dev.kind !== "audioinput") continue;
+    const id = dev.deviceId?.trim() ?? "";
+    if (!dev.label.trim()) hasUnlabeledInput = true;
+    if (!id || id === "default" || id === "communications" || seen.has(id)) continue;
+    seen.add(id);
+    devices.push({ deviceId: id, label: dev.label.trim() });
+  }
+
+  return {
+    devices,
+    needsPermission: hasUnlabeledInput && devices.every((d) => !d.label),
+    supported: true,
+  };
+}
+
+export async function requestMicrophoneLabels(): Promise<{
+  devices: AudioInputDeviceInfo[];
+  granted: boolean;
+}> {
+  if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+    return { devices: [], granted: false };
+  }
+  let stream: MediaStream | null = null;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch {
+    return { devices: [], granted: false };
+  } finally {
+    if (stream) {
+      for (const track of stream.getTracks()) {
+        try {
+          track.stop();
+        } catch {
+          // Ignore track stop errors
+        }
+      }
+    }
+  }
+  const listed = await listAudioInputDevices();
+  return { devices: listed.devices, granted: true };
+}
+
 export class VoiceRecorderSession {
   private stream: MediaStream | null = null;
   private audioCtx: AudioContext | null = null;
@@ -102,14 +163,18 @@ export class VoiceRecorderSession {
 
   async start(options: {
     language?: string | null;
+    deviceId?: string | null;
     onLevel?: (level: number) => void;
     onInterimTranscript?: (text: string) => void;
   }): Promise<void> {
     if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
       throw new Error("Microphone capture is unavailable in this environment");
     }
+    const preferredDeviceId =
+      options.deviceId && options.deviceId !== "default" ? options.deviceId : null;
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
+        ...(preferredDeviceId ? { deviceId: { ideal: preferredDeviceId } } : {}),
         channelCount: 1,
         echoCancellation: true,
         noiseSuppression: true,

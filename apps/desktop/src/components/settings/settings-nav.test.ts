@@ -111,7 +111,7 @@ describe("Settings search", () => {
   it("matches individual settings, localized labels and keywords across all language choices", () => {
     const cases: [string, string | undefined][] = [
       ["diff layout", "settings.diffLayout"], ["分支前缀", "settings.branchPrefix"],
-      ["音声認識", "voice.sttBackendTitle"], ["whisper", "voice.sttBackendTitle"],
+      ["入力マイク", "voice.microphoneTitle"], ["microphone", "voice.microphoneTitle"],
       ["keep awake", "settings.agentKeepAwake"], ["cloudflare", "settings.advancedRelayTitle"],
       ["CLAUDE.md", "settings.subTabInstructions"], ["飞书", "im.configuredChannels"],
       ["oauth-unused-term", undefined], ["   ", undefined],

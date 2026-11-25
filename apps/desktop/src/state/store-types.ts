@@ -715,6 +715,7 @@ export interface OrbitUiState {
   coalesceExploration: boolean;
   worktreeBranchPrefix: string;
   preferredEditor: ExternalEditorKind | null;
+  voiceInputDeviceId: string | null;
   terminalFontSize: number;
   terminalCursorStyle: TerminalCursorStyle;
   terminalScrollback: number;
@@ -738,6 +739,7 @@ export interface PersistedPrefs {
   coalesceExploration?: boolean;
   worktreeBranchPrefix?: string;
   preferredEditor?: ExternalEditorKind | null;
+  voiceInputDeviceId?: string | null;
   terminalFontSize?: number;
   terminalCursorStyle?: TerminalCursorStyle;
   terminalScrollback?: number;

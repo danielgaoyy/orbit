@@ -34,12 +34,10 @@ export const SETTING_ENTRIES = [
   ["notifications", "settings.pushQuietHours", "mobile quiet hours 移动免打扰 モバイル静音"],
   ["notifications", "settings.pushRegisteredDevices", "registered phone devices 已注册设备 登録端末"],
 
-  ["voice", "voice.enableTitle", "dictation speech microphone 语音听写 音声入力"],
+  ["voice", "voice.enableTitle", "dictation speech voice control 语音听写 音声入力"],
+  ["voice", "voice.microphoneTitle", "input microphone audio device airpods 麦克风 音频输入 マイク 入力デバイス"],
   ["voice", "voice.languageTitle", "dictation language 识别语言 認識言語"],
   ["voice", "voice.autoSpeakTitle", "read aloud speak responses 朗读 音声読み上げ"],
-  ["voice", "voice.sttBackendTitle", "whisper speech to text 语音转文字 音声認識"],
-  ["voice", "voice.ttsBackendTitle", "tts text to speech 文本转语音 音声合成"],
-  ["voice", "voice.sectionModels", "download voice models 语音模型 音声モデル"],
 
   ["cloud_sync", "settings.cloudSyncTitle", "encrypted sync status 云同步状态 クラウド同期"],
   ["cloud_sync", "settings.signInGithub", "github authentication sign in 登录 ログイン"],

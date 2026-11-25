@@ -159,6 +159,7 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   coalesceExploration: "preferences",
   worktreeBranchPrefix: "preferences",
   preferredEditor: "preferences",
+  voiceInputDeviceId: "preferences",
   terminalFontSize: "preferences",
   terminalCursorStyle: "preferences",
   terminalScrollback: "preferences",

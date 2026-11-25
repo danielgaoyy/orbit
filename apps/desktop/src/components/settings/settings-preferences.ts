@@ -27,6 +27,7 @@ const resettable: readonly ResettableSetting[] = [
   preference("settings.groupTheme", "theme", orbitActions.setTheme),
   preference("settings.diffLayout", "diffLayout", orbitActions.setDiffLayout),
   preference("settings.externalEditor", "preferredEditor", orbitActions.setPreferredEditor),
+  preference("voice.microphoneTitle", "voiceInputDeviceId", orbitActions.setVoiceInputDeviceId),
   preference("settings.defaultPermissions", "draftMode", (mode) => orbitActions.setDraftConfig({ mode })),
   preference("im.defaultProvider", "draftProvider", (provider) => orbitActions.setDraftConfig({ provider })),
   preference("settings.isolateWorktrees", "draftUseWorktree", (useWorktree) => orbitActions.setDraftConfig({ useWorktree })),

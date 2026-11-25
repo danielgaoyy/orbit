@@ -163,6 +163,7 @@ export function buildPersistedPrefsPayload(snap: OrbitUiState): PersistedPrefs {
     coalesceExploration: snap.coalesceExploration,
     worktreeBranchPrefix: snap.worktreeBranchPrefix,
     preferredEditor: snap.preferredEditor,
+    voiceInputDeviceId: snap.voiceInputDeviceId,
     terminalFontSize: snap.terminalFontSize,
     terminalCursorStyle: snap.terminalCursorStyle,
     terminalScrollback: snap.terminalScrollback,
@@ -736,6 +737,12 @@ export function createDefaultInitialState(
     coalesceExploration: initialPrefs.coalesceExploration ?? preferenceDefaults.coalesceExploration,
     worktreeBranchPrefix: initialPrefs.worktreeBranchPrefix ?? preferenceDefaults.worktreeBranchPrefix,
     preferredEditor: initialPrefs.preferredEditor ?? preferenceDefaults.preferredEditor,
+    voiceInputDeviceId:
+      typeof initialPrefs.voiceInputDeviceId === "string" &&
+      initialPrefs.voiceInputDeviceId.trim().length > 0 &&
+      initialPrefs.voiceInputDeviceId !== "default"
+        ? initialPrefs.voiceInputDeviceId
+        : preferenceDefaults.voiceInputDeviceId,
     terminalFontSize: preferenceDefaults.terminalFontSize,
     terminalCursorStyle: preferenceDefaults.terminalCursorStyle,
     terminalScrollback: preferenceDefaults.terminalScrollback,

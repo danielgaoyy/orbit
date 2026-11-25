@@ -182,10 +182,14 @@ export async function exerciseLocalSettings(cdp) {
     const permission = typeof Notification !== "undefined" ? Notification.permission : "unsupported";
     const sw = document.querySelector('[data-setting-id="settings.notifyApproval"] [role="switch"]');
     const soundBtn = document.querySelector('[data-setting-id="settings.notificationSoundTitle"] button');
-    const mobilePreviewSw = document.querySelector('[data-setting-id="settings.pushMessagePreview"] [role="switch"]');
-    if (!sw || !soundBtn || !mobilePreviewSw) return { ok: false, reason: "missing notifications controls" };
+    const mobileControls = [
+      "settings.pushEnabled",
+      "settings.pushMessagePreview",
+      "settings.pushQuietHours",
+      "settings.pushRegisteredDevices",
+    ].filter((id) => Boolean(document.querySelector(`[data-setting-id="${id}"]`)));
+    if (!sw || !soundBtn) return { ok: false, reason: "missing notifications controls" };
     const swRect = sw.getBoundingClientRect();
-    const mRect = mobilePreviewSw.getBoundingClientRect();
     return {
       ok: true,
       permission,
@@ -194,13 +198,15 @@ export async function exerciseLocalSettings(cdp) {
       desktopBefore: sw.getAttribute("aria-checked"),
       soundBtnDisabled: Boolean(soundBtn.disabled),
       desktopPoint: { x: swRect.left + swRect.width / 2, y: swRect.top + swRect.height / 2 },
-      mobilePreviewDisabled: mobilePreviewSw.hasAttribute("data-disabled"),
-      mobilePreviewOpacity: Number.parseFloat(getComputedStyle(mobilePreviewSw).opacity),
-      mobilePreviewBefore: mobilePreviewSw.getAttribute("aria-checked"),
-      mobilePoint: { x: mRect.left + mRect.width / 2, y: mRect.top + mRect.height / 2 },
+      mobileControls,
     };
   });
   assert.ok(notifDisabledCheck.ok, `Notifications disabled check setup failed: ${notifDisabledCheck.reason}`);
+  assert.deepEqual(
+    notifDisabledCheck.mobileControls,
+    [],
+    "Desktop Notifications settings must not render mobile push controls",
+  );
   if (notifDisabledCheck.permission === "denied" || notifDisabledCheck.permission === "unsupported") {
     assert.equal(notifDisabledCheck.desktopDisabled, true, "Blocked desktop notification switches must be disabled");
     assert.ok(notifDisabledCheck.desktopOpacity < 0.6, `Blocked desktop notification switch must dim (got opacity=${notifDisabledCheck.desktopOpacity})`);
@@ -213,18 +219,6 @@ export async function exerciseLocalSettings(cdp) {
       await evaluate(() => document.querySelector('[data-setting-id="settings.notifyApproval"] [role="switch"]')?.getAttribute("aria-checked")),
       notifDisabledCheck.desktopBefore,
       "Clicking a disabled Notifications desktop switch must never toggle its state",
-    );
-  }
-  if (notifDisabledCheck.mobilePreviewDisabled) {
-    assert.ok(notifDisabledCheck.mobilePreviewOpacity < 0.6, `Disabled mobile push switch must dim (got opacity=${notifDisabledCheck.mobilePreviewOpacity})`);
-    await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", ...notifDisabledCheck.mobilePoint });
-    for (const type of ["mousePressed", "mouseReleased"]) {
-      await cdp.send("Input.dispatchMouseEvent", { type, ...notifDisabledCheck.mobilePoint, button: "left", clickCount: 1 });
-    }
-    assert.equal(
-      await evaluate(() => document.querySelector('[data-setting-id="settings.pushMessagePreview"] [role="switch"]')?.getAttribute("aria-checked")),
-      notifDisabledCheck.mobilePreviewBefore,
-      "Clicking a disabled mobile push switch must never toggle its state",
     );
   }
 

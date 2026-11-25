@@ -31,10 +31,6 @@ export const SETTING_ENTRIES = [
   ["notifications", "settings.notifyGoalFinished", "goal finished notification 目标完成 目標完了"],
   ["notifications", "settings.notificationSoundTitle", "notification sound chime 声音 音"],
   ["notifications", "settings.notifyQuietHours", "desktop quiet hours do not disturb 免打扰 勿扰 おやすみ"],
-  ["notifications", "settings.pushEnabled", "mobile background push 移动推送 プッシュ通知"],
-  ["notifications", "settings.pushMessagePreview", "push message preview 消息预览 通知プレビュー"],
-  ["notifications", "settings.pushQuietHours", "mobile quiet hours 移动免打扰 モバイル静音"],
-  ["notifications", "settings.pushRegisteredDevices", "registered phone devices 已注册设备 登録端末"],
 
   ["voice", "voice.enableTitle", "dictation speech voice control 语音听写 音声入力"],
   ["voice", "voice.microphoneTitle", "input microphone audio device airpods 麦克风 音频输入 マイク 入力デバイス"],

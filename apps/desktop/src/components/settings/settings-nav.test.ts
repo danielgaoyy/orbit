@@ -128,6 +128,8 @@ describe("Settings search", () => {
     assert.equal(searchSettingsEntries("分支前缀", { t })[0]?.target, "git_worktrees");
     assert.equal(searchSettingsEntries("collapse exploration", { t })[0]?.target, "appearance");
     assert.equal(searchSettingsEntries("项目记忆", { t }).some((hit) => hit.settingId === "memory.title"), true);
+    assert.equal(searchSettingsEntries("mobile push", { t }).length, 0);
+    assert.equal(searchSettingsEntries("desktop quiet hours", { t })[0]?.settingId, "settings.notifyQuietHours");
   });
 
   it("omits native-only controls when searching from the web client", () => {

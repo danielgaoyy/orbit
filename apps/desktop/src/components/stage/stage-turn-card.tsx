@@ -310,9 +310,13 @@ export const TurnStageSection = memo(function TurnStageSection({
 
   const isWaitingOnlyOnBackgroundTasks =
     hasLiveBackgroundTasks &&
-    ((lastRawSeg?.kind === "wakeup" && isWaitingWakeupLabel(lastRawSeg.label)) ||
+    ((lastRawSeg?.kind === "wakeup" &&
+      (isWaitingWakeupLabel(lastRawSeg.label) || /background task/i.test(lastRawSeg.label))) ||
       (Boolean(agentStatusLabel && /background task/i.test(agentStatusLabel)) &&
         (lastRawSeg === null ||
+          lastRawSeg.kind === "wakeup" ||
+          lastRawSeg.kind === "notice" ||
+          lastRawSeg.kind === "agent_message" ||
           (lastRawSeg.kind === "assistant_message" &&
             lastRawSeg.item.item_type === "assistant_message" &&
             !lastRawSeg.item.streaming))));

@@ -2603,4 +2603,19 @@ export const ja: MessageDictionary = {
   "settings.deployCfConfirmTitle": "{alias} を Cloudflare Tunnel 経由で公開しますか？",
   "settings.deployCfConfirmDesc":
     "{alias} にローカル専用リレー (127.0.0.1:7878) と cloudflared トンネルを構築し（インバウンド開放ポート不要）、全 {count} 台へ自動適用します。",
+
+  // タイムラインのサブエージェント起動行と下部アクティビティ波紋
+  "stage.dispatchedSubagent": "{name} を起動",
+  "stage.dispatchedTwoSubagents": "{first}、{second} を起動",
+  "stage.dispatchedManySubagents": "{count} 個のサブエージェントを起動",
+  "stage.subagentsAwaitingSuffix": "{count} 件承認待ち",
+  "stage.activitySubagentAwaitingOne": "サブエージェント 1 件承認待ち",
+  "stage.activitySubagentAwaitingMany": "サブエージェント {count} 件承認待ち",
+  "stage.activitySubagentRunningOne": "サブエージェント 1 件実行中",
+  "stage.activitySubagentRunningMany": "サブエージェント {count} 件実行中",
+  "stage.activityBgTaskRunningOne": "バックグラウンドタスク 1 件実行中",
+  "stage.activityBgTaskRunningMany": "バックグラウンドタスク {count} 件実行中",
+  "stage.activityTimerWaitingOne": "タイマー 1 件待機中",
+  "stage.activityTimerWaitingMany": "タイマー {count} 件待機中",
+  "stage.activityGoalActive": "ゴール実行中",
 };

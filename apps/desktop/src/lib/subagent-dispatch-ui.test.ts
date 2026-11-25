@@ -7,7 +7,7 @@ import { createServer, type ViteDevServer } from "vite";
 let server: ViteDevServer;
 before(async () => {
   server = await createServer({
-    server: { middlewareMode: true, hmr: false, watch: null },
+    server: { middlewareMode: true, hmr: false, ws: false, watch: null },
     optimizeDeps: { noDiscovery: true, include: [] },
     plugins: [{
       name: "test-subagent-panel-actions",
@@ -71,7 +71,7 @@ function assertIndependentControls(html: string) {
   }
 }
 
-it("opens the subagent panel directly from overview and full-width dispatch rows", async () => {
+it("opens the subagent panel directly from overview portraits and quiet single-dispatch trace rows", async () => {
   const { SubagentCrewList } = await server.ssrLoadModule("/src/components/stage/subagent-crew-dock.tsx");
   const { DelegationMilestoneRow } = await server.ssrLoadModule("/src/components/stage/stage-step-group.tsx");
   const { opened } = await server.ssrLoadModule("/src/state/orbit-store.ts");
@@ -81,6 +81,7 @@ it("opens the subagent panel directly from overview and full-width dispatch rows
   for (const status of ["awaiting_permission", "running", "completed"]) {
     const overview = renderRow(SubagentCrewList, { agentId: "parent", subagents: [{ ...peer, status }] });
     assert.equal(overview.clicks.length, 1);
+    assert.match(overview.html, /data-slot="subagent-avatar"/);
     if (status === "awaiting_permission") assert.match(overview.html, /Approval required/);
     overview.clicks[0]();
     assert.equal(opened.at(-1).childAgentId, "ag_review");
@@ -89,34 +90,34 @@ it("opens the subagent panel directly from overview and full-width dispatch rows
   const item = { seq: 1, item_type: "tool_call", call_id: "launch", status: "running",
     detail: { kind: "generic", tool_name: "Run mcp orbit create agent",
       arguments_json: '{"title":"Reviewer"}' } };
-  for (const [rpcStatus, childStatus, statusLabel] of [
-    ["running", null, "Starting…"],
-    ["completed", null, "Starting…"],
-    ["completed", "running", "Working…"],
-    ["completed", "awaiting_permission", "Approval required"],
-    ["running", "completed", "Done"],
-    ["completed", "failed", "Failed"],
-    ["completed", "canceled", "Stopped"],
-    ["denied", null, "Failed"],
+  for (const [rpcStatus, childStatus, expectedSuffix] of [
+    ["running", null, ""],
+    ["completed", null, ""],
+    ["completed", "running", ""],
+    ["completed", "awaiting_permission", "· Approval required"],
+    ["running", "completed", ""],
+    ["completed", "failed", "· Failed"],
+    ["completed", "canceled", ""],
+    ["denied", null, "· Failed"],
   ] as const) {
     const row = renderRow(DelegationMilestoneRow, {
       items: [{ ...item, status: rpcStatus }], hostId: "local", agentId: "parent",
       sessionSubagents: childStatus ? [{ ...peer, status: childStatus }] : [],
     });
     assert.equal(row.clicks.length, 1);
-    assert.equal(row.html.replace(/<[^>]+>/g, "").trim(), "Reviewer" + statusLabel);
+    assert.equal(row.html.replace(/<[^>]+>/g, "").trim(), "Dispatched Reviewer" + expectedSuffix);
     assert.equal(row.html.match(/<button\b/g)?.length, 1);
+    assert.match(row.html, /data-slot="trace"/);
+    assert.match(row.html, /data-slot="trace-line"/);
+    assert.match(row.html, /data-slot="subagent-dispatch-trigger"/);
     assert.match(row.html, /min-h-\[28px\]/);
-    assert.match(row.html, /w-\[calc\(100%\+1[24]px\)\]/);
-    assert.match(row.html, /shrink-0 max-w-\[65%\] truncate/);
-    assert.match(row.html, /group-focus-visible\/sachip:opacity-100/);
-    assert.doesNotMatch(row.html, /aria-expanded|bg-surface-raised|border-border-subtle/);
-    assert.match(row.html, /data-slot="subagent-avatar"/);
-    assert.ok(row.html.includes(`data-status="${childStatus ?? (rpcStatus === "denied" ? "failed" : "running")}"`));
+    assert.match(row.html, /group-focus-visible\/dispatch:opacity-100/);
+    assert.doesNotMatch(row.html, /data-slot="subagent-avatar"|aria-expanded|bg-surface-raised|border-border-subtle/);
     const status = childStatus ?? (rpcStatus === "denied" ? "failed" : "running");
-    assert.equal(/lucide-(check|x)\b/.test(row.html), ["completed", "failed", "canceled"].includes(status));
-    assert.equal(row.html.includes("border-signal-warning-border"), status === "awaiting_permission");
-    assert.equal(row.html.includes("border-signal-danger-border"), status === "failed");
+    assert.equal(row.html.includes("text-signal-warning"), status === "awaiting_permission");
+    assert.equal(row.html.includes("text-signal-danger"), status === "failed");
+    assert.equal(row.html.includes('data-slot="trace-description"'), status === "awaiting_permission" || status === "failed");
+    assertIndependentControls(row.html);
     row.clicks[0]();
     assert.equal(opened.at(-1).callId, "launch");
     assert.equal(opened.at(-1).childAgentId, childStatus ? "ag_review" : null);
@@ -154,7 +155,7 @@ it("toggles outgoing messages on the main row and opens the recipient separately
   assert.equal(opened.at(-1).childHostId, "remote");
 });
 
-it("renders historical launches with the overview portraits and opens their respective child tabs", async () => {
+it("coalesces consecutive dispatches into a quiet collapsible trace while keeping portraits in overview", async () => {
   const { SubagentCrewList } = await server.ssrLoadModule("/src/components/stage/subagent-crew-dock.tsx");
   const { DelegationMilestoneRow } = await server.ssrLoadModule("/src/components/stage/stage-step-group.tsx");
   const { assignSubagentCharacters } = await server.ssrLoadModule("/src/lib/subagent-avatar.ts");
@@ -170,38 +171,87 @@ it("renders historical launches with the overview portraits and opens their resp
     item_type: "tool_call", seq, call_id: "launch-" + seq, status: "completed",
     timestamp_ms: sa.createdAtMs - 20, detail: { kind: "generic", tool_name: "create_agent", arguments_json: "{}" },
   }));
-  const timeline = renderRow(DelegationMilestoneRow, { items, sessionSubagents: [...sessionSubagents].reverse(), agentId: "parent" });
+  const props = { items, sessionSubagents: [...sessionSubagents].reverse(), agentId: "parent" };
+
+  // Overview HUD remains the sole source of animal portraits.
   const overview = renderRow(SubagentCrewList, { agentId: "parent", subagents: sessionSubagents });
-  const portraits = (html: string) => Array.from(html.matchAll(/data-character="([^"]+)"/g), (m) => m[1]);
-  assert.deepEqual(portraits(timeline.html), portraits(overview.html));
-  assert.match(timeline.html, /flex-col gap-0\.5/);
-  assert.match(timeline.html.replace(/<[^>]+>/g, ""), /^AuditorDoneReviewerApproval required· /);
-  assert.doesNotMatch(timeline.html, /Spawned subagent|waiting for response/);
-  timeline.clicks.forEach((click, i) => {
-    click();
-    assert.equal(opened.at(-1).childAgentId, children[i].childAgentId);
-  });
-  assert.equal(timeline.clicks.length, 2);
+  const overviewPortraits = Array.from(overview.html.matchAll(/data-character="([^"]+)"/g), (m) => m[1]);
+  assert.equal(overviewPortraits.length, 2);
+
+  // Collapsed timeline batch coalesces both dispatches with semantic-only awaiting suffix.
+  const collapsed = renderRow(DelegationMilestoneRow, props);
+  assert.doesNotMatch(collapsed.html, /data-slot="subagent-avatar"/);
+  assert.match(collapsed.html, /data-slot="trace-collapsible-trigger"/);
+  assert.match(collapsed.html, /aria-expanded="false"/);
+  assert.equal(collapsed.html.replace(/<[^>]+>/g, "").trim(), "Dispatched Auditor, Reviewer· 1 awaiting approval");
+  assert.doesNotMatch(collapsed.html, /Done|Working|Spawned subagent|waiting for response/);
+  assertIndependentControls(collapsed.html);
+
+  // Expanding reveals quiet clickable items that open each subagent directly.
+  const expanded = renderRow(DelegationMilestoneRow, props, [0]);
+  assert.match(expanded.html, /aria-expanded="true"/);
+  assert.match(expanded.html, /data-slot="trace-collapsible-content"/);
+  assert.doesNotMatch(expanded.html, /data-slot="subagent-avatar"/);
+  assert.equal(expanded.clicks.length, 3); // 1 collapsible toggle + 2 child open buttons
+  expanded.clicks[1]();
+  assert.equal(opened.at(-1).childAgentId, "ag_Auditor");
+  expanded.clicks[2]();
+  assert.equal(opened.at(-1).childAgentId, "ag_Reviewer");
+
+  // 3+ consecutive dispatches summarize by count and surface only semantic failure/awaiting cues.
+  const trio = ["Auditor", "Reviewer", "Planner"].map((title, i) => ({
+    key: "managed:" + title, callId: "ag_" + title, childAgentId: "ag_" + title,
+    title, childHostId: "remote", createdAtMs: 60000 + i * 1000, isManaged: true,
+    status: i === 0 ? "completed" : i === 1 ? "failed" : "canceled",
+  }));
+  const trioItems = trio.map((sa, seq) => ({
+    item_type: "tool_call", seq: seq + 10, call_id: "trio-" + seq, status: "completed",
+    timestamp_ms: sa.createdAtMs - 20, detail: { kind: "generic", tool_name: "create_agent", arguments_json: "{}" },
+  }));
+  const trioCollapsed = renderRow(DelegationMilestoneRow, { items: trioItems, sessionSubagents: trio, agentId: "parent" });
+  assert.equal(trioCollapsed.html.replace(/<[^>]+>/g, "").trim(), "Dispatched 3 subagents· 1 failed");
+  const trioExpanded = renderRow(DelegationMilestoneRow, { items: trioItems, sessionSubagents: trio, agentId: "parent" }, [0]);
+  assert.match(trioExpanded.html, /Auditor/);
+  assert.match(trioExpanded.html, /Reviewer.*· Failed/);
+  assert.match(trioExpanded.html, /Planner.*· Stopped/);
+  assert.doesNotMatch(trioExpanded.html, /data-slot="subagent-avatar"/);
 });
 
-it("uses the current run for dispatch elapsed time and removes the clock in every settled state", async () => {
+it("never renders live elapsed clocks or duplicated nested grandchild trees in timeline dispatches", async () => {
   const { DelegationMilestoneRow } = await server.ssrLoadModule("/src/components/stage/stage-step-group.tsx");
+  const { SubagentCrewList } = await server.ssrLoadModule("/src/components/stage/subagent-crew-dock.tsx");
   const { useLiveSecondClock } = await server.ssrLoadModule("/src/lib/live-clock.ts");
   const now = Number(renderToStaticMarkup(createElement(() => String(useLiveSecondClock(true)))));
   const launch = { item_type: "tool_call", seq: 1, call_id: "launch", status: "completed",
     timestamp_ms: now - 25 * 60_000, summary_title: "mcp_orbit_create_agent",
     detail: { kind: "subagent", role: "Reviewer", prompt_preview: "", child_agent_id: "ag_review" } };
   const child = { key: "managed:remote:ag_review", callId: "launch", title: "Reviewer",
-    childHostId: "remote", childAgentId: "ag_review", isManaged: true,
+    childHostId: "remote", childAgentId: "ag_review", isManaged: true, depth: 1,
     createdAtMs: launch.timestamp_ms, activeStartedAtMs: now - 10_000 };
+  const grandchild = { key: "managed:remote:ag_nested", callId: "nested", title: "Deep Auditor",
+    childHostId: "remote", childAgentId: "ag_nested", parentAgentId: "ag_review", isManaged: true,
+    depth: 2, status: "running",
+    lineage: [
+      { host_id: "local", agent_id: "parent", title: "Parent" },
+      { host_id: "remote", agent_id: "ag_review", title: "Reviewer" },
+      { host_id: "remote", agent_id: "ag_nested", title: "Deep Auditor" },
+    ] };
   for (const status of ["running", "awaiting_permission", "completed", "failed", "canceled"]) {
     const { html } = renderRow(DelegationMilestoneRow, {
-      items: [launch], sessionSubagents: [{ ...child, status }], hostId: "local", agentId: "parent",
+      items: [launch], sessionSubagents: [{ ...child, status }, grandchild], hostId: "local", agentId: "parent",
     });
-    assert.doesNotMatch(html, /· 2[45]m/);
-    if (status === "running" || status === "awaiting_permission") assert.match(html, /· 10s</);
-    else assert.doesNotMatch(html, /data-slot="trace-description"/);
+    assert.doesNotMatch(html, /· 2[45]m|· 10s/);
+    assert.doesNotMatch(html, /Deep Auditor/);
+    assert.doesNotMatch(html, /data-slot="subagent-avatar"/);
   }
+  // Overview HUD still shows both the direct child and nested grandchild portraits.
+  const overview = renderRow(SubagentCrewList, {
+    agentId: "parent",
+    subagents: [{ ...child, status: "running" }, grandchild],
+  });
+  assert.match(overview.html, /Reviewer/);
+  assert.match(overview.html, /Deep Auditor/);
+  assert.equal(overview.html.match(/data-slot="subagent-avatar"/g)?.length, 2);
 });
 
 it("uses one inline step rail and offers a bottom collapse action from ten steps", async () => {

@@ -29,6 +29,7 @@ import { useStageFind } from "@/components/stage/use-stage-find";
 import { ChatOutlineRail, type OutlinePromptItem } from "@/components/stage/stage-outline-rail";
 import { resolveOutlinePrompts } from "@/lib/outline-rail";
 import { StageOverviewPanel } from "@/components/stage/stage-overview-panel";
+import { StreamStageActivityWave } from "@/components/stage/stage-activity-wave";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -1146,6 +1147,10 @@ export function StreamStage() {
   const handleOpenSubagent = useCallback(
     (sa: ResolvedSubagentItem) => openSubagent(selectedAgentId ?? undefined, sa),
     [selectedAgentId],
+  );
+  const runningBackgroundTasks = useMemo(
+    () => stageInsights.background_tasks.filter((task) => task.status === "running"),
+    [stageInsights.background_tasks],
   );
 
   // Record live turn & per-thinking-block start/completion durations for the active session
@@ -2350,7 +2355,7 @@ export function StreamStage() {
                   hasPendingJump={hasPendingJumpForActive}
                   isLatestTurnActive={isLatestTurnActive}
                   agentStatusLabel={isLatestTurnActive ? (currentAgent?.status_label ?? null) : null}
-                  hasLiveBackgroundTasks={stageInsights.background_tasks.length > 0}
+                  hasLiveBackgroundTasks={runningBackgroundTasks.length > 0}
                   baselineMaxSeq={baselineMaxSeq}
                   isNetworkOffline={isNetworkOffline}
                   autoFoldCompleted={coalesceExploration}
@@ -2377,7 +2382,13 @@ export function StreamStage() {
                   onToggleTurnCollapsed={turnCollapse.toggleTurn}
                 />
 
-                {isLatestTurnActive && <div aria-hidden="true" className="h-[32px] shrink-0" />}
+                <StreamStageActivityWave
+                  hostId={selectedHostId}
+                  agentId={selectedAgentId}
+                  sessionSubagents={sessionSubagents}
+                  runningBackgroundTasks={runningBackgroundTasks}
+                  isForegroundRunning={isLatestTurnActive}
+                />
               </>
             )}
           </div>

@@ -16,6 +16,10 @@ import { mergeAgentPendingPermissions } from "@/components/side-panel/subagent-t
 import { DecisionDock } from "@/components/stage/stage-approval-dock";
 import { PlanReviewCard } from "@/components/stage/plan-review-card";
 import {
+  StageActivityWave,
+  summarizeActiveSubagents,
+} from "@/components/stage/stage-activity-wave";
+import {
   PromptImageLightbox,
   type PromptImagePreviewTarget,
   TurnStageSection,
@@ -41,6 +45,10 @@ import {
   type ResolvedSubagentItem,
   buildSubagentNameMatcher,
 } from "@/lib/subagents";
+import {
+  selectActiveGoalForAgent,
+  selectArmedTimerCountForAgent,
+} from "@/state/selectors/session-selectors";
 import {
   orbitActions,
   threadScopeKey,
@@ -183,8 +191,29 @@ export const AgentStagePane = memo(function AgentStagePane({
   }, [hostId, agentId]);
 
   const isRunning = isAgentForegroundRunning(agent);
+  const liveSubagentActivity = useMemo(
+    () => summarizeActiveSubagents(sessionSubagents),
+    [sessionSubagents],
+  );
+  const runningBackgroundTasks = useMemo(
+    () => (stage?.insights.background_tasks ?? []).filter((task) => task.status === "running"),
+    [stage?.insights.background_tasks],
+  );
+  const armedTimersCount = useMemo(
+    () => selectArmedTimerCountForAgent(hostDetail, agentId),
+    [hostDetail, agentId],
+  );
+  const hasActiveGoal = useMemo(() => {
+    const goal = selectActiveGoalForAgent(hostDetail, agentId);
+    return Boolean(goal && goal.status !== "paused");
+  }, [hostDetail, agentId]);
+  const handleWaveClick = useMemo(() => {
+    const soleActive = liveSubagentActivity.soleActive;
+    if (!soleActive) return undefined;
+    return () => handleOpenNestedSubagent(soleActive);
+  }, [liveSubagentActivity.soleActive, handleOpenNestedSubagent]);
   const lastTurn = turns[turns.length - 1];
-  const contentVersion = `${turns.length}:${stage?.latest_seq ?? 0}:${lastTurn?.live_segments.length ?? 0}:${isRunning ? 1 : 0}`;
+  const contentVersion = `${turns.length}:${stage?.latest_seq ?? 0}:${lastTurn?.live_segments.length ?? 0}:${isRunning ? 1 : 0}:${liveSubagentActivity.runningCount}:${liveSubagentActivity.awaitingCount}:${runningBackgroundTasks.length}`;
 
   const handleSend = async (steerOverride?: boolean) => {
     const trimmed = reply.trim();
@@ -320,6 +349,7 @@ export const AgentStagePane = memo(function AgentStagePane({
                         isTurnActive={isTurnActive}
                         isLastTurn={isLastTurn}
                         agentStatusLabel={isTurnActive ? (agent?.status_label ?? null) : null}
+                        hasLiveBackgroundTasks={isTurnActive && runningBackgroundTasks.length > 0}
                         isNetworkOffline={isNetworkOffline}
                         autoFoldCompleted={coalesceExploration}
                         hostId={hostId}
@@ -338,6 +368,17 @@ export const AgentStagePane = memo(function AgentStagePane({
                   );
                 });
               })()}
+              <StageActivityWave
+                runningSubagentsCount={liveSubagentActivity.runningCount}
+                awaitingSubagentsCount={liveSubagentActivity.awaitingCount}
+                runningBackgroundTasks={runningBackgroundTasks}
+                armedTimersCount={armedTimersCount}
+                hasActiveGoal={hasActiveGoal}
+                isForegroundRunning={isRunning}
+                onClick={handleWaveClick}
+                actionHint={t("sidebar.remoteOpenAction")}
+                className="mt-3 mb-1"
+              />
             </div>
           ) : hydrating ? (
             <div role="status" className="text-ink-muted flex items-center justify-center gap-2 py-8 text-[13px]">

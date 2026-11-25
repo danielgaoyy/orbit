@@ -628,6 +628,40 @@ html:not(.orbit-mac).dark .orbit-native-scroll {
   @apply shimmer;
 }
 
+/* Calm concentric ripple emblem for StageActivityWave (compositor transform + opacity only) */
+@keyframes orbit-activity-ripple {
+  0% {
+    transform: scale(0.55);
+    opacity: 0.48;
+  }
+  100% {
+    transform: scale(2.2);
+    opacity: 0;
+  }
+}
+
+.orbit-activity-ripple-ring {
+  transform: scale(1.35);
+  opacity: 0.28;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .orbit-activity-ripple-ring {
+    will-change: transform, opacity;
+    animation: orbit-activity-ripple 2.2s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+  }
+
+  .orbit-activity-ripple-ring-delayed {
+    animation-delay: -1.1s;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .orbit-activity-ripple-ring-delayed {
+    display: none;
+  }
+}
+
 /* ============================================================================
  * Orbit Global Motion Primitives (120Hz Compositor-Only, Natural Deceleration)
  * ============================================================================ */
@@ -1018,7 +1052,8 @@ html.orbit-theme-switching *::after {
 html.orbit-window-hidden .animate-spin,
 html.orbit-window-hidden .animate-pulse,
 html.orbit-window-hidden [class*="animate-[spin"],
-html.orbit-window-hidden .orbit-spinner-reduced {
+html.orbit-window-hidden .orbit-spinner-reduced,
+html.orbit-window-hidden .orbit-activity-ripple-ring {
   animation-play-state: paused !important;
 }
 

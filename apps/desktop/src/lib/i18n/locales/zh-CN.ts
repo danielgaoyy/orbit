@@ -2575,4 +2575,19 @@ export const zhCN: MessageDictionary = {
   "settings.deployCfConfirmTitle": "通过 Cloudflare 隧道在 {alias} 开启零端口中继？",
   "settings.deployCfConfirmDesc":
     "将在 {alias} 安装仅监听本机的 Orbit Relay (127.0.0.1:7878) 与 cloudflared 隧道（无需开放任何公网入站端口），并自动下发给全部 {count} 台主机。",
+
+  // 时间线静默子代理派发与底部活动波纹
+  "stage.dispatchedSubagent": "已派发 {name}",
+  "stage.dispatchedTwoSubagents": "已派发 {first}、{second}",
+  "stage.dispatchedManySubagents": "已派发 {count} 个子代理",
+  "stage.subagentsAwaitingSuffix": "{count} 个待审批",
+  "stage.activitySubagentAwaitingOne": "1 个子代理待审批",
+  "stage.activitySubagentAwaitingMany": "{count} 个子代理待审批",
+  "stage.activitySubagentRunningOne": "1 个子代理运行中",
+  "stage.activitySubagentRunningMany": "{count} 个子代理运行中",
+  "stage.activityBgTaskRunningOne": "1 个后台任务运行中",
+  "stage.activityBgTaskRunningMany": "{count} 个后台任务运行中",
+  "stage.activityTimerWaitingOne": "1 个定时器等待中",
+  "stage.activityTimerWaitingMany": "{count} 个定时器等待中",
+  "stage.activityGoalActive": "目标执行中",
 };

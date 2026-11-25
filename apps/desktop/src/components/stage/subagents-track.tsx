@@ -1,6 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
-  ArrowUpRight,
   ChevronRight,
   HeartPulse,
 } from "lucide-react";
@@ -108,20 +107,15 @@ type SubagentMaybeWithAvatar = ResolvedSubagentItem & {
 };
 
 /**
- * Single source of truth for timeline subagent/peer row geometry.
+ * Single source of truth for timeline peer/subagent message row geometry.
  * Negative-bleed hover pill (`-mx-[6px]` / `-mx-[7px]` with 1px border) keeps every avatar
  * strictly aligned to `x = 0px` alongside Trace icons and assistant prose.
  */
 const SUBAGENT_ROW_BASE = "flex min-h-[28px] min-w-0 items-center transition-colors";
 const SUBAGENT_ROW_TONE = {
   normal: "-mx-[6px] rounded-[8px] pl-[6px] pr-[3px] hover:bg-accent/55",
-  normalFull: "-mx-[6px] w-[calc(100%+12px)] rounded-[8px] px-[6px] hover:bg-accent/55",
   danger:
     "-mx-[7px] rounded-[8px] border border-signal-danger-border bg-signal-danger-bg/45 pl-[6px] pr-[3px]",
-  dangerFull:
-    "-mx-[7px] w-[calc(100%+14px)] rounded-[8px] border border-signal-danger-border bg-signal-danger-bg/45 px-[6px] hover:bg-signal-danger-bg",
-  warningFull:
-    "-mx-[7px] w-[calc(100%+14px)] rounded-[8px] border border-signal-warning-border bg-signal-warning-bg/55 px-[6px] hover:bg-signal-warning-bg",
 } as const;
 
 const instantPanelClass = "h-auto duration-0 data-[starting-style]:h-auto data-[starting-style]:opacity-100";
@@ -135,62 +129,6 @@ function useAnchoredOpenChange(onChange?: (open: boolean) => void, holdViewport 
     holdViewport(triggerRef.current, () => onChange(open), "top", { intent: open ? "expand" : "collapse" });
   };
   return { triggerRef, onOpenChange };
-}
-
-/** Unified frameless timeline row for dispatched subagents, sharing exact `x = 0px` alignment with `PeerMessageRow`. */
-export function SubagentDispatchRow({
-  avatar,
-  name,
-  statusLabel,
-  tone = "normal",
-  title,
-  onClick,
-  trailing,
-}: {
-  avatar: ReactNode;
-  name: string;
-  statusLabel: string;
-  tone?: "normal" | "danger" | "warning";
-  title?: string;
-  onClick: () => void;
-  trailing?: ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      title={title}
-      onClick={onClick}
-      className={cn(
-        "group/sachip cursor-pointer gap-1.5 text-left text-[13px] leading-[18px] outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
-        SUBAGENT_ROW_BASE,
-        tone === "danger"
-          ? SUBAGENT_ROW_TONE.dangerFull
-          : tone === "warning"
-            ? SUBAGENT_ROW_TONE.warningFull
-            : SUBAGENT_ROW_TONE.normalFull,
-      )}
-    >
-      {avatar}
-      <span className="shrink-0 max-w-[65%] truncate font-medium text-ink-primary">{name}</span>
-      <span
-        className={cn(
-          "shrink-0 text-[11px]",
-          tone === "danger"
-            ? "text-signal-danger"
-            : tone === "warning"
-              ? "text-signal-warning"
-              : "text-ink-tertiary",
-        )}
-      >
-        {statusLabel}
-      </span>
-      {trailing}
-      <ArrowUpRight
-        aria-hidden="true"
-        className="ml-auto size-3 shrink-0 text-ink-muted opacity-0 transition-opacity group-hover/sachip:opacity-100 group-focus-visible/sachip:opacity-100"
-      />
-    </button>
-  );
 }
 
 /** Shared collapsible disclosure for incoming reports and outgoing messages. Opening the peer is a separate action. */

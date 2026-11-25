@@ -428,21 +428,33 @@ export function selectActiveGoalForAgent(
 }
 
 /**
+ * Counts armed conditional timers for `agentId` on `hostDetail` without allocating.
+ * Safe to invoke directly inside `useOrbitSelector` because it returns a primitive number.
+ */
+export function selectArmedTimerCountForAgent(
+  hostDetail: HostDetailView | null | undefined,
+  agentId: string | null,
+): number {
+  if (!hostDetail || !agentId) return 0;
+  const timers = hostDetail.conditional_timers;
+  if (!timers || timers.length === 0) return 0;
+  let count = 0;
+  for (const timer of timers) {
+    if (timer.agent_id === agentId && timer.state === "armed") {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+/**
  * Returns true if `agentId` currently has any armed conditional timers on `hostDetail`.
  */
 export function hasArmedTimersForAgent(
   hostDetail: HostDetailView | null | undefined,
   agentId: string | null,
 ): boolean {
-  if (!hostDetail || !agentId) return false;
-  const timers = hostDetail.conditional_timers;
-  if (!timers || timers.length === 0) return false;
-  for (const timer of timers) {
-    if (timer.agent_id === agentId && timer.state === "armed") {
-      return true;
-    }
-  }
-  return false;
+  return selectArmedTimerCountForAgent(hostDetail, agentId) > 0;
 }
 
 /**

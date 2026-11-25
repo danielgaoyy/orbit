@@ -2605,6 +2605,21 @@ export const en = {
   "settings.deployCfConfirmTitle": "Expose {alias} via Cloudflare Tunnel?",
   "settings.deployCfConfirmDesc":
     "Installs a loopback-only Orbit Relay (127.0.0.1:7878) and cloudflared tunnel on {alias} with zero open inbound firewall ports, then applies it across all {count} hosts.",
+
+  // Quiet Timeline Subagent Dispatches & Bottom Activity Wave
+  "stage.dispatchedSubagent": "Dispatched {name}",
+  "stage.dispatchedTwoSubagents": "Dispatched {first}, {second}",
+  "stage.dispatchedManySubagents": "Dispatched {count} subagents",
+  "stage.subagentsAwaitingSuffix": "{count} awaiting approval",
+  "stage.activitySubagentAwaitingOne": "1 subagent awaiting approval",
+  "stage.activitySubagentAwaitingMany": "{count} subagents awaiting approval",
+  "stage.activitySubagentRunningOne": "1 subagent running",
+  "stage.activitySubagentRunningMany": "{count} subagents running",
+  "stage.activityBgTaskRunningOne": "1 background task running",
+  "stage.activityBgTaskRunningMany": "{count} background tasks running",
+  "stage.activityTimerWaitingOne": "1 timer waiting",
+  "stage.activityTimerWaitingMany": "{count} timers waiting",
+  "stage.activityGoalActive": "Goal active",
 } as const;
 
 export type MessageKey = keyof typeof en;

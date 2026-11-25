@@ -28,15 +28,21 @@
 - **防轮次错位与跨轮去重不变式**：
   1. 在并发 `steer`（改向）、`interrupt`（打断）或排队消息自动冲刷时，每一条 assistant 响应与 finalize 事件必须严格绑定并校验当前活跃 turn 上下文，严禁下一轮错收到上一轮残留输出（off-by-one lag）。
   2. 延迟到达的跨轮 finalize 消息必须在持久化与 WebSocket 广播路径（`crates/orbit-daemon/src/manager.rs` / `lib.rs`）正确归位或去重。
-- **消息源解耦（`PromptOrigin`）与非打断排队/引导生命周期**（Issue #52）：
+- **消息源解耦（`PromptOrigin`）、权限闸门与非打断排队/引导生命周期**（Issue #52）：
   1. 驱动命令 `DriverCommand::SendPrompt` 显式区分 `PromptOrigin::Human` 与 `PromptOrigin::Agent`。**`ActiveTurnBehavior::Steer`（用户引导）在全 6 个 Provider 上均为非破坏性操作，严禁发送 `session/cancel` / `turn/interrupt` / `abort` 强杀运行中的子代理或后台常驻任务**：
-     - `Antigravity`（`agy acp`）对人类 `Steer` 使用原生并发 `session/prompt` 注入（记录旧 RPC 于 `superseded_prompt_rpcs`，零 `session/cancel`、零清理 `bg_tracker` / `subagent_monitors`；若旧版/严格服务端报错拒绝并发则自动回退到高优人类队列）；在仅等待后台任务/子代理（`active_prompt_rpc_key == None`）时直接投递新 `session/prompt` 且保留全部后台跟踪。
-     - `Codex` / `Claude Code` / `Pi` 走各自原生非破坏性 mid-turn steer；通用 ACP 驱动（`acp_generic.rs` / `acp_providers.rs`）因无原生并发 steer，统一将人类 `Steer` 降级为高优非破坏性队列（优先于 Agent 队列顺位投递，零 `session/cancel`）。
-     - 来自子代理 / Peer 的异步汇报与唤醒（`PromptOrigin::Agent`）在 ACP / Antigravity 上强制走非打断 FIFO 排队（`Steer` 自动降级为 `Queue`）；仅显式 `ActiveTurnBehavior::Interrupt` / `DriverCommand::Interrupt` / `DriverCommand::InterruptAndDrainQueue` 允许触发破坏性 `session/cancel`。
-     - 队列条“引导”（`flush_queued_user_prompt_now`）在无阻塞权限审批时同样走 `ActiveTurnBehavior::Steer`，仅在 `AwaitingPermission` 时走 `ActiveTurnBehavior::Interrupt` 解除权限阻塞。
-  2. 新增保队列中断 `DriverCommand::InterruptAndDrainQueue`（对应 `WireMessage::InterruptTurn { preserve_queue: true }`）：在人类判定上游长考停滞时终止当前卡死轮，但**保留**所有已排队消息继续冲刷；硬停止（`DriverCommand::Interrupt`）则取消当前轮并丢弃未投递队列。
-  3. 全 6 个 Provider 驱动统一通过 `DriverEvent::PromptDeliveryUpdated` 上报权威状态流 `Queued -> Dispatched -> Settled / Dropped`（`Settled` 必须在 `StatusChanged(Idle)` 之前发射），由 `AgentOrchestrator` 持久化隐私安全日志（仅含 ID / turn ID / 时长）与时间线状态更新事件。
-  - **必跑验证**：改动此区域必跑 `pitfall_01`、`pitfall_02`、`pitfall_06`、`pitfall_08`（见 `docs/engineering/testing-and-ci.md`）。
+     - **权限/问题/计划闸门统一契约（Option A）**：当会话存在未决的权限审批、提问（`QuestionRequest` / `elicitation/create`）或 Codex 合成计划闸门（`pending_synthetic_plan_gate`）时，全 6 个 Provider 驱动对 `ActiveTurnBehavior::Steer` **一律不丢弃、不向底层写入 mid-gate 引导帧、不取消审批卡**，而是无损排入高优人类队列（`pending_human_steers`，优先于常规队列 `queued_prompts` / `pending_prompts`），待全部闸门放行且当前轮结算后自动顺位冲刷；仅显式 `ActiveTurnBehavior::Interrupt`、`DriverCommand::Interrupt` 或 `DriverCommand::InterruptAndDrainQueue` 才允许拒绝/取消未决闸门（并立即解除 Codex 合成计划闸门或直接冲刷替代轮，严禁死锁）。
+     - **多闸门并发状态不变式**：Claude、Codex、Antigravity、通用 ACP 与 Pi 在单条审批/问题/计划闸门解析后，**仅当全部未决权限与问题计数归零**才恢复 `Running` / `AutonomousWakeup` / `Idle`；若仍有剩余闸门，必须保持 `AwaitingPermission` 并指向下一条待审批 `request_id`。
+     - `Antigravity`（`agy acp`）对人类 `Steer` 使用原生并发 `session/prompt` 注入（记录旧 RPC 于 `superseded_prompt_rpcs`，零 `session/cancel`、零清理 `bg_tracker` / `subagent_monitors`；若旧版/严格服务端报错拒绝并发则自动回退到高优人类队列）。在仅等待后台任务（`autonomous_turn_id = bgwait_*`，`is_background_waiting() == true`）时直接投递新 `session/prompt` 且保留全部后台跟踪；在活跃后置自主唤醒（`autonomous_turn_id = wakeup_*`，`is_foreground_busy() == true`）期间，`Queue` / Agent `Steer` 入队等待唤醒结算而不静默吞掉未读转录，`Human + Steer` 先 flush 发射未读唤醒转录增量再并发注入，`Interrupt` / `InterruptAndDrainQueue` 真正下发 `session/cancel`。
+     - `Claude Code` 在前台轮结束（`"result"`）但仍有运行中后台任务（`bg_bash_tasks`）时，统一对齐 `waiting:*` 契约发射 `AgentStatus::AutonomousWakeup { turn_id: "bgwait_*", source: "waiting:..." }`（`is_background_waiting() == true`、`is_foreground_busy() == false`，确保 Stage 面板 `is_running || has_background_tasks || is_awaiting_permission` 持续展示运行中后台任务，同时 Daemon 立即可接收并自动冲刷队列）；最后一条后台任务通过 `task_notification` 结束后平滑回落至 `Idle`。若 `task_notification` 触发了无前台 turn 的自主输出（`stream_event` / `assistant`），驱动自动登记 `wakeup_*` 自主唤醒态并将中途到达的 `Steer` 排入 `pending_human_steers`，避免被唤醒轮的 `"result"` 错位结算。
+     - `Codex` / `Claude Code` / `Pi` 在无未决闸门且处于活跃前台轮时走各自原生非破坏性 mid-turn steer（Codex 在 `turn/started` 前的启动窗口内将人类 `Steer` 排入 `pending_human_steers` 优先冲刷）；通用 ACP 驱动（`acp_generic.rs` / `acp_providers.rs`）因无原生并发 steer，统一将人类 `Steer` 降级为高优非破坏性队列（优先于 Agent 队列顺位投递，零 `session/cancel`）。
+     - 来自子代理 / Peer 的异步汇报与唤醒（`PromptOrigin::Agent`）在 ACP / Antigravity 上强制走非打断 FIFO 排队（`Steer` 自动降级为 `Queue`）；`dispatch_coalesced_batch` 在活跃前台 `AutonomousWakeup`（`!is_background_waiting()`）时同样填写 `blocking_turn_id`。
+     - 队列条“引导”（`flush_queued_user_prompt_now`）在无阻塞权限/问题闸门（`has_pending_human_gates == false`）时走 `ActiveTurnBehavior::Steer`，仅在存在未决权限或问题闸门时走 `ActiveTurnBehavior::Interrupt` 解除阻塞。
+  2. **Daemon 服务端自动冲刷与错误隔离不变式**（`crates/orbit-daemon/src/manager.rs`）：
+     - `has_pending_human_gates` 统一检查 `pending_permissions` 与 `pending_questions`，用于 `enqueue_user_prompt`、`flush_queued_user_prompt_now`、自动压缩、空闲清理及自动冲刷守卫；进入 `AgentStatus::Error` 时必须同步清理残留的 `pending_permissions` / `pending_questions`，避免后续入队被陈旧闸门永久阻塞。
+     - 服务端队列自动冲刷（`Idle` / `waiting:*` 触发）必须按顺序执行：① 复核无人类闸门、未被 `suppress_auto_drain` 抑制且仍为前台空闲；② 预检 `PrePromptSubmit` Hook（拦截时保留队列项并写入时间线告警）；③ 经 `get_or_resume_driver` 确保驱动存活后再原子消费 SQLite 队列行；④ 若最终派发瞬时失败，通过 `requeue_agent_prompt_front` 原位回插队首，严禁静默丢消息。
+  3. 新增保队列中断 `DriverCommand::InterruptAndDrainQueue`（对应 `WireMessage::InterruptTurn { preserve_queue: true }`）：在人类判定上游长考停滞时终止当前卡死轮，但**保留**所有已排队消息继续冲刷；硬停止（`DriverCommand::Interrupt`）则取消当前轮并丢弃驱动内未投递队列（且仅在存在活跃轮/闸门时设置 `suppress_auto_drain`）。
+  4. 全 6 个 Provider 驱动统一通过 `DriverEvent::PromptDeliveryUpdated` 上报权威状态流 `Queued -> Dispatched -> Settled / Dropped`（`Settled` 必须在 `StatusChanged(Idle)` 之前发射），由 `AgentOrchestrator` 持久化隐私安全日志（仅含 ID / turn ID / 时长）与时间线状态更新事件。
+  - **必跑验证**：改动此区域必跑 `pitfall_01`、`pitfall_02`、`pitfall_06`、`pitfall_08`、`pitfall_09`、`pitfall_11`（见 `docs/engineering/testing-and-ci.md`）。
 
 ---
 

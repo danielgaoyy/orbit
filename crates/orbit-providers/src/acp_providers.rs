@@ -1349,7 +1349,9 @@ async fn run_acp_actor(
                         message_ids,
                     } => {
                         user_interrupted = false;
-                        if active_prompt_rpc_key.is_some() || active_turn_id.is_some() {
+                        let has_active_turn =
+                            active_prompt_rpc_key.is_some() || active_turn_id.is_some();
+                        if has_active_turn || !pending_perms.is_empty() {
                             let blocking_tid = active_turn_id.clone();
                             if matches!(behavior, ActiveTurnBehavior::Interrupt) {
                                 user_interrupted = true;
@@ -1365,64 +1367,70 @@ async fn run_acp_actor(
                                     .to_string();
                                     let _ = shim.write_stdin_line(resp).await;
                                 }
-                                cancelling_active_turn = true;
-                                cancel_deadline = Some(
-                                    tokio::time::Instant::now() + Duration::from_secs(10),
-                                );
-                                let cancel = json!({
-                                    "jsonrpc": "2.0",
-                                    "method": "session/cancel",
-                                    "params": { "sessionId": session_id }
-                                })
-                                .to_string();
-                                if shim.write_stdin_line(cancel).await.is_err() {
-                                    emit_dropped_queued_prompts(
-                                        &evt_tx,
-                                        None,
-                                        &mut pending_human_steers,
-                                    )
-                                    .await;
-                                    emit_dropped_queued_prompts(
-                                        &evt_tx,
-                                        pending_interrupt_replacement.take(),
-                                        &mut pending_prompts,
-                                    )
-                                    .await;
+                                if !has_active_turn {
+                                    // Orphaned pending permission with no active turn: fall
+                                    // through to dispatch the replacement turn directly.
+                                } else {
+                                    cancelling_active_turn = true;
+                                    cancel_deadline = Some(
+                                        tokio::time::Instant::now() + Duration::from_secs(10),
+                                    );
+                                    let cancel = json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "session/cancel",
+                                        "params": { "sessionId": session_id }
+                                    })
+                                    .to_string();
+                                    if shim.write_stdin_line(cancel).await.is_err() {
+                                        emit_dropped_queued_prompts(
+                                            &evt_tx,
+                                            None,
+                                            &mut pending_human_steers,
+                                        )
+                                        .await;
+                                        emit_dropped_queued_prompts(
+                                            &evt_tx,
+                                            pending_interrupt_replacement.take(),
+                                            &mut pending_prompts,
+                                        )
+                                        .await;
+                                        emit_prompt_delivery(
+                                            &evt_tx,
+                                            &turn_id,
+                                            &message_ids,
+                                            AgentMessageDeliveryStatus::Dropped,
+                                            None,
+                                        )
+                                        .await;
+                                        finalize_and_emit_unexpected_exit(&mut seg_state, &evt_tx)
+                                            .await;
+                                        break;
+                                    }
+                                    if let Some(prev_rep) = pending_interrupt_replacement.take() {
+                                        emit_prompt_delivery(
+                                            &evt_tx,
+                                            &prev_rep.turn_id,
+                                            &prev_rep.message_ids,
+                                            AgentMessageDeliveryStatus::Dropped,
+                                            None,
+                                        )
+                                        .await;
+                                    }
                                     emit_prompt_delivery(
                                         &evt_tx,
                                         &turn_id,
                                         &message_ids,
-                                        AgentMessageDeliveryStatus::Dropped,
-                                        None,
+                                        AgentMessageDeliveryStatus::Queued,
+                                        blocking_tid,
                                     )
                                     .await;
-                                    finalize_and_emit_unexpected_exit(&mut seg_state, &evt_tx)
-                                        .await;
-                                    break;
+                                    pending_interrupt_replacement = Some(QueuedDriverPrompt {
+                                        turn_id,
+                                        prompt,
+                                        message_ids,
+                                    });
+                                    continue;
                                 }
-                                if let Some(prev_rep) = pending_interrupt_replacement.take() {
-                                    emit_prompt_delivery(
-                                        &evt_tx,
-                                        &prev_rep.turn_id,
-                                        &prev_rep.message_ids,
-                                        AgentMessageDeliveryStatus::Dropped,
-                                        None,
-                                    )
-                                    .await;
-                                }
-                                emit_prompt_delivery(
-                                    &evt_tx,
-                                    &turn_id,
-                                    &message_ids,
-                                    AgentMessageDeliveryStatus::Queued,
-                                    blocking_tid,
-                                )
-                                .await;
-                                pending_interrupt_replacement = Some(QueuedDriverPrompt {
-                                    turn_id,
-                                    prompt,
-                                    message_ids,
-                                });
                             } else {
                                 // ACP providers lack native non-destructive mid-turn steer, and
                                 // `session/cancel` is a destructive force-cancellation that can
@@ -1449,8 +1457,8 @@ async fn run_acp_actor(
                                 } else {
                                     pending_prompts.push_back(queued);
                                 }
+                                continue;
                             }
-                            continue;
                         }
 
                         cancelling_active_turn = false;

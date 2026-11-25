@@ -3307,6 +3307,9 @@ impl AgentOrchestrator {
         let checked_prompt = self
             .run_pre_prompt_submit_hook(agent_id, existing_agent.as_ref(), prompt)
             .await?;
+        if !matches!(behavior, ActiveTurnBehavior::Interrupt) {
+            self.suppress_auto_drain.write().await.remove(agent_id);
+        }
         self.send_prompt_with_options_after_hook(
             agent_id,
             checked_prompt,
@@ -3383,7 +3386,7 @@ impl AgentOrchestrator {
             .await?;
         let is_busy = ag.status.is_foreground_busy()
             || matches!(ag.status, AgentStatus::AwaitingPermission { .. })
-            || self.has_pending_permissions(agent_id).await;
+            || self.has_pending_human_gates(agent_id).await;
         if !is_busy {
             return self
                 .send_prompt_with_options(
@@ -3415,7 +3418,7 @@ impl AgentOrchestrator {
 
         // Re-check status after persisting to close the lost-wakeup race where the agent
         // became foreground-idle between our initial check and SQLite insert.
-        let still_busy = store_still_busy || self.has_pending_permissions(agent_id).await;
+        let still_busy = store_still_busy || self.has_pending_human_gates(agent_id).await;
         if !still_busy {
             let aid_take = agent_id.to_string();
             let qid_take = saved.queue_id.clone();
@@ -3522,7 +3525,7 @@ impl AgentOrchestrator {
         let awaiting_permission = updated_opt
             .as_ref()
             .is_some_and(|ag| matches!(ag.status, AgentStatus::AwaitingPermission { .. }))
-            || self.has_pending_permissions(agent_id).await;
+            || self.has_pending_human_gates(agent_id).await;
         if let Some(updated) = updated_opt {
             let _ = self
                 .broadcast_tx
@@ -3541,6 +3544,8 @@ impl AgentOrchestrator {
                 .insert(agent_id.to_string());
             self.cancel_pending_permissions_and_questions(agent_id)
                 .await;
+        } else {
+            self.suppress_auto_drain.write().await.remove(agent_id);
         }
         let behavior = if should_interrupt {
             ActiveTurnBehavior::Interrupt
@@ -3663,6 +3668,9 @@ impl AgentOrchestrator {
             | AgentStatus::AwaitingPermission {
                 turn_id: ref tid, ..
             } => Some(tid.clone()),
+            AgentStatus::AutonomousWakeup {
+                turn_id: ref tid, ..
+            } if !ag.status.is_background_waiting() => Some(tid.clone()),
             _ => None,
         };
         let queued_at_ms = Utc::now().timestamp_millis();
@@ -4000,10 +4008,28 @@ impl AgentOrchestrator {
         if preserve_queue {
             self.suppress_auto_drain.write().await.remove(agent_id);
         } else {
-            self.suppress_auto_drain
-                .write()
-                .await
-                .insert(agent_id.to_string());
+            let aid_chk = agent_id.to_string();
+            let has_active_or_gate = self.has_pending_human_gates(agent_id).await
+                || self
+                    .try_store(move |s| s.get_agent(&aid_chk))
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|ag| {
+                        matches!(
+                            ag.status,
+                            AgentStatus::Initializing
+                                | AgentStatus::Running { .. }
+                                | AgentStatus::AwaitingPermission { .. }
+                                | AgentStatus::AutonomousWakeup { .. }
+                        )
+                    });
+            if has_active_or_gate {
+                self.suppress_auto_drain
+                    .write()
+                    .await
+                    .insert(agent_id.to_string());
+            }
         }
         let had_pending_initial = self
             .pending_initial_prompt_agents
@@ -4047,6 +4073,7 @@ impl AgentOrchestrator {
     }
 
     async fn settle_initializing_agent_idle(&self, agent_id: &str) {
+        self.suppress_auto_drain.write().await.remove(agent_id);
         self.keep_awake.mark_agent_idle(agent_id);
         let aid_settle = agent_id.to_string();
         if let Ok(Some((ev, updated_opt))) = self
@@ -6821,6 +6848,18 @@ impl AgentOrchestrator {
             .any(|(aid, _)| aid == agent_id)
     }
 
+    pub async fn has_pending_questions(&self, agent_id: &str) -> bool {
+        self.pending_questions
+            .read()
+            .await
+            .get(agent_id)
+            .is_some_and(|ids| !ids.is_empty())
+    }
+
+    pub async fn has_pending_human_gates(&self, agent_id: &str) -> bool {
+        self.has_pending_permissions(agent_id).await || self.has_pending_questions(agent_id).await
+    }
+
     #[cfg(test)]
     pub(crate) async fn insert_pending_permission_for_test(
         &self,
@@ -7089,42 +7128,50 @@ impl AgentOrchestrator {
         )
     }
 
-    async fn get_or_resume_driver(
-        self: &Arc<Self>,
-        agent_id: &str,
-    ) -> anyhow::Result<mpsc::Sender<DriverCommand>> {
-        if let Some(tx) = self.live_agent_tx(agent_id).await {
-            return Ok(tx);
-        }
+    fn get_or_resume_driver<'a>(
+        self: &'a Arc<Self>,
+        agent_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = anyhow::Result<mpsc::Sender<DriverCommand>>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            if let Some(tx) = self.live_agent_tx(agent_id).await {
+                return Ok(tx);
+            }
 
-        let start_lock = self.agent_start_lock(agent_id).await;
-        let _start_guard = start_lock.lock().await;
+            let start_lock = self.agent_start_lock(agent_id).await;
+            let _start_guard = start_lock.lock().await;
 
-        // Re-check after acquiring the per-agent startup lock so concurrent eager-fork startup
-        // and user `send_prompt` share the same live shim without socket collision.
-        if let Some(tx) = self.live_agent_tx(agent_id).await {
-            return Ok(tx);
-        }
+            // Re-check after acquiring the per-agent startup lock so concurrent eager-fork startup
+            // and user `send_prompt` share the same live shim without socket collision.
+            if let Some(tx) = self.live_agent_tx(agent_id).await {
+                return Ok(tx);
+            }
 
-        let aid = agent_id.to_string();
-        let (summary, resume_ref) = self
-            .try_store(move |s| -> anyhow::Result<_> {
-                let summary = s
-                    .get_agent(&aid)?
-                    .ok_or_else(|| anyhow::anyhow!("agent `{aid}` not found"))?;
-                let resume_ref = s.get_persistence_ref(&aid)?;
-                Ok((summary, resume_ref))
-            })
-            .await?;
-        let (executable, _) = self
-            .resolve_launch_executable(summary.provider, summary.acp_agent_id.as_deref())
-            .await?;
-        let launch_gen = self.bump_generation(agent_id).await;
+            let aid = agent_id.to_string();
+            let (summary, resume_ref) = self
+                .try_store(move |s| -> anyhow::Result<_> {
+                    let summary = s
+                        .get_agent(&aid)?
+                        .ok_or_else(|| anyhow::anyhow!("agent `{aid}` not found"))?;
+                    let resume_ref = s.get_persistence_ref(&aid)?;
+                    Ok((summary, resume_ref))
+                })
+                .await?;
+            let (executable, _) = self
+                .resolve_launch_executable(summary.provider, summary.acp_agent_id.as_deref())
+                .await?;
+            let launch_gen = self.bump_generation(agent_id).await;
 
-        self.spawn_and_wire_driver_locked(
-            &summary, executable, resume_ref, None, false, None, false, launch_gen,
-        )
-        .await
+            self.spawn_and_wire_driver_locked(
+                &summary, executable, resume_ref, None, false, None, false, launch_gen,
+            )
+            .await
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7861,9 +7908,8 @@ impl AgentOrchestrator {
                 let mut next_attention: Option<AttentionState> = None;
                 match &status {
                     AgentStatus::Idle => {
-                        compact_after_idle = was_running_turn
-                            && !self.has_pending_permissions(agent_id).await
-                            && !self.pending_questions.read().await.contains_key(agent_id);
+                        compact_after_idle =
+                            was_running_turn && !self.has_pending_human_gates(agent_id).await;
                         self.clear_pending_requests(agent_id).await;
                         let suppressed = self.suppress_auto_drain.write().await.remove(agent_id);
                         if (was_foreground_busy || was_awaiting_permission) && !suppressed {
@@ -7906,6 +7952,7 @@ impl AgentOrchestrator {
                         message,
                         recoverable,
                     } => {
+                        self.clear_pending_requests(agent_id).await;
                         self.suppress_auto_drain.write().await.remove(agent_id);
                         self.turn_usage_recorded.write().await.remove(agent_id);
                         tracing::warn!(
@@ -8939,7 +8986,7 @@ impl AgentOrchestrator {
         let mut payload = payload;
         sanitize_timeline_payload(&mut payload);
         let has_pending_perms = if is_status_change && should_drain_queued_prompt {
-            self.has_pending_permissions(agent_id).await
+            self.has_pending_human_gates(agent_id).await
         } else {
             false
         };
@@ -9255,6 +9302,94 @@ impl AgentOrchestrator {
                 let mgr = Arc::clone(self);
                 let aid = agent_id.to_string();
                 tokio::spawn(async move {
+                    if mgr.has_pending_human_gates(&aid).await
+                        || mgr.suppress_auto_drain.read().await.contains(&aid)
+                    {
+                        return;
+                    }
+                    let aid_peek = aid.clone();
+                    let qid_peek = peeked_queue_id.clone();
+                    let peeked = mgr
+                        .with_store(move |s| {
+                            let ag = s.get_agent(&aid_peek).ok().flatten()?;
+                            if ag.archived_at.is_some()
+                                || ag.status.is_foreground_busy()
+                                || matches!(
+                                    ag.status,
+                                    AgentStatus::AwaitingPermission { .. }
+                                        | AgentStatus::Error { .. }
+                                )
+                            {
+                                return None;
+                            }
+                            let item = s.peek_queued_prompt(&aid_peek, &qid_peek).ok().flatten()?;
+                            Some((item, ag))
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                    let Some((peeked_item, existing_ag)) = peeked else {
+                        return;
+                    };
+
+                    // Preflight `PrePromptSubmit` hook BEFORE consuming the queued prompt so a
+                    // blocked hook preserves the prompt intact for the user.
+                    let checked_prompt = match mgr
+                        .run_pre_prompt_submit_hook(
+                            &aid,
+                            Some(&existing_ag),
+                            peeked_item.wire_prompt.clone(),
+                        )
+                        .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                agent_id = %aid,
+                                queue_id = %peeked_queue_id,
+                                error = %e,
+                                "PrePromptSubmit hook blocked auto-drain of queued prompt"
+                            );
+                            let aid_notice = aid.clone();
+                            let msg = format!("Queued prompt paused: {e}");
+                            if let Ok(Ok(ev)) = mgr
+                                .with_store(move |s| {
+                                    s.append_timeline_event(
+                                        &aid_notice,
+                                        1,
+                                        None,
+                                        TimelinePayload::Notice {
+                                            level: "warning".into(),
+                                            message: msg,
+                                        },
+                                    )
+                                })
+                                .await
+                            {
+                                let _ = mgr.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+                            }
+                            return;
+                        }
+                    };
+
+                    // Ensure the provider driver is live BEFORE consuming the SQLite queue row so
+                    // transient resume failures never drop the queued prompt.
+                    if let Err(e) = mgr.get_or_resume_driver(&aid).await {
+                        tracing::warn!(
+                            agent_id = %aid,
+                            queue_id = %peeked_queue_id,
+                            error = %e,
+                            "Failed ensuring driver ready before auto-draining queued prompt; keeping prompt queued"
+                        );
+                        return;
+                    }
+
+                    // Re-check gates and foreground-idle atomically right before taking the row.
+                    if mgr.has_pending_human_gates(&aid).await
+                        || mgr.suppress_auto_drain.read().await.contains(&aid)
+                    {
+                        return;
+                    }
                     let aid_claim = aid.clone();
                     let qid_claim = peeked_queue_id.clone();
                     let claimed = mgr
@@ -9262,7 +9397,14 @@ impl AgentOrchestrator {
                             let Some(ag) = s.get_agent(&aid_claim).ok().flatten() else {
                                 return (None, None);
                             };
-                            if ag.archived_at.is_some() {
+                            if ag.archived_at.is_some()
+                                || ag.status.is_foreground_busy()
+                                || matches!(
+                                    ag.status,
+                                    AgentStatus::AwaitingPermission { .. }
+                                        | AgentStatus::Error { .. }
+                                )
+                            {
                                 return (None, None);
                             }
                             let item = s.take_queued_prompt(&aid_claim, &qid_claim).ok().flatten();
@@ -9287,9 +9429,9 @@ impl AgentOrchestrator {
                     if let Err(e) = mgr
                         .dispatch_user_prompt_with_handoff(
                             &aid,
-                            next_item.wire_prompt,
-                            Some(next_item.display_prompt),
-                            next_item.badges,
+                            checked_prompt,
+                            Some(next_item.display_prompt.clone()),
+                            next_item.badges.clone(),
                             None,
                             ActiveTurnBehavior::Steer,
                             None,
@@ -9298,9 +9440,23 @@ impl AgentOrchestrator {
                     {
                         tracing::warn!(
                             agent_id = %aid,
+                            queue_id = %next_item.queue_id,
                             error = %e,
-                            "Failed auto-draining daemon queued prompt"
+                            "Failed auto-draining daemon queued prompt; re-queuing at front"
                         );
+                        let aid_requeue = aid.clone();
+                        let restore_item = next_item;
+                        if let Ok(Some(restored_ag)) = mgr
+                            .with_store(move |s| {
+                                let _ = s.requeue_agent_prompt_front(&aid_requeue, &restore_item);
+                                s.get_agent(&aid_requeue).ok().flatten()
+                            })
+                            .await
+                        {
+                            let _ = mgr
+                                .broadcast_tx
+                                .send(DaemonBroadcast::AgentUpdated(restored_ag));
+                        }
                     }
                 });
             } else if should_check_auto_archive && auto_arch {
@@ -15063,6 +15219,432 @@ diff --git a/config/prod.env b/config/prod.env\n\
         }
         assert!(saw_status_tl, "expected StatusChanged(Idle) broadcast");
         assert!(saw_agent_upd, "expected AgentUpdated(Idle) broadcast");
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[tokio::test]
+    async fn pending_questions_gate_enqueue_flush_error_cleanup_and_active_wakeup_blocking_tid() {
+        let (home_dir, store, orch) = test_orchestrator("human_gates_q").await;
+        let ws_dir = home_dir.join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("mkdir ws");
+        let now = Utc::now();
+
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_q".into(),
+                title: "Repo".into(),
+                cwd: ws_dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_q".into(),
+                    workspace_id: "ws_q".into(),
+                    cwd: ws_dir.to_string_lossy().to_string(),
+                    title: "Question Gate Agent".into(),
+                    provider: ProviderKind::Codex,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let agent_gen = orch.bump_generation("ag_q").await;
+        let dummy_task = tokio::spawn(async {});
+        orch.live_agents.write().await.insert(
+            "ag_q".into(),
+            LiveAgentEntry {
+                generation: agent_gen,
+                cmd_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: dummy_task.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+
+        // 1. Pending question alone (even if status is Idle) MUST be recognized by
+        //    `has_pending_human_gates`, hold `enqueue_user_prompt`, and trigger Interrupt on flush!
+        orch.ingest_driver_event(
+            "ag_q",
+            agent_gen,
+            DriverEvent::QuestionRequest {
+                request_id: "q_gate_1".into(),
+                questions: vec![orbit_protocol::QuestionItem {
+                    id: "q1".into(),
+                    header: None,
+                    question: "Proceed?".into(),
+                    options: vec!["yes".into()],
+                    is_multi_select: false,
+                }],
+            },
+        )
+        .await;
+        assert!(orch.has_pending_questions("ag_q").await);
+        assert!(orch.has_pending_human_gates("ag_q").await);
+
+        orch.enqueue_user_prompt(
+            "ag_q",
+            "Wait behind question".into(),
+            None,
+            Vec::new(),
+            Some("q_behind_question".into()),
+        )
+        .await
+        .expect("enqueue behind question");
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "enqueue_user_prompt must NOT dispatch while pending question is open"
+        );
+        assert!(
+            store
+                .peek_queued_prompt("ag_q", "q_behind_question")
+                .expect("peek")
+                .is_some()
+        );
+
+        orch.flush_queued_user_prompt_now("ag_q", "q_behind_question")
+            .await
+            .expect("flush behind question");
+        assert!(
+            !orch.has_pending_human_gates("ag_q").await,
+            "flush must cancel pending question gate"
+        );
+        match cmd_rx.try_recv().expect("driver cmd") {
+            DriverCommand::SendPrompt { behavior, .. } => {
+                assert_eq!(behavior, ActiveTurnBehavior::Interrupt);
+            }
+            other => panic!("expected SendPrompt(Interrupt), got {other:?}"),
+        }
+
+        // 2. AgentStatus::Error MUST clear stale pending permissions/questions so subsequent
+        //    prompts are never stranded!
+        orch.ingest_driver_event(
+            "ag_q",
+            agent_gen,
+            DriverEvent::QuestionRequest {
+                request_id: "q_gate_err".into(),
+                questions: vec![orbit_protocol::QuestionItem {
+                    id: "q2".into(),
+                    header: None,
+                    question: "Erroring?".into(),
+                    options: vec![],
+                    is_multi_select: false,
+                }],
+            },
+        )
+        .await;
+        assert!(orch.has_pending_human_gates("ag_q").await);
+        orch.ingest_driver_event(
+            "ag_q",
+            agent_gen,
+            DriverEvent::StatusChanged(AgentStatus::Error {
+                message: "boom".into(),
+                recoverable: true,
+            }),
+        )
+        .await;
+        assert!(
+            !orch.has_pending_human_gates("ag_q").await,
+            "AgentStatus::Error must clear stale pending permissions/questions"
+        );
+        orch.enqueue_user_prompt("ag_q", "Recover after error".into(), None, Vec::new(), None)
+            .await
+            .expect("enqueue after error dispatches directly");
+        match cmd_rx.try_recv().expect("dispatched after error") {
+            DriverCommand::SendPrompt {
+                prompt, behavior, ..
+            } => {
+                assert_eq!(behavior, ActiveTurnBehavior::Steer);
+                assert!(prompt.contains("Recover after error"));
+            }
+            other => panic!("expected direct SendPrompt(Steer), got {other:?}"),
+        }
+
+        // 3. dispatch_coalesced_batch must set blocking_turn_id for active foreground
+        //    AutonomousWakeup, and leave it None for passive `waiting:*`.
+        orch.ingest_driver_event(
+            "ag_q",
+            agent_gen,
+            DriverEvent::StatusChanged(AgentStatus::AutonomousWakeup {
+                turn_id: "wakeup_live_42".into(),
+                source: "background_task".into(),
+            }),
+        )
+        .await;
+        orch.dispatch_coalesced_batch(crate::messaging::CoalescedDispatchBatch {
+            recipient_id: "ag_q".into(),
+            entries: vec![crate::messaging::QueuedAgentMessage {
+                recipient_id: "ag_q".into(),
+                message_id: "msg_wake_blk".into(),
+                source: crate::messaging::AgentPromptSource {
+                    kind: AgentMessageKind::DirectMessage,
+                    source_agent_id: Some("peer_1".into()),
+                    source_host_id: None,
+                    source_title: Some("Peer".into()),
+                    event: None,
+                    permission_context: None,
+                },
+                body: "hello during wakeup".into(),
+                active_turn_behavior: ActiveTurnBehavior::Queue,
+                session_mode: None,
+                unarchive: false,
+            }],
+            wire_prompt: "hello during wakeup".into(),
+            active_turn_behavior: ActiveTurnBehavior::Queue,
+            session_mode: None,
+            unarchive: false,
+        })
+        .await
+        .expect("dispatch batch");
+        let events = store.fetch_recent_timeline("ag_q", 20).expect("timeline");
+        assert!(
+            events.iter().any(|ev| matches!(
+                &ev.payload,
+                TimelinePayload::AgentMessage {
+                    message_id,
+                    blocking_turn_id,
+                    ..
+                } if message_id == "msg_wake_blk"
+                    && blocking_turn_id.as_deref() == Some("wakeup_live_42")
+            )),
+            "dispatch_coalesced_batch must populate blocking_turn_id for active foreground AutonomousWakeup: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_drain_runs_pre_prompt_hook_and_requeues_front_on_transient_dispatch_failure() {
+        let (home_dir, store, orch) = test_orchestrator("auto_drain_safe").await;
+        let ws_dir = home_dir.join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("mkdir ws");
+        let now = Utc::now();
+
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_ad".into(),
+                title: "Repo".into(),
+                cwd: ws_dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_ad".into(),
+                    workspace_id: "ws_ad".into(),
+                    cwd: ws_dir.to_string_lossy().to_string(),
+                    title: "Auto Drain Agent".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::FullAccess,
+                    status: AgentStatus::Running {
+                        turn_id: "t_run".into(),
+                    },
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        // Register a live agent whose receiver is dropped so dispatch fails transiently AFTER
+        // `get_or_resume_driver` returns the cached `cmd_tx`!
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        drop(cmd_rx);
+        let agent_gen = orch.bump_generation("ag_ad").await;
+        let dummy_task = tokio::spawn(async {});
+        orch.live_agents.write().await.insert(
+            "ag_ad".into(),
+            LiveAgentEntry {
+                generation: agent_gen,
+                cmd_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: dummy_task.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+
+        store
+            .enqueue_agent_prompt("ag_ad", "q_first", "First queued", "First queued", &[])
+            .expect("enq 1");
+        store
+            .enqueue_agent_prompt("ag_ad", "q_second", "Second queued", "Second queued", &[])
+            .expect("enq 2");
+
+        // Transition Running -> Idle triggers auto-drain; dispatch fails because receiver closed,
+        // so `q_first` MUST be re-queued at the FRONT (ahead of `q_second`) rather than dropped!
+        orch.ingest_driver_event(
+            "ag_ad",
+            agent_gen,
+            DriverEvent::StatusChanged(AgentStatus::Idle),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let ag = store.get_agent("ag_ad").expect("get").expect("agent");
+        let q_ids: Vec<&str> = ag
+            .queued_prompts
+            .iter()
+            .map(|q| q.queue_id.as_str())
+            .collect();
+        assert_eq!(
+            q_ids,
+            vec!["q_first", "q_second"],
+            "transient dispatch failure during auto-drain MUST re-queue q_first at the front"
+        );
+
+        // Now attach a live receiver AND install a blocking PrePromptSubmit hook -> auto-drain
+        // must keep q_first intact and record a warning notice instead of dispatching it!
+        let (live_tx, mut live_rx) = mpsc::channel(4);
+        orch.live_agents.write().await.insert(
+            "ag_ad".into(),
+            LiveAgentEntry {
+                generation: agent_gen,
+                cmd_tx: live_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: dummy_task.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+        orch.hooks
+            .upsert_hook(
+                None,
+                orbit_protocol::LifecycleHookRule {
+                    id: "hk_block_auto_drain".into(),
+                    name: "Block auto drain".into(),
+                    scope: orbit_protocol::HookScope::UserGlobal,
+                    event: orbit_protocol::HookEventKind::PrePromptSubmit,
+                    matcher: None,
+                    action: orbit_protocol::HookAction::Command {
+                        command: "/bin/sh".into(),
+                        args: vec!["-c".into(), "echo blocked-auto-drain >&2; exit 2".into()],
+                        env: std::collections::BTreeMap::new(),
+                    },
+                    timeout_ms: 5_000,
+                    enabled: true,
+                    trusted: true,
+                    description: None,
+                },
+            )
+            .await
+            .expect("upsert hook");
+        orch.ingest_driver_event(
+            "ag_ad",
+            agent_gen,
+            DriverEvent::StatusChanged(AgentStatus::Running {
+                turn_id: "t_run_2".into(),
+            }),
+        )
+        .await;
+        orch.ingest_driver_event(
+            "ag_ad",
+            agent_gen,
+            DriverEvent::StatusChanged(AgentStatus::Idle),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            live_rx.try_recv().is_err(),
+            "blocked PrePromptSubmit hook must prevent auto-drain dispatch"
+        );
+        let ag_after = store.get_agent("ag_ad").expect("get").expect("agent");
+        assert_eq!(
+            ag_after.queued_prompts.first().map(|q| q.queue_id.as_str()),
+            Some("q_first"),
+            "blocked PrePromptSubmit hook must preserve queued prompt in SQLite"
+        );
+        let tl = store.fetch_recent_timeline("ag_ad", 20).expect("timeline");
+        assert!(
+            tl.iter().any(|ev| matches!(
+                &ev.payload,
+                TimelinePayload::Notice { level, message }
+                    if level == "warning" && message.contains("Queued prompt paused:")
+            )),
+            "blocked auto-drain must record a warning Notice: {tl:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&home_dir);
     }

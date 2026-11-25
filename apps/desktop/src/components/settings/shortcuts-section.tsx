@@ -276,11 +276,12 @@ export function ShortcutsSection({ jumpTo }: { jumpTo?: string }) {
                                 if (isRecording) setRecordingId(null);
                               }}
                               title={t("settings.shortcutsClickToRecord")}
+                              aria-label={`${item.action}: ${item.keys}`}
                               className={cn(
-                                "inline-flex h-[26px] min-w-[68px] cursor-pointer items-center justify-center rounded-[7px] border px-2 font-mono text-[11px] transition-colors",
+                                "inline-flex min-h-[26px] cursor-pointer items-center justify-center rounded-[7px] transition-colors outline-none focus-visible:ring-1 focus-visible:ring-border-strong",
                                 isRecording
-                                  ? "border-border-strong bg-surface-raised text-ink-primary ring-border-strong ring-1"
-                                  : "border-border-subtle bg-surface-recessed text-ink-secondary hover:border-border-default hover:text-ink-primary",
+                                  ? "border-border-strong bg-surface-raised text-ink-primary ring-border-strong min-w-[84px] border px-2.5 ring-1"
+                                  : "hover:bg-surface-recessed -mr-1.5 px-1.5 py-0.5",
                               )}
                             >
                               {isRecording ? (
@@ -288,7 +289,7 @@ export function ShortcutsSection({ jumpTo }: { jumpTo?: string }) {
                                   {t("settings.shortcutsPressKeys")}
                                 </span>
                               ) : (
-                                item.keys
+                                <ShortcutKbd keys={item.keys} className="shrink-0" />
                               )}
                             </button>
                           ) : (

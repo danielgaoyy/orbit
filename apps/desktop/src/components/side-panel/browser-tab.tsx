@@ -21,6 +21,7 @@ import {
   Tablet,
   X,
 } from "lucide-react";
+import { ShortcutKbd } from "@/components/ui/kbd";
 import { Select } from "@/components/ui/select";
 import { useI18n } from "@/lib/i18n";
 import {
@@ -964,9 +965,10 @@ export const BrowserTab = memo(function BrowserTab({
           <button
             type="button"
             onClick={() => setPickElementMode(false)}
-            className="text-muted-foreground hover:text-foreground shrink-0 cursor-pointer rounded px-1.5 py-0.5 text-[11px] transition-colors"
+            aria-label={t("common.cancel")}
+            className="shrink-0 cursor-pointer rounded p-0.5 transition-opacity hover:opacity-80"
           >
-            Esc
+            <ShortcutKbd keys="Esc" size="xs" variant="subtle" />
           </button>
         </div>
       )}

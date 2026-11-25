@@ -59,7 +59,7 @@ import { SkillsPluginsSection } from "./skills-plugins-section";
 import { Button } from "@/components/ui/button";
 import { IconButton } from "@/components/ui/icon-button";
 import { Input } from "@/components/ui/input";
-import { Kbd } from "@/components/ui/kbd";
+import { ShortcutKbd } from "@/components/ui/kbd";
 import { ListRow } from "@/components/ui/list-row";
 import {
   DropdownMenu,
@@ -439,7 +439,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                   aria-activedescendant={searching && selected >= 0 ? `settings-result-${selected}` : undefined}
                   className={cn(
                     "h-[30px] pl-[28px] text-[13px] shadow-none",
-                    query ? "pr-[28px]" : "pr-[40px]",
+                    query ? "pr-[28px]" : "pr-[48px]",
                   )}
                 />
                 <div className="absolute right-[6px] flex items-center">
@@ -455,9 +455,12 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                       <X />
                     </IconButton>
                   ) : (
-                    <Kbd variant="subtle" size="xs" className="text-[11px]">
-                      {modSymbol()}F
-                    </Kbd>
+                    <ShortcutKbd
+                      keys={`${modSymbol()}F`}
+                      size="xs"
+                      variant="subtle"
+                      className="pointer-events-none"
+                    />
                   )}
                 </div>
               </div>

@@ -1095,7 +1095,7 @@ html.orbit-linux .animate-spin {
   [data-slot="select-trigger"], [data-slot="select-trigger"] > span:first-child,
   [data-slot="tabs-trigger"], [data-slot="field-label"]
 ) { font-size: 13px; }
-:where(.settings-view, .settings-drawer) :is([data-slot="badge"], [data-slot="kbd"]) { font-size: 11px; }
+:where(.settings-view, .settings-drawer) [data-slot="badge"] { font-size: 11px; }
 .settings-select-menu :is([data-slot="select-item"], [data-slot="select-item-label"]),
 .settings-scope-menu [data-slot="dropdown-menu-item"] { font-size: 13px; }
 .settings-select-menu :is([data-slot="select-item-description"], [data-slot="select-item-badge"]) { font-size: 11px; }

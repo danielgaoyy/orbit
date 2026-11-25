@@ -23,6 +23,7 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Field, FieldLabel, FieldGroup } from "@/components/ui/field";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { Input } from "@/components/ui/input";
+import { ShortcutKbd } from "@/components/ui/kbd";
 import { Textarea } from "@/components/ui/textarea";
 import { isImeKeyEvent } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
@@ -892,11 +893,11 @@ function ManagedSkills({
                       <Button
                         size="sm"
                         disabled={!isDirty || saving || !online}
-                        title={modSymbol() + "S"}
                         onClick={() => void handleSaveEditor()}
                       >
                         {saving && <OrbitSpinner size={13} />}
-                        {t("common.save")}
+                        <span>{t("common.save")}</span>
+                        <ShortcutKbd keys={`${modSymbol()}S`} size="xs" variant="inverted" />
                       </Button>
                     </div>
                   </div>

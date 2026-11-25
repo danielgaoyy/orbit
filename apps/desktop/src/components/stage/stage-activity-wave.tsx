@@ -42,9 +42,10 @@ export interface StageActivityWaveProps extends StageLiveActivityInput {
 }
 
 /**
- * Minimal bottom concentric ripple-wave activity line summarizing live background dependencies
- * (awaiting/running subagents, running background tasks, armed timers, or active goals)
- * without duplicating Overview HUD avatars or active turn spinners.
+ * Minimal bottom status line summarizing live background dependencies once the foreground turn
+ * is idle (or immediately when a subagent is awaiting approval), using quiet text-only shimmer
+ * copy (or warning tone for blocking approvals) without competing with live step disclosures or
+ * Overview cards.
  */
 export const StageActivityWave = memo(function StageActivityWave({
   runningSubagentsCount,
@@ -85,68 +86,49 @@ export const StageActivityWave = memo(function StageActivityWave({
 
   if (!summary) return null;
 
-  const isWarning = summary.tone === "warning";
   const rowClasses = cn(
-    "group/wave inline-flex max-w-full min-h-[24px] min-w-0 items-center gap-2 py-0.5 text-left text-[13px] leading-[18px] tabular-nums select-none",
+    "group/wave inline-flex max-w-full min-h-[24px] min-w-0 items-center py-0.5 text-left text-[13px] leading-[18px] tabular-nums select-none",
     onClick &&
       "cursor-pointer outline-none focus-visible:underline decoration-ink-muted underline-offset-4",
   );
 
   const innerContent = (
-    <>
-      <span
-        data-slot="stage-activity-wave-orb"
-        data-tone={summary.tone}
-        aria-hidden="true"
-        className={cn(
-          "relative inline-flex size-[18px] shrink-0 items-center justify-center",
-          isWarning
-            ? "text-signal-warning"
-            : cn("text-ink-secondary", onClick && "transition-colors group-hover/wave:text-ink-primary"),
-        )}
-      >
-        <span className="orbit-activity-ripple-ring pointer-events-none absolute size-[7px] rounded-full border border-current" />
-        <span className="orbit-activity-ripple-ring orbit-activity-ripple-ring-delayed pointer-events-none absolute size-[7px] rounded-full border border-current" />
-        <span className="size-[5px] rounded-full bg-current" />
-      </span>
-
-      <span className="flex min-w-0 flex-1 items-baseline gap-1.5 overflow-hidden">
-        <span className="min-w-0 truncate">
-          {summary.parts.map((part, idx) => (
-            <span key={part.kind}>
-              {idx > 0 && (
-                <span aria-hidden="true" className="text-ink-muted">
-                  {" · "}
-                </span>
-              )}
-              <span
-                className={cn(
-                  part.tone === "warning"
-                    ? "font-medium text-signal-warning"
-                    : "shimmer",
-                )}
-              >
-                {part.text}
+    <span className="flex min-w-0 flex-1 items-baseline gap-1.5 overflow-hidden">
+      <span className="min-w-0 truncate">
+        {summary.parts.map((part, idx) => (
+          <span key={part.kind}>
+            {idx > 0 && (
+              <span aria-hidden="true" className="text-ink-muted">
+                {" · "}
               </span>
-            </span>
-          ))}
-        </span>
-
-        {summary.secondaryHint && (
-          <span
-            className={cn(
-              "min-w-0 shrink truncate text-ink-tertiary",
-              onClick && "transition-colors group-hover/wave:text-ink-secondary",
             )}
-          >
-            <span aria-hidden="true" className="text-ink-muted">
-              ·{" "}
+            <span
+              className={cn(
+                part.tone === "warning"
+                  ? "font-medium text-signal-warning"
+                  : "shimmer",
+              )}
+            >
+              {part.text}
             </span>
-            {summary.secondaryHint}
           </span>
-        )}
+        ))}
       </span>
-    </>
+
+      {summary.secondaryHint && (
+        <span
+          className={cn(
+            "min-w-0 shrink truncate text-ink-tertiary",
+            onClick && "transition-colors group-hover/wave:text-ink-secondary",
+          )}
+        >
+          <span aria-hidden="true" className="text-ink-muted">
+            ·{" "}
+          </span>
+          {summary.secondaryHint}
+        </span>
+      )}
+    </span>
   );
 
   return (
@@ -216,10 +198,12 @@ export const StreamStageActivityWave = memo(function StreamStageActivityWave({
   );
   const hasActiveGoal = Boolean(activeGoal && activeGoal.status !== "paused");
   const hasLiveActivityWave =
-    liveSubagentActivity.runningCount > 0 ||
     liveSubagentActivity.awaitingCount > 0 ||
-    runningBackgroundTasks.length > 0 ||
-    (!isForegroundRunning && (armedTimersCount > 0 || hasActiveGoal));
+    (!isForegroundRunning &&
+      (liveSubagentActivity.runningCount > 0 ||
+        runningBackgroundTasks.length > 0 ||
+        armedTimersCount > 0 ||
+        hasActiveGoal));
 
   const handleClick = useCallback(() => {
     const state = getOrbitState();

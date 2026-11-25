@@ -19,10 +19,43 @@ import {
   SettingSelect,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import {
+  countOverwrites,
+  migrationPreviewKey,
+  unexpectedOverwrites,
+} from "@/components/settings/ide-migration-model";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ContextBanner } from "@/components/ui/context-banner";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
-import { useI18n } from "@/lib/i18n";
+import { useI18n, type MessageKey } from "@/lib/i18n";
+
+const MIGRATION_SOURCE_KEYS: Record<string, MessageKey> = {
+  claude: "securityOps.migrationSourceClaude",
+  claude_code: "securityOps.migrationSourceClaude",
+  codex: "securityOps.migrationSourceCodex",
+  antigravity: "securityOps.migrationSourceAntigravity",
+  cursor: "securityOps.migrationSourceCursor",
+  vscode: "securityOps.migrationSourceVscode",
+};
+
+const MIGRATION_KIND_KEYS: Record<string, MessageKey> = {
+  rule: "securityOps.migrationKindRules",
+  rules: "securityOps.migrationKindRules",
+  skill: "securityOps.migrationKindSkills",
+  skills: "securityOps.migrationKindSkills",
+  command: "securityOps.migrationKindCommands",
+  commands: "securityOps.migrationKindCommands",
+  mcp: "securityOps.migrationKindMcp",
+};
+
+const MIGRATION_DECISION_KEYS: Record<string, MessageKey> = {
+  create: "securityOps.migrationDecisionCreate",
+  unchanged: "securityOps.migrationDecisionUnchanged",
+  skip: "securityOps.migrationDecisionSkip",
+  overwrite: "securityOps.migrationDecisionOverwrite",
+  rename: "securityOps.migrationDecisionRename",
+};
 import {
   type AuditChainVerification,
   type ExternalIdeMigrationItem,
@@ -185,7 +218,7 @@ export const HostSandboxSection = memo(function HostSandboxSection({
         )}
 
         {sandboxLoaded && effectivePolicy.mode !== "off" && (
-          <div className="bg-surface-recessed/45 text-ink-muted flex items-center gap-2 px-4 py-2.5 text-[11px]">
+          <div className="bg-surface-recessed/45 text-ink-muted flex items-center gap-2 px-4 py-2 text-[11px]">
             <Lock className="size-[13px] shrink-0 opacity-80" />
             <span>{t("securityOps.sandboxCredentialsProtected")}</span>
           </div>
@@ -204,11 +237,14 @@ export const HostAuditChainSection = memo(function HostAuditChainSection({
 }) {
   const { t } = useI18n();
   const [auditStatus, setAuditStatus] = useState<AuditChainVerification | null>(null);
-  const [verifyingAudit, setVerifyingAudit] = useState(false);
+  const [verifyingAudit, setVerifyingAudit] = useState(() => isOnline);
   const [exportingAudit, setExportingAudit] = useState(false);
 
   useEffect(() => {
-    if (!isOnline) return;
+    if (!isOnline) {
+      setVerifyingAudit(false);
+      return;
+    }
     let active = true;
     setVerifyingAudit(true);
     void orbitIpc
@@ -270,7 +306,7 @@ export const HostAuditChainSection = memo(function HostAuditChainSection({
       <SettingCard>
         <div
           data-setting-id="securityOps.auditChainTitle"
-          className="flex flex-col gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between"
+          className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
         >
           <div className="min-w-0 space-y-1">
             <div className="flex flex-wrap items-center gap-2">
@@ -295,7 +331,7 @@ export const HostAuditChainSection = memo(function HostAuditChainSection({
             </div>
 
             {auditStatus && (
-              <div className="text-ink-secondary flex flex-wrap items-center gap-2.5 font-mono text-[11px] tabular-nums">
+              <div className="text-ink-secondary flex flex-wrap items-center gap-2 font-mono text-[11px] tabular-nums">
                 <span>
                   {t("securityOps.auditEntriesCount", { count: auditStatus.verified_entries })}
                 </span>
@@ -350,14 +386,14 @@ export const HostSandboxAndAuditPanel = memo(function HostSandboxAndAuditPanel({
   isOnline: boolean;
 }) {
   return (
-    <div className="flex flex-col gap-5">
+    <div className="flex flex-col gap-6">
       <HostSandboxSection hostId={hostId} isOnline={isOnline} />
       <HostAuditChainSection hostId={hostId} isOnline={isOnline} />
     </div>
   );
 });
 
-export const HostDiagnosticsAndMigrationPanel = memo(function HostDiagnosticsAndMigrationPanel({
+export const HostDiagnosticsSection = memo(function HostDiagnosticsSection({
   hostId,
   isOnline,
 }: {
@@ -365,28 +401,9 @@ export const HostDiagnosticsAndMigrationPanel = memo(function HostDiagnosticsAnd
   isOnline: boolean;
 }) {
   const { t } = useI18n();
-  const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
-  const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
-
   const [exportingDiag, setExportingDiag] = useState(false);
   const [lastDiagJson, setLastDiagJson] = useState<string | null>(null);
   const [copiedDiag, setCopiedDiag] = useState(false);
-
-  const [source, setSource] = useState<"all" | ExternalIdeSource>("all");
-  const [conflict, setConflict] = useState<MigrationConflict>("skip");
-  const [includeWorkspace, setIncludeWorkspace] = useState(true);
-  const [inspecting, setInspecting] = useState(false);
-  const [executing, setExecuting] = useState(false);
-  const [previewItems, setPreviewItems] = useState<ExternalIdeMigrationItem[] | null>(null);
-  const [migrationRan, setMigrationRan] = useState(false);
-
-  const activeCwd = useMemo(() => {
-    if (!includeWorkspace) return null;
-    if (selectedHostId === hostId && selectedCwd && selectedCwd !== "~") {
-      return selectedCwd;
-    }
-    return null;
-  }, [hostId, includeWorkspace, selectedCwd, selectedHostId]);
 
   const handleExportDiagnostics = useCallback(async () => {
     setExportingDiag(true);
@@ -415,9 +432,94 @@ export const HostDiagnosticsAndMigrationPanel = memo(function HostDiagnosticsAnd
     }
   }, [lastDiagJson, t]);
 
+  return (
+    <div className="flex flex-col gap-3">
+      <SettingGroupLabel>{t("securityOps.diagGroup")}</SettingGroupLabel>
+      <SettingCard>
+        <SettingRow
+          settingId="securityOps.diagTitle"
+          title={t("securityOps.diagTitle")}
+          description={t("securityOps.diagDesc")}
+        >
+          <div className="flex items-center gap-2">
+            {lastDiagJson && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => void handleCopyDiagnostics()}
+              >
+                {copiedDiag ? (
+                  <Check data-icon="inline-start" className="text-signal-success" />
+                ) : (
+                  <Copy data-icon="inline-start" />
+                )}
+                {t("common.copy")}
+              </Button>
+            )}
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={!isOnline || exportingDiag}
+              onClick={() => void handleExportDiagnostics()}
+            >
+              {exportingDiag ? (
+                <OrbitSpinner size={12} />
+              ) : (
+                <Download data-icon="inline-start" />
+              )}
+              {t("securityOps.diagExportButton")}
+            </Button>
+          </div>
+        </SettingRow>
+      </SettingCard>
+    </div>
+  );
+});
+
+export const HostMigrationSection = memo(function HostMigrationSection({
+  hostId,
+  isOnline,
+}: {
+  hostId: string;
+  isOnline: boolean;
+}) {
+  const { t } = useI18n();
+  const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
+  const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
+
+  const [source, setSource] = useState<"all" | ExternalIdeSource>("all");
+  const [conflict, setConflict] = useState<MigrationConflict>("skip");
+  const [includeWorkspace, setIncludeWorkspace] = useState(true);
+  const [inspecting, setInspecting] = useState(false);
+  const [executing, setExecuting] = useState(false);
+  const [preview, setPreview] = useState<{
+    key: string;
+    items: ExternalIdeMigrationItem[];
+    ran: boolean;
+    unexpected: string[];
+  } | null>(null);
+
+  const activeCwd = useMemo(() => {
+    if (!includeWorkspace) return null;
+    if (selectedHostId === hostId && selectedCwd && selectedCwd !== "~") {
+      return selectedCwd;
+    }
+    return null;
+  }, [hostId, includeWorkspace, selectedCwd, selectedHostId]);
+
+  const previewKey = migrationPreviewKey(source, activeCwd, conflict);
+  // A preview only describes the run it was computed for: the daemon re-scans
+  // and re-decides on execute, so stale inputs must force a fresh dry run.
+  const fresh = preview !== null && preview.key === previewKey ? preview : null;
+  const previewItems = fresh?.items ?? null;
+  const migrationRan = fresh?.ran ?? false;
+  const unexpected = fresh?.unexpected ?? [];
+  const overwriteCount = previewItems === null ? 0 : countOverwrites(previewItems);
+
   const handleInspectMigration = useCallback(async () => {
     setInspecting(true);
-    setMigrationRan(false);
     try {
       const items = await orbitIpc.inspectExternalIdeMigration(
         hostId,
@@ -425,7 +527,12 @@ export const HostDiagnosticsAndMigrationPanel = memo(function HostDiagnosticsAnd
         activeCwd,
         conflict,
       );
-      setPreviewItems(items);
+      setPreview({
+        key: migrationPreviewKey(source, activeCwd, conflict),
+        items,
+        ran: false,
+        unexpected: [],
+      });
     } catch (err) {
       orbitActions.showToast(err instanceof Error ? err.message : String(err));
     } finally {
@@ -434,6 +541,9 @@ export const HostDiagnosticsAndMigrationPanel = memo(function HostDiagnosticsAnd
   }, [activeCwd, conflict, hostId, source]);
 
   const handleExecuteMigration = useCallback(async () => {
+    const key = migrationPreviewKey(source, activeCwd, conflict);
+    const confirmed = preview !== null && preview.key === key ? preview.items : null;
+    if (confirmed === null) return;
     setExecuting(true);
     try {
       const items = await orbitIpc.executeExternalIdeMigration(
@@ -442,8 +552,14 @@ export const HostDiagnosticsAndMigrationPanel = memo(function HostDiagnosticsAnd
         activeCwd,
         conflict,
       );
-      setPreviewItems(items);
-      setMigrationRan(true);
+      setPreview({
+        key,
+        items,
+        ran: true,
+        // The daemon re-decided against the live filesystem; surface any file it
+        // clobbered that the dry run had not flagged as an overwrite.
+        unexpected: unexpectedOverwrites(confirmed, items),
+      });
       orbitActions.showToast(
         t("securityOps.migrationExecutedToast", { count: items.length }),
       );
@@ -452,199 +568,171 @@ export const HostDiagnosticsAndMigrationPanel = memo(function HostDiagnosticsAnd
     } finally {
       setExecuting(false);
     }
-  }, [activeCwd, conflict, hostId, source, t]);
+  }, [activeCwd, conflict, hostId, preview, source, t]);
 
   return (
-    <>
-      {/* Diagnostic Bundle Export */}
-      <div className="flex flex-col gap-2">
-        <SettingGroupLabel>{t("securityOps.diagGroup")}</SettingGroupLabel>
-        <SettingCard>
-          <SettingRow
-            settingId="securityOps.diagTitle"
-            title={t("securityOps.diagTitle")}
-            description={t("securityOps.diagDesc")}
-          >
-            <div className="flex items-center gap-2">
-              {lastDiagJson && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => void handleCopyDiagnostics()}
-                >
-                  {copiedDiag ? (
-                    <Check data-icon="inline-start" className="text-signal-success" />
-                  ) : (
-                    <Copy data-icon="inline-start" />
-                  )}
-                  {t("common.copy")}
-                </Button>
-              )}
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={!isOnline || exportingDiag}
-                onClick={() => void handleExportDiagnostics()}
-              >
-                {exportingDiag ? (
-                  <OrbitSpinner size={12} />
-                ) : (
-                  <Download data-icon="inline-start" />
-                )}
-                {t("securityOps.diagExportButton")}
-              </Button>
-            </div>
-          </SettingRow>
-        </SettingCard>
-      </div>
+    <div data-setting-id="securityOps.migrationGroup" className="flex flex-col gap-3">
+      <SettingGroupLabel>{t("securityOps.migrationGroup")}</SettingGroupLabel>
+      <SettingCard>
+        <SettingRow
+          settingId="securityOps.migrationSourceTitle"
+          title={t("securityOps.migrationSourceTitle")}
+          description={t("securityOps.migrationSourceDesc")}
+        >
+          <SettingSelect<"all" | ExternalIdeSource>
+            value={source}
+            disabled={!isOnline || inspecting || executing}
+            onChange={setSource}
+            options={[
+              { value: "all", label: t("securityOps.migrationAllSources") },
+              { value: "claude", label: "Claude Code" },
+              { value: "codex", label: "Codex" },
+              { value: "antigravity", label: "Antigravity" },
+              { value: "cursor", label: "Cursor" },
+              { value: "vscode", label: "VS Code" },
+            ]}
+          />
+        </SettingRow>
 
-      {/* Import from IDE / CLI */}
-      <div data-setting-id="securityOps.migrationGroup" className="flex flex-col gap-2">
-        <SettingGroupLabel>{t("securityOps.migrationGroup")}</SettingGroupLabel>
-        <SettingCard>
+        <SettingRow
+          settingId="securityOps.migrationConflictTitle"
+          title={t("securityOps.migrationConflictTitle")}
+          description={t("securityOps.migrationConflictDesc")}
+        >
+          <SettingSelect<MigrationConflict>
+            value={conflict}
+            disabled={!isOnline || inspecting || executing}
+            onChange={setConflict}
+            options={[
+              { value: "skip", label: t("securityOps.migrationConflictSkip") },
+              { value: "rename", label: t("securityOps.migrationConflictRename") },
+              { value: "overwrite", label: t("securityOps.migrationConflictOverwrite") },
+            ]}
+          />
+        </SettingRow>
+
+        {selectedHostId === hostId && selectedCwd && selectedCwd !== "~" && (
           <SettingRow
-            settingId="securityOps.migrationSourceTitle"
-            title={t("securityOps.migrationSourceTitle")}
-            description={t("securityOps.migrationSourceDesc")}
+            settingId="securityOps.migrationScopeTitle"
+            title={t("securityOps.migrationScopeTitle")}
+            description={selectedCwd}
           >
-            <SettingSelect<"all" | ExternalIdeSource>
-              value={source}
+            <ToggleSwitch
+              checked={includeWorkspace}
               disabled={!isOnline || inspecting || executing}
-              onChange={(val) => {
-                setSource(val);
-                setPreviewItems(null);
-                setMigrationRan(false);
-              }}
-              options={[
-                { value: "all", label: t("securityOps.migrationAllSources") },
-                { value: "claude", label: "Claude Code" },
-                { value: "codex", label: "Codex" },
-                { value: "antigravity", label: "Antigravity" },
-                { value: "cursor", label: "Cursor" },
-                { value: "vscode", label: "VS Code" },
-              ]}
+              ariaLabel={t("securityOps.migrationScopeTitle")}
+              onChange={setIncludeWorkspace}
             />
           </SettingRow>
+        )}
 
-          <SettingRow
-            settingId="securityOps.migrationConflictTitle"
-            title={t("securityOps.migrationConflictTitle")}
-            description={t("securityOps.migrationConflictDesc")}
-          >
-            <SettingSelect<MigrationConflict>
-              value={conflict}
+        <div className="flex flex-col gap-3 px-4 py-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
               disabled={!isOnline || inspecting || executing}
-              onChange={(val) => {
-                setConflict(val);
-                setPreviewItems(null);
-                setMigrationRan(false);
-              }}
-              options={[
-                { value: "skip", label: t("securityOps.migrationConflictSkip") },
-                { value: "rename", label: t("securityOps.migrationConflictRename") },
-                { value: "overwrite", label: t("securityOps.migrationConflictOverwrite") },
-              ]}
-            />
-          </SettingRow>
-
-          {selectedHostId === hostId && selectedCwd && selectedCwd !== "~" && (
-            <SettingRow
-              settingId="securityOps.migrationScopeTitle"
-              title={t("securityOps.migrationScopeTitle")}
-              description={selectedCwd}
+              onClick={() => void handleInspectMigration()}
             >
-              <ToggleSwitch
-                checked={includeWorkspace}
-                disabled={!isOnline || inspecting || executing}
-                ariaLabel={t("securityOps.migrationScopeTitle")}
-                onChange={(include) => {
-                  setIncludeWorkspace(include);
-                  setPreviewItems(null);
-                  setMigrationRan(false);
-                }}
-              />
-            </SettingRow>
-          )}
-
-          <div className="flex flex-col gap-3 px-4 py-3.5">
-            <div className="flex flex-wrap items-center gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={!isOnline || inspecting || executing}
-                onClick={() => void handleInspectMigration()}
-              >
-                {inspecting ? (
-                  <OrbitSpinner size={12} />
-                ) : (
-                  <FolderInput data-icon="inline-start" />
-                )}
-                {t("securityOps.migrationPreviewButton")}
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                disabled={
-                  !isOnline ||
-                  inspecting ||
-                  executing ||
-                  migrationRan ||
-                  previewItems === null ||
-                  previewItems.length === 0
-                }
-                onClick={() => void handleExecuteMigration()}
-              >
-                {executing && <OrbitSpinner size={12} />}
-                {t("securityOps.migrationExecuteButton")}
-              </Button>
-            </div>
-
-            {previewItems !== null && (
-              previewItems.length === 0 ? (
-                <div className="text-ink-muted text-[13px]">
-                  {t("securityOps.migrationEmpty")}
-                </div>
+              {inspecting ? (
+                <OrbitSpinner size={12} />
               ) : (
-                <div className="border-border-subtle overflow-hidden rounded-[8px] border">
-                  <div className="bg-surface-recessed/70 border-border-subtle text-ink-muted flex items-center justify-between border-b px-3 py-1.5 text-[11px] font-medium">
-                    <span>
-                      {migrationRan
-                        ? t("securityOps.migrationResultLabel", { count: previewItems.length })
-                        : t("securityOps.migrationDryRunLabel", { count: previewItems.length })}
-                    </span>
-                  </div>
-                  <div className="orbit-native-scroll divide-border-subtle/70 max-h-[200px] divide-y overflow-y-auto">
-                    {previewItems.map((item, idx) => (
-                      <div
-                        key={`${item.source}:${item.kind}:${item.name}:${idx}`}
-                        className="flex items-center justify-between gap-2 px-3 py-2 text-[13px]"
-                      >
-                        <div className="flex min-w-0 items-center gap-2">
-                          <Badge variant="outline" className="shrink-0 font-mono text-[11px]">
-                            {item.source}
-                          </Badge>
-                          <Badge variant="secondary" className="shrink-0 text-[11px]">
-                            {item.kind}
-                          </Badge>
-                          <span className="text-ink-primary truncate font-mono text-[11px]">
-                            {item.name}
-                          </span>
-                        </div>
-                        <Badge variant="outline" className="shrink-0 font-mono text-[11px]">
-                          {item.decision}
-                        </Badge>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )
+                <FolderInput data-icon="inline-start" />
+              )}
+              {t("securityOps.migrationPreviewButton")}
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              disabled={
+                !isOnline ||
+                inspecting ||
+                executing ||
+                migrationRan ||
+                previewItems === null ||
+                previewItems.length === 0
+              }
+              onClick={() => void handleExecuteMigration()}
+            >
+              {executing && <OrbitSpinner size={12} />}
+              {t("securityOps.migrationExecuteButton")}
+            </Button>
+            {!migrationRan && overwriteCount > 0 && (
+              <span className="text-signal-warning text-[11px] tabular-nums">
+                {t("securityOps.migrationOverwriteCount", { count: overwriteCount })}
+              </span>
             )}
           </div>
-        </SettingCard>
-      </div>
-    </>
+
+          {unexpected.length > 0 && (
+            <ContextBanner
+              variant="inline"
+              tone="warning"
+              icon={<AlertTriangle className="size-3.5" />}
+            >
+              <div className="flex min-w-0 flex-col gap-1">
+                <span className="text-[13px]">
+                  {t("securityOps.migrationOverwriteMismatch", { count: unexpected.length })}
+                </span>
+                <span className="text-ink-secondary truncate font-mono text-[11px]">
+                  {unexpected.join(" · ")}
+                </span>
+              </div>
+            </ContextBanner>
+          )}
+
+          {previewItems !== null && (
+            previewItems.length === 0 ? (
+              <div className="text-ink-muted text-[13px]">
+                {t("securityOps.migrationEmpty")}
+              </div>
+            ) : (
+              <div className="border-border-subtle overflow-hidden rounded-[8px] border">
+                <div className="bg-surface-recessed/70 border-border-subtle text-ink-muted flex items-center justify-between border-b px-3 py-2 text-[11px] font-medium">
+                  <span>
+                    {migrationRan
+                      ? t("securityOps.migrationResultLabel", { count: previewItems.length })
+                      : t("securityOps.migrationDryRunLabel", { count: previewItems.length })}
+                  </span>
+                </div>
+                <div className="orbit-native-scroll divide-border-subtle/70 max-h-[200px] divide-y overflow-y-auto">
+                  {previewItems.map((item, idx) => (
+                    <div
+                      key={`${item.source}:${item.kind}:${item.name}:${idx}`}
+                      className="flex items-center justify-between gap-2 px-3 py-2 text-[13px]"
+                    >
+                      <div className="flex min-w-0 items-center gap-2">
+                        <Badge variant="outline" className="shrink-0 font-mono text-[11px]">
+                          {MIGRATION_SOURCE_KEYS[item.source]
+                            ? t(MIGRATION_SOURCE_KEYS[item.source])
+                            : item.source}
+                        </Badge>
+                        <Badge variant="secondary" className="shrink-0 text-[11px]">
+                          {MIGRATION_KIND_KEYS[item.kind]
+                            ? t(MIGRATION_KIND_KEYS[item.kind])
+                            : item.kind}
+                        </Badge>
+                        <span className="text-ink-primary truncate font-mono text-[11px]">
+                          {item.name}
+                        </span>
+                      </div>
+                      <Badge
+                        variant={item.decision === "overwrite" ? "warning" : "outline"}
+                        className="shrink-0 font-mono text-[11px]"
+                      >
+                        {MIGRATION_DECISION_KEYS[item.decision]
+                          ? t(MIGRATION_DECISION_KEYS[item.decision])
+                          : item.decision}
+                      </Badge>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )
+          )}
+        </div>
+      </SettingCard>
+    </div>
   );
 });

@@ -1,8 +1,10 @@
 import { memo } from "react";
 import { Button } from "@/components/ui/button";
 import { SimpleTooltip } from "@/components/ui/overlays";
+import { ProviderIcon } from "@/components/ui/provider-icons";
 import { SubagentAvatar } from "@/components/ui/subagent-avatar";
 import { useI18n } from "@/lib/i18n";
+import { formatEffortLabel } from "@/lib/model-metadata";
 import { isSubagentActiveStatus, type ResolvedSubagentItem } from "@/lib/subagents";
 import type { SessionSubagentWithAvatar } from "@/state/selectors/session-selectors";
 import { getOrbitState, orbitActions } from "@/state/orbit-store";
@@ -62,18 +64,28 @@ export function SubagentPanelAction({
 
 type TranslateFn = ReturnType<typeof useI18n>["t"];
 
-function statusSubtitle(sa: SessionSubagentWithAvatar, t: TranslateFn): string {
-  const base =
-    sa.status === "awaiting_permission"
-      ? t("overview.subagentApprovalRequired")
-      : sa.status === "running"
-        ? t("overview.subagentWorking")
-        : sa.status === "failed"
-          ? t("overview.subagentFailed")
-          : sa.status === "canceled"
-            ? t("overview.subagentStopped")
-            : t("overview.subagentFinished");
-  return sa.remoteHostName ? `${base} · ${sa.remoteHostName}` : base;
+function statusLabel(status: SessionSubagentWithAvatar["status"], t: TranslateFn): string {
+  return status === "awaiting_permission"
+    ? t("overview.subagentApprovalRequired")
+    : status === "running"
+      ? t("overview.subagentWorking")
+      : status === "failed"
+        ? t("overview.subagentFailed")
+        : status === "canceled"
+          ? t("overview.subagentStopped")
+          : t("overview.subagentFinished");
+}
+
+function miniDockSubtitle(sa: SessionSubagentWithAvatar, t: TranslateFn): string {
+  const effortText = sa.childEffort ? formatEffortLabel(sa.childEffort, t) : null;
+  const modelWithEffort = sa.modelLabel
+    ? effortText
+      ? `${sa.modelLabel} ${effortText}`
+      : sa.modelLabel
+    : null;
+  return [sa.agentLabel, modelWithEffort, statusLabel(sa.status, t), sa.remoteHostName]
+    .filter(Boolean)
+    .join(" · ");
 }
 
 export function archiveSettledSubagentsList(
@@ -124,17 +136,30 @@ export const SubagentCrewList = memo(function SubagentCrewList({
         const isAwaiting = sa.status === "awaiting_permission";
         const depth = Math.max(1, sa.depth ?? 1);
         const indentLevels = Math.min(depth - 1, 5);
-        const parentCrumb =
-          depth > 1 && sa.lineage && sa.lineage.length >= 2
-            ? sa.lineage[sa.lineage.length - 2]?.title ?? null
-            : null;
         const lineageText =
           sa.lineage && sa.lineage.length > 1
             ? sa.lineage.map((step) => step.title).join(" → ")
             : null;
-        const subtitleBase = statusSubtitle(sa, t);
-        const subtitle = parentCrumb ? `${subtitleBase} · ${parentCrumb}` : subtitleBase;
-        const tooltip = [lineageText, sa.promptPreview || sa.title].filter(Boolean).join("\n");
+        const stateText = statusLabel(sa.status, t);
+        const effortText = sa.childEffort ? formatEffortLabel(sa.childEffort, t) : null;
+        const showModel = Boolean(sa.modelLabel) && depth < 4;
+        const modelWithEffort =
+          sa.childModel || sa.modelLabel
+            ? effortText
+              ? `${sa.childModel || sa.modelLabel} ${effortText}`
+              : (sa.childModel || sa.modelLabel)
+            : effortText;
+        const metaLine = [
+          sa.agentLabel,
+          modelWithEffort,
+          stateText,
+          sa.remoteHostName,
+        ]
+          .filter(Boolean)
+          .join(" · ");
+        const promptDetail =
+          sa.promptPreview && sa.promptPreview !== sa.title ? sa.promptPreview : null;
+        const tooltip = [lineageText || sa.title, metaLine, promptDetail].filter(Boolean).join("\n");
 
         return (
           <div
@@ -147,7 +172,7 @@ export const SubagentCrewList = memo(function SubagentCrewList({
               title={tooltip}
               onClick={() => openSubagent(sa.parentAgentId || agentId, sa)}
               className={cn(
-                "flex cursor-pointer text-left min-h-[42px] w-full items-center gap-2.5 rounded-[8px] px-2 py-1.5 transition-colors",
+                "flex cursor-pointer text-left min-h-[42px] w-full items-center gap-2.5 overflow-hidden rounded-[8px] px-2 py-1.5 transition-colors",
                 indentLevels > 0 && "border-l border-border-subtle/80 rounded-l-[4px]",
                 isAwaiting
                   ? "bg-signal-warning-bg/75 hover:bg-signal-warning-bg"
@@ -164,17 +189,48 @@ export const SubagentCrewList = memo(function SubagentCrewList({
                 <span className="text-ink-primary block truncate text-[13px] leading-[18px] font-medium">
                   {sa.title}
                 </span>
-                <span
-                  className={cn(
-                    "block truncate text-[11px] leading-[15px]",
-                    isAwaiting
-                      ? "text-signal-warning font-medium"
-                      : sa.status === "failed"
-                        ? "text-signal-danger"
-                        : "text-ink-tertiary",
+                <span className="text-ink-tertiary flex min-w-0 items-center gap-1 overflow-hidden text-[11px] leading-[15px]">
+                  {sa.childProvider && (
+                    <ProviderIcon
+                      provider={sa.childProvider}
+                      className="size-[11px] shrink-0 opacity-85"
+                    />
                   )}
-                >
-                  {subtitle}
+                  {showModel ? (
+                    <>
+                      <span className="min-w-0 truncate">{sa.modelLabel}</span>
+                      {effortText && (
+                        <span className="text-ink-muted shrink-0">{effortText}</span>
+                      )}
+                      <span aria-hidden="true" className="text-ink-faint shrink-0">·</span>
+                    </>
+                  ) : sa.agentLabel ? (
+                    <>
+                      <span className="shrink-0">{sa.agentLabel}</span>
+                      {effortText && (
+                        <span className="text-ink-muted shrink-0">{effortText}</span>
+                      )}
+                      <span aria-hidden="true" className="text-ink-faint shrink-0">·</span>
+                    </>
+                  ) : null}
+                  <span
+                    className={cn(
+                      "shrink-0",
+                      isAwaiting
+                        ? "text-signal-warning font-medium"
+                        : sa.status === "failed"
+                          ? "text-signal-danger"
+                          : undefined,
+                    )}
+                  >
+                    {stateText}
+                  </span>
+                  {sa.remoteHostName && !showModel && (
+                    <>
+                      <span aria-hidden="true" className="text-ink-faint shrink-0">·</span>
+                      <span className="min-w-0 truncate">{sa.remoteHostName}</span>
+                    </>
+                  )}
                 </span>
               </span>
             </button>
@@ -209,7 +265,7 @@ export const SubagentCrewMiniDock = memo(function SubagentCrewMiniDock({
     >
       <div className="flex items-center -space-x-1.5">
         {shown.map((sa) => {
-          const subtitle = statusSubtitle(sa, t);
+          const subtitle = miniDockSubtitle(sa, t);
           return (
             <SimpleTooltip
               key={sa.key}

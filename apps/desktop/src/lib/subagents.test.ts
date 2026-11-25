@@ -3,7 +3,11 @@ import { describe, it } from "node:test";
 import type { AgentCardView, HostDetailView, SessionSubagentEntryView } from "./orbit-ipc.ts";
 import {
   type ResolvedSubagentItem,
+  areResolvedSubagentsEqual,
   filterVisibleSubagents,
+  formatSubagentRuntimeDisplay,
+  inferNativeSubagentModel,
+  mapManagedStatus,
   resolveAgentAncestorLineage,
   resolveToolCallSubagent,
   resolveDelegationDispatches,
@@ -190,6 +194,27 @@ describe("managed child lifecycle", () => {
       [{ status_label: "Launch failed" }, "failed"], [{ status_label: "Error" }, "failed"],
     ] as const) assert.equal(resolve("legacy", [card("", overrides)])[0].status, expected);
     assert.equal(resolve("states", [card("running", { archived_at_rfc3339: new Date(created).toISOString() })])[0].status, "running");
+    assert.equal(
+      mapManagedStatus(
+        card("closed", {
+          status_label: "Closed",
+          attention: "permission",
+          is_running: false,
+          is_awaiting_permission: false,
+        }),
+      ),
+      "canceled",
+    );
+    assert.equal(
+      mapManagedStatus(
+        card("autonomous_wakeup", {
+          status_label: "Waiting for 1 background task",
+          is_running: false,
+          has_background_tasks: true,
+        }),
+      ),
+      "completed",
+    );
   });
 
   it("resets each observed restart once and preserves the clock across tokens, permission waits and snapshot replays", (t) => {
@@ -433,5 +458,194 @@ describe("multi-level subagent lineage", () => {
     });
     assert.equal(resolved.length, 8);
     assert.equal(resolved[resolved.length - 1]?.depth, 8);
+  });
+});
+
+describe("subagent runtime agent & model metadata", () => {
+  it("formats real Agent and compact Model labels without fabricating Default", () => {
+    const claude = formatSubagentRuntimeDisplay({
+      provider: "claude_code",
+      rawModel: "claude-sonnet-4-6",
+      providerCatalogs: [
+        {
+          provider: "claude_code",
+          configured_default_model: null,
+          configured_default_effort: null,
+          models: [
+            {
+              id: "claude-sonnet-4-6",
+              label: "Claude Sonnet 4.6",
+              description: "",
+              is_default: true,
+              default_effort: null,
+              thinking_options: [],
+              supports_fast_mode: false,
+            },
+          ],
+        },
+      ],
+    });
+    assert.equal(claude.agentLabel, "Claude Code");
+    assert.equal(claude.modelLabel, "Sonnet 4.6");
+
+    const codex = formatSubagentRuntimeDisplay({
+      provider: "codex",
+      rawModel: "gpt-5.4",
+      effort: "xhigh",
+    });
+    assert.equal(codex.agentLabel, "Codex");
+    assert.equal(codex.modelLabel, "GPT 5.4");
+    assert.equal(codex.effort, "xhigh");
+
+    const agy = formatSubagentRuntimeDisplay({
+      provider: "antigravity",
+      rawModel: "gemini-4-neon-high",
+    });
+    assert.equal(agy.agentLabel, "Antigravity");
+    assert.equal(agy.modelLabel, "Gemini 4 Neon");
+    assert.equal(agy.effort, "high");
+
+    const noModel = formatSubagentRuntimeDisplay({
+      provider: "antigravity",
+      rawModel: null,
+    });
+    assert.equal(noModel.agentLabel, "Antigravity");
+    assert.equal(noModel.modelLabel, null);
+    assert.equal(noModel.effort, null);
+
+    const acp = formatSubagentRuntimeDisplay({
+      provider: "acp",
+      acpAgentId: "cursor-acp",
+      rawModel: "claude-opus-4-6",
+      acpAgents: [
+        {
+          spec: { id: "cursor-acp", name: "Cursor ACP", source: "builtin_catalog" },
+          installed: true,
+        } as never,
+      ],
+    });
+    assert.equal(acp.agentLabel, "Cursor ACP");
+    assert.equal(acp.modelLabel, "claude-opus-4-6");
+  });
+
+  it("extracts native subagent models from structured field or legacy Claude subtitle only", () => {
+    assert.equal(
+      inferNativeSubagentModel("antigravity", {
+        model: "gemini-4-neon-high",
+        subtitle: "Investigating files",
+      }),
+      "gemini-4-neon-high",
+    );
+    assert.equal(
+      inferNativeSubagentModel("claude_code", {
+        model: null,
+        subtitle: "claude-haiku-4-5",
+      }),
+      "claude-haiku-4-5",
+    );
+    assert.equal(
+      inferNativeSubagentModel("claude_code", {
+        model: null,
+        subtitle: "Scanning codebase files",
+      }),
+      null,
+    );
+    assert.equal(
+      inferNativeSubagentModel("codex", {
+        model: null,
+        subtitle: "Codex",
+      }),
+      null,
+    );
+  });
+
+  it("resolves Agent + Model for both managed children and parent-inherited native subagents", () => {
+    const hostDetails: Record<string, HostDetailView> = {
+      "host-1": {
+        host: { host_id: "host-1", display_name: "Local" },
+        agents: [
+          {
+            agent_id: "ag_parent",
+            parent_agent_id: null,
+            title: "Main",
+            provider: "claude_code",
+            model: "claude-opus-4-6",
+            status_label: "Running",
+            is_running: true,
+            is_awaiting_permission: false,
+            updated_at_rfc3339: "2026-11-26T00:00:00Z",
+            latest_seq: 10,
+          },
+          {
+            agent_id: "ag_child_codex",
+            parent_agent_id: "ag_parent",
+            title: "P0 Fix",
+            provider: "codex",
+            model: "gpt-5.4",
+            effort: "high",
+            worktree_branch: "fix/cloud-sync",
+            status_label: "Running",
+            is_running: true,
+            is_awaiting_permission: false,
+            updated_at_rfc3339: "2026-11-26T00:01:00Z",
+            latest_seq: 20,
+          },
+        ],
+        provider_subagents: {
+          ag_parent: [
+            {
+              subagent_id: "task_1",
+              parent_agent_id: "ag_parent",
+              parent_subagent_id: null,
+              title: "Code Explorer",
+              subtitle: null,
+              model: "claude-haiku-4-5",
+              status: "completed",
+              created_at: "2026-11-26T00:00:10Z",
+              updated_at: "2026-11-26T00:00:20Z",
+            },
+          ],
+        },
+        provider_catalogs: [],
+        acp_agents: [],
+      } as unknown as HostDetailView,
+    };
+
+    const resolved = resolveSessionSubagents({
+      hostId: "host-1",
+      agentId: "ag_parent",
+      insightsSubagents: [],
+      hostDetails,
+      fleetHosts: [],
+    });
+
+    const managed = resolved.find((sa) => sa.childAgentId === "ag_child_codex");
+    assert.ok(managed);
+    assert.equal(managed.agentLabel, "Codex");
+    assert.equal(managed.modelLabel, "GPT 5.4");
+    assert.equal(managed.childEffort, "high");
+    assert.equal(managed.childWorktreeBranch, "fix/cloud-sync");
+
+    const native = resolved.find((sa) => sa.providerSubagentId === "task_1");
+    assert.ok(native);
+    assert.equal(native.childProvider, "claude_code");
+    assert.equal(native.agentLabel, "Claude Code");
+    assert.equal(native.modelLabel, "Haiku 4.5");
+
+    // Equality guard notices model and effort updates cleanly.
+    assert.equal(
+      areResolvedSubagentsEqual(resolved, [
+        { ...resolved[0], modelLabel: "GPT 5.4 Pro" },
+        ...resolved.slice(1),
+      ]),
+      false,
+    );
+    assert.equal(
+      areResolvedSubagentsEqual(resolved, [
+        { ...resolved[0], childEffort: "xhigh" },
+        ...resolved.slice(1),
+      ]),
+      false,
+    );
   });
 });

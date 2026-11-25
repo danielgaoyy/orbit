@@ -2232,6 +2232,12 @@ async fn handle_codex_notification(
                                 parent_subagent_id: None,
                                 title: title.clone(),
                                 subtitle: Some("Codex".into()),
+                                model: item
+                                    .get("model")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(ToOwned::to_owned),
                                 status: pstatus,
                                 created_at: now,
                                 updated_at: now,
@@ -2269,8 +2275,29 @@ async fn handle_codex_notification(
                         })
                         .await;
                 }
+                "contextCompaction" | "ContextCompaction" => {
+                    let (level, message) = if is_done {
+                        ("compaction", "Context compacted")
+                    } else {
+                        ("compaction_live", "Compacting context…")
+                    };
+                    let _ = evt_tx
+                        .send(DriverEvent::Notice {
+                            level: level.into(),
+                            message: message.into(),
+                        })
+                        .await;
+                }
                 _ => {}
             }
+        }
+        "thread/compacted" => {
+            let _ = evt_tx
+                .send(DriverEvent::Notice {
+                    level: "compaction".into(),
+                    message: "Context compacted".into(),
+                })
+                .await;
         }
         "thread/tokenUsage/updated" => {
             usage_tracker.on_token_usage_updated(params);

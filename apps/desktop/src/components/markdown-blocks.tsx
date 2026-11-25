@@ -247,12 +247,17 @@ const InlineSpans = memo(
                   cancelHoverPrefetch();
                   openOrbitLink(href, linkCtx);
                 }}
-                className={`text-foreground decoration-foreground/30 hover:decoration-foreground cursor-pointer font-medium underline-offset-3 hover:underline ${className}`}
+                className={cn(
+                  span.inline_code
+                    ? "group/link cursor-pointer no-underline"
+                    : "text-ink-link hover:text-ink-link-hover decoration-ink-link/30 hover:decoration-ink-link-hover/80 cursor-pointer underline underline-offset-[3px] transition-colors",
+                  className,
+                )}
               >
                 {span.math_ml ? (
                   <InlineMathSpan tex={span.text} mathMl={span.math_ml} />
                 ) : span.inline_code ? (
-                  <code className="text-foreground/90 rounded-[5px] bg-black/[0.055] px-1.5 py-[0.5px] align-baseline font-mono text-[0.88em] leading-[1.35] [overflow-wrap:anywhere] dark:bg-white/[0.09]">
+                  <code className="text-ink-link group-hover/link:text-ink-link-hover group-hover/link:decoration-ink-link-hover/55 rounded-[5px] bg-black/[0.055] px-1.5 py-[0.5px] align-baseline font-mono text-[0.88em] leading-[1.35] underline-offset-2 transition-colors group-hover/link:bg-black/[0.085] group-hover/link:underline [overflow-wrap:anywhere] dark:bg-white/[0.09] dark:group-hover/link:bg-white/[0.14]">
                     {span.text}
                   </code>
                 ) : (
@@ -378,6 +383,66 @@ export function useClipboardCopy(text: string) {
   return { copied, copy };
 }
 
+type CodeBlockLine = Extract<RichBlockView, { kind: "code_block" }>["lines"][number];
+
+function codeLineIsEqual(a: CodeBlockLine, b: CodeBlockLine): boolean {
+  if (a === b) return true;
+  if (a.line_number !== b.line_number || a.tokens.length !== b.tokens.length) return false;
+  for (let i = 0; i < a.tokens.length; i += 1) {
+    const ta = a.tokens[i];
+    const tb = b.tokens[i];
+    if (
+      ta.text !== tb.text ||
+      ta.fg_hex !== tb.fg_hex ||
+      ta.bold !== tb.bold ||
+      ta.italic !== tb.italic
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+const HighlightedCodeLine = memo(
+  function HighlightedCodeLine({
+    line,
+    showLineNumbers,
+    isDark,
+  }: {
+    line: CodeBlockLine;
+    showLineNumbers: boolean;
+    isDark: boolean;
+  }) {
+    return (
+      <div className="flex min-w-fit">
+        {showLineNumbers && (
+          <span className="text-ink-faint tabular-nums mr-3.5 w-6 shrink-0 text-right select-none">
+            {line.line_number}
+          </span>
+        )}
+        <span className="whitespace-pre">
+          {line.tokens.map((tok, idx) => (
+            <span
+              key={idx}
+              style={{
+                color: resolveTokenColor(tok, isDark),
+                fontWeight: tok.bold ? 600 : undefined,
+                fontStyle: tok.italic ? "italic" : undefined,
+              }}
+            >
+              {tok.text}
+            </span>
+          ))}
+        </span>
+      </div>
+    );
+  },
+  (prev, next) =>
+    prev.isDark === next.isDark &&
+    prev.showLineNumbers === next.showLineNumbers &&
+    codeLineIsEqual(prev.line, next.line),
+);
+
 export const HighlightedCodeBlock = memo(
   function HighlightedCodeBlock({
     language,
@@ -403,9 +468,10 @@ export const HighlightedCodeBlock = memo(
     }, []);
 
     const canCollapse = !embedded && lines.length > CODE_BLOCK_COLLAPSE_THRESHOLD;
+    // Skip regex shell classification while actively streaming at 60Hz; classify once settled.
     const shellMeta = useMemo(
-      () => (embedded ? null : classifyRunnableShellSnippet(language, raw_code)),
-      [embedded, language, raw_code],
+      () => (embedded || !settled ? null : classifyRunnableShellSnippet(language, raw_code)),
+      [embedded, settled, language, raw_code],
     );
 
     const handleRunInTerminal = useCallback(() => {
@@ -420,31 +486,19 @@ export const HighlightedCodeBlock = memo(
       runTimerRef.current = window.setTimeout(() => setJustRan(false), 1500);
     }, [shellMeta, linkCtx.hostId, linkCtx.cwd]);
 
+    const showLineNumbers = lines.length > 2;
     const codeBody = (
       <ScrollArea
         orientation="horizontal"
         viewportClassName="px-3.5 py-3 font-mono text-[13px] leading-[1.6]"
       >
         {lines.map((line) => (
-          <div key={line.line_number} className="flex min-w-fit">
-            <span className="text-ink-faint tabular-nums mr-3.5 w-6 shrink-0 text-right select-none">
-              {line.line_number}
-            </span>
-            <span className="whitespace-pre">
-              {line.tokens.map((tok, idx) => (
-                <span
-                  key={idx}
-                  style={{
-                    color: resolveTokenColor(tok, isDark),
-                    fontWeight: tok.bold ? 600 : undefined,
-                    fontStyle: tok.italic ? "italic" : undefined,
-                  }}
-                >
-                  {tok.text}
-                </span>
-              ))}
-            </span>
-          </div>
+          <HighlightedCodeLine
+            key={line.line_number}
+            line={line}
+            showLineNumbers={showLineNumbers}
+            isDark={isDark}
+          />
         ))}
       </ScrollArea>
     );
@@ -461,7 +515,7 @@ export const HighlightedCodeBlock = memo(
           settled ? { containIntrinsicBlockSize: `auto ${intrinsicHeight}px` } : undefined
         }
         className={cn(
-          "border-border-subtle bg-surface-recessed text-ink-primary my-3 overflow-hidden rounded-xl border",
+          "border-border-subtle bg-surface-recessed text-ink-primary my-3 overflow-hidden rounded-xl border first:mt-0 last:mb-0",
           settled && "orbit-heavy-block-settled",
         )}
       >
@@ -617,7 +671,7 @@ const MarkdownTableBlock = memo(
           settled ? { containIntrinsicBlockSize: `auto ${intrinsicHeight}px` } : undefined
         }
         className={cn(
-          "border-border my-3 overflow-hidden rounded-xl border bg-black/[0.015] dark:bg-white/[0.02]",
+          "border-border-subtle my-3 overflow-hidden rounded-xl border first:mt-0 last:mb-0",
           settled && "orbit-heavy-block-settled",
         )}
       >
@@ -630,12 +684,12 @@ const MarkdownTableBlock = memo(
         >
           <table className="w-full border-collapse text-[13px] leading-[1.55]">
             {headers.length > 0 && (
-              <thead className="border-border border-b bg-black/[0.035] dark:bg-white/[0.045]">
+              <thead className="border-border-subtle bg-surface-recessed/65 border-b">
                 <tr>
                   {colIndices.map((colIdx) => (
                     <th
                       key={colIdx}
-                      className={`border-border/70 text-ink-secondary border-r px-3.5 py-2 text-[11px] leading-[1.45] font-semibold tracking-[0.03em] uppercase whitespace-pre-wrap last:border-r-0 ${tableAlignClass(
+                      className={`text-ink-secondary px-3.5 py-2 text-[12px] leading-[1.45] font-medium whitespace-pre-wrap ${tableAlignClass(
                         alignments[colIdx],
                       )}`}
                     >
@@ -649,12 +703,12 @@ const MarkdownTableBlock = memo(
               {rows.map((row, rowIdx) => (
                 <tr
                   key={rowIdx}
-                  className="border-border/65 border-b last:border-b-0 even:bg-black/[0.015] dark:even:bg-white/[0.018]"
+                  className="border-border-subtle/80 hover:bg-accent/45 border-b transition-colors last:border-b-0"
                 >
                   {colIndices.map((colIdx) => (
                     <td
                       key={colIdx}
-                      className={`border-border/60 text-foreground/90 border-r px-3.5 py-2 align-top whitespace-pre-wrap last:border-r-0 ${tableAlignClass(
+                      className={`text-foreground/88 px-3.5 py-2 align-top whitespace-pre-wrap ${tableAlignClass(
                         alignments[colIdx],
                       )}`}
                     >
@@ -683,79 +737,206 @@ function unorderedMarkerClass(depth: number): string {
   return "list-disc";
 }
 
+function nestedListGroupIsEqual(a: NestedListGroupNode, b: NestedListGroupNode): boolean {
+  if (a === b) return true;
+  if (
+    a.listKind !== b.listKind ||
+    a.depth !== b.depth ||
+    a.startIndex !== b.startIndex ||
+    a.items.length !== b.items.length
+  ) {
+    return false;
+  }
+  for (let i = 0; i < a.items.length; i += 1) {
+    if (!nestedListItemIsEqual(a.items[i], b.items[i])) return false;
+  }
+  return true;
+}
+
+function nestedListItemIsEqual(
+  a: NestedListGroupNode["items"][number],
+  b: NestedListGroupNode["items"][number],
+): boolean {
+  if (a === b) return true;
+  if (!richBlockIsEqual(a.item, b.item)) return false;
+  if (a.children.length !== b.children.length) return false;
+  for (let i = 0; i < a.children.length; i += 1) {
+    if (!nestedListGroupIsEqual(a.children[i], b.children[i])) return false;
+  }
+  return true;
+}
+
+const MemoNestedListItem = memo(
+  function MemoNestedListItem({
+    entry,
+    listKind,
+    listSpacingClass,
+    itemKey,
+  }: {
+    entry: NestedListGroupNode["items"][number];
+    listKind: NestedListGroupNode["listKind"];
+    listSpacingClass: string;
+    itemKey: string;
+  }) {
+    if (listKind === "ordered") {
+      return (
+        <li value={entry.item.index} className="pl-1 whitespace-pre-wrap">
+          <InlineSpans spans={entry.item.spans} />
+          {entry.children.map((child, childIdx) => (
+            <MemoNestedListGroup
+              key={`${itemKey}-${childIdx}`}
+              group={child}
+              listSpacingClass={listSpacingClass}
+              groupKey={`${itemKey}-${childIdx}`}
+            />
+          ))}
+        </li>
+      );
+    }
+
+    if (listKind === "unordered") {
+      return (
+        <li className="pl-1 whitespace-pre-wrap">
+          <InlineSpans spans={entry.item.spans} />
+          {entry.children.map((child, childIdx) => (
+            <MemoNestedListGroup
+              key={`${itemKey}-${childIdx}`}
+              group={child}
+              listSpacingClass={listSpacingClass}
+              groupKey={`${itemKey}-${childIdx}`}
+            />
+          ))}
+        </li>
+      );
+    }
+
+    return (
+      <li className="relative pl-5.5 whitespace-pre-wrap">
+        <span
+          aria-hidden="true"
+          className={cn(
+            "absolute top-[4px] left-0 inline-flex size-[14px] items-center justify-center rounded-[4px] border select-none",
+            entry.item.checked
+              ? "border-border-strong bg-ink-primary/12 text-ink-primary"
+              : "border-border-strong bg-transparent",
+          )}
+        >
+          {entry.item.checked && <Check className="size-2.5 stroke-[2.5]" />}
+        </span>
+        <InlineSpans spans={entry.item.spans} />
+        {entry.children.map((child, childIdx) => (
+          <MemoNestedListGroup
+            key={`${itemKey}-${childIdx}`}
+            group={child}
+            listSpacingClass={listSpacingClass}
+            groupKey={`${itemKey}-${childIdx}`}
+          />
+        ))}
+      </li>
+    );
+  },
+  (prev, next) =>
+    prev.listKind === next.listKind &&
+    prev.listSpacingClass === next.listSpacingClass &&
+    prev.itemKey === next.itemKey &&
+    nestedListItemIsEqual(prev.entry, next.entry),
+);
+
+const MemoNestedListGroup = memo(
+  function MemoNestedListGroup({
+    group,
+    listSpacingClass,
+    groupKey,
+  }: {
+    group: NestedListGroupNode;
+    listSpacingClass: string;
+    groupKey: string;
+  }) {
+    const isRoot = group.depth === 0;
+    const spacing = isRoot ? listSpacingClass : "mt-1 [&>li+li]:mt-1";
+
+    if (group.listKind === "ordered") {
+      return (
+        <ol
+          data-list-depth={group.depth}
+          start={group.startIndex}
+          className={cn(
+            "marker:text-foreground/70 marker:tabular-nums list-decimal",
+            isRoot ? "pl-6" : "pl-[20px]",
+            spacing,
+          )}
+        >
+          {group.items.map((entry, idx) => (
+            <MemoNestedListItem
+              key={idx}
+              entry={entry}
+              listKind="ordered"
+              listSpacingClass={listSpacingClass}
+              itemKey={`${groupKey}-${idx}`}
+            />
+          ))}
+        </ol>
+      );
+    }
+
+    if (group.listKind === "unordered") {
+      return (
+        <ul
+          data-list-depth={group.depth}
+          className={cn(
+            "marker:text-foreground/65 pl-[20px]",
+            unorderedMarkerClass(group.depth),
+            spacing,
+          )}
+        >
+          {group.items.map((entry, idx) => (
+            <MemoNestedListItem
+              key={idx}
+              entry={entry}
+              listKind="unordered"
+              listSpacingClass={listSpacingClass}
+              itemKey={`${groupKey}-${idx}`}
+            />
+          ))}
+        </ul>
+      );
+    }
+
+    return (
+      <ul
+        data-list-depth={group.depth}
+        className={cn("list-none", isRoot ? "pl-0.5" : "pl-[20px]", spacing)}
+      >
+        {group.items.map((entry, idx) => (
+          <MemoNestedListItem
+            key={idx}
+            entry={entry}
+            listKind="checklist"
+            listSpacingClass={listSpacingClass}
+            itemKey={`${groupKey}-${idx}`}
+          />
+        ))}
+      </ul>
+    );
+  },
+  (prev, next) =>
+    prev.listSpacingClass === next.listSpacingClass &&
+    prev.groupKey === next.groupKey &&
+    nestedListGroupIsEqual(prev.group, next.group),
+);
+
 function renderNestedListGroup(
   group: NestedListGroupNode,
   listSpacingClass: string,
   key: string,
 ): ReactNode {
-  const isRoot = group.depth === 0;
-  const spacing = isRoot ? listSpacingClass : "mt-1 [&>li+li]:mt-1";
-
-  if (group.listKind === "ordered") {
-    return (
-      <ol
-        key={key}
-        data-list-depth={group.depth}
-        start={group.startIndex}
-        className={cn(
-          "marker:text-foreground/70 marker:tabular-nums list-decimal",
-          isRoot ? "pl-6" : "pl-[20px]",
-          spacing,
-        )}
-      >
-        {group.items.map((entry, idx) => (
-          <li key={idx} value={entry.item.index} className="pl-1 whitespace-pre-wrap">
-            <InlineSpans spans={entry.item.spans} />
-            {entry.children.map((child, childIdx) =>
-              renderNestedListGroup(child, listSpacingClass, `${key}-${idx}-${childIdx}`),
-            )}
-          </li>
-        ))}
-      </ol>
-    );
-  }
-
-  if (group.listKind === "unordered") {
-    return (
-      <ul
-        key={key}
-        data-list-depth={group.depth}
-        className={cn(
-          "marker:text-foreground/65 pl-[20px]",
-          unorderedMarkerClass(group.depth),
-          spacing,
-        )}
-      >
-        {group.items.map((entry, idx) => (
-          <li key={idx} className="pl-1 whitespace-pre-wrap">
-            <InlineSpans spans={entry.item.spans} />
-            {entry.children.map((child, childIdx) =>
-              renderNestedListGroup(child, listSpacingClass, `${key}-${idx}-${childIdx}`),
-            )}
-          </li>
-        ))}
-      </ul>
-    );
-  }
-
   return (
-    <ul
+    <MemoNestedListGroup
       key={key}
-      data-list-depth={group.depth}
-      className={cn("list-none", isRoot ? "pl-0.5" : "pl-[20px]", spacing)}
-    >
-      {group.items.map((entry, idx) => (
-        <li key={idx} className="relative pl-5 whitespace-pre-wrap">
-          <span className="text-foreground/75 absolute top-0 left-0 select-none">
-            {entry.item.checked ? "✓" : "○"}
-          </span>
-          <InlineSpans spans={entry.item.spans} />
-          {entry.children.map((child, childIdx) =>
-            renderNestedListGroup(child, listSpacingClass, `${key}-${idx}-${childIdx}`),
-          )}
-        </li>
-      ))}
-    </ul>
+      group={group}
+      listSpacingClass={listSpacingClass}
+      groupKey={key}
+    />
   );
 }
 
@@ -801,10 +982,10 @@ function renderGroupedNodeContent(
     case "heading": {
       const sizeClass =
         block.level === 1
-          ? "text-[20px] leading-[1.3] font-semibold tracking-[-0.02em] text-foreground mt-4"
+          ? "text-[20px] leading-[1.3] font-semibold tracking-[-0.02em] text-foreground mt-4 first:mt-0"
           : block.level === 2
-            ? "text-[17px] leading-[1.35] font-semibold tracking-[-0.015em] text-foreground mt-3.5"
-            : "text-[15px] leading-[1.45] font-semibold text-foreground mt-3";
+            ? "text-[17px] leading-[1.35] font-semibold tracking-[-0.015em] text-foreground mt-3.5 first:mt-0"
+            : "text-[15px] leading-[1.45] font-semibold text-foreground mt-3 first:mt-0";
       return (
         <div className={sizeClass}>
           <InlineSpans spans={block.spans} />
@@ -833,7 +1014,7 @@ function renderGroupedNodeContent(
     }
     case "block_quote":
       return (
-        <blockquote className="border-border text-muted-foreground border-l-2 pl-3.5">
+        <blockquote className="border-border-strong text-ink-secondary border-l-[2.5px] py-0.5 pl-3.5">
           <InlineSpans spans={block.spans} />
         </blockquote>
       );
@@ -850,7 +1031,7 @@ function renderGroupedNodeContent(
     case "math_block":
       return <MathBlockView tex={block.tex} mathMl={block.math_ml} settled={settled} />;
     case "horizontal_rule":
-      return <hr className="border-border my-3.5 select-none" />;
+      return <hr className="border-border-subtle my-3.5 first:mt-0 last:mb-0 select-none" />;
     case "list_item":
       return null;
   }
@@ -934,8 +1115,8 @@ export const MarkdownBlocksView = memo(function MarkdownBlocksView({
   const containerClass = compact
     ? "selectable-text text-foreground/82 min-w-0 space-y-1 text-[13px] leading-[1.55] break-words"
     : bubble
-      ? "selectable-text text-foreground/95 min-w-0 space-y-2 text-[15px] leading-[1.65] break-words"
-      : "selectable-text text-foreground/95 min-w-0 space-y-3 text-[15px] leading-[1.65] break-words";
+      ? "selectable-text text-foreground/92 min-w-0 space-y-2 text-[15px] leading-[1.65] break-words"
+      : "selectable-text text-foreground/88 min-w-0 space-y-3 text-[15px] leading-[1.65] break-words";
   const listSpacingClass = compact || bubble ? "space-y-0.5" : "space-y-1";
 
   return (

@@ -149,6 +149,8 @@ pub struct ProviderSubagentDescriptor {
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub status: ProviderSubagentStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

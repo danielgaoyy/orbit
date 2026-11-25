@@ -39,7 +39,6 @@ import {
   type StageTurnView,
   type TimelineItemView,
   isAgentForegroundRunning,
-  orbitIpc,
 } from "@/lib/orbit-ipc";
 import { useI18n } from "@/lib/i18n";
 import { isAgentInGitRepo } from "@/lib/projects";
@@ -55,7 +54,6 @@ import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
 import { cn } from "@/lib/utils";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import {
-  EMPTY_ARTIFACTS,
   EMPTY_DIFF_FILES,
   EMPTY_INSIGHTS,
   EMPTY_TURNS,
@@ -79,8 +77,9 @@ import {
   type ViewportAnchorHoldFn,
   WARM_RESTING_CAP,
   WARM_SCROLLING_CAP,
-  areArtifactListsEquivalent,
   computeStageScrollState,
+  createHostAgentSelector,
+  createStableHostArtifactsSelector,
   createStageScrollUiStore,
   createStageSessionSelector,
   createTurnProseMatcherLookup,
@@ -366,8 +365,6 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   sessionSubagents,
   sessionSubagentMatcher,
   onOpenSubagent,
-  queuedNotificationCount,
-  onInterruptAndContinue,
 }: {
   selectedHostId: string;
   selectedAgentId: string;
@@ -400,8 +397,6 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   sessionSubagents: readonly ResolvedSubagentItem[];
   sessionSubagentMatcher: SubagentNameMatcher | null;
   onOpenSubagent: (subagent: ResolvedSubagentItem) => void;
-  queuedNotificationCount: number;
-  onInterruptAndContinue: (() => void) | null;
 }) {
   const widthBucket = stageMaxContentWidthPx ? Math.round(stageMaxContentWidthPx / 32) : 24;
   const selectionTurnsRef = useRef<number[]>([]);
@@ -427,6 +422,14 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
 
   const turnsRef = useRef(stageTurns);
   turnsRef.current = stageTurns;
+  const turnIndexByKeyRef = useRef<Map<string, number>>(new Map());
+  useMemo(() => {
+    const map = new Map<string, number>();
+    for (let i = 0; i < stageTurns.length; i += 1) {
+      map.set(stageTurns[i].key, i);
+    }
+    turnIndexByKeyRef.current = map;
+  }, [stageTurns]);
   const activeRef = useRef(isLatestTurnActive);
   activeRef.current = isLatestTurnActive;
 
@@ -586,10 +589,11 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
         nextWarmKeys.add(turns[idx].key);
       }
       if (prevWarmKeys.size > 0) {
-        for (let i = 0; i < total; i += 1) {
-          const key = turns[i].key;
-          if (prevWarmKeys.has(key)) {
-            merged.add(i);
+        const indexByKey = turnIndexByKeyRef.current;
+        for (const key of prevWarmKeys) {
+          const idx = indexByKey.get(key);
+          if (idx !== undefined && idx < total) {
+            merged.add(idx);
             nextWarmKeys.add(key);
           }
         }
@@ -910,8 +914,6 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
               sessionSubagents={needsSubagents ? sessionSubagents : undefined}
               sessionSubagentMatcher={needsSubagents ? sessionSubagentMatcher : proseMatcherForTurn(turn)}
               onOpenSubagent={onOpenSubagent}
-              queuedNotificationCount={turnActive ? queuedNotificationCount : 0}
-              onInterruptAndContinue={turnActive ? onInterruptAndContinue : null}
             />
           </div>
         );
@@ -955,9 +957,16 @@ export function StreamStage() {
     canDockOverview,
     onStageTransitionEnd,
   } = useWorkspaceMotion();
-  const hostDetail = useOrbitSelector((s) =>
-    selectedHostId ? (s.hostDetails[selectedHostId] ?? null) : null,
+  const selectHostAgent = useMemo(
+    () => createHostAgentSelector(selectedHostId, selectedAgentId),
+    [selectedHostId, selectedAgentId],
   );
+  const hostAgent = useOrbitSelector(selectHostAgent);
+  const selectStableArtifacts = useMemo(
+    () => createStableHostArtifactsSelector(selectedHostId),
+    [selectedHostId],
+  );
+  const stableHostArtifacts = useOrbitSelector(selectStableArtifacts);
   const stageView = useOrbitSelector((s) =>
     s.selectedHostId && s.selectedAgentId
       ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`] ?? null)
@@ -968,18 +977,6 @@ export function StreamStage() {
       ? Boolean(s.rewoundSessions[`${s.selectedHostId}::${s.selectedAgentId}`])
       : false,
   );
-
-  // Stabilize hostArtifacts across `host_changed` bursts so completed historical turns
-  // never re-render when unrelated host metadata changes.
-  const hostArtifactsRef = useRef<readonly ArtifactSummary[]>(EMPTY_ARTIFACTS);
-  const rawHostArtifacts = hostDetail?.artifacts ?? EMPTY_ARTIFACTS;
-  const stableHostArtifacts = useMemo(() => {
-    if (areArtifactListsEquivalent(hostArtifactsRef.current, rawHostArtifacts)) {
-      return hostArtifactsRef.current;
-    }
-    hostArtifactsRef.current = rawHostArtifacts;
-    return rawHostArtifacts;
-  }, [rawHostArtifacts]);
 
   const stageContainerRef = useRef<HTMLDivElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -1053,13 +1050,15 @@ export function StreamStage() {
     if (!open) setRewindTarget(null);
   }, []);
 
-  const currentAgent = useMemo(
-    () =>
-      hostDetail?.agents.find((a) => a.agent_id === selectedAgentId) ??
-      stageView?.agent ??
-      null,
-    [hostDetail, selectedAgentId, stageView?.agent],
-  );
+  const currentAgent = hostAgent ?? stageView?.agent ?? null;
+  const currentWorkspaceBranch = useOrbitSelector((s) => {
+    if (!selectedHostId || !currentAgent?.workspace_id) return null;
+    return (
+      s.hostDetails[selectedHostId]?.workspaces.find(
+        (w) => w.workspace_id === currentAgent.workspace_id,
+      )?.git_branch ?? null
+    );
+  });
   const isAgentRunning = isAgentForegroundRunning(currentAgent);
   const fleetHydrated = useOrbitSelector((s) => s.fleetHydrated);
   const bootstrapError = useOrbitSelector((s) => s.bootstrapError);
@@ -1150,32 +1149,6 @@ export function StreamStage() {
     );
   }, [selectedHostId, selectedAgentId, latestTurn, isLatestTurnActive]);
 
-  const queuedNotificationCount = useMemo(() => {
-    if (!isLatestTurnActive || !latestTurn) return 0;
-    let count = 0;
-    if (
-      latestTurn.agent_message?.item_type === "agent_message" &&
-      latestTurn.agent_message.delivery_status === "queued"
-    ) {
-      count += 1;
-    }
-    for (const seg of latestTurn.live_segments) {
-      if (
-        seg.kind === "agent_message" &&
-        seg.item.item_type === "agent_message" &&
-        seg.item.delivery_status === "queued"
-      ) {
-        count += 1;
-      }
-    }
-    return count;
-  }, [isLatestTurnActive, latestTurn]);
-
-  const handleInterruptAndContinue = useCallback(() => {
-    if (!selectedHostId || !selectedAgentId) return;
-    void orbitIpc.interruptAgentAndContinue(selectedHostId, selectedAgentId);
-  }, [selectedHostId, selectedAgentId]);
-
   const stagePushStyle = useMemo<CSSProperties>(
     () => ({
       transform: stageShiftPx !== 0 ? `translate3d(${stageShiftPx}px, 0, 0)` : undefined,
@@ -1187,6 +1160,8 @@ export function StreamStage() {
 
   const promptFallback = t("stage.prompt");
   // Loaded prompt turns map seq -> virtualizer turnIndex for O(log N) scroll-sync binary search.
+  // Stabilize array identity so streaming token deltas on the tail turn don't cascade into OutlineRail.
+  const prevLoadedOutlineRef = useRef<OutlinePromptWithIndex[]>([]);
   const loadedOutlineAnchors = useMemo<OutlinePromptWithIndex[]>(() => {
     const out: OutlinePromptWithIndex[] = [];
     for (let turnIndex = 0; turnIndex < stageTurns.length; turnIndex += 1) {
@@ -1203,6 +1178,19 @@ export function StreamStage() {
         });
       }
     }
+    const prev = prevLoadedOutlineRef.current;
+    if (
+      prev.length === out.length &&
+      out.every(
+        (item, i) =>
+          item.seq === prev[i].seq &&
+          item.turnIndex === prev[i].turnIndex &&
+          item.preview === prev[i].preview,
+      )
+    ) {
+      return prev;
+    }
+    prevLoadedOutlineRef.current = out;
     return out;
   }, [stageTurns, promptFallback]);
 
@@ -1293,7 +1281,12 @@ export function StreamStage() {
   );
 
   const canForkWorktree = useOrbitSelector((s) =>
-    isAgentInGitRepo(selectedHostId, currentAgent, hostDetail, s.sidebarView),
+    isAgentInGitRepo(
+      selectedHostId,
+      currentAgent,
+      selectedHostId ? (s.hostDetails[selectedHostId] ?? null) : null,
+      s.sidebarView,
+    ),
   );
 
   const handleConfirmRewind = useCallback(
@@ -1620,7 +1613,14 @@ export function StreamStage() {
 
       if (heightChanged) {
         if (canAutoFollow()) {
-          snapScrollerToBottom();
+          const targetTop = Math.max(0, sh - ch);
+          if (Math.abs(scrollerEl.scrollTop - targetTop) > 0.5) {
+            scrollerEl.scrollTop = targetTop;
+            lastObservedScrollTopRef.current = scrollerEl.scrollTop;
+          }
+          // Coalesce state sync onto the single scroll rAF instead of running both
+          // `bottomSyncRafRef` and `scrollRafRef` on every streaming frame.
+          handleScroll();
         } else if (
           clientShrankBy > 0.5 &&
           stickToBottomRef.current &&
@@ -1632,8 +1632,10 @@ export function StreamStage() {
           // keep the bottom line visible right above it even when the session is idle.
           scrollerEl.scrollTop += clientShrankBy;
           lastObservedScrollTopRef.current = scrollerEl.scrollTop;
+          handleScroll();
+        } else {
+          scheduleBottomSync();
         }
-        scheduleBottomSync();
       } else {
         handleScroll();
       }
@@ -2117,6 +2119,14 @@ export function StreamStage() {
     scheduleBottomSync,
   ]);
 
+  const scrollViewportStyle = useMemo<CSSProperties>(
+    () => ({
+      paddingRight: `${24 + overviewReservePx}px`,
+      transition: overviewReserveTransition,
+    }),
+    [overviewReservePx, overviewReserveTransition],
+  );
+
   if (!selectedHostId) {
     if (!fleetHydrated) {
       return <StageHydratingFallback bootstrapError={bootstrapError} />;
@@ -2251,12 +2261,9 @@ export function StreamStage() {
           className="min-h-0 flex-1"
           viewportRef={scrollRef}
           onViewportScroll={handleScroll}
-          viewportStyle={{
-            paddingRight: `${24 + overviewReservePx}px`,
-            transition: overviewReserveTransition,
-          }}
+          viewportStyle={scrollViewportStyle}
           onViewportTransitionEnd={onStageTransitionEnd}
-          viewportClassName="pt-6 pb-[24px] pl-[24px]"
+          viewportClassName="pt-6 pb-[24px] pl-[24px] [overflow-anchor:none]"
           contentClassName={stageTurns.length === 0 ? "flex min-h-full flex-col" : undefined}
         >
           <div
@@ -2277,12 +2284,7 @@ export function StreamStage() {
                 const cleanDir = (effectiveCwd || "").replace(/\/+$/, "");
                 const folderLabel =
                   cleanDir && cleanDir !== "~" ? cleanDir.split("/").pop() || cleanDir : null;
-                const wsBranch =
-                  currentAgent && hostDetail
-                    ? (hostDetail.workspaces.find(
-                        (w) => w.workspace_id === currentAgent.workspace_id,
-                      )?.git_branch ?? null)
-                    : null;
+                const wsBranch = currentWorkspaceBranch;
                 return (
                   <div className="flex flex-1 flex-col items-center justify-center pb-12 text-center select-none">
                     <div className="bg-foreground/[0.035] text-muted-foreground/70 mb-3 flex size-9 items-center justify-center rounded-full ring-1 ring-inset ring-black/[0.06] dark:bg-white/[0.045] dark:ring-white/[0.08]">
@@ -2342,8 +2344,6 @@ export function StreamStage() {
                   sessionSubagents={sessionSubagents}
                   sessionSubagentMatcher={sessionSubagentMatcher}
                   onOpenSubagent={handleOpenSubagent}
-                  queuedNotificationCount={queuedNotificationCount}
-                  onInterruptAndContinue={handleInterruptAndContinue}
                 />
 
                 <StreamStageActivityWave

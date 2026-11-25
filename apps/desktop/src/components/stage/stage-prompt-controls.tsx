@@ -18,7 +18,6 @@ import {
   FileCode2,
   FileDiff,
   FileImage,
-  FileSymlink,
   FileText,
   Film,
   Folder,
@@ -39,6 +38,7 @@ import { InlineDirectiveToken } from "@/components/composer/composer-directive-t
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
 import { resolveSlashCommandIcon } from "@/components/composer/slash-menu";
 import { MarkdownBlocksView, useClipboardCopy } from "@/components/markdown-blocks";
+import { ImageLightbox, type ImageLightboxItem } from "@/components/viewers/image-lightbox";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { DiffStat } from "@/components/ui/diff-stat";
@@ -93,6 +93,8 @@ import {
   extractUserPromptPresentation,
   formatFullTimestampTooltip,
   formatRelativeTimeLabel,
+  mayUserPromptOverflow,
+  observeSharedBubbleResize,
   useSharedRelativeNow,
 } from "./stage-helpers";
 
@@ -139,6 +141,7 @@ function resolvePromptBadgeIcon(badge: PromptBadge): LucideIcon {
 
 const PromptImageThumbnail = memo(function PromptImageThumbnail({
   badge,
+  allImageBadges,
   cleanText,
   imageIndex,
   hostId,
@@ -147,6 +150,7 @@ const PromptImageThumbnail = memo(function PromptImageThumbnail({
   onPreviewImage,
 }: {
   badge: PromptBadge;
+  allImageBadges: readonly PromptBadge[];
   cleanText: string;
   imageIndex: number;
   hostId: string;
@@ -228,15 +232,52 @@ const PromptImageThumbnail = memo(function PromptImageThumbnail({
       <button
         type="button"
         title={t("stage.preview", { name: badge.label })}
-        onClick={() =>
+        onClick={() => {
+          const gallery: ImageLightboxItem[] = [];
+          let galleryIndex = 0;
+          for (let i = 0; i < allImageBadges.length; i += 1) {
+            const b = allImageBadges[i];
+            if (i === imageIndex) {
+              galleryIndex = gallery.length;
+              gallery.push({
+                url: imgUrl,
+                label: badge.label,
+                path: imgPath,
+                hostId,
+                cwd,
+              });
+              continue;
+            }
+            const siblingRecent = !b.path
+              ? lookupRecentSentTurnImage(hostId, agentId || null, cleanText, i, b.label)
+              : null;
+            const siblingPath = b.path?.trim() || siblingRecent?.path?.trim() || null;
+            const cachedSibling =
+              siblingPath && hostId ? getCachedPromptImage(hostId, siblingPath) : null;
+            const siblingUrl =
+              cachedSibling?.status === "ready"
+                ? cachedSibling.url
+                : siblingRecent?.previewUrl ?? null;
+            if (siblingUrl) {
+              gallery.push({
+                url: siblingUrl,
+                label: b.label,
+                path: cachedSibling?.status === "ready" ? cachedSibling.resolvedPath : siblingPath,
+                hostId,
+                cwd,
+              });
+            }
+          }
           onPreviewImage({
             url: imgUrl,
             label: badge.label,
             path: imgPath,
             hostId,
             cwd,
-          })
-        }
+            gallery: gallery.length > 1 ? gallery : undefined,
+            galleryIndex,
+          });
+        }}
         className="group/img border-border-subtle bg-surface-recessed relative size-[56px] shrink-0 cursor-pointer overflow-hidden rounded-[12px] border shadow-sm transition-[border-color,box-shadow] duration-150 hover:border-border-strong"
       >
         <img
@@ -271,55 +312,43 @@ export const PromptImageLightbox = memo(function PromptImageLightbox({
   target: PromptImagePreviewTarget | null;
   onClose: () => void;
 }) {
-  const { t } = useI18n();
+  const items = useMemo<readonly ImageLightboxItem[]>(() => {
+    if (!target) return [];
+    if (target.gallery && target.gallery.length > 0) {
+      return target.gallery;
+    }
+    return [
+      {
+        url: target.url,
+        label: target.label,
+        path: target.path,
+        hostId: target.hostId,
+        cwd: target.cwd,
+      },
+    ];
+  }, [target]);
+
+  const handleOpenInSidePanel = useCallback(
+    (item: ImageLightboxItem) => {
+      const p = item.path;
+      const h = item.hostId;
+      const c = item.cwd;
+      onClose();
+      if (p && h) {
+        orbitActions.openFileInSidePanel(p, { hostId: h, cwd: c });
+      }
+    },
+    [onClose],
+  );
+
   return (
-    <Dialog open={target !== null} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="w-fit max-w-[92vw] gap-3 p-4 sm:p-5">
-        <DialogHeader className="gap-1 pr-8">
-          <DialogTitle className="truncate font-mono text-[13px] font-medium">
-            {target?.label ?? ""}
-          </DialogTitle>
-          {target?.path && (
-            <DialogDescription className="truncate font-mono text-[11px]">
-              {target.path}
-            </DialogDescription>
-          )}
-        </DialogHeader>
-
-        {target && (
-          <div className="flex flex-col items-end gap-3">
-            <div className="border-border-subtle bg-surface-recessed flex max-h-[76vh] max-w-[86vw] items-center justify-center overflow-hidden rounded-xl border p-1.5">
-              <img
-                src={target.url}
-                alt={target.label}
-                className="max-h-[72vh] max-w-[84vw] rounded-lg object-contain"
-              />
-            </div>
-
-            {target.path && target.hostId && (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  const p = target.path;
-                  const h = target.hostId;
-                  const c = target.cwd;
-                  onClose();
-                  if (p) {
-                    orbitActions.openFileInSidePanel(p, { hostId: h, cwd: c });
-                  }
-                }}
-                className="gap-1.5 text-[13px]"
-              >
-                <FileSymlink className="size-3.5" />
-                {t("stage.openInPanel")}
-              </Button>
-            )}
-          </div>
-        )}
-      </DialogContent>
-    </Dialog>
+    <ImageLightbox
+      open={target !== null}
+      items={items}
+      initialIndex={target?.galleryIndex ?? 0}
+      onClose={onClose}
+      onOpenInSidePanel={handleOpenInSidePanel}
+    />
   );
 });
 
@@ -697,39 +726,30 @@ export const UserPromptBubble = memo(function UserPromptBubble({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [overflowing, setOverflowing] = useState(false);
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const imagesRef = useRef<HTMLDivElement | null>(null);
   const actionsRef = useRef<HTMLDivElement | null>(null);
   const bubbleRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
 
   const { cleanText, badges, sanitizedLegacy } = useMemo(
-    () => extractUserPromptPresentation(item),
-    [item],
+    () => extractUserPromptPresentation(item, locale),
+    [item, locale],
   );
 
   useLayoutEffect(() => {
     const el = bodyRef.current;
     if (!el) return;
+    if (!mayUserPromptOverflow(cleanText, badges.length)) {
+      setOverflowing((prev) => (prev ? false : prev));
+      return;
+    }
     const measure = () => {
       const nextOverflow = el.scrollHeight > USER_PROMPT_PREVIEW_MAX_PX + 10;
       setOverflowing((prev) => (prev === nextOverflow ? prev : nextOverflow));
     };
     measure();
-    if (typeof ResizeObserver === "undefined") return;
-    let rafId = 0;
-    const ro = new ResizeObserver(() => {
-      if (rafId) return;
-      rafId = window.requestAnimationFrame(() => {
-        rafId = 0;
-        measure();
-      });
-    });
-    ro.observe(el);
-    return () => {
-      ro.disconnect();
-      if (rafId) window.cancelAnimationFrame(rafId);
-    };
+    return observeSharedBubbleResize(el, measure);
   }, [cleanText, badges.length]);
 
   useEffect(() => {
@@ -816,6 +836,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
             <PromptImageThumbnail
               key={`uimg-${badge.path ?? badge.label}-${idx}`}
               badge={badge}
+              allImageBadges={imageBadges}
               cleanText={cleanText}
               imageIndex={idx}
               hostId={hostId}
@@ -980,7 +1001,7 @@ export const UserPromptBubble = memo(function UserPromptBubble({
         </div>
       )}
 
-      <div ref={actionsRef} className="mt-1 flex h-[20px] shrink-0 items-center justify-end gap-1 pr-1 whitespace-nowrap opacity-0 transition-opacity duration-150 group-focus-within/user:opacity-100 group-hover/user:opacity-100 [@media(hover:none)]:opacity-100 motion-reduce:transition-none">
+      <div ref={actionsRef} className="mt-1 flex h-[20px] shrink-0 items-center justify-end gap-1 pr-2 whitespace-nowrap opacity-0 transition-opacity duration-150 group-focus-within/user:opacity-100 group-hover/user:opacity-100 [@media(hover:none)]:opacity-100 motion-reduce:transition-none">
         {promptTimestampMs !== null && (
           <RelativeTimestampPill timestampMs={promptTimestampMs} />
         )}
@@ -1013,7 +1034,7 @@ export const TurnChangesBar = memo(function TurnChangesBar({
       : t(diffs.length === 1 ? "stage.fileChanged" : "stage.filesChanged", { count: diffs.length });
 
   return (
-    <div className="pt-1.5">
+    <div>
       <button
         type="button"
         onClick={() => orbitActions.openInspectorForFile(primaryPath, "session_turns")}
@@ -1458,6 +1479,7 @@ export const TurnFooter = memo(function TurnFooter({
   forkUpToSeq,
   showFork,
   isLastTurn,
+  hasChangesBar = false,
   canForkWorktree = false,
   onRequestFork,
 }: {
@@ -1466,6 +1488,7 @@ export const TurnFooter = memo(function TurnFooter({
   forkUpToSeq: number | null;
   showFork: boolean;
   isLastTurn?: boolean;
+  hasChangesBar?: boolean;
   canForkWorktree?: boolean;
   onRequestFork?: (upToSeq: number | null, worktree: boolean) => void;
 }) {
@@ -1479,8 +1502,12 @@ export const TurnFooter = memo(function TurnFooter({
   return (
     <div className={cn(
       "flex items-center gap-1",
-      isLastTurn ? "mt-[6px] h-[22px]" :
-        'mt-[4px] h-[20px] opacity-0 transition-opacity duration-150 group-hover/turn:opacity-100 group-focus-within/turn:opacity-100 has-[[data-fork-menu-open="true"]]:opacity-100 [@media(hover:none)]:opacity-100 motion-reduce:transition-none [&_button]:h-[20px]',
+      isLastTurn
+        ? cn(hasChangesBar ? "mt-[10px]" : "mt-[8px]", "h-[22px]")
+        : cn(
+            hasChangesBar ? "mt-[10px]" : "mt-[6px]",
+            'h-[20px] opacity-0 transition-opacity duration-150 group-hover/turn:opacity-100 group-focus-within/turn:opacity-100 has-[[data-fork-menu-open="true"]]:opacity-100 [@media(hover:none)]:opacity-100 motion-reduce:transition-none [&_button]:h-[20px]',
+          ),
       // The non-virtualized subagent panel renders turn sections as direct siblings.
       isLastTurn === undefined && "group-last/turn:opacity-100",
     )}>

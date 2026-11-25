@@ -54,7 +54,7 @@ const EMPTY_ACP_AGENTS: readonly AcpAgentAvailability[] = [];
 const HOVER_INTENT_MS = 90;
 
 /**
- * Isolated Agent + Model + Thinking Mode Selector (`[ProviderIcon Model · Effort ⚡ ▾]`).
+ * Isolated Agent + Model + Thinking Mode Selector (`[ProviderIcon Model Effort ⚡ ▾]`).
  * - Never subscribes to `composerDrafts`, and packs active-agent config into 1 primitive selector
  *   so keystrokes and unrelated background heartbeats trigger zero re-renders.
  * - Auto-focuses active model row on open, supports hover-intent (`90ms`), full keyboard navigation
@@ -568,10 +568,10 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
 
   const triggerTooltipLabel = isFastActive
     ? t("composer.fastModeTooltip", {
-        label: `${activeTriggerLabel}${activeEffortLabel ? ` · ${activeEffortLabel}` : ""}`,
+        label: `${activeTriggerLabel}${activeEffortLabel ? ` ${activeEffortLabel}` : ""}`,
       })
     : activeEffortLabel
-      ? `${activeTriggerLabel} · ${activeEffortLabel}`
+      ? `${activeTriggerLabel} ${activeEffortLabel}`
       : activeTriggerLabel;
 
   const focusFlyoutFirstItem = useCallback(() => {
@@ -588,6 +588,24 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
     });
   }, []);
 
+  const triggerContent = (
+    <>
+      <ProviderIcon provider={activeProvider} className="size-4 shrink-0" />
+      <span className="text-ink-primary min-w-0 truncate font-normal opacity-90">
+        {activeTriggerLabel}
+      </span>
+      {activeEffortLabel && (
+        <span className="text-ink-muted shrink-0 text-[13px] font-normal">
+          {activeEffortLabel}
+        </span>
+      )}
+      {isFastActive && (
+        <Zap className="text-signal-info size-3 shrink-0 stroke-[2.1]" aria-hidden="true" />
+      )}
+      <ChevronDown className="text-ink-faint size-3.5 shrink-0 stroke-[1.75]" />
+    </>
+  );
+
   if (disabled) {
     return (
       <SimpleTooltip label={disabledTitle ?? triggerTooltipLabel} side="top">
@@ -595,26 +613,10 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
           <button
             type="button"
             disabled
+            data-composer-model-trigger="true"
             className="inline-flex h-8.5 max-w-76 cursor-not-allowed items-center gap-1.5 rounded-full px-2.5 text-[13px] opacity-65"
           >
-            <ProviderIcon provider={activeProvider} className="size-4 shrink-0" />
-            <span className="text-ink-primary truncate font-normal opacity-90">
-              {activeTriggerLabel}
-            </span>
-            {activeEffortLabel && (
-              <>
-                <span aria-hidden="true" className="text-ink-faint text-[11px]">
-                  ·
-                </span>
-                <span className="text-ink-muted shrink-0 text-[13px] font-normal">
-                  {activeEffortLabel}
-                </span>
-              </>
-            )}
-            {isFastActive && (
-              <Zap className="text-signal-info size-3 shrink-0 stroke-[2.1]" aria-hidden="true" />
-            )}
-            <ChevronDown className="text-ink-faint size-3.5 shrink-0 stroke-[1.75]" />
+            {triggerContent}
           </button>
         </span>
       </SimpleTooltip>
@@ -641,26 +643,10 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
         <PopoverTrigger asChild>
           <button
             type="button"
+            data-composer-model-trigger="true"
             className="hover:text-ink-primary hover:bg-accent inline-flex h-8.5 max-w-76 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors"
           >
-            <ProviderIcon provider={activeProvider} className="size-4 shrink-0" />
-            <span className="text-ink-primary truncate font-normal opacity-90">
-              {activeTriggerLabel}
-            </span>
-            {activeEffortLabel && (
-              <>
-                <span aria-hidden="true" className="text-ink-faint text-[11px]">
-                  ·
-                </span>
-                <span className="text-ink-muted shrink-0 text-[13px] font-normal">
-                  {activeEffortLabel}
-                </span>
-              </>
-            )}
-            {isFastActive && (
-              <Zap className="text-signal-info size-3 shrink-0 stroke-[2.1]" aria-hidden="true" />
-            )}
-            <ChevronDown className="text-ink-faint size-3.5 shrink-0 stroke-[1.75]" />
+            {triggerContent}
           </button>
         </PopoverTrigger>
       </SimpleTooltip>
@@ -797,6 +783,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                       <button
                         key={prof.profile_id}
                         type="button"
+                        title={[prof.name, profMeta].filter(Boolean).join(" — ")}
                         onMouseEnter={() => scheduleFlyoutRow(null, null, true)}
                         onClick={() => {
                           orbitActions.setDraftConfig({
@@ -811,7 +798,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                           setModelPopoverOpen(false);
                         }}
                         className={cn(
-                          "flex w-full cursor-pointer items-center justify-between gap-2 rounded-[7px] px-2 py-1 text-left transition-colors",
+                          "flex w-full cursor-pointer items-center justify-between gap-2 overflow-hidden rounded-[7px] px-2 py-1 text-left transition-colors",
                           isActiveProf
                             ? "bg-accent text-ink-primary"
                             : "text-ink-secondary hover:bg-accent/70 hover:text-ink-primary",
@@ -853,6 +840,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                           <button
                             key={item.spec.id}
                             type="button"
+                            title={item.spec.name}
                             onMouseEnter={() => scheduleFlyoutRow(null, null, true)}
                             onClick={() => {
                               orbitActions.setDraftConfig({
@@ -864,7 +852,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                               setModelPopoverOpen(false);
                             }}
                             className={cn(
-                              "flex h-[28px] w-full cursor-pointer items-center justify-between gap-2 rounded-[7px] px-2 text-left transition-colors",
+                              "flex h-[28px] w-full cursor-pointer items-center justify-between gap-2 overflow-hidden rounded-[7px] px-2 text-left transition-colors",
                               isSelectedAcp
                                 ? "bg-accent text-ink-primary"
                                 : "hover:bg-accent/65",
@@ -910,14 +898,24 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                     </>
                   ) : (
                     <>
-                      <div className="text-ink-primary flex items-center justify-between gap-2 px-2 py-1 text-[13px] font-medium">
-                        <span className="truncate">
+                      <div
+                        title={[
+                          activeAcpSpec?.name ??
+                            effectiveAcpAgentId ??
+                            t("composer.acpAgentFallback"),
+                          rawActiveModel,
+                        ]
+                          .filter(Boolean)
+                          .join(" — ")}
+                        className="text-ink-primary flex items-center justify-between gap-2 overflow-hidden px-2 py-1 text-[13px] font-medium"
+                      >
+                        <span className="min-w-0 truncate">
                           {activeAcpSpec?.name ??
                             effectiveAcpAgentId ??
                             t("composer.acpAgentFallback")}
                         </span>
                         {rawActiveModel && (
-                          <span className="text-ink-muted shrink-0 font-mono text-[11px] font-normal">
+                          <span className="text-ink-muted min-w-0 max-w-[55%] shrink-0 truncate font-mono text-[11px] font-normal">
                             {rawActiveModel}
                           </span>
                         )}
@@ -1000,7 +998,11 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                             rowRefs.current.set(row.key, el);
                           }}
                           type="button"
-                          title={row.kind === "model" ? row.desc || undefined : undefined}
+                          title={
+                            row.kind === "model"
+                              ? [row.label, row.desc].filter(Boolean).join(" — ")
+                              : [row.label, rowSecondary].filter(Boolean).join(" — ")
+                          }
                           onMouseEnter={(e) => {
                             if (hasFlyout) {
                               scheduleFlyoutRow(row.key, e.currentTarget, hoveredModelKey === null);
@@ -1034,13 +1036,15 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                             );
                             setModelPopoverOpen(false);
                           }}
-                          className="focus-visible:ring-ring/40 flex h-full min-w-0 flex-1 cursor-pointer items-center justify-between gap-1.5 rounded-[7px] pr-0.5 pl-2 text-left outline-none focus-visible:ring-1"
+                          className="focus-visible:ring-ring/40 flex h-full min-w-0 flex-1 cursor-pointer items-center justify-between gap-1.5 overflow-hidden rounded-[7px] pr-0.5 pl-2 text-left outline-none focus-visible:ring-1"
                         >
-                          <div className="flex min-w-0 items-baseline gap-1.5">
+                          <div className="flex min-w-0 flex-1 items-baseline gap-1.5">
                             <span
                               className={cn(
-                                "shrink-0 text-[13px] leading-normal",
-                                row.kind === "model" && "truncate",
+                                "text-[13px] leading-normal",
+                                row.kind === "model"
+                                  ? "min-w-0 truncate"
+                                  : "min-w-0 max-w-[60%] shrink-0 truncate",
                                 isModelActive
                                   ? "text-ink-primary font-medium"
                                   : "text-ink-secondary group-hover/model:text-ink-primary font-normal",
@@ -1049,7 +1053,12 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                               {row.label}
                             </span>
                             {rowSecondary && (
-                              <span className="text-ink-muted min-w-0 truncate text-[11px] leading-normal font-normal">
+                              <span
+                                className={cn(
+                                  "text-ink-muted text-[11px] leading-normal font-normal",
+                                  row.kind === "model" ? "shrink-0" : "min-w-0 truncate",
+                                )}
+                              >
                                 {rowSecondary}
                               </span>
                             )}
@@ -1202,61 +1211,62 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                                     : "hover:bg-accent/65",
                               )}
                             >
-                              <button
-                                ref={(el) => {
-                                  subRowRefs.current.set(child.key, el);
-                                }}
-                                data-l2-item="true"
-                                type="button"
-                                onMouseEnter={(e) => {
-                                  if (childHasFlyout) {
-                                    scheduleLevel3Row(
-                                      child.key,
-                                      e.currentTarget,
-                                      hoveredSubKey === null,
-                                    );
-                                  } else {
-                                    scheduleLevel3Row(null, null, false);
-                                  }
-                                }}
-                                onKeyDown={(e) => {
-                                  if (e.key === "ArrowRight" && childHasFlyout) {
-                                    e.preventDefault();
+                                <button
+                                  ref={(el) => {
+                                    subRowRefs.current.set(child.key, el);
+                                  }}
+                                  data-l2-item="true"
+                                  type="button"
+                                  title={[child.label, child.desc].filter(Boolean).join(" — ")}
+                                  onMouseEnter={(e) => {
+                                    if (childHasFlyout) {
+                                      scheduleLevel3Row(
+                                        child.key,
+                                        e.currentTarget,
+                                        hoveredSubKey === null,
+                                      );
+                                    } else {
+                                      scheduleLevel3Row(null, null, false);
+                                    }
+                                  }}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "ArrowRight" && childHasFlyout) {
+                                      e.preventDefault();
+                                      e.stopPropagation();
+                                      scheduleLevel3Row(child.key, e.currentTarget, true);
+                                      focusLevel3FirstItem();
+                                    }
+                                  }}
+                                  onClick={(e) => {
                                     e.stopPropagation();
-                                    scheduleLevel3Row(child.key, e.currentTarget, true);
-                                    focusLevel3FirstItem();
-                                  }
-                                }}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  handleSelectModelAndEffort(
-                                    effectiveBrowsedProvider,
-                                    child.id,
-                                    childEffort,
-                                    child.supportsFastMode ? undefined : false,
-                                  );
-                                  setModelPopoverOpen(false);
-                                }}
-                                className="focus-visible:ring-ring/40 flex h-full min-w-0 flex-1 cursor-pointer items-center justify-between gap-1.5 rounded-[7px] pr-0.5 pl-2 text-left outline-none focus-visible:ring-1"
-                              >
-                                <div className="flex min-w-0 items-baseline gap-1.5">
-                                  <span
-                                    className={cn(
-                                      "truncate text-[13px] leading-normal",
-                                      isChildActive
-                                        ? "text-ink-primary font-medium"
-                                        : "text-ink-secondary group-hover/submodel:text-ink-primary font-normal",
-                                    )}
-                                  >
-                                    {child.label}
-                                  </span>
-                                  {childEffortLabel && (
-                                    <span className="text-ink-muted shrink-0 text-[11px] leading-normal font-normal">
-                                      {childEffortLabel}
+                                    handleSelectModelAndEffort(
+                                      effectiveBrowsedProvider,
+                                      child.id,
+                                      childEffort,
+                                      child.supportsFastMode ? undefined : false,
+                                    );
+                                    setModelPopoverOpen(false);
+                                  }}
+                                  className="focus-visible:ring-ring/40 flex h-full min-w-0 flex-1 cursor-pointer items-center justify-between gap-1.5 overflow-hidden rounded-[7px] pr-0.5 pl-2 text-left outline-none focus-visible:ring-1"
+                                >
+                                  <div className="flex min-w-0 flex-1 items-baseline gap-1.5">
+                                    <span
+                                      className={cn(
+                                        "min-w-0 truncate text-[13px] leading-normal",
+                                        isChildActive
+                                          ? "text-ink-primary font-medium"
+                                          : "text-ink-secondary group-hover/submodel:text-ink-primary font-normal",
+                                      )}
+                                    >
+                                      {child.label}
                                     </span>
-                                  )}
-                                </div>
-                              </button>
+                                    {childEffortLabel && (
+                                      <span className="text-ink-muted shrink-0 text-[11px] leading-normal font-normal">
+                                        {childEffortLabel}
+                                      </span>
+                                    )}
+                                  </div>
+                                </button>
 
                               {childHasFlyout ? (
                                 <button

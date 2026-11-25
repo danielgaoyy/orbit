@@ -2658,6 +2658,10 @@ pub enum WireMessage {
         enabled: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_etag: Option<String>,
+        /// Create-only intent: refuse to overwrite an existing skill at this slug. Defaults to
+        /// `false` so older peers that omit the field keep the previous upsert semantics.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        create_only: bool,
     },
     ToggleManagedSkill {
         request_id: Uuid,
@@ -2680,6 +2684,13 @@ pub enum WireMessage {
         source_markdown_or_path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         slug_override: Option<String>,
+        /// Optimistic version check for an explicit replace of an existing skill.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_etag: Option<String>,
+        /// Create-only intent: refuse to overwrite an existing skill at the resolved slug.
+        /// Defaults to `false` for wire compatibility with older peers.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        create_only: bool,
     },
 
     // System Keep-Awake (OS Sleep Prevention)
@@ -3125,6 +3136,10 @@ pub enum WireMessage {
         keep_existing_secrets: bool,
         #[serde(default = "wire_default_true")]
         enabled: bool,
+        /// Create-only intent: refuse to replace an existing server with the same name in the
+        /// target scope. Defaults to `false` for wire compatibility with older peers.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        create_only: bool,
     },
     ToggleExternalMcpServer {
         request_id: Uuid,
@@ -5613,6 +5628,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 keep_existing_secrets: true,
                 enabled: true,
+                create_only: false,
             },
             WireMessage::ToggleExternalMcpServer {
                 request_id: req_id,

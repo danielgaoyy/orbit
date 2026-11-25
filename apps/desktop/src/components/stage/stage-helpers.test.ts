@@ -9,7 +9,9 @@ import { computePrependRestoredScrollTop } from "../../lib/stage-pagination.ts";
 import type { OrbitUiState } from "../../state/store-types.ts";
 import {
   EMPTY_WORK_COUNTS,
+  createHostAgentSelector,
   createRelativeClock,
+  createStableHostArtifactsSelector,
   createStageSessionSelector,
   createTurnProseMatcherLookup,
   estimateTurnSizeFallback,
@@ -22,6 +24,8 @@ import {
   getTurnItemHeight,
   getTurnListRows,
   getTurnTopGapPx,
+  isLiveCompactionSegment,
+  mayUserPromptOverflow,
   resolveTurnForkSeq,
   turnHasSubagentReferences,
   updateStageTimingHistory,
@@ -57,9 +61,13 @@ function thought(seq: number): TimelineItemView {
 }
 
 const message: TimelineItemView = {
-  item_type: "agent_message", seq: 14, kind: "direct_message", message_id: "message", text: "", blocks: [],
+  item_type: "agent_message", seq: 14, kind: "finish_notification", event: "failed", message_id: "message", text: "Error: failed", blocks: [],
 };
 const inlineMessage = { kind: "agent_message", key: "message", item: message } as const;
+const hiddenDirectMessage: TimelineItemView = {
+  item_type: "agent_message", seq: 15, kind: "direct_message", message_id: "dm", text: "Hello", blocks: [],
+};
+const inlineHiddenDirect = { kind: "agent_message", key: "dm", item: hiddenDirectMessage } as const;
 
 const prompt: TimelineItemView = {
   item_type: "user_prompt", seq: 10, message_id: "prompt", text: "Continue", blocks: [],
@@ -70,10 +78,10 @@ test("turn spacing counts the historical footer slot once and preserves a distin
   const user = { ...turn(2), user_prompt: prompt };
   assert.equal(getTurnTopGapPx(user, undefined), 0);
   assert.equal(getTurnTopGapPx(peer, undefined), 0);
-  assert.equal(getTurnTopGapPx(peer, true), 0);
+  assert.equal(getTurnTopGapPx(peer, true), 8);
   assert.equal(getTurnTopGapPx(peer, false), 12);
-  assert.equal(getTurnTopGapPx(user, true), 16);
-  assert.equal(getTurnTopGapPx(user, false), 28);
+  assert.equal(getTurnTopGapPx(user, true), 14);
+  assert.equal(getTurnTopGapPx(user, false), 32);
 });
 
 test("only rendered footer content contributes to the following turn's spacing", () => {
@@ -83,6 +91,7 @@ test("only rendered footer content contributes to the following turn's spacing",
   assert.equal(getTurnFooter(report, { ...historical, isActive: true }), null);
   for (const footerless of [
     { ...turn(1), agent_message: message, completed_at_ms: 123 },
+    { ...turn(1, [inlineHiddenDirect]), agent_message: hiddenDirectMessage, completed_at_ms: 456 },
     { ...report, is_compaction_command: true },
     turn(1, [{ kind: "wakeup", key: "wait", label: "Waiting for a peer" }]),
   ]) {
@@ -102,6 +111,20 @@ test("only rendered footer content contributes to the following turn's spacing",
   assert.equal(getTurnFooter(replyTurn, { canFork: false })?.replyText, "Finished");
 });
 
+test("isLiveCompactionSegment distinguishes live compacting from completed dividers", () => {
+  assert.equal(isLiveCompactionSegment({ key: "compact-live-12", label: "Compacting context…" }), true);
+  assert.equal(isLiveCompactionSegment({ key: "compact-12", label: "Compacting context..." }), true);
+  assert.equal(isLiveCompactionSegment({ key: "compact-12", label: "Compaction requested" }), true);
+  assert.equal(isLiveCompactionSegment({ key: "compact-13", label: "Context compacted" }), false);
+  assert.equal(
+    isLiveCompactionSegment({
+      key: "compact-14",
+      label: "Context compacted automatically (from 142k tokens)",
+    }),
+    false,
+  );
+});
+
 test("prepending rebases the first cached row's padding and preserves its content anchor", () => {
   const older = { ...turn(1, [inlineMessage]), agent_message: message };
   const marker = { ...turn(2), is_compaction_command: true };
@@ -113,8 +136,8 @@ test("prepending rebases the first cached row's padding and preserves its conten
   const timings = new Map();
   const before = getTurnListRows(oldTurns, "host::agent", timings, false);
   const after = getTurnListRows(turns, "host::agent", timings, false, before);
-  assert.deepEqual(before.map(row => row.topGapPx), [0, 0, 16]);
-  assert.deepEqual(after.map(row => row.topGapPx), [0, 0, 28, 0, 16]);
+  assert.deepEqual(before.map(row => row.topGapPx), [0, 8, 14]);
+  assert.deepEqual(after.map(row => row.topGapPx), [0, 8, 32, 8, 14]);
   assert.equal(getTurnListRows([...turns], "host::agent", timings, false, after), after);
 
   // One cold estimate and four known content heights. TanStack measures the
@@ -130,9 +153,9 @@ test("prepending rebases the first cached row's padding and preserves its conten
   const newList = layout(turns, after);
   const oldTotal = oldList.getTotalSize();
   const newTotal = newList.getTotalSize();
-  const addedHeight = estimateTurnSizeFallback(older) + 24 + 30 + 28;
+  const addedHeight = estimateTurnSizeFallback(older) + 26 + 8 + 30 + 32;
   assert.equal(newTotal - oldTotal, addedHeight);
-  assert.equal(newList.measurementsCache[2].size, 202 + 24 + 28);
+  assert.equal(newList.measurementsCache[2].size, 202 + 26 + 32);
   const oldAnchor = getTurnContentStart(before[0], oldList.measurementsCache[0].start);
   const newAnchor = getTurnContentStart(after[2], newList.measurementsCache[2].start);
   assert.equal(newAnchor - oldAnchor, addedHeight);
@@ -154,7 +177,7 @@ test("a cached reply can settle, become historical, or lose its predecessor with
   const appended = getTurnListRows([reply, turn(2)], "host::agent", timings, true, settled);
   const rewound = getTurnListRows([reply], "host::agent", timings, false, appended);
   assert.deepEqual([active, settled, appended, rewound].map(rows => getTurnItemHeight(reply, rows[0], content)), [
-    content, content + 28, content + 24, content + 28,
+    content, content + 30, content + 26, content + 30,
   ]);
 });
 
@@ -342,4 +365,69 @@ test("relative labels and cached calendar dates follow the Stage locale", () => 
       assert.equal(formatRelativeTimeLabel(stamp, now, locale), date);
     }
   }
+});
+
+test("narrow host selectors preserve identity across unrelated sibling host updates and short prompts skip overflow measurement", () => {
+  assert.equal(mayUserPromptOverflow("A"), false);
+  assert.equal(mayUserPromptOverflow("short single line prompt"), false);
+  assert.equal(mayUserPromptOverflow("line1\nline2"), true);
+  assert.equal(mayUserPromptOverflow("x".repeat(73)), true);
+  assert.equal(mayUserPromptOverflow("short", 1), true);
+
+  const selectAgent = createHostAgentSelector("h1", "a1");
+  const selectArtifacts = createStableHostArtifactsSelector("h1");
+  const makeAgent = (id: string, status: string): AgentCardView => ({
+    agent_id: id,
+    workspace_id: "ws1",
+    provider: "claude",
+    title: id,
+    task_summary: "",
+    cwd: "/repo",
+    status_label: status,
+    latest_seq: 1,
+    is_running: false,
+    is_awaiting_permission: false,
+    model: "sonnet",
+    effort: "medium",
+    updated_at_rfc3339: "2026-01-01T00:00:00Z",
+    mode: { kind: "default" },
+    queued_prompts: [],
+  } as unknown as AgentCardView);
+
+  const state1 = {
+    hostDetails: {
+      h1: {
+        agents: [makeAgent("a1", "Idle"), makeAgent("a2", "Idle")],
+        artifacts: [{ artifact_id: "art1", title: "Spec", version: 1, kind: "doc", resource_uri: "uri://1" }],
+      } as unknown as HostDetailView,
+    },
+  };
+  const firstAgent = selectAgent(state1);
+  const firstArtifacts = selectArtifacts(state1);
+
+  // Sibling agent `a2` mutates and `hostDetails.h1` is cloned with structurally equivalent `a1` & `artifacts`
+  const state2 = {
+    hostDetails: {
+      h1: {
+        agents: [makeAgent("a1", "Idle"), makeAgent("a2", "Running")],
+        artifacts: [{ artifact_id: "art1", title: "Spec", version: 1, kind: "doc", resource_uri: "uri://1" }],
+      } as unknown as HostDetailView,
+    },
+  };
+  assert.equal(selectAgent(state2), firstAgent);
+  assert.equal(selectArtifacts(state2), firstArtifacts);
+
+  // Genuine status mutation on `a1` propagates immediately
+  const state3 = {
+    hostDetails: {
+      h1: {
+        agents: [makeAgent("a1", "Running"), makeAgent("a2", "Running")],
+        artifacts: [{ artifact_id: "art1", title: "Spec", version: 2, kind: "doc", resource_uri: "uri://1" }],
+      } as unknown as HostDetailView,
+    },
+  };
+  assert.notEqual(selectAgent(state3), firstAgent);
+  assert.equal(selectAgent(state3)?.status_label, "Running");
+  assert.notEqual(selectArtifacts(state3), firstArtifacts);
+  assert.equal(selectArtifacts(state3)[0]?.version, 2);
 });

@@ -181,7 +181,7 @@ export const ShortcutsSection = memo(function ShortcutsSection({ jumpTo }: { jum
   }, [locale, isMac, mod, shift, query, enterToSend, activeTurnSendBehavior, customKeybindings]);
 
   return (
-    <div className="flex flex-col gap-5">
+    <div className="flex flex-col gap-6">
       <SettingSectionHeader
         title={t("settings.shortcutsTitle")}
         description={t("settings.shortcutsDesc")}
@@ -195,7 +195,7 @@ export const ShortcutsSection = memo(function ShortcutsSection({ jumpTo }: { jum
           onChange={(e) => setQuery(e.target.value)}
           aria-label={t("settings.searchShortcutsPlaceholder")}
           placeholder={t("settings.searchShortcutsPlaceholder")}
-          className="h-[34px] rounded-[10px] pl-8.5 text-[13px]"
+          className="h-[34px] rounded-[10px] pl-[32px] text-[13px]"
         />
       </div>
 
@@ -204,9 +204,9 @@ export const ShortcutsSection = memo(function ShortcutsSection({ jumpTo }: { jum
           {t("settings.noMatchingShortcuts")}
         </div>
       ) : (
-        <div className="flex flex-col gap-5">
+        <div className="flex flex-col gap-6">
           {groups.map(([groupName, items]) => (
-            <div key={groupName} className="flex flex-col gap-2">
+            <div key={groupName} className="flex flex-col gap-3">
               <SettingGroupLabel>{groupName}</SettingGroupLabel>
               <SettingCard>
                 {items.map((item) => {
@@ -222,19 +222,19 @@ export const ShortcutsSection = memo(function ShortcutsSection({ jumpTo }: { jum
                       data-setting-id={item.settingId}
                       className="relative flex flex-col"
                     >
-                      <div className="flex items-center justify-between gap-4 px-4 py-2.5">
+                      <div className="flex items-center justify-between gap-4 px-4 py-2">
                         <div className="flex min-w-0 items-center gap-2">
                           <span className="text-ink-primary truncate text-[13px]">
                             {item.action}
                           </span>
                           {item.isCustomized && (
-                            <span className="bg-surface-recessed text-ink-muted rounded px-1.5 py-0.5 text-[11px] font-medium">
+                            <span className="bg-surface-recessed text-ink-muted rounded px-2 py-1 text-[11px] font-medium">
                               {t("settings.shortcutsCustomBadge")}
                             </span>
                           )}
                         </div>
 
-                        <div className="flex shrink-0 items-center gap-1.5">
+                        <div className="flex shrink-0 items-center gap-2">
                           {item.actionId ? (
                             <button
                               type="button"
@@ -254,8 +254,8 @@ export const ShortcutsSection = memo(function ShortcutsSection({ jumpTo }: { jum
                               className={cn(
                                 "inline-flex min-h-[26px] cursor-pointer items-center justify-center rounded-[7px] transition-colors outline-none focus-visible:ring-1 focus-visible:ring-border-strong",
                                 isRecording
-                                  ? "border-border-strong bg-surface-raised text-ink-primary ring-border-strong min-w-[84px] border px-2.5 ring-1"
-                                  : "hover:bg-surface-recessed -mr-1.5 px-1.5 py-0.5",
+                                  ? "border-border-strong bg-surface-raised text-ink-primary ring-border-strong min-w-[84px] border px-3 ring-1"
+                                  : "hover:bg-surface-recessed -mr-2 px-2 py-1",
                               )}
                             >
                               {isRecording ? (
@@ -274,7 +274,7 @@ export const ShortcutsSection = memo(function ShortcutsSection({ jumpTo }: { jum
 
                       {showReserved && reservedWarning && (
                         <div className="border-border-subtle bg-signal-warning-bg text-signal-warning flex items-center justify-between gap-2 border-t px-4 py-2 text-[13px]">
-                          <span className="flex items-center gap-1.5">
+                          <span className="flex items-center gap-2">
                             <AlertTriangle className="size-3.5 shrink-0" />
                             <span>
                               {t("settings.shortcutsReservedError", {
@@ -287,7 +287,7 @@ export const ShortcutsSection = memo(function ShortcutsSection({ jumpTo }: { jum
 
                       {showConflict && pendingConflict && (
                         <div className="border-border-subtle bg-signal-warning-bg text-signal-warning flex flex-wrap items-center justify-between gap-2 border-t px-4 py-2 text-[13px]">
-                          <span className="flex min-w-0 items-center gap-1.5">
+                          <span className="flex min-w-0 items-center gap-2">
                             <AlertTriangle className="size-3.5 shrink-0" />
                             <span className="truncate">
                               {t("settings.shortcutsConflictNotice", {
@@ -296,7 +296,7 @@ export const ShortcutsSection = memo(function ShortcutsSection({ jumpTo }: { jum
                               })}
                             </span>
                           </span>
-                          <div className="flex shrink-0 items-center gap-1.5">
+                          <div className="flex shrink-0 items-center gap-2">
                             <Button
                               type="button"
                               size="sm"

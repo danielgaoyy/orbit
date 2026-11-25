@@ -4,6 +4,7 @@ import type {
   TimelineItemView,
   ToolCallDetail,
 } from "../../lib/orbit-ipc.ts";
+import { isTimelineAgentMessageHidden } from "../../lib/turn-delegation-split.ts";
 import { findTurnIndexForSeq } from "./stage-helpers.ts";
 
 export const STAGE_FIND_REMOTE_DEBOUNCE_MS = 180;
@@ -133,16 +134,19 @@ function collectTurnSearchSlices(turn: StageTurnView): SearchableEventSlice[] {
   if (turn.user_prompt) {
     pushSlice(extractItemSearchSlice(turn.user_prompt, true));
   }
-  if (turn.agent_message) {
+  if (
+    turn.agent_message?.item_type === "agent_message" &&
+    !isTimelineAgentMessageHidden(turn.agent_message)
+  ) {
     pushSlice(extractItemSearchSlice(turn.agent_message, true));
   }
   for (const seg of turn.live_segments) {
-    if (
-      seg.kind === "assistant_message" ||
-      seg.kind === "agent_message" ||
-      seg.kind === "notice"
-    ) {
+    if (seg.kind === "assistant_message" || seg.kind === "notice") {
       pushSlice(extractItemSearchSlice(seg.item, true));
+    } else if (seg.kind === "agent_message") {
+      if (seg.item.item_type === "agent_message" && !isTimelineAgentMessageHidden(seg.item)) {
+        pushSlice(extractItemSearchSlice(seg.item, true));
+      }
     } else if (seg.kind === "step_group") {
       for (const item of seg.items) {
         pushSlice(extractItemSearchSlice(item, false));

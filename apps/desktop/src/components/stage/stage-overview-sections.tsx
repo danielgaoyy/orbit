@@ -525,8 +525,8 @@ export const OverviewExpandFooter = memo(function OverviewExpandFooter({
     <div
       className={cn(
         expanded
-          ? "bg-[var(--overview-surface,var(--surface-raised))] border-border-subtle sticky bottom-0 z-[2] border-t pt-1 pr-2 pb-2 pl-2"
-          : "pt-0.5 pb-1.5 pl-2",
+          ? "bg-[var(--overview-surface,var(--surface-raised))] sticky bottom-0 z-[2] px-2 pt-1 pb-1.5"
+          : "px-2 pt-0.5 pb-1.5",
       )}
     >
       <button

@@ -807,15 +807,19 @@ async fn handle_claude_task_notification(
                 .filter(|s| !s.is_empty())
                 .unwrap_or(tid.as_str())
                 .to_string();
+            let model = val
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
             let synthesized = ProviderSubagentDescriptor {
                 subagent_id: tid.clone(),
                 parent_agent_id: parent_agent_id.to_string(),
                 parent_subagent_id: None,
                 title,
-                subtitle: val
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .map(ToOwned::to_owned),
+                subtitle: None,
+                model,
                 status: terminal_status,
                 created_at: now,
                 updated_at: now,
@@ -1912,13 +1916,20 @@ async fn run_claude_actor(
                                                     .get("parent_tool_use_id")
                                                     .and_then(|v| v.as_str())
                                                     .and_then(|p| tool_use_to_task.get(p).cloned());
+                                                let model = val
+                                                    .get("model")
+                                                    .and_then(|v| v.as_str())
+                                                    .map(str::trim)
+                                                    .filter(|s| !s.is_empty())
+                                                    .map(ToOwned::to_owned);
                                                 let now = Utc::now();
                                                 let desc = ProviderSubagentDescriptor {
                                                     subagent_id: task_id.clone(),
                                                     parent_agent_id: cfg.agent_id.clone(),
                                                     parent_subagent_id: parent_sub,
                                                     title,
-                                                    subtitle: val.get("model").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+                                                    subtitle: None,
+                                                    model,
                                                     status: ProviderSubagentStatus::Running,
                                                     created_at: now,
                                                     updated_at: now,
@@ -1948,6 +1959,15 @@ async fn run_claude_actor(
                                                 .filter(|s| !s.trim().is_empty())
                                             {
                                                 desc.title = title.to_string();
+                                            }
+                                            if let Some(model) = val
+                                                .pointer("/patch/model")
+                                                .or_else(|| val.get("model"))
+                                                .and_then(|v| v.as_str())
+                                                .map(str::trim)
+                                                .filter(|s| !s.is_empty())
+                                            {
+                                                desc.model = Some(model.to_string());
                                             }
                                             desc.updated_at = Utc::now();
                                             let _ = evt_tx
@@ -1993,6 +2013,50 @@ async fn run_claude_actor(
                                                     .await;
                                             }
                                         }
+                                    }
+                                    "status" => {
+                                        if val.get("status").and_then(|v| v.as_str())
+                                            == Some("compacting")
+                                        {
+                                            let _ = evt_tx
+                                                .send(DriverEvent::Notice {
+                                                    level: "compaction_live".into(),
+                                                    message: "Compacting context…".into(),
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                    "compact_boundary" => {
+                                        let meta = val.get("compact_metadata");
+                                        let is_auto = meta
+                                            .and_then(|m| m.get("trigger"))
+                                            .and_then(|v| v.as_str())
+                                            .is_some_and(|s| s.eq_ignore_ascii_case("auto"));
+                                        let pre_tokens = meta
+                                            .and_then(|m| m.get("pre_tokens"))
+                                            .and_then(|v| v.as_u64())
+                                            .filter(|&n| n > 0);
+                                        let base = if is_auto {
+                                            "Context compacted automatically"
+                                        } else {
+                                            "Context compacted"
+                                        };
+                                        let message = match pre_tokens {
+                                            Some(n) if n >= 1_000_000 => {
+                                                format!("{base} (from {:.1}M tokens)", n as f64 / 1_000_000.0)
+                                            }
+                                            Some(n) if n >= 1_000 => {
+                                                format!("{base} (from {}k tokens)", (n + 500) / 1_000)
+                                            }
+                                            Some(n) => format!("{base} (from {n} tokens)"),
+                                            None => base.to_string(),
+                                        };
+                                        let _ = evt_tx
+                                            .send(DriverEvent::Notice {
+                                                level: "compaction".into(),
+                                                message,
+                                            })
+                                            .await;
                                     }
                                     _ => {}
                                 }
@@ -4356,6 +4420,7 @@ mod tests {
             "subtype": "task_notification",
             "task_id": "sub_pre_restart_99",
             "description": "Code Reviewer Subagent",
+            "model": "claude-sonnet-4-6",
             "status": "completed",
             "summary": "Review complete with 0 issues."
         });
@@ -4379,6 +4444,8 @@ mod tests {
                 assert_eq!(desc.subagent_id, "sub_pre_restart_99");
                 assert_eq!(desc.parent_agent_id, "ag_claude_parent");
                 assert_eq!(desc.title, "Code Reviewer Subagent");
+                assert_eq!(desc.model.as_deref(), Some("claude-sonnet-4-6"));
+                assert_eq!(desc.subtitle, None);
                 assert_eq!(desc.status, ProviderSubagentStatus::Completed);
             }
             other => panic!("expected ProviderSubagentUpsert, got {other:?}"),

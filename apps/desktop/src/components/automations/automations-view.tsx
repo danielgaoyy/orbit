@@ -41,6 +41,20 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { isBareHomeDir, isLocalHostCard, normalizeProjectPath } from "@/lib/projects";
+import { useLiveSecondClock } from "@/lib/live-clock";
+
+const LiveTimerCountdown = memo(function LiveTimerCountdown({
+  fireAtMs,
+}: {
+  fireAtMs: number;
+}) {
+  const nowMs = useLiveSecondClock(true);
+  return (
+    <span className="text-foreground/90 tabular-nums shrink-0 rounded-md bg-amber-500/12 px-1.5 py-0.5 font-mono text-[11px] font-medium">
+      {formatTimerCountdown(fireAtMs, nowMs)}
+    </span>
+  );
+});
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -410,7 +424,6 @@ export function AutomationsView() {
   const [timerPrompt, setTimerPrompt] = useState("");
   const [timerSubmitting, setTimerSubmitting] = useState(false);
   const [timerBusyId, setTimerBusyId] = useState<string | null>(null);
-  const [timerNowMs, setTimerNowMs] = useState(() => Date.now());
 
   const conditionalTimers = useMemo(
     () => hostDetail?.conditional_timers ?? [],
@@ -420,7 +433,6 @@ export function AutomationsView() {
     () => conditionalTimers.filter((t) => t.state === "armed").length,
     [conditionalTimers],
   );
-  const hasArmedTimers = armedTimerCount > 0;
   const activeAgentChoices = useMemo(
     () =>
       (hostDetail?.agents ?? []).filter(
@@ -428,13 +440,6 @@ export function AutomationsView() {
       ),
     [hostDetail?.agents],
   );
-
-  useEffect(() => {
-    if (!hasArmedTimers) return;
-    setTimerNowMs(Date.now());
-    const id = window.setInterval(() => setTimerNowMs(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, [hasArmedTimers]);
 
   useEffect(() => {
     setTimerDialogOpen(false);
@@ -1350,9 +1355,7 @@ export function AutomationsView() {
                                 {timer.prompt}
                               </span>
                               {isArmed ? (
-                                <span className="text-foreground/90 tabular-nums shrink-0 rounded-md bg-amber-500/12 px-1.5 py-0.5 font-mono text-[11px] font-medium">
-                                  {formatTimerCountdown(timer.fire_at_ms, timerNowMs)}
-                                </span>
+                                <LiveTimerCountdown fireAtMs={timer.fire_at_ms} />
                               ) : (
                                 <span className="text-muted-foreground bg-muted/70 shrink-0 rounded-md px-1.5 py-0.5 text-[10.5px] font-medium">
                                   {stateLabel}

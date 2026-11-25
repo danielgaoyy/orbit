@@ -120,26 +120,36 @@ export const ReviewTab = memo(function ReviewTab({
   const selectedDiffPath = useOrbitSelector((s) => s.selectedDiffPath);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
 
-  const activeWorkspace = useOrbitSelector((s) => {
+  const activeWorkspaceKey = useOrbitSelector((s) => {
+    if (!visible) return "";
     const detail = s.hostDetails[selectedHostId];
-    if (!detail) return null;
+    if (!detail) return "";
     const normCwd = selectedCwd ? normalizeProjectPath(selectedCwd) : "";
+    let ws = null;
     if (s.selectedAgentId) {
       const ag = detail.agents.find((a) => a.agent_id === s.selectedAgentId);
       if (ag) {
-        const ws = detail.workspaces.find((w) => w.workspace_id === ag.workspace_id);
-        if (ws && (!normCwd || normalizeProjectPath(ws.cwd) === normCwd)) {
-          return ws;
+        const candidate = detail.workspaces.find((w) => w.workspace_id === ag.workspace_id);
+        if (candidate && (!normCwd || normalizeProjectPath(candidate.cwd) === normCwd)) {
+          ws = candidate;
         }
       }
     }
-    if (!normCwd) return null;
-    return (
-      detail.workspaces.find(
-        (w) => !w.archived_at && normalizeProjectPath(w.cwd) === normCwd,
-      ) ?? null
-    );
+    if (!ws && normCwd) {
+      ws =
+        detail.workspaces.find(
+          (w) => !w.archived_at && normalizeProjectPath(w.cwd) === normCwd,
+        ) ?? null;
+    }
+    if (!ws) return "";
+    return `${ws.workspace_id}\0${ws.is_worktree ? "1" : "0"}\0${ws.cwd}`;
   });
+
+  const activeWorkspace = useMemo(() => {
+    if (!activeWorkspaceKey) return null;
+    const [workspace_id, isWt, cwd] = activeWorkspaceKey.split("\0");
+    return { workspace_id, is_worktree: isWt === "1", cwd };
+  }, [activeWorkspaceKey]);
 
   const gitReview = useOrbitSelector((s) =>
     s.selectedHostId && s.selectedWorkspaceCwd

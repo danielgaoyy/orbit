@@ -119,4 +119,92 @@ describe("Orbit Desktop i18n", () => {
     assert.equal(enA.t("common.settings"), "Settings");
     assert.equal(zh.t("common.settings"), "设置");
   });
+
+  it("enforces typography, terminology, and interpolation invariants across locales", () => {
+    const canonicalKeys = Object.keys(en) as MessageKey[];
+
+    for (const key of canonicalKeys) {
+      assert.doesNotMatch(
+        MESSAGES.en[key],
+        /[“”‘’]/,
+        `en.${key} must use straight quotes/apostrophes`,
+      );
+      assert.doesNotMatch(
+        MESSAGES["zh-CN"][key],
+        /[「」]/,
+        `zh-CN.${key} must use Chinese quotes “…” instead of 「…」`,
+      );
+      assert.doesNotMatch(
+        MESSAGES["zh-CN"][key],
+        / — /,
+        `zh-CN.${key} must avoid spaced English em-dashes`,
+      );
+      assert.doesNotMatch(
+        MESSAGES.ja[key],
+        /～/,
+        `ja.${key} must use wave dash 〜 instead of fullwidth tilde ～`,
+      );
+      assert.doesNotMatch(
+        MESSAGES.ja[key],
+        /プロバイダ(?!ー)/,
+        `ja.${key} must consistently spell プロバイダー`,
+      );
+    }
+
+    // Effort & Fast mode labels remain crisp English across all locales
+    const englishLabels: Array<[MessageKey, string]> = [
+      ["composer.effortOff", "Off"],
+      ["composer.effortLow", "Low"],
+      ["composer.effortMedium", "Medium"],
+      ["composer.effortHigh", "High"],
+      ["composer.effortXhigh", "Extra High"],
+      ["composer.effortMax", "Max"],
+      ["composer.effortUltra", "Ultra"],
+      ["composer.fast", "Fast"],
+    ];
+    for (const [key, expected] of englishLabels) {
+      for (const meta of LOCALES) {
+        assert.equal(MESSAGES[meta.id][key], expected, `${meta.id}.${key} must stay "${expected}"`);
+      }
+    }
+
+    // Regression: stage.forkedFrom must retain {title} for split-based bold rendering
+    for (const meta of LOCALES) {
+      assert.ok(
+        MESSAGES[meta.id]["stage.forkedFrom"].includes("{title}"),
+        `${meta.id}.stage.forkedFrom must contain {title}`,
+      );
+    }
+
+    // Regression: zh-CN direct connect banner must not duplicate 连接
+    assert.equal(
+      translate("zh-CN", "banner.connectingTo", {
+        host: "Mac",
+        mode: translate("zh-CN", "banner.directly"),
+      }),
+      "正在直接连接 Mac…",
+    );
+
+    // Regression: fleet update summary formats locale-appropriate separator and version suffix
+    assert.equal(
+      translate("zh-CN", "store.fleetUpdateCompleteParts", {
+        parts: [
+          translate("zh-CN", "store.fleetPartSucceeded", { count: 2 }),
+          translate("zh-CN", "store.fleetPartCurrent", { count: 1 }),
+        ].join(translate("zh-CN", "store.fleetPartsSeparator")),
+        version: translate("zh-CN", "store.versionSuffix", { version: "1.2.3" }),
+      }),
+      "Fleet 更新完成（v1.2.3）：成功更新 2 台、1 台已是最新。",
+    );
+    assert.equal(
+      translate("ja", "store.fleetUpdateCompleteParts", {
+        parts: [
+          translate("ja", "store.fleetPartSucceeded", { count: 2 }),
+          translate("ja", "store.fleetPartCurrent", { count: 1 }),
+        ].join(translate("ja", "store.fleetPartsSeparator")),
+        version: translate("ja", "store.versionSuffix", { version: "1.2.3" }),
+      }),
+      "フリート更新（v1.2.3）が完了しました：2 台更新、1 台最新。",
+    );
+  });
 });

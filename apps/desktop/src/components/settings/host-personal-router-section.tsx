@@ -4,7 +4,6 @@ import { Button } from "@/components/ui/button";
 import {
   SettingCard,
   SettingGroup,
-  SettingPageHeader,
   SettingResourceRow,
   SettingRow,
   SettingSelect,
@@ -12,6 +11,7 @@ import {
 } from "./settings-primitives";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Field, FieldLabel } from "@/components/ui/field";
 import { useI18n } from "@/lib/i18n";
 import {
@@ -38,6 +38,44 @@ function formatHermesVersion(raw?: string | null): string {
   return trimmed.replace(/^(?:hermes\s+agent|hermes)\s+/i, "").trim() || trimmed;
 }
 
+/**
+ * Policy fields owned exclusively by the advanced-options form: they are edited into the
+ * local draft and must only reach the daemon through "Save Policy". Engine switches commit
+ * the server-side config instead, so these stay out of that payload.
+ */
+function hasUnsavedPolicyEdits(draft: PersonalRouterConfig, saved?: PersonalRouterConfig | null) {
+  if (!saved) return false;
+  return (
+    draft.scope !== saved.scope ||
+    draft.pre_review_mode !== saved.pre_review_mode ||
+    draft.share_host_hermes_memory !== saved.share_host_hermes_memory ||
+    (draft.soul_prompt_override ?? null) !== (saved.soul_prompt_override ?? null) ||
+    (draft.external_webhook_url ?? null) !== (saved.external_webhook_url ?? null)
+  );
+}
+
+/**
+ * Rebases the draft onto a fresh server snapshot while keeping policy fields the user has
+ * edited but not yet saved, so switching engines neither submits nor discards them.
+ */
+function rebaseDraftOntoSnapshot(
+  next: PersonalRouterConfig,
+  savedBefore: PersonalRouterConfig | null,
+  draftBefore: PersonalRouterConfig,
+): PersonalRouterConfig {
+  if (!savedBefore) return next;
+  const keep = <K extends keyof PersonalRouterConfig>(key: K): PersonalRouterConfig[K] =>
+    draftBefore[key] === savedBefore[key] ? next[key] : draftBefore[key];
+  return {
+    ...next,
+    scope: keep("scope"),
+    pre_review_mode: keep("pre_review_mode"),
+    share_host_hermes_memory: keep("share_host_hermes_memory"),
+    soul_prompt_override: keep("soul_prompt_override"),
+    external_webhook_url: keep("external_webhook_url"),
+  };
+}
+
 export const HostPersonalRouterSection = memo(function HostPersonalRouterSection({
   hostId,
 }: HostPersonalRouterSectionProps) {
@@ -46,13 +84,14 @@ export const HostPersonalRouterSection = memo(function HostPersonalRouterSection
   const [fleetHosts, setFleetHosts] = useState<RouterHostCapabilities[]>([]);
   const [primarySelection, setPrimarySelection] = useState<PrimaryRouterSelection | null>(null);
   const [loading, setLoading] = useState(true);
-  const [discovering, setDiscovering] = useState(false);
+  const [discovering, setDiscovering] = useState(true);
   const [saving, setSaving] = useState(false);
   const [activatingHostId, setActivatingHostId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [bridgeBundle, setBridgeBundle] = useState<HermesBridgeBundle | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [webhookSecretDraft, setWebhookSecretDraft] = useState("");
+  const [pendingEngine, setPendingEngine] = useState<string | null>(null);
   const requestRef = useRef(0);
 
   const [draft, setDraft] = useState<PersonalRouterConfig>({
@@ -100,6 +139,7 @@ export const HostPersonalRouterSection = memo(function HostPersonalRouterSection
     const request = ++requestRef.current;
     setBridgeBundle(null);
     setWebhookSecretDraft("");
+    setPendingEngine(null);
     if (!targetHostId) {
       loadedHostRef.current = null;
       setStatus(null);
@@ -135,12 +175,17 @@ export const HostPersonalRouterSection = memo(function HostPersonalRouterSection
     };
   }, [effectiveHostId, loadStatus]);
 
-  const handleEngineSwitch = async (value: string) => {
+  const applyEngineSwitch = async (value: string) => {
     if (!effectiveHostId) return;
     const provider: ProviderKind = value.startsWith("acp:") ? "acp" : (value as ProviderKind);
     const acpId = value.startsWith("acp:") ? value.slice(4) : null;
+    // Base the payload on the server-side saved config, never on `draft`: unsaved advanced
+    // policy edits must not be committed by an engine switch.
+    const savedBefore = status?.config ?? null;
+    const draftBefore = draft;
+    const base = savedBefore ?? draftBefore;
     const nextCfg: PersonalRouterConfig = {
-      ...draft,
+      ...base,
       enabled: true,
       provider,
       acp_agent_id: acpId,
@@ -153,7 +198,7 @@ export const HostPersonalRouterSection = memo(function HostPersonalRouterSection
       const snap = await orbitIpc.configurePersonalRouter(effectiveHostId, nextCfg, true);
       loadedHostRef.current = effectiveHostId;
       setStatus(snap);
-      setDraft(snap.config);
+      setDraft(rebaseDraftOntoSnapshot(snap.config, savedBefore, draftBefore));
       if (snap.router_agent?.agent_id) {
         const nextPrimary = await orbitIpc.setPrimaryRouterSelection({
           host_id: effectiveHostId,
@@ -168,6 +213,20 @@ export const HostPersonalRouterSection = memo(function HostPersonalRouterSection
     } finally {
       setSaving(false);
     }
+  };
+
+  /**
+   * Engine switches archive the live Router conversation on the daemon side, which is
+   * destructive and unrecoverable, so gate it behind confirmation whenever such a session
+   * actually exists. First-time setup has nothing to lose and switches directly.
+   */
+  const handleEngineSwitch = (value: string) => {
+    if (!effectiveHostId) return;
+    if (status?.router_agent?.agent_id) {
+      setPendingEngine(value);
+      return;
+    }
+    void applyEngineSwitch(value);
   };
 
   const handleSave = async (activate: boolean) => {
@@ -295,14 +354,24 @@ export const HostPersonalRouterSection = memo(function HostPersonalRouterSection
   ];
   if (!engines.some((option) => option.value === engine)) engines.push({ value: engine, label: engine });
   const pending = saving || loading || !!activatingHostId;
+  const pendingEngineLabel =
+    engines.find((option) => option.value === pendingEngine)?.label ?? pendingEngine ?? "";
+  const keepsPolicyDraft = hasUnsavedPolicyEdits(draft, status?.config);
   return (
-    <div className="flex flex-col gap-6">
-      <SettingPageHeader
-        title={t("settings.personalAgentTitle")}
-        description={t("settings.personalAgentDesc")}
-        action={
-          effectiveHostId &&
-          status?.router_agent?.agent_id && (
+    <SettingGroup
+      title={t("settings.navPersonalRouter")}
+      action={
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={discovering || pending}
+            onClick={() => void scanFleetHosts()}
+          >
+            <RefreshCw className={cn(discovering && "animate-spin")} />
+            {t(discovering ? "settings.personalAgentScanning" : "settings.personalAgentScanFleet")}
+          </Button>
+          {effectiveHostId && status?.router_agent?.agent_id && (
             <Button
               size="sm"
               variant="outline"
@@ -317,34 +386,21 @@ export const HostPersonalRouterSection = memo(function HostPersonalRouterSection
               <Bot />
               {t("settings.personalAgentOpenSession")}
             </Button>
-          )
-        }
-      />
-      {error && (
-        <p
-          role="alert"
-          className="rounded-lg border border-signal-danger-border bg-signal-danger-bg p-3 text-[13px] text-signal-danger"
-        >
-          {error}
-        </p>
-      )}
-      <SettingGroup
-        title={t("settings.personalAgentChooseHost")}
-        settingId="settings.personalAgentChooseHost"
-        action={
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={discovering || pending}
-            onClick={() => void scanFleetHosts()}
+          )}
+        </div>
+      }
+    >
+      <div className="flex flex-col gap-3">
+        <p className="text-[13px] text-ink-secondary">{t("settings.personalAgentDesc")}</p>
+        {error && (
+          <p
+            role="alert"
+            className="rounded-lg border border-signal-danger-border bg-signal-danger-bg p-3 text-[13px] text-signal-danger"
           >
-            <RefreshCw className={cn(discovering && "animate-spin")} />
-            {t(discovering ? "settings.personalAgentScanning" : "settings.personalAgentScanFleet")}
-          </Button>
-        }
-      >
-        <p className="text-[13px] text-ink-secondary">{t("settings.personalAgentChooseHostDesc")}</p>
-        <SettingCard>
+            {error}
+          </p>
+        )}
+        <SettingCard settingId="settings.personalAgentChooseHost">
           {!fleetHosts.length && (
             <p className="px-4 py-3 text-[13px] text-ink-muted">
               {t(discovering ? "common.loading" : "settings.personalAgentNoHosts")}
@@ -396,148 +452,165 @@ export const HostPersonalRouterSection = memo(function HostPersonalRouterSection
             );
           })}
         </SettingCard>
-      </SettingGroup>
-      {effectiveHostId && (
-        <>
-          <SettingCard>
-            <SettingRow
-              settingId="settings.personalAgentEngineLabel"
-              title={t("settings.personalAgentEngineLabel")}
-              description={t("settings.personalAgentEngineHint")}
-            >
-              <SettingSelect
+        {effectiveHostId && (
+          <>
+            <SettingCard>
+              <SettingRow
+                settingId="settings.personalAgentEngineLabel"
+                title={t("settings.personalAgentEngineLabel")}
+                description={t("settings.personalAgentEngineHint")}
+              >
+                <SettingSelect
+                  disabled={pending || !status}
+                  value={engine}
+                  options={engines}
+                  ariaLabel={t("settings.personalAgentEngineLabel")}
+                  onChange={handleEngineSwitch}
+                />
+              </SettingRow>
+            </SettingCard>
+            <details className="group/router rounded-xl border border-border-subtle bg-surface-raised">
+              <summary
+                data-setting-id="settings.personalAgentAdvancedOptions"
+                className="flex cursor-pointer list-none items-center justify-between gap-2 px-4 py-3 text-[13px] font-medium [&::-webkit-details-marker]:hidden"
+              >
+                {t("settings.personalAgentAdvancedOptions")}
+                <ChevronRight className="size-[14px] text-ink-muted group-open/router:rotate-90" />
+              </summary>
+              <fieldset
                 disabled={pending || !status}
-                value={engine}
-                options={engines}
-                ariaLabel={t("settings.personalAgentEngineLabel")}
-                onChange={(value) => void handleEngineSwitch(value)}
-              />
-            </SettingRow>
-          </SettingCard>
-          <details className="group/router rounded-xl border border-border-subtle bg-surface-raised">
-            <summary
-              data-setting-id="settings.personalAgentAdvancedOptions"
-              className="flex cursor-pointer list-none items-center justify-between gap-2 px-4 py-3 text-[13px] font-medium [&::-webkit-details-marker]:hidden"
-            >
-              {t("settings.personalAgentAdvancedOptions")}
-              <ChevronRight className="size-[14px] text-ink-muted group-open/router:rotate-90" />
-            </summary>
-            <fieldset
-              disabled={pending || !status}
-              className="space-y-3 border-t border-border-subtle px-4 py-3"
-            >
-              <SettingRow title={t("settings.personalAgentScopeLabel")} disabled={pending || !status}>
-                <SettingSelect<RouterScope>
-                  value={draft.scope}
-                  disabled={pending || !status}
-                  ariaLabel={t("settings.personalAgentScopeLabel")}
-                  options={[
-                    { value: "global_fleet", label: t("settings.agentFleetScope") },
-                    { value: "local_host_only", label: t("settings.agentLocalScope") },
-                  ]}
-                  onChange={(scope) => setDraft((d) => ({ ...d, scope }))}
-                />
-              </SettingRow>
-              <SettingRow title={t("settings.personalAgentGuardianLabel")} disabled={pending || !status}>
-                <SettingSelect<RouterPreReviewMode>
-                  value={draft.pre_review_mode}
-                  disabled={pending || !status}
-                  ariaLabel={t("settings.personalAgentGuardianLabel")}
-                  options={[
-                    { value: "medium_risk_only", label: t("settings.agentReviewMedium") },
-                    { value: "assist_only", label: t("settings.agentAssistOnly") },
-                    { value: "disabled", label: t("settings.agentReviewDisabled") },
-                  ]}
-                  onChange={(pre_review_mode) => setDraft((d) => ({ ...d, pre_review_mode }))}
-                />
-              </SettingRow>
-              <SettingRow title={t("settings.personalAgentShareHermesMemory")} disabled={pending || !status}>
-                <ToggleSwitch
-                  checked={draft.share_host_hermes_memory}
-                  disabled={pending || !status}
-                  ariaLabel={t("settings.personalAgentShareHermesMemory")}
-                  onChange={(share_host_hermes_memory) =>
-                    setDraft((d) => ({ ...d, share_host_hermes_memory }))
-                  }
-                />
-              </SettingRow>
-              <Field>
-                <FieldLabel htmlFor="router-discipline">
-                  {t("settings.personalAgentCustomDiscipline")}
-                </FieldLabel>
-                <Textarea
-                  id="router-discipline"
-                  value={draft.soul_prompt_override ?? ""}
-                  onChange={(event) =>
-                    setDraft((d) => ({ ...d, soul_prompt_override: event.target.value || null }))
-                  }
-                  rows={3}
-                />
-              </Field>
-              <Field>
-                <FieldLabel htmlFor="router-webhook">{t("settings.personalAgentWebhookUrl")}</FieldLabel>
-                <Input
-                  id="router-webhook"
-                  value={draft.external_webhook_url ?? ""}
-                  type="url"
-                  placeholder="http://127.0.0.1:8642/webhooks/orbit"
-                  onChange={(event) =>
-                    setDraft((d) => ({ ...d, external_webhook_url: event.target.value || null }))
-                  }
-                />
-              </Field>
-              <Field>
-                <FieldLabel htmlFor="router-secret">
-                  {t("settings.personalAgentWebhookSecret")}
-                </FieldLabel>
-                <Input
-                  id="router-secret"
-                  type="password"
-                  autoComplete="new-password"
-                  value={webhookSecretDraft}
-                  placeholder={draft.has_external_webhook_secret ? "••••••••" : undefined}
-                  onChange={(event) => setWebhookSecretDraft(event.target.value)}
-                />
-              </Field>
-              <div className="flex flex-wrap gap-2">
-                <Button size="sm" onClick={() => void handleSave(false)}>
-                  {t("settings.personalAgentSavePolicy")}
-                </Button>
-                <Button variant="outline" size="sm" onClick={() => void handleExportBridge()}>
-                  <ExternalLink />
-                  {t("settings.personalAgentExportBridge")}
-                </Button>
-              </div>
-              {bridgeBundle && (
-                <div className="space-y-3 rounded-lg bg-surface-recessed p-3">
-                  <div className="text-[13px] font-medium">
-                    {bridgeBundle.host_name} · ~/.hermes/config.yaml
-                  </div>
-                  {[
-                    { key: "mcp", title: "Streamable HTTP MCP", body: bridgeBundle.mcp_yaml_snippet },
-                    { key: "toolset", title: "ACP", body: bridgeBundle.acp_toolset_yaml_snippet },
-                  ].map((item) => (
-                    <div key={item.key}>
-                      <div className="flex items-center justify-between text-[11px]">
-                        <span>{item.title}</span>
-                        <Button
-                          size="icon-sm"
-                          variant="ghost"
-                          aria-label={t("common.copy")}
-                          onClick={() => void copyText(item.key, item.body)}
-                        >
-                          {copiedKey === item.key ? <Check /> : <Copy />}
-                        </Button>
-                      </div>
-                      <pre className="overflow-x-auto font-mono text-[11px]">{item.body}</pre>
-                    </div>
-                  ))}
+                className="space-y-3 border-t border-border-subtle px-4 py-3"
+              >
+                <SettingRow title={t("settings.personalAgentScopeLabel")} disabled={pending || !status}>
+                  <SettingSelect<RouterScope>
+                    value={draft.scope}
+                    disabled={pending || !status}
+                    ariaLabel={t("settings.personalAgentScopeLabel")}
+                    options={[
+                      { value: "global_fleet", label: t("settings.agentFleetScope") },
+                      { value: "local_host_only", label: t("settings.agentLocalScope") },
+                    ]}
+                    onChange={(scope) => setDraft((d) => ({ ...d, scope }))}
+                  />
+                </SettingRow>
+                <SettingRow title={t("settings.personalAgentGuardianLabel")} disabled={pending || !status}>
+                  <SettingSelect<RouterPreReviewMode>
+                    value={draft.pre_review_mode}
+                    disabled={pending || !status}
+                    ariaLabel={t("settings.personalAgentGuardianLabel")}
+                    options={[
+                      { value: "medium_risk_only", label: t("settings.agentReviewMedium") },
+                      { value: "assist_only", label: t("settings.agentAssistOnly") },
+                      { value: "disabled", label: t("settings.agentReviewDisabled") },
+                    ]}
+                    onChange={(pre_review_mode) => setDraft((d) => ({ ...d, pre_review_mode }))}
+                  />
+                </SettingRow>
+                <SettingRow title={t("settings.personalAgentShareHermesMemory")} disabled={pending || !status}>
+                  <ToggleSwitch
+                    checked={draft.share_host_hermes_memory}
+                    disabled={pending || !status}
+                    ariaLabel={t("settings.personalAgentShareHermesMemory")}
+                    onChange={(share_host_hermes_memory) =>
+                      setDraft((d) => ({ ...d, share_host_hermes_memory }))
+                    }
+                  />
+                </SettingRow>
+                <Field>
+                  <FieldLabel htmlFor="router-discipline">
+                    {t("settings.personalAgentCustomDiscipline")}
+                  </FieldLabel>
+                  <Textarea
+                    id="router-discipline"
+                    value={draft.soul_prompt_override ?? ""}
+                    onChange={(event) =>
+                      setDraft((d) => ({ ...d, soul_prompt_override: event.target.value || null }))
+                    }
+                    rows={3}
+                  />
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="router-webhook">{t("settings.personalAgentWebhookUrl")}</FieldLabel>
+                  <Input
+                    id="router-webhook"
+                    value={draft.external_webhook_url ?? ""}
+                    type="url"
+                    placeholder="http://127.0.0.1:8642/webhooks/orbit"
+                    onChange={(event) =>
+                      setDraft((d) => ({ ...d, external_webhook_url: event.target.value || null }))
+                    }
+                  />
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="router-secret">
+                    {t("settings.personalAgentWebhookSecret")}
+                  </FieldLabel>
+                  <Input
+                    id="router-secret"
+                    type="password"
+                    autoComplete="new-password"
+                    value={webhookSecretDraft}
+                    placeholder={draft.has_external_webhook_secret ? "••••••••" : undefined}
+                    onChange={(event) => setWebhookSecretDraft(event.target.value)}
+                  />
+                </Field>
+                <div className="flex flex-wrap gap-2">
+                  <Button size="sm" onClick={() => void handleSave(false)}>
+                    {t("settings.personalAgentSavePolicy")}
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={() => void handleExportBridge()}>
+                    <ExternalLink />
+                    {t("settings.personalAgentExportBridge")}
+                  </Button>
                 </div>
-              )}
-            </fieldset>
-          </details>
-        </>
-      )}
-    </div>
+                {bridgeBundle && (
+                  <div className="space-y-3 rounded-lg bg-surface-recessed p-3">
+                    <div className="text-[13px] font-medium">
+                      {bridgeBundle.host_name} · ~/.hermes/config.yaml
+                    </div>
+                    {[
+                      { key: "mcp", title: "Streamable HTTP MCP", body: bridgeBundle.mcp_yaml_snippet },
+                      { key: "toolset", title: "ACP", body: bridgeBundle.acp_toolset_yaml_snippet },
+                    ].map((item) => (
+                      <div key={item.key}>
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span>{item.title}</span>
+                          <Button
+                            size="icon-sm"
+                            variant="ghost"
+                            aria-label={t("common.copy")}
+                            onClick={() => void copyText(item.key, item.body)}
+                          >
+                            {copiedKey === item.key ? <Check /> : <Copy />}
+                          </Button>
+                        </div>
+                        <pre className="overflow-x-auto font-mono text-[11px]">{item.body}</pre>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </fieldset>
+            </details>
+          </>
+        )}
+      </div>
+      <ConfirmDialog
+        open={pendingEngine !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingEngine(null);
+        }}
+        title={t("settings.personalAgentSwitchConfirmTitle", { engine: pendingEngineLabel })}
+        description={t("settings.personalAgentSwitchConfirmBody")}
+        detail={
+          keepsPolicyDraft ? t("settings.personalAgentSwitchConfirmDraftKept") : undefined
+        }
+        confirmLabel={t("settings.personalAgentSwitchConfirmAction")}
+        tone="danger"
+        defaultAction="cancel"
+        onConfirm={async () => {
+          if (pendingEngine !== null) await applyEngineSwitch(pendingEngine);
+        }}
+      />
+    </SettingGroup>
   );
 });

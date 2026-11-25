@@ -208,16 +208,14 @@ describe("Stage stall detection and streaming-tail trailing activity", () => {
         holdViewport: () => {},
         onRequestRewind: () => {},
         onPreviewImage: () => {},
-        queuedNotificationCount: 0,
-        onInterruptAndContinue: () => {},
       }),
     );
     assert.match(briskHtml, /Let me create the full file now/);
     assert.doesNotMatch(briskHtml, /Working…|Working\.\.\./);
     assert.doesNotMatch(briskHtml, /Interrupt &amp; continue/);
 
-    // Silent for 50s while buffering a large write_file tool call (empty queue):
-    // trailing working disclosure MUST be visible, and empty-queue Interrupt & continue MUST remain hidden.
+    // Silent for 50s while buffering a large write_file tool call:
+    // trailing working disclosure MUST be visible without Interrupt & continue clutter.
     const silentToolBufferingTurn = makeStreamingAssistantTurn(now - 50_000, now - 100_000);
     const silentEmptyQueueHtml = renderToStaticMarkup(
       createElement(TurnStageSection, {
@@ -234,36 +232,11 @@ describe("Stage stall detection and streaming-tail trailing activity", () => {
         holdViewport: () => {},
         onRequestRewind: () => {},
         onPreviewImage: () => {},
-        queuedNotificationCount: 0,
-        onInterruptAndContinue: () => {},
       }),
     );
     assert.match(silentEmptyQueueHtml, /Working/);
+    assert.doesNotMatch(silentEmptyQueueHtml, /2 queued/);
     assert.doesNotMatch(silentEmptyQueueHtml, /Interrupt &amp; continue/);
-
-    // Same 50s silent streaming tail, but with 2 queued follow-ups: shows both trailing activity and Interrupt & continue
-    const silentQueuedHtml = renderToStaticMarkup(
-      createElement(TurnStageSection, {
-        turn: silentToolBufferingTurn,
-        isTurnActive: true,
-        isLastTurn: true,
-        isNetworkOffline: false,
-        autoFoldCompleted: true,
-        hostId: "local",
-        cwd: "/tmp/repo",
-        agentId: "ag_1",
-        thinkingSignature: "",
-        getThinkingDurationMs: () => null,
-        holdViewport: () => {},
-        onRequestRewind: () => {},
-        onPreviewImage: () => {},
-        queuedNotificationCount: 2,
-        onInterruptAndContinue: () => {},
-      }),
-    );
-    assert.match(silentQueuedHtml, /Working/);
-    assert.match(silentQueuedHtml, /2 queued/);
-    assert.match(silentQueuedHtml, /Interrupt &amp; continue/);
   });
 
   it("treats Waiting for 1 timer and Waiting for N background tasks as calm background waits after settled reply", async () => {
@@ -319,8 +292,6 @@ describe("Stage stall detection and streaming-tail trailing activity", () => {
           holdViewport: () => {},
           onRequestRewind: () => {},
           onPreviewImage: () => {},
-          queuedNotificationCount: 0,
-          onInterruptAndContinue: () => {},
         }),
       );
       assert.match(html, /Timer set, waiting cleanly\./);
@@ -349,8 +320,6 @@ describe("Stage stall detection and streaming-tail trailing activity", () => {
         holdViewport: () => {},
         onRequestRewind: () => {},
         onPreviewImage: () => {},
-        queuedNotificationCount: 0,
-        onInterruptAndContinue: () => {},
       }),
     );
     assert.match(workingHtml, /Thinking/);

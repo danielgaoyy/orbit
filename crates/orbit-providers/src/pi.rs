@@ -1634,7 +1634,18 @@ async fn run_pi_actor(
                             continue;
                         };
                         let mut ev_type = val.get("type").and_then(Value::as_str).unwrap_or("");
-                        if ev_type=="response" && val.get("command").and_then(Value::as_str)==Some("compact") && val["success"]==true{ev_type="agent_end";}
+                        if ev_type == "response"
+                            && val.get("command").and_then(Value::as_str) == Some("compact")
+                            && val["success"] == true
+                        {
+                            let _ = evt_tx
+                                .send(DriverEvent::Notice {
+                                    level: "compaction".into(),
+                                    message: "Context compacted".into(),
+                                })
+                                .await;
+                            ev_type = "agent_end";
+                        }
                         match ev_type {
                             "response" => {
                                 let cmd_name =

@@ -749,6 +749,7 @@ export function createDefaultInitialState(
       initialPrefs.voiceInputDeviceId !== "default"
         ? initialPrefs.voiceInputDeviceId
         : preferenceDefaults.voiceInputDeviceId,
+    voiceEnabledByHost: {},
     terminalFontSize: preferenceDefaults.terminalFontSize,
     terminalCursorStyle: preferenceDefaults.terminalCursorStyle,
     terminalScrollback: preferenceDefaults.terminalScrollback,

@@ -255,15 +255,36 @@ export function useStageFind({
     });
   }, [stageContainerRef]);
 
+  const lastHighlightRepaintAtRef = useRef(0);
+  const trailingHighlightTimerRef = useRef<number | null>(null);
+
   const repaintHighlights = useCallback(() => {
     const fh = highlightStateRef.current;
-    if (fh.open && fh.query.trim()) {
-      applyStageFindHighlights(
-        contentRef.current,
-        fh.query,
-        fh.activeTurnIndex,
-        fh.activeVisibleOccurrence,
-      );
+    if (!fh.open || !fh.query.trim()) return;
+    const run = () => {
+      lastHighlightRepaintAtRef.current = performance.now();
+      const latest = highlightStateRef.current;
+      if (latest.open && latest.query.trim()) {
+        applyStageFindHighlights(
+          contentRef.current,
+          latest.query,
+          latest.activeTurnIndex,
+          latest.activeVisibleOccurrence,
+        );
+      }
+    };
+    const elapsed = performance.now() - lastHighlightRepaintAtRef.current;
+    if (elapsed >= 80) {
+      if (trailingHighlightTimerRef.current !== null) {
+        window.clearTimeout(trailingHighlightTimerRef.current);
+        trailingHighlightTimerRef.current = null;
+      }
+      run();
+    } else if (trailingHighlightTimerRef.current === null) {
+      trailingHighlightTimerRef.current = window.setTimeout(() => {
+        trailingHighlightTimerRef.current = null;
+        run();
+      }, 80 - elapsed);
     }
   }, [contentRef]);
 
@@ -404,6 +425,10 @@ export function useStageFind({
       clearStageFindHighlights();
       if (highlightRafRef.current !== null) {
         window.cancelAnimationFrame(highlightRafRef.current);
+      }
+      if (trailingHighlightTimerRef.current !== null) {
+        window.clearTimeout(trailingHighlightTimerRef.current);
+        trailingHighlightTimerRef.current = null;
       }
     };
   }, []);

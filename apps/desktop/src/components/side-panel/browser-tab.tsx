@@ -354,12 +354,23 @@ export const BrowserTab = memo(function BrowserTab({
   useEffect(() => {
     const el = stageRef.current;
     if (!el) return;
+    let lastW = 0;
+    let rafId: number | null = null;
     const ro = new ResizeObserver((entries) => {
-      const w = entries[0]?.contentRect.width ?? 0;
-      if (w > 0) setStageWidth(w);
+      const nextW = Math.round(entries[0]?.contentRect.width ?? 0);
+      if (nextW <= 0 || nextW === lastW) return;
+      lastW = nextW;
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
+      rafId = window.requestAnimationFrame(() => {
+        rafId = null;
+        setStageWidth(nextW);
+      });
     });
     ro.observe(el);
-    return () => ro.disconnect();
+    return () => {
+      ro.disconnect();
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
+    };
   }, []);
 
   // Load host CDP sessions when visible or switching into CDP mode

@@ -24,6 +24,17 @@ interface ArchivedItem {
 
 const BUCKETS = ["dataOps.today", "dataOps.thisWeek", "dataOps.earlier"] as const;
 
+const archivedDateFormatters = new Map<string, Intl.DateTimeFormat>();
+
+function getArchivedDateFormatter(locale: string): Intl.DateTimeFormat {
+  let formatter = archivedDateFormatters.get(locale);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" });
+    archivedDateFormatters.set(locale, formatter);
+  }
+  return formatter;
+}
+
 export function ArchivedSection({ hostId }: { hostId: string | null }) {
   const { locale, t } = useI18n();
   const detail = useOrbitSelector((s) => (hostId ? s.hostDetails[hostId] : null));
@@ -58,34 +69,52 @@ export function ArchivedSection({ hostId }: { hostId: string | null }) {
     return records.sort((a, b) => b.archivedAtMs - a.archivedAtMs);
   }, [hostId, detail, archived, titles, sidebarView]);
 
-  const projects = [...new Set(entries.map((item) => item.project))].sort();
+  const projects = useMemo(
+    () => [...new Set(entries.map((item) => item.project))].sort(),
+    [entries],
+  );
   const selectedProject = project !== null && projects.includes(project) ? project : null;
-  const today = new Date(nowMs);
-  today.setHours(0, 0, 0, 0);
-  const weekStart = new Date(today);
-  weekStart.setDate(weekStart.getDate() - 6);
-  const filtered = entries.filter((item) => {
+  const todayStartMs = useMemo(() => {
+    const today = new Date(nowMs);
+    today.setHours(0, 0, 0, 0);
+    return today.getTime();
+  }, [nowMs]);
+  const weekStartMs = useMemo(() => {
+    const weekStart = new Date(todayStartMs);
+    weekStart.setDate(weekStart.getDate() - 6);
+    return weekStart.getTime();
+  }, [todayStartMs]);
+  const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    return (
-      (selectedProject === null || item.project === selectedProject) &&
-      (item.title.toLowerCase().includes(needle) || item.project.toLowerCase().includes(needle))
+    return entries.filter(
+      (item) =>
+        (selectedProject === null || item.project === selectedProject) &&
+        (!needle ||
+          item.title.toLowerCase().includes(needle) ||
+          item.project.toLowerCase().includes(needle)),
     );
-  });
-  const grouped: ArchivedItem[][] = [[], [], []];
-  for (const item of filtered) {
-    grouped[
-      item.archivedAtMs >= today.getTime() ? 0 : item.archivedAtMs >= weekStart.getTime() ? 1 : 2
-    ].push(item);
-  }
-  const date = new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" });
+  }, [entries, query, selectedProject]);
+  const hasActiveFilter = query.trim() !== "" || selectedProject !== null;
+  const grouped = useMemo(() => {
+    const buckets: ArchivedItem[][] = [[], [], []];
+    for (const item of filtered) {
+      buckets[
+        item.archivedAtMs >= todayStartMs ? 0 : item.archivedAtMs >= weekStartMs ? 1 : 2
+      ].push(item);
+    }
+    return buckets;
+  }, [filtered, todayStartMs, weekStartMs]);
+  const date = getArchivedDateFormatter(locale);
 
   return (
-    <section data-setting-id="dataOps.archive" className="flex flex-col gap-2">
+    <section data-setting-id="dataOps.archive" className="flex flex-col gap-3">
       <SettingGroupLabel
         action={
-          entries.length > 0 && (
-            <Button variant="ghost" size="sm" onClick={() => setToDelete(entries)}>
-              {t("dataOps.emptyArchive")}
+          filtered.length > 0 && (
+            <Button variant="ghost" size="sm" onClick={() => setToDelete(filtered)}>
+              {hasActiveFilter
+                ? t("dataOps.emptyArchiveFiltered", { count: filtered.length })
+                : t("dataOps.emptyArchive")}
             </Button>
           )
         }
@@ -145,7 +174,7 @@ export function ArchivedSection({ hostId }: { hostId: string | null }) {
         grouped.map(
           (items, index) =>
             items.length > 0 && (
-              <div key={BUCKETS[index]} className="flex flex-col gap-1.5">
+              <div key={BUCKETS[index]} className="flex flex-col gap-2">
                 <span className="text-ink-muted text-[11px]">{t(BUCKETS[index])}</span>
                 <SettingCard>
                   {items.map((item) => (
@@ -158,9 +187,6 @@ export function ArchivedSection({ hostId }: { hostId: string | null }) {
                       ]
                         .filter(Boolean)
                         .join(" · ")}
-                      onClick={() =>
-                        orbitActions.restoreArchivedThread(hostId, item.agentId, { open: true })
-                      }
                       action={
                         <div className="flex items-center gap-1">
                           <Button
@@ -199,9 +225,13 @@ export function ArchivedSection({ hostId }: { hostId: string | null }) {
         tone="danger"
         confirmLabel={t("common.delete")}
         title={
-          toDelete?.length === 1
-            ? t("dataOps.deleteThread", { name: toDelete[0].title })
-            : t("dataOps.emptyArchive")
+          toDelete === null
+            ? ""
+            : toDelete.length === 1
+              ? t("dataOps.deleteThread", { name: toDelete[0].title })
+              : toDelete.length < entries.length
+                ? t("dataOps.emptyArchiveFiltered", { count: toDelete.length })
+                : t("dataOps.emptyArchive")
         }
         description={t("dataOps.deleteConfirm", { count: toDelete?.length ?? 0 })}
         onConfirm={async () => {

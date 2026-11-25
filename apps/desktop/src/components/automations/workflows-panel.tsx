@@ -867,7 +867,10 @@ export const WorkflowsPanel = memo(function WorkflowsPanel({
                             <span className="text-foreground truncate font-medium">
                               {step.name}
                             </span>
-                            <span className="text-muted-foreground/75 shrink-0 text-[11px]">
+                            <span
+                              title={`${formatProviderLabel(step.provider)}${step.model ? ` · ${step.model}` : ""}`}
+                              className="text-muted-foreground/75 max-w-[45%] shrink-0 truncate text-[11px]"
+                            >
                               {formatProviderLabel(step.provider)}
                               {step.model ? ` · ${step.model}` : ""}
                             </span>

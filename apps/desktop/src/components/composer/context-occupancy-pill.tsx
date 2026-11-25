@@ -1,9 +1,8 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
-import { AlertCircle, Minimize2, RefreshCw } from "lucide-react";
+import { AlertCircle, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/overlays";
-import { type ContextOccupancyBreakdown, orbitIpc } from "@/lib/orbit-ipc";
+import type { ContextOccupancyBreakdown } from "@/lib/orbit-ipc";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { type MessageKey, useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
@@ -127,7 +126,6 @@ export const ContextOccupancyPill = memo(function ContextOccupancyPill() {
   const [breakdown, setBreakdown] = useState<ContextOccupancyBreakdown | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const [hoveredCategory, setHoveredCategory] = useState<string | null>(null);
-  const [compacting, setCompacting] = useState(false);
 
   const open = pinnedOpen || hoverOpen;
   const openTimerRef = useRef<number | null>(null);
@@ -258,23 +256,6 @@ export const ContextOccupancyPill = memo(function ContextOccupancyPill() {
       setHoverOpen(false);
     }, CLOSE_DELAY_MS);
   }, [pinnedOpen, hoverOpen]);
-
-  const handleCompactNow = useCallback(async () => {
-    if (!hostId || !agentId || compacting) return;
-    setPinnedOpen(true);
-    setCompacting(true);
-    try {
-      await orbitIpc.compactAgentContext(hostId, agentId);
-      orbitActions.showToast(t("composer.compactSuccessToast"));
-      await fetchBreakdown(hostId, agentId);
-    } catch (err) {
-      orbitActions.showToast(
-        err instanceof Error ? err.message : t("composer.compactFailedToast"),
-      );
-    } finally {
-      setCompacting(false);
-    }
-  }, [agentId, compacting, fetchBreakdown, hostId, t]);
 
   if (isDraft || !hostId || !agentId) {
     return null;
@@ -552,27 +533,6 @@ export const ContextOccupancyPill = memo(function ContextOccupancyPill() {
               })}
             </div>
           )}
-
-          {/* Calm 1-click Compact Now action for active sessions */}
-          <div className="border-border-subtle border-t pt-2">
-            <Button
-              type="button"
-              variant="outline"
-              size="xs"
-              disabled={compacting}
-              onClick={() => void handleCompactNow()}
-              className="h-[28px] w-full justify-center gap-1.5 text-[12px]"
-            >
-              {compacting ? (
-                <OrbitSpinner size={12} />
-              ) : (
-                <Minimize2 className="size-3 stroke-[1.8]" />
-              )}
-              <span>
-                {compacting ? t("composer.compactingNow") : t("composer.compactNow")}
-              </span>
-            </Button>
-          </div>
         </div>
       </PopoverContent>
     </Popover>

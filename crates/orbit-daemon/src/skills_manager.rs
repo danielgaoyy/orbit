@@ -42,7 +42,14 @@ pub enum SkillManagerError {
     InvalidInput(String),
     NotFound(String),
     PermissionDenied(String),
-    Conflict { expected: String, actual: String },
+    Conflict {
+        expected: String,
+        actual: String,
+    },
+    /// A create-only write (`SkillWritePrecondition::MustNotExist`) targeted a slug that already
+    /// exists. Reported separately from `Conflict` so clients can offer rename / open / replace
+    /// instead of a stale-etag reload prompt.
+    AlreadyExists(String),
     TooLarge(String),
     Io(String),
 }
@@ -54,6 +61,7 @@ impl SkillManagerError {
             Self::NotFound(_) => "skill_not_found",
             Self::PermissionDenied(_) => "skill_permission_denied",
             Self::Conflict { .. } => "skill_etag_conflict",
+            Self::AlreadyExists(_) => "skill_already_exists",
             Self::TooLarge(_) => "skill_too_large",
             Self::Io(_) => "skill_io_error",
         }
@@ -66,6 +74,7 @@ impl std::fmt::Display for SkillManagerError {
             Self::InvalidInput(msg)
             | Self::NotFound(msg)
             | Self::PermissionDenied(msg)
+            | Self::AlreadyExists(msg)
             | Self::TooLarge(msg)
             | Self::Io(msg) => f.write_str(msg),
             Self::Conflict { expected, actual } => write!(
@@ -91,6 +100,44 @@ pub struct ReadSkillOutcome {
     pub etag: String,
 }
 
+/// Write intent for [`upsert_managed_skill`], making "create a new skill" and "modify an existing
+/// one" impossible to confuse at the type level.
+///
+/// The former `Option<String>` etag field could not express create-only intent: a `None` etag meant
+/// "skip the conflict check", so every caller that omitted an etag silently overwrote any existing
+/// `SKILL.md` at the same slug.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SkillWritePrecondition {
+    /// Create-only: reject with [`SkillManagerError::AlreadyExists`] if the target already exists.
+    MustNotExist,
+    /// Optimistic update: the on-disk content hash must equal this etag.
+    MustMatch(String),
+    /// No precondition — blind upsert. Preserved as the default so existing non-UI callers keep
+    /// their original behavior.
+    #[default]
+    Unchecked,
+}
+
+impl SkillWritePrecondition {
+    /// Resolve the wire representation (`create_only` flag plus optional etag) into a precondition.
+    ///
+    /// `create_only` wins over an etag so a create request can never degrade into a blind write;
+    /// a blank or whitespace-only etag is treated as absent, matching the previous filter.
+    pub fn from_wire(create_only: bool, expected_etag: Option<String>) -> Self {
+        if create_only {
+            return Self::MustNotExist;
+        }
+        match expected_etag
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(etag) => Self::MustMatch(etag.to_string()),
+            None => Self::Unchecked,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UpsertSkillParams {
     pub scope: SkillWriteScope,
@@ -100,7 +147,7 @@ pub struct UpsertSkillParams {
     pub description: String,
     pub content: String,
     pub enabled: bool,
-    pub expected_etag: Option<String>,
+    pub precondition: SkillWritePrecondition,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1206,29 +1253,36 @@ fn upsert_managed_skill_unlocked(
         ));
     }
 
-    if let Some(expected) = params
-        .expected_etag
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        if md_path.exists() {
-            let existing_bytes = fs::read(&md_path).map_err(|e| {
-                SkillManagerError::Io(format!("read existing SKILL.md failed: {e}"))
-            })?;
-            let actual = sha256_hex(&existing_bytes);
-            if actual != expected {
+    // Enforce the write precondition BEFORE touching either `SKILL.md` or the enabled-state file,
+    // so a rejected create leaves the existing skill byte-for-byte and toggle-for-toggle intact.
+    match &params.precondition {
+        SkillWritePrecondition::MustNotExist => {
+            if md_path.exists() {
+                return Err(SkillManagerError::AlreadyExists(format!(
+                    "a skill named `{slug}` already exists in this scope"
+                )));
+            }
+        }
+        SkillWritePrecondition::MustMatch(expected) => {
+            if md_path.exists() {
+                let existing_bytes = fs::read(&md_path).map_err(|e| {
+                    SkillManagerError::Io(format!("read existing SKILL.md failed: {e}"))
+                })?;
+                let actual = sha256_hex(&existing_bytes);
+                if actual != *expected {
+                    return Err(SkillManagerError::Conflict {
+                        expected: expected.clone(),
+                        actual,
+                    });
+                }
+            } else {
                 return Err(SkillManagerError::Conflict {
-                    expected: expected.to_string(),
-                    actual,
+                    expected: expected.clone(),
+                    actual: "<missing>".to_string(),
                 });
             }
-        } else {
-            return Err(SkillManagerError::Conflict {
-                expected: expected.to_string(),
-                actual: "<missing>".to_string(),
-            });
         }
+        SkillWritePrecondition::Unchecked => {}
     }
 
     atomic_write_bytes(&md_path, final_content.as_bytes())?;
@@ -1246,7 +1300,8 @@ fn upsert_managed_skill_unlocked(
 }
 
 /// Create or update an `OrbitUser` or `OrbitProject` skill with strict slug validation,
-/// canonical containment, symlink protection, size cap, optimistic `expected_etag`, and atomic writes.
+/// canonical containment, symlink protection, size cap, atomic writes, and the
+/// [`SkillWritePrecondition`] guard (create-only, etag match, or unchecked).
 pub fn upsert_managed_skill(
     orbit_home: &Path,
     user_home: &Path,
@@ -1654,6 +1709,10 @@ fn resolve_import_local_file(
 /// Safely import a skill from pasted Markdown or a validated local Markdown file inside the
 /// active workspace or explicit skills directories. Rejects remote URLs, symlinks, non-Markdown
 /// files, and arbitrary `$HOME`/`$ORBIT_HOME` files.
+///
+/// Pass [`SkillWritePrecondition::MustNotExist`] to refuse overwriting an existing skill at the
+/// resolved slug (the slug is derived from the override, path, frontmatter, or heading, so the
+/// caller cannot always predict it up front).
 pub fn import_managed_skill(
     orbit_home: &Path,
     user_home: &Path,
@@ -1661,6 +1720,7 @@ pub fn import_managed_skill(
     cwd: Option<&str>,
     source_markdown_or_path: &str,
     slug_override: Option<&str>,
+    precondition: SkillWritePrecondition,
 ) -> Result<Vec<ManagedSkillRecord>, SkillManagerError> {
     let _guard = lock_skills_io()?;
     let trimmed = source_markdown_or_path.trim();
@@ -1721,7 +1781,7 @@ pub fn import_managed_skill(
             description,
             content: final_content,
             enabled: true,
-            expected_etag: None,
+            precondition,
         },
     )
 }
@@ -1929,7 +1989,7 @@ Run static checks first.
                 description: "Generate concise changelogs".to_string(),
                 content: "# Release Notes\n\nSummarize commits by impact.".to_string(),
                 enabled: true,
-                expected_etag: None,
+                precondition: SkillWritePrecondition::Unchecked,
             },
         )
         .expect("create skill");
@@ -1959,7 +2019,7 @@ Run static checks first.
                 description: "Updated".to_string(),
                 content: "---\nname: Release Notes\ndescription: Updated\n---\nV2\n".to_string(),
                 enabled: true,
-                expected_etag: Some("0000000000000000".to_string()),
+                precondition: SkillWritePrecondition::MustMatch("0000000000000000".to_string()),
             },
         );
         assert!(matches!(conflict, Err(SkillManagerError::Conflict { .. })));
@@ -1976,7 +2036,7 @@ Run static checks first.
                 content: "---\nname: Release Notes v2\ndescription: Updated desc\n---\nV2 body\n"
                     .to_string(),
                 enabled: true,
-                expected_etag: Some(read_v1.etag),
+                precondition: SkillWritePrecondition::MustMatch(read_v1.etag),
             },
         )
         .expect("update with valid etag");
@@ -2055,7 +2115,7 @@ Run static checks first.
                     description: String::new(),
                     content: "body".to_string(),
                     enabled: true,
-                    expected_etag: None,
+                    precondition: SkillWritePrecondition::Unchecked,
                 },
             );
             assert!(
@@ -2087,6 +2147,7 @@ Run static checks first.
             Some(&cwd_str),
             "# SQL Performance Checklist\n\nInspect query plans before adding indexes.",
             None,
+            SkillWritePrecondition::Unchecked,
         )
         .expect("import pasted markdown");
         let sql_rec = imported_md
@@ -2110,6 +2171,7 @@ Run static checks first.
             Some(&cwd_str),
             &local_doc.to_string_lossy(),
             Some("api-guide"),
+            SkillWritePrecondition::Unchecked,
         )
         .expect("import local file");
         assert!(imported_file.iter().any(|s| s.id == "orbit_user:api-guide"));
@@ -2122,6 +2184,7 @@ Run static checks first.
             Some(&cwd_str),
             "https://evil.example.com/SKILL.md",
             None,
+            SkillWritePrecondition::Unchecked,
         );
         assert!(matches!(
             url_err,
@@ -2140,6 +2203,7 @@ Run static checks first.
             Some(&cwd_str),
             "~/.ssh/id_ed25519",
             None,
+            SkillWritePrecondition::Unchecked,
         );
         assert!(matches!(
             ssh_err,
@@ -2155,6 +2219,7 @@ Run static checks first.
             Some(&cwd_str),
             "~/.orbit/identity.key",
             None,
+            SkillWritePrecondition::Unchecked,
         );
         assert!(matches!(
             key_err,
@@ -2171,6 +2236,7 @@ Run static checks first.
             Some(&cwd_str),
             &home_md.to_string_lossy(),
             None,
+            SkillWritePrecondition::Unchecked,
         );
         assert!(matches!(
             home_md_err,
@@ -2187,6 +2253,7 @@ Run static checks first.
             Some(&cwd_str),
             &outside_file.to_string_lossy(),
             None,
+            SkillWritePrecondition::Unchecked,
         );
         assert!(matches!(
             outside_err,
@@ -2218,6 +2285,7 @@ Run static checks first.
             Some(&cwd_str),
             &link_md.to_string_lossy(),
             None,
+            SkillWritePrecondition::Unchecked,
         );
         assert!(matches!(
             import_sym_err,
@@ -2234,6 +2302,7 @@ Run static checks first.
             Some(&cwd_str),
             &link_dir.join("secret.md").to_string_lossy(),
             None,
+            SkillWritePrecondition::Unchecked,
         );
         assert!(matches!(
             import_parent_sym_err,
@@ -2279,7 +2348,7 @@ Run static checks first.
                 description: String::new(),
                 content: "Body".to_string(),
                 enabled: true,
-                expected_etag: None,
+                precondition: SkillWritePrecondition::Unchecked,
             },
         );
         assert!(matches!(
@@ -2299,7 +2368,7 @@ Run static checks first.
                 description: String::new(),
                 content: "Body".to_string(),
                 enabled: true,
-                expected_etag: None,
+                precondition: SkillWritePrecondition::Unchecked,
             },
         );
         assert!(matches!(
@@ -2335,7 +2404,7 @@ Run static checks first.
                     description: "Concurrent test".to_string(),
                     content: "Body".to_string(),
                     enabled: true,
-                    expected_etag: None,
+                    precondition: SkillWritePrecondition::Unchecked,
                 },
             )
             .expect("create skill");
@@ -2474,6 +2543,254 @@ Run static checks first.
         assert!(
             !skills.iter().any(|s| s.slug == "leak"),
             "symlinked command file must be rejected"
+        );
+    }
+
+    /// Regression: the settings "new skill" entry passed no etag, so `upsert_managed_skill`
+    /// skipped its conflict check and silently replaced an existing `SKILL.md` (and forced it
+    /// back to enabled). Create-only must refuse and leave BOTH content and enabled untouched.
+    #[test]
+    fn create_only_rejects_existing_slug_without_mutating_content_or_enabled() {
+        let sb = TempSandbox::new("create-only-existing");
+        let cwd_str = sb.workspace.to_string_lossy().to_string();
+
+        let created = upsert_managed_skill(
+            &sb.orbit_home,
+            &sb.user_home,
+            UpsertSkillParams {
+                scope: SkillWriteScope::User,
+                cwd: Some(cwd_str.clone()),
+                slug: "review".to_string(),
+                name: "Review".to_string(),
+                description: "Original description".to_string(),
+                content: "# Review\n\nOriginal body worth protecting.".to_string(),
+                enabled: true,
+                precondition: SkillWritePrecondition::MustNotExist,
+            },
+        )
+        .expect("first create succeeds");
+        let rec = created
+            .iter()
+            .find(|s| s.slug == "review")
+            .expect("created record");
+
+        // Disable it so we can prove a rejected create does not flip `enabled` back to true.
+        toggle_managed_skill(
+            &sb.orbit_home,
+            &sb.user_home,
+            &rec.id,
+            false,
+            Some(&cwd_str),
+        )
+        .expect("disable skill");
+
+        let md_path = sb.orbit_home.join("skills").join("review").join("SKILL.md");
+        let bytes_before = fs::read(&md_path).expect("read before");
+
+        let err = upsert_managed_skill(
+            &sb.orbit_home,
+            &sb.user_home,
+            UpsertSkillParams {
+                scope: SkillWriteScope::User,
+                cwd: Some(cwd_str.clone()),
+                slug: "review".to_string(),
+                name: "Review".to_string(),
+                description: "Clobbering description".to_string(),
+                content: "# Review\n\nCLOBBERED BODY".to_string(),
+                enabled: true,
+                precondition: SkillWritePrecondition::MustNotExist,
+            },
+        );
+        assert!(
+            matches!(err, Err(SkillManagerError::AlreadyExists(_))),
+            "create-only on an existing slug must report AlreadyExists, got {err:?}"
+        );
+
+        // The whole point of the fix: nothing on disk moved.
+        let bytes_after = fs::read(&md_path).expect("read after");
+        assert_eq!(
+            bytes_before, bytes_after,
+            "rejected create must not rewrite SKILL.md"
+        );
+        assert!(
+            String::from_utf8_lossy(&bytes_after).contains("Original body worth protecting"),
+            "original body must survive"
+        );
+        assert!(
+            !String::from_utf8_lossy(&bytes_after).contains("CLOBBERED"),
+            "clobbering content must never reach disk"
+        );
+
+        let after = list_managed_skills(&sb.orbit_home, &sb.user_home, Some(&cwd_str));
+        let rec_after = after
+            .iter()
+            .find(|s| s.slug == "review")
+            .expect("record still present");
+        assert!(
+            !rec_after.enabled,
+            "rejected create must not re-enable the existing skill"
+        );
+    }
+
+    #[test]
+    fn create_only_creates_when_absent_and_etag_update_still_works() {
+        let sb = TempSandbox::new("create-only-absent");
+        let cwd_str = sb.workspace.to_string_lossy().to_string();
+
+        let created = upsert_managed_skill(
+            &sb.orbit_home,
+            &sb.user_home,
+            UpsertSkillParams {
+                scope: SkillWriteScope::User,
+                cwd: Some(cwd_str.clone()),
+                slug: "fresh-skill".to_string(),
+                name: "Fresh Skill".to_string(),
+                description: "Brand new".to_string(),
+                content: "# Fresh Skill\n\nBody.".to_string(),
+                enabled: true,
+                precondition: SkillWritePrecondition::MustNotExist,
+            },
+        )
+        .expect("create-only succeeds when target is absent");
+        let rec = created
+            .iter()
+            .find(|s| s.slug == "fresh-skill")
+            .expect("created record");
+        assert_eq!(rec.id, "orbit_user:fresh-skill");
+        assert!(rec.enabled);
+
+        // Regression guard: the etag path must keep working after the enum migration.
+        let read = read_managed_skill(&sb.orbit_home, &sb.user_home, &rec.id, Some(&cwd_str))
+            .expect("read created");
+        let updated = upsert_managed_skill(
+            &sb.orbit_home,
+            &sb.user_home,
+            UpsertSkillParams {
+                scope: SkillWriteScope::User,
+                cwd: Some(cwd_str.clone()),
+                slug: "fresh-skill".to_string(),
+                name: "Fresh Skill v2".to_string(),
+                description: "Edited".to_string(),
+                content: "---\nname: Fresh Skill v2\ndescription: Edited\n---\nV2 body\n"
+                    .to_string(),
+                enabled: true,
+                precondition: SkillWritePrecondition::MustMatch(read.etag),
+            },
+        )
+        .expect("etag update still works");
+        assert_eq!(
+            updated
+                .iter()
+                .find(|s| s.slug == "fresh-skill")
+                .expect("updated record")
+                .name,
+            "Fresh Skill v2"
+        );
+
+        // An unchecked write remains a blind upsert for non-UI callers (backward compatibility).
+        upsert_managed_skill(
+            &sb.orbit_home,
+            &sb.user_home,
+            UpsertSkillParams {
+                scope: SkillWriteScope::User,
+                cwd: Some(cwd_str.clone()),
+                slug: "fresh-skill".to_string(),
+                name: "Fresh Skill v3".to_string(),
+                description: "Blind".to_string(),
+                content: "# Fresh Skill v3\n\nBlind overwrite.".to_string(),
+                enabled: true,
+                precondition: SkillWritePrecondition::Unchecked,
+            },
+        )
+        .expect("unchecked upsert keeps legacy overwrite behavior");
+    }
+
+    /// Regression: skill import did no existence check at all, overwrote the target, and the UI
+    /// still reported "imported" because its `beforeIds` diff found no new id.
+    #[test]
+    fn import_create_only_rejects_existing_slug_without_mutating_content() {
+        let sb = TempSandbox::new("import-create-only");
+        let cwd_str = sb.workspace.to_string_lossy().to_string();
+
+        upsert_managed_skill(
+            &sb.orbit_home,
+            &sb.user_home,
+            UpsertSkillParams {
+                scope: SkillWriteScope::User,
+                cwd: Some(cwd_str.clone()),
+                slug: "api-guide".to_string(),
+                name: "Api Guide".to_string(),
+                description: "Hand written".to_string(),
+                content: "# Api Guide\n\nHand written body.".to_string(),
+                enabled: true,
+                precondition: SkillWritePrecondition::MustNotExist,
+            },
+        )
+        .expect("seed existing skill");
+
+        let md_path = sb
+            .orbit_home
+            .join("skills")
+            .join("api-guide")
+            .join("SKILL.md");
+        let before = fs::read(&md_path).expect("read before");
+
+        let err = import_managed_skill(
+            &sb.orbit_home,
+            &sb.user_home,
+            SkillWriteScope::User,
+            Some(&cwd_str),
+            "# Imported Guide\n\nIMPORTED BODY",
+            Some("api-guide"),
+            SkillWritePrecondition::MustNotExist,
+        );
+        assert!(
+            matches!(err, Err(SkillManagerError::AlreadyExists(_))),
+            "create-only import onto an existing slug must report AlreadyExists, got {err:?}"
+        );
+        assert_eq!(
+            before,
+            fs::read(&md_path).expect("read after"),
+            "rejected import must not rewrite SKILL.md"
+        );
+
+        // A non-colliding slug still imports normally.
+        let ok = import_managed_skill(
+            &sb.orbit_home,
+            &sb.user_home,
+            SkillWriteScope::User,
+            Some(&cwd_str),
+            "# Imported Guide\n\nIMPORTED BODY",
+            Some("api-guide-2"),
+            SkillWritePrecondition::MustNotExist,
+        )
+        .expect("create-only import succeeds for a free slug");
+        assert!(ok.iter().any(|s| s.id == "orbit_user:api-guide-2"));
+    }
+
+    #[test]
+    fn precondition_from_wire_maps_create_only_and_etag() {
+        assert_eq!(
+            SkillWritePrecondition::from_wire(false, None),
+            SkillWritePrecondition::Unchecked
+        );
+        // Blank etags were previously filtered out; keep treating them as "no precondition".
+        assert_eq!(
+            SkillWritePrecondition::from_wire(false, Some("   ".to_string())),
+            SkillWritePrecondition::Unchecked
+        );
+        assert_eq!(
+            SkillWritePrecondition::from_wire(false, Some("abc123".to_string())),
+            SkillWritePrecondition::MustMatch("abc123".to_string())
+        );
+        assert_eq!(
+            SkillWritePrecondition::from_wire(true, None),
+            SkillWritePrecondition::MustNotExist
+        );
+        // create_only must win so a create can never degrade into a blind overwrite.
+        assert_eq!(
+            SkillWritePrecondition::from_wire(true, Some("abc123".to_string())),
+            SkillWritePrecondition::MustNotExist
         );
     }
 }

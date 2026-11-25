@@ -82,6 +82,7 @@ import {
   orbitActions,
   useOrbitSelector,
 } from "@/state/orbit-store";
+import { OVERVIEW_PANEL_WIDTH_PX } from "@/lib/workspace-layout";
 import { cn } from "@/lib/utils";
 
 const EMPTY_HOST_DETAILS: Record<string, HostDetailView> = Object.freeze({});
@@ -175,26 +176,79 @@ const StageOverviewBody = memo(function StageOverviewBody({
       ? (s.hostDetails[hostId]?.conditional_timers ?? EMPTY_TIMERS)
       : EMPTY_TIMERS,
   );
-  const localSubagentHostDetail = useOrbitSelector((s) =>
-    hasLocalSubagentRecords(s.hostDetails[hostId], hostId, agentId, insights.subagents)
-      ? (s.hostDetails[hostId] ?? null)
-      : null,
-  );
-  const crossHostDetails = useOrbitSelector((s) =>
-    hasCrossHostChildAgents(s.hostDetails, hostId, agentId, insights.subagents)
+  const subagentSummaryRef = useRef<ReturnType<typeof selectSessionSubagents> | null>(null);
+  const subagentSummary = useOrbitSelector((s) => {
+    const hasCrossHost = hasCrossHostChildAgents(s.hostDetails, hostId, agentId, insights.subagents);
+    const localDetail = s.hostDetails[hostId];
+    const hasLocal =
+      !hasCrossHost && hasLocalSubagentRecords(localDetail, hostId, agentId, insights.subagents);
+    const scopedHostDetails = hasCrossHost
       ? s.hostDetails
-      : EMPTY_HOST_DETAILS,
-  );
-  const crossHostFleetHosts = useOrbitSelector((s) =>
-    hasCrossHostChildAgents(s.hostDetails, hostId, agentId, insights.subagents)
-      ? s.fleet.hosts
-      : EMPTY_FLEET_HOSTS,
-  );
+      : hasLocal && localDetail
+        ? { [hostId]: localDetail }
+        : EMPTY_HOST_DETAILS;
+    const next = selectSessionSubagents(
+      {
+        hostDetails: scopedHostDetails,
+        fleet: {
+          revision: 0,
+          total_pending_approvals: 0,
+          hosts: (hasCrossHost ? s.fleet.hosts : EMPTY_FLEET_HOSTS) as HostCardView[],
+          projects: [],
+        },
+        archivedSubagents: s.archivedSubagents,
+      },
+      hostId,
+      agentId,
+      insights.subagents,
+    );
+    const prev = subagentSummaryRef.current;
+    if (
+      prev &&
+      prev.activeCount === next.activeCount &&
+      prev.awaitingCount === next.awaitingCount &&
+      prev.settledCount === next.settledCount &&
+      prev.all.length === next.all.length &&
+      prev.visible.length === next.visible.length &&
+      prev.all.every((a, i) => {
+        const b = next.all[i];
+        return (
+          a.key === b.key &&
+          a.callId === b.callId &&
+          a.handle === b.handle &&
+          a.status === b.status &&
+          a.title === b.title &&
+          a.promptPreview === b.promptPreview &&
+          a.childAgentId === b.childAgentId &&
+          a.providerSubagentId === b.providerSubagentId &&
+          a.childHostId === b.childHostId &&
+          a.remoteHostName === b.remoteHostName &&
+          a.character.id === b.character.id &&
+          a.isManaged === b.isManaged &&
+          a.childProvider === b.childProvider &&
+          a.childAcpAgentId === b.childAcpAgentId &&
+          a.childModel === b.childModel &&
+          a.childEffort === b.childEffort &&
+          a.agentLabel === b.agentLabel &&
+          a.modelLabel === b.modelLabel &&
+          a.childWorktreeBranch === b.childWorktreeBranch &&
+          a.createdAtMs === b.createdAtMs &&
+          a.activeStartedAtMs === b.activeStartedAtMs &&
+          a.sortOrder === b.sortOrder &&
+          a.depth === b.depth
+        );
+      }) &&
+      prev.visible.every((a, i) => a.key === next.visible[i].key)
+    ) {
+      return prev;
+    }
+    subagentSummaryRef.current = next;
+    return next;
+  });
   const gitReview = useOrbitSelector((s) => findGitReviewForCwd(s.gitReviews, hostId, cwd));
   const terminalCount = useOrbitSelector((s) =>
     selectScopedTerminalCount(s.terminalTabs, s.hostDetails[hostId]?.terminals, hostId, cwd),
   );
-  const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
   const selectedDiffPath = useOrbitSelector((s) => s.selectedDiffPath);
   const activeSideTab = useOrbitSelector((s) =>
     s.sidePanelOpen
@@ -217,34 +271,10 @@ const StageOverviewBody = memo(function StageOverviewBody({
     [hostArtifacts, resolvedWorkspaceId, agentId],
   );
 
-  const scopedSubagentHostDetails = useMemo(
-    () =>
-      crossHostDetails !== EMPTY_HOST_DETAILS
-        ? crossHostDetails
-        : localSubagentHostDetail
-          ? { [hostId]: localSubagentHostDetail }
-          : EMPTY_HOST_DETAILS,
-    [crossHostDetails, localSubagentHostDetail, hostId],
-  );
-
-  const selectorSlice = useMemo(
-    () => ({
-      hostDetails: scopedSubagentHostDetails,
-      fleet: {
-        revision: 0,
-        total_pending_approvals: 0,
-        hosts: crossHostFleetHosts as HostCardView[],
-        projects: [],
-      },
-      archivedSubagents,
-    }),
-    [scopedSubagentHostDetails, crossHostFleetHosts, archivedSubagents],
-  );
-
   const toolSummary = useMemo(
     () =>
       selectWorkspaceToolSummary(
-        selectorSlice,
+        { hostDetails: EMPTY_HOST_DETAILS },
         hostId,
         agentId,
         cwd,
@@ -262,7 +292,6 @@ const StageOverviewBody = memo(function StageOverviewBody({
         },
       ),
     [
-      selectorSlice,
       hostId,
       agentId,
       cwd,
@@ -276,11 +305,6 @@ const StageOverviewBody = memo(function StageOverviewBody({
       groupTitle,
       resolvedWorkspaceId,
     ],
-  );
-
-  const subagentSummary = useMemo(
-    () => selectSessionSubagents(selectorSlice, hostId, agentId, insights.subagents),
-    [selectorSlice, hostId, agentId, insights.subagents],
   );
 
   const pullRequests = useMemo(
@@ -974,6 +998,7 @@ const DockedOverviewShell = memo(function DockedOverviewShell({
       inert={!dockedOverviewVisualOpen}
       style={{
         top: `${dockedTopPx}px`,
+        width: `${OVERVIEW_PANEL_WIDTH_PX}px`,
         maxHeight: responsiveMaxHeight,
         transform: dockedOverviewTransform,
         opacity: dockedOverviewVisualOpen ? 1 : 0,
@@ -981,7 +1006,7 @@ const DockedOverviewShell = memo(function DockedOverviewShell({
         willChange: isAnimating ? "transform, opacity" : undefined,
       }}
       className={cn(
-        "fixed right-4 z-[25] flex w-[288px] origin-top-right flex-col",
+        "fixed right-4 z-[25] flex origin-top-right flex-col",
         !dockedOverviewVisualOpen && "pointer-events-none",
       )}
     >
@@ -1112,9 +1137,13 @@ const PopoverOverviewShell = memo(function PopoverOverviewShell({
           setPopoverMounted(false);
         }
       }}
-      style={isPopoverAnimating ? { willChange: "transform, opacity" } : undefined}
+      style={
+        isPopoverAnimating
+          ? { width: `${OVERVIEW_PANEL_WIDTH_PX}px`, willChange: "transform, opacity" }
+          : { width: `${OVERVIEW_PANEL_WIDTH_PX}px` }
+      }
       className={cn(
-        "absolute top-3 right-4 z-30 flex max-h-[min(560px,calc(100%-24px))] w-[288px] max-w-[calc(100%-32px)] origin-top-right flex-col outline-none motion-reduce:transition-none",
+        "absolute top-3 right-4 z-30 flex max-h-[min(560px,calc(100%-24px))] max-w-[calc(100%-32px)] origin-top-right flex-col outline-none motion-reduce:transition-none",
         popoverVisualOpen
           ? "translate-x-0 translate-y-0 scale-100 opacity-100 transition-[opacity,transform] duration-[165ms] ease-[var(--ease-out-expo)]"
           : "pointer-events-none translate-x-1 -translate-y-1.5 scale-[0.97] opacity-0 transition-[opacity,transform] duration-[120ms] ease-[var(--ease-exit)]",
@@ -1158,7 +1187,7 @@ function areStageOverviewPanelPropsEqual(
 }
 
 /**
- * Antigravity-inspired 288px Session Overview HUD:
+ * Antigravity-inspired 304px Session Overview HUD:
  * - Spacious stage (`canDock = true`): docks cleanly at top-right (left of scrollbar).
  * - Compact/split stage (`canDock = false`): opens on demand via TopBar Overview toggle (`⌘⌥O`),
  *   while TopBar relays living Subagent avatars whenever Overview is hidden.

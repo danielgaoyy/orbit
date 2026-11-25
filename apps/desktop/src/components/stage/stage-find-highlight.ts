@@ -19,15 +19,24 @@ function getCssHighlights(): HighlightRegistryLike | null {
   return cssObj.highlights;
 }
 
-function collectTextMatchRanges(root: HTMLElement, needleLower: string): Range[] {
-  if (!needleLower || typeof document === "undefined") return [];
-  const ranges: Range[] = [];
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+function collectTextMatchRanges(
+  root: HTMLElement,
+  needleLower: string,
+  activeTurnEl: HTMLElement | null = null,
+): { allRanges: Range[]; activeTurnRanges: Range[] } {
+  if (!needleLower || typeof document === "undefined") {
+    return { allRanges: [], activeTurnRanges: [] };
+  }
+  const allRanges: Range[] = [];
+  const activeTurnRanges: Range[] = [];
+  // Filter at the element level so skipped subtrees (`button`, `kbd`, `aria-hidden`) are
+  // pruned in O(1) without calling `parent.closest(...)` on every single text node.
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
-      const parent = node.parentElement;
-      if (!parent) return NodeFilter.FILTER_REJECT;
-      if (parent.closest(SKIP_ANCESTOR_SELECTOR)) {
-        return NodeFilter.FILTER_REJECT;
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        return (node as Element).matches(SKIP_ANCESTOR_SELECTOR)
+          ? NodeFilter.FILTER_REJECT
+          : NodeFilter.FILTER_SKIP;
       }
       return node.nodeValue && node.nodeValue.length > 0
         ? NodeFilter.FILTER_ACCEPT
@@ -36,18 +45,27 @@ function collectTextMatchRanges(root: HTMLElement, needleLower: string): Range[]
   });
 
   let current = walker.nextNode();
-  while (current && ranges.length < MAX_DOM_HIGHLIGHT_RANGES) {
+  while (current && allRanges.length < MAX_DOM_HIGHLIGHT_RANGES) {
     const text = current.nodeValue ?? "";
     const lower = text.toLowerCase();
     let offset = 0;
-    while (ranges.length < MAX_DOM_HIGHLIGHT_RANGES) {
+    let inActiveTurn: boolean | null = null;
+    while (allRanges.length < MAX_DOM_HIGHLIGHT_RANGES) {
       const idx = lower.indexOf(needleLower, offset);
       if (idx < 0) break;
       try {
         const range = document.createRange();
         range.setStart(current, idx);
         range.setEnd(current, idx + needleLower.length);
-        ranges.push(range);
+        allRanges.push(range);
+        if (activeTurnEl) {
+          if (inActiveTurn === null) {
+            inActiveTurn = activeTurnEl.contains(current);
+          }
+          if (inActiveTurn) {
+            activeTurnRanges.push(range);
+          }
+        }
       } catch {
         // Ignore stale text nodes mid-mutation
       }
@@ -55,7 +73,7 @@ function collectTextMatchRanges(root: HTMLElement, needleLower: string): Range[]
     }
     current = walker.nextNode();
   }
-  return ranges;
+  return { allRanges, activeTurnRanges };
 }
 
 export function clearStageFindHighlights(): void {
@@ -82,22 +100,25 @@ export function applyStageFindHighlights(
     return null;
   }
 
-  const allRanges = collectTextMatchRanges(stageContentEl, needle);
+  const turnEl =
+    activeTurnIndex !== null && activeTurnIndex >= 0
+      ? stageContentEl.querySelector<HTMLElement>(`[data-orbit-turn-index="${activeTurnIndex}"]`)
+      : null;
+
+  const { allRanges, activeTurnRanges } = collectTextMatchRanges(stageContentEl, needle, turnEl);
   let activeRange: Range | null = null;
 
-  if (activeTurnIndex !== null && activeTurnIndex >= 0) {
-    const turnEl = stageContentEl.querySelector<HTMLElement>(
-      `[data-orbit-turn-index="${activeTurnIndex}"]`,
-    );
-    if (turnEl) {
-      const turnRanges = collectTextMatchRanges(turnEl, needle);
-      if (turnRanges.length > 0) {
-        const clampedIdx =
-          activeVisibleOccurrenceInTurn !== null && activeVisibleOccurrenceInTurn >= 0
-            ? Math.min(activeVisibleOccurrenceInTurn, turnRanges.length - 1)
-            : 0;
-        activeRange = turnRanges[clampedIdx] ?? turnRanges[0] ?? null;
-      }
+  if (turnEl) {
+    const turnRanges =
+      activeTurnRanges.length > 0 || allRanges.length < MAX_DOM_HIGHLIGHT_RANGES
+        ? activeTurnRanges
+        : collectTextMatchRanges(turnEl, needle).allRanges;
+    if (turnRanges.length > 0) {
+      const clampedIdx =
+        activeVisibleOccurrenceInTurn !== null && activeVisibleOccurrenceInTurn >= 0
+          ? Math.min(activeVisibleOccurrenceInTurn, turnRanges.length - 1)
+          : 0;
+      activeRange = turnRanges[clampedIdx] ?? turnRanges[0] ?? null;
     }
   }
 

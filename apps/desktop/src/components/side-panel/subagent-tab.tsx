@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, GitBranch } from "lucide-react";
 import {
   ConversationViewport,
   useViewportAnchorHold,
@@ -13,30 +13,38 @@ import {
 import {
   PromptImageLightbox,
   type PromptImagePreviewTarget,
-  TurnStageSection,
 } from "@/components/stage/stream-stage";
+import { SidePanelTurnList } from "@/components/stage/side-turn-list";
 import { useDelegationDispatches } from "@/components/stage/use-delegation-dispatches";
 import {
+  createStableHostArtifactsSelector,
   createStageSessionSelector,
-  getTurnFooter,
-  getTurnTopGapPx,
+  type TurnTimingRecord,
 } from "@/components/stage/stage-helpers";
 import { Button } from "@/components/ui/button";
 import { ContextBanner } from "@/components/ui/context-banner";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
+import { ProviderIcon } from "@/components/ui/provider-icons";
 import { SubagentAvatar } from "@/components/ui/subagent-avatar";
+import { cn } from "@/lib/utils";
 import {
+  type AgentCardView,
+  type HostCardView,
+  type HostDetailView,
   type PendingPermissionSummary,
   type StageTurnView,
   type SubagentLineageStepView,
   type TimelineItemView,
-  isAgentForegroundRunning,
   orbitIpc,
 } from "@/lib/orbit-ipc";
+import { formatEffortLabel } from "@/lib/model-metadata";
 import { computeSubagentTurnsFingerprint, MAX_CACHED_STAGE_VIEWS } from "@/lib/stage-cache";
 import {
   type ResolvedSubagentItem,
   buildSubagentNameMatcher,
+  formatSubagentRuntimeDisplay,
+  inferNativeSubagentModel,
+  mapManagedStatus,
   resolveAgentAncestorLineage,
 } from "@/lib/subagents";
 import { useI18n } from "@/lib/i18n";
@@ -48,11 +56,12 @@ import type {
 import { upsertLruRecord } from "@/state/store-helpers";
 import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
-const NOOP_REWIND = () => {};
 const EMPTY_TURNS: StageTurnView[] = [];
 const EMPTY_HOST_PERMS: readonly PendingPermissionSummary[] = [];
 const EMPTY_QUESTIONS: readonly PendingQuestionTimelineItem[] = [];
 const EMPTY_SUBAGENT_PERMS: readonly UnifiedPendingSubagentPermission[] = [];
+const EMPTY_HOST_DETAILS: Record<string, HostDetailView> = {};
+const EMPTY_FLEET_HOSTS: readonly HostCardView[] = [];
 let providerTurnCache: Record<string, StageTurnView[]> = {};
 const HYDRATION_TIMEOUT_MS = 1500;
 
@@ -105,32 +114,6 @@ export function mergeAgentPendingPermissions(
     });
   }
   return extras ?? stagePendingPermissions;
-}
-
-interface ThinkingTimingRecord {
-  startedAtMs: number;
-  completedAtMs: number | null;
-  durationMs: number | null;
-}
-
-function buildSubagentTurnThinkingSignature(
-  turn: StageTurnView,
-  agentId: string,
-  thinkingTimings: Record<string, ThinkingTimingRecord>,
-): string {
-  let sig = "";
-  for (const seg of turn.live_segments) {
-    if (seg.kind !== "step_group") continue;
-    for (const it of seg.items) {
-      if (it.item_type !== "assistant_thinking") continue;
-      const key = `${agentId}::think::${it.item_id || it.seq}`;
-      const dur = thinkingTimings[key]?.durationMs;
-      if (dur !== null && dur !== undefined) {
-        sig += `${it.seq}:${dur};`;
-      }
-    }
-  }
-  return sig;
 }
 
 function hasProviderContent(turns: StageTurnView[]): boolean {
@@ -194,19 +177,8 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
     return parentStage?.insights.subagents.find((sa) => sa.id === tab.subagentCallId) ?? null;
   });
 
-  const childStatusLabel = childAgent?.status_label.toLowerCase() ?? "";
   const status: "awaiting_permission" | "running" | "completed" | "canceled" | "failed" = childAgent
-    ? childAgent.is_awaiting_permission
-      ? "awaiting_permission"
-      : isAgentForegroundRunning(childAgent)
-        ? "running"
-        : childStatusLabel.includes("cancel") ||
-            childStatusLabel.includes("interrupt") ||
-            childStatusLabel.includes("stopped")
-          ? "canceled"
-          : childStatusLabel.includes("error") || childStatusLabel.includes("fail")
-            ? "failed"
-            : "completed"
+    ? mapManagedStatus(childAgent)
     : providerSubagent
       ? providerSubagent.status === "running"
         ? "running"
@@ -236,8 +208,8 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
   );
   const wasHostConnected = useRef(hostConnected);
   const isActiveTab = useOrbitSelector((s) => s.sidePanelOpen && s.activeSidePanelTabId === tab.id);
-  const thinkingTimingsRef = useRef<Record<string, ThinkingTimingRecord>>({});
-  const [, setThinkingTick] = useState(0);
+  const thinkingTimingsRef = useRef<Record<string, TurnTimingRecord>>({});
+  const [thinkingTick, setThinkingTick] = useState(0);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef<boolean>(true);
   const holdViewport = useViewportAnchorHold(viewportRef, stickToBottomRef);
@@ -342,6 +314,11 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
   const contentVersion = `${childStage?.revision ?? 0}:${displayTurnsFingerprint}`;
   const effectiveAgentId = tab.childAgentId ?? tab.providerSubagentId ?? parentAgentId ?? "";
   const effectiveHostId = isManaged ? (hostId ?? "") : (parentHostId ?? "");
+  const selectStableArtifacts = useMemo(
+    () => createStableHostArtifactsSelector(effectiveHostId || null),
+    [effectiveHostId],
+  );
+  const stableHostArtifacts = useOrbitSelector(selectStableArtifacts);
   const selectChildren = useMemo(
     () => createStageSessionSelector(effectiveHostId, effectiveAgentId),
     [effectiveHostId, effectiveAgentId],
@@ -484,6 +461,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
                 startedAtMs: seededStartMs,
                 completedAtMs: null,
                 durationMs: null,
+                workDurationMs: null,
               };
               changed = true;
             }
@@ -518,18 +496,28 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
 
   const viewportResetKey = `${tab.id}:${tab.childAgentId ?? tab.providerSubagentId ?? tab.subagentCallId ?? ""}`;
 
-  const hostDetails = useOrbitSelector((s) => s.hostDetails);
-  const fleetHosts = useOrbitSelector((s) => s.fleet.hosts);
+  const stageAncestorLineage = childStage?.insights?.ancestor_lineage ?? null;
+  const needsLineageLookup =
+    isManaged &&
+    Boolean(hostId) &&
+    Boolean(tab.childAgentId) &&
+    !(stageAncestorLineage && stageAncestorLineage.length > 0);
+  const lineageHostDetails = useOrbitSelector((s) =>
+    needsLineageLookup ? s.hostDetails : EMPTY_HOST_DETAILS,
+  );
+  const lineageFleetHosts = useOrbitSelector((s) =>
+    needsLineageLookup ? s.fleet.hosts : EMPTY_FLEET_HOSTS,
+  );
   const ancestorLineage = useMemo((): SubagentLineageStepView[] => {
     if (!isManaged || !hostId || !tab.childAgentId) return [];
     return resolveAgentAncestorLineage({
       hostId,
       agentId: tab.childAgentId,
-      stageAncestorLineage: childStage?.insights?.ancestor_lineage ?? null,
-      hostDetails,
-      fleetHosts,
+      stageAncestorLineage,
+      hostDetails: lineageHostDetails,
+      fleetHosts: lineageFleetHosts,
     });
-  }, [isManaged, hostId, tab.childAgentId, childStage?.insights?.ancestor_lineage, hostDetails, fleetHosts]);
+  }, [isManaged, hostId, tab.childAgentId, stageAncestorLineage, lineageHostDetails, lineageFleetHosts]);
 
   const handleOpenLineageStep = useCallback(
     (step: SubagentLineageStepView, index: number) => {
@@ -550,11 +538,70 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
     [ancestorLineage],
   );
 
+  const parentRuntimeKey = useOrbitSelector((s) => {
+    if (!parentHostId || !parentAgentId) return "";
+    const ag = s.hostDetails[parentHostId]?.agents.find((a) => a.agent_id === parentAgentId);
+    if (!ag) return "";
+    return `${ag.provider ?? ""}\0${ag.provider === "acp" ? (ag.acp_agent_id ?? "") : ""}`;
+  });
+  const [parentProviderRaw, parentAcpAgentRaw] = parentRuntimeKey ? parentRuntimeKey.split("\0") : ["", ""];
+  const effectiveProvider =
+    childAgent?.provider ?? ((parentProviderRaw || null) as AgentCardView["provider"] | null);
+  const effectiveAcpAgentId =
+    childAgent?.acp_agent_id ?? (parentAcpAgentRaw || null);
+  const effectiveRawModel =
+    childAgent?.model?.trim() ||
+    inferNativeSubagentModel(effectiveProvider, providerSubagent) ||
+    null;
+  const effectiveEffort = childAgent?.effort ?? null;
+  const runtimeProviderCatalogs = useOrbitSelector((s) => {
+    const detail = (hostId ? s.hostDetails[hostId] : null) ?? (parentHostId ? s.hostDetails[parentHostId] : null);
+    return detail?.provider_catalogs;
+  });
+  const runtimeAcpAgents = useOrbitSelector((s) => {
+    const detail = (hostId ? s.hostDetails[hostId] : null) ?? (parentHostId ? s.hostDetails[parentHostId] : null);
+    return detail?.acp_agents;
+  });
+  const runtimeDisplay = useMemo(
+    () =>
+      formatSubagentRuntimeDisplay({
+        provider: effectiveProvider,
+        acpAgentId: effectiveAcpAgentId,
+        rawModel: effectiveRawModel,
+        effort: effectiveEffort,
+        providerCatalogs: runtimeProviderCatalogs,
+        acpAgents: runtimeAcpAgents,
+      }),
+    [
+      effectiveProvider,
+      effectiveAcpAgentId,
+      effectiveRawModel,
+      effectiveEffort,
+      runtimeProviderCatalogs,
+      runtimeAcpAgents,
+    ],
+  );
+  const effortLabelText = runtimeDisplay.effort ? formatEffortLabel(runtimeDisplay.effort, t) : null;
+  const worktreeBranch = childAgent?.worktree_branch ?? null;
+  // For multi-level subagent trees (depth >= 2), expose clickable parent crumbs without repeating
+  // the current subagent's own title (already shown in the tab strip directly above).
+  const ancestorCrumbs = ancestorLineage.length > 2 ? ancestorLineage.slice(0, -1) : [];
+  const statusLabelText =
+    status === "awaiting_permission"
+      ? t("overview.subagentApprovalRequired")
+      : status === "running"
+        ? t("overview.subagentWorking")
+        : status === "failed"
+          ? t("overview.subagentFailed")
+          : status === "canceled"
+            ? t("overview.subagentStopped")
+            : t("overview.subagentFinished");
+
   // Show an actionable fallback banner ONLY when awaiting approval without a live DecisionDock payload
-  // (e.g. cold hydration or provider-only subagent whose gate lives on the parent), or to identify a cross-host subagent.
+  // (e.g. cold hydration or provider-only subagent whose gate lives on the parent).
   const showApprovalFallbackBanner =
     status === "awaiting_permission" && !hasManagedDecisions && !showParentFallbackDock;
-  const showInlineContextBar = showApprovalFallbackBanner || Boolean(remoteHostName);
+  const showInlineContextBar = showApprovalFallbackBanner;
 
   const handleFallbackApprovalAction = useCallback(() => {
     if (isManaged && hostId && tab.childAgentId) {
@@ -569,39 +616,131 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
 
   return (
     <div className="orbit-stage-enter bg-surface-base flex min-h-0 flex-1 flex-col overflow-hidden">
-      {ancestorLineage.length > 1 && (
-        <nav
-          aria-label={t("overview.subagentLineageAria")}
-          className="border-border-subtle bg-surface-base flex h-[30px] shrink-0 items-center gap-1 overflow-x-auto border-b px-4 text-[11px] text-ink-tertiary"
-        >
-          {ancestorLineage.map((step, idx) => {
-            const isCurrent = idx === ancestorLineage.length - 1;
-            return (
-              <span key={`${step.host_id}::${step.agent_id}`} className="inline-flex shrink-0 items-center gap-1">
-                {idx > 0 && <ChevronRight aria-hidden="true" className="size-3 text-ink-muted" />}
-                {isCurrent ? (
-                  <span className="max-w-[180px] truncate font-medium text-ink-primary">
-                    {step.title}
-                  </span>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => handleOpenLineageStep(step, idx)}
-                    title={step.host_name ? `${step.title} · ${step.host_name}` : step.title}
-                    className="max-w-[160px] cursor-pointer truncate rounded-[4px] px-1 py-0.5 text-ink-tertiary transition-colors hover:bg-accent/70 hover:text-ink-primary"
+      <div
+        data-slot="subagent-context-header"
+        className="border-border-subtle bg-surface-base flex h-[32px] shrink-0 items-center justify-between gap-3 overflow-hidden border-b px-4 text-[11px] select-none"
+      >
+        <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
+          {ancestorCrumbs.length > 0 && (
+            <>
+              <nav
+                aria-label={t("overview.subagentLineageAria")}
+                className="flex min-w-0 shrink items-center gap-0.5 overflow-hidden text-ink-tertiary"
+              >
+                {ancestorCrumbs.map((step, idx) => (
+                  <span
+                    key={`${step.host_id}::${step.agent_id}`}
+                    className="inline-flex min-w-0 shrink items-center gap-0.5"
                   >
-                    {step.title}
-                  </button>
-                )}
-              </span>
-            );
-          })}
-        </nav>
-      )}
+                    {idx > 0 && (
+                      <ChevronRight aria-hidden="true" className="text-ink-faint size-3 shrink-0" />
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => handleOpenLineageStep(step, idx)}
+                      title={step.host_name ? `${step.title} · ${step.host_name}` : step.title}
+                      className="max-w-[110px] shrink-0 cursor-pointer truncate rounded-[4px] px-1 py-0.5 text-ink-tertiary transition-colors hover:bg-accent/70 hover:text-ink-primary"
+                    >
+                      {step.title}
+                    </button>
+                  </span>
+                ))}
+              </nav>
+              <span aria-hidden="true" className="bg-border-subtle mx-0.5 h-3 w-px shrink-0" />
+            </>
+          )}
+
+          {(effectiveProvider || runtimeDisplay.agentLabel || runtimeDisplay.modelLabel || effortLabelText) && (
+            <div className="flex min-w-0 items-center gap-1.5 overflow-hidden">
+              {effectiveProvider && (
+                <ProviderIcon
+                  provider={effectiveProvider}
+                  className="size-[13px] shrink-0 opacity-85"
+                />
+              )}
+              {runtimeDisplay.agentLabel && (
+                <span className="text-ink-primary shrink-0 font-medium">
+                  {runtimeDisplay.agentLabel}
+                </span>
+              )}
+              {(runtimeDisplay.modelLabel || effortLabelText) && (
+                <>
+                  {runtimeDisplay.agentLabel && (
+                    <span aria-hidden="true" className="text-ink-faint shrink-0">
+                      ·
+                    </span>
+                  )}
+                  <span className="flex min-w-0 items-center gap-1 overflow-hidden">
+                    {runtimeDisplay.modelLabel && (
+                      <span
+                        title={runtimeDisplay.rawModel ?? runtimeDisplay.modelLabel}
+                        className="text-ink-secondary min-w-0 truncate"
+                      >
+                        {runtimeDisplay.modelLabel}
+                      </span>
+                    )}
+                    {effortLabelText && (
+                      <span className="text-ink-muted shrink-0">
+                        {effortLabelText}
+                      </span>
+                    )}
+                  </span>
+                </>
+              )}
+            </div>
+          )}
+
+          {worktreeBranch && (
+            <span
+              title={worktreeBranch}
+              className="bg-surface-recessed text-ink-tertiary inline-flex max-w-[120px] shrink-0 items-center gap-1 rounded-[5px] px-1.5 py-0.5 font-mono text-[10.5px] leading-none"
+            >
+              <GitBranch className="size-[10px] shrink-0 opacity-75" />
+              <span className="truncate">{worktreeBranch}</span>
+            </span>
+          )}
+
+          {remoteHostName && (
+            <span
+              title={remoteHostName}
+              className="bg-surface-recessed text-ink-tertiary border-border-subtle max-w-[110px] shrink-0 truncate rounded-[5px] border px-1.5 py-0.5 text-[10.5px] leading-none"
+            >
+              {remoteHostName}
+            </span>
+          )}
+        </div>
+
+        <span
+          className={cn(
+            "inline-flex shrink-0 items-center gap-1.5",
+            status === "awaiting_permission"
+              ? "text-signal-warning font-medium"
+              : status === "failed"
+                ? "text-signal-danger"
+                : status === "running"
+                  ? "text-ink-secondary"
+                  : "text-ink-tertiary",
+          )}
+        >
+          {status === "running" && (
+            <span
+              aria-hidden="true"
+              className="bg-signal-success size-[6px] shrink-0 animate-pulse rounded-full motion-reduce:animate-none [.orbit-window-hidden_&]:[animation-play-state:paused]"
+            />
+          )}
+          {status === "awaiting_permission" && (
+            <span aria-hidden="true" className="bg-signal-warning size-[6px] shrink-0 rounded-full" />
+          )}
+          {status === "failed" && (
+            <span aria-hidden="true" className="bg-signal-danger size-[6px] shrink-0 rounded-full" />
+          )}
+          <span>{statusLabelText}</span>
+        </span>
+      </div>
       {showInlineContextBar && (
         <ContextBanner
           variant="strip"
-          tone={showApprovalFallbackBanner ? "warning" : "neutral"}
+          tone="warning"
           icon={
             <SubagentAvatar
               character={currentPeer?.character}
@@ -611,28 +750,17 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
             />
           }
           actions={
-            showApprovalFallbackBanner ? (
-              <Button
-                type="button"
-                variant="outline"
-                size="xs"
-                onClick={handleFallbackApprovalAction}
-              >
-                {isManaged ? t("common.refresh") : t("approval.inspectSubagent")}
-              </Button>
-            ) : undefined
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              onClick={handleFallbackApprovalAction}
+            >
+              {isManaged ? t("common.refresh") : t("approval.inspectSubagent")}
+            </Button>
           }
         >
-          <span className="inline-flex items-center gap-2">
-            {showApprovalFallbackBanner && (
-              <span className="font-medium">{t("overview.subagentApprovalRequired")}</span>
-            )}
-            {remoteHostName && (
-              <span className="bg-surface-recessed text-ink-tertiary border-border-subtle inline-flex max-w-[180px] items-center truncate rounded-[6px] border px-1.5 py-0.5 text-[11px] leading-none">
-                {remoteHostName}
-              </span>
-            )}
-          </span>
+          <span className="font-medium">{t("overview.subagentApprovalRequired")}</span>
         </ContextBanner>
       )}
 
@@ -648,59 +776,39 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
       >
         <div className="orbit-stage-enter mx-auto w-full min-w-0 max-w-[740px]">
           {displayTurns.length > 0 ? (
-            <div>
-              {(() => {
-                let previousHasFooter: boolean | undefined;
-                return displayTurns.map((turn, idx) => {
-                  const isLastTurn = idx === displayTurns.length - 1;
-                  const isTurnActive = isLastTurn && status === "running";
-                  const topGapPx = getTurnTopGapPx(turn, previousHasFooter);
-                  previousHasFooter =
-                    getTurnFooter(turn, {
-                      isActive: isTurnActive,
-                      isLastTurn,
-                      canFork: false,
-                    }) !== null;
-                  const liveLabel = isLastTurn
-                    ? isManaged
-                      ? (childAgent?.status_label ?? null)
-                      : status === "running"
-                        ? "Working..."
-                        : null
-                    : null;
-                  const thinkingSignature = buildSubagentTurnThinkingSignature(
-                    turn,
-                    effectiveAgentId,
-                    thinkingTimingsRef.current,
-                  );
-                  return (
-                    <div key={turn.key} style={topGapPx > 0 ? { paddingTop: topGapPx } : undefined}>
-                      <TurnStageSection
-                        turn={turn}
-                        dispatches={dispatches}
-                        isTurnActive={isTurnActive}
-                        isLastTurn={isLastTurn}
-                        agentStatusLabel={liveLabel}
-                        hasLiveBackgroundTasks={isTurnActive && runningBackgroundTasks.length > 0}
-                        isNetworkOffline={isNetworkOffline}
-                        autoFoldCompleted={coalesceExploration}
-                        hostId={effectiveHostId}
-                        cwd={cwd}
-                        agentId={effectiveAgentId}
-                        thinkingSignature={thinkingSignature}
-                        getThinkingDurationMs={getThinkingDurationMs}
-                        holdViewport={holdViewport}
-                        onRequestRewind={NOOP_REWIND}
-                        onPreviewImage={setImagePreviewTarget}
-                        sessionSubagents={subagentSessionSubagents}
-                        sessionSubagentMatcher={subagentNameMatcher}
-                        onOpenSubagent={handleOpenNestedSubagent}
-                        parentMessageLabel="Sent to parent"
-                      />
-                    </div>
-                  );
-                });
-              })()}
+            <>
+              <SidePanelTurnList
+                key={viewportResetKey}
+                scopeKey={viewportResetKey}
+                hostId={effectiveHostId}
+                agentId={effectiveAgentId}
+                cwd={cwd}
+                turns={displayTurns}
+                isRunning={status === "running"}
+                liveStatusLabel={
+                  isManaged
+                    ? (childAgent?.status_label ?? null)
+                    : status === "running"
+                      ? "Working..."
+                      : null
+                }
+                hasLiveBackgroundTasks={runningBackgroundTasks.length > 0}
+                isNetworkOffline={isNetworkOffline}
+                autoFoldCompleted={coalesceExploration}
+                hostArtifacts={stableHostArtifacts}
+                scrollRef={viewportRef}
+                stickToBottomRef={stickToBottomRef}
+                holdViewport={holdViewport}
+                onPreviewImage={setImagePreviewTarget}
+                dispatches={dispatches}
+                sessionSubagents={subagentSessionSubagents}
+                sessionSubagentMatcher={subagentNameMatcher}
+                onOpenSubagent={handleOpenNestedSubagent}
+                parentMessageLabel="Sent to parent"
+                thinkingTimings={thinkingTimingsRef.current}
+                thinkingTimingsVersion={thinkingTick}
+                getThinkingDurationMs={getThinkingDurationMs}
+              />
               <StageActivityWave
                 runningSubagentsCount={nestedSubagentActivity.runningCount}
                 awaitingSubagentsCount={nestedSubagentActivity.awaitingCount}
@@ -711,7 +819,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
                 onClick={handleNestedWaveClick}
                 className="mt-3 mb-1"
               />
-            </div>
+            </>
           ) : hydrating ? (
             <div role="status" className="text-ink-muted flex items-center justify-center gap-2 py-6 text-[13px]">
               <OrbitSpinner size={14} />

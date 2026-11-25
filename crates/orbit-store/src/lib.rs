@@ -4352,6 +4352,7 @@ mod tests {
             parent_subagent_id: None,
             title: "Codebase Explorer".into(),
             subtitle: Some("Claude Sonnet · high".into()),
+            model: Some("claude-sonnet-4-6".into()),
             status: orbit_protocol::ProviderSubagentStatus::Running,
             created_at: now,
             updated_at: now,
@@ -6702,6 +6703,7 @@ mod tests {
                 parent_subagent_id: None,
                 title: "Database Migration Engineer".into(),
                 subtitle: None,
+                model: Some("claude-opus-4-6".into()),
                 status: orbit_protocol::ProviderSubagentStatus::Running,
                 created_at: now,
                 updated_at: now,
@@ -6714,6 +6716,7 @@ mod tests {
                 parent_subagent_id: None,
                 title: "sub_title_keep".into(),
                 subtitle: None,
+                model: None,
                 status: orbit_protocol::ProviderSubagentStatus::Completed,
                 created_at: now,
                 updated_at: now,
@@ -6727,6 +6730,7 @@ mod tests {
             .find(|s| s.subagent_id == "sub_title_keep")
             .expect("found");
         assert_eq!(kept.title, "Database Migration Engineer");
+        assert_eq!(kept.model.as_deref(), Some("claude-opus-4-6"));
         assert_eq!(
             kept.status,
             orbit_protocol::ProviderSubagentStatus::Completed

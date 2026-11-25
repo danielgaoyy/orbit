@@ -57,40 +57,50 @@ export function peerFinishStatus(item: AgentMessage, cleanBody?: string): Coales
   return null;
 }
 
-/** Match each terminal event to the latest direct report in this turn, including its opening prompt. */
+/**
+ * Returns true when an incoming `agent_message` is an inter-agent communication item
+ * (`direct_message`, routine/queued `finish_notification`, etc.) that should stay silent
+ * across both main stage and subagent/peer conversation streams.
+ *
+ * Preserves only:
+ * - `heartbeat` wakeup dividers
+ * - `permission_context` approval checkpoints (rendered only while still pending)
+ * - failed `finish_notification` alerts
+ */
+export function isTimelineAgentMessageHidden(item: AgentMessage): boolean {
+  if (item.kind === "heartbeat") return false;
+  if (item.permission_context) return false;
+  if (item.kind === "finish_notification") {
+    return peerFinishStatus(item) !== "failed";
+  }
+  return true;
+}
+
+/**
+ * Suppress hidden incoming `agent_message` segments (routine/queued finish callbacks and
+ * inter-agent direct messages) and rejoin adjacent `step_group` segments split across
+ * those now-invisible boundaries.
+ */
 export function coalescePeerFinishes(
-  openingMessage: StageTurnView["agent_message"],
+  _openingMessage: StageTurnView["agent_message"],
   segments: readonly TurnLiveSegmentView[],
-  hostId: string,
+  _hostId: string,
 ) {
-  const reports = new Map<string, AgentMessage>();
   const finishStatuses = new Map<AgentMessage, CoalescedFinishStatus>();
   const visible: TurnLiveSegmentView[] = [];
-  function matchMessage(item: AgentMessage) {
-    if (!item.source_agent_id || item.permission_context) return false;
-    const source = JSON.stringify([item.source_host_id || hostId, item.source_agent_id]);
-    if (item.kind === "direct_message") {
-      reports.set(source, item);
-      return false;
-    }
-    const status = peerFinishStatus(item);
-    if (!status) return false;
-    const report = reports.get(source);
-    reports.delete(source);
-    if (!report || status === "failed") return false;
-    finishStatuses.set(report, status);
-    return true;
-  }
-  if (openingMessage?.item_type === "agent_message") matchMessage(openingMessage);
-  let removedFinish = false;
+  let removedHidden = false;
   for (const seg of segments) {
-    if (seg.kind === "agent_message" && seg.item.item_type === "agent_message" && matchMessage(seg.item)) {
-      removedFinish = true;
+    if (
+      seg.kind === "agent_message" &&
+      seg.item.item_type === "agent_message" &&
+      isTimelineAgentMessageHidden(seg.item)
+    ) {
+      removedHidden = true;
       continue;
     }
-    // The core flushed its work group at the finish. Rejoin just that now-invisible boundary.
+    // The core flushed its work group at the agent message. Rejoin just that now-invisible boundary.
     const prev = visible.at(-1);
-    if (removedFinish && prev?.kind === "step_group" && seg.kind === "step_group") {
+    if (removedHidden && prev?.kind === "step_group" && seg.kind === "step_group") {
       const items = [...prev.items, ...seg.items];
       const thoughtMs = (prev.thought_duration_ms ?? 0) + (seg.thought_duration_ms ?? 0) || null;
       visible[visible.length - 1] = {
@@ -106,7 +116,7 @@ export function coalescePeerFinishes(
     } else {
       visible.push(seg);
     }
-    removedFinish = false;
+    removedHidden = false;
   }
   return { segments: visible, finishStatuses };
 }
@@ -163,12 +173,12 @@ function stableTimelineItemKey(item: TimelineItemView): string {
 }
 
 /**
- * Returns true when a timeline item is a subagent dispatch (`invoke_subagent`, `create_agent`,
- * `spawn_workspace_peer`, or `detail.kind === "subagent"`) or an inter-agent message
- * (`send_message`, `send_agent_prompt`, `message_peer`) that should be promoted out of folded
- * work groups into a first-class chronological milestone row (Codex-style segmentation).
+ * Returns true when a timeline item is an outgoing subagent dispatch (`invoke_subagent`,
+ * `create_agent`, `spawn_workspace_peer`, or `detail.kind === "subagent"`) or inter-agent
+ * message (`send_message`, `send_agent_prompt`, `message_peer`), used by `useDelegationDispatches`
+ * to resolve target subagents across turns while keeping them folded inside step groups.
  */
-export function isDelegationMilestoneToolCall(
+export function isSubagentOrMessageToolCall(
   item: TimelineItemView,
 ): item is ToolCallTimelineItem {
   if (item.item_type !== "tool_call") return false;
@@ -180,8 +190,26 @@ export function isDelegationMilestoneToolCall(
     return !isLegacyPlaceholder || item.status === "running";
   }
   if (item.detail.kind === "generic") {
+    return classifyGenericSubagentTool(item.detail.tool_name) !== null;
+  }
+  return false;
+}
+
+/**
+ * Returns true when a timeline item is a session-level state-change milestone (`orbit_timer`
+ * create, `schedule`, or `handoff_worktree`) promoted out of folded work groups.
+ *
+ * Outgoing subagent dispatches (`invoke_subagent`, `create_agent`, `spawn_workspace_peer`,
+ * `detail.kind === "subagent"`) and outgoing inter-agent messages (`send_message`,
+ * `send_agent_prompt`, `message_peer`) stay folded inside regular step groups (aligned with
+ * Codex / Antigravity) so work blocks are never fragmented by standalone rows.
+ */
+export function isDelegationMilestoneToolCall(
+  item: TimelineItemView,
+): item is ToolCallTimelineItem {
+  if (item.item_type !== "tool_call") return false;
+  if (item.detail.kind === "generic") {
     return (
-      classifyGenericSubagentTool(item.detail.tool_name) !== null ||
       classifyStateChangeMilestoneTool(item.detail.tool_name, item.detail.arguments_json) !== null
     );
   }
@@ -345,41 +373,6 @@ function basenameOfPath(filePath: string): string {
   return parts[parts.length - 1] ?? trimmed;
 }
 
-function extractThinkingHeadline(rawText: string, preferLatest = false): string {
-  if (!rawText) return "";
-  const lines = rawText.split(/\r?\n/);
-  const cleanedLines: string[] = [];
-  let inFence = false;
-
-  for (const rawLine of lines) {
-    const trimmed = rawLine.trim();
-    if (/^```/.test(trimmed)) {
-      inFence = !inFence;
-      continue;
-    }
-    if (inFence || !trimmed) continue;
-
-    const plain = trimmed
-      .replace(/^#{1,6}\s+/, "")
-      .replace(/^(?:[-*+]|\d{1,3}\.)\s+/, "")
-      .replace(/^>\s*/, "")
-      .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
-      .replace(/[*_`~]+/g, "")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    if (plain.length > 0) {
-      cleanedLines.push(plain);
-      if (!preferLatest) break;
-    }
-  }
-
-  const chosen = preferLatest
-    ? (cleanedLines[cleanedLines.length - 1] ?? "")
-    : (cleanedLines[0] ?? "");
-  return chosen.length > 88 ? `${chosen.slice(0, 87)}…` : chosen;
-}
-
 function humanizeIdentifier(raw: string): string {
   const clean = raw
     .trim()
@@ -541,8 +534,7 @@ function buildLiveStepStatus(item: TimelineItemView | undefined, locale: OrbitLo
   const t = translate.bind(null, locale);
   if (!item) return [t("stage.working"), null];
   if (item.item_type === "assistant_thinking") {
-    const headline = extractThinkingHeadline(item.text, true);
-    return headline ? [t("stage.thinking"), headline] : [t("stage.thinkingPending"), null];
+    return [t("stage.thinkingPending"), null];
   }
   if (item.item_type === "tool_call") {
     switch (item.detail.kind) {
@@ -701,7 +693,7 @@ export function summarizeWorkChunk(
         }
         break;
       case "file_read":
-        markSeen("read");
+        markSeen("explore");
         readCalls += 1;
         if (tc.detail.path) pushUnique(readPaths, tc.detail.path);
         else readPathless += 1;
@@ -712,10 +704,10 @@ export function summarizeWorkChunk(
           markSeen("search_web");
           webSearchCount += 1;
         } else if (sub === "glob") {
-          markSeen("look_files");
+          markSeen("explore");
           globCount += 1;
         } else {
-          markSeen("search_files");
+          markSeen("explore");
           grepCount += 1;
         }
         break;
@@ -804,7 +796,7 @@ export function summarizeWorkChunk(
           ? t("stage.editedPath", { path: soleName })
           : editedFileCount === 1
             ? t("stage.editedFile")
-            : t("stage.editedFiles", { count: editedFileCount }),
+            : t("stage.editedFiles"),
         tier: 1,
         rawCallCount: editCalls,
         firstOrder: firstSeen.get("edit") ?? 0,
@@ -819,7 +811,7 @@ export function summarizeWorkChunk(
           ? t("stage.createdPath", { path: soleName })
           : createdFileCount === 1
             ? t("stage.createdFile")
-            : t("stage.createdFiles", { count: createdFileCount }),
+            : t("stage.createdFiles"),
         tier: 1,
         rawCallCount: createCalls,
         firstOrder: firstSeen.get("create") ?? 0,
@@ -828,7 +820,7 @@ export function summarizeWorkChunk(
 
     if (subagentCount > 0) {
       buckets.push({
-        label: subagentCount === 1 ? t("stage.ranAgent") : t("stage.ranAgents", { count: subagentCount }),
+        label: subagentCount === 1 ? t("stage.ranAgent") : t("stage.ranAgents"),
         tier: 2,
         rawCallCount: subagentCount,
         firstOrder: firstSeen.get("subagent") ?? 0,
@@ -841,43 +833,36 @@ export function summarizeWorkChunk(
         label:
           mcpServerCount === 1
             ? t("stage.usedIntegration", { name: firstServer })
-            : t("stage.usedIntegrations", { count: mcpServerCount }),
+            : t("stage.usedIntegrations"),
         tier: 2,
         rawCallCount: mcpCallCount,
         firstOrder: firstSeen.get("mcp") ?? 0,
       });
     }
 
-    if (readFileCount > 0) {
-      const soleName =
-        isSoleCategory && readPaths.length === 1 ? basenameOfPath(readPaths[0]) : "";
-      buckets.push({
-        label: soleName
+    if (readFileCount > 0 || grepCount > 0 || globCount > 0) {
+      const exploreCalls = readCalls + grepCount + globCount;
+      let exploreLabel: string;
+      if (readFileCount > 0) {
+        const soleName =
+          isSoleCategory && readPaths.length === 1 && grepCount === 0 && globCount === 0
+            ? basenameOfPath(readPaths[0])
+            : "";
+        exploreLabel = soleName
           ? t("stage.readPath", { path: soleName })
-          : readFileCount === 1
+          : readFileCount === 1 && grepCount === 0 && globCount === 0
             ? t("stage.readFile")
-            : t("stage.readFiles", { count: readFileCount }),
-        tier: 3,
-        rawCallCount: readCalls,
-        firstOrder: firstSeen.get("read") ?? 0,
-      });
-    }
-
-    if (grepCount > 0) {
+            : t("stage.readFiles");
+      } else if (grepCount > 0) {
+        exploreLabel = t("stage.searchedFiles");
+      } else {
+        exploreLabel = t("stage.foundFiles");
+      }
       buckets.push({
-        label: t("stage.searchedFiles"),
+        label: exploreLabel,
         tier: 3,
-        rawCallCount: grepCount,
-        firstOrder: firstSeen.get("search_files") ?? 0,
-      });
-    }
-
-    if (globCount > 0) {
-      buckets.push({
-        label: t("stage.foundFiles"),
-        tier: 3,
-        rawCallCount: globCount,
-        firstOrder: firstSeen.get("look_files") ?? 0,
+        rawCallCount: exploreCalls,
+        firstOrder: firstSeen.get("explore") ?? 0,
       });
     }
 
@@ -892,7 +877,7 @@ export function summarizeWorkChunk(
 
     if (commandCount > 0) {
       buckets.push({
-        label: commandCount === 1 ? t("stage.ranCommand") : t("stage.ranCommands", { count: commandCount }),
+        label: commandCount === 1 ? t("stage.ranCommand") : t("stage.ranCommands"),
         tier: 4,
         rawCallCount: commandCount,
         firstOrder: firstSeen.get("shell") ?? 0,
@@ -901,7 +886,7 @@ export function summarizeWorkChunk(
 
     if (otherToolCount > 0) {
       buckets.push({
-        label: otherToolCount === 1 ? t("stage.usedTool") : t("stage.usedTools", { count: otherToolCount }),
+        label: otherToolCount === 1 ? t("stage.usedTool") : t("stage.usedTools"),
         tier: 4,
         rawCallCount: otherToolCount,
         firstOrder: firstSeen.get("other") ?? 0,
@@ -915,26 +900,11 @@ export function summarizeWorkChunk(
         a.firstOrder - b.firstOrder,
     );
 
-    const visibleLimit = buckets.length > 3 ? 2 : 3;
-    const shownLen = Math.min(buckets.length, visibleLimit);
-    let hiddenSteps = 0;
-    for (let i = shownLen; i < buckets.length; i += 1) {
-      hiddenSteps += buckets[i].rawCallCount;
-    }
-    const formattedShown = buckets
-      .slice(0, shownLen)
+    const formatted = buckets
       .map((b, idx) => (idx === 0 || locale !== "en" ? b.label : lowercaseClauseLead(b.label)))
       .join(locale === "en" ? ", " : "、");
 
-    if (shownLen > 0 && hiddenSteps > 0) {
-      label = t(hiddenSteps === 1 ? "stage.oneMoreStep" : "stage.moreSteps", {
-        summary: formattedShown, count: hiddenSteps,
-      });
-    } else if (formattedShown) {
-      label = formattedShown;
-    } else {
-      label = t("stage.usedTools", { count: totalTc });
-    }
+    label = formatted || t("stage.usedTools");
   }
 
   return {

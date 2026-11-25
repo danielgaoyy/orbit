@@ -249,7 +249,7 @@ export const HostMemorySection = memo(function HostMemorySection({
   const [statusFilter, setStatusFilter] = useState<MemoryStatus | "all">("all");
   const [categoryFilter, setCategoryFilter] = useState<MemoryCategory | "all">("all");
   const [entries, setEntries] = useState<MemoryRowEntry[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(() => Boolean(activeCwd));
   const [error, setError] = useState<string | null>(null);
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ProjectMemoryItem | null>(null);
@@ -266,6 +266,7 @@ export const HostMemorySection = memo(function HostMemorySection({
     const seq = ++request.current;
     if (!activeCwd) {
       setEntries([]);
+      setLoading(false);
       return;
     }
     setLoading(true);
@@ -303,9 +304,15 @@ export const HostMemorySection = memo(function HostMemorySection({
   }, [activeCwd, categoryFilter, hostId, searchQuery, statusFilter]);
 
   useEffect(() => {
+    if (!searchQuery.trim()) {
+      void loadMemories();
+      return () => {
+        request.current += 1;
+      };
+    }
     const timer = window.setTimeout(() => {
       void loadMemories();
-    }, searchQuery.trim() ? 180 : 0);
+    }, 180);
     return () => {
       request.current += 1;
       window.clearTimeout(timer);
@@ -427,14 +434,14 @@ export const HostMemorySection = memo(function HostMemorySection({
       />
 
       {error && (
-        <div className="border-signal-danger/30 bg-signal-danger/8 text-signal-danger rounded-[10px] border px-3.5 py-2.5 text-[13px]">
+        <div className="border-signal-danger/30 bg-signal-danger/8 text-signal-danger rounded-[10px] border px-4 py-2 text-[13px]">
           {error}
         </div>
       )}
 
       {/* Recall and filters */}
       <SettingCard>
-        <div className="flex flex-col gap-3 px-4 py-3.5">
+        <div className="flex flex-col gap-3 px-4 py-3">
           <div data-setting-id="memory.searchPlaceholder" className="relative flex-1">
             <Search className="text-ink-faint pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2" />
             <Input
@@ -475,7 +482,7 @@ export const HostMemorySection = memo(function HostMemorySection({
       </SettingCard>
 
       {/* Memory Items */}
-      <div className="flex flex-col gap-2">
+      <div className="flex flex-col gap-3">
         <SettingGroupLabel>
           {t("memory.listHeading", { count: entries.length })}
         </SettingGroupLabel>
@@ -494,7 +501,7 @@ export const HostMemorySection = memo(function HostMemorySection({
           </SettingCard>
         ) : loading && entries.length === 0 ? (
           <SettingCard>
-            <div className="text-ink-muted flex items-center gap-2.5 px-4 py-6 text-[13px]">
+            <div className="text-ink-muted flex items-center gap-2 px-4 py-6 text-[13px]">
               <OrbitSpinner size={14} />
               <span>{t("common.loading")}</span>
             </div>
@@ -512,7 +519,7 @@ export const HostMemorySection = memo(function HostMemorySection({
             </Empty>
           </SettingCard>
         ) : (
-          <div className="flex flex-col gap-2.5">
+          <div className="flex flex-col gap-3">
             {entries.map(({ item, score }) => {
               const needsRevalidation = item.status === "needs_revalidation";
               const isConfirming = confirmingId === item.id;
@@ -520,7 +527,7 @@ export const HostMemorySection = memo(function HostMemorySection({
                 <div
                   key={item.id}
                   className={cn(
-                    "bg-surface-raised flex flex-col gap-2.5 rounded-[12px] border px-4 py-3.5 transition-colors",
+                    "bg-surface-raised flex flex-col gap-3 rounded-[12px] border px-4 py-3 transition-colors",
                     needsRevalidation
                       ? "border-signal-warning/45 bg-signal-warning/[0.035]"
                       : "border-border-subtle",
@@ -528,7 +535,7 @@ export const HostMemorySection = memo(function HostMemorySection({
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0 flex-1 space-y-1">
-                      <div className="flex flex-wrap items-center gap-1.5">
+                      <div className="flex flex-wrap items-center gap-2">
                         <span className="text-ink-primary text-[13px] font-semibold">
                           {item.title}
                         </span>
@@ -559,7 +566,7 @@ export const HostMemorySection = memo(function HostMemorySection({
                       </p>
                     </div>
 
-                    <div className="flex shrink-0 items-center gap-1.5">
+                    <div className="flex shrink-0 items-center gap-2">
                       {item.status !== "confirmed" && (
                         <Button
                           variant={needsRevalidation ? "default" : "outline"}
@@ -597,7 +604,7 @@ export const HostMemorySection = memo(function HostMemorySection({
                   </div>
 
                   {(item.file_paths.length > 0 || item.tags.length > 0) && (
-                    <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                    <div className="flex flex-wrap items-center gap-2 pt-1">
                       {item.file_paths.map((fp) => (
                         <Badge
                           key={`fp:${fp}`}

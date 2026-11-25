@@ -121,4 +121,32 @@ describe("text-reveal", () => {
     assert.equal(shouldPaceTextReveal(true), true);
     assert.equal(shouldPaceTextReveal(false), false);
   });
+
+  it("slices large code blocks and multi-byte grapheme clusters safely via windowed boundary clamping", () => {
+    const emojiLine = "prefix 👨‍👩‍👧‍👦 suffix";
+    const emojiBlock = makeParagraph(emojiLine);
+    // Cutting inside the ZWJ family emoji must clamp cleanly to its start without splitting surrogates.
+    const slicedEmoji = sliceRichBlocks([emojiBlock], 10);
+    assert.equal(slicedEmoji.length, 1);
+    assert.equal(slicedEmoji[0].kind === "paragraph" ? slicedEmoji[0].spans[0].text : "", "prefix ");
+
+    const rawLines = Array.from({ length: 120 }, (_, i) => `const line_${i} = ${i};`);
+    const codeBlock: RichBlockView = {
+      kind: "code_block",
+      language: "ts",
+      raw_code: rawLines.join("\n"),
+      lines: rawLines.map((text, idx) => ({
+        line_number: idx + 1,
+        tokens: [{ text, fg_hex: "#d4d4d4", bold: false, italic: false }],
+      })),
+    };
+    const twoLinesLen = rawLines[0].length + 1 + 5;
+    const slicedCode = sliceRichBlocks([codeBlock], twoLinesLen);
+    assert.equal(slicedCode.length, 1);
+    assert.equal(slicedCode[0].kind, "code_block");
+    if (slicedCode[0].kind === "code_block") {
+      assert.equal(slicedCode[0].lines.length, 2);
+      assert.equal(slicedCode[0].raw_code, `${rawLines[0]}\nconst`);
+    }
+  });
 });

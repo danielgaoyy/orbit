@@ -60,7 +60,7 @@ export function AddHostSection({ onPaired }: { onPaired: (id: string) => void })
     (host) => isLocalHostCard(host) || machine?.host_id === host.host_id,
   );
   return (
-    <div className="flex flex-col gap-[20px]">
+    <div className="flex flex-col gap-6">
       {machine && !localPaired && (
         <SettingCard>
           <SettingResourceRow
@@ -80,7 +80,7 @@ export function AddHostSection({ onPaired }: { onPaired: (id: string) => void })
           />
         </SettingCard>
       )}
-      <div className="flex flex-col gap-2">
+      <div className="flex flex-col gap-3">
         <SettingGroupLabel>{t("web.uri")}</SettingGroupLabel>
         <SettingCard>
           <form
@@ -113,7 +113,7 @@ export function AddHostSection({ onPaired }: { onPaired: (id: string) => void })
         </SettingCard>
       </div>
       {sshHosts.length > 0 && (
-        <div className="flex flex-col gap-2">
+        <div className="flex flex-col gap-3">
           <SettingGroupLabel>{t("settings.fleetSshConfig")}</SettingGroupLabel>
           <SettingCard>
             {sshHosts.map((ssh) => {

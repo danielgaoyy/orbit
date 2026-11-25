@@ -254,9 +254,9 @@ it("never renders live elapsed clocks or duplicated nested grandchild trees in t
   assert.equal(overview.html.match(/data-slot="subagent-avatar"/g)?.length, 2);
 });
 
-it("uses one inline step rail and offers a bottom collapse action from ten steps", async () => {
+it("uses one inline step rail and folds earlier steps above twelve without a bottom collapse button", async () => {
   const { TurnActivityDisclosure } = await server.ssrLoadModule("/src/components/stage/stage-step-group.tsx");
-  for (const count of [1, 9, 10, 50]) {
+  for (const count of [1, 9, 12, 13, 50]) {
     const props = {
       items: Array.from({ length: count }, (_, seq) => ({
         item_type: "assistant_message", seq, text: "Step " + (seq + 1), blocks: [], streaming: false,
@@ -269,17 +269,20 @@ it("uses one inline step rail and offers a bottom collapse action from ten steps
     const expanded = renderRow(TurnActivityDisclosure, props, [0]);
     assert.match(expanded.html, /aria-expanded="true"/);
     assert.equal(expanded.html.match(/data-slot="trace"/g)?.length, 2);
-    assert.equal(expanded.html.match(/data-slot="trace-line"/g)?.length, count + 1);
+    const visibleSteps = count > 12 ? 8 : count;
+    assert.equal(expanded.html.match(/data-slot="trace-line"/g)?.length, visibleSteps + 1);
     assert.equal(expanded.html.match(/data-slot="trace-collapsible-content-inner"/g)?.length, 1);
     assert.match(expanded.html, /data-slot="trace-collapsible-trigger"/);
     assertIndependentControls(expanded.html);
     assert.ok(expanded.html.includes("Step " + count + "</span>"));
-    assert.doesNotMatch(expanded.html, /orbit-disclosure-(track|scroll)|orbit-sticky-disclosure-bar|lucide-(maximize|minimize)|max-h-\[340px\]|overflow-y-auto/);
-    assert.equal(expanded.html.includes("Collapse " + count + " steps"), count >= 10);
-    if (count >= 10) {
-      const folded = renderRow(TurnActivityDisclosure, props, [0, 1]);
-      assert.match(folded.html, /aria-expanded="false"/);
-      assert.doesNotMatch(folded.html, /Step 1|Collapse \d+ steps/);
+    assert.doesNotMatch(expanded.html, /orbit-disclosure-(track|scroll)|orbit-sticky-disclosure-bar|lucide-(maximize|minimize)|max-h-\[340px\]|overflow-y-auto|Collapse \d+ steps/);
+    if (count > 12) {
+      const hidden = count - 8;
+      assert.ok(expanded.html.includes(`Show ${hidden} earlier steps`));
+      assert.ok(!expanded.html.includes("Step 1</span>"));
+    } else {
+      assert.doesNotMatch(expanded.html, /Show \d+ earlier step/);
+      assert.ok(expanded.html.includes("Step 1</span>"));
     }
   }
 });
@@ -301,21 +304,32 @@ it("keeps hook order when a compaction-only turn gains ordinary activity", async
   }
   const html = renderToStaticMarkup(createElement(TurnUpdate));
   assert.match(html, /Compaction finished/);
-  assert.match(html, /contain:layout style/);
+  assert.match(html, /contain:layout[_ ]style/);
 });
 
-it("keeps incoming message expansion separate from opening a provider-native sender", async () => {
+it("keeps incoming failure expansion separate from opening a provider-native sender and hides direct messages", async () => {
   const { AgentMessageCard } = await server.ssrLoadModule("/src/components/stage/subagents-track.tsx");
   const { opened } = await server.ssrLoadModule("/src/state/orbit-store.ts");
-  const props = { hostId: "local", agentId: "parent", sessionSubagents: [{
+  const subagents = [{
     callId: "launch", title: "Reviewer", childAgentId: null,
     providerSubagentId: "native-review", childHostId: "local",
-  }], item: { kind: "direct_message", source_agent_id: "native-review", source_title: "Reviewer",
-    text: "Review ready", blocks: [], seq: 2 } };
+  }];
+  // Direct inter-agent messages stay completely silent
+  const directHtml = renderRow(AgentMessageCard, {
+    hostId: "local", agentId: "parent", sessionSubagents: subagents,
+    item: { kind: "direct_message", source_agent_id: "native-review", source_title: "Reviewer",
+      text: "Review ready", blocks: [], seq: 2 },
+  }).html;
+  assert.equal(directHtml, "");
+
+  // Failed finish alerts stay expandable with a separate open-sender control
+  const props = { hostId: "local", agentId: "parent", sessionSubagents: subagents,
+    item: { kind: "finish_notification", event: "failed", source_agent_id: "native-review", source_title: "Reviewer",
+      text: "Review failed", blocks: [], seq: 2 } };
   const before = opened.length;
   const expanded = renderRow(AgentMessageCard, props, [0]);
   assert.match(expanded.html, /aria-expanded="true"/);
-  assert.match(expanded.html, /<p[^>]*>Review ready<\/p>/);
+  assert.match(expanded.html, /<p[^>]*>Review failed<\/p>/);
   assert.equal(opened.length, before);
   expanded.clicks[1]();
   assert.equal(opened.at(-1).providerSubagentId, "native-review");
@@ -350,13 +364,10 @@ it("tracks the exact child's pending approval across reloads and exposes only In
 
     host.pending_permissions = [{ agent_id: "ag_other", request_id: "req" },
       { agent_id: "ag_review", request_id: "other" }];
+    // Once resolved, permission callbacks stay completely silent in the main stream
     const settled = renderRow(AgentMessageCard, props);
-    assert.match(settled.html, /data-status="completed"/);
-    assert.match(settled.html, />Resolved</);
-    assert.doesNotMatch(settled.html, /requested approval|Awaiting decision|border-signal-warning/);
-    assert.match(settled.html, /data-slot="collapsible-trigger"/);
-    assert.doesNotMatch(settled.html, /border-border-subtle|bg-surface-recessed/);
-    assert.equal(settled.clicks.length, 2);
+    assert.equal(settled.html, "");
+    assert.equal(settled.clicks.length, 0);
   } finally {
     delete host.pending_permissions;
     delete state.stages[stageKey];
@@ -386,17 +397,13 @@ it("reuses dispatch maps until a resolved entry or timeline key changes", async 
   assert.notEqual(results[4], results[5]);
 });
 
-it("shows one frameless peer report with the finish badge and status, preserving separate failure alerts", async () => {
+it("hides direct inter-agent messages and routine finish callbacks while preserving failure alerts", async () => {
   const { TurnStageSection } = await server.ssrLoadModule("/src/components/stage/stage-turn-card.tsx");
   const report = {
     item_type: "agent_message", kind: "direct_message", seq: 1, message_id: "report",
     source_agent_id: "ag_review", source_title: "Reviewer", text: "Review ready", blocks: [],
   };
-  for (const [event, expectedStatus, badge] of [
-    ["finished", "finished", "bg-signal-success"],
-    ["canceled", "stopped", "bg-ink-muted"],
-    ["errored", "failed", "bg-signal-danger"],
-  ]) {
+  for (const event of ["finished", "canceled", "errored"]) {
     const finish = { ...report, seq: 5, message_id: "finish", kind: "finish_notification", event, text: "Final notification" };
     const turn = {
       agent_message: report, folded_steps: [], notices: [], compactions: [], turn_diffs: [],
@@ -405,19 +412,36 @@ it("shows one frameless peer report with the finish badge and status, preserving
     const html = renderRow(TurnStageSection, {
       hostId: "local", agentId: "parent", cwd: "/", hostArtifacts: [], turn, isTurnActive: false,
     }).html;
-    assert.equal(html.match(/data-slot="subagent-avatar"/g)?.length, event === "errored" ? 2 : 1);
-    assert.match(html, new RegExp(badge));
-    assert.match(html, new RegExp(">" + expectedStatus + "<", "i"));
-    assert.match(html, /Review ready/);
+    // Timeline messages never render colorful animal avatars or direct inter-agent rows
+    assert.doesNotMatch(html, /data-slot="subagent-avatar"/);
+    assert.doesNotMatch(html, /Review ready/);
     if (event === "errored") {
+      assert.match(html, />failed</i);
       assert.match(html, /border-signal-danger-border bg-signal-danger-bg\/45/);
       assert.match(html, /Final notification/);
     } else {
-      assert.doesNotMatch(html, /Final notification|bg-surface-recessed\/55|border-signal-danger-border/);
-      const rowClasses = html.match(/class="(group\/msgrow [^"]+)"/)?.[1] ?? "";
-      assert.match(rowClasses, /hover:bg-accent\/55/);
-      assert.doesNotMatch(rowClasses, /\bborder\b|bg-surface-raised/);
+      assert.equal(html, "");
     }
+  }
+
+  // Standalone direct_message or routine finish_notification turns render nothing (no ghost footer)
+  for (const opening of [
+    report,
+    {
+      item_type: "agent_message", kind: "finish_notification", seq: 10, message_id: "fin-10",
+      source_agent_id: "ag_review", source_title: "Reviewer", event: "finished", text: "Done", blocks: [],
+    },
+  ]) {
+    const emptyTurn = {
+      agent_message: opening,
+      folded_steps: [], notices: [], compactions: [], turn_diffs: [],
+      live_segments: [],
+      completed_at_ms: 1_700_000_000_000,
+    };
+    const emptyHtml = renderRow(TurnStageSection, {
+      hostId: "local", agentId: "parent", cwd: "/", hostArtifacts: [], turn: emptyTurn, isTurnActive: false,
+    }).html;
+    assert.equal(emptyHtml, "");
   }
 });
 
@@ -458,13 +482,14 @@ it("keeps an empty live status static and remembers a manual override on an auto
   };
   const live = renderRow(TurnActivityDisclosure, props);
   assert.match(live.html, /data-status="running"/);
+  assert.match(live.html, /lucide-brain/);
   assert.match(live.html, /Thinking…/);
-  assert.match(live.html, /Offline/i);
+  assert.doesNotMatch(live.html, /Offline|queued|waiting for response|steps/i);
   assert.doesNotMatch(live.html, /<button\b|data-slot="trace-collapsible"/);
   assert.equal(renderRow(TurnActivityDisclosure, { ...props, isWorkActive: false }).html, "");
 
   const failed = {
-    ...props, isWorkActive: false, settledLabel: "Worked", settledDurationMs: 3200,
+    ...props, isWorkActive: false, settledLabel: "Ran a command", settledDurationMs: 3200,
     summaryCounts: { failed_count: 1, unrecovered_failure_count: 1 },
     items: [{ item_type: "tool_call", seq: 1, status: "failed", diff_files: [],
       detail: { kind: "shell", command: "pwd", output_preview: "failure output", exit_code: 1 } }],
@@ -472,7 +497,8 @@ it("keeps an empty live status static and remembers a manual override on an auto
   const initial = renderRow(TurnActivityDisclosure, failed);
   assert.equal(initial.html.match(/aria-expanded="true"/g)?.length, 2);
   assert.match(initial.html, /failure output/);
-  assert.match(initial.html, /data-slot="trace-description"[^>]*>· 3s</);
+  // Settled step groups omit per-group duration (moved to turn-level Worked for) and leading icons
+  assert.doesNotMatch(initial.html, /data-slot="trace-description"[^>]*>· 3s</);
   assert.match(initial.html, /1 failed/);
   assertIndependentControls(initial.html);
   renderRow(TurnActivityDisclosure, failed, [0]);
@@ -489,6 +515,24 @@ it("exposes tool details only when present and keeps navigation and Copy outside
   const pending = renderRow(StepItemRow, { ...props, item: { ...tool, detail: generic } });
   assert.match(pending.html, /data-status="running"/);
   assert.doesNotMatch(pending.html, /<button\b/);
+
+  // Long clickable file paths must truncate only the path button, never squeezing the action verb (`Read` / `已读取`)
+  const longRead = renderRow(StepItemRow, {
+    ...props,
+    item: {
+      ...tool,
+      status: "completed",
+      detail: {
+        kind: "file_read",
+        path: "/Users/jess/.gemini/antigravity-cli/brain/a46fa900-2ce2-438f-9c5a-0c7812b510d5/.user_uploaded/uploaded_media_0_1795624988351.jpg",
+        start_line: null,
+        end_line: null,
+      },
+    },
+  });
+  assert.match(longRead.html, /data-slot="trace-line"[^>]*class="[^"]*\bshrink-0\b/);
+  assert.match(longRead.html, /data-slot="trace-title"[^>]*class="[^"]*\bshrink-0\b/);
+  assert.match(longRead.html, /<button[^>]*class="[^"]*\bmin-w-0\b[^"]*\btruncate\b[^"]*"[^>]*>\/Users\/jess\/\.gemini\//);
 
   for (const detail of [
     { ...generic, arguments_json: '{"project":"orbit"}' },
@@ -521,4 +565,138 @@ it("renders system notes as markers and a detail-free worktree handoff as a stat
   assert.match(handoff.html, /data-slot="trace-line"/);
   assert.match(handoff.html, /data-status="running"/);
   assert.doesNotMatch(handoff.html, /<button\b/);
+});
+
+it("wraps completed turn work behind Worked for, hides settled icons/suffixes, and omits thinking preview", async () => {
+  const { TurnStageSection } = await server.ssrLoadModule("/src/components/stage/stage-turn-card.tsx");
+  const { TurnActivityDisclosure } = await server.ssrLoadModule("/src/components/stage/stage-step-group.tsx");
+  const { StepItemRow } = await server.ssrLoadModule("/src/components/stage/stage-tool-renderers.tsx");
+
+  // 1. Live step group: dynamic tool icon (FilePenLine for running file_edit) + active label + dotless elapsed,
+  //    drops step count / diff / stall / queued / thinking subtitle
+  const liveGroup = renderRow(TurnActivityDisclosure, {
+    items: [
+      { item_type: "assistant_thinking", seq: 1, text: "Checking hidden headline" },
+      { item_type: "tool_call", seq: 2, status: "running", summary_title: "Edit a.ts", diff_files: [], detail: { kind: "file_edit", path: "/a.ts" } },
+    ],
+    isWorkActive: true,
+    liveLabel: "Editing a.ts…",
+    liveDetail: "Checking hidden headline",
+    settledLabel: "",
+    summaryCounts: { action_steps: 1, additions: 12, deletions: 4, unrecovered_failure_count: 0 },
+    labelIncludesFailure: false,
+    defaultCollapsed: true,
+    autoOpenForError: false,
+    liveStartedAtMs: Date.now() - 5000,
+    cwd: "/",
+    agentId: "ag",
+    thinkingSignature: "",
+    getThinkingDurationMs: () => null,
+    holdViewport: (_a: unknown, apply: () => void) => apply(),
+  });
+  assert.match(liveGroup.html, /lucide-file-pen-line/);
+  assert.doesNotMatch(liveGroup.html, /lucide-list-checks|lucide-sparkles/);
+  assert.match(liveGroup.html, /Editing a\.ts…/);
+  // Elapsed renders without middle-dot separator
+  assert.match(liveGroup.html, /data-slot="trace-description"[^>]*>5s</);
+  assert.doesNotMatch(liveGroup.html, /· 5s|Checking hidden headline|2 steps|\+12|>-4<|Offline|queued/i);
+
+  // 2. Inner thinking row: omits both leading icon and truncated headline preview while collapsed
+  const thinkingRow = renderRow(StepItemRow, {
+    cwd: "/",
+    thoughtDurationMs: 5000,
+    holdViewport: (_a: unknown, apply: () => void) => apply(),
+    item: { item_type: "assistant_thinking", seq: 1, item_id: "th1", text: "Secret preview sentence\nDetails" },
+  });
+  assert.match(thinkingRow.html, /Thought for 5s/);
+  assert.doesNotMatch(thinkingRow.html, /Secret preview sentence|lucide-sparkles/);
+  assert.equal(thinkingRow.html.match(/data-slot="trace-icon"/g)?.length, 1);
+
+  // 3. Completed turn with tool work + final reply: folds pre-final work behind iconless "Worked for 18s"
+  const turn = {
+    key: "turn-1",
+    turn_index: 0,
+    anchor_seq: 10,
+    is_compaction_command: false,
+    folded_steps: [],
+    notices: [],
+    compactions: [],
+    turn_diffs: [],
+    work_duration_ms: 18_000,
+    turn_duration_ms: 18_000,
+    has_unrecovered_error: false,
+    live_segments: [
+      {
+        kind: "step_group",
+        key: "sg-1",
+        first_seq: 11,
+        items: [
+          { item_type: "tool_call", seq: 11, status: "completed", summary_title: "Read a", diff_files: [], detail: { kind: "file_read", path: "/repo/a.ts" } },
+          { item_type: "tool_call", seq: 12, status: "completed", summary_title: "Read b", diff_files: [], detail: { kind: "file_read", path: "/repo/b.ts" } },
+        ],
+        summary: {
+          counts: { action_steps: 2, read_file_count: 2, unrecovered_failure_count: 0, failed_count: 0, denied_count: 0, additions: 0, deletions: 0 },
+          label: "Read files",
+          live_label: "Reading b.ts…",
+          live_detail: null,
+          label_includes_failure: false,
+        },
+        has_following_content: true,
+        has_running_step: false,
+        work_duration_ms: 18_000,
+      },
+      {
+        kind: "assistant_message",
+        key: "msg-final",
+        item: {
+          item_type: "assistant_message",
+          seq: 13,
+          item_id: "m13",
+          text: "All done.",
+          streaming: false,
+          blocks: [{ kind: "paragraph", spans: [{ text: "All done.", bold: false, italic: false, strikethrough: false, inline_code: false, link_url: null }] }],
+        },
+      },
+    ],
+  };
+  const collapsedTurn = renderRow(TurnStageSection, {
+    hostId: "local",
+    agentId: "ag-worked",
+    cwd: "/repo",
+    hostArtifacts: [],
+    turn,
+    isTurnActive: false,
+    autoFoldCompleted: true,
+    isNetworkOffline: false,
+    thinkingSignature: "",
+    getThinkingDurationMs: () => null,
+    holdViewport: (_a: unknown, apply: () => void) => apply(),
+    onRequestRewind: () => {},
+    onPreviewImage: () => {},
+  });
+  assert.match(collapsedTurn.html, /Worked for 18s/);
+  assert.match(collapsedTurn.html, /All done\./);
+  assert.doesNotMatch(collapsedTurn.html, /Read files/);
+  // Trigger has trailing chevron trace-icon only (no leading prefix icon inside trace-line)
+  assert.equal(collapsedTurn.html.match(/data-slot="trace-icon"/g)?.length, 1);
+
+  // Expanding "Worked for 18s" (via autoFoldCompleted=false) reveals iconless "Read files" without per-group "· 18s"
+  const expandedTurn = renderRow(TurnStageSection, {
+    hostId: "local",
+    agentId: "ag-worked-open",
+    cwd: "/repo",
+    hostArtifacts: [],
+    turn,
+    isTurnActive: false,
+    autoFoldCompleted: false,
+    isNetworkOffline: false,
+    thinkingSignature: "",
+    getThinkingDurationMs: () => null,
+    holdViewport: (_a: unknown, apply: () => void) => apply(),
+    onRequestRewind: () => {},
+    onPreviewImage: () => {},
+  });
+  assert.match(expandedTurn.html, /Worked for 18s/);
+  assert.match(expandedTurn.html, /Read files/);
+  assert.doesNotMatch(expandedTurn.html, /· 18s/);
 });

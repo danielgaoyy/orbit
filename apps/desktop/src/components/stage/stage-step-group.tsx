@@ -1,26 +1,22 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowLeftRight,
   ArrowRight,
-  ArrowUp,
   ArrowUpRight,
   Blocks,
+  Brain,
   ChevronRight,
+  ChevronsUpDown,
+  FoldVertical,
   GitBranch,
-  ListChecks,
   RotateCw,
-  Scissors,
-  Sparkles,
   Timer,
   Users,
 } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { DiffStat } from "@/components/ui/diff-stat";
 import { Marker, MarkerContent, MarkerIcon } from "@/components/ui/marker";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { SubagentAvatar } from "@/components/ui/subagent-avatar";
 import {
   Trace,
   TraceCollapsible,
@@ -39,10 +35,7 @@ import {
   extractSubagentMessageCall,
   resolveDelegationDispatches,
 } from "@/lib/subagents";
-import {
-  type SubagentCharacterSpec,
-  resolveSubagentCharacter,
-} from "@/lib/subagent-avatar";
+import type { SubagentCharacterSpec } from "@/lib/subagent-avatar";
 import { formatDurationCompact, formatThoughtSummaryLabel } from "@/lib/timeline-coalesce";
 import {
   type ToolCallTimelineItem,
@@ -66,13 +59,16 @@ import {
 import { StageCopyButton } from "./stage-prompt-controls";
 import {
   InlineLiveElapsed,
-  LiveStallInterruptButton,
   StepItemRow,
+  resolveLiveToolCallIcon,
 } from "./stage-tool-renderers";
 
 type SubagentMaybeWithAvatar = ResolvedSubagentItem & {
   readonly character?: SubagentCharacterSpec;
 };
+
+export const LONG_STEP_LIST_THRESHOLD = 12;
+export const RECENT_VISIBLE_STEP_COUNT = 8;
 
 /** Vertical step connector rail for expanded turn activity steps. */
 export const StepTimelineRail = memo(function StepTimelineRail({
@@ -81,6 +77,7 @@ export const StepTimelineRail = memo(function StepTimelineRail({
   cwd,
   holdViewport,
   isLiveActive = false,
+  followBottomOnExpand = false,
   autoExpandErrors = false,
   agentId,
   thinkingSignature: _thinkingSignature,
@@ -93,6 +90,7 @@ export const StepTimelineRail = memo(function StepTimelineRail({
   cwd: string;
   holdViewport: ViewportAnchorHoldFn;
   isLiveActive?: boolean;
+  followBottomOnExpand?: boolean;
   autoExpandErrors?: boolean;
   agentId: string;
   thinkingSignature: string;
@@ -100,13 +98,52 @@ export const StepTimelineRail = memo(function StepTimelineRail({
   sessionSubagents?: readonly SubagentMaybeWithAvatar[];
   onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
 }) {
+  const { t } = useI18n();
+  const [showEarlier, setShowEarlier] = useState(false);
+  const showEarlierRef = useRef<HTMLButtonElement | null>(null);
+
   if (items.length === 0) return null;
 
+  const hasOverflow = items.length > LONG_STEP_LIST_THRESHOLD;
+  const candidateHiddenCount = hasOverflow ? items.length - RECENT_VISIBLE_STEP_COUNT : 0;
+  const hasHiddenError =
+    autoExpandErrors &&
+    candidateHiddenCount > 0 &&
+    items
+      .slice(0, candidateHiddenCount)
+      .some(
+        (it) =>
+          it.item_type === "tool_call" && (it.status === "failed" || it.status === "denied"),
+      );
+  const hiddenCount = hasOverflow && !showEarlier && !hasHiddenError ? candidateHiddenCount : 0;
+  const visibleItems = hiddenCount > 0 ? items.slice(hiddenCount) : items;
   const lastSeq = items[items.length - 1]?.seq;
 
   return (
     <Trace className="gap-1">
-      {items.map((sub, i) => {
+      {hiddenCount > 0 && (
+        <button
+          ref={showEarlierRef}
+          type="button"
+          onClick={() =>
+            holdViewport(showEarlierRef.current, () => setShowEarlier(true), "top", {
+              intent: "expand",
+            })
+          }
+          className="text-ink-muted hover:text-foreground flex min-h-[24px] w-fit cursor-pointer items-center gap-2 rounded-md text-left text-[13px] leading-[18px] transition-colors outline-none focus-visible:ring-1 focus-visible:ring-ring/45"
+        >
+          <TraceIcon>
+            <ChevronsUpDown className="size-3.5" />
+          </TraceIcon>
+          <span>
+            {t(hiddenCount === 1 ? "stage.showEarlierStep" : "stage.showEarlierSteps", {
+              count: hiddenCount,
+            })}
+          </span>
+        </button>
+      )}
+      {visibleItems.map((sub, i) => {
+        const originalIndex = hiddenCount + i;
         const isLastInLiveGroup = isLiveActive && sub.seq === lastSeq;
         const thinkingKey =
           sub.item_type === "assistant_thinking"
@@ -116,12 +153,13 @@ export const StepTimelineRail = memo(function StepTimelineRail({
 
         return (
           <StepItemRow
-            key={stableStepItemKey(sub, i)}
+            key={stableStepItemKey(sub, originalIndex)}
             item={sub}
             hostId={hostId}
             agentId={agentId}
             cwd={cwd}
             holdViewport={holdViewport}
+            followBottomOnExpand={followBottomOnExpand}
             isActivelyThinking={
               sub.item_type === "assistant_thinking" && isLastInLiveGroup
             }
@@ -153,7 +191,6 @@ type DelegationMilestoneEntry =
       detailIsMono: boolean;
       status: "running" | "completed" | "failed" | "denied";
       subagent?: SubagentMaybeWithAvatar;
-      character?: SubagentCharacterSpec;
     }
   | {
       kind: "state_change";
@@ -211,11 +248,6 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
         const enriched = resolved.subagent as SubagentMaybeWithAvatar;
 
         if (resolved.action === "message") {
-          const character =
-            enriched.character ??
-            resolveSubagentCharacter(
-              enriched.childAgentId || enriched.providerSubagentId || enriched.callId || enriched.key,
-            );
           const msgCall = extractSubagentMessageCall(it);
           const rawArgs = it.detail.kind === "generic" ? it.detail.arguments_json.trim() : "";
           const detailText =
@@ -231,7 +263,6 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
             detailIsMono: !msgCall?.message && detailText.length > 0,
             status: it.status,
             subagent: enriched,
-            character,
           });
           continue;
         }
@@ -491,13 +522,7 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
             preview={entry.preview}
             failed={isFailed}
             statusLabel={isFailed ? t("stage.failed") : undefined}
-            avatar={entry.character ? (
-              <SubagentAvatar
-                character={entry.character}
-                status={recipient?.status ?? (entry.status === "running" ? "running" : "completed")}
-                size="sm"
-              />
-            ) : entry.status === "running" ? (
+            avatar={entry.status === "running" ? (
               <OrbitSpinner size={14} />
             ) : isFailed ? (
               <AlertTriangle className="size-3.5 shrink-0 text-signal-danger" />
@@ -530,8 +555,8 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
 export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   items,
   isWorkActive,
+  isTrailingLatest = false,
   liveLabel,
-  liveDetail,
   settledLabel,
   hasProjectedSummary = false,
   thoughtDurationMs,
@@ -540,13 +565,6 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   defaultCollapsed,
   autoOpenForError,
   liveStartedAtMs,
-  latestActivityMs,
-  latestVisibleProgressMs,
-  queuedNotificationCount = 0,
-  onInterruptAndContinue = null,
-  isNetworkOffline = false,
-  isBackgroundWait = false,
-  settledDurationMs,
   hostId,
   cwd,
   agentId,
@@ -561,8 +579,9 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
 }: {
   items: TimelineItemView[];
   isWorkActive: boolean;
+  isTrailingLatest?: boolean;
   liveLabel: string;
-  liveDetail: string | null;
+  liveDetail?: string | null;
   settledLabel: string;
   hasProjectedSummary?: boolean;
   thoughtDurationMs?: number | null;
@@ -571,13 +590,7 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   defaultCollapsed: boolean;
   autoOpenForError: boolean;
   liveStartedAtMs: number | null;
-  latestActivityMs?: number | null;
-  latestVisibleProgressMs?: number | null;
-  queuedNotificationCount?: number;
-  onInterruptAndContinue?: (() => void) | null;
-  isNetworkOffline?: boolean;
-  isBackgroundWait?: boolean;
-  settledDurationMs: number | null;
+  settledDurationMs?: number | null;
   hostId?: string;
   cwd: string;
   agentId: string;
@@ -625,8 +638,157 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
 
   const defaultOpen = !defaultCollapsed || autoOpenForError;
   const isExpanded = userExpanded !== null ? userExpanded : defaultOpen;
+  const [hasOpened, setHasOpened] = useState(isExpanded);
+  if (isExpanded && !hasOpened) {
+    setHasOpened(true);
+  }
 
   if (items.length === 0 && !isWorkActive) return null;
+
+  const handleOpenChange = (open: boolean) => {
+    holdViewport(
+      foldBtnRef.current,
+      () => {
+        setUserExpanded(open);
+        if (canPersist) {
+          sharedDisclosureStateStore.set(agentId, turnIndex, workOrdinal, turnAnchorSeq, open);
+        }
+      },
+      "top",
+      { intent: open ? "expand" : "collapse", followBottom: isTrailingLatest },
+    );
+  };
+
+  const showFailureBadge =
+    !isWorkActive && summaryCounts.unrecovered_failure_count > 0 && !labelIncludesFailure;
+
+  const hasFailure = !isWorkActive && (labelIncludesFailure || showFailureBadge);
+  let activeLiveTool: Extract<TimelineItemView, { item_type: "tool_call" }> | null = null;
+  if (isWorkActive && items.length > 0) {
+    for (let i = items.length - 1; i >= 0; i -= 1) {
+      const it = items[i];
+      if (it.item_type === "tool_call" && it.status === "running") {
+        activeLiveTool = it;
+        break;
+      }
+    }
+    if (!activeLiveTool) {
+      const tail = items[items.length - 1];
+      if (tail?.item_type === "tool_call") activeLiveTool = tail;
+    }
+  }
+  const ActiveToolIcon = activeLiveTool ? resolveLiveToolCallIcon(activeLiveTool) : null;
+  const line = (
+    <TraceLine status={isWorkActive ? "running" : hasFailure ? "error" : undefined} className="text-[13px]">
+      {isWorkActive && (
+        <TraceIcon>
+          {ActiveToolIcon ? (
+            <ActiveToolIcon />
+          ) : (
+            <Brain className="size-3.5 animate-pulse motion-reduce:animate-none [.orbit-window-hidden_&]:[animation-play-state:paused]" strokeWidth={1.75} />
+          )}
+        </TraceIcon>
+      )}
+      <TraceTitle>
+        {isWorkActive ? activeLabel || t("stage.working") : finishedLabel}
+      </TraceTitle>
+      {isWorkActive && <InlineLiveElapsed startedAtMs={effectiveLiveStartedAtMs} />}
+      {showFailureBadge && (
+        <TraceDescription className="text-destructive">
+          · {t("stage.failedCount", { count: summaryCounts.unrecovered_failure_count })}
+        </TraceDescription>
+      )}
+    </TraceLine>
+  );
+
+  if (items.length === 0) {
+    return (
+      <Trace>
+        <div className="flex flex-wrap items-center gap-1.5">
+          {line}
+        </div>
+      </Trace>
+    );
+  }
+
+  return (
+    <Trace>
+      <TraceCollapsible open={isExpanded} onOpenChange={handleOpenChange}>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <TraceCollapsibleTrigger ref={foldBtnRef}>{line}</TraceCollapsibleTrigger>
+        </div>
+        <TraceCollapsibleContent>
+          {hasOpened ? (
+            <StepTimelineRail
+              items={items}
+              hostId={hostId}
+              cwd={cwd}
+              holdViewport={holdViewport}
+              isLiveActive={isWorkActive}
+              followBottomOnExpand={isTrailingLatest}
+              autoExpandErrors={
+                !isWorkActive && (summaryCounts.failed_count > 0 || summaryCounts.denied_count > 0)
+              }
+              agentId={agentId}
+              thinkingSignature={thinkingSignature}
+              getThinkingDurationMs={getThinkingDurationMs}
+              sessionSubagents={sessionSubagents}
+              onOpenSubagent={onOpenSubagent}
+            />
+          ) : null}
+        </TraceCollapsibleContent>
+      </TraceCollapsible>
+    </Trace>
+  );
+});
+
+export const TurnWorkedDisclosure = memo(function TurnWorkedDisclosure({
+  durationMs,
+  unrecoveredFailureCount = 0,
+  defaultCollapsed,
+  autoOpenForError,
+  agentId,
+  turnIndex,
+  turnAnchorSeq,
+  holdViewport,
+  children,
+}: {
+  durationMs: number | null;
+  unrecoveredFailureCount?: number;
+  defaultCollapsed: boolean;
+  autoOpenForError: boolean;
+  agentId: string;
+  turnIndex?: number;
+  turnAnchorSeq?: number;
+  holdViewport: ViewportAnchorHoldFn;
+  children: ReactNode | (() => ReactNode);
+}) {
+  const { t, locale } = useI18n();
+  const canPersist =
+    typeof turnIndex === "number" &&
+    typeof turnAnchorSeq === "number" &&
+    Boolean(agentId);
+  const workOrdinal = -1;
+
+  const [userExpanded, setUserExpanded] = useState<boolean | null>(() =>
+    canPersist
+      ? sharedDisclosureStateStore.get(agentId, turnIndex, workOrdinal, turnAnchorSeq)
+      : null,
+  );
+  const foldBtnRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    if (!canPersist) return;
+    const saved = sharedDisclosureStateStore.get(agentId, turnIndex, workOrdinal, turnAnchorSeq);
+    setUserExpanded((prev) => (prev === saved ? prev : saved));
+  }, [canPersist, agentId, turnIndex, turnAnchorSeq]);
+
+  const defaultOpen = !defaultCollapsed || autoOpenForError;
+  const isExpanded = userExpanded !== null ? userExpanded : defaultOpen;
+  const [hasOpened, setHasOpened] = useState(isExpanded);
+  if (isExpanded && !hasOpened) {
+    setHasOpened(true);
+  }
 
   const handleOpenChange = (open: boolean) => {
     holdViewport(
@@ -642,140 +804,143 @@ export const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
     );
   };
 
-  const showFailureBadge =
-    !isWorkActive && summaryCounts.unrecovered_failure_count > 0 && !labelIncludesFailure;
-  const showDiffNumbers =
-    isWorkActive && items.length > 0 && (summaryCounts.additions > 0 || summaryCounts.deletions > 0);
-  const showSettledDuration =
-    !isWorkActive &&
-    settledDurationMs !== null &&
-    settledDurationMs >= 1000 &&
-    !(thoughtOnly && Math.round((thoughtDurationMs ?? 0) / 1000) >= 1);
-
-  const hasFailure = !isWorkActive && (labelIncludesFailure || showFailureBadge);
-  const SummaryIcon = hasFailure ? AlertTriangle : thoughtOnly || items.length === 0 ? Sparkles : ListChecks;
-  const activeStallLabel = isBackgroundWait
-    ? items.length > 0
-      ? t("stage.runningInBackground")
-      : null
-    : undefined;
-  const line = (
-    <TraceLine status={isWorkActive ? "running" : hasFailure ? "error" : undefined} className="text-[13px]">
-      <TraceIcon><SummaryIcon /></TraceIcon>
-      <TraceTitle>
-        {isWorkActive ? activeLabel || t("stage.working") : finishedLabel}
-        {isWorkActive && liveDetail && items.length > 0 && <> {liveDetail}</>}
-      </TraceTitle>
-      {isWorkActive && items.length >= 2 && (
-        <TraceDescription>· {t("stage.stepCount", { count: items.length })}</TraceDescription>
-      )}
-      {isWorkActive && (
-        <InlineLiveElapsed
-          startedAtMs={effectiveLiveStartedAtMs}
-          lastActivityMs={latestActivityMs}
-          lastVisibleProgressMs={latestVisibleProgressMs}
-          isNetworkOffline={isNetworkOffline}
-          stallLabel={activeStallLabel}
-          queuedNotificationCount={queuedNotificationCount}
-        />
-      )}
-      {showDiffNumbers && (
-        <TraceDescription>
-          <DiffStat size="xs" additions={summaryCounts.additions} deletions={summaryCounts.deletions} />
-        </TraceDescription>
-      )}
-      {showFailureBadge && (
-        <TraceDescription className="text-destructive">
-          · {t("stage.failedCount", { count: summaryCounts.unrecovered_failure_count })}
-        </TraceDescription>
-      )}
-      {showSettledDuration && (
-        <TraceDescription>· {formatDurationCompact(settledDurationMs, locale)}</TraceDescription>
-      )}
-    </TraceLine>
-  );
-
-  const interruptButton = isWorkActive ? (
-    <LiveStallInterruptButton
-      startedAtMs={effectiveLiveStartedAtMs}
-      lastActivityMs={latestActivityMs}
-      lastVisibleProgressMs={latestVisibleProgressMs}
-      isNetworkOffline={isNetworkOffline}
-      stallLabel={activeStallLabel}
-      queuedNotificationCount={queuedNotificationCount}
-      onInterruptAndContinue={onInterruptAndContinue}
-    />
-  ) : null;
-
-  if (items.length === 0) {
-    return (
-      <Trace>
-        <div className="flex flex-wrap items-center gap-1.5">
-          {line}
-          {interruptButton}
-        </div>
-      </Trace>
-    );
-  }
+  const label =
+    durationMs !== null && durationMs >= 1000
+      ? t("stage.workedFor", { duration: formatDurationCompact(durationMs, locale) })
+      : t("stage.worked");
+  const showFailureBadge = unrecoveredFailureCount > 0;
 
   return (
     <Trace>
       <TraceCollapsible open={isExpanded} onOpenChange={handleOpenChange}>
-        <div className="flex flex-wrap items-center gap-1.5">
-          <TraceCollapsibleTrigger ref={foldBtnRef}>{line}</TraceCollapsibleTrigger>
-          {interruptButton}
-        </div>
+        <TraceCollapsibleTrigger ref={foldBtnRef}>
+          <TraceLine status={showFailureBadge ? "error" : undefined} className="text-[13px]">
+            <TraceTitle>{label}</TraceTitle>
+            {showFailureBadge && (
+              <TraceDescription className="text-destructive">
+                · {t("stage.failedCount", { count: unrecoveredFailureCount })}
+              </TraceDescription>
+            )}
+          </TraceLine>
+        </TraceCollapsibleTrigger>
         <TraceCollapsibleContent>
-          <StepTimelineRail
-            items={items}
-            hostId={hostId}
-            cwd={cwd}
-            holdViewport={holdViewport}
-            isLiveActive={isWorkActive}
-            autoExpandErrors={
-              !isWorkActive && (summaryCounts.failed_count > 0 || summaryCounts.denied_count > 0)
-            }
-            agentId={agentId}
-            thinkingSignature={thinkingSignature}
-            getThinkingDurationMs={getThinkingDurationMs}
-            sessionSubagents={sessionSubagents}
-            onOpenSubagent={onOpenSubagent}
-          />
-          {items.length >= 10 && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="xs"
-              className="mt-1"
-              onClick={() => {
-                foldBtnRef.current?.focus({ preventScroll: true });
-                foldBtnRef.current?.scrollIntoView({ block: "nearest" });
-                handleOpenChange(false);
-              }}
-            >
-              <ArrowUp data-icon="inline-start" />
-              {t("stage.collapseSteps", { count: items.length })}
-            </Button>
-          )}
+          {hasOpened ? (
+            <div className="min-w-0 space-y-3">
+              {typeof children === "function" ? children() : children}
+            </div>
+          ) : null}
         </TraceCollapsibleContent>
       </TraceCollapsible>
     </Trace>
   );
 });
 
-export const CompactionMilestoneRow = memo(function CompactionMilestoneRow({
-  label,
+export const CompactingStatusRow = memo(function CompactingStatusRow({
+  startedAtMs,
 }: {
-  label?: string;
+  startedAtMs?: number | null;
 }) {
   const { t } = useI18n();
+  const fallbackStartRef = useRef<number>(Date.now());
+  const effectiveStartedAtMs = startedAtMs ?? fallbackStartRef.current;
+
   return (
-    <Marker variant="separator" className="py-1">
-      <MarkerIcon><Scissors /></MarkerIcon>
-      <MarkerContent className="group-data-[variant=separator]/marker:shrink">
-        {!label || label === "Context compacted" ? t("stage.compacted") : label}
-      </MarkerContent>
-    </Marker>
+    <Trace className="py-1">
+      <TraceLine status="running" className="text-[13px]">
+        <TraceIcon>
+          <FoldVertical
+            className="size-3.5 animate-pulse motion-reduce:animate-none [.orbit-window-hidden_&]:[animation-play-state:paused]"
+            strokeWidth={1.75}
+          />
+        </TraceIcon>
+        <TraceTitle>{t("stage.compacting")}</TraceTitle>
+        <InlineLiveElapsed startedAtMs={effectiveStartedAtMs} />
+      </TraceLine>
+    </Trace>
+  );
+});
+
+function parseCompactionLabel(
+  raw: string | undefined,
+  forceManual = false,
+): {
+  kind: "default" | "auto" | "handoff" | "custom";
+  meta: string | null;
+  customText: string | null;
+} {
+  const trimmed = raw?.trim() ?? "";
+  if (
+    !trimmed ||
+    /^context compacted$/i.test(trimmed) ||
+    /^compacting context/i.test(trimmed) ||
+    /^compaction requested$/i.test(trimmed)
+  ) {
+    return { kind: "default", meta: null, customText: null };
+  }
+  const tokenMatch = trimmed.match(/^(.*?)\s*\(from\s+([^)]+)\)\s*$/i);
+  const base = (tokenMatch ? tokenMatch[1] : trimmed).trim();
+  const meta = tokenMatch ? tokenMatch[2].trim() : null;
+
+  if (/^context compacted automatically$/i.test(base)) {
+    return { kind: forceManual ? "default" : "auto", meta, customText: null };
+  }
+  if (/^context compacted$/i.test(base)) {
+    return { kind: "default", meta, customText: null };
+  }
+  if (/^context compacted for summary handoff/i.test(base)) {
+    return { kind: "handoff", meta, customText: null };
+  }
+  return { kind: "custom", meta, customText: base };
+}
+
+export const CompactionMilestoneRow = memo(function CompactionMilestoneRow({
+  label,
+  isManual = false,
+}: {
+  label?: string;
+  isManual?: boolean;
+}) {
+  const { t } = useI18n();
+  const parsed = parseCompactionLabel(label, isManual);
+  const displayLabel =
+    parsed.kind === "auto"
+      ? t("stage.compactedAuto")
+      : parsed.kind === "handoff"
+        ? t("stage.compactedHandoff")
+        : parsed.kind === "custom" && parsed.customText
+          ? parsed.customText
+          : t("stage.compacted");
+
+  return (
+    <div
+      role="separator"
+      data-slot="marker"
+      data-variant="separator"
+      title={t("stage.compactedTooltip")}
+      className="flex w-full items-center gap-3 py-2 select-none"
+    >
+      <span
+        aria-hidden="true"
+        className="from-transparent via-border-subtle to-border-subtle h-px min-w-0 flex-1 bg-gradient-to-r"
+      />
+      <span className="text-ink-muted inline-flex min-w-0 max-w-full items-center gap-1.5 text-[11.5px] leading-[16px]">
+        <FoldVertical
+          data-slot="marker-icon"
+          className="text-ink-faint size-[12.5px] shrink-0"
+          strokeWidth={1.75}
+        />
+        <span data-slot="marker-content" className="truncate">{displayLabel}</span>
+        {parsed.meta && (
+          <span className="text-ink-faint tabular-nums shrink-0 font-mono text-[11px]">
+            · {parsed.meta}
+          </span>
+        )}
+      </span>
+      <span
+        aria-hidden="true"
+        className="from-transparent via-border-subtle to-border-subtle h-px min-w-0 flex-1 bg-gradient-to-l"
+      />
+    </div>
   );
 });
 

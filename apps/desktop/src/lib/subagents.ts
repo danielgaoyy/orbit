@@ -1,13 +1,22 @@
 import type {
+  AcpAgentAvailability,
   AgentCardView,
   HostCardView,
   HostDetailView,
   ProviderKind,
+  ProviderModelCatalog,
   ProviderSubagentDescriptor,
+  ReasoningEffort,
   SessionSubagentEntryView,
   SubagentLineageStepView,
   TimelineItemView,
-} from "@/lib/orbit-ipc";
+} from "./orbit-ipc.ts";
+import {
+  formatCatalogModelLabel,
+  formatProviderDisplayName,
+  prettifyModelSlug,
+  stripAgyEffortSuffix,
+} from "./model-metadata.ts";
 
 export const MAX_SUBAGENT_LINEAGE_DEPTH = 8;
 
@@ -55,8 +64,20 @@ export interface ResolvedSubagentItem {
   remoteHostName: string | null;
   /** Managed child agent ID when isManaged === true */
   childAgentId: string | null;
-  /** Provider kind of the managed child agent (when isManaged === true) */
+  /** Real provider engine (from managed child card, or inherited from parent for provider-native subagents) */
   childProvider: ProviderKind | null;
+  /** Optional ACP agent ID when childProvider === "acp" */
+  childAcpAgentId?: string | null;
+  /** Real model slug used by this subagent when known (never synthesized as "Default") */
+  childModel?: string | null;
+  /** Real thinking/reasoning effort when explicitly configured or inferred from model slug */
+  childEffort?: ReasoningEffort | null;
+  /** Pre-formatted human-readable Agent label (e.g. "Claude Code", "Codex", "Antigravity", or ACP agent name) */
+  agentLabel?: string | null;
+  /** Pre-formatted compact model label (e.g. "Sonnet 4.6", "GPT 5.4", "Gemini 4 Neon"), or null when unknown/default */
+  modelLabel?: string | null;
+  /** Optional git worktree branch when this managed subagent runs in an isolated worktree */
+  childWorktreeBranch?: string | null;
   /** Provider native subagent ID when read-only native subagent */
   providerSubagentId: string | null;
   /** Managed card creation time, or zero when unavailable. */
@@ -75,6 +96,91 @@ export interface ResolvedSubagentItem {
   lineage?: readonly SubagentLineageStepView[];
 }
 
+export interface SubagentRuntimeDisplay {
+  agentLabel: string | null;
+  modelLabel: string | null;
+  rawModel: string | null;
+  effort: ReasoningEffort | null;
+}
+
+const LEGACY_CLAUDE_SUBTITLE_MODEL_RE = /^(?:claude-[a-z0-9._-]+|opus|sonnet|haiku)$/i;
+
+/**
+ * Extracts a real model slug from a provider-native subagent descriptor.
+ * Prefers the explicit structured `model` field and falls back cleanly for older daemons
+ * where Claude Code placed the model slug inside `subtitle`.
+ */
+export function inferNativeSubagentModel(
+  provider: ProviderKind | null | undefined,
+  descriptor: Pick<ProviderSubagentDescriptor, "model" | "subtitle"> | null | undefined,
+): string | null {
+  if (!descriptor) return null;
+  const explicit = descriptor.model?.trim();
+  if (explicit) return explicit;
+  if (provider === "claude_code") {
+    const legacy = descriptor.subtitle?.trim();
+    if (legacy && LEGACY_CLAUDE_SUBTITLE_MODEL_RE.test(legacy)) {
+      return legacy;
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolves compact, human-readable Agent and Model labels shared across the Overview subagent list,
+ * TopBar mini-dock tooltip, and the Side Panel `SubagentTab` header.
+ * Never fabricates `"Default"` when no real model slug is known.
+ */
+export function formatSubagentRuntimeDisplay(params: {
+  provider: ProviderKind | null | undefined;
+  acpAgentId?: string | null;
+  rawModel?: string | null;
+  effort?: ReasoningEffort | null;
+  providerCatalogs?: readonly ProviderModelCatalog[];
+  acpAgents?: readonly AcpAgentAvailability[];
+}): SubagentRuntimeDisplay {
+  const { provider, acpAgentId, providerCatalogs, acpAgents } = params;
+  const rawModel = params.rawModel?.trim() || null;
+  const effort: ReasoningEffort | null =
+    params.effort ??
+    (provider === "antigravity" && rawModel
+      ? stripAgyEffortSuffix(rawModel).inferredEffort
+      : null);
+
+  let agentLabel: string | null = null;
+  if (provider === "acp") {
+    const matchedAcp = acpAgentId
+      ? acpAgents?.find((a) => a.spec.id === acpAgentId)?.spec.name?.trim()
+      : null;
+    agentLabel = matchedAcp || acpAgentId?.trim() || formatProviderDisplayName("acp");
+  } else if (provider) {
+    agentLabel = formatProviderDisplayName(provider);
+  }
+
+  let modelLabel: string | null = null;
+  if (rawModel) {
+    if (provider === "acp") {
+      modelLabel = rawModel;
+    } else if (provider) {
+      const catalog = providerCatalogs?.find((c) => c.provider === provider);
+      const formatted =
+        catalog && catalog.models.length > 0
+          ? formatCatalogModelLabel(catalog, rawModel)
+          : prettifyModelSlug(rawModel, provider);
+      const compact =
+        provider === "claude_code"
+          ? formatted.replace(/^Claude\s+/i, "").trim()
+          : formatted.trim();
+      modelLabel = compact && compact.toLowerCase() !== "default" ? compact : null;
+    } else {
+      const formatted = prettifyModelSlug(rawModel).trim();
+      modelLabel = formatted && formatted.toLowerCase() !== "default" ? formatted : null;
+    }
+  }
+
+  return { agentLabel, modelLabel, rawModel, effort };
+}
+
 const STATUS_PRIORITY: Record<ResolvedSubagentStatus, number> = {
   awaiting_permission: 0,
   running: 1,
@@ -84,14 +190,14 @@ const STATUS_PRIORITY: Record<ResolvedSubagentStatus, number> = {
 };
 
 // Rust serializes AgentStatus on AgentCardView. Older desktop snapshots only have the flags/label.
-function mapManagedStatus(agent: AgentCardView & { status?: { state: string } }): ResolvedSubagentStatus {
+export function mapManagedStatus(agent: AgentCardView & { status?: { state: string } }): ResolvedSubagentStatus {
   const state = agent.status?.state;
   if (agent.is_awaiting_permission || state === "awaiting_permission") return "awaiting_permission";
   if (
     isAgentForegroundRunningLocal(agent) ||
     state === "initializing" ||
     state === "running" ||
-    state === "autonomous_wakeup"
+    (state === "autonomous_wakeup" && !agent.has_background_tasks)
   ) {
     return "running";
   }
@@ -267,15 +373,33 @@ export function resolveSessionSubagents(params: {
   const allAgentsByComposite = new Map<string, ManagedNode>();
   const allAgentsById = new Map<string, ManagedNode>();
   const childrenByParent = new Map<string, ManagedNode[]>();
-  const rootNode = (() => {
-    const ag = hostDetails[hostId]?.agents.find((a) => a.agent_id === agentId);
-    return {
-      host_id: hostId,
-      host_name: hostNameById.get(hostId) ?? hostId,
-      agent_id: agentId,
-      title: ag?.title || agentId,
-    } satisfies SubagentLineageStepView;
-  })();
+  const parentAgent = hostDetails[hostId]?.agents.find((a) => a.agent_id === agentId) ?? null;
+  const parentProvider = parentAgent?.provider ?? null;
+  const parentAcpAgentId = parentProvider === "acp" ? (parentAgent?.acp_agent_id ?? null) : null;
+  const rootNode = {
+    host_id: hostId,
+    host_name: hostNameById.get(hostId) ?? hostId,
+    agent_id: agentId,
+    title: parentAgent?.title || agentId,
+  } satisfies SubagentLineageStepView;
+
+  const formatRuntimeForHost = (
+    targetHostId: string,
+    provider: ProviderKind | null,
+    acpAgentId: string | null,
+    rawModel: string | null,
+    effort: ReasoningEffort | null,
+  ) => {
+    const detail = hostDetails[targetHostId] ?? hostDetails[hostId];
+    return formatSubagentRuntimeDisplay({
+      provider,
+      acpAgentId,
+      rawModel,
+      effort,
+      providerCatalogs: detail?.provider_catalogs,
+      acpAgents: detail?.acp_agents,
+    });
+  };
 
   for (const [hid, detail] of Object.entries(hostDetails)) {
     const runs = managedRuns(hid, detail.agents);
@@ -458,6 +582,14 @@ export function resolveSessionSubagents(params: {
       : undefined;
     if (providerSub) {
       consumedProviderIds.add(providerSub.subagent_id);
+      const nativeModel = inferNativeSubagentModel(parentProvider, providerSub);
+      const runtime = formatRuntimeForHost(
+        insightHostId,
+        parentProvider,
+        parentAcpAgentId,
+        nativeModel,
+        null,
+      );
       out.push({
         key: `provider:${providerSub.subagent_id}`,
         callId: sa.id,
@@ -468,7 +600,13 @@ export function resolveSessionSubagents(params: {
         childHostId: insightHostId,
         remoteHostName: insightRemoteHost,
         childAgentId: null,
-        childProvider: null,
+        childProvider: parentProvider,
+        childAcpAgentId: parentAcpAgentId,
+        childModel: nativeModel,
+        childEffort: runtime.effort,
+        agentLabel: runtime.agentLabel,
+        modelLabel: runtime.modelLabel,
+        childWorktreeBranch: null,
         providerSubagentId: providerSub.subagent_id,
         createdAtMs: 0,
         sortOrder: Math.max(sa.last_seq, parseTimestampMs(providerSub.updated_at)),
@@ -480,6 +618,13 @@ export function resolveSessionSubagents(params: {
       continue;
     }
 
+    const insightRuntime = formatRuntimeForHost(
+      insightHostId,
+      parentProvider,
+      parentAcpAgentId,
+      null,
+      null,
+    );
     out.push({
       key: `insight:${sa.id}`,
       callId: sa.id,
@@ -491,7 +636,13 @@ export function resolveSessionSubagents(params: {
       childHostId: insightHostId,
       remoteHostName: insightRemoteHost,
       childAgentId: null,
-      childProvider: null,
+      childProvider: parentProvider,
+      childAcpAgentId: parentAcpAgentId,
+      childModel: null,
+      childEffort: null,
+      agentLabel: insightRuntime.agentLabel,
+      modelLabel: null,
+      childWorktreeBranch: null,
       providerSubagentId: sa.provider_subagent_id ?? null,
       createdAtMs: 0,
       sortOrder: sa.last_seq,
@@ -507,6 +658,15 @@ export function resolveSessionSubagents(params: {
     const insight = managedInsights.get(childId);
     const effectiveLineage =
       insight?.lineage && insight.lineage.length > 0 ? insight.lineage : entry.lineage;
+    const managedAcpId = entry.agent.acp_agent_id ?? null;
+    const managedModel = entry.agent.model?.trim() || null;
+    const runtime = formatRuntimeForHost(
+      entry.childHostId,
+      entry.agent.provider,
+      managedAcpId,
+      managedModel,
+      entry.agent.effort ?? null,
+    );
     out.push({
       key: `managed:${entry.childHostId}:${childId}`,
       callId: insight?.id ?? childId,
@@ -520,6 +680,12 @@ export function resolveSessionSubagents(params: {
       remoteHostName: entry.remoteHostName,
       childAgentId: childId,
       childProvider: entry.agent.provider,
+      childAcpAgentId: managedAcpId,
+      childModel: managedModel,
+      childEffort: runtime.effort,
+      agentLabel: runtime.agentLabel,
+      modelLabel: runtime.modelLabel,
+      childWorktreeBranch: entry.agent.worktree_branch ?? null,
       providerSubagentId: null,
       createdAtMs: parseTimestampMs(entry.agent.created_at_rfc3339),
       sortOrder: Math.max(
@@ -537,6 +703,8 @@ export function resolveSessionSubagents(params: {
   // 5. Append unconsumed provider native subagents (freshly arrived before stage delta)
   for (const ps of providerList) {
     if (consumedProviderIds.has(ps.subagent_id)) continue;
+    const nativeModel = inferNativeSubagentModel(parentProvider, ps);
+    const runtime = formatRuntimeForHost(hostId, parentProvider, parentAcpAgentId, nativeModel, null);
     out.push({
       key: `provider:${ps.subagent_id}`,
       callId: `provider:${ps.subagent_id}`,
@@ -547,7 +715,13 @@ export function resolveSessionSubagents(params: {
       childHostId: hostId,
       remoteHostName: null,
       childAgentId: null,
-      childProvider: null,
+      childProvider: parentProvider,
+      childAcpAgentId: parentAcpAgentId,
+      childModel: nativeModel,
+      childEffort: runtime.effort,
+      agentLabel: runtime.agentLabel,
+      modelLabel: runtime.modelLabel,
+      childWorktreeBranch: null,
       providerSubagentId: ps.subagent_id,
       createdAtMs: 0,
       sortOrder: parseTimestampMs(ps.updated_at),
@@ -708,6 +882,13 @@ export function areResolvedSubagentsEqual(
       x.title !== y.title ||
       x.status !== y.status ||
       x.childAgentId !== y.childAgentId ||
+      x.childProvider !== y.childProvider ||
+      (x.childAcpAgentId ?? null) !== (y.childAcpAgentId ?? null) ||
+      (x.childModel ?? null) !== (y.childModel ?? null) ||
+      (x.childEffort ?? null) !== (y.childEffort ?? null) ||
+      (x.agentLabel ?? null) !== (y.agentLabel ?? null) ||
+      (x.modelLabel ?? null) !== (y.modelLabel ?? null) ||
+      (x.childWorktreeBranch ?? null) !== (y.childWorktreeBranch ?? null) ||
       x.providerSubagentId !== y.providerSubagentId ||
       x.childHostId !== y.childHostId ||
       x.promptPreview !== y.promptPreview ||

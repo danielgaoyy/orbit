@@ -35,6 +35,7 @@ import {
   type UpsertExternalMcpServerRequest,
 } from "@/lib/orbit-ipc";
 import { t } from "@/lib/i18n";
+import { isAlreadyExistsError, suggestAvailableName } from "@/lib/name-conflict";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -150,7 +151,7 @@ function KvEditorRows({
   onChange: (next: KvDraftRow[]) => void;
 }) {
   return (
-    <div className="space-y-1.5">
+    <div className="space-y-2">
       <div className="flex items-center justify-between">
         <span className="text-ink-muted text-[11px] font-medium">{label}</span>
         <button
@@ -170,7 +171,7 @@ function KvEditorRows({
           {t("devTools.none")}
         </div>
       ) : (
-        <div className="space-y-1.5">
+        <div className="space-y-2">
           {rows.map((row) => {
             const secret = isSecretKey(row.key);
             const placeholder =
@@ -178,7 +179,7 @@ function KvEditorRows({
                 ? t("devTools.blankToKeep", { value: row.existingMasked })
                 : valuePlaceholder;
             return (
-              <div key={row.id} className="flex items-center gap-1.5">
+              <div key={row.id} className="flex items-center gap-2">
                 <Input
                   type="text"
                   aria-label={keyPlaceholder}
@@ -238,6 +239,8 @@ function McpServerDrawer({
   workspaceCwd,
   editing,
   importingFrom,
+  existingServers,
+  onOpenExisting,
   onClose,
   onSave,
 }: {
@@ -252,6 +255,9 @@ function McpServerDrawer({
   workspaceCwd: string | null;
   editing: ExternalMcpServerRecord | null;
   importingFrom: ExternalMcpServerRecord | null;
+  /** Servers already listed for `workspaceCwd`, used for the instant create-only precheck. */
+  existingServers: readonly ExternalMcpServerRecord[];
+  onOpenExisting: (server: ExternalMcpServerRecord) => void;
   onClose: () => void;
   onSave: (req: UpsertExternalMcpServerRequest) => Promise<void>;
 }) {
@@ -285,12 +291,28 @@ function McpServerDrawer({
   const [enabled, setEnabled] = useState(() => seed?.enabled ?? true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Create-only conflict for "add" and "import from": the name already exists in the target scope.
+  const [conflict, setConflict] = useState<{ name: string; suggestion: string } | null>(null);
+  const [replaceOpen, setReplaceOpen] = useState(false);
+  const nameInputRef = useRef<HTMLInputElement | null>(null);
+  const targetScopeId = scope === "project" ? "project_dot_mcp" : "orbit_user";
+  // The listed project servers belong to `workspaceCwd`; an import into another project can
+  // only be checked by the daemon's create-only guard.
+  const precheckable = scope === "user" || targetCwd === workspaceCwd;
+  const takenNames = useMemo(
+    () => existingServers.filter((sv) => sv.scope === targetScopeId).map((sv) => sv.name),
+    [existingServers, targetScopeId],
+  );
   const canSubmit =
     Boolean(name.trim()) &&
     (transportKind === "stdio" ? Boolean(command.trim()) : Boolean(url.trim()));
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  /**
+   * Save the server. New servers ("add", "import from") are create-only; `replace` is only true
+   * after the user confirms the danger dialog. MCP config entries carry no version/etag, so a
+   * confirmed replace is an explicit upsert of that one entry.
+   */
+  const submit = async (replace: boolean) => {
     if (saving) return;
     const cleanName = name.trim();
     if (!/^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$/.test(cleanName)) {
@@ -365,6 +387,14 @@ function McpServerDrawer({
     }
 
     const keepExistingSecrets = Boolean(seed) && keptAnySecret;
+    const createOnly = !isEdit && !replace;
+
+    if (createOnly && precheckable && takenNames.includes(cleanName)) {
+      setError(null);
+      setConflict({ name: cleanName, suggestion: suggestAvailableName(cleanName, takenNames) });
+      nameInputRef.current?.focus();
+      return;
+    }
 
     setError(null);
     setSaving(true);
@@ -379,13 +409,25 @@ function McpServerDrawer({
         headers: transportKind === "streamable_http" ? headers : {},
         keep_existing_secrets: keepExistingSecrets,
         enabled,
+        create_only: createOnly,
       });
+      setConflict(null);
       onClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (createOnly && isAlreadyExistsError(err)) {
+        setConflict({ name: cleanName, suggestion: suggestAvailableName(cleanName, takenNames) });
+        nameInputRef.current?.focus();
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
       setSaving(false);
     }
+  };
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    void submit(false);
   };
 
   return (
@@ -408,7 +450,7 @@ function McpServerDrawer({
         scope === "user" ? t("devTools.global") : (targetCwd ?? undefined)
       }
     >
-      <form onSubmit={(e) => void handleSubmit(e)} className="flex flex-col">
+      <form onSubmit={handleSubmit} className="flex flex-col">
         <FieldGroup>
           {importingFrom && importProjects.length > 0 && (
             <Field>
@@ -416,7 +458,11 @@ function McpServerDrawer({
               <SettingSelect
                 value={destination}
                 ariaLabel={t("devTools.scope")}
-                onChange={setDestination}
+                onChange={(next) => {
+                  setDestination(next);
+                  setConflict(null);
+                  setReplaceOpen(false);
+                }}
                 options={[
                   { value: "", label: t("devTools.global") },
                   ...importProjects,
@@ -442,14 +488,73 @@ function McpServerDrawer({
             </FieldLabel>
             <Input
               id="mcp-server-name"
+              ref={nameInputRef}
               type="text"
               autoFocus={!isEdit}
               value={name}
               disabled={isEdit}
-              onChange={(e) => setName(e.target.value)}
+              onChange={(e) => {
+                setName(e.target.value);
+                setConflict(null);
+              }}
               placeholder="github"
               className="font-mono"
             />
+            {conflict && (
+              <div className="border-border-subtle bg-surface-raised mt-1 flex flex-col gap-2 rounded-md border p-3">
+                <span className="text-ink-primary text-[13px] font-medium">
+                  {t("devTools.conflictTitle")}
+                </span>
+                <span className="text-ink-muted text-[11px]">
+                  {t("devTools.conflictExists", { name: conflict.name })}
+                </span>
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={saving}
+                    onClick={() => {
+                      setName(conflict.suggestion);
+                      setConflict(null);
+                      nameInputRef.current?.focus();
+                    }}
+                  >
+                    {t("devTools.conflictRename", { name: conflict.suggestion })}
+                  </Button>
+                  {precheckable &&
+                    existingServers.some(
+                      (sv) => sv.scope === targetScopeId && sv.name === conflict.name,
+                    ) && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        disabled={saving}
+                        onClick={() => {
+                          const existing = existingServers.find(
+                            (sv) => sv.scope === targetScopeId && sv.name === conflict.name,
+                          );
+                          setConflict(null);
+                          if (existing) onOpenExisting(existing);
+                        }}
+                      >
+                        {t("devTools.conflictOpen")}
+                      </Button>
+                    )}
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    disabled={saving}
+                    className="text-signal-danger"
+                    onClick={() => setReplaceOpen(true)}
+                  >
+                    {t("devTools.conflictReplace")}
+                  </Button>
+                </div>
+              </div>
+            )}
           </Field>
 
           {transportKind === "stdio" ? (
@@ -522,7 +627,7 @@ function McpServerDrawer({
             </>
           )}
 
-          <Field orientation="horizontal" className="pt-0.5">
+          <Field orientation="horizontal" className="pt-1">
             <FieldLabel className="font-normal">
               {t("devTools.enabled")}
             </FieldLabel>
@@ -563,6 +668,19 @@ function McpServerDrawer({
           </div>
         </FieldGroup>
       </form>
+      <ConfirmDialog
+        open={replaceOpen}
+        onOpenChange={setReplaceOpen}
+        tone="danger"
+        title={t("devTools.conflictReplaceTitle", { name: conflict?.name ?? name.trim() })}
+        description={t("devTools.conflictReplaceBody", { name: conflict?.name ?? name.trim() })}
+        confirmLabel={t("devTools.conflictReplace")}
+        onConfirm={async () => {
+          setReplaceOpen(false);
+          setConflict(null);
+          await submit(true);
+        }}
+      />
     </SettingDrawer>
   );
 }
@@ -590,7 +708,7 @@ export function HostMcpSection({
   });
   const [servers, setServers] =
     useState<readonly ExternalMcpServerRecord[]>(EMPTY_SERVERS);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(() => online);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [probingIds, setProbingIds] = useState<Record<string, boolean>>({});
@@ -614,7 +732,11 @@ export function HostMcpSection({
   const toggleChainRef = useRef<Promise<void>>(Promise.resolve());
 
   const refreshServers = useCallback(async (options?: { silent?: boolean }) => {
-    if (!mountedRef.current || !online) return;
+    if (!mountedRef.current) return;
+    if (!online) {
+      setLoading(false);
+      return;
+    }
     const reqHost = hostId;
     const seq = ++fetchSeqRef.current;
     if (!options?.silent) {
@@ -790,7 +912,7 @@ export function HostMcpSection({
   };
 
   return (
-    <section data-setting-id="settings.subTabMcp" className="space-y-2">
+    <section data-setting-id="settings.subTabMcp" className="space-y-3">
       <SettingGroupLabel
         action={
           <div className="flex items-center gap-2">
@@ -936,7 +1058,7 @@ export function HostMcpSection({
                   </p>
                 )}
                 {expanded && (
-                  <div className="border-border-subtle bg-surface-recessed space-y-2.5 border-t px-4 py-3 text-[13px]">
+                  <div className="border-border-subtle bg-surface-recessed space-y-3 border-t px-4 py-3 text-[13px]">
                     <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px]">
                       <span className="text-ink-muted">
                         {t("devTools.source")} ·{" "}
@@ -973,11 +1095,11 @@ export function HostMcpSection({
                             {isHttp ? t("devTools.headers") : t("devTools.env")}
                           </span>
                         </div>
-                        <div className="flex flex-wrap gap-1.5">
+                        <div className="flex flex-wrap gap-2">
                           {maskedEntries.map(([k, v]) => (
                             <span
                               key={k}
-                              className="border-border-subtle/70 bg-surface-raised/70 text-ink-primary/85 inline-flex items-center gap-1 rounded border px-1.5 py-0.5 font-mono text-[11px]"
+                              className="border-border-subtle/70 bg-surface-raised/70 text-ink-primary/85 inline-flex items-center gap-1 rounded border px-2 py-1 font-mono text-[11px]"
                             >
                               <span>{k}</span>
                               {v && (
@@ -990,7 +1112,7 @@ export function HostMcpSection({
                     )}
 
                     {probe && probe.ok && (
-                      <div className="space-y-1.5">
+                      <div className="space-y-2">
                         <div className="text-ink-muted flex items-center gap-1 text-[11px] font-medium">
                           <Wrench className="h-[11px] w-[11px]" />
                           <span>
@@ -1004,12 +1126,12 @@ export function HostMcpSection({
                         ) : (
                           <div className="orbit-native-scroll border-border-subtle/60 bg-surface-raised/50 max-h-[210px] divide-y divide-border-subtle/50 overflow-y-auto overscroll-contain rounded-lg border">
                             {probe.tools.map((tool) => (
-                              <div key={tool.name} className="px-2.5 py-1.5">
+                              <div key={tool.name} className="px-3 py-2">
                                 <div className="text-ink-primary font-mono text-[11px] font-medium">
                                   {tool.name}
                                 </div>
                                 {tool.description && (
-                                  <div className="text-ink-muted mt-0.5 line-clamp-2 text-[11px] leading-snug">
+                                  <div className="text-ink-muted mt-1 line-clamp-2 text-[11px] leading-snug">
                                     {tool.description}
                                   </div>
                                 )}
@@ -1039,6 +1161,9 @@ export function HostMcpSection({
       />
       {editor && (
         <McpServerDrawer
+          // Remount when switching target (e.g. "open existing" from a conflict) so the form
+          // re-seeds from the selected server instead of keeping the draft.
+          key={editor.editing?.id ?? editor.importingFrom?.id ?? "new"}
           open={editor.open}
           onClosed={() => setEditor(null)}
           importProjects={importProjects}
@@ -1046,6 +1171,10 @@ export function HostMcpSection({
           workspaceCwd={workspaceCwd}
           editing={editor.editing}
           importingFrom={editor.importingFrom}
+          existingServers={servers}
+          onOpenExisting={(server) =>
+            setEditor({ open: true, editing: server, importingFrom: null })
+          }
           onClose={() =>
             setEditor((state) => state && { ...state, open: false })
           }

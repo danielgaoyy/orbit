@@ -14,21 +14,20 @@ export type SettingsNavGroupId = (typeof SETTINGS_NAV_GROUPS)[number]["id"];
 export const SETTINGS_CORE_SECTIONS = [
   { group: "preferences", id: "general", labelKey: "settings.navGeneral" },
   { group: "preferences", id: "appearance", labelKey: "settings.navAppearance" },
-  { group: "preferences", id: "git_worktrees", labelKey: "settings.groupGitWorktrees" },
+  { group: "preferences", id: "workspace", labelKey: "settings.groupGitWorktrees" },
   { group: "preferences", id: "shortcuts", labelKey: "settings.subTabShortcuts" },
   { group: "preferences", id: "notifications", labelKey: "settings.subTabNotifications" },
   { group: "preferences", id: "voice", labelKey: "settings.subTabVoice" },
-  { group: "fleet_sync", id: "cloud_sync", labelKey: "settings.subTabCloudSync" },
   { group: "fleet_sync", id: "hosts", labelKey: "settings.nav4Hosts" },
+  { group: "fleet_sync", id: "cloud_sync", labelKey: "settings.subTabCloudSync" },
   { group: "agents_safety", id: "agents", labelKey: "settings.navAgents" },
-  { group: "agents_safety", id: "personal_router", labelKey: "settings.navPersonalRouter" },
-  { group: "agents_safety", id: "safety", labelKey: "settings.nav4Safety" },
+  { group: "agents_safety", id: "permissions", labelKey: "settings.nav4Safety" },
   { group: "agents_safety", id: "usage", labelKey: "settings.navUsage" },
-  { group: "context_extensions", id: "instructions_memory", labelKey: "settings.nav4Instructions" },
-  { group: "context_extensions", id: "mcp_tools", labelKey: "settings.nav4Mcp" },
-  { group: "context_extensions", id: "skills_plugins", labelKey: "settings.nav4Skills" },
-  { group: "context_extensions", id: "im_channels", labelKey: "settings.subTabImChannels" },
-  { group: "context_extensions", id: "data_diagnostics", labelKey: "settings.nav4Data" },
+  { group: "context_extensions", id: "context", labelKey: "settings.nav4Instructions" },
+  { group: "context_extensions", id: "mcp", labelKey: "settings.nav4Mcp" },
+  { group: "context_extensions", id: "hooks", labelKey: "settings.subTabHooks" },
+  { group: "context_extensions", id: "extensions", labelKey: "settings.nav4Skills" },
+  { group: "context_extensions", id: "channels", labelKey: "settings.subTabImChannels" },
 ] as const satisfies readonly { group: SettingsNavGroupId; id: string; labelKey: MessageKey }[];
 export type SettingsCoreSectionId = (typeof SETTINGS_CORE_SECTIONS)[number]["id"];
 
@@ -36,34 +35,38 @@ export type SettingsCoreSectionId = (typeof SETTINGS_CORE_SECTIONS)[number]["id"
 const HOST_ROUTES = {
   agents: "agents",
   acp: "agents",
-  router: "personal_router",
-  safety: "safety",
-  guardian: "safety",
-  im_channels: "im_channels",
-  skills: "skills_plugins",
-  plugins: "skills_plugins",
+  router: "agents",
+  permissions: "permissions",
+  safety: "permissions",
+  guardian: "permissions",
+  channels: "channels",
+  im_channels: "channels",
+  skills: "extensions",
+  plugins: "extensions",
   voice: "voice",
-  mcp: "mcp_tools",
-  hooks: "mcp_tools",
-  lsp: "mcp_tools",
-  rules: "instructions_memory",
-  memory: "instructions_memory",
-  instructions: "instructions_memory",
+  mcp: "mcp",
+  hooks: "hooks",
+  lsp: "workspace",
+  rules: "context",
+  memory: "context",
+  instructions: "context",
   usage: "usage",
   connection: "hosts",
-  data_diagnostics: "data_diagnostics",
-  archived: "data_diagnostics",
+  data_diagnostics: "hosts",
+  archived: "hosts",
 } as const satisfies Record<string, SettingsCoreSectionId>;
 export type HostSettingsTab = keyof typeof HOST_ROUTES;
 export type SettingsSubTabId = HostSettingsTab | "add_host";
 
 export const LEGACY_SETTING_ANCHORS: Partial<Record<SettingsSubTabId, MessageKey>> = {
   acp: "settings.subTabAcpRegistry",
+  router: "settings.personalAgentChooseHost",
   guardian: "guardian.groupPolicy",
   hooks: "hooks.title",
   lsp: "settings.subTabLsp",
   plugins: "plugins.title",
   archived: "dataOps.archive",
+  data_diagnostics: "securityOps.diagTitle",
 };
 export type SettingsPage = SettingsCoreSectionId | SettingsSubTabId;
 export type SettingsSection = SettingsPage | `host:${string}:${HostSettingsTab}`;
@@ -73,12 +76,13 @@ export type SettingsSection = SettingsPage | `host:${string}:${HostSettingsTab}`
 const ALIASES = {
   providers: "agents",
   models_agents: "agents",
-  router: "personal_router",
-  channels: "im_channels",
-  extensions: "instructions",
+  git_worktrees: "workspace",
+  personal_router: "router",
+  safety: "permissions",
   context: "instructions",
   instructions_rules: "instructions",
   instructions_memory: "instructions",
+  extensions: "skills",
   capabilities: "skills",
   skills_plugins: "skills",
   mcp_tools: "mcp",
@@ -109,7 +113,6 @@ export function resolveSettingsSectionTarget(
   if (!target) return fallbackSection;
   const explicit = parseHostSettingsSection(target);
   if (explicit) {
-    if (explicit.tab === "router") return "personal_router";
     return `host:${explicit.hostId}:${explicit.tab}`;
   }
   const page = Object.hasOwn(ALIASES, target) ? ALIASES[target as SettingsLegacyAlias] : target;
@@ -152,8 +155,8 @@ export interface SettingsSearchResult extends SearchEntry {
 }
 
 const hostRequiredTargets = new Set<SettingsPage>([
-  "agents", "acp", "guardian", "connection", "usage", "voice", "rules", "memory", "im_channels",
-  "mcp_tools", "mcp", "hooks", "lsp", "skills_plugins", "skills", "plugins",
+  "agents", "acp", "permissions", "safety", "guardian", "connection", "usage", "voice", "rules", "memory",
+  "channels", "im_channels", "mcp", "hooks", "lsp", "skills", "plugins", "data_diagnostics",
 ]);
 export const SETTINGS_SEARCH_CATALOG: readonly SearchEntry[] = [
   ...SETTINGS_CORE_SECTIONS.map(({ id, labelKey }) => ({ coreSection: id, target: id, labelKey })),
@@ -202,7 +205,10 @@ export function searchSettingsEntries(
   const phrase = terms.join(" ");
   for (const { entry, fields, labels, keywords, parentLabelKey } of index) {
     if (options.isDesktop === false && (entry.settingId === "settings.appVersion" || entry.settingId === "settings.externalEditor")) continue;
-    if (options.hasHost === false && hostRequiredTargets.has(entry.target) && entry.settingId !== "im.defaultProvider") continue;
+    if (
+      options.hasHost === false &&
+      (hostRequiredTargets.has(entry.target) || entry.settingId?.startsWith("securityOps.migration"))
+    ) continue;
 
     if (!terms.every((term) => fields.some((field) => field.includes(term)))) continue;
     const score = matchScore(phrase, normalize(options.t(entry.labelKey) ?? entry.labelKey), labels, keywords);

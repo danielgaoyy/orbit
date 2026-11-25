@@ -206,16 +206,24 @@ function QuickOpenFileInner() {
                   }
                 }}
                 onClick={() => openSelected(filePath)}
+                title={filePath}
                 className={cn(
-                  "flex w-full cursor-pointer items-center justify-between gap-3 rounded-lg px-2.5 py-1.5 text-left transition-colors",
+                  "flex w-full cursor-pointer items-center justify-between gap-3 overflow-hidden rounded-lg px-2.5 py-1.5 text-left transition-colors",
                   active ? "bg-accent text-foreground" : "text-foreground/85 hover:bg-accent/60",
                 )}
               >
-                <div className="flex min-w-0 items-center gap-2">
+                <div className="flex min-w-0 flex-1 items-center gap-2">
                   <Icon className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                  <span className="shrink-0 text-[12.5px] font-medium">{name}</span>
+                  <span
+                    className={cn(
+                      "min-w-0 truncate text-[12.5px] font-medium",
+                      dir ? "max-w-[65%] shrink-0" : "flex-1",
+                    )}
+                  >
+                    {name}
+                  </span>
                   {dir && (
-                    <span className="text-muted-foreground truncate font-mono text-[11.5px]">
+                    <span className="text-muted-foreground min-w-0 flex-1 truncate font-mono text-[11.5px]">
                       {dir}
                     </span>
                   )}

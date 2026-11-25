@@ -23,6 +23,8 @@
   --ink-tertiary: oklch(0.515 0.006 258);
   --ink-muted: oklch(0.585 0.005 258);
   --ink-faint: oklch(0.675 0.005 258);
+  --ink-link: oklch(0.44 0.075 255);
+  --ink-link-hover: oklch(0.36 0.095 255);
 
   /* 3-Tier Hairline Borders */
   --border-subtle: oklch(0.18 0.01 258 / 7%);
@@ -107,6 +109,8 @@
   --ink-tertiary: oklch(0.640 0.006 258);
   --ink-muted: oklch(0.565 0.006 258);
   --ink-faint: oklch(0.475 0.006 258);
+  --ink-link: oklch(0.72 0.065 252);
+  --ink-link-hover: oklch(0.80 0.08 252);
 
   /* 3-Tier Hairline Borders */
   --border-subtle: oklch(1 0 0 / 7.2%);
@@ -170,6 +174,8 @@
   --color-ink-tertiary: var(--ink-tertiary);
   --color-ink-muted: var(--ink-muted);
   --color-ink-faint: var(--ink-faint);
+  --color-ink-link: var(--ink-link);
+  --color-ink-link-hover: var(--ink-link-hover);
   --color-border-subtle: var(--border-subtle);
   --color-border-default: var(--border-default);
   --color-border-strong: var(--border-strong);
@@ -628,40 +634,6 @@ html:not(.orbit-mac).dark .orbit-native-scroll {
   @apply shimmer;
 }
 
-/* Calm concentric ripple emblem for StageActivityWave (compositor transform + opacity only) */
-@keyframes orbit-activity-ripple {
-  0% {
-    transform: scale(0.55);
-    opacity: 0.48;
-  }
-  100% {
-    transform: scale(2.2);
-    opacity: 0;
-  }
-}
-
-.orbit-activity-ripple-ring {
-  transform: scale(1.35);
-  opacity: 0.28;
-}
-
-@media (prefers-reduced-motion: no-preference) {
-  .orbit-activity-ripple-ring {
-    will-change: transform, opacity;
-    animation: orbit-activity-ripple 2.2s cubic-bezier(0.22, 1, 0.36, 1) infinite;
-  }
-
-  .orbit-activity-ripple-ring-delayed {
-    animation-delay: -1.1s;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .orbit-activity-ripple-ring-delayed {
-    display: none;
-  }
-}
-
 /* ============================================================================
  * Orbit Global Motion Primitives (120Hz Compositor-Only, Natural Deceleration)
  * ============================================================================ */
@@ -1052,8 +1024,7 @@ html.orbit-theme-switching *::after {
 html.orbit-window-hidden .animate-spin,
 html.orbit-window-hidden .animate-pulse,
 html.orbit-window-hidden [class*="animate-[spin"],
-html.orbit-window-hidden .orbit-spinner-reduced,
-html.orbit-window-hidden .orbit-activity-ripple-ring {
+html.orbit-window-hidden .orbit-spinner-reduced {
   animation-play-state: paused !important;
 }
 
@@ -1109,7 +1080,7 @@ html.orbit-linux .animate-spin {
   }
 }
 
-/* Settings modal keeps all 17 flat destinations scannable inside the dialog rail. */
+/* Settings modal keeps all 16 flat destinations scannable inside the dialog rail. */
 .settings-rail-group [data-settings-section] {
   height: 27px;
 }

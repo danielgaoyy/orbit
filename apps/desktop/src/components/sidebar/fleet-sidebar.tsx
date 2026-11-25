@@ -492,6 +492,32 @@ export const FleetSidebar = memo(function FleetSidebar() {
     }
   };
 
+  const activeRouter = useMemo(() => {
+    const orderedHosts = primaryRouterHostId
+      ? [
+          ...fleet.hosts.filter((h) => h.host_id === primaryRouterHostId),
+          ...fleet.hosts.filter((h) => h.host_id !== primaryRouterHostId),
+        ]
+      : fleet.hosts;
+    for (const h of orderedHosts) {
+      const detail = hostDetails[h.host_id];
+      if (!detail) continue;
+      const found = detail.agents.find(
+        (a) =>
+          !archivedThreads[threadScopeKey(h.host_id, a.agent_id)] &&
+          (a.handle === "router" || a.title.includes("Personal Router")),
+      );
+      if (found) {
+        return {
+          hostId: h.host_id,
+          hostName: h.display_name,
+          agent: found,
+        };
+      }
+    }
+    return null;
+  }, [primaryRouterHostId, fleet.hosts, hostDetails, archivedThreads]);
+
   return (
     <aside
       data-orbit-sidebar="true"
@@ -585,30 +611,6 @@ export const FleetSidebar = memo(function FleetSidebar() {
         </button>
 
         {(() => {
-          const orderedHosts = primaryRouterHostId
-            ? [
-                ...fleet.hosts.filter((h) => h.host_id === primaryRouterHostId),
-                ...fleet.hosts.filter((h) => h.host_id !== primaryRouterHostId),
-              ]
-            : fleet.hosts;
-          let activeRouter: { hostId: string; hostName: string; agent: AgentCardView } | null = null;
-          for (const h of orderedHosts) {
-            const detail = hostDetails[h.host_id];
-            if (!detail) continue;
-            const found = detail.agents.find(
-              (a) =>
-                !archivedThreads[threadScopeKey(h.host_id, a.agent_id)] &&
-                (a.handle === "router" || a.title.includes("Personal Router")),
-            );
-            if (found) {
-              activeRouter = {
-                hostId: h.host_id,
-                hostName: h.display_name,
-                agent: found,
-              };
-              break;
-            }
-          }
           const isRouterActive =
             activeRouter !== null &&
             workspacePanel === "conversation" &&
@@ -1100,8 +1102,11 @@ export const FleetSidebar = memo(function FleetSidebar() {
                     ] ??
                     null;
 
+                  const needsProjWsIdSet = Boolean(
+                    wsMenu || renamingWorkspaceId || dragOverDropId?.startsWith("ws:"),
+                  );
                   const projWsIdSet =
-                    model.curatedWorkspaces.length > 0
+                    needsProjWsIdSet && model.curatedWorkspaces.length > 0
                       ? new Set(model.curatedWorkspaces.map((w) => w.workspace_id))
                       : null;
 
@@ -1282,7 +1287,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                 {fleetHealth.total > 1
                   ? `${fleetHealth.online}/${fleetHealth.total}`
                   : fleetHealth.connecting > 0
-                    ? t("common.sync")
+                    ? t("common.connecting")
                     : t("common.offline")}
               </span>
             </button>

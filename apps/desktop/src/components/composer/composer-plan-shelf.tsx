@@ -1,4 +1,4 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   Check,
@@ -26,6 +26,7 @@ import {
   reconcilePlanShelf,
   traceStatus,
   type PlanRowState,
+  type PlanShelfPreference,
 } from "./composer-plan-shelf-model";
 
 const sessionPreferences = createPlanShelfCache();
@@ -93,6 +94,10 @@ export const ComposerPlanShelf = memo(function ComposerPlanShelf({
   return <SessionPlanShelf key={scope} scope={scope} {...props} />;
 });
 
+type DescribedPlan = NonNullable<ReturnType<typeof describePlan>>;
+
+const COLLAPSE_HOVER_RESYNC_MS = 220;
+
 function SessionPlanShelf({
   scope,
   planSteps,
@@ -101,16 +106,71 @@ function SessionPlanShelf({
   isForegroundRunning,
   hasPendingDecisions,
 }: Omit<ShelfProps, "hostId" | "agentId"> & { scope: string }) {
-  const { t } = useI18n();
   const plan = useMemo(
     () => describePlan(planSteps, isForegroundRunning, latestTurnAnchorSeq),
     [planSteps, isForegroundRunning, latestTurnAnchorSeq],
   );
   const [saved, setSaved] = useState(() => sessionPreferences.get(scope));
-  const [hovered, setHovered] = useState(false);
   const preference = reconcilePlanShelf(saved, plan, sourceTurn);
   if (preference !== saved) setSaved(preference);
   const open = Boolean(preference?.open && !hasPendingDecisions);
+
+  useLayoutEffect(() => {
+    sessionPreferences.save(scope, preference);
+  }, [scope, preference]);
+
+  const handleAutoDismiss = useCallback((version: string, latestSeq: number) => {
+    setSaved((prev) =>
+      prev && prev.version === version && prev.latestSeq === latestSeq
+        ? { ...prev, dismissed: true, settledLive: false }
+        : prev,
+    );
+  }, []);
+
+  if (!plan || !preference || preference.dismissed) return null;
+
+  return (
+    <VisiblePlanShelf
+      plan={plan}
+      preference={preference}
+      open={open}
+      hasPendingDecisions={hasPendingDecisions}
+      onOpenChange={(nextOpen) => {
+        if (!hasPendingDecisions) {
+          setSaved({
+            ...preference,
+            open: nextOpen,
+            settledLive: nextOpen ? false : plan.shouldAutoDismiss,
+          });
+        }
+      }}
+      onDismiss={() => setSaved({ ...preference, dismissed: true, settledLive: false })}
+      onAutoDismiss={handleAutoDismiss}
+    />
+  );
+}
+
+function VisiblePlanShelf({
+  plan,
+  preference,
+  open,
+  hasPendingDecisions,
+  onOpenChange,
+  onDismiss,
+  onAutoDismiss,
+}: {
+  plan: DescribedPlan;
+  preference: PlanShelfPreference;
+  open: boolean;
+  hasPendingDecisions: boolean;
+  onOpenChange: (nextOpen: boolean) => void;
+  onDismiss: () => void;
+  onAutoDismiss: (version: string, latestSeq: number) => void;
+}) {
+  const { t } = useI18n();
+  // Kept on the mounted shelf body so unmounting (dismiss / turn retirement) always resets hover.
+  const [hovered, setHovered] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
 
@@ -121,35 +181,39 @@ function SessionPlanShelf({
     }
   }, [open]);
 
-  useLayoutEffect(() => {
-    sessionPreferences.save(scope, preference);
-  }, [scope, preference]);
+  useEffect(() => {
+    if (open) return;
+    // When the shelf auto-collapses on completion, layout shrinks out from under a stationary
+    // pointer and WebKit/Chromium may not fire `mouseleave`. Re-sync hover immediately and once
+    // the 180ms collapse animation settles so auto-dismiss is never stranded by stale hover state.
+    const syncHover = () => {
+      setHovered(Boolean(containerRef.current?.matches(":hover")));
+    };
+    const raf = window.requestAnimationFrame(syncHover);
+    const settleTimer = window.setTimeout(syncHover, COLLAPSE_HOVER_RESYNC_MS);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      window.clearTimeout(settleTimer);
+    };
+  }, [open]);
 
   // Auto-dismiss cleanly after a brief dwell once a live plan finishes all steps.
   // Pause auto-dismiss while the reader is hovering or manually inspecting the list.
   const shouldScheduleAutoDismiss = Boolean(
-    plan &&
-      preference &&
-      !preference.dismissed &&
-      preference.settledLive &&
+    preference.settledLive &&
       plan.shouldAutoDismiss &&
       !open &&
       !hovered &&
       !hasPendingDecisions,
   );
+  const { version, latestSeq } = preference;
   useEffect(() => {
-    if (!shouldScheduleAutoDismiss || !preference) return;
+    if (!shouldScheduleAutoDismiss) return;
     const timer = window.setTimeout(() => {
-      setSaved((prev) =>
-        prev && prev.version === preference.version && prev.latestSeq === preference.latestSeq
-          ? { ...prev, dismissed: true, settledLive: false }
-          : prev,
-      );
+      onAutoDismiss(version, latestSeq);
     }, PLAN_AUTO_DISMISS_MS);
     return () => window.clearTimeout(timer);
-  }, [shouldScheduleAutoDismiss, preference]);
-
-  if (!plan || !preference || preference.dismissed) return null;
+  }, [shouldScheduleAutoDismiss, version, latestSeq, onAutoDismiss]);
 
   const { rows, done, skipped, headline } = plan;
   const progress = t("plan.progress", { done, total: rows.length });
@@ -164,17 +228,10 @@ function SessionPlanShelf({
   return (
     <div className="w-full px-[24px] pb-2">
       <Collapsible
+        ref={containerRef}
         data-slot="composer-plan-shelf"
         open={open}
-        onOpenChange={(nextOpen) => {
-          if (!hasPendingDecisions) {
-            setSaved({
-              ...preference,
-              open: nextOpen,
-              settledLive: nextOpen ? false : preference.settledLive,
-            });
-          }
-        }}
+        onOpenChange={onOpenChange}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
         className={cn(
@@ -244,7 +301,7 @@ function SessionPlanShelf({
                 size="icon-xs"
                 className="mr-1.5 size-[22px] rounded-[6px] text-ink-muted hover:text-ink-primary"
                 aria-label={t("plan.dismiss")}
-                onClick={() => setSaved({ ...preference, dismissed: true, settledLive: false })}
+                onClick={onDismiss}
               >
                 <X className="size-3" />
               </Button>

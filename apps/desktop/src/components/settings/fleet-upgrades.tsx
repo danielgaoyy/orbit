@@ -204,7 +204,7 @@ export function FleetUpgrades({
                 status={version ? `v${version}` : t("common.unknownVersion")}
                 action={
                   update?.status === "upgrading" ? (
-                    <Badge variant="secondary" className="gap-1.5">
+                    <Badge variant="secondary" className="gap-2">
                       <OrbitSpinner size={11} />
                       <span>{t("common.updating")}</span>
                     </Badge>

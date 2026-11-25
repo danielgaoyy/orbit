@@ -27,6 +27,7 @@ import { Input } from "@/components/ui/input";
 import { ShortcutKbd } from "@/components/ui/kbd";
 import { Textarea } from "@/components/ui/textarea";
 import { isImeKeyEvent } from "@/lib/ime";
+import { isAlreadyExistsError, suggestAvailableName } from "@/lib/name-conflict";
 import { modSymbol } from "@/lib/keybindings";
 import {
   type ManagedSkillRecord,
@@ -36,6 +37,7 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { t, useLocale, type MessageKey } from "@/lib/i18n";
+import { cn } from "@/lib/utils";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
 type SkillSourceFilter = "all" | "user" | "project" | "claude" | "codex" | "agy" | "builtin";
@@ -106,6 +108,7 @@ const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
   online,
   existingSkillIds,
   onMutated,
+  onOpenExisting,
 }: {
   mode: "none" | "create" | "import";
   onClose: () => void;
@@ -114,6 +117,7 @@ const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
   online: boolean;
   existingSkillIds: readonly string[];
   onMutated: (updated: readonly ManagedSkillRecord[], openId?: string | null) => void;
+  onOpenExisting: (skillId: string) => void;
 }) {
   useLocale();
   const [newScope, setNewScope] = useState<SkillWriteScope>("user");
@@ -128,6 +132,22 @@ const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
   const [importSlugOverride, setImportSlugOverride] = useState("");
   const [importSource, setImportSource] = useState("");
   const [importing, setImporting] = useState(false);
+
+  // Create-only conflict state: which slug collided, a free suggested name, and whether the
+  // collision came from the create or import tab. Drives the inline prompt plus the danger
+  // replace dialog, so a conflict never resolves into a silent overwrite.
+  const [conflict, setConflict] = useState<{
+    slug: string;
+    suggestion: string;
+    kind: "create" | "import";
+  } | null>(null);
+  const [replaceTarget, setReplaceTarget] = useState<string | null>(null);
+  const slugInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    setConflict(null);
+    setReplaceTarget(null);
+  }, [mode]);
 
   const isCreate = mode === "create";
   const busy = creating || importing;
@@ -153,7 +173,33 @@ const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
     [activeCwd],
   );
 
-  const handleCreateSkill = async () => {
+  /** Skill ids that would collide with a write into the given scope. */
+  const takenSlugs = useCallback(
+    (scope: SkillWriteScope) => {
+      const prefix = scope === "project" ? "orbit_project:" : "orbit_user:";
+      return existingSkillIds
+        .filter((id) => id.startsWith(prefix))
+        .map((id) => id.slice(prefix.length));
+    },
+    [existingSkillIds],
+  );
+
+  const skillIdFor = (scope: SkillWriteScope, slug: string) =>
+    `${scope === "project" ? "orbit_project" : "orbit_user"}:${slug}`;
+
+  const resetCreateFields = () => {
+    setNewName("");
+    setNewSlug("");
+    setSlugTouched(false);
+    setNewDesc("");
+    setNewBody("");
+  };
+
+  /**
+   * Create a skill. `replace` is only ever true after the user confirms the danger dialog; the
+   * default path is create-only so an existing `SKILL.md` can never be overwritten silently.
+   */
+  const handleCreateSkill = async (replace = false) => {
     const slug = newSlug.trim();
     if (!SLUG_RE.test(slug)) {
       orbitActions.showToast(t("managedSkills.slugError"));
@@ -163,11 +209,27 @@ const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
       orbitActions.showToast(t("managedSkills.needProject"));
       return;
     }
+    // Instant precheck against the in-memory list so the common case never round-trips.
+    if (!replace && takenSlugs(newScope).includes(slug)) {
+      setConflict({
+        slug,
+        suggestion: suggestAvailableName(slug, takenSlugs(newScope)),
+        kind: "create",
+      });
+      slugInputRef.current?.focus();
+      return;
+    }
     setCreating(true);
     try {
       const name = newName.trim() || slug;
       const desc = newDesc.trim();
       const body = newBody.trim() || `# ${name}\n`;
+      const createdId = skillIdFor(newScope, slug);
+      // Replacing an existing skill requires its current etag, so the confirmed overwrite is
+      // still version-checked rather than a blind write.
+      const expectedEtag = replace
+        ? (await orbitIpc.readManagedSkill(hostId, createdId, activeCwd)).etag
+        : null;
       const updated = await orbitIpc.upsertManagedSkill(hostId, {
         scope: newScope,
         cwd: activeCwd,
@@ -176,24 +238,36 @@ const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
         description: desc,
         content: body,
         enabled: true,
-        expectedEtag: null,
+        expectedEtag,
+        createOnly: !replace,
       });
-      setNewName("");
-      setNewSlug("");
-      setSlugTouched(false);
-      setNewDesc("");
-      setNewBody("");
+      setConflict(null);
+      resetCreateFields();
       onClose();
-      const createdId = `${newScope === "project" ? "orbit_project" : "orbit_user"}:${slug}`;
       onMutated(updated, createdId);
     } catch (err) {
-      orbitActions.showToast(String(err));
+      // The daemon is the authority: a conflict can still appear if the list snapshot was stale.
+      if (!replace && isAlreadyExistsError(err)) {
+        setConflict({
+          slug,
+          suggestion: suggestAvailableName(slug, takenSlugs(newScope)),
+          kind: "create",
+        });
+        slugInputRef.current?.focus();
+      } else {
+        orbitActions.showToast(String(err));
+      }
     } finally {
       setCreating(false);
     }
   };
 
-  const handleImportSkill = async () => {
+  /**
+   * Import a skill. `replaceSlug` is only set after the user confirms the danger dialog; the
+   * import is then pinned to that exact slug and version-checked against its current etag.
+   */
+  const handleImportSkill = async (replaceSlug: string | null = null) => {
+    const replace = replaceSlug !== null;
     if (!importSource.trim()) {
       orbitActions.showToast(t("managedSkills.importSource"));
       return;
@@ -202,32 +276,71 @@ const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
       orbitActions.showToast(t("managedSkills.needProject"));
       return;
     }
-    const slugOverride = importSlugOverride.trim() || null;
+    const slugOverride = replaceSlug ?? (importSlugOverride.trim() || null);
     if (slugOverride && !SLUG_RE.test(slugOverride)) {
       orbitActions.showToast(t("managedSkills.slugError"));
+      return;
+    }
+    // Only the explicit override can be prechecked — otherwise the slug is derived server-side
+    // from the Markdown frontmatter or heading, so the daemon's create-only guard is what catches
+    // the collision.
+    if (!replace && slugOverride && takenSlugs(importScope).includes(slugOverride)) {
+      setConflict({
+        slug: slugOverride,
+        suggestion: suggestAvailableName(slugOverride, takenSlugs(importScope)),
+        kind: "import",
+      });
       return;
     }
     setImporting(true);
     try {
       const beforeIds = new Set(existingSkillIds);
+      const expectedEtag = replaceSlug
+        ? (
+            await orbitIpc.readManagedSkill(
+              hostId,
+              skillIdFor(importScope, replaceSlug),
+              activeCwd,
+            )
+          ).etag
+        : null;
       const updated = await orbitIpc.importManagedSkill(hostId, {
         scope: importScope,
         cwd: activeCwd,
         sourceMarkdownOrPath: importSource,
         slugOverride,
+        expectedEtag,
+        createOnly: !replace,
       });
+      setConflict(null);
       setImportSource("");
       setImportSlugOverride("");
       onClose();
+      // With create-only enforced, a successful import always yields a new record. Keep the
+      // diff only to decide which skill to open, and no longer report success when nothing was
+      // added — the old `else` branch said "imported" while an overwrite had just happened.
       const newlyAdded = updated.find((s) => !beforeIds.has(s.id));
+      const targetId = newlyAdded?.id ?? (replaceSlug ? skillIdFor(importScope, replaceSlug) : null);
+      onMutated(updated, targetId);
       if (newlyAdded) {
-        onMutated(updated, newlyAdded.id);
-      } else {
-        onMutated(updated, null);
         orbitActions.showToast(t("managedSkills.imported"));
       }
     } catch (err) {
-      orbitActions.showToast(String(err));
+      if (!replace && isAlreadyExistsError(err)) {
+        // The daemon reports the resolved slug in its message; fall back to the override.
+        const resolved = /`([^`]+)`/.exec(String(err))?.[1] ?? slugOverride;
+        if (resolved) {
+          setConflict({
+            slug: resolved,
+            suggestion: suggestAvailableName(resolved, takenSlugs(importScope)),
+            kind: "import",
+          });
+        } else {
+          orbitActions.showToast(String(err));
+        }
+      } else {
+        orbitActions.showToast(String(err));
+      }
     } finally {
       setImporting(false);
     }
@@ -246,7 +359,7 @@ const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
         onSubmit={(e) => {
           e.preventDefault();
           if (!busy && online && canSubmit) {
-            void (isCreate ? handleCreateSkill() : handleImportSkill());
+            void (isCreate ? handleCreateSkill() : handleImportSkill(null));
           }
         }}
       >
@@ -257,7 +370,12 @@ const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
               value={writeScope}
               disabled={busy}
               ariaLabel={t("managedSkills.scope")}
-              onChange={isCreate ? setNewScope : setImportScope}
+              onChange={(nextScope) => {
+                if (isCreate) setNewScope(nextScope);
+                else setImportScope(nextScope);
+                setConflict(null);
+                setReplaceTarget(null);
+              }}
               options={scopeOptions}
             />
             <span className="text-ink-muted break-all font-mono text-[11px]">
@@ -275,7 +393,11 @@ const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
                   onChange={(e) => {
                     const name = e.target.value;
                     setNewName(name);
-                    if (!slugTouched) setNewSlug(slugifyName(name));
+                    if (!slugTouched) {
+                      setNewSlug(slugifyName(name));
+                      setConflict(null);
+                      setReplaceTarget(null);
+                    }
                   }}
                 />
               </Field>
@@ -283,6 +405,7 @@ const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
                 <FieldLabel htmlFor="managed-skill-slug">{t("managedSkills.slug")}</FieldLabel>
                 <Input
                   id="managed-skill-slug"
+                  ref={slugInputRef}
                   value={newSlug}
                   required
                   pattern="[a-z0-9][a-z0-9_\-]{0,63}"
@@ -290,6 +413,8 @@ const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
                   onChange={(e) => {
                     setSlugTouched(true);
                     setNewSlug(e.target.value.toLowerCase());
+                    setConflict(null);
+                    setReplaceTarget(null);
                   }}
                   className="font-mono"
                 />
@@ -331,7 +456,11 @@ const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
                   value={importSource}
                   disabled={busy}
                   required
-                  onChange={(e) => setImportSource(e.target.value)}
+                  onChange={(e) => {
+                    setImportSource(e.target.value);
+                    setConflict(null);
+                    setReplaceTarget(null);
+                  }}
                   className="font-mono text-[13px]"
                 />
               </Field>
@@ -341,15 +470,77 @@ const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
                 </FieldLabel>
                 <Input
                   id="managed-skill-import-slug"
+                  ref={slugInputRef}
                   value={importSlugOverride}
                   disabled={busy}
-                  onChange={(e) => setImportSlugOverride(e.target.value.toLowerCase())}
+                  onChange={(e) => {
+                    setImportSlugOverride(e.target.value.toLowerCase());
+                    setConflict(null);
+                    setReplaceTarget(null);
+                  }}
                   className="font-mono"
                 />
               </Field>
             </>
           )}
         </FieldGroup>
+        {conflict && (
+          <div className="border-border-subtle bg-surface-raised flex flex-col gap-2 rounded-md border p-3">
+            <span className="text-ink-primary text-[13px] font-medium">
+              {t("managedSkills.conflictTitle")}
+            </span>
+            <span className="text-ink-muted text-[11px]">
+              {t("managedSkills.conflictExists", { slug: conflict.slug })}
+            </span>
+            <div className="flex flex-wrap items-center gap-2 pt-1">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={busy}
+                onClick={() => {
+                  if (conflict.kind === "create") {
+                    setSlugTouched(true);
+                    setNewSlug(conflict.suggestion);
+                  } else {
+                    setImportSlugOverride(conflict.suggestion);
+                  }
+                  setConflict(null);
+                  slugInputRef.current?.focus();
+                }}
+              >
+                {t("managedSkills.conflictRename", { slug: conflict.suggestion })}
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={busy}
+                onClick={() => {
+                  const target = skillIdFor(
+                    conflict.kind === "create" ? newScope : importScope,
+                    conflict.slug,
+                  );
+                  setConflict(null);
+                  onClose();
+                  onOpenExisting(target);
+                }}
+              >
+                {t("managedSkills.conflictOpen")}
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                disabled={busy}
+                className="text-signal-danger"
+                onClick={() => setReplaceTarget(conflict.slug)}
+              >
+                {t("managedSkills.conflictReplace")}
+              </Button>
+            </div>
+          </div>
+        )}
         <Button
           type="submit"
           size="sm"
@@ -360,6 +551,23 @@ const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
           {t(isCreate ? "managedSkills.create" : "managedSkills.import")}
         </Button>
       </form>
+      <ConfirmDialog
+        open={replaceTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setReplaceTarget(null);
+        }}
+        tone="danger"
+        title={t("managedSkills.conflictReplaceTitle", { slug: replaceTarget ?? "" })}
+        description={t("managedSkills.conflictReplaceBody", { slug: replaceTarget ?? "" })}
+        confirmLabel={t("managedSkills.conflictReplace")}
+        onConfirm={async () => {
+          const slug = replaceTarget;
+          const kind = conflict?.kind ?? (isCreate ? "create" : "import");
+          setReplaceTarget(null);
+          if (!slug) return;
+          await (kind === "create" ? handleCreateSkill(true) : handleImportSkill(slug));
+        }}
+      />
     </SettingDrawer>
   );
 });
@@ -410,7 +618,7 @@ function ManagedSkills({
 }) {
   useLocale();
   const [skills, setSkills] = useState<readonly ManagedSkillRecord[]>(storeSkills);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(() => online);
   const [search, setSearch] = useState("");
   const [sourceFilter, setSourceFilter] = useState<SkillSourceFilter>("all");
 
@@ -429,6 +637,14 @@ function ManagedSkills({
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [discardEdits, setDiscardEdits] = useState(false);
   const [forking, setForking] = useState(false);
+  // Fork (copy to user/project) conflict: the copy's slug already exists in the target scope.
+  const [forkConflict, setForkConflict] = useState<{
+    skill: ManagedSkillRecord;
+    scope: SkillWriteScope;
+    slug: string;
+    suggestion: string;
+  } | null>(null);
+  const [forkReplaceOpen, setForkReplaceOpen] = useState(false);
 
   const readSeqRef = useRef(0);
   const listSeqRef = useRef(0);
@@ -459,7 +675,10 @@ function ManagedSkills({
   }, []);
 
   const refreshSkills = useCallback(async () => {
-    if (!online) return;
+    if (!online) {
+      setLoading(false);
+      return;
+    }
     const seq = listSeqRef.current + 1;
     listSeqRef.current = seq;
     setLoading(true);
@@ -635,30 +854,55 @@ function ManagedSkills({
     clearEditorState();
   };
 
-  const handleForkToOrbit = async (skill: ManagedSkillRecord, scope: SkillWriteScope) => {
+  /**
+   * Copy a skill into an Orbit scope. Create-only by default: a same-slug skill already in the
+   * target scope opens the conflict prompt instead of being overwritten. `mode.slug` renames the
+   * copy; `mode.replace` (only after the danger confirmation) overwrites with an etag check.
+   */
+  const handleForkToOrbit = async (
+    skill: ManagedSkillRecord,
+    scope: SkillWriteScope,
+    mode: { slug?: string; replace?: boolean } = {},
+  ) => {
     if (forking) return;
+    const slug = mode.slug ?? skill.slug;
+    const prefix = scope === "project" ? "orbit_project:" : "orbit_user:";
+    const nextId = `${prefix}${slug}`;
+    const taken = skills.filter((s) => s.id.startsWith(prefix)).map((s) => s.slug);
+    if (!mode.replace && taken.includes(slug)) {
+      setForkConflict({ skill, scope, slug, suggestion: suggestAvailableName(slug, taken) });
+      return;
+    }
     setForking(true);
     try {
       const content =
         loadedSkillId === skill.id && !loadingContent
           ? loadedContent
           : (await orbitIpc.readManagedSkill(hostId, skill.id, activeCwd)).content;
+      const expectedEtag = mode.replace
+        ? (await orbitIpc.readManagedSkill(hostId, nextId, activeCwd)).etag
+        : null;
       const updated = await orbitIpc.upsertManagedSkill(hostId, {
         scope,
         cwd: activeCwd,
-        slug: skill.slug,
+        slug,
         name: skill.name,
         description: skill.description,
         content,
         enabled: true,
-        expectedEtag: null,
+        expectedEtag,
+        createOnly: !mode.replace,
       });
+      setForkConflict(null);
       hasLoadedScopedRef.current = true;
       setSkills(updated);
-      const nextId = `${scope === "project" ? "orbit_project" : "orbit_user"}:${skill.slug}`;
       openSkillEditor(nextId);
     } catch (err) {
-      orbitActions.showToast(String(err));
+      if (!mode.replace && isAlreadyExistsError(err)) {
+        setForkConflict({ skill, scope, slug, suggestion: suggestAvailableName(slug, taken) });
+      } else {
+        orbitActions.showToast(String(err));
+      }
     } finally {
       setForking(false);
     }
@@ -753,7 +997,7 @@ function ManagedSkills({
           );
         }}
       />
-      <section data-setting-id="managedSkills.title" className="flex flex-col gap-2">
+      <section data-setting-id="managedSkills.title" className="flex flex-col gap-3">
         <SettingGroupLabel
           action={
             <div className="flex items-center gap-1">
@@ -764,7 +1008,7 @@ function ManagedSkills({
                 disabled={loading || !online}
                 onClick={() => void refreshSkills()}
               >
-                <RefreshCw />
+                <RefreshCw className={cn(loading && "animate-spin")} />
               </Button>
               <Button
                 variant="ghost"
@@ -817,7 +1061,7 @@ function ManagedSkills({
           {filteredSkills.length === 0 ? (
             <p className="text-ink-muted px-4 py-5 text-center text-[13px]">
               {t(
-                loading
+                loading && workflows.length === 0
                   ? "common.loading"
                   : workflows.length > 0
                     ? "managedSkills.noMatches"
@@ -857,6 +1101,70 @@ function ManagedSkills({
           online={online}
           existingSkillIds={existingSkillIds}
           onMutated={handleSkillMutated}
+          onOpenExisting={openSkillEditor}
+        />
+        <ConfirmDialog
+          open={forkConflict !== null && !forkReplaceOpen}
+          onOpenChange={(open) => {
+            if (!open) setForkConflict(null);
+          }}
+          title={t("managedSkills.conflictTitle")}
+          description={t("managedSkills.conflictExists", { slug: forkConflict?.slug ?? "" })}
+          detail={
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="text-signal-danger -mx-2"
+              onClick={() => setForkReplaceOpen(true)}
+            >
+              {t("managedSkills.conflictReplace")}
+            </Button>
+          }
+          confirmLabel={t("managedSkills.conflictRename", {
+            slug: forkConflict?.suggestion ?? "",
+          })}
+          secondaryAction={{
+            label: t("managedSkills.conflictOpen"),
+            variant: "outline",
+            onClick: () => {
+              const target = forkConflict;
+              setForkConflict(null);
+              if (target) {
+                openSkillEditor(
+                  `${target.scope === "project" ? "orbit_project" : "orbit_user"}:${target.slug}`,
+                );
+              }
+            },
+          }}
+          onConfirm={async () => {
+            const target = forkConflict;
+            setForkConflict(null);
+            if (target) {
+              await handleForkToOrbit(target.skill, target.scope, { slug: target.suggestion });
+            }
+          }}
+        />
+        <ConfirmDialog
+          open={forkReplaceOpen}
+          onOpenChange={(open) => {
+            if (!open) {
+              setForkReplaceOpen(false);
+              setForkConflict(null);
+            }
+          }}
+          tone="danger"
+          title={t("managedSkills.conflictReplaceTitle", { slug: forkConflict?.slug ?? "" })}
+          description={t("managedSkills.conflictReplaceBody", { slug: forkConflict?.slug ?? "" })}
+          confirmLabel={t("managedSkills.conflictReplace")}
+          onConfirm={async () => {
+            const target = forkConflict;
+            setForkReplaceOpen(false);
+            setForkConflict(null);
+            if (target) {
+              await handleForkToOrbit(target.skill, target.scope, { replace: true });
+            }
+          }}
         />
         {selectedSkill && (
           <SettingDrawer
@@ -884,7 +1192,7 @@ function ManagedSkills({
                 </code>
                 {selectedSkill.is_command && <span>{t("managedSkills.command")}</span>}
                 {(selectedSkill.has_scripts || selectedSkill.has_references) && (
-                  <span className="inline-flex items-center gap-1.5 font-mono">
+                  <span className="inline-flex items-center gap-2 font-mono">
                     <Code2 className="size-3" />
                     {[
                       selectedSkill.has_scripts && "scripts/",

@@ -281,7 +281,9 @@ export function createUpdaterSlice(ctx: OrbitStoreContext) {
             notifyToast(
               res.status === "updated"
                 ? t("store.localServiceUpdated", {
-                    version: resolvedVer ? ` (v${resolvedVer})` : "",
+                    version: resolvedVer
+                      ? t("store.versionSuffix", { version: resolvedVer })
+                      : "",
                   })
                 : t("store.localServiceRestarted"),
             );
@@ -331,10 +333,15 @@ export function createUpdaterSlice(ctx: OrbitStoreContext) {
         }));
         if (!opts?.silent) {
           notifyToast(
-            t("store.hostUpdated", {
-              host: host.display_name,
-              version: resolvedVer ? ` (v${resolvedVer})` : "",
-            }),
+            resolvedVer
+              ? t("store.hostUpdatedToVersion", {
+                  host: host.display_name,
+                  version: resolvedVer,
+                })
+              : t("store.hostUpdated", {
+                  host: host.display_name,
+                  version: "",
+                }),
           );
         }
         return { ok: true, version: resolvedVer };
@@ -482,7 +489,9 @@ export function createUpdaterSlice(ctx: OrbitStoreContext) {
 
       // Nothing to update anywhere
       if (hostsToUpgrade.length === 0 && !desktopNeedsUpdate) {
-        const versionTag = targetVersion ? ` (v${targetVersion})` : "";
+        const versionTag = targetVersion
+          ? t("store.versionSuffix", { version: targetVersion })
+          : "";
         const msg =
           skippedOffline > 0
             ? t("store.fleetOnlineUpToDateOfflineSkipped", {
@@ -516,7 +525,9 @@ export function createUpdaterSlice(ctx: OrbitStoreContext) {
             targetVersion,
             summaryMessage: t("store.fleetUpgradingHosts", {
               count: hostsToUpgrade.length,
-              version: targetVersion ? ` (v${targetVersion})` : "",
+              version: targetVersion
+                ? t("store.versionSuffix", { version: targetVersion })
+                : "",
             }),
             pendingDesktopUpdate: desktopNeedsUpdate,
           },
@@ -584,8 +595,10 @@ export function createUpdaterSlice(ctx: OrbitStoreContext) {
       const summary =
         parts.length > 0
           ? t("store.fleetUpdateCompleteParts", {
-              parts: parts.join(", "),
-              version: targetVersion ? ` (v${targetVersion})` : "",
+              parts: parts.join(t("store.fleetPartsSeparator")),
+              version: targetVersion
+                ? t("store.versionSuffix", { version: targetVersion })
+                : "",
             })
           : t("store.fleetUpdateComplete");
 

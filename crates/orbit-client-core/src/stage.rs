@@ -1284,7 +1284,7 @@ pub fn summarize_work_items(
                 }
             }
             ToolCallDetail::FileRead { path, .. } => {
-                mark_seen("read");
+                mark_seen("explore");
                 read_calls += 1;
                 if !path.is_empty() {
                     push_unique(&mut read_paths, path);
@@ -1299,11 +1299,11 @@ pub fn summarize_work_items(
                         web_search_count += 1;
                     }
                     SearchSubkind::Glob => {
-                        mark_seen("look_files");
+                        mark_seen("explore");
                         glob_count += 1;
                     }
                     SearchSubkind::Grep => {
-                        mark_seen("search_files");
+                        mark_seen("explore");
                         grep_count += 1;
                     }
                 }
@@ -1411,7 +1411,7 @@ pub fn summarize_work_items(
             } else if edited_file_count == 1 {
                 "Edited a file".to_string()
             } else {
-                format!("Edited {edited_file_count} files")
+                "Edited files".to_string()
             };
             buckets.push(Bucket {
                 label: lbl,
@@ -1432,7 +1432,7 @@ pub fn summarize_work_items(
             } else if created_file_count == 1 {
                 "Created a file".to_string()
             } else {
-                format!("Created {created_file_count} files")
+                "Created files".to_string()
             };
             buckets.push(Bucket {
                 label: lbl,
@@ -1447,7 +1447,7 @@ pub fn summarize_work_items(
                 label: if subagent_count == 1 {
                     "Ran an agent".to_string()
                 } else {
-                    format!("Ran {subagent_count} agents")
+                    "Ran agents".to_string()
                 },
                 tier: 2,
                 raw_call_count: subagent_count,
@@ -1464,7 +1464,7 @@ pub fn summarize_work_items(
                 label: if mcp_server_count == 1 {
                     format!("Used {first_server} integration")
                 } else {
-                    format!("Used {mcp_server_count} integrations")
+                    "Used integrations".to_string()
                 },
                 tier: 2,
                 raw_call_count: mcp_call_count,
@@ -1472,42 +1472,35 @@ pub fn summarize_work_items(
             });
         }
 
-        if read_file_count > 0 {
-            let sole_name = if is_sole_category && read_paths.len() == 1 {
-                basename_of_path(&read_paths[0])
+        if read_file_count > 0 || grep_count > 0 || glob_count > 0 {
+            let explore_calls = read_calls + grep_count + glob_count;
+            let lbl = if read_file_count > 0 {
+                let sole_name = if is_sole_category
+                    && read_paths.len() == 1
+                    && grep_count == 0
+                    && glob_count == 0
+                {
+                    basename_of_path(&read_paths[0])
+                } else {
+                    String::new()
+                };
+                if !sole_name.is_empty() {
+                    format!("Read {sole_name}")
+                } else if read_file_count == 1 && grep_count == 0 && glob_count == 0 {
+                    "Read a file".to_string()
+                } else {
+                    "Read files".to_string()
+                }
+            } else if grep_count > 0 {
+                "Searched files".to_string()
             } else {
-                String::new()
-            };
-            let lbl = if !sole_name.is_empty() {
-                format!("Read {sole_name}")
-            } else if read_file_count == 1 {
-                "Read a file".to_string()
-            } else {
-                format!("Read {read_file_count} files")
+                "Looked for files".to_string()
             };
             buckets.push(Bucket {
                 label: lbl,
                 tier: 3,
-                raw_call_count: read_calls,
-                first_order: first_seen.get("read").copied().unwrap_or(0),
-            });
-        }
-
-        if grep_count > 0 {
-            buckets.push(Bucket {
-                label: "Searched files".to_string(),
-                tier: 3,
-                raw_call_count: grep_count,
-                first_order: first_seen.get("search_files").copied().unwrap_or(0),
-            });
-        }
-
-        if glob_count > 0 {
-            buckets.push(Bucket {
-                label: "Looked for files".to_string(),
-                tier: 3,
-                raw_call_count: glob_count,
-                first_order: first_seen.get("look_files").copied().unwrap_or(0),
+                raw_call_count: explore_calls,
+                first_order: first_seen.get("explore").copied().unwrap_or(0),
             });
         }
 
@@ -1525,7 +1518,7 @@ pub fn summarize_work_items(
                 label: if command_count == 1 {
                     "Ran a command".to_string()
                 } else {
-                    format!("Ran {command_count} commands")
+                    "Ran commands".to_string()
                 },
                 tier: 4,
                 raw_call_count: command_count,
@@ -1538,7 +1531,7 @@ pub fn summarize_work_items(
                 label: if other_tool_count == 1 {
                     "Used a tool".to_string()
                 } else {
-                    format!("Used {other_tool_count} tools")
+                    "Used tools".to_string()
                 },
                 tier: 4,
                 raw_call_count: other_tool_count,
@@ -1562,10 +1555,7 @@ pub fn summarize_work_items(
                 .then_with(|| a.first_order.cmp(&b.first_order))
         });
 
-        let visible_limit = if buckets.len() > 3 { 2 } else { 3 };
-        let shown_len = buckets.len().min(visible_limit);
-        let hidden_steps: u32 = buckets[shown_len..].iter().map(|b| b.raw_call_count).sum();
-        let formatted_shown = buckets[..shown_len]
+        let formatted = buckets
             .iter()
             .enumerate()
             .map(|(idx, b)| {
@@ -1578,13 +1568,10 @@ pub fn summarize_work_items(
             .collect::<Vec<_>>()
             .join(", ");
 
-        if shown_len > 0 && hidden_steps > 0 {
-            let noun = if hidden_steps == 1 { "step" } else { "steps" };
-            format!("{formatted_shown}, and {hidden_steps} more {noun}")
-        } else if !formatted_shown.is_empty() {
-            formatted_shown
+        if !formatted.is_empty() {
+            formatted
         } else {
-            format!("Used {total_tc} tools")
+            "Used tools".to_string()
         }
     };
 
@@ -2016,11 +2003,19 @@ fn finalize_turn(
             ..
         } = *it
         {
-            if level != "error" && contains_ascii_case_insensitive(message, "compact") {
-                compactions.push(TurnCompactionItemView {
-                    seq,
-                    label: message.clone(),
-                });
+            if is_compaction_notice(level, message) {
+                if !is_live_compaction_notice(level, message) {
+                    let normalized = normalize_compaction_label(message, is_compaction_command);
+                    let is_dup = compactions
+                        .last()
+                        .is_some_and(|prev| prev.label == normalized);
+                    if !is_dup {
+                        compactions.push(TurnCompactionItemView {
+                            seq,
+                            label: normalized,
+                        });
+                    }
+                }
             } else {
                 notices.push(it.clone());
             }
@@ -2180,7 +2175,7 @@ fn finalize_turn(
         last_assistant_reply,
         notices,
         compactions,
-        live_segments: build_live_segments(&body_items, started_at_ms),
+        live_segments: build_live_segments(&body_items, started_at_ms, is_compaction_command),
         turn_diffs,
         has_error,
         has_unrecovered_error: full_turn_tool_summary.counts.unrecovered_failure_count > 0,
@@ -2195,6 +2190,7 @@ fn finalize_turn(
 fn build_live_segments(
     body_items: &[TimelineItemView],
     fallback_start_ms: Option<i64>,
+    is_compaction_command: bool,
 ) -> Vec<TurnLiveSegmentView> {
     let mut raw_segments: Vec<TurnLiveSegmentView> = Vec::new();
     let mut step_buf: Vec<TimelineItemView> = Vec::new();
@@ -2251,7 +2247,7 @@ fn build_live_segments(
         });
     };
 
-    for it in body_items {
+    for (idx, it) in body_items.iter().enumerate() {
         if is_step_row_item(it) {
             step_buf.push(it.clone());
             continue;
@@ -2302,12 +2298,46 @@ fn build_live_segments(
                             message.clone()
                         },
                     });
-                } else if level != "error" && contains_ascii_case_insensitive(message, "compact") {
-                    flush_steps(&mut raw_segments, &mut step_buf, true, Some(it));
-                    raw_segments.push(TurnLiveSegmentView::Compaction {
-                        key: format!("compact-{seq}"),
-                        label: message.clone(),
-                    });
+                } else if is_compaction_notice(level, message) {
+                    let is_live = is_live_compaction_notice(level, message);
+                    if is_live {
+                        // Drop superseded in-progress compaction notices whenever a newer
+                        // compaction notice (live or completed) already exists later in the turn.
+                        let superseded = body_items[idx + 1..].iter().any(|later| {
+                            matches!(
+                                later,
+                                TimelineItemView::Notice {
+                                    level: l2,
+                                    message: m2,
+                                    ..
+                                } if is_compaction_notice(l2, m2)
+                            )
+                        });
+                        if !superseded {
+                            flush_steps(&mut raw_segments, &mut step_buf, true, Some(it));
+                            raw_segments.push(TurnLiveSegmentView::Compaction {
+                                key: format!("compact-live-{seq}"),
+                                label: if message.is_empty() {
+                                    "Compacting context…".to_string()
+                                } else {
+                                    message.clone()
+                                },
+                            });
+                        }
+                    } else {
+                        let normalized = normalize_compaction_label(message, is_compaction_command);
+                        let is_dup = matches!(
+                            raw_segments.last(),
+                            Some(TurnLiveSegmentView::Compaction { label, .. }) if *label == normalized
+                        );
+                        if !is_dup {
+                            flush_steps(&mut raw_segments, &mut step_buf, true, Some(it));
+                            raw_segments.push(TurnLiveSegmentView::Compaction {
+                                key: format!("compact-{seq}"),
+                                label: normalized,
+                            });
+                        }
+                    }
                 } else {
                     flush_steps(&mut raw_segments, &mut step_buf, false, Some(it));
                     raw_segments.push(TurnLiveSegmentView::Notice {
@@ -2322,6 +2352,39 @@ fn build_live_segments(
 
     flush_steps(&mut raw_segments, &mut step_buf, false, None);
     raw_segments
+}
+
+fn is_compaction_notice(level: &str, message: &str) -> bool {
+    level == "compaction"
+        || level == "compaction_live"
+        || (level != "error" && contains_ascii_case_insensitive(message, "compact"))
+}
+
+fn is_live_compaction_notice(level: &str, message: &str) -> bool {
+    level == "compaction_live"
+        || contains_ascii_case_insensitive(message, "compacting")
+        || contains_ascii_case_insensitive(message, "compaction requested")
+}
+
+/// Normalize provider compaction notice labels when the turn was explicitly triggered by a
+/// manual `/compact` command. Some providers (e.g. Antigravity `CHECKPOINT`) emit the same
+/// checkpoint event for manual and automatic compactions; rewriting the auto prefix here also
+/// fixes already-persisted timeline history across all clients.
+fn normalize_compaction_label(message: &str, is_compaction_command: bool) -> String {
+    if !is_compaction_command {
+        return message.to_string();
+    }
+    const AUTO_PREFIX: &str = "Context compacted automatically";
+    let trimmed = message.trim();
+    if let Some(prefix) = trimmed.get(..AUTO_PREFIX.len())
+        && prefix.eq_ignore_ascii_case(AUTO_PREFIX)
+    {
+        let rest = &trimmed[AUTO_PREFIX.len()..];
+        if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('(') {
+            return format!("Context compacted{rest}");
+        }
+    }
+    message.to_string()
 }
 
 fn compute_thought_duration_ms(
@@ -2444,14 +2507,7 @@ fn build_live_step_status(item: Option<&TimelineItemView>) -> (String, Option<St
         return ("Working…".to_string(), None);
     };
     match item {
-        TimelineItemView::AssistantThinking { text, .. } => {
-            let headline = extract_thinking_headline(text, true);
-            if headline.is_empty() {
-                ("Thinking…".to_string(), None)
-            } else {
-                ("Thinking".to_string(), Some(headline))
-            }
-        }
+        TimelineItemView::AssistantThinking { .. } => ("Thinking…".to_string(), None),
         TimelineItemView::ToolCall {
             summary_title,
             detail,
@@ -5287,18 +5343,15 @@ mod tests {
             ),
         ];
 
-        // 3 categories (edit tier 1, read tier 3, shell tier 4) -> joined up to 3 clauses
+        // 3 categories (edit tier 1, explore tier 3, shell tier 4) -> count-free natural clauses
         let three_cat = summarize_work_items(&items, None);
-        assert_eq!(
-            three_cat.label,
-            "Edited 2 files, read a file, ran a command"
-        );
+        assert_eq!(three_cat.label, "Edited files, read a file, ran a command");
 
-        // 2 categories (edit + shell) -> exact `Edited 2 files, ran a command`
+        // 2 categories (edit + shell) -> exact `Edited files, ran a command`
         let two_cat = summarize_work_items(&items[1..], None);
-        assert_eq!(two_cat.label, "Edited 2 files, ran a command");
+        assert_eq!(two_cat.label, "Edited files, ran a command");
 
-        // 4 categories -> collapses into top 2 + `and N more steps`
+        // 4 categories -> lists all categories without numeric counts or `and N more steps`
         let mut four_cat_items = items;
         four_cat_items.push(make_tool(
             5,
@@ -5314,7 +5367,7 @@ mod tests {
         let four_cat = summarize_work_items(&four_cat_items, None);
         assert_eq!(
             four_cat.label,
-            "Edited 2 files, used Github integration, and 2 more steps"
+            "Edited files, used Github integration, read a file, ran a command"
         );
     }
 
@@ -5513,11 +5566,11 @@ mod tests {
             Some(TurnLiveSegmentView::Wakeup { label, .. }) if label == "Resumed from background timer"
         ));
 
-        // Thinking only group should emit live_label="Thinking" + live_detail="Checking modules"
+        // Thinking only group should emit live_label="Thinking…" without a truncated headline subtitle
         let thinking_only = vec![items[1].clone()];
         let think_sum = summarize_work_items(&thinking_only, None);
-        assert_eq!(think_sum.live_label, "Thinking");
-        assert_eq!(think_sum.live_detail.as_deref(), Some("Checking modules"));
+        assert_eq!(think_sum.live_label, "Thinking…");
+        assert_eq!(think_sum.live_detail, None);
 
         let cur_agent = AgentCardView {
             agent_id: "parent_1".into(),
@@ -5882,6 +5935,7 @@ Log: file:///tmp/spoofed.log\n";
             parent_subagent_id: None,
             title: "Native Researcher".into(),
             subtitle: Some("Scanning codebase".into()),
+            model: None,
             status: ProviderSubagentStatus::Running,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -6098,6 +6152,7 @@ Log: file:///tmp/spoofed.log\n";
                 parent_subagent_id: None,
                 title: "Action Cinema Directing Researcher".into(),
                 subtitle: Some("Antigravity".into()),
+                model: None,
                 status: ProviderSubagentStatus::Running,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -6108,6 +6163,7 @@ Log: file:///tmp/spoofed.log\n";
                 parent_subagent_id: None,
                 title: "AI Video Action Prompting Researcher".into(),
                 subtitle: Some("Antigravity".into()),
+                model: None,
                 status: ProviderSubagentStatus::Running,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -6884,5 +6940,95 @@ Log: file:///tmp/spoofed.log\n";
             collect_stage_auxiliary_state(&[resolved_exit], Some("/repo"), None, &[], &[]);
         assert!(perms_after.is_empty());
         assert!(pending_plan_after.is_none());
+    }
+
+    #[test]
+    fn live_compaction_notice_projects_as_live_then_yields_to_completed_boundary() {
+        let prompt = TimelineItemView::UserPrompt {
+            seq: 1,
+            message_id: "m1".into(),
+            text: "Continue refactoring".into(),
+            badges: Vec::new(),
+            blocks: Vec::new(),
+            timestamp_ms: Some(1_000),
+        };
+        let live_notice = TimelineItemView::Notice {
+            seq: 2,
+            level: "compaction_live".into(),
+            message: "Compacting context…".into(),
+            timestamp_ms: Some(2_000),
+        };
+        let completed_notice = TimelineItemView::Notice {
+            seq: 3,
+            level: "compaction".into(),
+            message: "Context compacted automatically (from 142k tokens)".into(),
+            timestamp_ms: Some(5_000),
+        };
+        let dup_completed = TimelineItemView::Notice {
+            seq: 4,
+            level: "compaction".into(),
+            message: "Context compacted automatically (from 142k tokens)".into(),
+            timestamp_ms: Some(5_050),
+        };
+
+        // 1. While compaction is running, live segment uses `compact-live-*` and `compactions` stays empty
+        let (turns_live, _, _, _) =
+            process_timeline_for_stage(&[prompt.clone(), live_notice.clone()], Some("/repo"));
+        let t_live = &turns_live[0];
+        assert!(t_live.compactions.is_empty());
+        assert!(matches!(
+            t_live.live_segments.as_slice(),
+            [TurnLiveSegmentView::Compaction { key, .. }] if key == "compact-live-2"
+        ));
+
+        // 2. Once completed compaction arrives, superseded live notice disappears and duplicates collapse
+        let (turns_done, _, _, _) = process_timeline_for_stage(
+            &[prompt, live_notice, completed_notice, dup_completed],
+            Some("/repo"),
+        );
+        let t_done = &turns_done[0];
+        assert_eq!(t_done.compactions.len(), 1);
+        assert_eq!(
+            t_done.compactions[0].label,
+            "Context compacted automatically (from 142k tokens)"
+        );
+        assert_eq!(t_done.live_segments.len(), 1);
+        assert!(matches!(
+            t_done.live_segments.as_slice(),
+            [TurnLiveSegmentView::Compaction { key, label }]
+                if key == "compact-3" && label == "Context compacted automatically (from 142k tokens)"
+        ));
+    }
+
+    #[test]
+    fn manual_compact_turn_normalizes_auto_compaction_label_and_preserves_tokens() {
+        let manual_prompt = TimelineItemView::UserPrompt {
+            seq: 10,
+            message_id: "m10".into(),
+            text: "/compact".into(),
+            badges: Vec::new(),
+            blocks: Vec::new(),
+            timestamp_ms: Some(10_000),
+        };
+        let legacy_auto_notice = TimelineItemView::Notice {
+            seq: 11,
+            level: "info".into(),
+            message: "Context compacted automatically (from 367k tokens)".into(),
+            timestamp_ms: Some(12_000),
+        };
+        let (turns, _, _, _) =
+            process_timeline_for_stage(&[manual_prompt, legacy_auto_notice], Some("/repo"));
+        let t = &turns[0];
+        assert!(t.is_compaction_command);
+        assert_eq!(t.compactions.len(), 1);
+        assert_eq!(
+            t.compactions[0].label,
+            "Context compacted (from 367k tokens)"
+        );
+        assert!(matches!(
+            t.live_segments.as_slice(),
+            [TurnLiveSegmentView::Compaction { key, label }]
+                if key == "compact-11" && label == "Context compacted (from 367k tokens)"
+        ));
     }
 }

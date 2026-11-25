@@ -13,15 +13,42 @@ const graphemeSegmenter =
 function clampToSafeGraphemeBoundary(text: string, index: number): number {
   if (index <= 0) return 0;
   if (index >= text.length) return text.length;
-  if (graphemeSegmenter) {
-    const seg = graphemeSegmenter.segment(text).containing(index);
-    return seg?.index ?? index;
-  }
   const prevCode = text.charCodeAt(index - 1);
+  const currCode = text.charCodeAt(index);
+  // O(1) fast-path for ASCII boundaries (the common case for code and Latin prose).
+  if (prevCode < 0x80 && currCode < 0x80) {
+    return prevCode === 0x0d && currCode === 0x0a ? index - 1 : index;
+  }
+  if (graphemeSegmenter) {
+    // Segment only a bounded local window around `index` instead of scanning the entire string
+    // (critical for large streaming code blocks at 60Hz).
+    let winStart = Math.max(0, index - 32);
+    if (winStart > 0) {
+      const c = text.charCodeAt(winStart);
+      if (c >= 0xdc00 && c <= 0xdfff) winStart = Math.max(0, winStart - 1);
+    }
+    let winEnd = Math.min(text.length, index + 32);
+    if (winEnd < text.length) {
+      const c = text.charCodeAt(winEnd - 1);
+      if (c >= 0xd800 && c <= 0xdbff) winEnd = Math.min(text.length, winEnd + 1);
+    }
+    const seg = graphemeSegmenter.segment(text.slice(winStart, winEnd)).containing(index - winStart);
+    return seg ? winStart + seg.index : index;
+  }
   if (prevCode >= 0xd800 && prevCode <= 0xdbff) {
     return Math.max(0, index - 1);
   }
   return index;
+}
+
+function countLinesInString(text: string): number {
+  let count = 1;
+  let idx = text.indexOf("\n");
+  while (idx !== -1) {
+    count += 1;
+    idx = text.indexOf("\n", idx + 1);
+  }
+  return count;
 }
 
 function countSpansLength(spans: InlineSpanView[]): number {
@@ -131,7 +158,7 @@ export function sliceRichBlocks(blocks: RichBlockView[], budget: number): RichBl
         } else {
           const cut = clampToSafeGraphemeBoundary(block.raw_code, rem);
           const partialCode = block.raw_code.slice(0, cut);
-          const lineCount = partialCode.split("\n").length;
+          const lineCount = countLinesInString(partialCode);
           out.push({
             ...block,
             raw_code: partialCode,

@@ -1,11 +1,13 @@
 import { Fragment, memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
+  AlertTriangle,
   Check,
   ChevronRight,
   Cloud,
   Copy,
   ExternalLink,
+  KeyRound,
   Link2,
   QrCode,
   RefreshCw,
@@ -27,6 +29,7 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog-tabs";
@@ -34,6 +37,7 @@ import { Field, FieldDescription, FieldError, FieldGroup } from "@/components/ui
 import { Input } from "@/components/ui/input";
 import { ShortcutKbd } from "@/components/ui/kbd";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
+import { Segmented } from "@/components/ui/segmented";
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
@@ -66,7 +70,7 @@ function renderShortcutHint(template: string, shortcutKeys: string) {
     <Fragment key={idx}>
       {part}
       {idx < parts.length - 1 && (
-        <ShortcutKbd keys={shortcutKeys} size="xs" className="mx-0.5 align-middle" />
+        <ShortcutKbd keys={shortcutKeys} size="xs" className="mx-1 align-middle" />
       )}
     </Fragment>
   ));
@@ -94,13 +98,21 @@ export const CloudSyncSection = memo(function CloudSyncSection() {
   const [passphraseInput, setPassphraseInput] = useState("");
   const [confirmPassphraseInput, setConfirmPassphraseInput] = useState("");
   const [generatedKey, setGeneratedKey] = useState<string | null>(null);
-  const [copiedFlag, setCopiedFlag] = useState<"code" | "key" | "cli" | "link" | null>(null);
+  const [copiedFlag, setCopiedFlag] = useState<"code" | "key" | "link" | "manual" | null>(null);
   const copiedTimerRef = useRef<number | null>(null);
   const [manualCodeCopiedFor, setManualCodeCopiedFor] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<"github" | "link" | "unlock" | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const [clearHostsOnLogout, setClearHostsOnLogout] = useState(false);
   const [confirmSignOutOpen, setConfirmSignOutOpen] = useState(false);
+  const [manualDialogOpen, setManualDialogOpen] = useState(false);
+  const [manualMode, setManualMode] = useState<"generate" | "custom">("generate");
+  const [manualGeneratedPass, setManualGeneratedPass] = useState("");
+  const [manualSavedAck, setManualSavedAck] = useState(false);
+  const [manualCustomPass, setManualCustomPass] = useState("");
+  const [manualCustomConfirm, setManualCustomConfirm] = useState("");
+  const [manualDialogError, setManualDialogError] = useState<string | null>(null);
+  const [manualSubmitting, setManualSubmitting] = useState(false);
   const [linkQrOpen, setLinkQrOpen] = useState(false);
   const [linkQrUri, setLinkQrUri] = useState<string | null>(null);
   const [linkQrSvg, setLinkQrSvg] = useState<string | null>(null);
@@ -211,11 +223,15 @@ export const CloudSyncSection = memo(function CloudSyncSection() {
       ? trimmedPass.length > 0
       : trimmedPass.length >= 6 && trimmedConfirm === trimmedPass;
 
-  const markCopied = async (which: "code" | "key" | "cli" | "link", text: string) => {
+  const markCopied = async (which: "code" | "key" | "link" | "manual", text: string) => {
     try {
       await navigator.clipboard.writeText(text);
     } catch (err) {
-      setLocalError(String(err));
+      if (which === "manual") {
+        setManualDialogError(String(err));
+      } else {
+        setLocalError(String(err));
+      }
       return false;
     }
     if (copiedTimerRef.current !== null) {
@@ -227,6 +243,65 @@ export const CloudSyncSection = memo(function CloudSyncSection() {
       setCopiedFlag((cur) => (cur === which ? null : cur));
     }, 1800);
     return true;
+  };
+
+  const generateManualPassphrase = async () => {
+    setManualDialogError(null);
+    setManualSavedAck(false);
+    try {
+      const rec = await orbitIpc.cloudSyncGeneratePassphrase();
+      setManualGeneratedPass(rec);
+    } catch (err) {
+      setManualDialogError(String(err));
+    }
+  };
+
+  const openManualPassphraseDialog = () => {
+    setManualMode("generate");
+    setManualGeneratedPass("");
+    setManualSavedAck(false);
+    setManualCustomPass("");
+    setManualCustomConfirm("");
+    setManualDialogError(null);
+    setManualDialogOpen(true);
+    void generateManualPassphrase();
+  };
+
+  const trimmedManualGenerated = manualGeneratedPass.trim();
+  const trimmedManualCustom = manualCustomPass.trim();
+  const trimmedManualConfirm = manualCustomConfirm.trim();
+  const manualCustomNeedsConfirm =
+    trimmedManualCustom.length > 0 && trimmedManualConfirm.length === 0;
+  const manualCustomMismatch =
+    trimmedManualCustom.length > 0 &&
+    trimmedManualConfirm.length > 0 &&
+    trimmedManualConfirm !== trimmedManualCustom;
+  const manualCanConfirm =
+    !manualSubmitting &&
+    !busy &&
+    (manualMode === "generate"
+      ? trimmedManualGenerated.length > 0 && manualSavedAck
+      : trimmedManualCustom.length > 0 && trimmedManualConfirm === trimmedManualCustom);
+
+  const handleConfirmEnableManual = async () => {
+    if (!manualCanConfirm) return;
+    const targetPass = manualMode === "generate" ? trimmedManualGenerated : trimmedManualCustom;
+    setManualDialogError(null);
+    setManualSubmitting(true);
+    try {
+      const res = await orbitActions.enableCloudSyncManualPassphrase(targetPass);
+      if (res.ok) {
+        setManualDialogOpen(false);
+        setManualGeneratedPass("");
+        setManualSavedAck(false);
+        setManualCustomPass("");
+        setManualCustomConfirm("");
+      } else {
+        setManualDialogError(res.error ?? t("settings.cloudSyncManualEnableFailed"));
+      }
+    } finally {
+      setManualSubmitting(false);
+    }
   };
 
   const handleCopyDeviceCode = async (flow: CloudSyncDeviceFlowState) => {
@@ -325,12 +400,12 @@ export const CloudSyncSection = memo(function CloudSyncSection() {
         </span>
       </div>
 
-      <div className="flex flex-col gap-3.5 p-4">
+      <div className="flex flex-col gap-3 p-4">
         <div className="border-border-subtle bg-surface-recessed flex flex-col items-center gap-2 rounded-[10px] border px-4 py-4 text-center">
           <code className="select-text text-ink-primary font-mono text-[24px] leading-none font-semibold tracking-[0.16em] tabular-nums">
             {flow.user_code}
           </code>
-          <p className="text-ink-secondary flex flex-wrap items-center justify-center gap-1.5 text-[12px] leading-snug text-pretty">
+          <p className="text-ink-secondary flex flex-wrap items-center justify-center gap-2 text-[12px] leading-snug text-pretty">
             {codeCopiedReady ? (
               <>
                 <Check className="text-signal-success size-[13px] shrink-0" />
@@ -398,7 +473,7 @@ export const CloudSyncSection = memo(function CloudSyncSection() {
   );
 
   return (
-    <div className="flex flex-col gap-[24px]">
+    <div className="flex flex-col gap-6">
       <SettingSectionHeader
         title={t("settings.cloudSyncTitle")}
         description={t("settings.cloudSyncDesc")}
@@ -414,7 +489,7 @@ export const CloudSyncSection = memo(function CloudSyncSection() {
                 data-setting-id="settings.signInGithub"
                 className="flex flex-col items-start gap-4 p-4"
               >
-                <div className="flex flex-col gap-1.5">
+                <div className="flex flex-col gap-2">
                   <div className="inline-flex flex-wrap items-center gap-2">
                     <Cloud className="text-ink-secondary size-[16px]" />
                     <span className="text-ink-primary text-[13px] font-medium">GitHub</span>
@@ -458,7 +533,7 @@ export const CloudSyncSection = memo(function CloudSyncSection() {
                         </Button>
                       </div>
                       <Input
-                        aria-label="GitHub OAuth Client ID"
+                        aria-label={t("settings.cloudGithubClientIdAria")}
                         placeholder="Ov23li…"
                         disabled={busy}
                         value={clientIdInput}
@@ -669,7 +744,7 @@ export const CloudSyncSection = memo(function CloudSyncSection() {
               {generatedKey && (
                 <p className="text-ink-secondary text-[13px]">{t("settings.cloudStoreKey")}</p>
               )}
-              <FieldGroup className="gap-2.5">
+              <FieldGroup className="gap-3">
                 <Field>
                   <Input
                     type={generatedKey ? "text" : "password"}
@@ -741,24 +816,6 @@ export const CloudSyncSection = memo(function CloudSyncSection() {
               </Button>
             </SettingRow>
             <SettingRow
-              settingId="settings.cloudHeadless"
-              title={t("settings.cloudHeadless")}
-              description={t("settings.cloudHeadlessDesc")}
-            >
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => void markCopied("cli", "orbit login")}
-              >
-                {copiedFlag === "cli" ? (
-                  <Check data-icon="inline-start" />
-                ) : (
-                  <Copy data-icon="inline-start" />
-                )}
-                <code>orbit login</code>
-              </Button>
-            </SettingRow>
-            <SettingRow
               settingId="settings.fleetNetworkTitle"
               title={t("settings.fleetNetworkTitle")}
               description={t(
@@ -800,9 +857,15 @@ export const CloudSyncSection = memo(function CloudSyncSection() {
               >
                 <ToggleSwitch
                   checked={!status.instant_unlock_enabled}
-                  disabled={busy}
+                  disabled={busy || manualSubmitting}
                   ariaLabel={t("settings.cloudSyncRequireManualTitle")}
-                  onChange={(manual) => void orbitActions.setCloudSyncManualPassphraseMode(manual)}
+                  onChange={(manual) => {
+                    if (manual) {
+                      openManualPassphraseDialog();
+                    } else {
+                      void orbitActions.setCloudSyncManualPassphraseMode(false);
+                    }
+                  }}
                 />
               </SettingRow>
               {vaultUrl && (
@@ -819,6 +882,22 @@ export const CloudSyncSection = memo(function CloudSyncSection() {
                   </Button>
                 </SettingRow>
               )}
+              <div
+                data-setting-id="settings.cloudHeadless"
+                className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-3"
+              >
+                <div className="min-w-[140px] flex-1">
+                  <div className="text-ink-primary text-[13px] font-medium">
+                    {t("settings.cloudHeadless")}
+                  </div>
+                  <div className="text-ink-secondary mt-1 text-[11px] leading-[1.45]">
+                    {t("settings.cloudHeadlessDesc")}
+                  </div>
+                </div>
+                <code className="border-border-subtle bg-surface-recessed text-ink-primary rounded-md border px-2 py-1 font-mono text-[11px] select-text">
+                  orbit login
+                </code>
+              </div>
             </CollapsibleContent>
           </Collapsible>
         </>
@@ -879,7 +958,7 @@ export const CloudSyncSection = memo(function CloudSyncSection() {
             </DialogDescription>
           </DialogHeader>
 
-          <div className="flex flex-col items-center gap-3.5">
+          <div className="flex flex-col items-center gap-3">
             <div className="border-border-subtle bg-surface-recessed flex size-[208px] items-center justify-center rounded-[14px] border p-3">
               {linkQrLoading ? (
                 <OrbitSpinner size={20} className="text-ink-muted size-5" />
@@ -895,7 +974,7 @@ export const CloudSyncSection = memo(function CloudSyncSection() {
               )}
             </div>
 
-            <div className="text-ink-muted flex items-center gap-1.5 text-center text-[11px]">
+            <div className="text-ink-muted flex items-center gap-2 text-center text-[11px]">
               <ShieldCheck className="h-[13px] w-[13px] shrink-0 opacity-75" />
               <span>{t("settings.deviceLinkQrHint")}</span>
             </div>
@@ -906,7 +985,7 @@ export const CloudSyncSection = memo(function CloudSyncSection() {
                 variant="outline"
                 size="sm"
                 onClick={() => void markCopied("link", linkQrUri)}
-                className="gap-1.5"
+                className="gap-2"
               >
                 {copiedFlag === "link" ? (
                   <Check className="text-signal-success size-3.5" />
@@ -919,6 +998,190 @@ export const CloudSyncSection = memo(function CloudSyncSection() {
               </Button>
             )}
           </div>
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        open={manualDialogOpen}
+        onOpenChange={(next) => {
+          if (!manualSubmitting) {
+            setManualDialogOpen(next);
+            if (!next) setManualDialogError(null);
+          }
+        }}
+      >
+        <DialogContent className="max-w-[440px] gap-4 p-5" closeDisabled={manualSubmitting}>
+          <DialogHeader className="gap-1 pr-6">
+            <DialogTitle className="flex items-center gap-2 text-[17px]">
+              <KeyRound className="text-ink-muted size-[16px] shrink-0 stroke-[1.75]" />
+              <span>{t("settings.cloudSyncManualDialogTitle")}</span>
+            </DialogTitle>
+            <DialogDescription className="text-[13px] leading-[1.45]">
+              {t("settings.cloudSyncManualDialogDesc")}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div
+            role="note"
+            className="border-signal-warning-border bg-signal-warning-bg text-signal-warning flex items-start gap-2 rounded-xl border p-3 text-[13px] leading-[1.45]"
+          >
+            <AlertTriangle className="mt-0.5 size-[15px] shrink-0" />
+            <span className="min-w-0 flex-1 text-pretty">
+              {t("settings.cloudSyncManualWarning")}
+            </span>
+          </div>
+
+          <Segmented
+            fullWidth
+            disabled={manualSubmitting}
+            ariaLabel={t("settings.cloudSyncManualDialogTitle")}
+            value={manualMode}
+            onValueChange={(next) => {
+              setManualMode(next);
+              setManualDialogError(null);
+              if (next === "generate" && !manualGeneratedPass) {
+                void generateManualPassphrase();
+              }
+            }}
+            options={[
+              { value: "generate", label: t("settings.cloudSyncManualModeGenerate") },
+              { value: "custom", label: t("settings.cloudSyncManualModeCustom") },
+            ]}
+          />
+
+          <form
+            className="flex flex-col gap-4"
+            {...ime.compositionProps}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && ime.shouldIgnoreKeyDown(e)) e.preventDefault();
+            }}
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (manualCanConfirm) void handleConfirmEnableManual();
+            }}
+          >
+            {manualMode === "generate" ? (
+              <div className="flex flex-col gap-3">
+                <div className="border-border-subtle bg-surface-recessed flex flex-col gap-2 rounded-xl border p-3">
+                  <code className="text-ink-primary font-mono text-[13px] leading-[1.5] font-medium break-all tabular-nums select-text">
+                    {manualGeneratedPass || "…"}
+                  </code>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={manualSubmitting || !trimmedManualGenerated}
+                      onClick={() => void markCopied("manual", trimmedManualGenerated)}
+                    >
+                      {copiedFlag === "manual" ? (
+                        <Check data-icon="inline-start" className="text-signal-success" />
+                      ) : (
+                        <Copy data-icon="inline-start" />
+                      )}
+                      {t(copiedFlag === "manual" ? "common.copied" : "common.copy")}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      disabled={manualSubmitting}
+                      onClick={() => void generateManualPassphrase()}
+                    >
+                      <RefreshCw data-icon="inline-start" />
+                      {t("settings.cloudSyncManualRegenerate")}
+                    </Button>
+                  </div>
+                </div>
+                <label
+                  className={cn(
+                    "text-ink-secondary flex items-start gap-2 text-[13px] leading-[1.45]",
+                    manualSubmitting ? "cursor-not-allowed opacity-60" : "cursor-pointer",
+                  )}
+                >
+                  <Checkbox
+                    size="sm"
+                    className="mt-0.5"
+                    checked={manualSavedAck}
+                    disabled={manualSubmitting || !trimmedManualGenerated}
+                    onCheckedChange={setManualSavedAck}
+                  />
+                  <span>{t("settings.cloudSyncManualSavedAck")}</span>
+                </label>
+              </div>
+            ) : (
+              <FieldGroup className="gap-3">
+                <p className="text-ink-secondary text-[13px] leading-[1.45] text-pretty">
+                  {t("settings.cloudSyncManualCustomHint")}
+                </p>
+                <Field>
+                  <Input
+                    type="password"
+                    autoComplete="new-password"
+                    disabled={manualSubmitting}
+                    aria-label={t("settings.cloudEnterPass")}
+                    placeholder={t("settings.cloudEnterPass")}
+                    value={manualCustomPass}
+                    onChange={(e) => setManualCustomPass(e.target.value)}
+                  />
+                </Field>
+                <Field data-invalid={manualCustomMismatch || undefined}>
+                  <Input
+                    type="password"
+                    autoComplete="new-password"
+                    disabled={manualSubmitting}
+                    aria-invalid={manualCustomMismatch || undefined}
+                    aria-label={t("settings.cloudConfirmPass")}
+                    placeholder={t("settings.cloudConfirmPass")}
+                    value={manualCustomConfirm}
+                    onChange={(e) => setManualCustomConfirm(e.target.value)}
+                  />
+                  {manualCustomNeedsConfirm && (
+                    <FieldDescription className="text-[11px]">
+                      {t("settings.cloudConfirmPassHint")}
+                    </FieldDescription>
+                  )}
+                  {manualCustomMismatch && (
+                    <FieldError className="text-[11px]">
+                      {t("settings.cloudPassMismatch")}
+                    </FieldError>
+                  )}
+                </Field>
+              </FieldGroup>
+            )}
+
+            {manualDialogError && (
+              <div
+                role="alert"
+                className="border-signal-danger-border bg-signal-danger-bg text-signal-danger flex items-start gap-2 rounded-xl border p-3 text-[13px] leading-[1.45]"
+              >
+                <AlertCircle className="mt-0.5 size-[15px] shrink-0" />
+                <span className="min-w-0 flex-1 break-words">{manualDialogError}</span>
+              </div>
+            )}
+
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                disabled={manualSubmitting}
+                onClick={() => {
+                  setManualDialogOpen(false);
+                  setManualDialogError(null);
+                }}
+              >
+                {t("common.cancel")}
+              </Button>
+              <Button type="submit" size="sm" disabled={!manualCanConfirm}>
+                {manualSubmitting && <OrbitSpinner size={14} />}
+                {t(
+                  manualSubmitting
+                    ? "settings.cloudSyncManualEnabling"
+                    : "settings.cloudSyncManualConfirmButton",
+                )}
+              </Button>
+            </DialogFooter>
+          </form>
         </DialogContent>
       </Dialog>
     </div>

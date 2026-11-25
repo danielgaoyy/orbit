@@ -1,9 +1,15 @@
 import { memo, useMemo } from "react";
 import { Plus } from "lucide-react";
 import { AddHostSection } from "@/components/settings/add-host-section";
+import { ArchivedSection } from "@/components/settings/archived-section";
 import { FleetUpgrades } from "@/components/settings/fleet-upgrades";
 import { HostConnectionSection } from "@/components/settings/host-connection-section";
-import { SettingDrawer, SettingPageHeader } from "@/components/settings/settings-primitives";
+import { HostDiagnosticsSection } from "@/components/settings/host-security-ops-panels";
+import {
+  SettingDrawer,
+  SettingPageHeader,
+  useHostIsOnline,
+} from "@/components/settings/settings-primitives";
 import { Button } from "@/components/ui/button";
 import { useI18n } from "@/lib/i18n";
 import { isLocalHostCard } from "@/lib/projects";
@@ -28,6 +34,9 @@ export const HostsFleetSection = memo(function HostsFleetSection({
   );
   const localOnly = hosts.length === 1 && isLocalHostCard(hosts[0]);
   const detail = view === "connection" ? hosts.find((h) => h.host_id === hostId) : null;
+  const visibleHost = detail ?? (localOnly ? hosts[0] : null);
+  const opsHostId = visibleHost?.host_id ?? hostId;
+  const opsHostOnline = useHostIsOnline(opsHostId);
   if (view === "connection" && !detail) {
     return (
       <SettingPageHeader
@@ -41,7 +50,6 @@ export const HostsFleetSection = memo(function HostsFleetSection({
       />
     );
   }
-  const visibleHost = detail ?? (localOnly ? hosts[0] : null);
   return (
     <div className="flex flex-col gap-6">
       <SettingPageHeader
@@ -84,6 +92,14 @@ export const HostsFleetSection = memo(function HostsFleetSection({
           inlinePairing={localOnly}
         />
       )}
+      {opsHostId && (
+        <HostDiagnosticsSection
+          key={`diag:${opsHostId}`}
+          hostId={opsHostId}
+          isOnline={opsHostOnline}
+        />
+      )}
+      <ArchivedSection key={`archive:${opsHostId}`} hostId={opsHostId} />
       <SettingDrawer
         open={view === "add_host"}
         onOpenChange={(open) => {

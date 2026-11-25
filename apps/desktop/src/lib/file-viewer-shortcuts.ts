@@ -4,7 +4,7 @@ export const SIDEBAR_SELECTOR = '[data-orbit-sidebar="true"]';
 export const STAGE_SELECTOR = '[data-orbit-stage="true"]';
 export const COMPOSER_INPUT_SELECTOR = '[data-orbit-composer-input="true"]';
 export const SETTINGS_ESCAPE_OVERLAY_SELECTOR =
-  '[data-slot="dialog-content"], [role="dialog"], [role="alertdialog"], [data-slot="popover-content"], [role="menu"], [role="listbox"]';
+  '[data-slot="dialog-content"], [role="dialog"]:not([data-slot="settings-view"]), [role="alertdialog"], [data-slot="popover-content"], [role="menu"], [role="listbox"]';
 
 export type FileViewerShortcutAction = "find" | "toggle_edit" | "save" | "close_find" | null;
 
@@ -289,10 +289,17 @@ export function resolveGlobalFindAction(ctx: GlobalFindContext): GlobalFindActio
  * Settings exits.
  */
 export function hasOpenSettingsBlockingOverlay(
-  doc: Pick<ShortcutDocumentLike, "querySelector"> | null =
-    typeof document !== "undefined" ? document : null,
+  doc: Pick<Document, "querySelectorAll"> | null = typeof document !== "undefined" ? document : null,
 ): boolean {
-  return Boolean(doc?.querySelector?.(SETTINGS_ESCAPE_OVERLAY_SELECTOR));
+  if (!doc) return false;
+  for (const layer of doc.querySelectorAll<HTMLElement>(SETTINGS_ESCAPE_OVERLAY_SELECTOR)) {
+    // Base UI can retain a zero-size listbox after closing a select. The workspace
+    // underneath Settings also stays mounted, with inert marking its entire subtree.
+    if (layer.closest("[hidden], [inert], [aria-hidden=true], [data-ending-style]")) continue;
+    const rect = layer.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) return true;
+  }
+  return false;
 }
 
 export interface SettingsEscapeContext {
@@ -300,24 +307,19 @@ export interface SettingsEscapeContext {
   defaultPrevented?: boolean;
   activeView: "workspace" | "settings";
   commandPaletteOpen: boolean;
-  targetTagName?: string | null;
   hasBlockingOverlay: boolean;
 }
 
 /**
  * Pure guardrail deciding whether `Escape` should close the Settings view.
  * Bails out whenever an inner dialog, popover, menu, listbox, command palette,
- * or text input owns the `Escape` keystroke.
+ * or focused control has consumed the `Escape` keystroke.
  */
 export function shouldCloseSettingsOnEscape(ctx: SettingsEscapeContext): boolean {
   if (ctx.defaultPrevented || ctx.key !== "Escape") {
     return false;
   }
   if (ctx.activeView !== "settings" || ctx.commandPaletteOpen || ctx.hasBlockingOverlay) {
-    return false;
-  }
-  const tag = (ctx.targetTagName ?? "").toUpperCase();
-  if (tag === "INPUT" || tag === "TEXTAREA") {
     return false;
   }
   return true;

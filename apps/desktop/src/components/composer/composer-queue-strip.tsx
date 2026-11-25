@@ -403,7 +403,7 @@ export const ComposerQueueStrip = memo(function ComposerQueueStrip() {
                 "group/qrow flex h-[28px] min-w-0 items-center justify-between gap-2 overflow-hidden rounded-[8px] px-2 select-none",
                 isDragged
                   ? cn(
-                      "bg-surface-overlay ring-border-strong relative z-10 shadow-md ring-1",
+                      "bg-surface-overlay relative z-10 shadow-md",
                       queueDrag.phase === "settling"
                         ? "transition-[transform,box-shadow] duration-[140ms] ease-[var(--ease-out-expo)]"
                         : "cursor-grabbing",

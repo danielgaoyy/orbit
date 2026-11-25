@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   Check,
@@ -6,20 +6,14 @@ import {
   Cloud,
   Copy,
   ExternalLink,
-  Globe,
-  KeyRound,
   Link2,
-  Lock,
-  LogOut,
   QrCode,
   RefreshCw,
   ShieldCheck,
-  Sparkles,
-  Terminal,
 } from "lucide-react";
 import {
   SettingCard,
-  SettingGroupLabel,
+  SettingGroup,
   SettingRow,
   SettingSectionHeader,
   ToggleSwitch,
@@ -27,11 +21,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   Dialog,
@@ -40,45 +30,74 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog-tabs";
+import { Field, FieldDescription, FieldError, FieldGroup } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
+import { ShortcutKbd } from "@/components/ui/kbd";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
+import { modSymbol } from "@/lib/keybindings";
 import { orbitIpc } from "@/lib/orbit-ipc";
-import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
+import { formatDeviceFlowCountdown } from "@/state/cloud-sync-device-poll";
+import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import type { CloudSyncDeviceFlowState } from "@/state/store-types";
 
-type LoginMethodTab = "device" | "token" | "link";
+const SHORTCUT_SENTINEL = "__ORBIT_PASTE_SHORTCUT__";
 
-function formatRelativeSyncTime(tsMs: number | null): string {
-  if (!tsMs) return "Never synced yet";
-  const diffSec = Math.max(0, Math.floor((Date.now() - tsMs) / 1000));
-  if (diffSec < 15) return "Just now";
-  if (diffSec < 60) return `${diffSec}s ago`;
-  const diffMin = Math.floor(diffSec / 60);
-  if (diffMin < 60) return `${diffMin}m ago`;
-  const diffHr = Math.floor(diffMin / 60);
-  if (diffHr < 24) return `${diffHr}h ago`;
-  return new Date(tsMs).toLocaleDateString();
+function GithubMark({ className, ...props }: React.ComponentProps<"svg">) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      fill="currentColor"
+      aria-hidden="true"
+      className={cn("size-[15px] shrink-0", className)}
+      {...props}
+    >
+      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
+    </svg>
+  );
 }
 
-export function CloudSyncSection() {
-  const { t } = useI18n();
+function renderShortcutHint(template: string, shortcutKeys: string) {
+  const parts = template.split(SHORTCUT_SENTINEL);
+  if (parts.length === 1) return template;
+  return parts.map((part, idx) => (
+    <Fragment key={idx}>
+      {part}
+      {idx < parts.length - 1 && (
+        <ShortcutKbd keys={shortcutKeys} size="xs" className="mx-0.5 align-middle" />
+      )}
+    </Fragment>
+  ));
+}
+
+export const CloudSyncSection = memo(function CloudSyncSection() {
+  const { t, locale } = useI18n();
   const status = useOrbitSelector((s) => s.cloudSyncStatus);
   const busy = useOrbitSelector((s) => s.cloudSyncBusy);
   const storeError = useOrbitSelector((s) => s.cloudSyncError);
   const deviceFlow = useOrbitSelector((s) => s.cloudSyncDeviceFlow);
   const lastResult = useOrbitSelector((s) => s.cloudSyncLastResult);
-  const hosts = useOrbitSelector((s) => s.fleet.hosts);
+  const allRemoteHostsLackReachability = useOrbitSelector((s) => {
+    const hosts = s.fleet.hosts;
+    if (hosts.length <= 1) return false;
+    return !hosts.some(
+      (h) => Boolean((h.relay_url ?? "").trim()) || Boolean((h.ssh_alias ?? "").trim()),
+    );
+  });
 
-  const [loginTab, setLoginTab] = useState<LoginMethodTab>("device");
   const [clientIdInput, setClientIdInput] = useState("");
-  const [tokenInput, setTokenInput] = useState("");
+  const syncedClientIdRef = useRef<string | null>(null);
+  const [deviceLinkOpen, setDeviceLinkOpen] = useState(false);
   const [deviceLinkInput, setDeviceLinkInput] = useState("");
   const [passphraseInput, setPassphraseInput] = useState("");
   const [confirmPassphraseInput, setConfirmPassphraseInput] = useState("");
   const [generatedKey, setGeneratedKey] = useState<string | null>(null);
   const [copiedFlag, setCopiedFlag] = useState<"code" | "key" | "cli" | "link" | null>(null);
+  const copiedTimerRef = useRef<number | null>(null);
+  const [manualCodeCopiedFor, setManualCodeCopiedFor] = useState<string | null>(null);
+  const [pendingAction, setPendingAction] = useState<"github" | "link" | "unlock" | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const [clearHostsOnLogout, setClearHostsOnLogout] = useState(false);
   const [confirmSignOutOpen, setConfirmSignOutOpen] = useState(false);
@@ -87,27 +106,52 @@ export function CloudSyncSection() {
   const [linkQrSvg, setLinkQrSvg] = useState<string | null>(null);
   const [linkQrLoading, setLinkQrLoading] = useState(false);
   const [advancedSecOpen, setAdvancedSecOpen] = useState(false);
+  const [nowMs, setNowMs] = useState(() => Date.now());
 
   const ime = useImeCompositionGuard();
+  const pasteShortcut = `${modSymbol()}V`;
 
   useEffect(() => {
     void orbitActions.refreshCloudSyncStatus();
   }, []);
 
   useEffect(() => {
-    if (status?.github_client_id_override && !clientIdInput) {
-      setClientIdInput(status.github_client_id_override);
-    }
-  }, [status?.github_client_id_override, clientIdInput]);
+    return () => {
+      if (copiedTimerRef.current !== null) {
+        window.clearTimeout(copiedTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
-    if (status && !status.github_oauth_configured && !deviceFlow && loginTab === "device") {
-      setLoginTab("token");
+    const override = status?.github_client_id_override ?? null;
+    if (override && syncedClientIdRef.current !== override) {
+      syncedClientIdRef.current = override;
+      setClientIdInput((prev) => prev || override);
     }
-  }, [status, deviceFlow, loginTab]);
+  }, [status?.github_client_id_override]);
 
   useEffect(() => {
-    if (!linkQrOpen) return;
+    if (!deviceFlow) return;
+    setNowMs(Date.now());
+    const timer = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [deviceFlow?.device_code, deviceFlow?.expiresAtMs]);
+
+  useEffect(() => {
+    if (!busy) {
+      setPendingAction(null);
+    }
+  }, [busy]);
+
+  useEffect(() => {
+    if (!linkQrOpen) {
+      setLinkQrUri(null);
+      setLinkQrSvg(null);
+      return;
+    }
     let active = true;
     setLinkQrLoading(true);
     setLocalError(null);
@@ -137,90 +181,100 @@ export function CloudSyncSection() {
     return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(linkQrSvg)}`;
   }, [linkQrSvg]);
 
-  const effectiveState = status?.state ?? "signed_out";
+  const state = status?.state ?? "signed_out";
+  const unlocked = state === "ready" || state === "syncing" || state === "error";
+  const needsCustomClientId = status?.github_oauth_configured === false;
+  const canStartGithubLogin = !needsCustomClientId || Boolean(clientIdInput.trim());
+  const lastSynced = status?.last_synced_at_ms
+    ? new Date(status.last_synced_at_ms).toLocaleString(locale)
+    : t("settings.neverSynced");
   const displayError = localError ?? storeError ?? status?.last_error ?? null;
   const isAuthExpiredError = Boolean(
-    displayError &&
-      /401|bad credentials|expired|revoked|unauthorized/i.test(displayError),
+    displayError && /401|bad credentials|expired|revoked|unauthorized/i.test(displayError),
   );
-  const hostsWithReachableFabric = hosts.filter(
-    (h) => Boolean((h.relay_url ?? "").trim()) || Boolean((h.ssh_alias ?? "").trim()),
-  );
-  const allRemoteHostsLackReachability =
-    hosts.length > 1 && hostsWithReachableFabric.length === 0;
 
-  const markCopied = (which: "code" | "key" | "cli" | "link", text: string) => {
-    if (typeof navigator !== "undefined" && navigator.clipboard) {
-      void navigator.clipboard.writeText(text).catch(() => undefined);
+  const trimmedPass = passphraseInput.trim();
+  const trimmedConfirm = confirmPassphraseInput.trim();
+  const isCreatingVault = !status?.remote_vault_exists;
+  const usingCustomNewPassphrase = isCreatingVault && !generatedKey;
+  const passTooShort = usingCustomNewPassphrase && trimmedPass.length > 0 && trimmedPass.length < 6;
+  const passNeedsConfirm =
+    usingCustomNewPassphrase && trimmedPass.length >= 6 && trimmedConfirm.length === 0;
+  const passMismatch =
+    usingCustomNewPassphrase &&
+    trimmedPass.length >= 6 &&
+    trimmedConfirm.length > 0 &&
+    trimmedConfirm !== trimmedPass;
+  const canSubmitVault = !status
+    ? false
+    : status.remote_vault_exists || Boolean(generatedKey)
+      ? trimmedPass.length > 0
+      : trimmedPass.length >= 6 && trimmedConfirm === trimmedPass;
+
+  const markCopied = async (which: "code" | "key" | "cli" | "link", text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (err) {
+      setLocalError(String(err));
+      return false;
+    }
+    if (copiedTimerRef.current !== null) {
+      window.clearTimeout(copiedTimerRef.current);
     }
     setCopiedFlag(which);
-    window.setTimeout(() => {
+    copiedTimerRef.current = window.setTimeout(() => {
+      copiedTimerRef.current = null;
       setCopiedFlag((cur) => (cur === which ? null : cur));
     }, 1800);
+    return true;
+  };
+
+  const handleCopyDeviceCode = async (flow: CloudSyncDeviceFlowState) => {
+    const ok = await markCopied("code", flow.user_code);
+    if (ok) {
+      setManualCodeCopiedFor(flow.device_code);
+    }
   };
 
   const handleStartDeviceLogin = async () => {
     setLocalError(null);
     const trimmedCid = clientIdInput.trim();
-    if (!status?.github_oauth_configured && !trimmedCid) {
-      setLocalError(
-        "Enter a GitHub OAuth App Client ID (with Device Flow enabled), or switch to Personal Access Token below.",
-      );
+    if (needsCustomClientId && !trimmedCid) {
+      setLocalError(t("settings.cloudClientHint"));
       return;
     }
-    await orbitActions.startGithubCloudLogin(trimmedCid || null);
-  };
-
-  const handleTokenLogin = async () => {
-    setLocalError(null);
-    if (!tokenInput.trim()) {
-      setLocalError("Paste a GitHub Personal Access Token with the `gist` scope.");
-      return;
-    }
-    const ok = await orbitActions.loginCloudSyncWithToken(tokenInput);
-    if (ok) {
-      setTokenInput("");
-    }
+    setPendingAction("github");
+    await orbitActions.startGithubCloudLogin(needsCustomClientId ? trimmedCid : null);
   };
 
   const handleDeviceLinkLogin = async () => {
     setLocalError(null);
-    if (!deviceLinkInput.trim()) {
-      setLocalError("Paste an `orbit://sync-login?...` Device Link URI.");
-      return;
-    }
+    if (!deviceLinkInput.trim()) return;
+    setPendingAction("link");
     const ok = await orbitActions.importCloudSyncDeviceLinkUri(deviceLinkInput);
     if (ok) {
       setDeviceLinkInput("");
+      setDeviceLinkOpen(false);
     }
   };
 
   const handleGenerateKey = async () => {
     setLocalError(null);
-    const rec = await orbitIpc.cloudSyncGeneratePassphrase();
-    setGeneratedKey(rec);
-    setPassphraseInput(rec);
-    setConfirmPassphraseInput(rec);
+    try {
+      const rec = await orbitIpc.cloudSyncGeneratePassphrase();
+      setGeneratedKey(rec);
+      setPassphraseInput(rec);
+      setConfirmPassphraseInput(rec);
+    } catch (err) {
+      setLocalError(String(err));
+    }
   };
 
   const handleUnlock = async () => {
     setLocalError(null);
-    const pass = passphraseInput.trim();
-    if (!pass) {
-      setLocalError("Sync Passphrase cannot be empty.");
-      return;
-    }
-    if (!status?.remote_vault_exists && !generatedKey) {
-      if (pass.length < 6) {
-        setLocalError("Use at least 6 characters (or click Generate Recovery Key).");
-        return;
-      }
-      if (pass !== confirmPassphraseInput.trim()) {
-        setLocalError("Sync Passphrases do not match.");
-        return;
-      }
-    }
-    const ok = await orbitActions.unlockCloudSyncWithPassphrase(pass);
+    if (!canSubmitVault) return;
+    setPendingAction("unlock");
+    const ok = await orbitActions.unlockCloudSyncWithPassphrase(trimmedPass);
     if (ok) {
       setPassphraseInput("");
       setConfirmPassphraseInput("");
@@ -228,763 +282,607 @@ export function CloudSyncSection() {
     }
   };
 
+  const stateLabel = {
+    signed_out: t("settings.cloudSignedOut"),
+    locked: t(status?.remote_vault_exists ? "settings.cloudLocked" : "settings.cloudCreateVault"),
+    ready: t("settings.cloudReady"),
+    syncing: t("common.syncing"),
+    error: t("settings.cloudError"),
+  }[state];
+  const vaultUrl = status?.gist_html_url;
+  const startingGithub = busy && pendingAction === "github";
+  const linkingDevice = busy && pendingAction === "link";
+  const unlockingVault = busy && pendingAction === "unlock";
+
+  const remainingMs = deviceFlow ? Math.max(0, deviceFlow.expiresAtMs - nowMs) : 0;
+  const countdownLabel = formatDeviceFlowCountdown(remainingMs);
+  const codeCopiedReady = Boolean(
+    deviceFlow &&
+      (deviceFlow.clipboardCopied ||
+        manualCodeCopiedFor === deviceFlow.device_code ||
+        copiedFlag === "code"),
+  );
+
+  const renderDeviceFlowCard = (flow: CloudSyncDeviceFlowState, withPrimaryAnchors: boolean) => (
+    <SettingCard settingId={withPrimaryAnchors ? "settings.cloudSyncTitle" : undefined}>
+      <div
+        data-setting-id={withPrimaryAnchors ? "settings.signInGithub" : undefined}
+        className="flex flex-wrap items-center justify-between gap-2 px-4 py-3"
+      >
+        <div className="flex min-w-0 items-center gap-2">
+          <OrbitSpinner size={14} className="text-ink-primary" />
+          <span className="text-ink-primary text-[13px] font-medium">
+            {t("settings.cloudWaitingAuth")}
+          </span>
+        </div>
+        <span
+          className={cn(
+            "font-mono text-[11px] tabular-nums",
+            remainingMs < 60_000 ? "text-signal-warning font-medium" : "text-ink-muted",
+          )}
+        >
+          {t("settings.cloudCodeExpiresIn", { time: countdownLabel })}
+        </span>
+      </div>
+
+      <div className="flex flex-col gap-3.5 p-4">
+        <div className="border-border-subtle bg-surface-recessed flex flex-col items-center gap-2 rounded-[10px] border px-4 py-4 text-center">
+          <code className="select-text text-ink-primary font-mono text-[24px] leading-none font-semibold tracking-[0.16em] tabular-nums">
+            {flow.user_code}
+          </code>
+          <p className="text-ink-secondary flex flex-wrap items-center justify-center gap-1.5 text-[12px] leading-snug text-pretty">
+            {codeCopiedReady ? (
+              <>
+                <Check className="text-signal-success size-[13px] shrink-0" />
+                <span>
+                  {renderShortcutHint(
+                    t("settings.cloudCodeCopiedPasteHint", { shortcut: SHORTCUT_SENTINEL }),
+                    pasteShortcut,
+                  )}
+                </span>
+              </>
+            ) : (
+              <>
+                <Copy className="text-ink-muted size-[13px] shrink-0" />
+                <span>
+                  {renderShortcutHint(
+                    t("settings.cloudCodeCopyManualHint", { shortcut: SHORTCUT_SENTINEL }),
+                    pasteShortcut,
+                  )}
+                </span>
+              </>
+            )}
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant={codeCopiedReady ? "outline" : "default"}
+              onClick={() => void handleCopyDeviceCode(flow)}
+            >
+              {copiedFlag === "code" ? (
+                <Check data-icon="inline-start" className="text-signal-success" />
+              ) : (
+                <Copy data-icon="inline-start" />
+              )}
+              {copiedFlag === "code" ? t("common.copied") : t("settings.cloudCopyCode")}
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() =>
+                void orbitIpc
+                  .openExternalBrowserUrl(flow.verification_uri)
+                  .catch((err) => setLocalError(String(err)))
+              }
+            >
+              <ExternalLink data-icon="inline-start" />
+              {t("settings.cloudReopenBrowser")}
+            </Button>
+          </div>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            onClick={() => orbitActions.cancelGithubCloudLogin()}
+          >
+            {t("common.cancel")}
+          </Button>
+        </div>
+      </div>
+    </SettingCard>
+  );
+
   return (
-    <div className="space-y-6">
+    <div className="flex flex-col gap-[24px]">
       <SettingSectionHeader
         title={t("settings.cloudSyncTitle")}
         description={t("settings.cloudSyncDesc")}
       />
 
-      {/* Architecture / Zero-Server Trust Summary */}
-      <div className="border-border/80 bg-background/55 flex items-start gap-3 rounded-[13px] border px-4 py-3.5">
-        <ShieldCheck className="text-signal-success mt-0.5 h-[17px] w-[17px] shrink-0" />
-        <div className="text-muted-foreground space-y-1 text-[12.5px] leading-relaxed">
-          <div className="text-foreground text-[13px] font-medium">
-            Zero-Server · End-to-End Encrypted (GitHub Secret Gist)
-          </div>
-          <p>{t("settings.cloudSyncInstantSummary")}</p>
-        </div>
-      </div>
-
-      {/* Active GitHub Device Flow Card (shown regardless of signed_out/error state for seamless re-auth) */}
-      {deviceFlow && (
-        <div className="space-y-2">
-          <SettingGroupLabel>GitHub Verification</SettingGroupLabel>
-          <SettingCard>
-            <div className="space-y-4 p-4">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <div className="text-foreground text-[13.5px] font-medium">
-                    Enter this code on GitHub
+      {state === "signed_out" ? (
+        <div data-setting-fallback>
+          {deviceFlow ? (
+            renderDeviceFlowCard(deviceFlow, true)
+          ) : (
+            <SettingCard settingId="settings.cloudSyncTitle">
+              <div
+                data-setting-id="settings.signInGithub"
+                className="flex flex-col items-start gap-4 p-4"
+              >
+                <div className="flex flex-col gap-1.5">
+                  <div className="inline-flex flex-wrap items-center gap-2">
+                    <Cloud className="text-ink-secondary size-[16px]" />
+                    <span className="text-ink-primary text-[13px] font-medium">GitHub</span>
+                    <Badge variant="secondary">{stateLabel}</Badge>
                   </div>
-                  <div className="text-muted-foreground text-[12px]">
-                    Authorize Orbit to store your encrypted sync vault in a Secret Gist.
-                  </div>
+                  <p className="text-ink-secondary text-[13px] leading-[1.5] text-pretty">
+                    {t("settings.cloudSignedOutSummary")}
+                  </p>
                 </div>
-                <OrbitSpinner size={16} className="text-muted-foreground" />
-              </div>
 
-              <div className="border-border bg-muted/40 flex items-center justify-between rounded-[11px] border px-4 py-3">
-                <span className="selectable-text text-foreground font-mono text-[22px] font-semibold tracking-[0.14em]">
-                  {deviceFlow.user_code}
-                </span>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => markCopied("code", deviceFlow.user_code)}
-                  className="px-2.5"
-                >
-                  {copiedFlag === "code" ? (
-                    <>
-                      <Check className="text-signal-success size-3.5" />
-                      <span>{t("common.copied")}</span>
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="size-3.5" />
-                      <span>{t("common.copy")}</span>
-                    </>
-                  )}
-                </Button>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2">
-                <Button
-                  type="button"
-                  onClick={() => {
-                    markCopied("code", deviceFlow.user_code);
-                    void orbitIpc.openExternalBrowserUrl(deviceFlow.verification_uri);
-                  }}
-                  className="gap-2 text-[12.5px]"
-                >
-                  <ExternalLink className="size-3.5" />
-                  <span>{t("settings.copyCodeOpenGithub")}</span>
-                </Button>
-
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => orbitActions.cancelGithubCloudLogin()}
-                  className="text-muted-foreground hover:text-foreground px-3 text-[12.5px]"
-                >
-                  {t("common.cancel")}
-                </Button>
-              </div>
-            </div>
-          </SettingCard>
-        </div>
-      )}
-
-      {/* 1. SIGNED OUT */}
-      {effectiveState === "signed_out" && !deviceFlow && (
-        <div className="space-y-3">
-          <div className="space-y-2">
-              <SettingGroupLabel>{t("settings.signInGithub")}</SettingGroupLabel>
-              <SettingCard>
-                <div className="space-y-4 p-4">
-                  {/* Method Toggle */}
-                  <div className="bg-muted/60 grid grid-cols-3 gap-1 rounded-[10px] p-1">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setLoginTab("device");
-                        setLocalError(null);
-                      }}
-                      className={cn(
-                        "h-[30px] cursor-pointer rounded-[7px] px-2 text-[12px] font-medium transition-colors",
-                        loginTab === "device"
-                          ? "bg-background text-foreground shadow-xs"
-                          : "text-muted-foreground hover:text-foreground",
-                      )}
-                    >
-                      {t("settings.oauthDeviceFlow")}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setLoginTab("token");
-                        setLocalError(null);
-                      }}
-                      className={cn(
-                        "h-[30px] cursor-pointer rounded-[7px] px-2 text-[12px] font-medium transition-colors",
-                        loginTab === "token"
-                          ? "bg-background text-foreground shadow-xs"
-                          : "text-muted-foreground hover:text-foreground",
-                      )}
-                    >
-                      {t("settings.personalAccessToken")}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setLoginTab("link");
-                        setLocalError(null);
-                      }}
-                      className={cn(
-                        "h-[30px] cursor-pointer rounded-[7px] px-2 text-[12px] font-medium transition-colors",
-                        loginTab === "link"
-                          ? "bg-background text-foreground shadow-xs"
-                          : "text-muted-foreground hover:text-foreground",
-                      )}
-                    >
-                      {t("settings.deviceLinkTab")}
-                    </button>
-                  </div>
-
-                  {loginTab === "device" ? (
-                    <div className="space-y-3">
-                      {!status?.github_oauth_configured && (
-                        <div className="space-y-1.5">
-                          <div className="text-muted-foreground text-[12px] leading-relaxed">
-                            Provide a public GitHub OAuth App{" "}
-                            <span className="text-foreground/90 font-medium">Client ID</span> (with{" "}
-                            <span className="font-mono text-[11.5px]">Enable Device Flow</span>{" "}
-                            checked on{" "}
-                            <button
-                              type="button"
-                              onClick={() =>
-                                void orbitIpc.openExternalBrowserUrl(
-                                  "https://github.com/settings/developers",
-                                )
-                              }
-                              className="text-foreground/90 cursor-pointer underline underline-offset-2"
-                            >
-                              GitHub Developer Settings
-                            </button>
-                            ). No client secret is needed.
-                          </div>
-                          <Input
-                            type="text"
-                            value={clientIdInput}
-                            onChange={(e) => setClientIdInput(e.target.value)}
-                            {...ime.compositionProps}
-                            onKeyDown={(e) => {
-                              if (ime.shouldIgnoreKeyDown(e)) return;
-                              if (e.key === "Enter") void handleStartDeviceLogin();
-                            }}
-                            placeholder="Ov23li..."
-                            className="h-[34px] px-3 font-mono"
-                          />
-                        </div>
-                      )}
-
-                      <Button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => void handleStartDeviceLogin()}
-                        className="h-[36px] gap-2 px-4 text-[13px]"
-                      >
-                        {busy ? (
-                          <OrbitSpinner size={16} className="size-4" />
-                        ) : (
-                          <Cloud className="size-4" />
-                        )}
-                        <span>Sign in with GitHub</span>
-                      </Button>
-                    </div>
-                  ) : loginTab === "token" ? (
-                    <div className="space-y-3">
-                      <div className="text-muted-foreground text-[12px] leading-relaxed">
-                        Create a classic token with only the{" "}
-                        <code className="bg-muted text-foreground rounded px-1 py-0.5 font-mono text-[11.5px]">
-                          gist
-                        </code>{" "}
-                        checkbox checked — zero repo access required.{" "}
-                        <button
-                          type="button"
-                          onClick={() =>
-                            void orbitIpc.openExternalBrowserUrl(
-                              "https://github.com/settings/tokens/new?scopes=gist&description=Orbit%20Cloud%20Sync",
-                            )
-                          }
-                          className="text-foreground inline-flex cursor-pointer items-center gap-1 underline underline-offset-2"
-                        >
-                          <span>Create GitHub token</span>
-                          <ExternalLink className="h-3 w-3" />
-                        </button>
-                      </div>
-                      <div className="flex gap-2">
-                        <Input
-                          type="password"
-                          value={tokenInput}
-                          onChange={(e) => setTokenInput(e.target.value)}
-                          {...ime.compositionProps}
-                          onKeyDown={(e) => {
-                            if (ime.shouldIgnoreKeyDown(e)) return;
-                            if (e.key === "Enter") void handleTokenLogin();
-                          }}
-                          placeholder="ghp_... or github_pat_..."
-                          className="h-[34px] flex-1 px-3 font-mono"
-                        />
-                        <Button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => void handleTokenLogin()}
-                          className="h-[34px] shrink-0 gap-1.5 px-3.5"
-                        >
-                          {busy ? (
-                            <OrbitSpinner size={14} className="size-3.5" />
-                          ) : (
-                            <KeyRound className="size-3.5" />
-                          )}
-                          <span>Continue</span>
-                        </Button>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="space-y-3">
-                      <div className="text-muted-foreground text-[12px] leading-relaxed">
-                        {t("settings.deviceLinkTabDesc")}
-                      </div>
-                      <div className="flex gap-2">
-                        <Input
-                          type="password"
-                          value={deviceLinkInput}
-                          onChange={(e) => setDeviceLinkInput(e.target.value)}
-                          {...ime.compositionProps}
-                          onKeyDown={(e) => {
-                            if (ime.shouldIgnoreKeyDown(e)) return;
-                            if (e.key === "Enter") void handleDeviceLinkLogin();
-                          }}
-                          placeholder={t("settings.deviceLinkPlaceholder")}
-                          className="h-[34px] flex-1 px-3 font-mono"
-                        />
-                        <Button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => void handleDeviceLinkLogin()}
-                          className="h-[34px] shrink-0 gap-1.5 px-3.5"
-                        >
-                          {busy ? (
-                            <OrbitSpinner size={14} className="size-3.5" />
-                          ) : (
-                            <Link2 className="size-3.5" />
-                          )}
-                          <span>{t("settings.deviceLinkConnect")}</span>
-                        </Button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </SettingCard>
-            </div>
-        </div>
-      )}
-
-      {/* 2. LOCKED (Signed into GitHub, waiting for E2EE Sync Passphrase) */}
-      {effectiveState === "locked" && status && (
-        <div className="space-y-4">
-          <div className="space-y-2">
-            <SettingGroupLabel>GitHub Account</SettingGroupLabel>
-            <SettingCard>
-              <div className="flex items-center justify-between gap-3 px-4 py-3">
-                <div className="flex min-w-0 items-center gap-3">
-                  {status.account_avatar_url ? (
-                    <img
-                      src={status.account_avatar_url}
-                      alt={status.account_login ?? "GitHub"}
-                      className="h-9 w-9 shrink-0 rounded-full border border-black/10 dark:border-white/10"
-                    />
-                  ) : (
-                    <div className="bg-muted flex h-9 w-9 shrink-0 items-center justify-center rounded-full">
-                      <Cloud className="h-4 w-4" />
-                    </div>
-                  )}
-                  <div className="min-w-0">
-                      <div className="text-foreground flex items-center gap-2 text-[13.5px] font-medium">
-                        <span className="truncate">@{status.account_login}</span>
-                        <Badge variant="warning" className="rounded-full">
-                          {status.remote_vault_exists ? "Vault Locked" : "Setup Required"}
-                        </Badge>
-                      </div>
-                    <div className="text-muted-foreground truncate text-[12px]">
-                      {status.remote_vault_exists
-                        ? "Encrypted Orbit Vault found on GitHub — enter passphrase to unlock."
-                        : "Create a Sync Passphrase to encrypt your first Orbit Vault."}
-                    </div>
-                  </div>
-                </div>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  disabled={busy}
-                  onClick={() => void orbitActions.logoutCloudSync(false)}
-                  className="shrink-0 px-2.5"
-                >
-                  <LogOut className="size-3.5" />
-                  <span>Sign Out</span>
-                </Button>
-              </div>
-            </SettingCard>
-          </div>
-
-          <div className="space-y-2">
-            <SettingGroupLabel
-              action={
-                !status.remote_vault_exists && (
-                  <button
-                    type="button"
-                    onClick={() => void handleGenerateKey()}
-                    className="text-muted-foreground hover:text-foreground inline-flex cursor-pointer items-center gap-1 text-[12px] font-medium transition-colors"
-                  >
-                    <Sparkles className="h-3.5 w-3.5" />
-                    <span>Generate Recovery Key</span>
-                  </button>
-                )
-              }
-            >
-              {status.remote_vault_exists ? "Unlock Encrypted Vault" : "Create Sync Passphrase"}
-            </SettingGroupLabel>
-            <SettingCard>
-              <div className="space-y-3 p-4">
-                {generatedKey && (
-                  <div className="border-signal-success-border bg-signal-success-bg space-y-2 rounded-[10px] border p-3">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-signal-success text-[12px] font-medium">
-                        Generated Recovery Key — save this in your password manager
-                      </span>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="xs"
-                        onClick={() => markCopied("key", generatedKey)}
-                        className="gap-1 px-2 text-[11.5px]"
-                      >
-                        {copiedFlag === "key" ? (
-                          <>
-                            <Check className="text-signal-success size-3" />
-                            <span>Copied</span>
-                          </>
-                        ) : (
-                          <>
-                            <Copy className="size-3" />
-                            <span>Copy</span>
-                          </>
-                        )}
-                      </Button>
-                    </div>
-                    <div className="selectable-text text-foreground font-mono text-[13px] font-semibold">
-                      {generatedKey}
-                    </div>
-                  </div>
-                )}
-
-                <div className="space-y-2">
-                  <Input
-                    type={generatedKey ? "text" : "password"}
-                    value={passphraseInput}
-                    onChange={(e) => {
-                      setPassphraseInput(e.target.value);
-                      if (generatedKey && e.target.value !== generatedKey) {
-                        setGeneratedKey(null);
-                      }
-                    }}
+                {needsCustomClientId ? (
+                  <form
+                    className="flex w-full flex-col items-start gap-3"
                     {...ime.compositionProps}
                     onKeyDown={(e) => {
-                      if (ime.shouldIgnoreKeyDown(e)) return;
-                      if (e.key === "Enter" && (status.remote_vault_exists || generatedKey)) {
-                        void handleUnlock();
-                      }
+                      if (e.key === "Enter" && ime.shouldIgnoreKeyDown(e)) e.preventDefault();
                     }}
-                    placeholder={
-                      status.remote_vault_exists
-                        ? "Enter your Sync Passphrase or Recovery Key"
-                        : "Choose a Sync Passphrase (or click Generate Recovery Key)"
-                    }
-                    className="h-[36px] px-3 text-[13px]"
-                  />
-
-                  {!status.remote_vault_exists && !generatedKey && (
-                    <Input
-                      type="password"
-                      value={confirmPassphraseInput}
-                      onChange={(e) => setConfirmPassphraseInput(e.target.value)}
-                      {...ime.compositionProps}
-                      onKeyDown={(e) => {
-                        if (ime.shouldIgnoreKeyDown(e)) return;
-                        if (e.key === "Enter") void handleUnlock();
-                      }}
-                      placeholder="Confirm Sync Passphrase"
-                      className="h-[36px] px-3 text-[13px]"
-                    />
-                  )}
-                </div>
-
-                <div className="flex items-center justify-between gap-3 pt-1">
-                  <span className="text-muted-foreground text-[11.5px]">
-                    Cached locally after unlock — you only enter this once per device.
-                  </span>
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      if (!busy && canStartGithubLogin) void handleStartDeviceLogin();
+                    }}
+                  >
+                    <Field>
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <FieldDescription className="text-ink-secondary text-[12px]">
+                          {t("settings.cloudClientHint")}
+                        </FieldDescription>
+                        <Button
+                          type="button"
+                          size="xs"
+                          variant="link"
+                          className="h-auto p-0"
+                          onClick={() =>
+                            void orbitIpc.openExternalBrowserUrl(
+                              "https://github.com/settings/developers",
+                            )
+                          }
+                        >
+                          {t("settings.cloudDeveloperSettings")}
+                          <ExternalLink data-icon="inline-end" />
+                        </Button>
+                      </div>
+                      <Input
+                        aria-label="GitHub OAuth Client ID"
+                        placeholder="Ov23li…"
+                        disabled={busy}
+                        value={clientIdInput}
+                        onChange={(e) => setClientIdInput(e.target.value)}
+                      />
+                    </Field>
+                    <Button type="submit" disabled={busy || !canStartGithubLogin}>
+                      {startingGithub ? (
+                        <OrbitSpinner size={14} />
+                      ) : (
+                        <GithubMark data-icon="inline-start" />
+                      )}
+                      {startingGithub ? t("settings.cloudSigningIn") : t("settings.signInGithub")}
+                    </Button>
+                  </form>
+                ) : (
                   <Button
                     type="button"
                     disabled={busy}
-                    onClick={() => void handleUnlock()}
-                    className="h-[34px] shrink-0 gap-1.5 px-4"
+                    onClick={() => void handleStartDeviceLogin()}
                   >
-                    {busy ? (
-                      <OrbitSpinner size={14} className="size-3.5" />
+                    {startingGithub ? (
+                      <OrbitSpinner size={14} />
                     ) : (
-                      <Lock className="size-3.5" />
+                      <GithubMark data-icon="inline-start" />
                     )}
-                    <span>
-                      {status.remote_vault_exists ? "Unlock & Sync" : "Encrypt & Start Sync"}
-                    </span>
+                    {startingGithub ? t("settings.cloudSigningIn") : t("settings.signInGithub")}
                   </Button>
-                </div>
+                )}
               </div>
-            </SettingCard>
-          </div>
-        </div>
-      )}
 
-      {/* 3. READY / SYNCING / ERROR */}
-      {(effectiveState === "ready" ||
-        effectiveState === "syncing" ||
-        effectiveState === "error") &&
-        status && (
-          <div className="space-y-4">
-            <div className="space-y-2">
-              <SettingGroupLabel>Connected Account</SettingGroupLabel>
-              <SettingCard>
-                <div className="flex items-center justify-between gap-3 px-4 py-3.5">
-                  <div className="flex min-w-0 items-center gap-3">
-                    {status.account_avatar_url ? (
-                      <img
-                        src={status.account_avatar_url}
-                        alt={status.account_login ?? "GitHub"}
-                        className="h-10 w-10 shrink-0 rounded-full border border-black/10 dark:border-white/10"
-                      />
-                    ) : (
-                      <div className="bg-muted flex h-10 w-10 shrink-0 items-center justify-center rounded-full">
-                        <Cloud className="h-4.5 w-4.5" />
-                      </div>
-                    )}
-                    <div className="min-w-0">
-                      <div className="text-foreground flex flex-wrap items-center gap-2 text-[13.5px] font-medium">
-                        <span className="truncate">@{status.account_login}</span>
-                        <Badge
-                          variant={effectiveState === "error" ? "destructive" : "success"}
-                          className="rounded-full"
-                        >
-                          {effectiveState === "error"
-                            ? "Sync Attention"
-                            : `E2EE Synced · rev #${status.last_vault_revision}`}
-                        </Badge>
-                      </div>
-                      <div className="text-muted-foreground mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[12px]">
-                        <span>{status.synced_host_count} hosts</span>
-                        <span>·</span>
-                        <span>{status.synced_project_count} projects</span>
-                        <span>·</span>
-                        <span>Last sync: {formatRelativeSyncTime(status.last_synced_at_ms)}</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="flex shrink-0 items-center gap-2">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={() => setLinkQrOpen(true)}
-                      className="h-[32px] gap-1.5 text-[12.5px]"
-                    >
-                      <QrCode className="size-3.5" />
-                      <span>{t("settings.linkDeviceQr")}</span>
-                    </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      disabled={busy}
-                      onClick={() => void orbitActions.syncCloudNow()}
-                      className="h-[32px] shrink-0 text-[12.5px]"
-                    >
-                      <RefreshCw className={cn("size-3.5", busy && "animate-spin")} />
-                      <span>{busy ? "Syncing…" : "Sync Now"}</span>
-                    </Button>
-                  </div>
-                </div>
-
-                {lastResult && (
-                  <div className="border-border/60 text-muted-foreground flex flex-wrap items-center justify-between gap-2 border-t px-4 py-2 text-[11.5px]">
-                    <span>
-                      Last run: +{lastResult.hosts_added} hosts, {lastResult.hosts_updated} updated,{" "}
-                      +{lastResult.projects_added} projects
-                      {lastResult.pushed_remote ? " (uploaded)" : " (up to date)"}
-                    </span>
-                    {status.gist_html_url && (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          void orbitIpc.openExternalBrowserUrl(status.gist_html_url ?? "")
-                        }
-                        className="text-foreground/80 hover:text-foreground inline-flex cursor-pointer items-center gap-1 font-medium"
-                      >
-                        <span>View Secret Gist</span>
-                        <ExternalLink className="h-3 w-3" />
-                      </button>
-                    )}
-                  </div>
-                )}
-              </SettingCard>
-            </div>
-
-            <div className="space-y-2">
-              <SettingGroupLabel>Sync Preferences</SettingGroupLabel>
-              <SettingCard>
-                <SettingRow
-                  title="Auto-sync changes"
-                  description="Automatically sync newly paired hosts, pinned projects, and preferences in the background."
-                >
-                  <ToggleSwitch
-                    checked={status.auto_sync_enabled}
-                    onChange={(enabled) => void orbitActions.setCloudAutoSync(enabled)}
-                  />
-                </SettingRow>
-
-                {status.gist_html_url && (
-                  <SettingRow
-                    title="Remote encrypted vault"
-                    description="Stored as a private Secret Gist on your GitHub account."
-                  >
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={() =>
-                        void orbitIpc.openExternalBrowserUrl(status.gist_html_url ?? "")
-                      }
-                      className="px-2.5"
-                    >
-                      <span>Open on GitHub</span>
-                      <ExternalLink className="size-3" />
-                    </Button>
-                  </SettingRow>
-                )}
-
-                <SettingRow
-                  title="Sign out of this device"
-                  description="Removes local credentials only — your encrypted GitHub Secret Gist remains safe for other devices."
-                >
-                  <div className="flex items-center gap-2.5">
-                    <label className="text-muted-foreground flex cursor-pointer items-center gap-1.5 text-[12px] select-none">
-                      <Checkbox
-                        size="sm"
-                        checked={clearHostsOnLogout}
-                        onCheckedChange={setClearHostsOnLogout}
-                      />
-                      <span>Clear hosts</span>
-                    </label>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={busy}
-                      onClick={() => setConfirmSignOutOpen(true)}
-                      className="hover:border-signal-danger-border hover:bg-signal-danger-bg hover:text-signal-danger"
-                    >
-                      <LogOut className="size-3.5" />
-                      <span>Sign Out</span>
-                    </Button>
-                  </div>
-                </SettingRow>
-              </SettingCard>
-            </div>
-
-            {/* Optional Manual Passphrase / Dual-Gist Security Toggle */}
-            <Collapsible
-              open={advancedSecOpen}
-              onOpenChange={setAdvancedSecOpen}
-              className="border-border bg-background/60 rounded-[13px] border px-4 py-3"
-            >
-              <CollapsibleTrigger className="group/sec flex w-full cursor-pointer items-center justify-between gap-2 text-left outline-none">
-                <span className="flex min-w-0 items-center gap-2">
-                  <ChevronRight className="text-muted-foreground size-3.5 shrink-0 transition-transform duration-150 group-data-[panel-open]/sec:rotate-90" />
-                  <span className="text-foreground text-[12.5px] font-medium">
-                    {t("settings.cloudSyncAdvancedTitle")}
+              <Collapsible
+                open={deviceLinkOpen}
+                onOpenChange={(next) => {
+                  setDeviceLinkOpen(next);
+                  if (next) setLocalError(null);
+                }}
+              >
+                <CollapsibleTrigger className="group/link text-ink-secondary hover:bg-surface-recessed/50 hover:text-ink-primary focus-visible:bg-surface-recessed/60 flex w-full cursor-pointer items-center gap-2 px-4 py-3 text-left text-[13px] transition-colors outline-none">
+                  <Link2 className="text-ink-muted size-[14px] shrink-0" />
+                  <span className="flex-1 font-medium">
+                    {t("settings.importFromSignedInDevice")}
                   </span>
-                </span>
-                <span className="bg-muted text-muted-foreground shrink-0 rounded-md px-2 py-0.5 text-[11px] font-medium">
-                  {status.instant_unlock_enabled
-                    ? t("settings.cloudSyncInstantBadge")
-                    : t("settings.cloudSyncManualBadge")}
-                </span>
-              </CollapsibleTrigger>
-
-              <CollapsibleContent className="pt-3">
-                <SettingCard>
-                  <SettingRow
-                    title={t("settings.cloudSyncRequireManualTitle")}
-                    description={t("settings.cloudSyncRequireManualDesc")}
+                  <ChevronRight className="text-ink-muted size-[13px] shrink-0 transition-transform group-data-[panel-open]/link:rotate-90" />
+                </CollapsibleTrigger>
+                <CollapsibleContent>
+                  <form
+                    className="flex flex-col gap-3 px-4 pt-1 pb-4"
+                    {...ime.compositionProps}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && ime.shouldIgnoreKeyDown(e)) e.preventDefault();
+                    }}
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      if (!busy && deviceLinkInput.trim()) void handleDeviceLinkLogin();
+                    }}
                   >
-                    <ToggleSwitch
-                      checked={!status.instant_unlock_enabled}
-                      onChange={(requireManual) =>
-                        void orbitActions.setCloudSyncManualPassphraseMode(requireManual)
-                      }
-                    />
-                  </SettingRow>
-                </SettingCard>
-              </CollapsibleContent>
-            </Collapsible>
-
-            {/* Auto-register remote Linux/macOS servers tip */}
-            <div className="space-y-2">
-              <SettingGroupLabel>Auto-Register Headless Servers</SettingGroupLabel>
-              <div className="border-border bg-background/60 flex items-center justify-between gap-3 rounded-[13px] border px-4 py-3">
-                <div className="min-w-0 space-y-0.5">
-                  <div className="text-foreground flex items-center gap-1.5 text-[12.5px] font-medium">
-                    <Terminal className="text-muted-foreground h-3.5 w-3.5" />
-                    <span>Skip pairing codes on Linux &amp; macOS servers</span>
-                  </div>
-                  <div className="text-muted-foreground text-[12px]">
-                    Run{" "}
-                    <code className="selectable-text bg-muted text-foreground rounded px-1.5 py-0.5 font-mono text-[11.5px]">
-                      orbit login
-                    </code>{" "}
-                    on any host — it encrypts &amp; registers itself into this vault automatically.
-                  </div>
-                </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => markCopied("cli", "orbit login")}
-                  className="shrink-0 px-2.5"
-                >
-                  {copiedFlag === "cli" ? (
-                    <>
-                      <Check className="text-signal-success size-3.5" />
-                      <span>Copied</span>
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="size-3.5" />
-                      <span>Copy</span>
-                    </>
-                  )}
+                    <Field>
+                      <FieldDescription className="text-ink-secondary text-[12px] leading-[1.45]">
+                        {t("settings.deviceLinkTabDesc")}
+                      </FieldDescription>
+                      <div className="flex items-center gap-2">
+                        <Input
+                          type="password"
+                          autoComplete="off"
+                          disabled={busy}
+                          aria-label={t("settings.importFromSignedInDevice")}
+                          value={deviceLinkInput}
+                          onChange={(e) => setDeviceLinkInput(e.target.value)}
+                          placeholder={t("settings.deviceLinkPlaceholder")}
+                          className="min-w-0 flex-1 font-mono"
+                        />
+                        <Button
+                          type="submit"
+                          variant="outline"
+                          size="sm"
+                          disabled={busy || !deviceLinkInput.trim()}
+                        >
+                          {linkingDevice && <OrbitSpinner size={13} />}
+                          {t("settings.deviceLinkConnect")}
+                        </Button>
+                      </div>
+                    </Field>
+                  </form>
+                </CollapsibleContent>
+              </Collapsible>
+            </SettingCard>
+          )}
+        </div>
+      ) : (
+        <div data-setting-fallback>
+          <SettingCard settingId="settings.cloudSyncTitle">
+            <SettingRow
+              title={
+                <span className="inline-flex flex-wrap items-center gap-2">
+                  <Cloud className="text-ink-secondary size-[16px]" />
+                  {status?.account_login ? `@${status.account_login}` : "GitHub"}
+                  <Badge
+                    variant={
+                      state === "ready" ? "success" : state === "error" ? "destructive" : "secondary"
+                    }
+                  >
+                    {stateLabel}
+                  </Badge>
+                </span>
+              }
+              description={
+                unlocked && status
+                  ? t("settings.cloudAccountSummary", {
+                      hosts: status.synced_host_count,
+                      projects: status.synced_project_count,
+                      time: lastSynced,
+                    })
+                  : t("settings.cloudLockedDesc")
+              }
+            >
+              {unlocked && (
+                <Button size="sm" disabled={busy} onClick={() => void orbitActions.syncCloudNow()}>
+                  <RefreshCw
+                    data-icon="inline-start"
+                    className={cn(busy && "animate-spin motion-reduce:animate-none")}
+                  />
+                  {busy ? t("common.syncing") : t("settings.cloudSyncNow")}
                 </Button>
-              </div>
-            </div>
-          </div>
-        )}
-
-      {effectiveState === "ready" && hosts.length > 0 && (
-        <div className="space-y-2">
-          <SettingGroupLabel>{t("settings.fleetNetworkTitle")}</SettingGroupLabel>
-          <SettingCard>
-            <div className="flex items-start gap-2.5 px-4 py-3 text-[12px]">
-              <Globe className="text-muted-foreground mt-0.5 h-4 w-4 shrink-0" />
-              <span className="text-muted-foreground leading-relaxed">
-                {allRemoteHostsLackReachability
-                  ? t("settings.fleetNetworkMissingReachability")
-                  : t("settings.fleetNetworkAutoDesc")}
-              </span>
-            </div>
+              )}
+            </SettingRow>
+            {unlocked && lastResult && (
+              <p role="status" className="text-ink-muted px-4 py-2 text-[11px]">
+                {t("settings.cloudLastRun", {
+                  added: lastResult.hosts_added,
+                  updated: lastResult.hosts_updated,
+                  projects: lastResult.projects_added,
+                })}
+              </p>
+            )}
           </SettingCard>
         </div>
       )}
 
       {displayError && (
-        <div className="border-signal-danger-border bg-signal-danger-bg text-signal-danger flex flex-wrap items-center justify-between gap-2.5 rounded-[11px] border px-3.5 py-2.5 text-[12.5px]">
-          <div className="flex min-w-0 flex-1 items-start gap-2">
-            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-            <span className="selectable-text break-words">{displayError}</span>
-          </div>
-          {(effectiveState === "error" || isAuthExpiredError) && (
+        <div
+          role="alert"
+          className="border-signal-danger-border bg-signal-danger-bg text-signal-danger flex flex-wrap items-center gap-2 rounded-xl border p-3 text-[13px]"
+        >
+          <AlertCircle className="size-[16px] shrink-0" />
+          <span className="min-w-0 flex-1 break-words">{displayError}</span>
+          {(state === "error" || isAuthExpiredError) && !deviceFlow && (
             <Button
-              type="button"
+              variant="outline"
               size="sm"
-              disabled={busy}
+              disabled={busy || !canStartGithubLogin}
               onClick={() => void handleStartDeviceLogin()}
-              className="shrink-0"
             >
-              {busy ? (
-                <OrbitSpinner size={14} className="size-3.5" />
-              ) : (
-                <Cloud className="size-3.5" />
-              )}
-              <span>Sign In Again with GitHub</span>
+              {t("settings.signInGithub")}
             </Button>
           )}
         </div>
       )}
 
+      {deviceFlow && state !== "signed_out" && (
+        <SettingGroup title={t("settings.cloudVerification")}>
+          {renderDeviceFlowCard(deviceFlow, false)}
+        </SettingGroup>
+      )}
+
+      {state === "locked" && status && (
+        <SettingGroup
+          title={t(
+            status.remote_vault_exists ? "settings.cloudUnlock" : "settings.cloudCreateVault",
+          )}
+        >
+          <SettingCard>
+            <form
+              className="flex flex-col gap-3 p-4"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (!busy && canSubmitVault) void handleUnlock();
+              }}
+              {...ime.compositionProps}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && ime.shouldIgnoreKeyDown(e)) e.preventDefault();
+              }}
+            >
+              {!status.remote_vault_exists && (
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void handleGenerateKey()}
+                  >
+                    {t("settings.cloudGenerateKey")}
+                  </Button>
+                  {generatedKey && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      disabled={busy}
+                      onClick={() => void markCopied("key", generatedKey)}
+                    >
+                      {t(copiedFlag === "key" ? "common.copied" : "common.copy")}
+                    </Button>
+                  )}
+                </div>
+              )}
+              {generatedKey && (
+                <p className="text-ink-secondary text-[13px]">{t("settings.cloudStoreKey")}</p>
+              )}
+              <FieldGroup className="gap-2.5">
+                <Field>
+                  <Input
+                    type={generatedKey ? "text" : "password"}
+                    autoComplete="off"
+                    disabled={busy}
+                    aria-label={t("settings.cloudEnterPass")}
+                    placeholder={t("settings.cloudEnterPass")}
+                    value={passphraseInput}
+                    onChange={(e) => {
+                      setPassphraseInput(e.target.value);
+                      if (generatedKey && e.target.value !== generatedKey) setGeneratedKey(null);
+                    }}
+                  />
+                  {passTooShort && <FieldDescription>{t("settings.cloudPassLength")}</FieldDescription>}
+                </Field>
+                {!status.remote_vault_exists && !generatedKey && (
+                  <Field data-invalid={passMismatch || undefined}>
+                    <Input
+                      type="password"
+                      autoComplete="new-password"
+                      disabled={busy}
+                      aria-invalid={passMismatch || undefined}
+                      aria-label={t("settings.cloudConfirmPass")}
+                      placeholder={t("settings.cloudConfirmPass")}
+                      value={confirmPassphraseInput}
+                      onChange={(e) => setConfirmPassphraseInput(e.target.value)}
+                    />
+                    {passNeedsConfirm && (
+                      <FieldDescription>{t("settings.cloudConfirmPassHint")}</FieldDescription>
+                    )}
+                    {passMismatch && <FieldError>{t("settings.cloudPassMismatch")}</FieldError>}
+                  </Field>
+                )}
+              </FieldGroup>
+              <Button className="self-start" type="submit" disabled={busy || !canSubmitVault}>
+                {unlockingVault && <OrbitSpinner size={14} />}
+                {t(
+                  status.remote_vault_exists ? "settings.cloudUnlock" : "settings.cloudCreateVault",
+                )}
+              </Button>
+            </form>
+          </SettingCard>
+        </SettingGroup>
+      )}
+
+      {unlocked && status && (
+        <>
+          <SettingCard>
+            <SettingRow
+              settingId="settings.cloudAutoSync"
+              title={t("settings.cloudAutoSync")}
+              description={t("settings.cloudAutoSyncDesc")}
+            >
+              <ToggleSwitch
+                checked={status.auto_sync_enabled}
+                disabled={busy}
+                ariaLabel={t("settings.cloudAutoSync")}
+                onChange={(enabled) => void orbitActions.setCloudAutoSync(enabled)}
+              />
+            </SettingRow>
+            <SettingRow
+              settingId="settings.linkDeviceQr"
+              title={t("settings.deviceLinkQrTitle")}
+              description={t("settings.deviceLinkQrDesc")}
+            >
+              <Button variant="outline" size="sm" disabled={busy} onClick={() => setLinkQrOpen(true)}>
+                <QrCode data-icon="inline-start" />
+                {t("settings.linkDeviceQr")}
+              </Button>
+            </SettingRow>
+            <SettingRow
+              settingId="settings.cloudHeadless"
+              title={t("settings.cloudHeadless")}
+              description={t("settings.cloudHeadlessDesc")}
+            >
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void markCopied("cli", "orbit login")}
+              >
+                {copiedFlag === "cli" ? (
+                  <Check data-icon="inline-start" />
+                ) : (
+                  <Copy data-icon="inline-start" />
+                )}
+                <code>orbit login</code>
+              </Button>
+            </SettingRow>
+            <SettingRow
+              settingId="settings.fleetNetworkTitle"
+              title={t("settings.fleetNetworkTitle")}
+              description={t(
+                allRemoteHostsLackReachability
+                  ? "settings.fleetNetworkMissingReachability"
+                  : "settings.fleetNetworkAutoDesc",
+              )}
+            >
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => orbitActions.setSettingsSection("hosts")}
+              >
+                {t("settings.nav4Hosts")}
+              </Button>
+            </SettingRow>
+          </SettingCard>
+          <Collapsible
+            data-setting-id="settings.cloudSyncAdvancedTitle"
+            open={advancedSecOpen}
+            onOpenChange={setAdvancedSecOpen}
+            className="border-border-subtle bg-surface-raised rounded-xl border"
+          >
+            <CollapsibleTrigger className="group/sec flex w-full cursor-pointer items-center gap-2 px-4 py-3 text-left text-[13px]">
+              <ChevronRight className="text-ink-muted size-[13px] transition-transform group-data-[panel-open]/sec:rotate-90" />
+              <span className="flex-1 font-medium">{t("settings.cloudSyncAdvancedTitle")}</span>
+              <Badge variant="secondary">
+                {t(
+                  status.instant_unlock_enabled
+                    ? "settings.cloudSyncInstantBadge"
+                    : "settings.cloudSyncManualBadge",
+                )}
+              </Badge>
+            </CollapsibleTrigger>
+            <CollapsibleContent className="divide-border-subtle divide-y transition-opacity">
+              <SettingRow
+                title={t("settings.cloudSyncRequireManualTitle")}
+                description={t("settings.cloudSyncRequireManualDesc")}
+              >
+                <ToggleSwitch
+                  checked={!status.instant_unlock_enabled}
+                  disabled={busy}
+                  ariaLabel={t("settings.cloudSyncRequireManualTitle")}
+                  onChange={(manual) => void orbitActions.setCloudSyncManualPassphraseMode(manual)}
+                />
+              </SettingRow>
+              {vaultUrl && (
+                <SettingRow
+                  title={t("settings.cloudRemoteVault")}
+                  description={t("settings.cloudSyncDesc")}
+                >
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void orbitIpc.openExternalBrowserUrl(vaultUrl)}
+                  >
+                    GitHub <ExternalLink data-icon="inline-end" />
+                  </Button>
+                </SettingRow>
+              )}
+            </CollapsibleContent>
+          </Collapsible>
+        </>
+      )}
+
+      {(unlocked || state === "locked") && (
+        <div className="flex justify-end">
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={busy}
+            onClick={() => {
+              setClearHostsOnLogout(false);
+              setConfirmSignOutOpen(true);
+            }}
+          >
+            {t("settings.cloudSignOut")}
+          </Button>
+        </div>
+      )}
       <ConfirmDialog
         open={confirmSignOutOpen}
         onOpenChange={setConfirmSignOutOpen}
-        title={
-          clearHostsOnLogout
-            ? "Sign out and clear paired hosts?"
-            : "Sign out of Cloud Sync?"
+        title={t("settings.cloudSignOutTitle")}
+        description={t("settings.cloudSignOutDesc")}
+        detail={
+          <label
+            className={cn(
+              "text-ink-secondary flex items-center gap-2 text-[13px]",
+              busy ? "cursor-not-allowed opacity-60" : "cursor-pointer",
+            )}
+          >
+            <Checkbox
+              size="sm"
+              checked={clearHostsOnLogout}
+              disabled={busy}
+              onCheckedChange={setClearHostsOnLogout}
+            />
+            {t("settings.cloudClearHosts")}
+          </label>
         }
-        description={
-          clearHostsOnLogout
-            ? "Removes local sync credentials and clears synced host pairings on this device. Your encrypted GitHub Secret Gist remains safe for other devices."
-            : "Removes local Cloud Sync credentials from this device. Your paired hosts and encrypted GitHub Secret Gist remain intact."
-        }
-        confirmLabel={clearHostsOnLogout ? "Sign out & clear hosts" : "Sign out"}
+        defaultAction="cancel"
+        confirmLabel={t(
+          clearHostsOnLogout ? "settings.cloudSignOutAndClear" : "settings.cloudSignOut",
+        )}
         tone={clearHostsOnLogout ? "danger" : "default"}
         onConfirm={() => orbitActions.logoutCloudSync(clearHostsOnLogout)}
       />
-
       <Dialog open={linkQrOpen} onOpenChange={setLinkQrOpen}>
         <DialogContent className="max-w-[380px] gap-5 p-5">
           <DialogHeader className="gap-1 pr-6">
-            <DialogTitle className="flex items-center gap-2 text-[15px]">
-              <QrCode className="text-muted-foreground h-[16px] w-[16px] stroke-[1.75]" />
+            <DialogTitle className="flex items-center gap-2 text-[17px]">
+              <QrCode className="text-ink-muted h-[16px] w-[16px] stroke-[1.75]" />
               <span>{t("settings.deviceLinkQrTitle")}</span>
             </DialogTitle>
-            <DialogDescription className="text-[12.5px] leading-relaxed">
+            <DialogDescription className="text-[13px] leading-relaxed">
               {t("settings.deviceLinkQrDesc")}
             </DialogDescription>
           </DialogHeader>
 
           <div className="flex flex-col items-center gap-3.5">
-            <div className="flex size-[208px] items-center justify-center rounded-[14px] border border-black/[0.08] bg-white p-3 shadow-2xs dark:border-white/[0.14]">
+            <div className="border-border-subtle bg-surface-recessed flex size-[208px] items-center justify-center rounded-[14px] border p-3">
               {linkQrLoading ? (
-                <OrbitSpinner size={20} className="size-5 text-zinc-500" />
+                <OrbitSpinner size={20} className="text-ink-muted size-5" />
               ) : linkQrDataUri ? (
                 <img
                   src={linkQrDataUri}
@@ -993,11 +891,11 @@ export function CloudSyncSection() {
                   className="size-full object-contain select-none [image-rendering:pixelated]"
                 />
               ) : (
-                <AlertCircle className="size-5 text-rose-500" />
+                <AlertCircle className="text-signal-danger size-5" />
               )}
             </div>
 
-            <div className="text-muted-foreground flex items-center gap-1.5 text-center text-[11.5px]">
+            <div className="text-ink-muted flex items-center gap-1.5 text-center text-[11px]">
               <ShieldCheck className="h-[13px] w-[13px] shrink-0 opacity-75" />
               <span>{t("settings.deviceLinkQrHint")}</span>
             </div>
@@ -1007,18 +905,16 @@ export function CloudSyncSection() {
                 type="button"
                 variant="outline"
                 size="sm"
-                onClick={() => markCopied("link", linkQrUri)}
+                onClick={() => void markCopied("link", linkQrUri)}
                 className="gap-1.5"
               >
                 {copiedFlag === "link" ? (
                   <Check className="text-signal-success size-3.5" />
                 ) : (
-                  <Copy className="text-muted-foreground size-3.5" />
+                  <Copy className="text-ink-muted size-3.5" />
                 )}
                 <span>
-                  {copiedFlag === "link"
-                    ? t("common.copied")
-                    : t("settings.copyDeviceLinkUri")}
+                  {copiedFlag === "link" ? t("common.copied") : t("settings.copyDeviceLinkUri")}
                 </span>
               </Button>
             )}
@@ -1027,4 +923,4 @@ export function CloudSyncSection() {
       </Dialog>
     </div>
   );
-}
+});

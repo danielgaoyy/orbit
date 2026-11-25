@@ -7,6 +7,10 @@ import {
 import { DecisionDock } from "@/components/stage/stage-approval-dock";
 import { PlanReviewCard } from "@/components/stage/plan-review-card";
 import {
+  StageActivityWave,
+  summarizeActiveSubagents,
+} from "@/components/stage/stage-activity-wave";
+import {
   PromptImageLightbox,
   type PromptImagePreviewTarget,
   TurnStageSection,
@@ -426,6 +430,27 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
   const latestTurn = displayTurns[displayTurns.length - 1] ?? null;
   const isLatestTurnActive = Boolean(latestTurn && status === "running");
 
+  const nestedSubagentActivity = useMemo(
+    () => summarizeActiveSubagents(children),
+    [children],
+  );
+
+  const runningBackgroundTasks = useMemo(
+    () =>
+      isManaged
+        ? (childStage?.insights.background_tasks ?? []).filter((task) => task.status === "running")
+        : [],
+    [isManaged, childStage?.insights.background_tasks],
+  );
+
+  const handleNestedWaveClick = useMemo(() => {
+    const target = nestedSubagentActivity.firstActive;
+    if (!target) return undefined;
+    return () => handleOpenNestedSubagent(target);
+  }, [nestedSubagentActivity.firstActive, handleOpenNestedSubagent]);
+
+  const effectiveContentVersion = `${contentVersion}:${nestedSubagentActivity.runningCount}:${nestedSubagentActivity.awaitingCount}:${runningBackgroundTasks.length}`;
+
   // Track live per-thinking-block start/completion durations matching StreamStage
   useEffect(() => {
     if (!effectiveAgentId) return;
@@ -616,7 +641,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
         hostId={effectiveHostId}
         cwd={cwd}
         resetKey={viewportResetKey}
-        contentVersion={contentVersion}
+        contentVersion={effectiveContentVersion}
         viewportRef={viewportRef}
         stickToBottomRef={stickToBottomRef}
         viewportClassName="px-6 pt-6 pb-[24px]"
@@ -656,6 +681,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
                         isTurnActive={isTurnActive}
                         isLastTurn={isLastTurn}
                         agentStatusLabel={liveLabel}
+                        hasLiveBackgroundTasks={isTurnActive && runningBackgroundTasks.length > 0}
                         isNetworkOffline={isNetworkOffline}
                         autoFoldCompleted={coalesceExploration}
                         hostId={effectiveHostId}
@@ -675,6 +701,16 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
                   );
                 });
               })()}
+              <StageActivityWave
+                runningSubagentsCount={nestedSubagentActivity.runningCount}
+                awaitingSubagentsCount={nestedSubagentActivity.awaitingCount}
+                runningBackgroundTasks={runningBackgroundTasks}
+                armedTimersCount={0}
+                hasActiveGoal={false}
+                isForegroundRunning={isLatestTurnActive}
+                onClick={handleNestedWaveClick}
+                className="mt-3 mb-1"
+              />
             </div>
           ) : hydrating ? (
             <div role="status" className="text-ink-muted flex items-center justify-center gap-2 py-6 text-[13px]">

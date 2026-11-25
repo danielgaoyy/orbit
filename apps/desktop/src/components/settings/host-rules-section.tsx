@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   BookOpen,
@@ -16,6 +16,7 @@ import {
   type SettingSelectOption,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { t, type MessageKey } from "@/lib/i18n";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -46,20 +47,20 @@ const RULE_PATH_REGEX =
 
 const TRIGGER_GROUPS: {
   mode: RuleTriggerMode;
-  label: string;
-  hint: string;
+  label: MessageKey;
+  hint: MessageKey;
 }[] = [
-  { mode: "always", label: "Always", hint: "Injected on every prompt" },
-  { mode: "glob_auto_attach", label: "Glob", hint: "Attached when mentioned/edited files match" },
-  { mode: "agent_decided", label: "Agent", hint: "Indexed by description; agent reads if relevant" },
-  { mode: "manual", label: "Manual", hint: "Attached via @rule:<name> in Composer" },
+  { mode: "always", label: "context.triggerAlways", hint: "context.triggerAlwaysHint" },
+  { mode: "glob_auto_attach", label: "context.triggerGlob", hint: "context.triggerGlobHint" },
+  { mode: "agent_decided", label: "context.triggerAgent", hint: "context.triggerAgentHint" },
+  { mode: "manual", label: "context.triggerManual", hint: "context.triggerManualHint" },
 ];
 
 const SCOPE_OPTIONS: SettingSelectOption<RuleScope>[] = [
-  { value: "project_orbit", label: ".orbit/rules/*.md", description: "Project Orbit rule" },
-  { value: "project_claude", label: ".claude/rules/*.md", description: "Project Claude rule" },
-  { value: "project_cursor", label: ".cursor/rules/*.mdc", description: "Project Cursor rule" },
-  { value: "user_global", label: "~/.orbit/rules/*.md", description: "User global across projects" },
+  { value: "project_orbit", label: ".orbit/rules/*.md" },
+  { value: "project_claude", label: ".claude/rules/*.md" },
+  { value: "project_cursor", label: ".cursor/rules/*.mdc" },
+  { value: "user_global", label: "~/.orbit/rules/*.md" },
 ];
 
 function scopeBadgeLabel(scope: RuleScope): string {
@@ -71,7 +72,7 @@ function scopeBadgeLabel(scope: RuleScope): string {
     case "project_cursor":
       return ".cursor";
     case "user_global":
-      return "Global";
+      return t("context.scopeGlobal");
   }
 }
 
@@ -111,12 +112,6 @@ function parseGlobsInput(raw: string): string[] {
     if (tail) out.push(tail);
   }
   return Array.from(new Set(out));
-}
-
-function basenameOf(path: string): string {
-  const clean = path.replace(/\/+$/, "");
-  const idx = clean.lastIndexOf("/");
-  return idx >= 0 ? clean.slice(idx + 1) || clean : clean;
 }
 
 function RuleEditorModal({
@@ -178,23 +173,14 @@ function RuleEditorModal({
   }, [busy, isDirty, onClose]);
 
   const approxTokens = useMemo(() => estimateTokensClient(body), [body]);
-  const activeHint = TRIGGER_GROUPS.find((g) => g.mode === triggerMode)?.hint ?? "";
-
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.isComposing || e.keyCode === 229) return;
-      if (e.key === "Escape" && !busy) {
-        e.preventDefault();
-        if (confirmDiscard) {
-          setConfirmDiscard(false);
-        } else {
-          requestClose();
-        }
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [busy, confirmDiscard, requestClose]);
+  const parsedGlobs = useMemo(
+    () => (triggerMode === "glob_auto_attach" ? parseGlobsInput(globsText) : []),
+    [triggerMode, globsText],
+  );
+  const canSubmit =
+    (Boolean(editing) || Boolean(name.trim())) &&
+    (triggerMode !== "glob_auto_attach" || parsedGlobs.length > 0);
+  const activeHint = TRIGGER_GROUPS.find((g) => g.mode === triggerMode)?.hint;
 
   const scopeOptions = useMemo(
     () =>
@@ -207,16 +193,16 @@ function RuleEditorModal({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (busy) return;
     const cleanName = name.trim();
     if (!editing && !RULE_PATH_REGEX.test(cleanName)) {
       setError(
-        "Name must use A-Z, 0-9, `-`, `_` (optional `/` subdirectories up to 3 levels).",
+        t("context.ruleNameError"),
       );
       return;
     }
-    const parsedGlobs = triggerMode === "glob_auto_attach" ? parseGlobsInput(globsText) : [];
     if (triggerMode === "glob_auto_attach" && parsedGlobs.length === 0) {
-      setError("Add at least one glob pattern (e.g. **/*.rs).");
+      setError(t("context.ruleGlobError"));
       return;
     }
 
@@ -263,7 +249,10 @@ function RuleEditorModal({
     <Dialog
       open
       onOpenChange={(nextOpen) => {
-        if (!nextOpen) requestClose();
+        if (!nextOpen) {
+          if (confirmDiscard && !busy) setConfirmDiscard(false);
+          else requestClose();
+        }
       }}
     >
       <DialogContent
@@ -271,9 +260,9 @@ function RuleEditorModal({
         className="flex max-h-[88vh] max-w-[540px] flex-col gap-0 p-0"
       >
         <DialogHeader className="px-5 pt-5 pr-12 pb-4">
-          <DialogTitle>{editing ? `Edit ${editing.name}` : "New Path Rule"}</DialogTitle>
+          <DialogTitle>{editing ? t("context.editRule", { name: editing.name }) : t("context.newRule")}</DialogTitle>
           {editing && (
-            <DialogDescription className="truncate font-mono text-[11.5px]">
+            <DialogDescription className="truncate font-mono text-[11px]">
               {editing.relative_path}
             </DialogDescription>
           )}
@@ -285,9 +274,9 @@ function RuleEditorModal({
         >
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <Field>
-              <FieldLabel>Name</FieldLabel>
+              <FieldLabel htmlFor="rule-name">{t("context.name")}</FieldLabel>
               <Input
-                type="text"
+                id="rule-name" type="text"
                 value={name}
                 disabled={Boolean(editing) || busy}
                 onChange={(e) => {
@@ -300,7 +289,7 @@ function RuleEditorModal({
             </Field>
 
             <Field>
-              <FieldLabel>Scope</FieldLabel>
+              <FieldLabel>{t("context.scope")}</FieldLabel>
               <SettingSelect
                 value={scope}
                 options={scopeOptions}
@@ -316,8 +305,8 @@ function RuleEditorModal({
 
           <Field>
             <div className="flex items-center justify-between">
-              <FieldLabel>Trigger Mode</FieldLabel>
-              <span className="text-ink-muted text-[11.5px]">{activeHint}</span>
+              <FieldLabel>{t("context.triggerMode")}</FieldLabel>
+              <span className="text-ink-muted text-[11px]">{activeHint && t(activeHint)}</span>
             </div>
             <Tabs
               value={triggerMode}
@@ -328,8 +317,8 @@ function RuleEditorModal({
             >
               <TabsList className="grid w-full grid-cols-4">
                 {TRIGGER_GROUPS.map((g) => (
-                  <TabsTrigger key={g.mode} value={g.mode} disabled={busy} className="text-[12px]">
-                    {g.label}
+                  <TabsTrigger key={g.mode} value={g.mode} disabled={busy} className="text-[13px]">
+                    {t(g.label)}
                   </TabsTrigger>
                 ))}
               </TabsList>
@@ -338,7 +327,7 @@ function RuleEditorModal({
 
           {triggerMode === "glob_auto_attach" && (
             <Field>
-              <FieldLabel htmlFor="rule-globs">Glob Patterns</FieldLabel>
+              <FieldLabel htmlFor="rule-globs">{t("context.globPatterns")}</FieldLabel>
               <Input
                 id="rule-globs"
                 type="text"
@@ -349,18 +338,16 @@ function RuleEditorModal({
                   setConfirmDiscard(false);
                 }}
                 placeholder="**/*.rs, !**/tests/**"
-                className="font-mono text-[12px]"
+                className="font-mono text-[13px]"
               />
               <FieldDescription className="text-[11px]">
-                Comma-separated globs. Supports <code className="font-mono">**</code>,{" "}
-                <code className="font-mono">{"{ts,tsx}"}</code>, and{" "}
-                <code className="font-mono">!negation</code>.
+                {t("context.globHint")}
               </FieldDescription>
             </Field>
           )}
 
           <Field>
-            <FieldLabel htmlFor="rule-description">Description</FieldLabel>
+            <FieldLabel htmlFor="rule-description">{t("context.ruleDescription")}</FieldLabel>
             <Input
               id="rule-description"
               type="text"
@@ -372,15 +359,15 @@ function RuleEditorModal({
               }}
               placeholder={
                 triggerMode === "agent_decided"
-                  ? "When should the agent read this rule?"
-                  : "Short summary (optional)"
+                  ? t("context.whenToRead")
+                  : t("context.optionalSummary")
               }
             />
           </Field>
 
           <Field>
             <div className="flex items-center justify-between">
-              <FieldLabel htmlFor="rule-body">Rule Instructions (Markdown)</FieldLabel>
+              <FieldLabel htmlFor="rule-body">{t("context.ruleBody")}</FieldLabel>
               <span className="text-ink-muted text-[11px] tabular-nums">
                 ~{approxTokens.toLocaleString()} tok
               </span>
@@ -394,13 +381,13 @@ function RuleEditorModal({
                 setConfirmDiscard(false);
               }}
               rows={8}
-              placeholder="Write concise, actionable engineering constraints..."
-              className="min-h-[150px] resize-y font-mono text-[12px] leading-relaxed"
+              placeholder={t("context.rulePlaceholder")}
+              className="min-h-[150px] resize-y font-mono text-[13px] leading-relaxed"
             />
           </Field>
 
           <Field orientation="horizontal" className="pt-0.5">
-            <FieldLabel className="text-[12.5px] font-normal">Enabled</FieldLabel>
+            <FieldLabel className="text-[13px] font-normal">{t("context.enabled")}</FieldLabel>
             <ToggleSwitch
               checked={enabled}
               disabled={busy}
@@ -408,19 +395,19 @@ function RuleEditorModal({
                 setEnabled(next);
                 setConfirmDiscard(false);
               }}
-              ariaLabel="Enable rule"
+              ariaLabel={t("context.enabled")}
             />
           </Field>
 
           {error && (
-            <div className="rounded-[8px] border border-red-500/30 bg-red-500/8 px-3 py-2 text-[12px] text-red-600 dark:text-red-400">
+            <div className="rounded-[8px] border border-signal-danger-border bg-signal-danger-bg px-3 py-2 text-[13px] text-signal-danger">
               {error}
             </div>
           )}
 
           {confirmDiscard && (
-            <div className="flex items-center justify-between gap-2 rounded-[8px] border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[12px]">
-              <span className="text-amber-700 dark:text-amber-300">Discard unsaved changes?</span>
+            <div className="flex items-center justify-between gap-2 rounded-[8px] border border-signal-warning-border bg-signal-warning-bg px-3 py-2 text-[13px]">
+              <span className="text-signal-warning">{t("context.discardTitle")}</span>
               <div className="flex items-center gap-1.5">
                 <Button
                   type="button"
@@ -428,21 +415,21 @@ function RuleEditorModal({
                   size="xs"
                   onClick={() => setConfirmDiscard(false)}
                 >
-                  Keep editing
+                  {t("context.keepEditing")}
                 </Button>
                 <Button
                   type="button"
                   size="xs"
                   onClick={onClose}
-                  className="bg-amber-600 text-white hover:bg-amber-700"
+                  className="border-signal-warning-border bg-signal-warning-bg text-signal-warning border hover:bg-surface-raised"
                 >
-                  Discard
+                  {t("review.discard")}
                 </Button>
               </div>
             </div>
           )}
 
-          <div className="border-border mt-1 flex items-center justify-between gap-2 border-t pt-3.5">
+          <div className="border-border-subtle mt-1 flex items-center justify-between gap-2 border-t pt-3.5">
             <div>
               {editing && !confirmDelete && (
                 <Button
@@ -451,10 +438,10 @@ function RuleEditorModal({
                   size="sm"
                   disabled={busy}
                   onClick={() => setConfirmDelete(true)}
-                  className="text-muted-foreground hover:text-red-600 dark:hover:text-red-400"
+                  className="text-ink-muted hover:text-signal-danger"
                 >
-                  <Trash2 className="h-[13.5px] w-[13.5px]" />
-                  Delete
+                  <Trash2 className="h-[14px] w-[14px]" />
+                  {t("common.delete")}
                 </Button>
               )}
               {editing && confirmDelete && (
@@ -467,7 +454,7 @@ function RuleEditorModal({
                     onClick={() => void handleDelete()}
                   >
                     {deleting && <Loader2 className="h-3 w-3 animate-spin" />}
-                    Delete
+                    {t("common.delete")}
                   </Button>
                   <Button
                     type="button"
@@ -476,7 +463,7 @@ function RuleEditorModal({
                     disabled={busy}
                     onClick={() => setConfirmDelete(false)}
                   >
-                    Keep
+                    {t("common.cancel")}
                   </Button>
                 </div>
               )}
@@ -484,11 +471,11 @@ function RuleEditorModal({
 
             <div className="flex items-center gap-2">
               <Button type="button" variant="outline" size="sm" disabled={busy} onClick={requestClose}>
-                Cancel
+                {t("common.cancel")}
               </Button>
-              <Button type="submit" size="sm" disabled={busy}>
+              <Button type="submit" size="sm" disabled={busy || !canSubmit}>
                 {saving && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                Save Rule
+                {t("permissionRules.saveRule")}
               </Button>
             </div>
           </div>
@@ -498,64 +485,21 @@ function RuleEditorModal({
   );
 }
 
-export function HostRulesSection({ hostId }: { hostId: string }) {
-  const hostDetail = useOrbitSelector((s) => s.hostDetails[hostId]);
-  const fleet = useOrbitSelector((s) => s.fleet);
-  const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
-  const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
-  const pathRulesByScope = useOrbitSelector((s) => s.pathRulesByScope);
-
-  const projectCwds = useMemo(() => {
-    const seen = new Set<string>();
-    const list: { path: string; label: string }[] = [];
-    const add = (raw: string | null | undefined, label?: string) => {
-      const clean = raw?.trim();
-      if (!clean || clean === "~" || seen.has(clean)) return;
-      seen.add(clean);
-      list.push({ path: clean, label: label || basenameOf(clean) });
-    };
-
-    if (selectedHostId === hostId && selectedCwd) {
-      add(selectedCwd);
-    }
-    for (const proj of fleet.projects ?? []) {
-      if (proj.host_id === hostId) {
-        for (const dir of proj.directories) {
-          add(dir, proj.name);
-        }
-      }
-    }
-    for (const ws of hostDetail?.workspaces ?? []) {
-      add(ws.cwd, ws.title);
-    }
-    for (const dp of hostDetail?.discovered_projects ?? []) {
-      add(dp.path, dp.name);
-    }
-    return list;
-  }, [hostId, selectedHostId, selectedCwd, fleet.projects, hostDetail]);
-
-  const explicitGlobalRef = useRef(false);
-  const [activeCwd, setActiveCwd] = useState<string>(() => projectCwds[0]?.path ?? "~");
-
-  useEffect(() => {
-    if (activeCwd === "~") {
-      if (!explicitGlobalRef.current && projectCwds.length > 0) {
-        setActiveCwd(projectCwds[0].path);
-      }
-    } else if (projectCwds.length > 0 && !projectCwds.some((p) => p.path === activeCwd)) {
-      setActiveCwd(projectCwds[0].path);
-    }
-  }, [activeCwd, projectCwds]);
-
+export const HostRulesSection = memo(function HostRulesSection({
+  hostId,
+  cwd: activeCwd,
+}: {
+  hostId: string;
+  cwd: string;
+}) {
+  const scopeKey = `${hostId}::${activeCwd}`;
+  const snapshot = useOrbitSelector((s) => s.pathRulesByScope[scopeKey] ?? null);
   const refreshSeqRef = useRef(0);
   const [loading, setLoading] = useState(false);
   const [togglingIds, setTogglingIds] = useState<Set<string>>(() => new Set());
   const [modalState, setModalState] = useState<
     { open: false } | { open: true; editing: PathScopedRule | null }
   >({ open: false });
-
-  const scopeKey = `${hostId}::${activeCwd}`;
-  const snapshot = pathRulesByScope[scopeKey] ?? null;
 
   const refresh = useCallback(async () => {
     const seq = refreshSeqRef.current + 1;
@@ -573,21 +517,6 @@ export function HostRulesSection({ hostId }: { hostId: string }) {
   useEffect(() => {
     void refresh();
   }, [refresh]);
-
-  const workspaceOptions = useMemo<SettingSelectOption<string>[]>(() => {
-    const opts: SettingSelectOption<string>[] = projectCwds.map((p) => ({
-      value: p.path,
-      label: p.label,
-      description: p.path,
-      mono: false,
-    }));
-    opts.push({
-      value: "~",
-      label: "User Global Only",
-      description: "~/.orbit/rules/*.md",
-    });
-    return opts;
-  }, [projectCwds]);
 
   const rules = snapshot?.rules ?? [];
   const totalAlwaysTokens = snapshot?.total_always_tokens ?? 0;
@@ -632,83 +561,64 @@ export function HostRulesSection({ hostId }: { hostId: string }) {
   };
 
   return (
-    <div className="space-y-6">
+    <div data-setting-id="settings.subTabRules" className="space-y-6">
       <SettingSectionHeader
-        title="Rules"
-        description="Path-scoped instructions from .orbit/rules, .claude/rules, and .cursor/rules."
+        subpage
+        title={t("context.pathRules")}
+        description={t("context.pathRulesDescription")}
         action={
           <div className="flex items-center gap-1.5">
             <button
               type="button"
-              aria-label="Refresh rules"
+              aria-label={t("common.refresh")}
               onClick={() => void refresh()}
               disabled={loading}
-              className="border-border bg-background hover:bg-accent/70 text-muted-foreground hover:text-foreground inline-flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-[8px] border transition-colors disabled:opacity-45"
+              className="border-border-subtle bg-surface-base hover:bg-surface-recessed text-ink-muted hover:text-ink-primary inline-flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-[8px] border transition-colors disabled:opacity-45"
             >
-              <RefreshCw className={cn("h-[13.5px] w-[13.5px]", loading && "animate-spin")} />
+              <RefreshCw className={cn("h-[14px] w-[14px]", loading && "animate-spin")} />
             </button>
             <button
               type="button"
               onClick={() => setModalState({ open: true, editing: null })}
-              className="bg-foreground text-background hover:opacity-90 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-[8px] px-2.5 text-[12.5px] font-medium transition-opacity"
+              className="bg-ink-primary text-surface-base hover:opacity-90 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-[8px] px-2.5 text-[13px] font-medium transition-opacity"
             >
-              <Plus className="h-[13.5px] w-[13.5px] stroke-[2]" />
-              New Rule
+              <Plus className="h-[14px] w-[14px] stroke-[2]" />
+              {t("context.newRule")}
             </button>
           </div>
         }
       />
 
-      {/* Workspace Selector + Token Budget Meter */}
       <SettingCard>
-        <div className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="min-w-0">
-            <div className="text-foreground text-[13px] font-medium">Workspace</div>
-            <div className="text-muted-foreground truncate font-mono text-[11.5px]">
-              {activeCwd === "~" ? "~/.orbit/rules" : activeCwd}
-            </div>
-          </div>
-          <SettingSelect
-            value={activeCwd}
-            options={workspaceOptions}
-            onChange={(next) => {
-              explicitGlobalRef.current = next === "~";
-              setActiveCwd(next);
-            }}
-            triggerClassName="max-w-[220px]"
-            menuClassName="max-w-[320px]"
-          />
-        </div>
-
-        <div className="space-y-2 px-4 py-3">
-          <div className="flex items-center justify-between gap-2 text-[12px]">
-            <span className="text-muted-foreground flex items-center gap-1.5">
-              Always-active budget
+        <div data-setting-id="context.ruleBudget" className="space-y-2 px-4 py-3">
+          <div className="flex items-center justify-between gap-2 text-[13px]">
+            <span className="text-ink-muted flex items-center gap-1.5">
+              {t("context.ruleBudget")}
               {budgetWarning && (
-                <span className="inline-flex items-center gap-1 rounded bg-amber-500/12 px-1.5 py-0.5 text-[10.5px] font-medium text-amber-600 dark:text-amber-400">
+                <span className="inline-flex items-center gap-1 rounded bg-signal-warning-bg px-1.5 py-0.5 text-[11px] font-medium text-signal-warning">
                   <AlertTriangle className="h-3 w-3" />
-                  High budget
+                  {t("context.highBudget")}
                 </span>
               )}
             </span>
-            <span className="text-foreground/85 font-mono text-[11.5px] tabular-nums">
+            <span className="text-ink-secondary font-mono text-[11px] tabular-nums">
               {totalAlwaysTokens.toLocaleString()} / {WARN_TOKEN_BUDGET.toLocaleString()} tok
-              <span className="text-muted-foreground/70">
+              <span className="text-ink-muted">
                 {" "}
-                (cap {(HARD_CAP_TOKENS / 1000).toFixed(0)}k)
+                ({t("context.maxTokens", { count: HARD_CAP_TOKENS.toLocaleString() })})
               </span>
             </span>
           </div>
-          <div className="bg-muted h-[4px] w-full overflow-hidden rounded-full">
+          <div className="bg-surface-recessed h-[4px] w-full overflow-hidden rounded-full">
             <div
               style={{ width: `${budgetRatio}%` }}
               className={cn(
-                "h-full rounded-full transition-all duration-200",
+                "h-full rounded-full transition-none",
                 totalAlwaysTokens > HARD_CAP_TOKENS
-                  ? "bg-red-500"
+                  ? "bg-signal-danger"
                   : budgetWarning
-                    ? "bg-amber-500"
-                    : "bg-foreground/65",
+                    ? "bg-signal-warning"
+                    : "bg-ink-primary/65",
               )}
             />
           </div>
@@ -717,26 +627,25 @@ export function HostRulesSection({ hostId }: { hostId: string }) {
 
       {/* Rule List Grouped by Trigger Mode */}
       {loading && !snapshot ? (
-        <div className="text-muted-foreground flex items-center justify-center gap-2 py-12 text-[13px]">
+        <div className="text-ink-muted flex items-center justify-center gap-2 py-12 text-[13px]">
           <Loader2 className="h-4 w-4 animate-spin" />
-          Loading rules…
+          {t("common.loading")}
         </div>
       ) : groupedRules.length === 0 ? (
         <SettingCard>
           <div className="flex flex-col items-center justify-center gap-2 px-6 py-10 text-center">
-            <BookOpen className="text-muted-foreground/50 h-6 w-6 stroke-[1.5]" />
-            <div className="text-foreground text-[13.5px] font-medium">No rules discovered</div>
-            <p className="text-muted-foreground max-w-[360px] text-[12.5px] leading-relaxed">
-              Add glob-scoped rules to automatically attach conventions when editing matching files,
-              or reference manual rules with <code className="font-mono">@rule:name</code>.
+            <BookOpen className="text-ink-muted h-6 w-6 stroke-[1.5]" />
+            <div className="text-ink-primary text-[13px] font-medium">{t("context.noRules")}</div>
+            <p className="text-ink-muted max-w-[360px] text-[13px] leading-relaxed">
+              {t("context.noRulesHint")}
             </p>
             <button
               type="button"
               onClick={() => setModalState({ open: true, editing: null })}
-              className="border-border bg-background hover:bg-accent/70 mt-1.5 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-[8px] border px-3 text-[12.5px] font-medium transition-colors"
+              className="border-border-subtle bg-surface-base hover:bg-surface-recessed mt-1.5 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-[8px] border px-3 text-[13px] font-medium transition-colors"
             >
               <Plus className="h-3.5 w-3.5" />
-              Create first rule
+              {t("permissionRules.addRule")}
             </button>
           </div>
         </SettingCard>
@@ -746,10 +655,10 @@ export function HostRulesSection({ hostId }: { hostId: string }) {
             <div key={group.mode} className="space-y-2">
               <SettingGroupLabel
                 action={
-                  <span className="text-muted-foreground/75 text-[11px]">{group.hint}</span>
+                  <span className="text-ink-muted text-[11px]">{t(group.hint)}</span>
                 }
               >
-                {group.label} ({group.items.length})
+                {t(group.label)} ({group.items.length})
               </SettingGroupLabel>
               <SettingCard>
                 {group.items.map((rule) => (
@@ -762,19 +671,19 @@ export function HostRulesSection({ hostId }: { hostId: string }) {
                   >
                     <div className="min-w-0 flex-1 space-y-1">
                       <div className="flex flex-wrap items-center gap-1.5">
-                        <span className="text-foreground font-mono text-[13px] font-medium">
+                        <span className="text-ink-primary font-mono text-[13px] font-medium">
                           {rule.name}
                         </span>
-                        <span className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 text-[10.5px] font-medium">
+                        <span className="bg-surface-recessed text-ink-muted rounded px-1.5 py-0.5 text-[11px] font-medium">
                           {scopeBadgeLabel(rule.scope)}
                         </span>
-                        <span className="text-muted-foreground/80 font-mono text-[10.5px] tabular-nums">
+                        <span className="text-ink-muted font-mono text-[11px] tabular-nums">
                           ~{rule.approx_tokens.toLocaleString()} tok
                         </span>
                       </div>
 
                       {rule.description && (
-                        <p className="text-muted-foreground text-[12px] leading-snug">
+                        <p className="text-ink-muted text-[13px] leading-snug">
                           {rule.description}
                         </p>
                       )}
@@ -784,7 +693,7 @@ export function HostRulesSection({ hostId }: { hostId: string }) {
                           {rule.globs.map((g) => (
                             <span
                               key={g}
-                              className="border-border/80 bg-background/80 text-muted-foreground rounded-[5px] border px-1.5 py-0.5 font-mono text-[11px]"
+                              className="border-border-subtle bg-surface-base text-ink-muted rounded-[5px] border px-1.5 py-0.5 font-mono text-[11px]"
                             >
                               {g}
                             </span>
@@ -796,9 +705,9 @@ export function HostRulesSection({ hostId }: { hostId: string }) {
                     <div className="flex shrink-0 items-center gap-2 pt-0.5">
                       <button
                         type="button"
-                        aria-label={`Edit ${rule.name}`}
+                        aria-label={t("context.editRule", { name: rule.name })}
                         onClick={() => setModalState({ open: true, editing: rule })}
-                        className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-[7px] transition-colors"
+                        className="text-ink-muted hover:text-ink-primary hover:bg-surface-recessed inline-flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-[7px] transition-colors"
                       >
                         <Pencil className="h-[13px] w-[13px]" />
                       </button>
@@ -806,7 +715,7 @@ export function HostRulesSection({ hostId }: { hostId: string }) {
                         checked={rule.enabled}
                         disabled={togglingIds.has(rule.id)}
                         onChange={(next) => void handleToggleRule(rule, next)}
-                        ariaLabel={`Toggle ${rule.name}`}
+                        ariaLabel={t("context.toggleRule", { name: rule.name })}
                       />
                     </div>
                   </div>
@@ -827,7 +736,7 @@ export function HostRulesSection({ hostId }: { hostId: string }) {
           onSave={async (params) => {
             await orbitActions.upsertPathRule(params);
             orbitActions.showToast(
-              modalState.editing ? `Updated rule ${params.name}` : `Created rule ${params.name}`,
+              t("permissionRules.ruleSavedToast"),
             );
           }}
           onDelete={async (rule) => {
@@ -836,10 +745,10 @@ export function HostRulesSection({ hostId }: { hostId: string }) {
               cwd: activeCwd,
               path: rule.path,
             });
-            orbitActions.showToast(`Deleted rule ${rule.name}`);
+            orbitActions.showToast(t("context.deletedRule", { name: rule.name }));
           }}
         />
       )}
     </div>
   );
-}
+});

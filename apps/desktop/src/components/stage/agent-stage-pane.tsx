@@ -7,6 +7,7 @@ import {
   Square,
   X,
 } from "lucide-react";
+import { resolveComposerEnterAction } from "@/components/composer/omni-composer";
 import {
   ConversationViewport,
   useViewportAnchorHold,
@@ -14,6 +15,10 @@ import {
 import { mergeAgentPendingPermissions } from "@/components/side-panel/subagent-tab";
 import { DecisionDock } from "@/components/stage/stage-approval-dock";
 import { PlanReviewCard } from "@/components/stage/plan-review-card";
+import {
+  StageActivityWave,
+  summarizeActiveSubagents,
+} from "@/components/stage/stage-activity-wave";
 import {
   PromptImageLightbox,
   type PromptImagePreviewTarget,
@@ -40,6 +45,10 @@ import {
   type ResolvedSubagentItem,
   buildSubagentNameMatcher,
 } from "@/lib/subagents";
+import {
+  selectActiveGoalForAgent,
+  selectArmedTimerCountForAgent,
+} from "@/state/selectors/session-selectors";
 import {
   orbitActions,
   threadScopeKey,
@@ -89,6 +98,7 @@ export const AgentStagePane = memo(function AgentStagePane({
   const hostDetail = useOrbitSelector((s) => (hostId ? (s.hostDetails[hostId] ?? null) : null));
   const customTitle = useOrbitSelector((s) => s.threadCustomTitles[tKey] ?? null);
   const coalesceExploration = useOrbitSelector((s) => s.coalesceExploration);
+  const activeTurnSendBehavior = useOrbitSelector((s) => s.activeTurnSendBehavior);
   const connectionState = useOrbitSelector((s) =>
     hostId
       ? (s.fleet.hosts.find((h) => h.host_id === hostId)?.connection_state ??
@@ -103,6 +113,8 @@ export const AgentStagePane = memo(function AgentStagePane({
     : null;
   const cwd = agent?.cwd ?? fallbackCwd ?? "";
   const foregroundRunning = isAgentForegroundRunning(agent);
+  const awaitingPermission = Boolean(agent?.is_awaiting_permission);
+  const isTurnBusy = foregroundRunning || awaitingPermission;
 
   const selectSession = useMemo(
     () => createStageSessionSelector(hostId || null, agentId || null),
@@ -179,19 +191,40 @@ export const AgentStagePane = memo(function AgentStagePane({
   }, [hostId, agentId]);
 
   const isRunning = isAgentForegroundRunning(agent);
+  const liveSubagentActivity = useMemo(
+    () => summarizeActiveSubagents(sessionSubagents),
+    [sessionSubagents],
+  );
+  const runningBackgroundTasks = useMemo(
+    () => (stage?.insights.background_tasks ?? []).filter((task) => task.status === "running"),
+    [stage?.insights.background_tasks],
+  );
+  const armedTimersCount = useMemo(
+    () => selectArmedTimerCountForAgent(hostDetail, agentId),
+    [hostDetail, agentId],
+  );
+  const hasActiveGoal = useMemo(() => {
+    const goal = selectActiveGoalForAgent(hostDetail, agentId);
+    return Boolean(goal && goal.status !== "paused");
+  }, [hostDetail, agentId]);
+  const handleWaveClick = useMemo(() => {
+    const soleActive = liveSubagentActivity.soleActive;
+    if (!soleActive) return undefined;
+    return () => handleOpenNestedSubagent(soleActive);
+  }, [liveSubagentActivity.soleActive, handleOpenNestedSubagent]);
   const lastTurn = turns[turns.length - 1];
-  const contentVersion = `${turns.length}:${stage?.latest_seq ?? 0}:${lastTurn?.live_segments.length ?? 0}:${isRunning ? 1 : 0}`;
+  const contentVersion = `${turns.length}:${stage?.latest_seq ?? 0}:${lastTurn?.live_segments.length ?? 0}:${isRunning ? 1 : 0}:${liveSubagentActivity.runningCount}:${liveSubagentActivity.awaitingCount}:${runningBackgroundTasks.length}`;
 
-  const handleSend = async () => {
+  const handleSend = async (steerOverride?: boolean) => {
     const trimmed = reply.trim();
     if (!trimmed || !hostId || !agentId || sending) return;
     setSending(true);
     setReply("");
     stickToBottomRef.current = true;
     try {
-      await orbitIpc.sendPrompt(hostId, agentId, trimmed, {
+      await orbitActions.dispatchDirectAgentPrompt(hostId, agentId, trimmed, {
         displayPrompt: trimmed,
-        activeTurnBehavior: foregroundRunning ? "steer" : "queue",
+        steerImmediately: steerOverride,
       });
     } catch (err) {
       setReply((cur) => recoverReplyDraftAfterSendError(cur, trimmed));
@@ -316,6 +349,7 @@ export const AgentStagePane = memo(function AgentStagePane({
                         isTurnActive={isTurnActive}
                         isLastTurn={isLastTurn}
                         agentStatusLabel={isTurnActive ? (agent?.status_label ?? null) : null}
+                        hasLiveBackgroundTasks={isTurnActive && runningBackgroundTasks.length > 0}
                         isNetworkOffline={isNetworkOffline}
                         autoFoldCompleted={coalesceExploration}
                         hostId={hostId}
@@ -334,6 +368,16 @@ export const AgentStagePane = memo(function AgentStagePane({
                   );
                 });
               })()}
+              <StageActivityWave
+                runningSubagentsCount={liveSubagentActivity.runningCount}
+                awaitingSubagentsCount={liveSubagentActivity.awaitingCount}
+                runningBackgroundTasks={runningBackgroundTasks}
+                armedTimersCount={armedTimersCount}
+                hasActiveGoal={hasActiveGoal}
+                isForegroundRunning={isRunning}
+                onClick={handleWaveClick}
+                className="mt-3 mb-1"
+              />
             </div>
           ) : hydrating ? (
             <div role="status" className="text-ink-muted flex items-center justify-center gap-2 py-8 text-[13px]">
@@ -382,15 +426,22 @@ export const AgentStagePane = memo(function AgentStagePane({
             {...replyIme.compositionProps}
             onKeyDown={(e) => {
               if (replyIme.shouldIgnoreKeyDown(e)) return;
-              if (e.key === "Enter" && !e.shiftKey) {
+              const enterAction = resolveComposerEnterAction(
+                e,
+                true,
+                isTurnBusy,
+                activeTurnSendBehavior,
+                awaitingPermission,
+              );
+              if (enterAction.submit) {
                 e.preventDefault();
-                void handleSend();
+                void handleSend(enterAction.steerImmediately);
               }
             }}
             placeholder={t("overview.messageAgentPlaceholder", { name: handleLabel })}
             className="text-ink-primary placeholder:text-ink-faint min-w-0 flex-1 bg-transparent text-[13px] leading-[18px] outline-none"
           />
-          {foregroundRunning && !reply.trim() ? (
+          {isTurnBusy && !reply.trim() ? (
             <button
               type="button"
               title={t("overview.stopAgent")}

@@ -4061,7 +4061,8 @@ pub fn derive_session_insights(
     let mut pr_map: HashMap<String, SessionPullRequestView> = HashMap::new();
     let mut link_map: HashMap<String, SessionLinkView> = HashMap::new();
 
-    let agent_has_live_work = current_agent.is_some_and(|a| a.is_running || a.has_background_tasks);
+    let agent_has_live_work = current_agent
+        .is_some_and(|a| a.is_running || a.has_background_tasks || a.is_awaiting_permission);
 
     for (index, item) in items.iter().enumerate() {
         plan.observe(item, index > 0);
@@ -6218,6 +6219,19 @@ Log: file:///tmp/spoofed.log\n";
         let insights = derive_session_insights(&items, Some("/repo"), Some(&cur), &[], &[]);
         assert_eq!(insights.background_tasks.len(), 1);
         assert_eq!(insights.background_tasks[0].title, "Run dev server");
+
+        // Running background tasks must also stay visible while the agent pauses at AwaitingPermission.
+        let mut gated = cur.clone();
+        gated.status = AgentStatus::AwaitingPermission {
+            turn_id: "t_gate".into(),
+            request_id: "perm_1".into(),
+        };
+        gated.is_running = false;
+        gated.has_background_tasks = false;
+        gated.is_awaiting_permission = true;
+        let gated_insights = derive_session_insights(&items, Some("/repo"), Some(&gated), &[], &[]);
+        assert_eq!(gated_insights.background_tasks.len(), 1);
+        assert_eq!(gated_insights.background_tasks[0].title, "Run dev server");
         assert_eq!(
             insights.background_tasks[0].command.as_deref(),
             Some("cd apps/desktop && npm run tauri dev")

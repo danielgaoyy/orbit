@@ -4,13 +4,16 @@ import {
   ArrowLeftRight,
   ArrowRight,
   ArrowUp,
+  ArrowUpRight,
   Blocks,
   ChevronRight,
+  GitBranch,
   ListChecks,
   RotateCw,
   Scissors,
   Sparkles,
   Timer,
+  Users,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { DiffStat } from "@/components/ui/diff-stat";
@@ -59,7 +62,6 @@ import { openSubagent, SubagentPanelAction } from "./subagent-crew-dock";
 import {
   LazyMarkdownMessageBody,
   PeerMessageRow,
-  SubagentDispatchRow,
 } from "./subagents-track";
 import { StageCopyButton } from "./stage-prompt-controls";
 import {
@@ -134,15 +136,14 @@ export const StepTimelineRail = memo(function StepTimelineRail({
   );
 });
 
+type SubagentDispatchEntry = {
+  kind: "subagent_dispatch";
+  key: string;
+  subagent: SubagentMaybeWithAvatar;
+};
+
 type DelegationMilestoneEntry =
-  | {
-      kind: "subagent_dispatch";
-      key: string;
-      subagent: SubagentMaybeWithAvatar;
-      character: SubagentCharacterSpec;
-      linked: boolean;
-      startedAtMs: number | null;
-    }
+  | SubagentDispatchEntry
   | {
       kind: "inter_agent_message";
       key: string;
@@ -163,9 +164,18 @@ type DelegationMilestoneEntry =
       status: "running" | "completed" | "failed" | "denied";
     };
 
+type GroupedMilestoneEntry =
+  | {
+      kind: "subagent_dispatch_group";
+      key: string;
+      dispatches: SubagentDispatchEntry[];
+    }
+  | Exclude<DelegationMilestoneEntry, SubagentDispatchEntry>;
+
 /**
  * First-class chronological milestone row rendered outside folded step groups:
- * 1. Subagent dispatches open the child directly from the inline status row.
+ * 1. Subagent dispatches coalesce into quiet monochrome `Trace` rows (rich animal portraits,
+ *    live clocks, and nested lineage live exclusively in `StageOverviewPanel` / TopBar Mini-Dock).
  * 2. Inter-agent messages (`send_message`, `message_peer`, `send_agent_prompt`) — compact expandable
  *    left-aligned rows matching `AgentMessageCard` with clean left-rail body (never card-inside-card).
  * 3. Session state milestones (Timers, Worktree Handoffs) — inline disclosures.
@@ -191,7 +201,7 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
   const { t, locale } = useI18n();
   const subagentFallback = t("approval.subagent");
   const sentMessageLabel = parentMessageLabel || t("stage.sentMessage");
-  const entries = useMemo(() => {
+  const groupedEntries = useMemo(() => {
     const out: DelegationMilestoneEntry[] = [];
 
     const matches = dispatches ?? resolveDelegationDispatches(items, sessionSubagents ?? EMPTY_SUBAGENTS, hostId);
@@ -199,13 +209,13 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
       const resolved = matches.get(it);
       if (resolved) {
         const enriched = resolved.subagent as SubagentMaybeWithAvatar;
-        const character =
-          enriched.character ??
-          resolveSubagentCharacter(
-            enriched.childAgentId || enriched.providerSubagentId || enriched.callId || enriched.key,
-          );
 
         if (resolved.action === "message") {
+          const character =
+            enriched.character ??
+            resolveSubagentCharacter(
+              enriched.childAgentId || enriched.providerSubagentId || enriched.callId || enriched.key,
+            );
           const msgCall = extractSubagentMessageCall(it);
           const rawArgs = it.detail.kind === "generic" ? it.detail.arguments_json.trim() : "";
           const detailText =
@@ -230,9 +240,6 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
           kind: "subagent_dispatch",
           key: `dispatch:${it.call_id || it.seq}`,
           subagent: enriched,
-          character,
-          linked: resolved.linked,
-          startedAtMs: enriched.activeStartedAtMs ?? it.timestamp_ms ?? (enriched.createdAtMs || null),
         });
         continue;
       }
@@ -279,137 +286,167 @@ export const DelegationMilestoneRow = memo(function DelegationMilestoneRow({
       }
     }
 
-    return out;
+    const grouped: GroupedMilestoneEntry[] = [];
+    for (const entry of out) {
+      if (entry.kind === "subagent_dispatch") {
+        const prev = grouped[grouped.length - 1];
+        if (prev?.kind === "subagent_dispatch_group") {
+          prev.dispatches.push(entry);
+        } else {
+          grouped.push({
+            kind: "subagent_dispatch_group",
+            key: entry.key,
+            dispatches: [entry],
+          });
+        }
+      } else {
+        grouped.push(entry);
+      }
+    }
+    return grouped;
   }, [items, sessionSubagents, hostId, sentMessageLabel, dispatches, locale, subagentFallback]);
 
-  if (entries.length === 0) return null;
+  if (groupedEntries.length === 0) return null;
 
   const openSubagentRecord = (subagent: ResolvedSubagentItem) =>
     openSubagent(subagent.parentAgentId || agentId, subagent);
 
-  // Map each direct child agent ID to its recursive descendants (depth > 1) so milestone rows
-  // surface multi-level Parent -> Child -> Grandchild lineage cleanly inline.
-  const nestedByRootChildId = useMemo(() => {
-    const map = new Map<string, SubagentMaybeWithAvatar[]>();
-    if (!sessionSubagents || sessionSubagents.length === 0) return map;
-    for (const sa of sessionSubagents) {
-      const depth = sa.depth ?? 1;
-      if (depth <= 1) continue;
-      // Find the top-level child ancestor in lineage (index 1 is depth 1 after index 0 root)
-      const rootChildId =
-        sa.lineage && sa.lineage.length >= 3
-          ? sa.lineage[1]?.agent_id
-          : sa.parentAgentId;
-      if (!rootChildId) continue;
-      const bucket = map.get(rootChildId);
-      if (bucket) bucket.push(sa);
-      else map.set(rootChildId, [sa]);
-    }
-    return map;
-  }, [sessionSubagents]);
-
   return (
     <div className="flex min-w-0 flex-col gap-0.5">
-      {entries.map((entry) => {
-        if (entry.kind === "subagent_dispatch") {
-          const { subagent, character } = entry;
-          const name = subagent.title === "Subagent" ? subagentFallback : subagent.title;
-          const effectiveStatus = subagent.status;
-          const starting = effectiveStatus === "running" && !entry.linked;
-          const statusKey = {
-            running: starting ? "stage.subagentStarting" : "overview.subagentWorking",
-            awaiting_permission: "overview.subagentApprovalRequired",
-            failed: "overview.subagentFailed",
-            completed: "stage.subagentDone",
-            canceled: "overview.subagentStopped",
-          } as const;
-          const isFailed = effectiveStatus === "failed";
-          const isAwaiting = effectiveStatus === "awaiting_permission";
-          const nestedDescendants = subagent.childAgentId
-            ? (nestedByRootChildId.get(subagent.childAgentId) ?? [])
-            : [];
+      {groupedEntries.map((entry) => {
+        if (entry.kind === "subagent_dispatch_group") {
+          if (entry.dispatches.length === 1) {
+            const { subagent } = entry.dispatches[0];
+            const name = subagent.title === "Subagent" ? subagentFallback : subagent.title;
+            const isAwaiting = subagent.status === "awaiting_permission";
+            const isFailed = subagent.status === "failed";
+
+            return (
+              <Trace key={entry.key}>
+                <button
+                  type="button"
+                  data-slot="subagent-dispatch-trigger"
+                  onClick={() => openSubagentRecord(subagent)}
+                  title={subagent.promptPreview || t("stage.openTargetInPanel", { target: name })}
+                  className="group/dispatch -mx-[6px] px-[6px] transition-colors hover:bg-accent/55"
+                >
+                  <TraceLine className="min-h-[28px]">
+                    <TraceIcon>
+                      {isAwaiting ? (
+                        <AlertTriangle className="size-3.5 text-signal-warning" />
+                      ) : isFailed ? (
+                        <AlertTriangle className="size-3.5 text-signal-danger" />
+                      ) : (
+                        <GitBranch className="size-3.5 text-ink-tertiary" />
+                      )}
+                    </TraceIcon>
+                    <TraceTitle className="text-muted-foreground transition-colors group-hover/dispatch:text-foreground">
+                      {t("stage.dispatchedSubagent", { name })}
+                    </TraceTitle>
+                    {isAwaiting && (
+                      <TraceDescription className="font-sans text-[11px] font-medium text-signal-warning">
+                        · {t("overview.subagentApprovalRequired")}
+                      </TraceDescription>
+                    )}
+                    {isFailed && (
+                      <TraceDescription className="font-sans text-[11px] text-signal-danger">
+                        · {t("overview.subagentFailed")}
+                      </TraceDescription>
+                    )}
+                    <ArrowUpRight
+                      aria-hidden="true"
+                      className="size-3 shrink-0 text-ink-muted opacity-0 transition-opacity group-hover/dispatch:opacity-100 group-focus-visible/dispatch:opacity-100"
+                    />
+                  </TraceLine>
+                </button>
+              </Trace>
+            );
+          }
+
+          const isOpen = expandedKey === entry.key;
+          const changeOpen = (open: boolean) => setExpandedKey(open ? entry.key : null);
+          const names = entry.dispatches.map((d) =>
+            d.subagent.title === "Subagent" ? subagentFallback : d.subagent.title,
+          );
+          let awaitingCount = 0;
+          let failedCount = 0;
+          for (const d of entry.dispatches) {
+            if (d.subagent.status === "awaiting_permission") awaitingCount += 1;
+            else if (d.subagent.status === "failed") failedCount += 1;
+          }
+          const groupTitle =
+            entry.dispatches.length === 2
+              ? t("stage.dispatchedTwoSubagents", { first: names[0], second: names[1] })
+              : t("stage.dispatchedManySubagents", { count: entry.dispatches.length });
 
           return (
-            <div key={entry.key} className="flex min-w-0 flex-col gap-0.5">
-              <SubagentDispatchRow
-                title={subagent.promptPreview || t("stage.openTargetInPanel", { target: name })}
-                onClick={() => openSubagentRecord(subagent)}
-                tone={isFailed ? "danger" : isAwaiting ? "warning" : "normal"}
-                name={name}
-                statusLabel={t(statusKey[effectiveStatus])}
-                avatar={
-                  <SubagentAvatar
-                    character={character}
-                    status={effectiveStatus}
-                    size="sm"
-                    showStatusBadge={
-                      effectiveStatus === "completed" || isFailed || effectiveStatus === "canceled"
-                    }
-                  />
-                }
-                trailing={
-                  (effectiveStatus === "running" || isAwaiting) && entry.startedAtMs != null ? (
-                    <InlineLiveElapsed startedAtMs={entry.startedAtMs} stallLabel={null} />
-                  ) : undefined
-                }
-              />
-              {nestedDescendants.length > 0 && (
-                <div className="ml-3.5 flex min-w-0 flex-col gap-0.5 border-l border-border-subtle/80 pl-2.5">
-                  {nestedDescendants.map((desc) => {
-                    const descName = desc.title === "Subagent" ? subagentFallback : desc.title;
-                    const descStatus = desc.status;
-                    const descFailed = descStatus === "failed";
-                    const descAwaiting = descStatus === "awaiting_permission";
-                    const descChar =
-                      desc.character ??
-                      resolveSubagentCharacter(
-                        desc.childAgentId || desc.providerSubagentId || desc.callId || desc.key,
-                      );
-                    const extraIndent = Math.min(Math.max(0, (desc.depth ?? 2) - 2), 4) * 12;
-                    const descStatusKey = {
-                      running: "overview.subagentWorking",
-                      awaiting_permission: "overview.subagentApprovalRequired",
-                      failed: "overview.subagentFailed",
-                      completed: "stage.subagentDone",
-                      canceled: "overview.subagentStopped",
-                    } as const;
-                    const descTooltip = [
-                      desc.lineage && desc.lineage.length > 1
-                        ? desc.lineage.map((step) => step.title).join(" → ")
-                        : null,
-                      desc.promptPreview || t("stage.openTargetInPanel", { target: descName }),
-                    ]
-                      .filter(Boolean)
-                      .join("\n");
+            <Trace key={entry.key}>
+              <TraceCollapsible open={isOpen} onOpenChange={changeOpen}>
+                <TraceCollapsibleTrigger>
+                  <TraceLine className="min-h-[28px]">
+                    <TraceIcon>
+                      {awaitingCount > 0 ? (
+                        <AlertTriangle className="size-3.5 text-signal-warning" />
+                      ) : failedCount > 0 ? (
+                        <AlertTriangle className="size-3.5 text-signal-danger" />
+                      ) : (
+                        <Users className="size-3.5 text-ink-tertiary" />
+                      )}
+                    </TraceIcon>
+                    <TraceTitle>{groupTitle}</TraceTitle>
+                    {awaitingCount > 0 && (
+                      <TraceDescription className="font-sans text-[11px] font-medium text-signal-warning">
+                        · {t("stage.subagentsAwaitingSuffix", { count: awaitingCount })}
+                      </TraceDescription>
+                    )}
+                    {failedCount > 0 && (
+                      <TraceDescription className="font-sans text-[11px] text-signal-danger">
+                        · {t("stage.failedCount", { count: failedCount })}
+                      </TraceDescription>
+                    )}
+                  </TraceLine>
+                </TraceCollapsibleTrigger>
+                <TraceCollapsibleContent className="flex flex-col gap-0.5">
+                  {entry.dispatches.map((d) => {
+                    const sa = d.subagent;
+                    const name = sa.title === "Subagent" ? subagentFallback : sa.title;
+                    const isAwaiting = sa.status === "awaiting_permission";
+                    const isFailed = sa.status === "failed";
+                    const isCanceled = sa.status === "canceled";
                     return (
-                      <div
-                        key={desc.key}
-                        style={extraIndent > 0 ? { paddingLeft: `${extraIndent}px` } : undefined}
-                        className="min-w-0"
+                      <button
+                        key={d.key}
+                        type="button"
+                        onClick={() => openSubagentRecord(sa)}
+                        title={sa.promptPreview || t("stage.openTargetInPanel", { target: name })}
+                        className="group/dispatch-item -mx-[6px] flex min-h-[26px] w-[calc(100%+12px)] cursor-pointer items-center gap-1.5 rounded-[6px] px-[6px] text-left text-[13px] leading-[18px] text-muted-foreground outline-none transition-colors hover:bg-accent/55 hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring/45"
                       >
-                        <SubagentDispatchRow
-                          title={descTooltip}
-                          onClick={() => openSubagentRecord(desc)}
-                          tone={descFailed ? "danger" : descAwaiting ? "warning" : "normal"}
-                          name={descName}
-                          statusLabel={t(descStatusKey[descStatus])}
-                          avatar={
-                            <SubagentAvatar
-                              character={descChar}
-                              status={descStatus}
-                              size="xs"
-                              showStatusBadge={
-                                descStatus === "completed" || descFailed || descStatus === "canceled"
-                              }
-                            />
-                          }
+                        <span className="min-w-0 truncate">{name}</span>
+                        {isAwaiting && (
+                          <span className="shrink-0 text-[11px] font-medium text-signal-warning">
+                            · {t("overview.subagentApprovalRequired")}
+                          </span>
+                        )}
+                        {isFailed && (
+                          <span className="shrink-0 text-[11px] text-signal-danger">
+                            · {t("overview.subagentFailed")}
+                          </span>
+                        )}
+                        {isCanceled && (
+                          <span className="shrink-0 text-[11px] text-ink-muted">
+                            · {t("overview.subagentStopped")}
+                          </span>
+                        )}
+                        <ArrowUpRight
+                          aria-hidden="true"
+                          className="ml-auto size-3 shrink-0 text-ink-muted opacity-0 transition-opacity group-hover/dispatch-item:opacity-100 group-focus-visible/dispatch-item:opacity-100"
                         />
-                      </div>
+                      </button>
                     );
                   })}
-                </div>
-              )}
-            </div>
+                </TraceCollapsibleContent>
+              </TraceCollapsible>
+            </Trace>
           );
         }
 

@@ -15,6 +15,7 @@ import {
   normalizeChord,
   sanitizeCustomKeybindings,
 } from "@/lib/shortcut-registry";
+import { waitForNextDevicePoll } from "../cloud-sync-device-poll";
 import {
   applyDocumentTheme,
   formatCloudSyncToast,
@@ -25,6 +26,7 @@ import {
 } from "../store-helpers";
 import type { OrbitStoreContext } from "../store-runtime";
 import type {
+  ActiveTurnSendBehavior,
   InstructionsTarget,
   SettingsSection,
   SettingsSectionTarget,
@@ -42,6 +44,13 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
   } = ctx;
 
   let cloudDeviceFlowPollToken = 0;
+  let cloudDeviceFlowAbort: AbortController | null = null;
+
+  function abortActiveDeviceFlow(): void {
+    cloudDeviceFlowPollToken += 1;
+    cloudDeviceFlowAbort?.abort();
+    cloudDeviceFlowAbort = null;
+  }
 
   async function pushCloudPrefPatch(patch: Record<string, unknown>): Promise<void> {
     if (getState().cloudSyncStatus?.state !== "ready") return;
@@ -64,18 +73,10 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
       const nextTheme: ThemeMode = fresh.theme ?? getState().theme;
       const nextResolved = resolveTheme(nextTheme);
       applyDocumentTheme(nextResolved);
-      const nextFontSize = fresh.terminalFontSize ?? getState().terminalFontSize;
-      const nextCursor = fresh.terminalCursorStyle ?? getState().terminalCursorStyle;
-      const nextScrollback = fresh.terminalScrollback ?? getState().terminalScrollback;
-      const nextTerminalThemeMode = fresh.terminalThemeMode ?? getState().terminalThemeMode;
       if (
         nextLocale === getState().locale &&
         nextTheme === getState().theme &&
-        nextResolved === getState().resolvedTheme &&
-        nextFontSize === getState().terminalFontSize &&
-        nextCursor === getState().terminalCursorStyle &&
-        nextScrollback === getState().terminalScrollback &&
-        nextTerminalThemeMode === getState().terminalThemeMode
+        nextResolved === getState().resolvedTheme
       ) {
         return;
       }
@@ -84,10 +85,6 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
         locale: nextLocale,
         theme: nextTheme,
         resolvedTheme: nextResolved,
-        terminalFontSize: nextFontSize,
-        terminalCursorStyle: nextCursor,
-        terminalScrollback: nextScrollback,
-        terminalThemeMode: nextTerminalThemeMode,
       }));
     },
 
@@ -213,6 +210,13 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
     },
 
 
+    setActiveTurnSendBehavior(behavior: ActiveTurnSendBehavior): void {
+      const normalized: ActiveTurnSendBehavior = behavior === "steer" ? "steer" : "queue";
+      setState((s) => ({ ...s, activeTurnSendBehavior: normalized }), true);
+      void pushCloudPrefPatch({ activeTurnSendBehavior: normalized });
+    },
+
+
     setCustomKeybinding(actionId: ShortcutActionId, chord: string | null): void {
       const def = SHORTCUT_ACTION_MAP[actionId];
       if (!def) return;
@@ -321,28 +325,22 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
     },
 
 
-    setTerminalPrefs(patch: {
+    setVoiceInputDeviceId(deviceId: string | null): void {
+      const normalized =
+        typeof deviceId === "string" && deviceId.trim().length > 0 && deviceId !== "default"
+          ? deviceId.trim()
+          : null;
+      setState((s) => ({ ...s, voiceInputDeviceId: normalized }), true);
+    },
+
+
+    setTerminalPrefs(_patch: {
       fontSize?: number;
       cursorStyle?: TerminalCursorStyle;
       scrollback?: number;
       themeMode?: TerminalThemeMode;
     }): void {
-      setState(
-        (s) => ({
-          ...s,
-          terminalFontSize:
-            patch.fontSize !== undefined
-              ? Math.min(18, Math.max(10, patch.fontSize))
-              : s.terminalFontSize,
-          terminalCursorStyle: patch.cursorStyle ?? s.terminalCursorStyle,
-          terminalScrollback:
-            patch.scrollback !== undefined
-              ? Math.min(50000, Math.max(500, patch.scrollback))
-              : s.terminalScrollback,
-          terminalThemeMode: patch.themeMode ?? s.terminalThemeMode,
-        }),
-        true,
-      );
+      // Terminal always uses Orbit's curated factory defaults and is not user-configurable.
     },
 
 
@@ -389,6 +387,10 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
             theme: nextTheme ?? s.theme,
             resolvedTheme: nextTheme ? resolveTheme(nextTheme) : s.resolvedTheme,
             enterToSend: typeof prefs.enterToSend === "boolean" ? prefs.enterToSend : s.enterToSend,
+            activeTurnSendBehavior:
+              prefs.activeTurnSendBehavior === "steer" || prefs.activeTurnSendBehavior === "queue"
+                ? prefs.activeTurnSendBehavior
+                : s.activeTurnSendBehavior,
             notifyOnApproval:
               typeof prefs.notifyOnApproval === "boolean"
                 ? prefs.notifyOnApproval
@@ -455,30 +457,63 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
 
 
     async startGithubCloudLogin(clientIdOverride?: string | null): Promise<void> {
-      cloudDeviceFlowPollToken += 1;
+      abortActiveDeviceFlow();
       const pollToken = cloudDeviceFlowPollToken;
+      const abortController = new AbortController();
+      cloudDeviceFlowAbort = abortController;
       setState((s) => ({ ...s, cloudSyncBusy: true, cloudSyncError: null }));
       try {
         const started = await orbitIpc.cloudSyncStartGithubDeviceFlow(clientIdOverride ?? null);
         if (pollToken !== cloudDeviceFlowPollToken) return;
+
+        // Copy the user_code BEFORE launching the browser while Orbit still holds window focus.
+        let clipboardCopied = false;
+        try {
+          if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(started.user_code);
+            clipboardCopied = true;
+          }
+        } catch {
+          clipboardCopied = false;
+        }
+        if (pollToken !== cloudDeviceFlowPollToken) return;
+
+        const startedAtMs = Date.now();
+        const expiresAtMs = startedAtMs + Math.max(1, started.expires_in_secs) * 1000;
         setState((s) => ({
           ...s,
           cloudSyncBusy: false,
-          cloudSyncDeviceFlow: started,
+          cloudSyncDeviceFlow: {
+            ...started,
+            startedAtMs,
+            expiresAtMs,
+            clipboardCopied,
+          },
           cloudSyncError: null,
         }));
 
-        // Poll GitHub Device Flow until authorized, cancelled, or expired
+        // Automatically open GitHub's device verification page — no second click needed.
+        void orbitIpc.openExternalBrowserUrl(started.verification_uri).catch(() => undefined);
+
+        // Poll GitHub Device Flow until authorized, cancelled, or expired.
+        // Window focus / visibilitychange accelerates wakeups without violating RFC 8628 intervals.
         let intervalMs = Math.max(2000, started.interval_secs * 1000);
-        const deadline = Date.now() + started.expires_in_secs * 1000;
-        while (pollToken === cloudDeviceFlowPollToken && Date.now() < deadline) {
-          await new Promise((r) => window.setTimeout(r, intervalMs));
-          if (pollToken !== cloudDeviceFlowPollToken) return;
+        let lastPollAtMs = startedAtMs;
+        while (pollToken === cloudDeviceFlowPollToken && Date.now() < expiresAtMs) {
+          const wake = await waitForNextDevicePoll({
+            minIntervalMs: intervalMs,
+            lastPollAtMs,
+            deadlineMs: expiresAtMs,
+            signal: abortController.signal,
+          });
+          if (pollToken !== cloudDeviceFlowPollToken || wake === "aborted") return;
+          if (wake === "expired") break;
           try {
             const polled = await orbitIpc.cloudSyncPollGithubDeviceFlow(
               started.device_code,
               clientIdOverride ?? null,
             );
+            lastPollAtMs = Date.now();
             if (pollToken !== cloudDeviceFlowPollToken) return;
             if (polled.status === "pending") {
               continue;
@@ -495,6 +530,8 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
                 cloudSyncStatus: status,
                 cloudSyncError: null,
               }));
+              // Bring Orbit Desktop back to the foreground as soon as GitHub approves.
+              void orbitIpc.focusMainWindow().catch(() => undefined);
               if (status.state === "ready") {
                 await ctx.actions.reloadFleetAndHosts();
                 await ctx.actions.hydrateSyncedPreferencesFromCore();
@@ -537,12 +574,16 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
           cloudSyncDeviceFlow: null,
           cloudSyncError: String(err),
         }));
+      } finally {
+        if (cloudDeviceFlowAbort === abortController) {
+          cloudDeviceFlowAbort = null;
+        }
       }
     },
 
 
     cancelGithubCloudLogin(): void {
-      cloudDeviceFlowPollToken += 1;
+      abortActiveDeviceFlow();
       setState((s) => ({
         ...s,
         cloudSyncBusy: false,
@@ -553,6 +594,7 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
 
 
     async loginCloudSyncWithToken(token: string): Promise<boolean> {
+      abortActiveDeviceFlow();
       setState((s) => ({ ...s, cloudSyncBusy: true, cloudSyncError: null }));
       try {
         const status = await orbitIpc.cloudSyncLoginWithToken(token.trim());
@@ -584,6 +626,7 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
     },
 
     async importCloudSyncDeviceLinkUri(uri: string): Promise<boolean> {
+      abortActiveDeviceFlow();
       setState((s) => ({ ...s, cloudSyncBusy: true, cloudSyncError: null }));
       try {
         const result = await orbitIpc.cloudSyncImportDeviceLinkUri(uri.trim());
@@ -647,6 +690,7 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
           locale: getState().locale,
           theme: getState().theme,
           enterToSend: getState().enterToSend,
+          activeTurnSendBehavior: getState().activeTurnSendBehavior,
           notifyOnApproval: getState().notifyOnApproval,
           notifyOnTurnComplete: getState().notifyOnTurnComplete,
           notifyOnAgentError: getState().notifyOnAgentError,
@@ -736,7 +780,7 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
 
 
     async logoutCloudSync(clearLocalHosts = false): Promise<void> {
-      cloudDeviceFlowPollToken += 1;
+      abortActiveDeviceFlow();
       setState((s) => ({ ...s, cloudSyncBusy: true, cloudSyncError: null }));
       try {
         const status = await orbitIpc.cloudSyncLogout(clearLocalHosts);

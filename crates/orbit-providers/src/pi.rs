@@ -25,8 +25,8 @@ use uuid::Uuid;
 
 use crate::attachments::build_pi_prompt_payload_async;
 use crate::driver::{
-    DriverCommand, DriverEvent, OrbitMcpLaunchSpec, ProviderSessionHandle, QueuedDriverPrompt,
-    SessionLaunchConfig, emit_dropped_queued_prompts, emit_prompt_delivery,
+    DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PromptOrigin, ProviderSessionHandle,
+    QueuedDriverPrompt, SessionLaunchConfig, emit_dropped_queued_prompts, emit_prompt_delivery,
 };
 
 const BOOT_GET_STATE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1083,6 +1083,7 @@ async fn run_pi_actor(
         PiStreamSegmentState::default()
     };
     let mut tool_cache: HashMap<String, ToolCallDetail> = HashMap::new();
+    let mut pending_human_steers: VecDeque<QueuedDriverPrompt> = VecDeque::new();
     let mut pending_prompts: VecDeque<QueuedDriverPrompt> = VecDeque::new();
     let mut pending_interrupt_replacement: Option<QueuedDriverPrompt> = None;
     let mut active_turn_message_ids: Vec<String> = Vec::new();
@@ -1097,7 +1098,7 @@ async fn run_pi_actor(
                         turn_id,
                         prompt,
                         behavior,
-                        origin: _origin,
+                        origin,
                         message_ids,
                     } => {
                         let effective_prompt = if inject_handoff_on_next_prompt {
@@ -1107,10 +1108,38 @@ async fn run_pi_actor(
                             prompt
                         };
 
-                        if let Some(ref blocking_tid) = active_turn_id {
-                            let blocking_tid_opt = Some(blocking_tid.clone());
+                        let has_pending_gates = !pending_ext_reqs.is_empty();
+                        if active_turn_id.is_some() || has_pending_gates {
+                            let blocking_tid_opt = active_turn_id.clone();
                             match behavior {
                                 ActiveTurnBehavior::Steer => {
+                                    // Option A: while an extension approval/question gate is
+                                    // pending, queue non-destructively in priority order instead
+                                    // of sending mid-gate `steer`.
+                                    if has_pending_gates || active_turn_id.is_none() {
+                                        emit_prompt_delivery(
+                                            &evt_tx,
+                                            &turn_id,
+                                            &message_ids,
+                                            AgentMessageDeliveryStatus::Queued,
+                                            blocking_tid_opt,
+                                        )
+                                        .await;
+                                        let queued = QueuedDriverPrompt {
+                                            turn_id,
+                                            prompt: effective_prompt,
+                                            message_ids,
+                                        };
+                                        if origin == PromptOrigin::Human {
+                                            pending_human_steers.push_back(queued);
+                                        } else {
+                                            pending_prompts.push_back(queued);
+                                        }
+                                        continue;
+                                    }
+                                    let blocking_tid = active_turn_id
+                                        .as_deref()
+                                        .unwrap_or(turn_id.as_str());
                                     let cmd_id = format!("pi_cmd_{next_cmd_id}");
                                     next_cmd_id += 1;
                                     let line = build_pi_prompt_command_async(
@@ -1127,6 +1156,12 @@ async fn run_pi_actor(
                                             &message_ids,
                                             AgentMessageDeliveryStatus::Dropped,
                                             None,
+                                        )
+                                        .await;
+                                        emit_dropped_queued_prompts(
+                                            &evt_tx,
+                                            None,
+                                            &mut pending_human_steers,
                                         )
                                         .await;
                                         emit_dropped_queued_prompts(
@@ -1158,6 +1193,7 @@ async fn run_pi_actor(
                                         None,
                                     )
                                     .await;
+                                    continue;
                                 }
                                 ActiveTurnBehavior::Queue => {
                                     emit_prompt_delivery(
@@ -1173,71 +1209,88 @@ async fn run_pi_actor(
                                         prompt: effective_prompt,
                                         message_ids,
                                     });
+                                    continue;
                                 }
                                 ActiveTurnBehavior::Interrupt => {
                                     cancel_pending_ext_reqs(&shim, &mut pending_ext_reqs).await;
-                                    let cmd_id = format!("pi_cmd_{next_cmd_id}");
-                                    next_cmd_id += 1;
-                                    let abort_line = json!({
-                                        "id": cmd_id,
-                                        "type": "abort"
-                                    })
-                                    .to_string();
-                                    if shim.write_stdin_line(abort_line).await.is_err() {
+                                    if active_turn_id.is_some() {
+                                        let cmd_id = format!("pi_cmd_{next_cmd_id}");
+                                        next_cmd_id += 1;
+                                        let abort_line = json!({
+                                            "id": cmd_id,
+                                            "type": "abort"
+                                        })
+                                        .to_string();
+                                        if shim.write_stdin_line(abort_line).await.is_err() {
+                                            emit_prompt_delivery(
+                                                &evt_tx,
+                                                &turn_id,
+                                                &message_ids,
+                                                AgentMessageDeliveryStatus::Dropped,
+                                                None,
+                                            )
+                                            .await;
+                                            emit_dropped_queued_prompts(
+                                                &evt_tx,
+                                                None,
+                                                &mut pending_human_steers,
+                                            )
+                                            .await;
+                                            emit_dropped_queued_prompts(
+                                                &evt_tx,
+                                                pending_interrupt_replacement.take(),
+                                                &mut pending_prompts,
+                                            )
+                                            .await;
+                                            if let Some(ref blocking_tid) = active_turn_id {
+                                                let active_ids =
+                                                    std::mem::take(&mut active_turn_message_ids);
+                                                emit_prompt_delivery(
+                                                    &evt_tx,
+                                                    blocking_tid,
+                                                    &active_ids,
+                                                    AgentMessageDeliveryStatus::Dropped,
+                                                    None,
+                                                )
+                                                .await;
+                                            }
+                                            finalize_and_emit_unexpected_exit(
+                                                &mut seg_state,
+                                                &evt_tx,
+                                            )
+                                            .await;
+                                            break;
+                                        }
+                                        if let Some(prev_rep) = pending_interrupt_replacement.take()
+                                        {
+                                            emit_prompt_delivery(
+                                                &evt_tx,
+                                                &prev_rep.turn_id,
+                                                &prev_rep.message_ids,
+                                                AgentMessageDeliveryStatus::Dropped,
+                                                None,
+                                            )
+                                            .await;
+                                        }
                                         emit_prompt_delivery(
                                             &evt_tx,
                                             &turn_id,
                                             &message_ids,
-                                            AgentMessageDeliveryStatus::Dropped,
-                                            None,
+                                            AgentMessageDeliveryStatus::Queued,
+                                            blocking_tid_opt,
                                         )
                                         .await;
-                                        emit_dropped_queued_prompts(
-                                            &evt_tx,
-                                            pending_interrupt_replacement.take(),
-                                            &mut pending_prompts,
-                                        )
-                                        .await;
-                                        let active_ids =
-                                            std::mem::take(&mut active_turn_message_ids);
-                                        emit_prompt_delivery(
-                                            &evt_tx,
-                                            blocking_tid,
-                                            &active_ids,
-                                            AgentMessageDeliveryStatus::Dropped,
-                                            None,
-                                        )
-                                        .await;
-                                        finalize_and_emit_unexpected_exit(&mut seg_state, &evt_tx)
-                                            .await;
-                                        break;
+                                        pending_interrupt_replacement = Some(QueuedDriverPrompt {
+                                            turn_id,
+                                            prompt: effective_prompt,
+                                            message_ids,
+                                        });
+                                        continue;
                                     }
-                                    if let Some(prev_rep) = pending_interrupt_replacement.take() {
-                                        emit_prompt_delivery(
-                                            &evt_tx,
-                                            &prev_rep.turn_id,
-                                            &prev_rep.message_ids,
-                                            AgentMessageDeliveryStatus::Dropped,
-                                            None,
-                                        )
-                                        .await;
-                                    }
-                                    emit_prompt_delivery(
-                                        &evt_tx,
-                                        &turn_id,
-                                        &message_ids,
-                                        AgentMessageDeliveryStatus::Queued,
-                                        blocking_tid_opt,
-                                    )
-                                    .await;
-                                    pending_interrupt_replacement = Some(QueuedDriverPrompt {
-                                        turn_id,
-                                        prompt: effective_prompt,
-                                        message_ids,
-                                    });
+                                    // Orphaned extension request with no active turn: fall
+                                    // through to dispatch the replacement turn directly.
                                 }
                             }
-                            continue;
                         }
 
                         active_turn_id = Some(turn_id.clone());
@@ -1286,6 +1339,8 @@ async fn run_pi_actor(
                         .await;
                     }
                     DriverCommand::Interrupt => {
+                        emit_dropped_queued_prompts(&evt_tx, None, &mut pending_human_steers)
+                            .await;
                         emit_dropped_queued_prompts(
                             &evt_tx,
                             pending_interrupt_replacement.take(),
@@ -1349,6 +1404,7 @@ async fn run_pi_actor(
                             }
                         } else if let Some(next_q) = pending_interrupt_replacement
                             .take()
+                            .or_else(|| pending_human_steers.pop_front())
                             .or_else(|| pending_prompts.pop_front())
                         {
                             active_turn_id = Some(next_q.turn_id.clone());
@@ -1548,6 +1604,7 @@ async fn run_pi_actor(
 
             maybe_frame = shim.rx.recv() => {
                 let Some(frame) = maybe_frame else {
+                    emit_dropped_queued_prompts(&evt_tx, None, &mut pending_human_steers).await;
                     emit_dropped_queued_prompts(
                         &evt_tx,
                         pending_interrupt_replacement.take(),
@@ -1607,6 +1664,7 @@ async fn run_pi_actor(
                                         }
                                         if let Some(next_q) = pending_interrupt_replacement
                                             .take()
+                                            .or_else(|| pending_human_steers.pop_front())
                                             .or_else(|| pending_prompts.pop_front())
                                         {
                                             active_turn_id = Some(next_q.turn_id.clone());
@@ -1845,6 +1903,7 @@ async fn run_pi_actor(
                                 }
                                 if let Some(next_q) = pending_interrupt_replacement
                                     .take()
+                                    .or_else(|| pending_human_steers.pop_front())
                                     .or_else(|| pending_prompts.pop_front())
                                 {
                                     active_turn_id = Some(next_q.turn_id.clone());
@@ -1913,6 +1972,8 @@ async fn run_pi_actor(
                         }
                     }
                     ShimFrame::Exited { code } => {
+                        emit_dropped_queued_prompts(&evt_tx, None, &mut pending_human_steers)
+                            .await;
                         emit_dropped_queued_prompts(
                             &evt_tx,
                             pending_interrupt_replacement.take(),

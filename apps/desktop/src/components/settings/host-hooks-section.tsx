@@ -1,12 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
-  Check,
   ChevronDown,
   ChevronRight,
-  ChevronsUpDown,
   Globe,
   Loader2,
-  Pencil,
   Play,
   Plus,
   RefreshCw,
@@ -18,32 +15,24 @@ import {
 import {
   SettingCard,
   SettingGroupLabel,
-  SettingSectionHeader,
+  SettingDrawer,
+  SettingResourceRow,
   SettingSelect,
   type SettingSelectOption,
   ToggleSwitch,
+  useHostIsOnline,
 } from "@/components/settings/settings-primitives";
 import { Button } from "@/components/ui/button";
+import { IconButton } from "@/components/ui/icon-button";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-  Tabs,
-  TabsList,
-  TabsTrigger,
-} from "@/components/ui/dialog-tabs";
-import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
+  Field,
+  FieldDescription,
+  FieldGroup,
+  FieldLabel,
+} from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/overlays";
-import { type MessageKey, useI18n } from "@/lib/i18n";
+import { type MessageKey, getLocale, t, useI18n } from "@/lib/i18n";
 import type {
   HookAction,
   HookDecision,
@@ -79,7 +68,11 @@ const HOOK_EVENTS: {
     labelKey: "hooks.eventPrePromptSubmit",
     hintKey: "hooks.eventPrePromptSubmitHint",
     matcherPlaceholder: "claude_code|codex",
-    samplePayload: { provider: "codex", target: "codex", prompt: "Dry-run test prompt" },
+    samplePayload: {
+      provider: "codex",
+      target: "codex",
+      prompt: "Dry-run test prompt",
+    },
   },
   {
     id: "pre_tool_use",
@@ -137,18 +130,16 @@ const HOOK_EVENTS: {
     labelKey: "hooks.eventSessionEnd",
     hintKey: "hooks.eventSessionEndHint",
     matcherPlaceholder: "claude_code|codex",
-    samplePayload: { provider: "claude_code", target: "claude_code", reason: "archived" },
+    samplePayload: {
+      provider: "claude_code",
+      target: "claude_code",
+      reason: "archived",
+    },
   },
 ];
 
 function eventMeta(kind: HookEventKind) {
   return HOOK_EVENTS.find((e) => e.id === kind) ?? HOOK_EVENTS[0];
-}
-
-function formatWorkspaceShortName(cwd: string): string {
-  const clean = cwd.replace(/\/+$/, "");
-  const parts = clean.split("/");
-  return parts[parts.length - 1] || clean || "~";
 }
 
 function formatActionPreview(action: HookAction): string {
@@ -166,38 +157,45 @@ function formatTimeoutLabel(ms: number): string {
 
 function formatRelativeTime(tsMs: number): string {
   const diffSec = Math.max(0, Math.floor((Date.now() - tsMs) / 1000));
-  if (diffSec < 5) return "just now";
-  if (diffSec < 60) return `${diffSec}s ago`;
-  const diffMin = Math.floor(diffSec / 60);
-  if (diffMin < 60) return `${diffMin}m ago`;
-  const diffHr = Math.floor(diffMin / 60);
-  if (diffHr < 24) return `${diffHr}h ago`;
-  return `${Math.floor(diffHr / 24)}d ago`;
+  const relative = new Intl.RelativeTimeFormat(getLocale(), {
+    numeric: "auto",
+    style: "short",
+  });
+  if (diffSec < 60) return relative.format(-diffSec, "second");
+  const minutes = Math.floor(diffSec / 60);
+  if (minutes < 60) return relative.format(-minutes, "minute");
+  const hours = Math.floor(minutes / 60);
+  return hours < 24
+    ? relative.format(-hours, "hour")
+    : relative.format(-Math.floor(hours / 24), "day");
 }
 
 function decisionPillClass(decision: HookDecision): string {
   switch (decision) {
     case "allow":
-      return "bg-emerald-500/12 text-emerald-700 dark:text-emerald-300";
+      return "bg-signal-success-bg text-signal-success";
     case "block":
-      return "bg-rose-500/12 text-rose-700 dark:text-rose-300";
+      return "bg-signal-danger-bg text-signal-danger";
     case "modify":
-      return "bg-amber-500/12 text-amber-700 dark:text-amber-300";
+      return "bg-signal-warning-bg text-signal-warning";
   }
 }
 
 function decisionLabel(decision: HookDecision): string {
   switch (decision) {
     case "allow":
-      return "Allow";
+      return t("approval.allow");
     case "block":
-      return "Block";
+      return t("devTools.block");
     case "modify":
-      return "Modify";
+      return t("devTools.modify");
   }
 }
 
-function serializeKeyValueLines(map: Record<string, string>, sep: string): string {
+function serializeKeyValueLines(
+  map: Record<string, string>,
+  sep: string,
+): string {
   return Object.entries(map)
     .map(([k, v]) => `${k}${sep}${v}`)
     .join("\n");
@@ -229,13 +227,17 @@ function hasMaskedValues(raw: string): boolean {
   return raw.includes("••••");
 }
 
-function HookEditorModal({
+function HookEditorDrawer({
+  open,
+  onClosed,
   hasProjectCwd,
   editing,
   onClose,
   onSave,
   onDelete,
 }: {
+  open: boolean;
+  onClosed: () => void;
   hasProjectCwd: boolean;
   editing: LifecycleHookRule | null;
   onClose: () => void;
@@ -243,10 +245,11 @@ function HookEditorModal({
   onDelete: (rule: LifecycleHookRule) => Promise<void>;
 }) {
   const { t } = useI18n();
-  const [scope, setScope] = useState<HookScope>(
-    () => editing?.scope ?? (hasProjectCwd ? "project_orbit" : "user_global"),
+  const scope: HookScope =
+    editing?.scope ?? (hasProjectCwd ? "project_orbit" : "user_global");
+  const [event, setEvent] = useState<HookEventKind>(
+    () => editing?.event ?? "pre_tool_use",
   );
-  const [event, setEvent] = useState<HookEventKind>(() => editing?.event ?? "pre_tool_use");
   const eventOptions: SettingSelectOption<HookEventKind>[] = useMemo(
     () =>
       HOOK_EVENTS.map((ev) => ({
@@ -257,9 +260,13 @@ function HookEditorModal({
     [t],
   );
   const [name, setName] = useState(() => editing?.name ?? "");
-  const [description, setDescription] = useState(() => editing?.description ?? "");
+  const [description, setDescription] = useState(
+    () => editing?.description ?? "",
+  );
   const [matcher, setMatcher] = useState(() => editing?.matcher ?? "");
-  const [timeoutMs, setTimeoutMs] = useState(() => String(editing?.timeout_ms ?? DEFAULT_TIMEOUT_MS));
+  const [timeoutMs, setTimeoutMs] = useState(() =>
+    String(editing?.timeout_ms ?? DEFAULT_TIMEOUT_MS),
+  );
   const [enabled, setEnabled] = useState(() => editing?.enabled ?? true);
 
   const [actionKind, setActionKind] = useState<"command" | "http_webhook">(
@@ -272,7 +279,9 @@ function HookEditorModal({
     editing?.action.type === "command" ? editing.action.args.join("\n") : "",
   );
   const [envText, setEnvText] = useState(() =>
-    editing?.action.type === "command" ? serializeKeyValueLines(editing.action.env, "=") : "",
+    editing?.action.type === "command"
+      ? serializeKeyValueLines(editing.action.env, "=")
+      : "",
   );
   const [webhookUrl, setWebhookUrl] = useState(() =>
     editing?.action.type === "http_webhook" ? editing.action.url : "",
@@ -288,41 +297,16 @@ function HookEditorModal({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const busy = saving || deleting;
-
-  const scopeOptions: SettingSelectOption<HookScope>[] = useMemo(
-    () => [
-      {
-        value: "user_global",
-        label: "User (~/.orbit/hooks.json)",
-        description: "Global across all workspaces on this host",
-      },
-      {
-        value: "project_orbit",
-        label: "Project (.orbit/hooks.json)",
-        description: "Scoped to the selected workspace (requires trust)",
-        disabled: !hasProjectCwd,
-      },
-    ],
-    [hasProjectCwd],
-  );
-
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.isComposing || e.keyCode === 229) return;
-      if (e.key === "Escape" && !busy) {
-        e.preventDefault();
-        onClose();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [busy, onClose]);
+  const canSubmit =
+    Boolean(name.trim()) &&
+    (actionKind === "command" ? Boolean(command.trim()) : Boolean(webhookUrl.trim()));
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (busy) return;
     const cleanName = name.trim();
     if (!cleanName) {
-      setError("Hook name is required.");
+      setError(t("devTools.requireName"));
       return;
     }
 
@@ -335,7 +319,7 @@ function HookEditorModal({
     if (actionKind === "command") {
       const cleanCmd = command.trim();
       if (!cleanCmd) {
-        setError("Executable command is required.");
+        setError(t("devTools.requireCommand"));
         return;
       }
       const args = argsText
@@ -344,7 +328,7 @@ function HookEditorModal({
         .filter((line) => line.length > 0);
       const parsedEnv = parseKeyValueLines(envText, "=");
       if (parsedEnv.invalidLine) {
-        setError(`Invalid env var line (expected KEY=VALUE): ${parsedEnv.invalidLine}`);
+        setError(t("devTools.requireEnvLines"));
         return;
       }
       action = {
@@ -356,12 +340,12 @@ function HookEditorModal({
     } else {
       const cleanUrl = webhookUrl.trim();
       if (!cleanUrl) {
-        setError("Webhook URL is required.");
+        setError(t("devTools.requireHttp"));
         return;
       }
       const parsedHeaders = parseKeyValueLines(headersText, ":");
       if (parsedHeaders.invalidLine) {
-        setError(`Invalid header line (expected Header: Value): ${parsedHeaders.invalidLine}`);
+        setError(t("devTools.requireHeaderLines"));
         return;
       }
       action = {
@@ -412,361 +396,311 @@ function HookEditorModal({
   };
 
   return (
-    <Dialog
-      open
-      onOpenChange={(nextOpen) => {
-        if (!nextOpen && !busy) onClose();
+    <SettingDrawer
+      open={open}
+      onOpenChangeComplete={(visible) => {
+        if (!visible) onClosed();
       }}
+      onOpenChange={(open) => {
+        if (!open && !busy) onClose();
+      }}
+      title={
+        editing
+          ? t("hooks.editHookTitle", { name: editing.name })
+          : t("hooks.addHookTitle")
+      }
+      description={
+        scope === "project_orbit" ? t("devTools.project") : t("devTools.global")
+      }
     >
-      <DialogContent
-        closeDisabled={busy}
-        className="flex max-h-[88vh] max-w-[540px] flex-col gap-0 p-0"
+      <form
+        onSubmit={(e) => void handleSubmit(e)}
+        className="flex flex-col gap-[16px]"
       >
-        <DialogHeader className="px-5 pt-5 pr-12 pb-4">
-          <DialogTitle>
-            {editing ? t("hooks.editHookTitle", { name: editing.name }) : t("hooks.addHookTitle")}
-          </DialogTitle>
-          <DialogDescription>{t(eventMeta(event).hintKey)}</DialogDescription>
-        </DialogHeader>
+        <Field>
+          <FieldLabel htmlFor="hook-name">{t("devTools.name")}</FieldLabel>
+          <Input
+            type="text"
+            value={name}
+            disabled={busy}
+            onChange={(e) => setName(e.target.value)}
+            id="hook-name"
+            placeholder="rustfmt"
+          />
+        </Field>
 
-        <form
-          onSubmit={(e) => void handleSubmit(e)}
-          className="orbit-native-scroll flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto overscroll-contain px-5 pb-5"
-        >
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <Field>
-              <FieldLabel>Name</FieldLabel>
-              <Input
-                type="text"
-                value={name}
-                disabled={busy}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="Format Rust files"
-              />
-            </Field>
-
-            <Field>
-              <FieldLabel>Scope</FieldLabel>
-              <SettingSelect
-                value={scope}
-                options={scopeOptions}
-                disabled={Boolean(editing) || busy}
-                onChange={setScope}
-                triggerClassName="h-[32px] w-full"
-              />
-            </Field>
-          </div>
-
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <Field>
-              <FieldLabel>Event</FieldLabel>
-              <SettingSelect
-                value={event}
-                options={eventOptions}
-                disabled={busy}
-                onChange={setEvent}
-                triggerClassName="h-[32px] w-full"
-              />
-            </Field>
-
-            <Field>
-              <FieldLabel htmlFor="hook-timeout">Timeout (ms, max 30000)</FieldLabel>
-              <Input
-                id="hook-timeout"
-                type="number"
-                min={100}
-                max={MAX_TIMEOUT_MS}
-                step={500}
-                value={timeoutMs}
-                disabled={busy}
-                onChange={(e) => setTimeoutMs(e.target.value)}
-                className="font-mono"
-              />
-            </Field>
-          </div>
-
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <Field>
-              <FieldLabel htmlFor="hook-matcher">
-                Matcher <span className="font-normal opacity-70">(optional)</span>
-              </FieldLabel>
-              <Input
-                id="hook-matcher"
-                type="text"
-                value={matcher}
-                disabled={busy}
-                onChange={(e) => setMatcher(e.target.value)}
-                placeholder={eventMeta(event).matcherPlaceholder}
-                className="font-mono text-[12px]"
-              />
-            </Field>
-
-            <Field>
-              <FieldLabel htmlFor="hook-description">
-                Description <span className="font-normal opacity-70">(optional)</span>
-              </FieldLabel>
-              <Input
-                id="hook-description"
-                type="text"
-                value={description}
-                disabled={busy}
-                onChange={(e) => setDescription(e.target.value)}
-                placeholder="Short summary"
-              />
-            </Field>
-          </div>
-
-          {/* Action Kind Switcher */}
-          <FieldGroup className="gap-2.5">
-            <div className="flex items-center justify-between gap-2">
-              <FieldLabel>Action</FieldLabel>
-              <Tabs
-                value={actionKind}
-                onValueChange={(v) => setActionKind(v as "command" | "http_webhook")}
-              >
-                <TabsList className="h-[28px]">
-                  <TabsTrigger value="command" disabled={busy} className="gap-1.5 text-[11.5px]">
-                    <Terminal className="h-[11.5px] w-[11.5px]" />
-                    Command
-                  </TabsTrigger>
-                  <TabsTrigger
-                    value="http_webhook"
-                    disabled={busy}
-                    className="gap-1.5 text-[11.5px]"
-                  >
-                    <Globe className="h-[11.5px] w-[11.5px]" />
-                    HTTP Webhook
-                  </TabsTrigger>
-                </TabsList>
-              </Tabs>
-            </div>
-
-            {actionKind === "command" ? (
-              <FieldGroup className="gap-2.5">
-                <Field>
-                  <FieldLabel htmlFor="hook-command" className="text-[11.5px]">
-                    Executable (spawned directly, no shell)
-                  </FieldLabel>
-                  <Input
-                    id="hook-command"
-                    type="text"
-                    value={command}
-                    disabled={busy}
-                    onChange={(e) => setCommand(e.target.value)}
-                    placeholder="rustfmt"
-                    className="font-mono text-[12px]"
-                  />
-                </Field>
-                <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
-                  <Field>
-                    <FieldLabel htmlFor="hook-args" className="text-[11.5px]">
-                      Arguments <span className="font-normal opacity-70">(one per line)</span>
-                    </FieldLabel>
-                    <Textarea
-                      id="hook-args"
-                      rows={3}
-                      value={argsText}
-                      disabled={busy}
-                      onChange={(e) => setArgsText(e.target.value)}
-                      placeholder={"--edition\n2024"}
-                      className="min-h-[72px] resize-none px-2.5 py-1.5 font-mono text-[11.5px]"
-                    />
-                  </Field>
-                  <Field>
-                    <FieldLabel htmlFor="hook-env" className="text-[11.5px]">
-                      Env Vars <span className="font-normal opacity-70">(KEY=VALUE)</span>
-                    </FieldLabel>
-                    <Textarea
-                      id="hook-env"
-                      rows={3}
-                      value={envText}
-                      disabled={busy}
-                      onChange={(e) => setEnvText(e.target.value)}
-                      placeholder={"RUST_LOG=warn"}
-                      className="min-h-[72px] resize-none px-2.5 py-1.5 font-mono text-[11.5px]"
-                    />
-                  </Field>
-                </div>
-                <FieldDescription className="text-[11px]">
-                  {t("hooks.commandStdinHint")}
-                  {editing && hasMaskedValues(envText)
-                    ? " Leave masked •••• values unchanged to preserve stored secrets."
-                    : ""}
-                </FieldDescription>
-              </FieldGroup>
-            ) : (
-              <FieldGroup className="gap-2.5">
-                <Field>
-                  <FieldLabel htmlFor="hook-webhook-url" className="text-[11.5px]">
-                    Webhook URL
-                  </FieldLabel>
-                  <Input
-                    id="hook-webhook-url"
-                    type="url"
-                    value={webhookUrl}
-                    disabled={busy}
-                    onChange={(e) => setWebhookUrl(e.target.value)}
-                    placeholder="https://hooks.example.com/orbit"
-                    className="font-mono text-[12px]"
-                  />
-                </Field>
-                <Field>
-                  <FieldLabel htmlFor="hook-headers" className="text-[11.5px]">
-                    Headers <span className="font-normal opacity-70">(Header: Value per line)</span>
-                  </FieldLabel>
-                  <Textarea
-                    id="hook-headers"
-                    rows={3}
-                    value={headersText}
-                    disabled={busy}
-                    onChange={(e) => setHeadersText(e.target.value)}
-                    placeholder={"Authorization: Bearer …"}
-                    className="min-h-[72px] resize-none px-2.5 py-1.5 font-mono text-[11.5px]"
-                  />
-                  {editing && hasMaskedValues(headersText) && (
-                    <FieldDescription className="text-[11px]">
-                      Leave masked •••• values unchanged to preserve stored secrets.
-                    </FieldDescription>
-                  )}
-                </Field>
-              </FieldGroup>
-            )}
-          </FieldGroup>
-
-          <Field orientation="horizontal" className="pt-0.5">
-            <FieldLabel className="text-ink-primary text-[12.5px]">Enabled</FieldLabel>
-            <ToggleSwitch
-              checked={enabled}
-              onChange={setEnabled}
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <Field>
+            <FieldLabel>{t("devTools.event")}</FieldLabel>
+            <SettingSelect
+              ariaLabel={t("devTools.event")}
+              value={event}
+              options={eventOptions}
               disabled={busy}
-              ariaLabel="Enable hook"
+              onChange={setEvent}
+              triggerClassName="h-[32px] w-full"
             />
           </Field>
 
-          {error && (
-            <div className="rounded-lg border border-rose-500/25 bg-rose-500/[0.07] px-3 py-2 text-[12px] text-rose-700 dark:text-rose-300">
-              {error}
-            </div>
-          )}
+          <Field>
+            <FieldLabel htmlFor="hook-timeout">
+              {t("devTools.timeout")}
+            </FieldLabel>
+            <Input
+              id="hook-timeout"
+              type="number"
+              min={100}
+              max={MAX_TIMEOUT_MS}
+              step={1}
+              value={timeoutMs}
+              disabled={busy}
+              onChange={(e) => setTimeoutMs(e.target.value)}
+              className="font-mono"
+            />
+          </Field>
+        </div>
 
-          <div className="border-border/70 mt-1 flex items-center justify-between gap-2 border-t pt-3">
-            <div>
-              {editing && !confirmDelete && (
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <Field>
+            <FieldLabel htmlFor="hook-matcher">
+              {t("devTools.matcher")}
+            </FieldLabel>
+            <Input
+              id="hook-matcher"
+              type="text"
+              value={matcher}
+              disabled={busy}
+              onChange={(e) => setMatcher(e.target.value)}
+              placeholder={eventMeta(event).matcherPlaceholder}
+              className="font-mono text-[13px]"
+            />
+          </Field>
+
+          <Field>
+            <FieldLabel htmlFor="hook-description">
+              {t("devTools.summary")}
+            </FieldLabel>
+            <Input
+              id="hook-description"
+              type="text"
+              value={description}
+              disabled={busy}
+              onChange={(e) => setDescription(e.target.value)}
+            />
+          </Field>
+        </div>
+
+        {/* Action Kind Switcher */}
+        <FieldGroup className="gap-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <FieldLabel>{t("devTools.action")}</FieldLabel>
+            <SettingSelect
+              ariaLabel={t("devTools.action")}
+              value={actionKind}
+              options={[
+                { value: "command", label: t("devTools.command") },
+                { value: "http_webhook", label: "HTTP Webhook" },
+              ]}
+              onChange={setActionKind}
+              disabled={busy}
+            />
+          </div>
+
+          {actionKind === "command" ? (
+            <FieldGroup className="gap-2.5">
+              <Field>
+                <FieldLabel htmlFor="hook-command" className="text-[11px]">
+                  {t("devTools.executable")}
+                </FieldLabel>
+                <Input
+                  id="hook-command"
+                  type="text"
+                  value={command}
+                  disabled={busy}
+                  onChange={(e) => setCommand(e.target.value)}
+                  placeholder="rustfmt"
+                  className="font-mono text-[13px]"
+                />
+              </Field>
+              <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                <Field>
+                  <FieldLabel htmlFor="hook-args" className="text-[11px]">
+                    {t("devTools.argsLines")}
+                  </FieldLabel>
+                  <Textarea
+                    id="hook-args"
+                    rows={3}
+                    value={argsText}
+                    disabled={busy}
+                    onChange={(e) => setArgsText(e.target.value)}
+                    placeholder={"--edition\n2024"}
+                    className="min-h-[72px] resize-none px-2.5 py-1.5 font-mono text-[11px]"
+                  />
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="hook-env" className="text-[11px]">
+                    {t("devTools.envLines")}
+                  </FieldLabel>
+                  <Textarea
+                    id="hook-env"
+                    rows={3}
+                    value={envText}
+                    disabled={busy}
+                    onChange={(e) => setEnvText(e.target.value)}
+                    placeholder={"RUST_LOG=warn"}
+                    className="min-h-[72px] resize-none px-2.5 py-1.5 font-mono text-[11px]"
+                  />
+                </Field>
+              </div>
+              <FieldDescription className="text-[11px]">
+                {t("hooks.commandStdinHint")}
+                {editing && hasMaskedValues(envText)
+                  ? ` ${t("devTools.keepMasked")}`
+                  : ""}
+              </FieldDescription>
+            </FieldGroup>
+          ) : (
+            <FieldGroup className="gap-2.5">
+              <Field>
+                <FieldLabel htmlFor="hook-webhook-url" className="text-[11px]">
+                  {t("devTools.endpoint")}
+                </FieldLabel>
+                <Input
+                  id="hook-webhook-url"
+                  type="url"
+                  value={webhookUrl}
+                  disabled={busy}
+                  onChange={(e) => setWebhookUrl(e.target.value)}
+                  placeholder="https://hooks.example.com/orbit"
+                  className="font-mono text-[13px]"
+                />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="hook-headers" className="text-[11px]">
+                  {t("devTools.headerLines")}
+                </FieldLabel>
+                <Textarea
+                  id="hook-headers"
+                  rows={3}
+                  value={headersText}
+                  disabled={busy}
+                  onChange={(e) => setHeadersText(e.target.value)}
+                  placeholder={"Authorization: Bearer …"}
+                  className="min-h-[72px] resize-none px-2.5 py-1.5 font-mono text-[11px]"
+                />
+                {editing && hasMaskedValues(headersText) && (
+                  <FieldDescription className="text-[11px]">
+                    {t("devTools.keepMasked")}
+                  </FieldDescription>
+                )}
+              </Field>
+            </FieldGroup>
+          )}
+        </FieldGroup>
+
+        <Field orientation="horizontal" className="pt-0.5">
+          <FieldLabel className="text-ink-primary text-[13px]">
+            {t("devTools.enabled")}
+          </FieldLabel>
+          <ToggleSwitch
+            checked={enabled}
+            onChange={setEnabled}
+            disabled={busy}
+            ariaLabel={t("devTools.enabled")}
+          />
+        </Field>
+
+        {error && (
+          <div className="rounded-lg border border-signal-danger-border bg-signal-danger-bg px-3 py-2 text-[13px] text-signal-danger">
+            {error}
+          </div>
+        )}
+
+        <div className="border-border-subtle/70 mt-1 flex items-center justify-between gap-2 border-t pt-3">
+          <div>
+            {editing && !confirmDelete && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                disabled={busy}
+                onClick={() => setConfirmDelete(true)}
+                className="text-ink-muted hover:text-signal-danger"
+              >
+                <Trash2 className="h-[13px] w-[13px]" />
+                {t("common.delete")}
+              </Button>
+            )}
+            {editing && confirmDelete && (
+              <div className="flex items-center gap-1.5">
+                <Button
+                  type="button"
+                  variant="destructive"
+                  size="xs"
+                  disabled={busy}
+                  onClick={() => void handleDelete()}
+                >
+                  {deleting && (
+                    <Loader2 className="h-[12px] w-[12px] animate-spin" />
+                  )}
+                  {t("common.delete")}
+                </Button>
                 <Button
                   type="button"
                   variant="ghost"
-                  size="sm"
+                  size="xs"
                   disabled={busy}
-                  onClick={() => setConfirmDelete(true)}
-                  className="text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400"
+                  onClick={() => setConfirmDelete(false)}
                 >
-                  <Trash2 className="h-[13px] w-[13px]" />
-                  Delete
+                  {t("common.cancel")}
                 </Button>
-              )}
-              {editing && confirmDelete && (
-                <div className="flex items-center gap-1.5">
-                  <Button
-                    type="button"
-                    variant="destructive"
-                    size="xs"
-                    disabled={busy}
-                    onClick={() => void handleDelete()}
-                  >
-                    {deleting && <Loader2 className="h-[11.5px] w-[11.5px] animate-spin" />}
-                    Delete
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="xs"
-                    disabled={busy}
-                    onClick={() => setConfirmDelete(false)}
-                  >
-                    Cancel
-                  </Button>
-                </div>
-              )}
-            </div>
-
-            <div className="flex items-center gap-2">
-              <Button type="button" variant="outline" size="sm" disabled={busy} onClick={onClose}>
-                Cancel
-              </Button>
-              <Button type="submit" size="sm" disabled={busy}>
-                {saving && <Loader2 className="h-[12px] w-[12px] animate-spin" />}
-                {editing ? "Save" : "Add Hook"}
-              </Button>
-            </div>
+              </div>
+            )}
           </div>
-        </form>
-      </DialogContent>
-    </Dialog>
+
+          <div className="flex items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={busy}
+              onClick={onClose}
+            >
+              {t("common.cancel")}
+            </Button>
+            <Button type="submit" size="sm" disabled={busy || !canSubmit}>
+              {saving && <Loader2 className="h-[12px] w-[12px] animate-spin" />}
+              {editing ? t("common.save") : t("hooks.addHook")}
+            </Button>
+          </div>
+        </div>
+      </form>
+    </SettingDrawer>
   );
 }
 
-export function HostHooksSection({ hostId }: { hostId: string }) {
+export const HostHooksSection = memo(function HostHooksSection({
+  hostId,
+  workspaceCwd: effectiveCwd = null,
+}: {
+  hostId: string;
+  workspaceCwd?: string | null;
+}) {
   const { t } = useI18n();
-  const hostCard = useOrbitSelector(
-    (s) => s.fleet.hosts.find((h) => h.host_id === hostId) ?? null,
-  );
-  const hostDetail = useOrbitSelector((s) => s.hostDetails[hostId] ?? null);
-  const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
-  const selectedWorkspaceCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
-
-  const workspaces = useMemo(() => {
-    const seen = new Set<string>();
-    const list: Array<{ cwd: string; label: string }> = [];
-    if (selectedHostId === hostId && selectedWorkspaceCwd && selectedWorkspaceCwd !== "~") {
-      seen.add(selectedWorkspaceCwd);
-      list.push({
-        cwd: selectedWorkspaceCwd,
-        label: formatWorkspaceShortName(selectedWorkspaceCwd),
-      });
-    }
-    for (const ws of hostDetail?.workspaces ?? []) {
-      if (!ws.cwd || ws.cwd === "~" || ws.archived_at || seen.has(ws.cwd)) continue;
-      seen.add(ws.cwd);
-      list.push({
-        cwd: ws.cwd,
-        label: ws.title || formatWorkspaceShortName(ws.cwd),
-      });
-    }
-    for (const proj of hostDetail?.discovered_projects ?? []) {
-      if (!proj.path || proj.path === "~" || seen.has(proj.path)) continue;
-      seen.add(proj.path);
-      list.push({
-        cwd: proj.path,
-        label: proj.name || formatWorkspaceShortName(proj.path),
-      });
-    }
-    return list;
-  }, [hostDetail, hostId, selectedHostId, selectedWorkspaceCwd]);
-
-  const [pickedCwd, setPickedCwd] = useState<string>(() => workspaces[0]?.cwd ?? "");
-
-  useEffect(() => {
-    if (workspaces.length === 0) {
-      if (pickedCwd) setPickedCwd("");
-    } else if (pickedCwd && !workspaces.some((w) => w.cwd === pickedCwd)) {
-      setPickedCwd(workspaces[0].cwd);
-    }
-  }, [pickedCwd, workspaces]);
-
-  const effectiveCwd = pickedCwd || null;
+  const isOnline = useHostIsOnline(hostId);
   const scopeKey = `${hostId}::${effectiveCwd ?? "__global__"}`;
-  const entry = useOrbitSelector((s) => s.lifecycleHooksByScope[scopeKey] ?? null);
+  const entry = useOrbitSelector(
+    (s) => s.lifecycleHooksByScope[scopeKey] ?? null,
+  );
   const hooks = entry?.hooks ?? EMPTY_HOOKS;
   const recentExecutions = entry?.recentExecutions ?? EMPTY_EXECUTIONS;
   const projectTrusted = entry?.projectHooksTrusted ?? false;
   const isLoading = entry?.status === "loading";
 
-  const isOnline =
-    hostCard?.connection_state === "online_direct" ||
-    hostCard?.connection_state === "online_relay";
-
-  const [modalOpen, setModalOpen] = useState(false);
-  const [editingRule, setEditingRule] = useState<LifecycleHookRule | null>(null);
+  const [editor, setEditor] = useState<{
+    open: boolean;
+    rule: LifecycleHookRule | null;
+  } | null>(null);
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [trustBusy, setTrustBusy] = useState(false);
@@ -787,11 +721,13 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
     () => hooks.filter((h) => h.scope === "project_orbit"),
     [hooks],
   );
-  const hasUntrustedProjectHooks = Boolean(effectiveCwd) && projectHooks.length > 0 && !projectTrusted;
+  const hasUntrustedProjectHooks =
+    Boolean(effectiveCwd) && projectHooks.length > 0 && !projectTrusted;
 
   const groupedByEvent = useMemo(() => {
     const map = new Map<HookEventKind, LifecycleHookRule[]>();
     for (const h of hooks) {
+      if ((h.scope === "project_orbit") !== Boolean(effectiveCwd)) continue;
       const list = map.get(h.event) ?? [];
       list.push(h);
       map.set(h.event, list);
@@ -800,7 +736,7 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
       event: ev,
       rules: map.get(ev.id) ?? [],
     })).filter((g) => g.rules.length > 0);
-  }, [hooks]);
+  }, [hooks, effectiveCwd]);
 
   const handleToggle = async (rule: LifecycleHookRule, next: boolean) => {
     if (togglingId) return;
@@ -825,7 +761,12 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
     setTestingId(scopedId);
     try {
       const sample = eventMeta(rule.event).samplePayload;
-      await orbitActions.testLifecycleHook(hostId, effectiveCwd, scopedId, sample);
+      await orbitActions.testLifecycleHook(
+        hostId,
+        effectiveCwd,
+        scopedId,
+        sample,
+      );
       setRunsExpanded(true);
     } catch (err) {
       setActionError(err instanceof Error ? err.message : String(err));
@@ -847,115 +788,55 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
     }
   };
 
-  const activeWorkspace = workspaces.find((w) => w.cwd === pickedCwd) ?? null;
-
   return (
-    <div className="space-y-5">
-      <SettingSectionHeader
-        title={t("hooks.title")}
-        description={t("hooks.description")}
+    <section data-setting-id="hooks.title" className="space-y-2">
+      <SettingGroupLabel
         action={
-          isOnline ? (
-            <div className="flex items-center gap-1.5">
-              <button
-                type="button"
-                disabled={isLoading}
-                onClick={refresh}
-                aria-label={t("hooks.refreshAria")}
-                className="border-border bg-background hover:bg-accent text-foreground inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-lg border transition-colors disabled:opacity-50"
-              >
-                <RefreshCw className={cn("h-[12.5px] w-[12.5px]", isLoading && "animate-spin")} />
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setEditingRule(null);
-                  setModalOpen(true);
-                }}
-                className="bg-foreground text-background hover:opacity-90 inline-flex h-[28px] cursor-pointer items-center gap-1 rounded-lg px-2.5 text-[12px] font-medium transition-opacity"
-              >
-                <Plus className="h-[13px] w-[13px]" />
-                {t("hooks.addHook")}
-              </button>
-            </div>
-          ) : undefined
+          <div className="flex items-center gap-2">
+            <IconButton
+              disabled={isLoading || !isOnline}
+              tooltip={t("hooks.refreshAria")}
+              onClick={refresh}
+            >
+              <RefreshCw className={cn(isLoading && "animate-spin")} />
+            </IconButton>
+            <Button
+              data-setting-id="hooks.addHook"
+              disabled={!isOnline}
+              size="sm"
+              variant="outline"
+              className="text-[13px]"
+              onClick={() => {
+                setEditor({ open: true, rule: null });
+              }}
+            >
+              <Plus /> {t("hooks.addHook")}
+            </Button>
+          </div>
         }
-      />
+      >
+        {t("hooks.title")}
+      </SettingGroupLabel>
 
       {!isOnline ? (
         <SettingCard>
-          <div className="text-muted-foreground px-4 py-6 text-center text-[13px]">
+          <div className="text-ink-muted px-4 py-6 text-center text-[13px]">
             {t("hooks.offline")}
           </div>
         </SettingCard>
       ) : (
         <>
-          {/* Scope Picker */}
-          <div className="flex items-center justify-between gap-3">
-            <span className="text-muted-foreground text-[12px] font-medium">Scope</span>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <button
-                  type="button"
-                  className="border-border bg-background hover:bg-accent text-foreground inline-flex h-[30px] max-w-[360px] cursor-pointer items-center gap-2 rounded-lg border px-2.5 text-[12.5px] transition-colors outline-none"
-                >
-                  <span className="truncate font-medium">
-                    {activeWorkspace ? activeWorkspace.label : "User Global only"}
-                  </span>
-                  {pickedCwd && (
-                    <span className="text-muted-foreground/75 truncate font-mono text-[11px]">
-                      {pickedCwd}
-                    </span>
-                  )}
-                  <ChevronsUpDown className="text-muted-foreground h-[12.5px] w-[12.5px] shrink-0" />
-                </button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="max-h-[260px] w-[340px] overflow-auto p-1">
-                <DropdownMenuItem
-                  onSelect={() => setPickedCwd("")}
-                  className="flex items-center justify-between gap-2 py-1.5"
-                >
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate text-[12.5px] font-medium">
-                      User Global only
-                    </span>
-                    <span className="text-muted-foreground block truncate font-mono text-[10.5px]">
-                      ~/.orbit/hooks.json
-                    </span>
-                  </span>
-                  {pickedCwd === "" && <Check className="h-[13px] w-[13px] shrink-0" />}
-                </DropdownMenuItem>
-                {workspaces.map((ws) => (
-                  <DropdownMenuItem
-                    key={ws.cwd}
-                    onSelect={() => setPickedCwd(ws.cwd)}
-                    className="flex items-center justify-between gap-2 py-1.5"
-                  >
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-[12.5px] font-medium">{ws.label}</span>
-                      <span className="text-muted-foreground block truncate font-mono text-[10.5px]">
-                        {ws.cwd}
-                      </span>
-                    </span>
-                    {ws.cwd === pickedCwd && <Check className="h-[13px] w-[13px] shrink-0" />}
-                  </DropdownMenuItem>
-                ))}
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </div>
-
           {/* Project Trust Banner */}
           {hasUntrustedProjectHooks && (
-            <div className="flex items-center justify-between gap-3 rounded-[12px] border border-amber-500/30 bg-amber-500/[0.07] px-3.5 py-2.5">
+            <div className="flex items-center justify-between gap-3 rounded-[12px] border border-signal-warning-border bg-signal-warning-bg px-3.5 py-2.5">
               <div className="flex min-w-0 items-start gap-2.5">
-                <ShieldAlert className="mt-0.5 h-[15px] w-[15px] shrink-0 text-amber-600 dark:text-amber-400" />
+                <ShieldAlert className="mt-0.5 h-[15px] w-[15px] shrink-0 text-signal-warning" />
                 <div className="min-w-0">
-                  <div className="text-foreground text-[12.5px] font-medium">
-                    Untrusted project hooks in{" "}
-                    <code className="font-mono text-[11.5px]">.orbit/hooks.json</code>
+                  <div className="text-ink-primary text-[13px] font-medium">
+                    {t("devTools.untrusted")} · .orbit/hooks.json
                   </div>
-                  <p className="text-muted-foreground text-[11.5px] leading-snug">
-                    Repository hooks will not run until you approve their current SHA-256 digest.
+                  <p className="text-ink-muted text-[11px] leading-snug">
+                    {t("devTools.trustHint")}
                   </p>
                 </div>
               </div>
@@ -963,36 +844,37 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
                 type="button"
                 disabled={trustBusy}
                 onClick={() => void handleTrustChange(true)}
-                className="inline-flex h-[28px] shrink-0 cursor-pointer items-center gap-1.5 rounded-lg bg-amber-600 px-2.5 text-[11.5px] font-medium text-white hover:bg-amber-700 disabled:opacity-50"
+                className="inline-flex h-[28px] shrink-0 cursor-pointer items-center gap-1.5 rounded-lg bg-action-primary-bg px-2.5 text-[11px] font-medium text-action-primary-fg hover:bg-action-primary-hover disabled:opacity-50"
               >
-                {trustBusy && <Loader2 className="h-[11.5px] w-[11.5px] animate-spin" />}
-                Trust Project
+                {trustBusy && (
+                  <Loader2 className="h-[12px] w-[12px] animate-spin" />
+                )}
+                {t("devTools.trustHooks")}
               </button>
             </div>
           )}
 
-          {Boolean(effectiveCwd) && projectHooks.length > 0 && projectTrusted && (
-            <div className="border-border/80 bg-background/50 flex items-center justify-between gap-3 rounded-[11px] border px-3.5 py-2">
-              <div className="text-muted-foreground flex min-w-0 items-center gap-2 text-[12px]">
-                <ShieldCheck className="h-[14px] w-[14px] shrink-0 text-emerald-600 dark:text-emerald-400" />
-                <span className="truncate">
-                  Project <code className="font-mono text-[11px]">.orbit/hooks.json</code> is
-                  trusted (SHA-256 verified)
-                </span>
+          {Boolean(effectiveCwd) &&
+            projectHooks.length > 0 &&
+            projectTrusted && (
+              <div className="border-border-subtle/80 bg-surface-raised/50 flex items-center justify-between gap-3 rounded-[11px] border px-3.5 py-2">
+                <div className="text-ink-muted flex min-w-0 items-center gap-2 text-[13px]">
+                  <ShieldCheck className="h-[14px] w-[14px] shrink-0 text-signal-success" />
+                  <span className="truncate">{t("devTools.trusted")}</span>
+                </div>
+                <button
+                  type="button"
+                  disabled={trustBusy}
+                  onClick={() => void handleTrustChange(false)}
+                  className="text-ink-muted hover:text-ink-primary shrink-0 cursor-pointer text-[11px] font-medium transition-colors disabled:opacity-50"
+                >
+                  {t("permissionRules.revokeAction")}
+                </button>
               </div>
-              <button
-                type="button"
-                disabled={trustBusy}
-                onClick={() => void handleTrustChange(false)}
-                className="text-muted-foreground hover:text-foreground shrink-0 cursor-pointer text-[11.5px] font-medium transition-colors disabled:opacity-50"
-              >
-                Revoke
-              </button>
-            </div>
-          )}
+            )}
 
           {(actionError || (entry?.status === "error" && entry.error)) && (
-            <div className="rounded-lg border border-rose-500/25 bg-rose-500/[0.07] px-3 py-2 text-[12px] text-rose-700 dark:text-rose-300">
+            <div className="rounded-lg border border-signal-danger-border bg-signal-danger-bg px-3 py-2 text-[13px] text-signal-danger">
               {actionError ?? entry?.error}
             </div>
           )}
@@ -1000,7 +882,7 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
           {/* Event-Grouped Hook List */}
           {isLoading && hooks.length === 0 ? (
             <SettingCard>
-              <div className="text-muted-foreground flex items-center justify-center gap-2 px-4 py-8 text-[12.5px]">
+              <div className="text-ink-muted flex items-center justify-center gap-2 px-4 py-8 text-[13px]">
                 <Loader2 className="h-[14px] w-[14px] animate-spin" />
                 <span>{t("hooks.loading")}</span>
               </div>
@@ -1008,18 +890,7 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
           ) : groupedByEvent.length === 0 ? (
             <SettingCard>
               <div className="flex flex-col items-center gap-2 px-4 py-8 text-center">
-                <p className="text-muted-foreground text-[12.5px]">{t("hooks.empty")}</p>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setEditingRule(null);
-                    setModalOpen(true);
-                  }}
-                  className="border-border bg-background hover:bg-accent text-foreground inline-flex h-[28px] cursor-pointer items-center gap-1 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
-                >
-                  <Plus className="h-[12.5px] w-[12.5px]" />
-                  {t("hooks.addHook")}
-                </button>
+                <p className="text-ink-muted text-[13px]">{t("hooks.empty")}</p>
               </div>
             </SettingCard>
           ) : (
@@ -1028,7 +899,9 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
                 <div key={event.id} className="space-y-1.5">
                   <SettingGroupLabel>
                     {t(event.labelKey)}{" "}
-                    <span className="font-normal opacity-70">· {rules.length}</span>
+                    <span className="font-normal opacity-70">
+                      · {rules.length}
+                    </span>
                   </SettingGroupLabel>
                   <SettingCard>
                     {rules.map((rule) => {
@@ -1036,85 +909,66 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
                       const untrusted = isProject && !rule.trusted;
                       const scopedKey = `${rule.scope}:${rule.id}`;
                       const isTesting = testingId === scopedKey;
-                      const isToggling = togglingId === scopedKey;
+                      const isToggling = Boolean(togglingId);
                       return (
-                        <div
+                        <SettingResourceRow
                           key={scopedKey}
-                          className="flex items-center justify-between gap-3 px-4 py-2.5"
-                        >
-                          <div className="min-w-0 flex-1">
-                            <div className="flex flex-wrap items-center gap-1.5">
-                              <span className="text-foreground truncate text-[13px] font-medium">
-                                {rule.name}
-                              </span>
-                              <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-[10.5px] font-medium">
-                                {isProject ? "Project" : "User"}
-                              </span>
-                              {untrusted && (
-                                <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10.5px] font-medium text-amber-700 dark:text-amber-300">
-                                  Untrusted
-                                </span>
-                              )}
-                              {rule.matcher && (
-                                <span className="border-border text-muted-foreground max-w-[160px] truncate rounded border px-1.5 py-0.5 font-mono text-[10px]">
-                                  {rule.matcher}
-                                </span>
-                              )}
-                            </div>
-                            <div className="text-muted-foreground mt-0.5 flex items-center gap-1.5 truncate text-[11.5px]">
-                              {rule.action.type === "command" ? (
-                                <Terminal className="h-[11px] w-[11px] shrink-0 opacity-70" />
-                              ) : (
-                                <Globe className="h-[11px] w-[11px] shrink-0 opacity-70" />
-                              )}
-                              <span className="truncate font-mono text-[11px]">
-                                {formatActionPreview(rule.action)}
-                              </span>
-                              <span className="opacity-40">·</span>
-                              <span className="shrink-0 tabular-nums opacity-75">
-                                {formatTimeoutLabel(rule.timeout_ms)}
-                              </span>
-                            </div>
-                          </div>
-
-                          <div className="flex shrink-0 items-center gap-1.5">
-                            <button
-                              type="button"
-                              disabled={untrusted || Boolean(testingId)}
-                              title={
-                                untrusted
-                                  ? "Trust project hooks before testing"
-                                  : `Dry-run ${rule.name}`
-                              }
-                              onClick={() => void handleTest(rule)}
-                              className="border-border bg-background hover:bg-accent text-foreground inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md border px-2 text-[11.5px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-45"
+                          title={rule.name}
+                          icon={
+                            rule.action.type === "command" ? (
+                              <Terminal />
+                            ) : (
+                              <Globe />
+                            )
+                          }
+                          description={
+                            <span className="font-mono">
+                              {formatActionPreview(rule.action)}
+                            </span>
+                          }
+                          status={
+                            <span
+                              className="block max-w-[160px] truncate"
+                              title={rule.matcher ?? undefined}
                             >
-                              {isTesting ? (
-                                <Loader2 className="h-[11px] w-[11px] animate-spin" />
-                              ) : (
-                                <Play className="h-[10.5px] w-[10.5px]" />
-                              )}
-                              Test
-                            </button>
-                            <button
-                              type="button"
-                              aria-label={`Edit ${rule.name}`}
-                              onClick={() => {
-                                setEditingRule(rule);
-                                setModalOpen(true);
-                              }}
-                              className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-md transition-colors"
-                            >
-                              <Pencil className="h-[12px] w-[12px]" />
-                            </button>
-                            <ToggleSwitch
-                              checked={rule.enabled}
-                              disabled={isToggling}
-                              ariaLabel={`Toggle ${rule.name}`}
-                              onChange={(next) => void handleToggle(rule, next)}
-                            />
-                          </div>
-                        </div>
+                              {[
+                                rule.matcher,
+                                formatTimeoutLabel(rule.timeout_ms),
+                                untrusted ? t("devTools.untrusted") : null,
+                              ]
+                                .filter(Boolean)
+                                .join(" · ")}
+                            </span>
+                          }
+                          onClick={() => {
+                            setEditor({ open: true, rule });
+                          }}
+                          action={
+                            <div className="flex items-center gap-2">
+                              <IconButton
+                                tooltip={t("devTools.test")}
+                                disabled={untrusted || Boolean(testingId)}
+                                onClick={() => void handleTest(rule)}
+                              >
+                                {isTesting ? (
+                                  <Loader2 className="animate-spin" />
+                                ) : (
+                                  <Play />
+                                )}
+                              </IconButton>
+                              <ToggleSwitch
+                                checked={rule.enabled}
+                                disabled={isToggling}
+                                ariaLabel={t("devTools.toggle", {
+                                  name: rule.name,
+                                })}
+                                onChange={(enabled) =>
+                                  void handleToggle(rule, enabled)
+                                }
+                              />
+                            </div>
+                          }
+                        />
                       );
                     })}
                   </SettingCard>
@@ -1124,59 +978,65 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
           )}
 
           {/* Collapsible Recent Runs Audit Log */}
-          <div className="space-y-1.5 pt-1">
-            <button
-              type="button"
-              onClick={() => setRunsExpanded((v) => !v)}
-              className="text-muted-foreground hover:text-foreground flex cursor-pointer items-center gap-1.5 px-0.5 text-[12px] font-medium transition-colors"
-            >
+          <details
+            data-setting-id="devTools.recentRuns"
+            className="space-y-1.5 pt-1"
+            open={runsExpanded}
+            onToggle={(event) => setRunsExpanded(event.currentTarget.open)}
+          >
+            <summary className="text-ink-muted hover:text-ink-primary flex cursor-pointer items-center gap-1.5 px-0.5 text-[13px] font-medium transition-colors">
               {runsExpanded ? (
-                <ChevronDown className="h-[13.5px] w-[13.5px]" />
+                <ChevronDown className="h-[14px] w-[14px]" />
               ) : (
-                <ChevronRight className="h-[13.5px] w-[13.5px]" />
+                <ChevronRight className="h-[14px] w-[14px]" />
               )}
-              <span>Recent Runs</span>
-              <span className="tabular-nums opacity-70">({recentExecutions.length})</span>
-            </button>
+              <span>{t("devTools.recentRuns")}</span>
+              <span className="tabular-nums opacity-70">
+                ({recentExecutions.length})
+              </span>
+            </summary>
 
             {runsExpanded && (
               <SettingCard>
                 {recentExecutions.length === 0 ? (
-                  <div className="text-muted-foreground px-4 py-5 text-center text-[12px]">
-                    No hook executions recorded yet. Use <strong>Test</strong> on any rule to run a
-                    dry-run check.
+                  <div className="text-ink-muted px-4 py-5 text-center text-[13px]">
+                    {t("devTools.emptyRuns")}
                   </div>
                 ) : (
                   recentExecutions.slice(0, 30).map((run) => {
-                    const preview = run.reason || run.stderr_preview || run.stdout_preview;
+                    const preview =
+                      run.reason || run.stderr_preview || run.stdout_preview;
                     return (
                       <div key={run.id} className="space-y-1 px-4 py-2.5">
                         <div className="flex items-center justify-between gap-2">
                           <div className="flex min-w-0 items-center gap-1.5">
                             <span
                               className={cn(
-                                "shrink-0 rounded px-1.5 py-0.5 text-[10.5px] font-medium",
+                                "shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium",
                                 decisionPillClass(run.decision),
                               )}
                             >
                               {decisionLabel(run.decision)}
                             </span>
-                            <span className="text-foreground truncate text-[12.5px] font-medium">
+                            <span className="text-ink-primary truncate text-[13px] font-medium">
                               {run.hook_name}
                             </span>
-                            <span className="text-muted-foreground shrink-0 text-[11px]">
+                            <span className="text-ink-muted shrink-0 text-[11px]">
                               {t(eventMeta(run.event).labelKey)}
                             </span>
                             {run.matched_target && (
-                              <span className="text-muted-foreground/80 truncate font-mono text-[10.5px]">
+                              <span className="text-ink-muted/80 truncate font-mono text-[11px]">
                                 ({run.matched_target})
                               </span>
                             )}
                           </div>
-                          <div className="text-muted-foreground flex shrink-0 items-center gap-2 text-[11px] tabular-nums">
-                            {run.exit_code !== null && run.exit_code !== undefined && (
-                              <span className="font-mono">exit {run.exit_code}</span>
-                            )}
+                          <div className="text-ink-muted flex shrink-0 items-center gap-2 text-[11px] tabular-nums">
+                            {run.exit_code !== null &&
+                              run.exit_code !== undefined && (
+                                <span className="font-mono">
+                                  exit {run.exit_code}
+                                </span>
+                              )}
                             <span>{run.duration_ms}ms</span>
                             <span className="opacity-70">
                               {formatRelativeTime(run.executed_at_ms)}
@@ -1184,7 +1044,7 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
                           </div>
                         </div>
                         {preview && (
-                          <div className="text-muted-foreground bg-muted/45 truncate rounded px-2 py-1 font-mono text-[11px]">
+                          <div className="text-ink-muted bg-surface-recessed/45 truncate rounded px-2 py-1 font-mono text-[11px]">
                             {preview}
                           </div>
                         )}
@@ -1194,26 +1054,32 @@ export function HostHooksSection({ hostId }: { hostId: string }) {
                 )}
               </SettingCard>
             )}
-          </div>
+          </details>
         </>
       )}
 
-      {modalOpen && (
-        <HookEditorModal
+      {editor && (
+        <HookEditorDrawer
+          open={editor.open}
+          onClosed={() => setEditor(null)}
           hasProjectCwd={Boolean(effectiveCwd)}
-          editing={editingRule}
-          onClose={() => {
-            setModalOpen(false);
-            setEditingRule(null);
-          }}
+          editing={editor.rule}
+          onClose={() =>
+            setEditor((state) => state && { ...state, open: false })
+          }
           onSave={async (rule) => {
             await orbitActions.upsertLifecycleHook(hostId, effectiveCwd, rule);
           }}
           onDelete={async (rule) => {
-            await orbitActions.deleteLifecycleHook(hostId, effectiveCwd, rule.id, rule.scope);
+            await orbitActions.deleteLifecycleHook(
+              hostId,
+              effectiveCwd,
+              rule.id,
+              rule.scope,
+            );
           }}
         />
       )}
-    </div>
+    </section>
   );
-}
+});

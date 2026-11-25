@@ -1,7 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ChevronDown,
-  ChevronRight,
   Download,
   Globe,
   KeyRound,
@@ -17,36 +15,28 @@ import {
 } from "lucide-react";
 import {
   SettingCard,
-  SettingSectionHeader,
+  SettingDrawer,
+  SettingGroupLabel,
+  SettingResourceRow,
+  SettingSelect,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  Tabs,
-  TabsList,
-  TabsTrigger,
-} from "@/components/ui/dialog-tabs";
+import { IconButton } from "@/components/ui/icon-button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import {
   type ExternalMcpServerRecord,
   type McpProbeResult,
   type McpServerScope,
-  type McpTransportKind,
   type McpWriteScope,
+  type McpTransportKind,
   type UpsertExternalMcpServerRequest,
 } from "@/lib/orbit-ipc";
-import { isLocalHostCard } from "@/lib/projects";
+import { t } from "@/lib/i18n";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
-
-type McpScopeFilter = "all" | "managed" | "discovered";
 
 interface KvDraftRow {
   id: string;
@@ -100,16 +90,20 @@ function parseArgsLine(raw: string): string[] {
 
 function formatArgsLine(args: string[]): string {
   return args
-    .map((a) => (/[\s"'\\]/.test(a) ? `"${a.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` : a))
+    .map((a) =>
+      /[\s"'\\]/.test(a)
+        ? `"${a.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
+        : a,
+    )
     .join(" ");
 }
 
 function scopeBadgeLabel(scope: McpServerScope): string {
   switch (scope) {
     case "orbit_user":
-      return "User";
+      return t("devTools.global");
     case "project_dot_mcp":
-      return "Project";
+      return t("devTools.project");
     case "claude_user":
       return "Claude";
     case "codex_user":
@@ -123,7 +117,9 @@ function makeRowId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
-function initKvRows(maskedMap: Record<string, string> | undefined): KvDraftRow[] {
+function initKvRows(
+  maskedMap: Record<string, string> | undefined,
+): KvDraftRow[] {
   if (!maskedMap) return [];
   return Object.entries(maskedMap)
     .sort(([a], [b]) => a.localeCompare(b))
@@ -156,20 +152,22 @@ function KvEditorRows({
   return (
     <div className="space-y-1.5">
       <div className="flex items-center justify-between">
-        <span className="text-muted-foreground text-[11.5px] font-medium">{label}</span>
+        <span className="text-ink-muted text-[11px] font-medium">{label}</span>
         <button
           type="button"
-          onClick={() => onChange([...rows, { id: makeRowId(), key: "", value: "" }])}
-          className="text-muted-foreground hover:text-foreground inline-flex cursor-pointer items-center gap-1 text-[11.5px] font-medium transition-colors"
+          onClick={() =>
+            onChange([...rows, { id: makeRowId(), key: "", value: "" }])
+          }
+          className="text-ink-muted hover:text-ink-primary inline-flex cursor-pointer items-center gap-1 text-[11px] font-medium transition-colors"
         >
-          <Plus className="h-[11.5px] w-[11.5px]" />
+          <Plus className="h-[12px] w-[12px]" />
           <span>{addLabel}</span>
         </button>
       </div>
 
       {rows.length === 0 ? (
-        <div className="border-border/70 text-muted-foreground/75 rounded-lg border border-dashed px-3 py-2 text-[11.5px]">
-          None configured
+        <div className="border-border-subtle/70 text-ink-muted/75 rounded-lg border border-dashed px-3 py-2 text-[11px]">
+          {t("devTools.none")}
         </div>
       ) : (
         <div className="space-y-1.5">
@@ -177,12 +175,13 @@ function KvEditorRows({
             const secret = isSecretKey(row.key);
             const placeholder =
               row.existingMasked && secret
-                ? `${row.existingMasked} (blank to keep)`
+                ? t("devTools.blankToKeep", { value: row.existingMasked })
                 : valuePlaceholder;
             return (
               <div key={row.id} className="flex items-center gap-1.5">
                 <Input
                   type="text"
+                  aria-label={keyPlaceholder}
                   value={row.key}
                   onChange={(e) =>
                     onChange(
@@ -194,26 +193,29 @@ function KvEditorRows({
                     )
                   }
                   placeholder={keyPlaceholder}
-                  className="h-[30px] w-[42%] font-mono text-[12px]"
+                  className="h-[30px] w-[42%] font-mono text-[13px]"
                 />
                 <div className="relative flex-1">
                   <Input
                     type={secret ? "password" : "text"}
+                    aria-label={valuePlaceholder}
                     value={row.value}
                     onChange={(e) =>
                       onChange(
-                        rows.map((r) => (r.id === row.id ? { ...r, value: e.target.value } : r)),
+                        rows.map((r) =>
+                          r.id === row.id ? { ...r, value: e.target.value } : r,
+                        ),
                       )
                     }
                     placeholder={placeholder}
-                    className="h-[30px] font-mono text-[12px]"
+                    className="h-[30px] font-mono text-[13px]"
                   />
                 </div>
                 <Button
                   type="button"
                   variant="ghost"
                   size="icon"
-                  aria-label={`Remove ${row.key || "row"}`}
+                  aria-label={t("common.delete")}
                   onClick={() => onChange(rows.filter((r) => r.id !== row.id))}
                   className="h-[28px] w-[28px] shrink-0"
                 >
@@ -228,14 +230,24 @@ function KvEditorRows({
   );
 }
 
-function McpServerModal({
+function McpServerDrawer({
+  open,
+  onClosed,
   hostId,
+  importProjects,
   workspaceCwd,
   editing,
   importingFrom,
   onClose,
   onSave,
 }: {
+  open: boolean;
+  onClosed: () => void;
+  importProjects: readonly {
+    value: string;
+    label: string;
+    description: string;
+  }[];
   hostId: string;
   workspaceCwd: string | null;
   editing: ExternalMcpServerRecord | null;
@@ -246,10 +258,12 @@ function McpServerModal({
   const seed = editing ?? importingFrom;
   const isEdit = Boolean(editing);
 
-  const [scope, setScope] = useState<McpWriteScope>(() =>
-    editing?.scope === "project_dot_mcp" ? "project" : "user",
-  );
-  const [transportKind, setTransportKind] = useState<"stdio" | "streamable_http">(() =>
+  const [destination, setDestination] = useState(workspaceCwd ?? "");
+  const targetCwd = importingFrom ? destination || null : workspaceCwd;
+  const scope: McpWriteScope = targetCwd ? "project" : "user";
+  const [transportKind, setTransportKind] = useState<
+    "stdio" | "streamable_http"
+  >(() =>
     seed?.transport.kind === "streamable_http" ? "streamable_http" : "stdio",
   );
   const [name, setName] = useState(() => seed?.name ?? "");
@@ -262,38 +276,29 @@ function McpServerModal({
   const [url, setUrl] = useState(() =>
     seed?.transport.kind === "streamable_http" ? seed.transport.url : "",
   );
-  const [envRows, setEnvRows] = useState<KvDraftRow[]>(() => initKvRows(seed?.masked_env));
+  const [envRows, setEnvRows] = useState<KvDraftRow[]>(() =>
+    initKvRows(seed?.masked_env),
+  );
   const [headerRows, setHeaderRows] = useState<KvDraftRow[]>(() =>
     initKvRows(seed?.masked_headers),
   );
   const [enabled, setEnabled] = useState(() => seed?.enabled ?? true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !saving) {
-        e.preventDefault();
-        onClose();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose, saving]);
+  const canSubmit =
+    Boolean(name.trim()) &&
+    (transportKind === "stdio" ? Boolean(command.trim()) : Boolean(url.trim()));
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (saving) return;
     const cleanName = name.trim();
     if (!/^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$/.test(cleanName)) {
-      setError("Name must use ASCII letters, digits, `.`, `_`, or `-`.");
+      setError(t("devTools.nameInvalid"));
       return;
     }
     if (cleanName.toLowerCase() === "orbit") {
-      setError("`orbit` is reserved for Orbit's built-in MCP server.");
-      return;
-    }
-    if (scope === "project" && !workspaceCwd) {
-      setError("Select a workspace before saving to project `.mcp.json`.");
+      setError(t("devTools.nameReserved"));
       return;
     }
 
@@ -303,11 +308,11 @@ function McpServerModal({
       const k = row.key.trim();
       if (!k) continue;
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) {
-        setError(`Invalid env variable name "${k}".`);
+        setError(t("devTools.invalidEnv", { name: k }));
         return;
       }
       if (BLOCKED_ENV_RE.test(k)) {
-        setError(`Environment variable "${k}" is blocked for security reasons.`);
+        setError(t("devTools.blockedEnv", { name: k }));
         return;
       }
       if (row.existingMasked && isSecretKey(k) && !row.value) {
@@ -323,7 +328,7 @@ function McpServerModal({
       const k = row.key.trim();
       if (!k) continue;
       if (/[\s\r\n:]/.test(k)) {
-        setError(`Invalid HTTP header name "${k}".`);
+        setError(t("devTools.invalidHeader", { name: k }));
         return;
       }
       if (row.existingMasked && isSecretKey(k) && !row.value) {
@@ -338,7 +343,7 @@ function McpServerModal({
     if (transportKind === "stdio") {
       const cleanCmd = command.trim();
       if (!cleanCmd) {
-        setError("Command is required for stdio MCP servers.");
+        setError(t("devTools.requireCommand"));
         return;
       }
       transport = {
@@ -349,7 +354,7 @@ function McpServerModal({
     } else {
       const cleanUrl = url.trim();
       if (!/^https?:\/\//i.test(cleanUrl)) {
-        setError("Streamable HTTP URL must start with http:// or https://.");
+        setError(t("devTools.requireHttp"));
         return;
       }
       transport = {
@@ -367,7 +372,7 @@ function McpServerModal({
       await onSave({
         host_id: hostId,
         scope,
-        cwd: workspaceCwd,
+        cwd: targetCwd,
         name: cleanName,
         transport,
         env: transportKind === "stdio" ? env : {},
@@ -384,238 +389,271 @@ function McpServerModal({
   };
 
   return (
-    <Dialog
-      open
-      onOpenChange={(nextOpen) => {
-        if (!nextOpen && !saving) onClose();
+    <SettingDrawer
+      open={open}
+      onOpenChangeComplete={(visible) => {
+        if (!visible) onClosed();
       }}
+      onOpenChange={(open) => {
+        if (!open && !saving) onClose();
+      }}
+      title={
+        isEdit
+          ? t("devTools.editServer")
+          : importingFrom
+            ? t("devTools.importServer")
+            : t("devTools.addServer")
+      }
+      description={
+        scope === "user" ? t("devTools.global") : (targetCwd ?? undefined)
+      }
     >
-      <DialogContent
-        closeDisabled={saving}
-        className="flex max-h-[85vh] max-w-[490px] flex-col gap-0 p-0"
-      >
-        <DialogHeader className="px-5 pt-5 pr-12 pb-4">
-          <DialogTitle>
-            {isEdit
-              ? "Edit MCP Server"
-              : importingFrom
-                ? "Import MCP Server"
-                : "Add MCP Server"}
-          </DialogTitle>
-          <DialogDescription>
-            {importingFrom
-              ? `Import "${importingFrom.name}" into Orbit. Existing secrets stay on the host.`
-              : "Configure a stdio or Streamable HTTP MCP server on this host."}
-          </DialogDescription>
-        </DialogHeader>
-
-        <form
-          onSubmit={(e) => void handleSubmit(e)}
-          className="orbit-native-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 pb-5"
-        >
-          <FieldGroup>
-            {/* Scope + Transport toggles */}
-            <div className="grid grid-cols-2 gap-3">
-              <Field>
-                <FieldLabel className="text-[11.5px]">Scope</FieldLabel>
-                <Tabs value={scope} onValueChange={(v) => setScope(v as McpWriteScope)}>
-                  <TabsList className="grid w-full grid-cols-2">
-                    <TabsTrigger value="user" disabled={isEdit} className="text-[12px]">
-                      User
-                    </TabsTrigger>
-                    <TabsTrigger
-                      value="project"
-                      disabled={isEdit || !workspaceCwd}
-                      title={workspaceCwd ? `${workspaceCwd}/.mcp.json` : "No active workspace"}
-                      className="text-[12px]"
-                    >
-                      Project .mcp.json
-                    </TabsTrigger>
-                  </TabsList>
-                </Tabs>
-              </Field>
-
-              <Field>
-                <FieldLabel className="text-[11.5px]">Transport</FieldLabel>
-                <Tabs
-                  value={transportKind}
-                  onValueChange={(v) => setTransportKind(v as "stdio" | "streamable_http")}
-                >
-                  <TabsList className="grid w-full grid-cols-2">
-                    <TabsTrigger value="stdio" className="text-[12px]">
-                      stdio
-                    </TabsTrigger>
-                    <TabsTrigger value="streamable_http" className="text-[12px]">
-                      HTTP / SSE
-                    </TabsTrigger>
-                  </TabsList>
-                </Tabs>
-              </Field>
-            </div>
-
+      <form onSubmit={(e) => void handleSubmit(e)} className="flex flex-col">
+        <FieldGroup>
+          {importingFrom && importProjects.length > 0 && (
             <Field>
-              <FieldLabel htmlFor="mcp-server-name" className="text-[11.5px]">
-                Server Name
-              </FieldLabel>
-              <Input
-                id="mcp-server-name"
-                type="text"
-                autoFocus={!isEdit}
-                value={name}
-                disabled={isEdit}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="github"
-                className="font-mono"
+              <FieldLabel>{t("devTools.scope")}</FieldLabel>
+              <SettingSelect
+                value={destination}
+                ariaLabel={t("devTools.scope")}
+                onChange={setDestination}
+                options={[
+                  { value: "", label: t("devTools.global") },
+                  ...importProjects,
+                ]}
               />
             </Field>
+          )}
+          <Field>
+            <FieldLabel>{t("devTools.transport")}</FieldLabel>
+            <SettingSelect
+              ariaLabel={t("devTools.transport")}
+              value={transportKind}
+              options={[
+                { value: "stdio", label: "stdio" },
+                { value: "streamable_http", label: "Streamable HTTP" },
+              ]}
+              onChange={setTransportKind}
+            />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="mcp-server-name" className="text-[11px]">
+              {t("devTools.name")}
+            </FieldLabel>
+            <Input
+              id="mcp-server-name"
+              type="text"
+              autoFocus={!isEdit}
+              value={name}
+              disabled={isEdit}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="github"
+              className="font-mono"
+            />
+          </Field>
 
-            {transportKind === "stdio" ? (
-              <>
-                <div className="grid grid-cols-2 gap-3">
-                  <Field>
-                    <FieldLabel htmlFor="mcp-server-command" className="text-[11.5px]">
-                      Command
-                    </FieldLabel>
-                    <Input
-                      id="mcp-server-command"
-                      type="text"
-                      value={command}
-                      onChange={(e) => setCommand(e.target.value)}
-                      placeholder="npx or uvx"
-                      className="font-mono"
-                    />
-                  </Field>
-                  <Field>
-                    <FieldLabel htmlFor="mcp-server-args" className="text-[11.5px]">
-                      Arguments
-                    </FieldLabel>
-                    <Input
-                      id="mcp-server-args"
-                      type="text"
-                      value={argsText}
-                      onChange={(e) => setArgsText(e.target.value)}
-                      placeholder="-y @modelcontextprotocol/server-github"
-                      className="font-mono"
-                    />
-                  </Field>
-                </div>
-
-                <KvEditorRows
-                  label="Environment Variables"
-                  addLabel="Add variable"
-                  keyPlaceholder="GITHUB_TOKEN"
-                  valuePlaceholder="Value"
-                  rows={envRows}
-                  onChange={setEnvRows}
-                />
-              </>
-            ) : (
-              <>
+          {transportKind === "stdio" ? (
+            <>
+              <div className="grid grid-cols-2 gap-3">
                 <Field>
-                  <FieldLabel htmlFor="mcp-server-url" className="text-[11.5px]">
-                    Endpoint URL
+                  <FieldLabel
+                    htmlFor="mcp-server-command"
+                    className="text-[11px]"
+                  >
+                    {t("devTools.command")}
                   </FieldLabel>
                   <Input
-                    id="mcp-server-url"
+                    id="mcp-server-command"
                     type="text"
-                    value={url}
-                    onChange={(e) => setUrl(e.target.value)}
-                    placeholder="https://mcp.example.com/mcp"
+                    value={command}
+                    onChange={(e) => setCommand(e.target.value)}
+                    placeholder="npx"
                     className="font-mono"
                   />
                 </Field>
-
-                <KvEditorRows
-                  label="HTTP Headers"
-                  addLabel="Add header"
-                  keyPlaceholder="Authorization"
-                  valuePlaceholder="Bearer …"
-                  rows={headerRows}
-                  onChange={setHeaderRows}
-                />
-              </>
-            )}
-
-            <Field orientation="horizontal" className="pt-0.5">
-              <FieldLabel className="font-normal">Enabled</FieldLabel>
-              <ToggleSwitch
-                checked={enabled}
-                onChange={setEnabled}
-                ariaLabel="Enable MCP server"
-              />
-            </Field>
-
-            {error && (
-              <div className="rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-[12px] text-red-600 dark:text-red-400">
-                {error}
+                <Field>
+                  <FieldLabel htmlFor="mcp-server-args" className="text-[11px]">
+                    {t("devTools.args")}
+                  </FieldLabel>
+                  <Input
+                    id="mcp-server-args"
+                    type="text"
+                    value={argsText}
+                    onChange={(e) => setArgsText(e.target.value)}
+                    placeholder="-y @modelcontextprotocol/server-github"
+                    className="font-mono"
+                  />
+                </Field>
               </div>
-            )}
 
-            <DialogFooter className="pt-2">
-              <Button type="button" variant="outline" size="sm" disabled={saving} onClick={onClose}>
-                Cancel
-              </Button>
-              <Button type="submit" size="sm" disabled={saving}>
-                {saving && <Loader2 className="h-[12.5px] w-[12.5px] animate-spin" />}
-                <span>{isEdit ? "Save Changes" : importingFrom ? "Import" : "Add Server"}</span>
-              </Button>
-            </DialogFooter>
-          </FieldGroup>
-        </form>
-      </DialogContent>
-    </Dialog>
+              <KvEditorRows
+                label={t("devTools.env")}
+                addLabel={t("devTools.addVar")}
+                keyPlaceholder="GITHUB_TOKEN"
+                valuePlaceholder={t("devTools.value")}
+                rows={envRows}
+                onChange={setEnvRows}
+              />
+            </>
+          ) : (
+            <>
+              <Field>
+                <FieldLabel htmlFor="mcp-server-url" className="text-[11px]">
+                  {t("devTools.endpoint")}
+                </FieldLabel>
+                <Input
+                  id="mcp-server-url"
+                  type="text"
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                  placeholder="https://mcp.example.com/mcp"
+                  className="font-mono"
+                />
+              </Field>
+
+              <KvEditorRows
+                label={t("devTools.headers")}
+                addLabel={t("devTools.addHeader")}
+                keyPlaceholder="Authorization"
+                valuePlaceholder="Bearer …"
+                rows={headerRows}
+                onChange={setHeaderRows}
+              />
+            </>
+          )}
+
+          <Field orientation="horizontal" className="pt-0.5">
+            <FieldLabel className="font-normal">
+              {t("devTools.enabled")}
+            </FieldLabel>
+            <ToggleSwitch
+              checked={enabled}
+              disabled={saving}
+              onChange={setEnabled}
+              ariaLabel={t("devTools.enabled")}
+            />
+          </Field>
+
+          {error && (
+            <div className="rounded-lg border border-signal-danger-border bg-signal-danger-bg px-3 py-2 text-[13px] text-signal-danger">
+              {error}
+            </div>
+          )}
+
+          <div className="flex justify-end gap-2 pt-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={saving}
+              onClick={onClose}
+            >
+              {t("common.cancel")}
+            </Button>
+            <Button type="submit" size="sm" disabled={saving || !canSubmit}>
+              {saving && <Loader2 className="h-[13px] w-[13px] animate-spin" />}
+              <span>
+                {isEdit
+                  ? t("common.save")
+                  : importingFrom
+                    ? t("devTools.importServer")
+                    : t("devTools.addServer")}
+              </span>
+            </Button>
+          </div>
+        </FieldGroup>
+      </form>
+    </SettingDrawer>
   );
 }
 
-export function HostMcpSection({ hostId }: { hostId: string }) {
-  const fleet = useOrbitSelector((s) => s.fleet);
-  const hostCard = fleet.hosts.find((h) => h.host_id === hostId) ?? null;
-  const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
-  const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
-  const servers = useOrbitSelector((s) => s.externalMcpServersByHost[hostId] ?? EMPTY_SERVERS);
-
-  const workspaceCwd = selectedHostId === hostId ? selectedCwd.trim() || null : null;
-
-  const [filter, setFilter] = useState<McpScopeFilter>("all");
+export function HostMcpSection({
+  hostId,
+  workspaceCwd = null,
+  importProjects = [],
+  onSelectDestination,
+}: {
+  hostId: string;
+  workspaceCwd?: string | null;
+  importProjects?: readonly {
+    value: string;
+    label: string;
+    description: string;
+  }[];
+  onSelectDestination?: (cwd: string) => void;
+}) {
+  const online = useOrbitSelector((s) => {
+    const state = s.fleet.hosts.find(
+      (h) => h.host_id === hostId,
+    )?.connection_state;
+    return state === "online_direct" || state === "online_relay";
+  });
+  const [servers, setServers] =
+    useState<readonly ExternalMcpServerRecord[]>(EMPTY_SERVERS);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [probingIds, setProbingIds] = useState<Record<string, boolean>>({});
-  const [localProbes, setLocalProbes] = useState<Record<string, McpProbeResult>>({});
-  const [togglingIds, setTogglingIds] = useState<Record<string, boolean>>({});
-  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
-  const [modalState, setModalState] = useState<{
+  const [localProbes, setLocalProbes] = useState<
+    Record<string, McpProbeResult>
+  >({});
+  const [removing, setRemoving] = useState<ExternalMcpServerRecord | null>(
+    null,
+  );
+  const [editor, setEditor] = useState<{
     open: boolean;
     editing: ExternalMcpServerRecord | null;
     importingFrom: ExternalMcpServerRecord | null;
-  }>({ open: false, editing: null, importingFrom: null });
+  } | null>(null);
 
   const mountedRef = useRef(true);
   const activeHostRef = useRef(hostId);
   const fetchSeqRef = useRef(0);
   const probeSeqRef = useRef<Record<string, number>>({});
+  const toggleSeqRef = useRef(0);
+  const toggleChainRef = useRef<Promise<void>>(Promise.resolve());
 
-  const refreshServers = useCallback(async () => {
+  const refreshServers = useCallback(async (options?: { silent?: boolean }) => {
+    if (!mountedRef.current || !online) return;
     const reqHost = hostId;
     const seq = ++fetchSeqRef.current;
-    setLoading(true);
+    if (!options?.silent) {
+      setLoading(true);
+    }
     setLoadError(null);
     try {
-      await orbitActions.refreshExternalMcpServers(reqHost, workspaceCwd);
-      if (mountedRef.current && activeHostRef.current === reqHost && fetchSeqRef.current === seq) {
+      const snapshot = await orbitActions.refreshExternalMcpServers(
+        reqHost,
+        workspaceCwd,
+      );
+      if (
+        mountedRef.current &&
+        activeHostRef.current === reqHost &&
+        fetchSeqRef.current === seq
+      ) {
+        setServers(snapshot);
         setLocalProbes({});
       }
     } catch (err) {
-      if (!mountedRef.current || activeHostRef.current !== reqHost || fetchSeqRef.current !== seq) {
+      if (
+        !mountedRef.current ||
+        activeHostRef.current !== reqHost ||
+        fetchSeqRef.current !== seq
+      ) {
         return;
       }
       setLoadError(err instanceof Error ? err.message : String(err));
     } finally {
-      if (mountedRef.current && activeHostRef.current === reqHost && fetchSeqRef.current === seq) {
+      if (
+        !options?.silent &&
+        mountedRef.current &&
+        activeHostRef.current === reqHost &&
+        fetchSeqRef.current === seq
+      ) {
         setLoading(false);
       }
     }
-  }, [hostId, workspaceCwd]);
+  }, [hostId, workspaceCwd, online]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -626,20 +664,14 @@ export function HostMcpSection({ hostId }: { hostId: string }) {
     };
   }, [hostId, refreshServers]);
 
-  const showHostBadge =
-    Boolean(hostCard) &&
-    (fleet.hosts.length > 1 || (hostCard !== null && !isLocalHostCard(hostCard)));
-
-  const managedCount = useMemo(() => servers.filter((s) => s.editable).length, [servers]);
-  const discoveredCount = useMemo(() => servers.filter((s) => !s.editable).length, [servers]);
-
-  const filteredServers = useMemo(() => {
-    return servers.filter((s) => {
-      if (filter === "managed") return s.editable;
-      if (filter === "discovered") return !s.editable;
-      return true;
-    });
-  }, [servers, filter]);
+  const filteredServers = useMemo(
+    () =>
+      servers.filter(
+        (server) =>
+          (server.scope === "project_dot_mcp") === Boolean(workspaceCwd),
+      ),
+    [servers, workspaceCwd],
+  );
 
   const handleProbe = async (serverId: string) => {
     const reqHost = hostId;
@@ -647,7 +679,11 @@ export function HostMcpSection({ hostId }: { hostId: string }) {
     probeSeqRef.current[serverId] = seq;
     setProbingIds((prev) => ({ ...prev, [serverId]: true }));
     try {
-      const result = await orbitActions.probeExternalMcpServer(reqHost, serverId, workspaceCwd);
+      const result = await orbitActions.probeExternalMcpServer(
+        reqHost,
+        serverId,
+        workspaceCwd,
+      );
       if (
         !mountedRef.current ||
         activeHostRef.current !== reqHost ||
@@ -692,147 +728,110 @@ export function HostMcpSection({ hostId }: { hostId: string }) {
     }
   };
 
-  const handleToggle = async (server: ExternalMcpServerRecord, nextEnabled: boolean) => {
+  const handleToggle = (
+    server: ExternalMcpServerRecord,
+    nextEnabled: boolean,
+  ) => {
     const reqHost = hostId;
-    setTogglingIds((prev) => ({ ...prev, [server.id]: true }));
-    try {
-      await orbitActions.toggleExternalMcpServer(reqHost, server.id, nextEnabled, workspaceCwd);
-    } catch (err) {
-      if (mountedRef.current && activeHostRef.current === reqHost) {
-        orbitActions.showToast(
-          err instanceof Error ? err.message : "Failed to update MCP server",
+    const seq = ++toggleSeqRef.current;
+    setServers((prev) =>
+      prev.map((item) =>
+        item.id === server.id ? { ...item, enabled: nextEnabled } : item,
+      ),
+    );
+    toggleChainRef.current = toggleChainRef.current.then(async () => {
+      try {
+        await orbitActions.toggleExternalMcpServer(
+          reqHost,
+          server.id,
+          nextEnabled,
+          workspaceCwd,
         );
+        if (
+          mountedRef.current &&
+          activeHostRef.current === reqHost &&
+          toggleSeqRef.current === seq
+        ) {
+          await refreshServers({ silent: true });
+        }
+      } catch (err) {
+        if (mountedRef.current && activeHostRef.current === reqHost) {
+          setServers((prev) =>
+            prev.map((item) =>
+              item.id === server.id ? { ...item, enabled: !nextEnabled } : item,
+            ),
+          );
+          orbitActions.showToast(
+            err instanceof Error ? err.message : t("common.actionFailed"),
+          );
+        }
       }
-    } finally {
-      if (mountedRef.current && activeHostRef.current === reqHost) {
-        setTogglingIds((prev) => {
-          const next = { ...prev };
-          delete next[server.id];
-          return next;
-        });
-      }
-    }
+    });
   };
 
-  const handleDelete = async (server: ExternalMcpServerRecord) => {
-    const reqHost = hostId;
-    setConfirmDeleteId(null);
-    try {
-      await orbitActions.deleteExternalMcpServer(reqHost, server.id, workspaceCwd);
-      if (!mountedRef.current || activeHostRef.current !== reqHost) return;
-      setLocalProbes((prev) => {
-        const next = { ...prev };
-        delete next[server.id];
-        return next;
-      });
-      orbitActions.showToast(`Removed MCP server "${server.name}"`);
-    } catch (err) {
-      if (mountedRef.current && activeHostRef.current === reqHost) {
-        orbitActions.showToast(
-          err instanceof Error ? err.message : "Failed to delete MCP server",
-        );
-      }
-    }
+  const handleDelete = async () => {
+    if (!removing) return;
+    await orbitActions.deleteExternalMcpServer(
+      hostId,
+      removing.id,
+      workspaceCwd,
+    );
+    await refreshServers();
   };
 
   const handleSave = async (req: UpsertExternalMcpServerRequest) => {
     await orbitActions.upsertExternalMcpServer(req);
-    if (mountedRef.current && activeHostRef.current === req.host_id) {
-      setLocalProbes({});
-      orbitActions.showToast(`Saved MCP server "${req.name}"`);
+    if (!mountedRef.current) return;
+    if (req.cwd && req.cwd !== workspaceCwd && onSelectDestination) {
+      onSelectDestination(req.cwd);
+    } else {
+      await refreshServers();
     }
   };
 
   return (
-    <div className="space-y-5">
-      <SettingSectionHeader
-        title="MCP Servers"
-        description="External stdio and Streamable HTTP Model Context Protocol servers on this host."
-        badge={
-          showHostBadge && hostCard ? (
-            <span className="bg-muted text-muted-foreground rounded-md px-2 py-0.5 text-[11.5px] font-medium">
-              {hostCard.display_name}
-            </span>
-          ) : null
-        }
+    <section data-setting-id="settings.subTabMcp" className="space-y-2">
+      <SettingGroupLabel
         action={
           <div className="flex items-center gap-2">
-            <button
-              type="button"
-              disabled={loading}
+            <IconButton
+              disabled={loading || !online}
+              tooltip={t("common.refresh")}
               onClick={() => void refreshServers()}
-              className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:opacity-50"
             >
-              <RefreshCw className={cn("h-[13px] w-[13px]", loading && "animate-spin")} />
-              <span>Refresh</span>
-            </button>
-            <button
-              type="button"
+              <RefreshCw className={cn(loading && "animate-spin")} />
+            </IconButton>
+            <Button
+              data-setting-id="devTools.addServer"
+              size="sm"
+              className="text-[13px]"
+              disabled={!online}
               onClick={() =>
-                setModalState({ open: true, editing: null, importingFrom: null })
+                setEditor({ open: true, editing: null, importingFrom: null })
               }
-              className="bg-foreground text-background inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg px-2.5 text-[12px] font-medium transition-opacity hover:opacity-90"
             >
-              <Plus className="h-[13.5px] w-[13.5px]" />
-              <span>Add MCP Server</span>
-            </button>
+              <Plus /> {t("devTools.addServer")}
+            </Button>
           </div>
         }
-      />
-
-      {/* Filter bar */}
-      <div className="flex flex-wrap items-center justify-between gap-2.5">
-        <Tabs
-          value={filter}
-          onValueChange={(next) => {
-            if (typeof next === "string") setFilter(next as McpScopeFilter);
-          }}
-        >
-          <TabsList aria-label="Filter MCP server scope">
-            {(
-              [
-                { id: "all", label: "All", count: servers.length },
-                { id: "managed", label: "Managed", count: managedCount },
-                { id: "discovered", label: "Discovered", count: discoveredCount },
-              ] as const
-            ).map((tab) => (
-              <TabsTrigger key={tab.id} value={tab.id}>
-                <span>{tab.label}</span>
-                <span className="text-ink-faint font-mono text-[11px] font-normal tabular-nums">
-                  {tab.count}
-                </span>
-              </TabsTrigger>
-            ))}
-          </TabsList>
-        </Tabs>
-
-        {workspaceCwd && (
-          <span
-            title={workspaceCwd}
-            className="text-muted-foreground/75 max-w-[260px] truncate font-mono text-[11px]"
-          >
-            {workspaceCwd}
-          </span>
-        )}
-      </div>
-
+      >
+        {t("devTools.servers")}
+      </SettingGroupLabel>
       {loadError && (
-        <div className="rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-[12px] text-red-600 dark:text-red-400">
+        <div className="rounded-lg border border-signal-danger-border bg-signal-danger-bg px-3 py-2 text-[13px] text-signal-danger">
           {loadError}
         </div>
       )}
 
       {/* Server List */}
-      {filteredServers.length === 0 ? (
+      {!online || filteredServers.length === 0 ? (
         <SettingCard>
-          <div className="text-muted-foreground px-4 py-8 text-center text-[12.5px]">
-            {loading
-              ? "Loading MCP servers…"
-              : filter === "managed"
-                ? "No Orbit or project MCP servers yet. Click Add MCP Server to configure one."
-                : filter === "discovered"
-                  ? "No external MCP servers detected in Claude, Codex, or Antigravity configs."
-                  : "No external MCP servers configured on this host."}
+          <div className="text-ink-muted px-4 py-8 text-center text-[13px]">
+            {!online
+              ? t("devTools.offline")
+              : loading
+                ? t("common.loading")
+                : t("devTools.emptyServers")}
           </div>
         </SettingCard>
       ) : (
@@ -841,8 +840,6 @@ export function HostMcpSection({ hostId }: { hostId: string }) {
             const expanded = expandedId === server.id;
             const probe = localProbes[server.id] ?? server.last_probe ?? null;
             const isProbing = Boolean(probingIds[server.id]);
-            const isToggling = Boolean(togglingIds[server.id]);
-            const confirmingDelete = confirmDeleteId === server.id;
             const isHttp = server.transport.kind === "streamable_http";
             const summaryLine =
               server.transport.kind === "stdio"
@@ -854,186 +851,138 @@ export function HostMcpSection({ hostId }: { hostId: string }) {
               : Object.entries(server.masked_env ?? {});
 
             return (
-              <div key={server.id} className="px-4 py-3">
-                <div className="flex items-center justify-between gap-3">
-                  <button
-                    type="button"
-                    aria-expanded={expanded}
-                    onClick={() => setExpandedId(expanded ? null : server.id)}
-                    className="flex min-w-0 flex-1 cursor-pointer items-center gap-2.5 text-left"
-                  >
-                    {expanded ? (
-                      <ChevronDown className="text-muted-foreground/70 h-[13.5px] w-[13.5px] shrink-0" />
-                    ) : (
-                      <ChevronRight className="text-muted-foreground/70 h-[13.5px] w-[13.5px] shrink-0" />
-                    )}
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <span
-                          className={cn(
-                            "truncate text-[13.5px] font-medium",
-                            server.enabled ? "text-foreground" : "text-muted-foreground",
-                          )}
-                        >
-                          {server.name}
-                        </span>
-                        <span className="border-border bg-background/70 text-muted-foreground inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 text-[10.5px] font-medium">
-                          {isHttp ? (
-                            <Globe className="h-[10px] w-[10px]" />
-                          ) : (
-                            <Terminal className="h-[10px] w-[10px]" />
-                          )}
-                          {isHttp ? "HTTP" : "stdio"}
-                        </span>
-                        <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-[10.5px] font-medium">
-                          {scopeBadgeLabel(server.scope)}
-                        </span>
-                        {probe && probe.ok && (
-                          <span className="inline-flex shrink-0 items-center gap-1 rounded bg-emerald-500/10 px-1.5 py-0.5 text-[10.5px] font-medium text-emerald-600 tabular-nums dark:text-emerald-400">
-                            {probe.tools.length} {probe.tools.length === 1 ? "tool" : "tools"} ·{" "}
-                            {probe.latency_ms}ms
-                          </span>
-                        )}
-                      </div>
-
-                      <div className="text-muted-foreground/75 mt-0.5 truncate font-mono text-[11.5px]">
-                        {summaryLine}
-                      </div>
-
-                      {probe && !probe.ok && (
-                        <div className="mt-0.5 truncate text-[11.5px] text-red-600 dark:text-red-400">
-                          {probe.error ?? "Probe failed"}
-                        </div>
-                      )}
-                    </div>
-                  </button>
-
-                  <div className="flex shrink-0 items-center gap-1.5">
-                    <button
-                      type="button"
-                      disabled={isProbing}
-                      onClick={() => void handleProbe(server.id)}
-                      className="border-border hover:bg-accent text-foreground/85 inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-md border px-2 text-[11.5px] font-medium transition-colors disabled:opacity-50"
-                    >
-                      {isProbing ? (
-                        <Loader2 className="h-[11.5px] w-[11.5px] animate-spin" />
-                      ) : (
-                        <Play className="h-[10.5px] w-[10.5px]" />
-                      )}
-                      <span>Test</span>
-                    </button>
-
-                    {server.editable ? (
-                      <>
-                        {confirmingDelete ? (
-                          <div className="flex items-center gap-1">
-                            <button
-                              type="button"
-                              onClick={() => void handleDelete(server)}
-                              className="inline-flex h-[24px] cursor-pointer items-center rounded-md border border-red-500/35 bg-red-500/10 px-2 text-[11px] font-medium text-red-600 transition-colors hover:bg-red-500/20 dark:text-red-400"
-                            >
-                              Remove
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => setConfirmDeleteId(null)}
-                              className="border-border text-muted-foreground hover:text-foreground inline-flex h-[24px] cursor-pointer items-center rounded-md border px-2 text-[11px] transition-colors"
-                            >
-                              Cancel
-                            </button>
-                          </div>
+              <div key={server.id}>
+                <SettingResourceRow
+                  title={server.name}
+                  description={<span className="font-mono">{summaryLine}</span>}
+                  icon={isHttp ? <Globe /> : <Terminal />}
+                  status={scopeBadgeLabel(server.scope)}
+                  onClick={() => setExpandedId(expanded ? null : server.id)}
+                  action={
+                    <div className="flex items-center gap-1">
+                      <IconButton
+                        tooltip={t("devTools.test")}
+                        disabled={isProbing}
+                        onClick={() => void handleProbe(server.id)}
+                      >
+                        {isProbing ? (
+                          <Loader2 className="animate-spin" />
                         ) : (
-                          <>
-                            <button
-                              type="button"
-                              aria-label={`Edit ${server.name}`}
-                              onClick={() =>
-                                setModalState({
-                                  open: true,
-                                  editing: server,
-                                  importingFrom: null,
-                                })
-                              }
-                              className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors"
-                            >
-                              <Pencil className="h-[12px] w-[12px]" />
-                            </button>
-                            <button
-                              type="button"
-                              aria-label={`Delete ${server.name}`}
-                              onClick={() => setConfirmDeleteId(server.id)}
-                              className="text-muted-foreground hover:bg-accent inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors hover:text-red-500"
-                            >
-                              <Trash2 className="h-[12px] w-[12px]" />
-                            </button>
-                          </>
+                          <Play />
                         )}
-
-                        <div className="pl-1">
+                      </IconButton>
+                      {server.editable ? (
+                        <>
+                          <IconButton
+                            tooltip={t("common.edit")}
+                            onClick={() =>
+                              setEditor({
+                                open: true,
+                                editing: server,
+                                importingFrom: null,
+                              })
+                            }
+                          >
+                            <Pencil />
+                          </IconButton>
+                          <IconButton
+                            tooltip={t("common.delete")}
+                            tone="danger"
+                            onClick={() => setRemoving(server)}
+                          >
+                            <Trash2 />
+                          </IconButton>
                           <ToggleSwitch
                             checked={server.enabled}
-                            disabled={isToggling}
-                            ariaLabel={`Toggle ${server.name}`}
-                            onChange={(next) => void handleToggle(server, next)}
+                            disabled={!online}
+                            ariaLabel={t("devTools.toggle", {
+                              name: server.name,
+                            })}
+                            onChange={(enabled) =>
+                              handleToggle(server, enabled)
+                            }
                           />
-                        </div>
-                      </>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setModalState({
-                            open: true,
-                            editing: null,
-                            importingFrom: server,
-                          })
-                        }
-                        className="border-border hover:bg-accent text-muted-foreground hover:text-foreground inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-md border px-2 text-[11.5px] font-medium transition-colors"
-                      >
-                        <Download className="h-[11px] w-[11px]" />
-                        <span>Import</span>
-                      </button>
+                        </>
+                      ) : (
+                        <IconButton
+                          tooltip={t("devTools.importServer")}
+                          onClick={() =>
+                            setEditor({
+                              open: true,
+                              editing: null,
+                              importingFrom: server,
+                            })
+                          }
+                        >
+                          <Download />
+                        </IconButton>
+                      )}
+                    </div>
+                  }
+                />
+                {probe && (
+                  <p
+                    className={cn(
+                      "px-4 pb-2 text-[11px]",
+                      probe.ok ? "text-signal-success" : "text-signal-danger",
                     )}
-                  </div>
-                </div>
-
+                  >
+                    {probe.ok
+                      ? t("devTools.probeResult", {
+                          count: probe.tools.length,
+                          ms: probe.latency_ms,
+                        })
+                      : probe.error || t("devTools.probeFailed")}
+                  </p>
+                )}
                 {expanded && (
-                  <div className="border-border/60 mt-2.5 space-y-2.5 border-t pt-2.5 pl-6 text-[12px]">
-                    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11.5px]">
-                      <span className="text-muted-foreground">
-                        Source:{" "}
-                        <code className="text-foreground/85 font-mono">{server.source_path}</code>
+                  <div className="border-border-subtle bg-surface-recessed space-y-2.5 border-t px-4 py-3 text-[13px]">
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px]">
+                      <span className="text-ink-muted">
+                        {t("devTools.source")} ·{" "}
+                        <code className="text-ink-primary/85 font-mono">
+                          {server.source_path}
+                        </code>
                       </span>
                       {probe?.server_name && (
-                        <span className="text-muted-foreground">
-                          Server:{" "}
-                          <code className="text-foreground/85 font-mono">
+                        <span className="text-ink-muted">
+                          {t("devTools.server")} ·{" "}
+                          <code className="text-ink-primary/85 font-mono">
                             {probe.server_name}
-                            {probe.server_version ? ` ${probe.server_version}` : ""}
+                            {probe.server_version
+                              ? ` ${probe.server_version}`
+                              : ""}
                           </code>
                         </span>
                       )}
                       {probe?.protocol_version && (
-                        <span className="text-muted-foreground">
-                          MCP <code className="text-foreground/85 font-mono">{probe.protocol_version}</code>
+                        <span className="text-ink-muted">
+                          MCP{" "}
+                          <code className="text-ink-primary/85 font-mono">
+                            {probe.protocol_version}
+                          </code>
                         </span>
                       )}
                     </div>
 
                     {maskedEntries.length > 0 && (
                       <div className="space-y-1">
-                        <div className="text-muted-foreground flex items-center gap-1 text-[11px] font-medium">
+                        <div className="text-ink-muted flex items-center gap-1 text-[11px] font-medium">
                           <KeyRound className="h-[11px] w-[11px]" />
-                          <span>{isHttp ? "Headers" : "Environment"}</span>
+                          <span>
+                            {isHttp ? t("devTools.headers") : t("devTools.env")}
+                          </span>
                         </div>
                         <div className="flex flex-wrap gap-1.5">
                           {maskedEntries.map(([k, v]) => (
                             <span
                               key={k}
-                              className="border-border/70 bg-background/70 text-foreground/85 inline-flex items-center gap-1 rounded border px-1.5 py-0.5 font-mono text-[11px]"
+                              className="border-border-subtle/70 bg-surface-raised/70 text-ink-primary/85 inline-flex items-center gap-1 rounded border px-1.5 py-0.5 font-mono text-[11px]"
                             >
                               <span>{k}</span>
-                              {v && <span className="text-muted-foreground">= {v}</span>}
+                              {v && (
+                                <span className="text-ink-muted">= {v}</span>
+                              )}
                             </span>
                           ))}
                         </div>
@@ -1042,25 +991,25 @@ export function HostMcpSection({ hostId }: { hostId: string }) {
 
                     {probe && probe.ok && (
                       <div className="space-y-1.5">
-                        <div className="text-muted-foreground flex items-center gap-1 text-[11px] font-medium">
+                        <div className="text-ink-muted flex items-center gap-1 text-[11px] font-medium">
                           <Wrench className="h-[11px] w-[11px]" />
                           <span>
-                            Tools ({probe.tools.length})
+                            {t("devTools.tools", { count: probe.tools.length })}
                           </span>
                         </div>
                         {probe.tools.length === 0 ? (
-                          <div className="text-muted-foreground/75 text-[11.5px]">
-                            Server reported no tools.
+                          <div className="text-ink-muted/75 text-[11px]">
+                            {t("devTools.emptyTools")}
                           </div>
                         ) : (
-                          <div className="orbit-native-scroll border-border/60 bg-background/50 max-h-[210px] divide-y divide-border/50 overflow-y-auto overscroll-contain rounded-lg border">
+                          <div className="orbit-native-scroll border-border-subtle/60 bg-surface-raised/50 max-h-[210px] divide-y divide-border-subtle/50 overflow-y-auto overscroll-contain rounded-lg border">
                             {probe.tools.map((tool) => (
                               <div key={tool.name} className="px-2.5 py-1.5">
-                                <div className="text-foreground font-mono text-[11.5px] font-medium">
+                                <div className="text-ink-primary font-mono text-[11px] font-medium">
                                   {tool.name}
                                 </div>
                                 {tool.description && (
-                                  <div className="text-muted-foreground mt-0.5 line-clamp-2 text-[11px] leading-snug">
+                                  <div className="text-ink-muted mt-0.5 line-clamp-2 text-[11px] leading-snug">
                                     {tool.description}
                                   </div>
                                 )}
@@ -1078,16 +1027,31 @@ export function HostMcpSection({ hostId }: { hostId: string }) {
         </SettingCard>
       )}
 
-      {modalState.open && (
-        <McpServerModal
+      <ConfirmDialog
+        open={Boolean(removing)}
+        onOpenChange={(open) => {
+          if (!open) setRemoving(null);
+        }}
+        title={t("devTools.removeServer", { name: removing?.name ?? "" })}
+        tone="danger"
+        confirmLabel={t("common.delete")}
+        onConfirm={handleDelete}
+      />
+      {editor && (
+        <McpServerDrawer
+          open={editor.open}
+          onClosed={() => setEditor(null)}
+          importProjects={importProjects}
           hostId={hostId}
           workspaceCwd={workspaceCwd}
-          editing={modalState.editing}
-          importingFrom={modalState.importingFrom}
-          onClose={() => setModalState({ open: false, editing: null, importingFrom: null })}
+          editing={editor.editing}
+          importingFrom={editor.importingFrom}
+          onClose={() =>
+            setEditor((state) => state && { ...state, open: false })
+          }
           onSave={handleSave}
         />
       )}
-    </div>
+    </section>
   );
 }

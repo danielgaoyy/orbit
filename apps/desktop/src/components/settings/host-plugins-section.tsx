@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -16,13 +16,16 @@ import {
   SettingCard,
   SettingGroupLabel,
   SettingRow,
-  SettingSectionHeader,
+  SettingDrawer,
+  SettingResourceRow,
   ToggleSwitch,
+  useHostIsOnline,
 } from "@/components/settings/settings-primitives";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
-import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
+import { Empty, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
+import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { useI18n } from "@/lib/i18n";
@@ -37,27 +40,128 @@ function notifyPluginsChanged(hostId: string): void {
   }
 }
 
-export function HostPluginsSection({ hostId }: { hostId: string }) {
+const InstallPluginDrawer = memo(function InstallPluginDrawer({
+  open,
+  onOpenChange,
+  hostId,
+  isOnline,
+  onInstalled,
+  onError,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  hostId: string;
+  isOnline: boolean;
+  onInstalled: (pluginId: string) => Promise<void>;
+  onError: (msg: string | null) => void;
+}) {
   const { t } = useI18n();
-  const host = useOrbitSelector((s) => s.fleet.hosts.find((h) => h.host_id === hostId) ?? null);
-  const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
-  const isOnline =
-    host?.connection_state === "online_direct" || host?.connection_state === "online_relay";
+  const [sourcePath, setSourcePath] = useState("");
+  const [enableOnInstall, setEnableOnInstall] = useState(false);
+  const [installing, setInstalling] = useState(false);
+
+  const handleInstall = async () => {
+    const trimmed = sourcePath.trim();
+    if (!trimmed || installing || !isOnline) return;
+    setInstalling(true);
+    onError(null);
+    try {
+      const installed = await orbitIpc.installPlugin(hostId, trimmed, enableOnInstall);
+      setSourcePath("");
+      onOpenChange(false);
+      orbitActions.showToast(t("plugins.installedToast", { name: installed.manifest.name }));
+      await onInstalled(installed.manifest.id);
+      notifyPluginsChanged(hostId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      onError(msg);
+      orbitActions.showToast(msg);
+    } finally {
+      setInstalling(false);
+    }
+  };
+
+  return (
+    <SettingDrawer
+      open={open}
+      onOpenChange={(next) => {
+        if (!installing) onOpenChange(next);
+      }}
+      title={t("plugins.installSection")}
+    >
+      <form
+        className="flex flex-col gap-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void handleInstall();
+        }}
+      >
+        <Field>
+          <FieldLabel htmlFor="plugin-source">{t("managedSkills.pluginSource")}</FieldLabel>
+          <Input
+            id="plugin-source"
+            value={sourcePath}
+            onChange={(e) => setSourcePath(e.target.value)}
+            placeholder={t("plugins.installPlaceholder")}
+            disabled={installing || !isOnline}
+            className="font-mono text-[13px]"
+          />
+        </Field>
+        <SettingCard>
+          <SettingRow
+            title={t("plugins.enableAfterInstallTitle")}
+            description={t("plugins.enableAfterInstallDesc")}
+          >
+            <ToggleSwitch
+              checked={enableOnInstall}
+              disabled={installing || !isOnline}
+              ariaLabel={t("plugins.enableAfterInstallTitle")}
+              onChange={setEnableOnInstall}
+            />
+          </SettingRow>
+        </SettingCard>
+        <Button
+          type="submit"
+          size="sm"
+          className="self-end"
+          disabled={installing || !isOnline || !sourcePath.trim()}
+        >
+          {installing && <OrbitSpinner size={13} />}
+          {t("plugins.installButton")}
+        </Button>
+      </form>
+    </SettingDrawer>
+  );
+});
+
+export const HostPluginsSection = memo(function HostPluginsSection({
+  hostId,
+}: {
+  hostId: string;
+}) {
+  const { t } = useI18n();
+  const isOnline = useHostIsOnline(hostId);
+  const selectedCwd = useOrbitSelector((s) =>
+    s.selectedHostId === hostId ? s.selectedWorkspaceCwd : null,
+  );
   const effectiveCwd = selectedCwd && selectedCwd !== "~" ? selectedCwd : null;
 
   const [plugins, setPlugins] = useState<InstalledPluginView[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [sourcePath, setSourcePath] = useState("");
-  const [enableOnInstall, setEnableOnInstall] = useState(false);
-  const [installing, setInstalling] = useState(false);
-  const [togglingId, setTogglingId] = useState<string | null>(null);
+  const [installOpen, setInstallOpen] = useState(false);
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [uninstallTarget, setUninstallTarget] = useState<InstalledPluginView | null>(null);
   const [previewPluginIds, setPreviewPluginIds] = useState<Record<string, boolean>>({});
   const [opOutputByKey, setOpOutputByKey] = useState<Record<string, string>>({});
   const [runningOpKey, setRunningOpKey] = useState<string | null>(null);
 
   const loadPlugins = useCallback(async () => {
+    if (!isOnline) {
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
@@ -68,49 +172,39 @@ export function HostPluginsSection({ hostId }: { hostId: string }) {
     } finally {
       setLoading(false);
     }
-  }, [hostId]);
+  }, [hostId, isOnline]);
 
   useEffect(() => {
     void loadPlugins();
   }, [loadPlugins]);
 
-  const handleInstall = useCallback(async () => {
-    const trimmed = sourcePath.trim();
-    if (!trimmed) return;
-    setInstalling(true);
-    setError(null);
-    try {
-      const installed = await orbitIpc.installPlugin(hostId, trimmed, enableOnInstall);
-      setSourcePath("");
-      orbitActions.showToast(t("plugins.installedToast", { name: installed.manifest.name }));
+  const handleInstalled = useCallback(
+    async (pluginId: string) => {
+      setSelectedId(pluginId);
+      setDetailOpen(true);
       await loadPlugins();
-      notifyPluginsChanged(hostId);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setError(msg);
-      orbitActions.showToast(msg);
-    } finally {
-      setInstalling(false);
-    }
-  }, [enableOnInstall, hostId, loadPlugins, sourcePath, t]);
+    },
+    [loadPlugins],
+  );
 
   const handleToggleEnabled = useCallback(
     async (plugin: InstalledPluginView, nextEnabled: boolean) => {
       const id = plugin.manifest.id;
-      setTogglingId(id);
+      const prevEnabled = plugin.enabled;
       setError(null);
+      setPlugins((prev) =>
+        prev.map((p) => (p.manifest.id === id ? { ...p, enabled: nextEnabled } : p)),
+      );
       try {
         await orbitIpc.setPluginEnabled(hostId, id, nextEnabled);
-        setPlugins((prev) =>
-          prev.map((p) => (p.manifest.id === id ? { ...p, enabled: nextEnabled } : p)),
-        );
         notifyPluginsChanged(hostId);
       } catch (err) {
+        setPlugins((prev) =>
+          prev.map((p) => (p.manifest.id === id ? { ...p, enabled: prevEnabled } : p)),
+        );
         const msg = err instanceof Error ? err.message : String(err);
         setError(msg);
         orbitActions.showToast(msg);
-      } finally {
-        setTogglingId(null);
       }
     },
     [hostId],
@@ -124,6 +218,7 @@ export function HostPluginsSection({ hostId }: { hostId: string }) {
     setPlugins((prev) => prev.filter((p) => p.manifest.id !== id));
     orbitActions.showToast(t("plugins.uninstalledToast", { name: uninstallTarget.manifest.name }));
     setUninstallTarget(null);
+    setSelectedId(null);
     notifyPluginsChanged(hostId);
   }, [hostId, t, uninstallTarget]);
 
@@ -146,274 +241,234 @@ export function HostPluginsSection({ hostId }: { hostId: string }) {
     [effectiveCwd, hostId],
   );
 
+  const selected = plugins.find((plugin) => plugin.manifest.id === selectedId);
+  const manifest = selected?.manifest;
   return (
-    <div className="flex flex-col gap-6">
-      <SettingSectionHeader
-        title={t("plugins.title")}
-        description={t("plugins.subtitle")}
+    <section data-setting-id="plugins.title" className="flex flex-col gap-2">
+      <SettingGroupLabel
         action={
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={loading || !isOnline}
-            onClick={() => void loadPlugins()}
-          >
-            <RefreshCw data-icon="inline-start" className={loading ? "animate-spin" : undefined} />
-            {t("common.refresh")}
-          </Button>
+          <div className="flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label={t("common.refresh")}
+              disabled={!isOnline || loading}
+              onClick={() => void loadPlugins()}
+            >
+              <RefreshCw />
+            </Button>
+            <Button
+              data-setting-id="plugins.installSection"
+              variant="outline"
+              size="sm"
+              disabled={!isOnline}
+              onClick={() => setInstallOpen(true)}
+            >
+              <Plus data-icon="inline-start" />
+              {t("plugins.installSection")}
+            </Button>
+          </div>
         }
-      />
+      >
+        {t("plugins.title")} · {plugins.length}
+      </SettingGroupLabel>
 
       {error && (
-        <div className="border-signal-danger/30 bg-signal-danger/8 text-signal-danger rounded-[10px] border px-3.5 py-2.5 text-[12px]">
+        <p role="alert" className="text-signal-danger text-[13px]">
           {error}
-        </div>
+        </p>
       )}
-
-      {/* Install Local / GitHub Plugin */}
-      <div className="flex flex-col gap-2">
-        <SettingGroupLabel>{t("plugins.installSection")}</SettingGroupLabel>
-        <SettingCard>
-          <div className="flex flex-col gap-3 px-4 py-3.5">
-            <div className="flex flex-col gap-2 sm:flex-row">
-              <Input
-                value={sourcePath}
-                onChange={(e) => setSourcePath(e.target.value)}
-                placeholder={t("plugins.installPlaceholder")}
-                disabled={installing || !isOnline}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    void handleInstall();
-                  }
-                }}
-                className="flex-1 font-mono text-[12.5px]"
-              />
-              <Button
-                size="sm"
-                disabled={installing || !isOnline || !sourcePath.trim()}
-                onClick={() => void handleInstall()}
-              >
-                {installing ? <OrbitSpinner size={12} /> : <Plus data-icon="inline-start" />}
-                {t("plugins.installButton")}
-              </Button>
-            </div>
-          </div>
-          <SettingRow
-            title={t("plugins.enableAfterInstallTitle")}
-            description={t("plugins.enableAfterInstallDesc")}
-          >
-            <ToggleSwitch
-              checked={enableOnInstall}
-              disabled={installing || !isOnline}
-              ariaLabel={t("plugins.enableAfterInstallTitle")}
-              onChange={setEnableOnInstall}
-            />
-          </SettingRow>
-        </SettingCard>
-      </div>
-
-      {/* Installed Plugins */}
-      <div className="flex flex-col gap-2">
-        <SettingGroupLabel>
-          {t("plugins.installedSection", { count: plugins.length })}
-        </SettingGroupLabel>
-
+      <SettingCard>
         {loading && plugins.length === 0 ? (
-          <SettingCard>
-            <div className="text-ink-muted flex items-center gap-2.5 px-4 py-6 text-[13px]">
-              <OrbitSpinner size={14} />
-              <span>{t("common.loading")}</span>
-            </div>
-          </SettingCard>
-        ) : plugins.length === 0 ? (
-          <SettingCard>
-            <Empty className="border-0 py-8">
-              <EmptyHeader>
-                <EmptyMedia variant="icon">
-                  <Puzzle />
-                </EmptyMedia>
-                <EmptyTitle>{t("plugins.emptyTitle")}</EmptyTitle>
-                <EmptyDescription>{t("plugins.emptyDesc")}</EmptyDescription>
-              </EmptyHeader>
-            </Empty>
-          </SettingCard>
-        ) : (
-          <div className="flex flex-col gap-3">
-            {plugins.map((plugin) => {
-              const m = plugin.manifest;
-              const isPreviewOpen = Boolean(previewPluginIds[m.id]);
-              const hasUiSlots = m.ui_slots.length > 0;
-              const opNames = m.mcp_ops.map((o) => o.name);
-              const fsCount = m.capabilities.fs_read_globs.length;
-              const httpCount = m.capabilities.http_domains.length;
-
-              return (
-                <SettingCard key={m.id}>
-                  <div className="flex flex-col gap-3 px-4 py-3.5">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0 flex-1 space-y-1">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="text-ink-primary text-[13.5px] font-semibold">
-                            {m.name}
-                          </span>
-                          <Badge variant="outline" className="font-mono text-[10.5px]">
-                            v{m.version}
-                          </Badge>
-                          <span className="text-ink-faint font-mono text-[11px]">{m.id}</span>
-                        </div>
-                        {m.description && (
-                          <p className="text-ink-secondary text-[12.5px] leading-[1.45]">
-                            {m.description}
-                          </p>
-                        )}
-                      </div>
-
-                      <div className="flex shrink-0 items-center gap-2">
-                        <ToggleSwitch
-                          checked={plugin.enabled}
-                          disabled={togglingId === m.id || !isOnline}
-                          ariaLabel={m.name}
-                          onChange={(next) => void handleToggleEnabled(plugin, next)}
-                        />
-                        <Button
-                          variant="ghost"
-                          size="icon-sm"
-                          aria-label={t("plugins.uninstallButton")}
-                          disabled={!isOnline}
-                          onClick={() => setUninstallTarget(plugin)}
-                        >
-                          <Trash2 className="text-ink-muted hover:text-signal-danger" />
-                        </Button>
-                      </div>
-                    </div>
-
-                    {/* Declared Capabilities Audit Badges */}
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <Badge variant="outline" className="gap-1 text-[11px]">
-                        <Shield className="size-3" />
-                        WASM Sandbox
-                      </Badge>
-                      {fsCount > 0 ? (
-                        m.capabilities.fs_read_globs.map((glob) => (
-                          <Badge
-                            key={`fs:${glob}`}
-                            variant="secondary"
-                            className="gap-1 font-mono text-[10.5px]"
-                          >
-                            <FolderLock className="size-3" />
-                            {glob}
-                          </Badge>
-                        ))
-                      ) : (
-                        <Badge variant="outline" className="text-ink-muted text-[10.5px]">
-                          {t("plugins.capNoFs")}
-                        </Badge>
-                      )}
-                      {httpCount > 0 ? (
-                        m.capabilities.http_domains.map((domain) => (
-                          <Badge
-                            key={`http:${domain}`}
-                            variant="secondary"
-                            className="gap-1 font-mono text-[10.5px]"
-                          >
-                            <Globe className="size-3" />
-                            {domain}
-                          </Badge>
-                        ))
-                      ) : (
-                        <Badge variant="outline" className="text-ink-muted text-[10.5px]">
-                          {t("plugins.capNoNet")}
-                        </Badge>
-                      )}
-                    </div>
-
-                    {/* Declared MCP Operations */}
-                    {m.mcp_ops.length > 0 && (
-                      <div className="flex flex-col gap-1.5 pt-1">
-                        <div className="text-ink-muted text-[11px] font-medium">
-                          {t("plugins.opsHeading")}
-                        </div>
-                        <div className="flex flex-wrap gap-1.5">
-                          {m.mcp_ops.map((op) => {
-                            const opKey = `${m.id}:${op.name}`;
-                            const running = runningOpKey === opKey;
-                            return (
-                              <Button
-                                key={op.name}
-                                variant="outline"
-                                size="xs"
-                                disabled={!plugin.enabled || !isOnline || running}
-                                title={op.description}
-                                onClick={() => void handleInvokeOp(m.id, op.name)}
-                              >
-                                {running ? (
-                                  <OrbitSpinner size={11} />
-                                ) : (
-                                  <Play data-icon="inline-start" />
-                                )}
-                                <span className="font-mono">{op.name}</span>
-                              </Button>
-                            );
-                          })}
-                        </div>
-                        {m.mcp_ops.map((op) => {
-                          const out = opOutputByKey[`${m.id}:${op.name}`];
-                          if (!out) return null;
-                          return (
-                            <pre
-                              key={`out:${op.name}`}
-                              className="border-border-subtle bg-surface-recessed text-ink-secondary max-h-36 overflow-auto rounded-[8px] border p-2.5 font-mono text-[11px]"
-                            >
-                              {out}
-                            </pre>
-                          );
-                        })}
-                      </div>
-                    )}
-
-                    {/* Inline Live UI Preview */}
-                    {hasUiSlots && plugin.enabled && (
-                      <div className="border-border-subtle/70 flex flex-col gap-2.5 border-t pt-2.5">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setPreviewPluginIds((prev) => ({ ...prev, [m.id]: !prev[m.id] }))
-                          }
-                          className="text-ink-secondary hover:text-ink-primary flex w-fit cursor-pointer items-center gap-1.5 text-[12px] font-medium transition-colors"
-                        >
-                          {isPreviewOpen ? (
-                            <ChevronDown className="size-3.5" />
-                          ) : (
-                            <ChevronRight className="size-3.5" />
-                          )}
-                          <span>{t("plugins.livePreviewToggle")}</span>
-                        </button>
-                        {isPreviewOpen && (
-                          <div className="flex flex-col gap-2.5">
-                            {m.ui_slots.map((slotDecl) => (
-                              <PluginSlotCard
-                                key={slotDecl.slot}
-                                hostId={hostId}
-                                pluginId={m.id}
-                                title={slotDecl.title}
-                                slot={slotDecl.slot}
-                                cwd={effectiveCwd}
-                                mcpOpNames={opNames}
-                              />
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                </SettingCard>
-              );
-            })}
+          <div className="text-ink-muted flex items-center gap-2 px-4 py-5 text-[13px]">
+            <OrbitSpinner size={13} />
+            {t("common.loading")}
           </div>
+        ) : plugins.length === 0 ? (
+          <Empty className="py-5">
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <Puzzle />
+              </EmptyMedia>
+              <EmptyTitle className="text-[13px]">
+                {t(isOnline ? "plugins.emptyTitle" : "sidebar.noHostConnected")}
+              </EmptyTitle>
+            </EmptyHeader>
+          </Empty>
+        ) : (
+          plugins.map((plugin) => (
+            <SettingResourceRow
+              key={plugin.manifest.id}
+              icon={<Puzzle />}
+              title={plugin.manifest.name}
+              description={plugin.manifest.description}
+              status={plugin.manifest.version}
+              onClick={() => {
+                setSelectedId(plugin.manifest.id);
+                setDetailOpen(true);
+              }}
+              action={
+                <ToggleSwitch
+                  checked={plugin.enabled}
+                  disabled={!isOnline}
+                  ariaLabel={plugin.manifest.name}
+                  onChange={(enabled) => void handleToggleEnabled(plugin, enabled)}
+                />
+              }
+            />
+          ))
         )}
-      </div>
+      </SettingCard>
 
+      <InstallPluginDrawer
+        open={installOpen}
+        onOpenChange={setInstallOpen}
+        hostId={hostId}
+        isOnline={isOnline}
+        onInstalled={handleInstalled}
+        onError={setError}
+      />
+      {manifest && selected && (
+        <SettingDrawer
+          open={detailOpen}
+          onOpenChange={setDetailOpen}
+          onOpenChangeComplete={(visible) => {
+            if (!visible) setSelectedId(null);
+          }}
+          title={manifest.name}
+          description={manifest.description}
+        >
+          <div className="flex flex-col gap-4">
+            <p className="text-ink-muted font-mono text-[11px]">
+              {manifest.id} · v{manifest.version}
+            </p>
+            {/* Declared Capabilities Audit Badges */}
+            <div className="flex flex-wrap items-center gap-1.5">
+              <Badge variant="outline" className="gap-1 text-[11px]">
+                <Shield className="size-3" />
+                {t("managedSkills.wasmSandbox")}
+              </Badge>
+              {manifest.capabilities.fs_read_globs.length > 0 ? (
+                manifest.capabilities.fs_read_globs.map((glob) => (
+                  <Badge
+                    key={`fs:${glob}`}
+                    variant="secondary"
+                    className="gap-1 font-mono text-[11px]"
+                  >
+                    <FolderLock className="size-3" />
+                    {glob}
+                  </Badge>
+                ))
+              ) : (
+                <Badge variant="outline" className="text-ink-muted text-[11px]">
+                  {t("plugins.capNoFs")}
+                </Badge>
+              )}
+              {manifest.capabilities.http_domains.length > 0 ? (
+                manifest.capabilities.http_domains.map((domain) => (
+                  <Badge
+                    key={`http:${domain}`}
+                    variant="secondary"
+                    className="gap-1 font-mono text-[11px]"
+                  >
+                    <Globe className="size-3" />
+                    {domain}
+                  </Badge>
+                ))
+              ) : (
+                <Badge variant="outline" className="text-ink-muted text-[11px]">
+                  {t("plugins.capNoNet")}
+                </Badge>
+              )}
+            </div>
+
+            {/* Declared MCP Operations */}
+            {manifest.mcp_ops.length > 0 && (
+              <div className="flex flex-col gap-1.5 pt-1">
+                <div className="text-ink-muted text-[11px] font-medium">
+                  {t("plugins.opsHeading")}
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {manifest.mcp_ops.map((op) => {
+                    const opKey = `${manifest.id}:${op.name}`;
+                    const running = runningOpKey === opKey;
+                    return (
+                      <Button
+                        key={op.name}
+                        variant="outline"
+                        size="xs"
+                        disabled={!selected.enabled || !isOnline || runningOpKey !== null}
+                        title={op.description}
+                        onClick={() => void handleInvokeOp(manifest.id, op.name)}
+                      >
+                        {running ? <OrbitSpinner size={11} /> : <Play data-icon="inline-start" />}
+                        <span className="font-mono">{op.name}</span>
+                      </Button>
+                    );
+                  })}
+                </div>
+                {manifest.mcp_ops.map((op) => {
+                  const out = opOutputByKey[`${manifest.id}:${op.name}`];
+                  if (!out) return null;
+                  return (
+                    <pre
+                      key={`out:${op.name}`}
+                      className="border-border-subtle bg-surface-recessed text-ink-secondary max-h-36 overflow-auto rounded-[8px] border p-2.5 font-mono text-[11px]"
+                    >
+                      {out}
+                    </pre>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Inline Live UI Preview */}
+            {manifest.ui_slots.length > 0 && selected.enabled && (
+              <div className="border-border-subtle/70 flex flex-col gap-2.5 border-t pt-2.5">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setPreviewPluginIds((prev) => ({ ...prev, [manifest.id]: !prev[manifest.id] }))
+                  }
+                  className="text-ink-secondary hover:text-ink-primary flex w-fit cursor-pointer items-center gap-1.5 text-[13px] font-medium transition-colors"
+                >
+                  {previewPluginIds[manifest.id] ? (
+                    <ChevronDown className="size-3.5" />
+                  ) : (
+                    <ChevronRight className="size-3.5" />
+                  )}
+                  <span>{t("plugins.livePreviewToggle")}</span>
+                </button>
+                {previewPluginIds[manifest.id] && (
+                  <div className="flex flex-col gap-2.5">
+                    {manifest.ui_slots.map((slotDecl) => (
+                      <PluginSlotCard
+                        key={slotDecl.slot}
+                        hostId={hostId}
+                        pluginId={manifest.id}
+                        title={slotDecl.title}
+                        slot={slotDecl.slot}
+                        cwd={effectiveCwd}
+                        mcpOpNames={manifest.mcp_ops.map((op) => op.name)}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            <Button
+              variant="outline"
+              size="sm"
+              className="self-start text-signal-danger"
+              disabled={!isOnline}
+              onClick={() => setUninstallTarget(selected)}
+            >
+              <Trash2 data-icon="inline-start" />
+              {t("plugins.uninstallButton")}
+            </Button>
+          </div>
+        </SettingDrawer>
+      )}
       <ConfirmDialog
         open={Boolean(uninstallTarget)}
         onOpenChange={(open) => {
@@ -430,6 +485,6 @@ export function HostPluginsSection({ hostId }: { hostId: string }) {
         defaultAction="cancel"
         onConfirm={handleConfirmUninstall}
       />
-    </div>
+    </section>
   );
-}
+});

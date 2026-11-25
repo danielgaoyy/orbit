@@ -4964,6 +4964,112 @@ async fn approve_voice_permission(
         .map_err(format_voice_rpc_error)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct SystemAudioInputDevice {
+    name: String,
+    is_default: bool,
+    transport: Option<String>,
+}
+
+fn normalize_macos_audio_transport(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let stripped = trimmed
+        .strip_prefix("coreaudio_device_type_")
+        .unwrap_or(trimmed);
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped.to_string())
+    }
+}
+
+fn parse_macos_audio_inputs(json: &str) -> Vec<SystemAudioInputDevice> {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(groups) = root.get("SPAudioDataType").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<SystemAudioInputDevice> = Vec::new();
+    for group in groups {
+        let Some(items) = group.get("_items").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for item in items {
+            let has_input = item
+                .get("coreaudio_device_input")
+                .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|n| n as u64)))
+                .is_some_and(|channels| channels > 0);
+            if !has_input {
+                continue;
+            }
+            let Some(name) = item
+                .get("_name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let is_default = item
+                .get("coreaudio_default_audio_input_device")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v.eq_ignore_ascii_case("spaudio_yes"));
+            let transport = item
+                .get("coreaudio_device_transport")
+                .and_then(|v| v.as_str())
+                .and_then(normalize_macos_audio_transport);
+
+            if let Some(existing) = out
+                .iter_mut()
+                .find(|entry| entry.name.eq_ignore_ascii_case(name))
+            {
+                existing.is_default |= is_default;
+                if existing.transport.is_none() {
+                    existing.transport = transport;
+                }
+            } else {
+                out.push(SystemAudioInputDevice {
+                    name: name.to_string(),
+                    is_default,
+                    transport,
+                });
+            }
+        }
+    }
+
+    out
+}
+
+#[tauri::command]
+async fn list_system_audio_inputs() -> Vec<SystemAudioInputDevice> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::process::Command::new("/usr/sbin/system_profiler")
+                .args(["SPAudioDataType", "-json"])
+                .output(),
+        )
+        .await;
+        match output {
+            Ok(Ok(out)) if out.status.success() => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                parse_macos_audio_inputs(&text)
+            }
+            _ => Vec::new(),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
 #[tauri::command]
 async fn synthesize_voice_speech(
     state: State<'_, DesktopAppState>,
@@ -5391,6 +5497,7 @@ pub fn run() {
             parse_voice_transcript,
             approve_voice_permission,
             synthesize_voice_speech,
+            list_system_audio_inputs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Orbit Tauri desktop application");
@@ -5488,5 +5595,56 @@ mod tests {
         );
         core.unsubscribe_terminal_binary(rx_b1.subscription_id());
         assert_eq!(core.active_terminal_binary_subscriber_count(), 0);
+    }
+
+    #[test]
+    fn parse_macos_audio_inputs_extracts_bluetooth_and_builtin_mics_only() {
+        let sample = r#"{
+          "SPAudioDataType": [
+            {
+              "_items": [
+                {
+                  "_name": "DELL S2721DGF",
+                  "coreaudio_device_output": 2,
+                  "coreaudio_device_transport": "coreaudio_device_type_hdmi"
+                },
+                {
+                  "_name": "MacBook Pro麦克风",
+                  "coreaudio_device_input": 1,
+                  "coreaudio_device_transport": "coreaudio_device_type_builtin"
+                },
+                {
+                  "_name": "Xiaomi Buds 6",
+                  "coreaudio_default_audio_input_device": "spaudio_yes",
+                  "coreaudio_device_input": 1,
+                  "coreaudio_device_transport": "coreaudio_device_type_bluetooth"
+                },
+                {
+                  "_name": "Xiaomi Buds 6",
+                  "coreaudio_default_audio_output_device": "spaudio_yes",
+                  "coreaudio_device_output": 2,
+                  "coreaudio_device_transport": "coreaudio_device_type_bluetooth"
+                }
+              ]
+            }
+          ]
+        }"#;
+        let parsed = parse_macos_audio_inputs(sample);
+        assert_eq!(
+            parsed,
+            vec![
+                SystemAudioInputDevice {
+                    name: "MacBook Pro麦克风".to_string(),
+                    is_default: false,
+                    transport: Some("builtin".to_string()),
+                },
+                SystemAudioInputDevice {
+                    name: "Xiaomi Buds 6".to_string(),
+                    is_default: true,
+                    transport: Some("bluetooth".to_string()),
+                },
+            ]
+        );
+        assert!(parse_macos_audio_inputs("not json").is_empty());
     }
 }

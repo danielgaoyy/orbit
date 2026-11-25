@@ -978,6 +978,45 @@ impl OrbitStore {
         })
     }
 
+    /// Re-insert a previously taken queued prompt at the front of `agent_id`'s FIFO queue
+    /// (preserving its `queue_id`, `created_at`, and ordering ahead of later queued items).
+    pub fn requeue_agent_prompt_front(
+        &self,
+        agent_id: &str,
+        item: &StoredQueuedPrompt,
+    ) -> Result<QueuedPromptView, StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        let min_order: Option<i64> = tx.query_row(
+            "SELECT MIN(sort_order) FROM agent_queued_prompts WHERE agent_id = ?1",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+        let front_order = min_order.map_or(1, |m| m.saturating_sub(1));
+        let badges_json = serde_json::to_string(&item.badges)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO agent_queued_prompts
+             (queue_id, agent_id, sort_order, wire_prompt, display_prompt, badges_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                item.queue_id,
+                agent_id,
+                front_order,
+                item.wire_prompt,
+                item.display_prompt,
+                badges_json,
+                item.created_at.to_rfc3339(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(QueuedPromptView {
+            queue_id: item.queue_id.clone(),
+            display_text: item.display_prompt.clone(),
+            badges: item.badges.clone(),
+            created_at: item.created_at,
+        })
+    }
+
     pub fn remove_queued_prompt(&self, agent_id: &str, queue_id: &str) -> Result<bool, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let affected = conn.execute(

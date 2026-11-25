@@ -40,8 +40,8 @@ import {
   type ReasoningEffort,
   type SessionMode,
   type SlashDirective,
-  isAgentForegroundRunning,
   orbitIpc,
+  resolvePromptDispatchMode,
 } from "@/lib/orbit-ipc";
 import {
   INITIAL_STAGE_TURN_WINDOW,
@@ -844,6 +844,73 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
     },
 
 
+    async dispatchDirectAgentPrompt(
+      hostId: string,
+      agentId: string,
+      prompt: string,
+      opts?: {
+        displayPrompt?: string;
+        badges?: PromptBadge[];
+        steerImmediately?: boolean;
+      },
+    ): Promise<"sent" | "queued"> {
+      const state = getState();
+      const detail = state.hostDetails[hostId];
+      const scopeKey = `${hostId}::${agentId}`;
+      const activeAgent =
+        detail?.agents.find((a) => a.agent_id === agentId) ??
+        state.stages[scopeKey]?.agent;
+      const supportsServerQueue = Boolean(detail?.host.supports_server_queue);
+      const wantsSteer =
+        opts?.steerImmediately ?? (state.activeTurnSendBehavior === "steer");
+      const dispatchMode = resolvePromptDispatchMode(
+        activeAgent,
+        supportsServerQueue,
+        wantsSteer,
+      );
+      const displayPrompt = opts?.displayPrompt ?? prompt;
+      const badges = opts?.badges;
+
+      if (dispatchMode === "enqueue_server") {
+        const queueId = `q_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        await orbitIpc.enqueuePrompt(hostId, agentId, prompt, {
+          displayPrompt,
+          ...(badges ? { badges } : {}),
+          queueId,
+        });
+        return "queued";
+      }
+
+      if (dispatchMode === "enqueue_local") {
+        const queuedItem: QueuedPromptItem = {
+          id: `q_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          wirePrompt: prompt,
+          displayText: displayPrompt,
+          badges: badges ?? [],
+          slashDirective: null,
+          contexts: [],
+          pastes: [],
+          quotes: [],
+        };
+        setState((s) => ({
+          ...s,
+          queuedPrompts: {
+            ...s.queuedPrompts,
+            [scopeKey]: [...(s.queuedPrompts[scopeKey] ?? []), queuedItem],
+          },
+        }));
+        return "queued";
+      }
+
+      await orbitIpc.sendPrompt(hostId, agentId, prompt, {
+        displayPrompt,
+        ...(badges ? { badges } : {}),
+        ...(dispatchMode === "steer" ? { activeTurnBehavior: "steer" } : {}),
+      });
+      return "sent";
+    },
+
+
     async dispatchInlineCodeEdit(
       params: InlineAiEditPromptParams,
     ): Promise<"sent" | "queued" | "composer"> {
@@ -874,16 +941,21 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       const detail = state.hostDetails[hostId];
       const activeAgent = detail?.agents.find((a) => a.agent_id === agentId);
       const supportsServerQueue = Boolean(detail?.host.supports_server_queue);
+      const dispatchMode = resolvePromptDispatchMode(
+        activeAgent,
+        supportsServerQueue,
+        state.activeTurnSendBehavior === "steer",
+      );
 
-      if (isAgentForegroundRunning(activeAgent) || activeAgent?.is_awaiting_permission) {
-        if (supportsServerQueue) {
+      if (dispatchMode === "enqueue_server" || dispatchMode === "enqueue_local") {
+        if (dispatchMode === "enqueue_server") {
           const queueId = `q_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
           await orbitIpc.enqueuePrompt(hostId, agentId, built.wirePrompt, {
             displayPrompt: built.displayPrompt,
             queueId,
           });
         } else {
-          const key = composerScopeKey(state);
+          const key = `${hostId}::${agentId}`;
           const queuedItem: QueuedPromptItem = {
             id: `q_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
             wirePrompt: built.wirePrompt,
@@ -915,6 +987,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       );
       await orbitIpc.sendPrompt(hostId, agentId, built.wirePrompt, {
         displayPrompt: built.displayPrompt,
+        ...(dispatchMode === "steer" ? { activeTurnBehavior: "steer" } : {}),
       });
       notifyToast(
         translateGlobal("sidePanel.editorAiEditDispatched", { range: built.rangeLabel }),
@@ -1245,9 +1318,52 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         pastes: [],
       });
 
+      const liveState = getState();
+      const liveDetail = liveState.hostDetails[hostId];
+      const liveAgent = liveDetail?.agents.find((a) => a.agent_id === agentId);
+      const supportsServerQueue = Boolean(liveDetail?.host.supports_server_queue);
+      const dispatchMode = resolvePromptDispatchMode(
+        liveAgent,
+        supportsServerQueue,
+        liveState.activeTurnSendBehavior === "steer",
+      );
+
+      if (dispatchMode === "enqueue_server") {
+        const queueId = `q_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        await orbitIpc.enqueuePrompt(hostId, agentId, composed.wire_prompt, {
+          displayPrompt: composed.display_prompt,
+          badges: composed.badges,
+          queueId,
+        });
+        return;
+      }
+
+      if (dispatchMode === "enqueue_local") {
+        const key = `${hostId}::${agentId}`;
+        const queuedItem: QueuedPromptItem = {
+          id: `q_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          wirePrompt: composed.wire_prompt,
+          displayText: composed.display_prompt,
+          badges: composed.badges,
+          slashDirective: "compact",
+          contexts: [],
+          pastes: [],
+          quotes: [],
+        };
+        setState((s) => ({
+          ...s,
+          queuedPrompts: {
+            ...s.queuedPrompts,
+            [key]: [...(s.queuedPrompts[key] ?? []), queuedItem],
+          },
+        }));
+        return;
+      }
+
       await orbitIpc.sendPrompt(hostId, agentId, composed.wire_prompt, {
         displayPrompt: composed.display_prompt,
         badges: composed.badges,
+        ...(dispatchMode === "steer" ? { activeTurnBehavior: "steer" } : {}),
       });
     },
 
@@ -1900,10 +2016,59 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         }));
         draftPersistence.flushNow();
         try {
-          await orbitIpc.sendPrompt(submitTarget.hostId, submitTarget.agentId, composed.wire_prompt, {
-            displayPrompt: composed.display_prompt,
-            badges: composed.badges,
-          });
+          const detail = getState().hostDetails[submitTarget.hostId];
+          const activeAgent = detail?.agents.find((a) => a.agent_id === submitTarget.agentId);
+          const supportsServerQueue = Boolean(detail?.host.supports_server_queue);
+          const dispatchMode = resolvePromptDispatchMode(
+            activeAgent,
+            supportsServerQueue,
+            steerImmediately,
+          );
+          if (dispatchMode === "enqueue_server") {
+            const queueId = `q_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            await orbitIpc.enqueuePrompt(
+              submitTarget.hostId,
+              submitTarget.agentId,
+              composed.wire_prompt,
+              {
+                displayPrompt: composed.display_prompt,
+                badges: composed.badges,
+                queueId,
+              },
+            );
+          } else if (dispatchMode === "enqueue_local") {
+            const queuedItem: QueuedPromptItem = {
+              id: `q_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+              wirePrompt: composed.wire_prompt,
+              displayText: composed.display_prompt,
+              badges: composed.badges,
+              slashDirective: "compact",
+              contexts: [],
+              pastes: [],
+              quotes: [],
+            };
+            setState((s) => ({
+              ...s,
+              queuedPrompts: {
+                ...s.queuedPrompts,
+                [submitTarget.scopeKey]: [
+                  ...(s.queuedPrompts[submitTarget.scopeKey] ?? []),
+                  queuedItem,
+                ],
+              },
+            }));
+          } else {
+            await orbitIpc.sendPrompt(
+              submitTarget.hostId,
+              submitTarget.agentId,
+              composed.wire_prompt,
+              {
+                displayPrompt: composed.display_prompt,
+                badges: composed.badges,
+                ...(dispatchMode === "steer" ? { activeTurnBehavior: "steer" } : {}),
+              },
+            );
+          }
         } catch (err) {
           setState((s) => ({
             ...s,
@@ -2254,16 +2419,21 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         const detail = getState().hostDetails[submitTarget.hostId];
         const activeAgent = detail?.agents.find((a) => a.agent_id === agentId);
         const supportsServerQueue = Boolean(detail?.host.supports_server_queue);
+        const dispatchMode = resolvePromptDispatchMode(
+          activeAgent,
+          supportsServerQueue,
+          steerImmediately,
+        );
 
-        if (isAgentForegroundRunning(activeAgent) || activeAgent?.is_awaiting_permission) {
-          if (steerImmediately) {
+        if (dispatchMode !== "send_idle") {
+          if (dispatchMode === "steer") {
             await orbitIpc.sendPrompt(submitTarget.hostId, agentId, assembledWirePrompt, {
               displayPrompt: cleanUserText,
               badges,
               activeTurnBehavior: "steer",
             });
             commitSubmissionSuccess();
-          } else if (supportsServerQueue) {
+          } else if (dispatchMode === "enqueue_server") {
             const queuedContexts: ContextMentionItem[] = mergedContexts.map((ctx) => {
               if (ctx.kind === "file" && ctx.previewUrl && pendingRevokeUrls.has(ctx.previewUrl)) {
                 return { ...ctx, previewUrl: undefined };
@@ -2473,18 +2643,18 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
 
       setState((s) => ({
         ...s,
+        sessionScrollNonce: s.sessionScrollNonce + 1,
         queuedPrompts: {
           ...s.queuedPrompts,
           [key]: list.filter((_, idx) => idx !== index),
         },
       }));
       const activeAgent = getState().hostDetails[hostId]?.agents.find((a) => a.agent_id === agentId);
-      if (isAgentForegroundRunning(activeAgent) || activeAgent?.is_awaiting_permission) {
-        await orbitIpc.interruptAgent(hostId, agentId);
-      }
+      const awaitingPermission = Boolean(activeAgent?.is_awaiting_permission);
       await orbitIpc.sendPrompt(hostId, agentId, target.wirePrompt, {
         displayPrompt: target.displayText,
         badges: target.badges,
+        activeTurnBehavior: awaitingPermission ? "interrupt" : "steer",
       });
     },
 

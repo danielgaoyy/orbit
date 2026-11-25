@@ -57,12 +57,20 @@ export function useGlobalErgonomicKeybindings(): void {
   const lastEscTimeRef = useRef<number>(0);
 
   useEffect(() => {
+    const innerEscapes = new WeakSet<KeyboardEvent>();
+    const captureOverlayEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && orbitActions.getSnapshot().activeView === "settings"
+        && hasOpenSettingsBlockingOverlay()) innerEscapes.add(event);
+    };
     const onKeyDown = (e: KeyboardEvent) => {
       const snap = orbitActions.getSnapshot();
       const custom = snap.customKeybindings;
       const isMac = isMacDesktop();
       const mod = isMac ? e.metaKey : e.ctrlKey;
       const keyLower = e.key.toLowerCase();
+
+      // A nested layer may have already dismissed itself during event propagation.
+      if (e.defaultPrevented || e.isComposing) return;
 
       // Guard: shortcut recorder & confirmation alertdialogs own keyboard focus
       if (isShortcutRecorderActive() || isConfirmDialogOpen()) {
@@ -83,7 +91,7 @@ export function useGlobalErgonomicKeybindings(): void {
       // 1a. Focus-aware Find (`⌘F` / custom) and Sidebar Filter (`⌘⇧F` / custom)
       const isCustomFind = Boolean(custom.find);
       const isCustomSidebarFilter = Boolean(custom.sidebar_filter);
-      if (isCustomSidebarFilter && matchesActionChord(e, "sidebar_filter", custom, isMac)) {
+      if (snap.activeView !== "settings" && isCustomSidebarFilter && matchesActionChord(e, "sidebar_filter", custom, isMac)) {
         e.preventDefault();
         if (e.repeat) return;
         orbitActions.focusSidebarFilter();
@@ -160,6 +168,7 @@ export function useGlobalErgonomicKeybindings(): void {
       // 1c. Escape inside Settings View returns instantaneously to Workspace
       if (e.key === "Escape" && snap.activeView === "settings") {
         const hasBlockingOverlay =
+          innerEscapes.has(e) ||
           snap.pairDialogOpen ||
           snap.relayDialogOpen ||
           snap.remoteFolderPickerHostId !== null ||
@@ -171,7 +180,6 @@ export function useGlobalErgonomicKeybindings(): void {
             defaultPrevented: e.defaultPrevented,
             activeView: snap.activeView,
             commandPaletteOpen: snap.commandPaletteOpen,
-            targetTagName: (e.target as HTMLElement | null)?.tagName,
             hasBlockingOverlay,
           })
         ) {
@@ -180,6 +188,8 @@ export function useGlobalErgonomicKeybindings(): void {
           return;
         }
       }
+
+      if (snap.activeView === "settings") return;
 
       // 2. Toggle Terminal Tab in Side Panel (`⌘J` / `Ctrl+\`` / custom) — works even inside terminal
       if (matchesActionChord(e, "toggle_terminal", custom, isMac)) {
@@ -196,7 +206,6 @@ export function useGlobalErgonomicKeybindings(): void {
 
       // Guard: do not toggle workspace panels behind full-window Settings or modal dialogs
       const isModalOverlayOpen =
-        snap.activeView === "settings" ||
         snap.commandPaletteOpen ||
         snap.quickOpenFilesOpen ||
         snap.pairDialogOpen ||
@@ -470,7 +479,11 @@ export function useGlobalErgonomicKeybindings(): void {
       }
     };
 
+    window.addEventListener("keydown", captureOverlayEscape, true);
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", captureOverlayEscape, true);
+      window.removeEventListener("keydown", onKeyDown);
+    };
   }, []);
 }

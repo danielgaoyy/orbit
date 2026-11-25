@@ -17,6 +17,7 @@ export interface SelectProps<T extends string | number> {
   value: T | null;
   options: readonly SelectOption<T>[];
   onChange: (value: T) => void;
+  onOpenChange?: (open: boolean) => void;
   placeholder?: string;
   disabled?: boolean;
   size?: "default" | "sm" | "compact";
@@ -41,6 +42,7 @@ function renderSelectOptionItem<T extends string | number>(opt: SelectOption<T>)
     >
       <div className="min-w-0 flex-1">
         <BaseSelect.ItemText
+          data-slot="select-item-label"
           className={cn(
             "text-foreground/90 data-[selected]:text-foreground block truncate text-[12.5px] data-[selected]:font-medium",
             opt.mono && "font-mono text-[12px]",
@@ -49,7 +51,7 @@ function renderSelectOptionItem<T extends string | number>(opt: SelectOption<T>)
           {opt.label}
         </BaseSelect.ItemText>
         {opt.description && (
-          <div className="text-muted-foreground mt-0.5 text-[11.5px] leading-snug">
+          <div data-slot="select-item-description" className="text-muted-foreground mt-0.5 text-[11.5px] leading-snug">
             {opt.description}
           </div>
         )}
@@ -57,7 +59,7 @@ function renderSelectOptionItem<T extends string | number>(opt: SelectOption<T>)
 
       <span className="flex shrink-0 items-center gap-1.5">
         {opt.badge && (
-          <span className="text-muted-foreground/65 text-[10.5px]">{opt.badge}</span>
+          <span data-slot="select-item-badge" className="text-muted-foreground/65 text-[10.5px]">{opt.badge}</span>
         )}
         <BaseSelect.ItemIndicator
           className={cn(
@@ -81,6 +83,7 @@ export function Select<T extends string | number>({
   value,
   options,
   onChange,
+  onOpenChange,
   placeholder = "Select…",
   disabled = false,
   size = "default",
@@ -122,8 +125,11 @@ export function Select<T extends string | number>({
       value={value}
       disabled={disabled}
       modal={false}
+      onOpenChange={(open) => {
+        if (!disabled) onOpenChange?.(open);
+      }}
       onValueChange={(next) => {
-        if (next !== null && next !== value) {
+        if (!disabled && next !== null && next !== value) {
           onChange(next);
         }
       }}
@@ -132,7 +138,7 @@ export function Select<T extends string | number>({
         aria-label={ariaLabel ?? ariaLabelAttr}
         data-slot="select-trigger"
         className={cn(
-          "border-border bg-background text-foreground hover:bg-accent/70 focus-visible:ring-foreground/20 flex cursor-pointer items-center justify-between border font-medium transition-colors outline-none focus-visible:ring-1 disabled:pointer-events-none disabled:opacity-45",
+          "border-border bg-background text-foreground hover:bg-accent/70 focus-visible:ring-foreground/20 flex cursor-pointer items-center justify-between border font-medium transition-colors outline-none focus-visible:ring-1 disabled:pointer-events-none disabled:opacity-45 data-[disabled]:pointer-events-none data-[disabled]:opacity-45",
           sizeClass,
           triggerClassName,
         )}

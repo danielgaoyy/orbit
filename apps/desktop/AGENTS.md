@@ -21,7 +21,7 @@
    npx tsc -p tsconfig.app.json --noEmit
    node --experimental-strip-types --test "src/**/*.test.ts"
    npm run build
-   npm run test:smoke   # 3 项 Chrome CDP 场景全过且 consoleErrors=0
+   npm run test:smoke   # 5 项 Chrome CDP 场景全过且 consoleErrors=0
    ```
    ```bash
    cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check

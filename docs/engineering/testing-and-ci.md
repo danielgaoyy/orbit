@@ -43,7 +43,7 @@ In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight
 
 ## 2. `e2e_pitfall_regressions` 历史踩坑回归清单
 
-[`crates/orbit-cli/tests/e2e_pitfall_regressions.rs`](../../crates/orbit-cli/tests/e2e_pitfall_regressions.rs) 固化了过往生产故障的自动化端到端拦截（其中基于 Unix Python mock / 进程组的 10 条通过 `#[cfg(unix)]` 门控，跨平台 3 条在 Linux/macOS/Windows 均运行）：
+[`crates/orbit-cli/tests/e2e_pitfall_regressions.rs`](../../crates/orbit-cli/tests/e2e_pitfall_regressions.rs) 固化了过往生产故障的自动化端到端拦截（其中基于 Unix Python mock / 进程组的 11 条通过 `#[cfg(unix)]` 门控，跨平台 3 条在 Linux/macOS/Windows 均运行）：
 
 | 用例名 | 平台 | 覆盖的历史生产故障 |
 | --- | --- | --- |
@@ -60,6 +60,7 @@ In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight
 | `pitfall_11_antigravity_open_rpc_background_wait_settles_and_wakes_without_stall` | Unix | Antigravity 在 `session/prompt` 持长挂起等待后台定时器期间，已生成回复即时收敛为 `streaming: false` 并转入 `Waiting for 1 timer` 静止态、定时器触发后经同一长连接唤醒续写独立回复并干净回到 `Idle` |
 | `pitfall_12_antigravity_event_driven_wakeup_late_reply_and_acp_replay_dedup` | Unix | Antigravity OS 事件驱动（`notify`）监听唤醒：`WAKEUP_IDLE_SETTLE_GRACE` 回落后迟到 `PLANNER_RESPONSE` 零等待自动冲刷恢复、以及新一轮提示词触发 `agy` ACP 重放历史唤醒消息/思考/工具/运行中后台任务的幂等去重与真实回复保留 |
 | `pitfall_13_antigravity_watcher_no_deadlock_initializing_reattach_and_archive_ack` | Unix | `AgyBrainWatcher` 并发文件写入与 watch 变更无 AB-BA 死锁、重启重连 `Initializing` 会话恢复 `Idle` 并提示未送达首条消息、以及 `archive_workspace_confirmed` 真实 Ack 与错误透传 |
+| `pitfall_14_cross_provider_bg_wait_synthetic_plan_gate_and_permission_steer` | Unix | 跨 Provider 交互语义对齐：Claude `bgwait_*` 后台任务等待态 Stage 持久展示、Codex 合成计划审批门（`plan_approval`）排队队列冲刷零死锁、以及待审批门期间人类 Steer 走 Option A 无损排队不丢失 |
 
 > **编写规则**：凡修复涉及消息流转、分端状态同步、Relay 建连或并行协作的生产 Bug，必须在同一 PR 中新增最小复现回归用例。
 
@@ -69,11 +70,13 @@ In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight
 
 ## 3. Desktop Chrome Runtime Smoke（防前端白屏/React `#185`）
 
-[`apps/desktop/scripts/smoke-render.mjs`](../../apps/desktop/scripts/smoke-render.mjs) 启动真实静态资源服务器与无头 Chrome CDP，校验 0 console/pageerror 与非空 UI 渲染，当前固定验证 3 个场景：
+[`apps/desktop/scripts/smoke-render.mjs`](../../apps/desktop/scripts/smoke-render.mjs) 启动真实静态资源服务器与无头 Chrome CDP，校验 0 console/pageerror 与非空 UI 渲染，当前固定验证 5 个场景：
 
 1. `bare-browser-empty-host`
 2. `mocked-tauri-active-session`
 3. `mocked-tauri-paginated-large-session`（模拟 `total_turn_count: 120` 仅下发尾部 3 轮窗口 `turn_index` 117..119 的分页大图渲染）
+4. `mocked-tauri-local-settings`（全窗布局、键盘搜索与重置、抽屉关闭、草稿和焦点恢复）
+5. `mocked-tauri-multi-host-settings`（主机切换保留当前设置页、MCP 配置按主机隔离）
 
 ---
 

@@ -20,8 +20,8 @@ Canonical visual, typography, motion, and spatial token reference for `apps/desk
 ### 2.1 Neutral Surfaces (OKLCH 258°)
 | Token | Light (`Alabaster Paper`) | Dark (`Obsidian Graphite`) | Usage |
 | --- | --- | --- | --- |
-| `--surface-recessed` | `#F5F6F8` | `#121318` | Code wells, terminal backdrop, diff panes, segmented tracks, settings rail |
-| `--surface-base` | `#FCFCFE` | `#17181E` | App canvas, sidebar, main conversation stage, side-panel body |
+| `--surface-recessed` | `#F5F6F8` | `#121318` | Code wells, terminal backdrop, diff panes, segmented tracks |
+| `--surface-base` | `#FCFCFE` | `#17181E` | App canvas, sidebar, main conversation stage, side-panel body, Settings rail and canvas |
 | `--surface-raised` | `#FFFFFF` | `#20222B` | Cards, Composer shell, Queue strip, Overview HUD, DecisionDock |
 | `--surface-overlay` | `#FFFFFF` | `#272A35` | Popovers, dropdowns, modals, tooltips, toasts |
 
@@ -89,10 +89,10 @@ Always compose official `shadcn/ui` (`base-nova` / `@base-ui/react`) and Orbit p
    - Any upward human scroll detaches sticky follow immediately; idle `ResizeObserver` never snaps while dock/shelf height changes compensate scroll cleanly. `holdViewport` pins disclosure triggers and reveals clamped previews for tall disclosures.
    - `UserPromptBubble` and `ConversationUserBubble` collapse on clicking anywhere outside the bubble card.
    - Full-history Outline Rail projects all `SessionInsightsView.outline_prompts`, shows up to 17 ticks before folding earlier prompts, and auto-paginates when jumping to unloaded history.
-2. **Steps, Footers & Parallel Viewport Parity** (`stage-step-group.tsx`, `subagents-track.tsx`, `subagent-tab.tsx`, `peer-split-tab.tsx`):
+2. **Steps, Footers & Parallel Viewport Parity** (`stage-step-group.tsx`, `stage-activity-wave.tsx`, `subagents-track.tsx`, `subagent-tab.tsx`, `agent-stage-pane.tsx`):
    - Folded steps compose `Trace`; compaction/wakeup milestones use `Marker`. Groups of ≥ 10 steps show a bottom collapse action. Stalled live runs or queued subagent deliveries surface inline status & `Interrupt & continue` / `Interrupt & deliver` controls.
-   - Historical `TurnFooter` reveals on hover/focus/touch; `StreamStage`, `SubagentTab`, and `PeerSplitTab` share `TurnStageSection`, `getTurnFooter`, and `getTurnTopGapPx`.
-   - `SubagentDispatchRow` and `PeerMessageRow` share a negative-bleed row shell aligned at `x = 0px` with prose. Child subagents live exclusively in the Right Side Panel (`selectAgent` routes child selections to parent thread + right panel).
+   - Historical `TurnFooter` reveals on hover/focus/touch; `StreamStage`, `SubagentTab`, and `AgentStagePane` share `TurnStageSection`, `getTurnFooter`, `getTurnTopGapPx`, and `StageActivityWave`.
+   - Timeline subagent dispatches coalesce into quiet monochrome `Trace` rows (`Dispatched {name}` / `Dispatched A, B` / `Dispatched N subagents`, with semantic-only warning/danger suffixes), leaving rich animal portraits, live timers, and nested trees exclusively to the Overview HUD and TopBar Mini-Dock. `PeerMessageRow` keeps a negative-bleed row shell aligned at `x = 0px` with prose. Active concurrent background dependencies (awaiting/running subagents, background tasks, armed timers, active goal) surface via `StageActivityWave` (minimal content-width concentric ripple emblem + calm shimmer summary, no hover pill background or trailing Overview hint, clickable only while the Overview preview card is hidden) at the bottom of the message stream. Child subagents live exclusively in the Right Side Panel (`selectAgent` routes child selections to parent thread + right panel).
 3. **Composer Dock Stack** (`components/composer/`, `stage-approval-dock.tsx`):
    - Reading column stacks `DecisionDock` → `ComposerPlanShelf` → `ComposerQueueStrip` → `OmniComposer`.
    - `InlineDirectiveToken` (`composer-directive-token.tsx`) is frameless, colorless, baseline-locked (`items-baseline` + `self-center` icon), and shared across `OmniComposer`, `UserPromptBubble`, and `ComposerQueueStrip`.
@@ -104,4 +104,8 @@ Always compose official `shadcn/ui` (`base-nova` / `@base-ui/react`) and Orbit p
 5. **Sidebar & Side Panel** (`components/sidebar/`, `components/side-panel/`, `settings/`):
    - `Needs Attention` and `Pinned` share `SidebarConversationRow` and deduplicate below. Each row reserves a `16px` leading signal column (awaiting / error / unread / idle armed timer `<AlarmClock>` / worktree) and a single non-shifting trailing status/action cell (foreground work & running subagents spin; idle timer-waiting threads stay calm & talkable).
    - File preview (`file-viewer-tab.tsx`, `workspace-slice.ts`) uses Rust 250-line prefix highlighting, promise-deduplicated intent prefetch (`pointerdown` + `65ms` hover dwell), stale-while-revalidate cache, and a `120ms` loading grace delay.
-   - Settings uses a `236px` 3-group rail (`APP` with top-level `Personal Agent`, `HOST` with collapsed manual Relay overrides in `Host Connection`, `WORKSPACE`), zero-config `Automatic Fleet Network` in `Cloud Sync`, and harmonized terminal palettes (`--surface-recessed`).
+6. **Desktop Settings** (`components/settings/`):
+   - Settings opens as a centered floating modal (`min(1180px, 92vw) × min(820px, 88vh)`, `rounded-[16px]`, `.floating-surface`) above the mounted, `inert` workspace. Close (`×`), clicking outside the backdrop, and `Escape` restore workspace focus, draft, and scroll position; inner drawers, menus, dialogs, and active search consume `Escape` first.
+   - A `240px` rail shares the canvas surface with a `1px` subtle divider and fits all 17 destinations under Preferences, Fleet & Sync, Agents & Safety, and Context & Extensions without scrolling on laptop viewports. Preference columns measure up to `680px`, operational pages up to `880px`, and the split Instructions editor fills the available dialog canvas.
+   - Host-scoped pages show a persistent host and transport selector in the `44px` top bar when the fleet includes a remote host or multiple hosts. Fleet details use a breadcrumb. Resource editors slide out as `480px` right drawers contained inside the Settings dialog frame. Page titles, subpage titles, controls and metadata use `20/17/13/11px`.
+   - Settings search uses real row anchors. A jump opens the target disclosure, scrolls it into view and highlights it for `1.2s`. Modal and drawer transitions use opacity and transform, and respect reduced motion.

@@ -1,3 +1,4 @@
+import { preferenceDefaults } from "./preference-defaults";
 import { useCallback, useRef, useSyncExternalStore } from "react";
 import {
   createDraftPersistenceController,
@@ -101,6 +102,7 @@ export {
 };
 export type { StoreTopic };
 export type {
+  ActiveTurnSendBehavior,
   ActiveViewMode,
   ArchivedThreadEntry,
   ComposerFocusOptions,
@@ -159,7 +161,7 @@ const viteHot = (
 const hmrData = viteHot?.data;
 
 const initialPrefs = loadPrefs();
-const initialTheme: ThemeMode = initialPrefs.theme ?? "system";
+const initialTheme: ThemeMode = initialPrefs.theme ?? preferenceDefaults.theme;
 const initialResolvedTheme: ResolvedTheme = resolveTheme(initialTheme);
 applyDocumentTheme(initialResolvedTheme);
 if (typeof document !== "undefined") {

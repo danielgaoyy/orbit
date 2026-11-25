@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { PanelLeft, PanelRight } from "lucide-react";
 import { resyncAllAmbientAnimations } from "@/lib/animation-sync";
 import { AutomationsView } from "@/components/automations/automations-view";
@@ -74,24 +74,24 @@ export default function App() {
 function MainDesktopApp() {
   const isDarkTheme = useOrbitSelector((s) => s.resolvedTheme === "dark");
   const activeView = useOrbitSelector((s) => s.activeView);
-  const settingsSection = useOrbitSelector((s) => s.settingsSection);
   const workspacePanel = useOrbitSelector((s) => s.workspacePanel);
-  const toastNotice = useOrbitSelector((s) => s.toastNotice);
-  const toastAction = useOrbitSelector((s) => s.toastAction);
-  const lastArchivedUndo = useOrbitSelector((s) => s.lastArchivedUndo);
 
-  // Presence state for smooth Settings modal enter & exit
+  // Keep the workspace DOM and its original keyboard focus through the Settings transition.
   const isSettingsOpen = activeView === "settings";
   const [settingsMounted, setSettingsMounted] = useState(isSettingsOpen);
   const [settingsClosing, setSettingsClosing] = useState(false);
 
-  // Presence state for smooth Toast enter & exit (monotonic revision key re-triggers enter on replacement)
-  const [renderedToast, setRenderedToast] = useState<string | null>(toastNotice);
-  const [renderedToastAction, setRenderedToastAction] = useState<ToastAction | null>(toastAction);
-  const [toastExiting, setToastExiting] = useState(false);
-  const [toastRevision, setToastRevision] = useState(0);
-  const renderedToastRef = useRef<string | null>(renderedToast);
-  renderedToastRef.current = renderedToast;
+  const returnFocus = useRef<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (isSettingsOpen && !settingsMounted) {
+      returnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    } else if (!isSettingsOpen && !settingsMounted && returnFocus.current) {
+      if (returnFocus.current.isConnected && !document.querySelector('[aria-modal="true"]')) {
+        returnFocus.current.focus({ preventScroll: true });
+      }
+      returnFocus.current = null;
+    }
+  }, [isSettingsOpen, settingsMounted]);
 
   useGlobalErgonomicKeybindings();
 
@@ -281,6 +281,54 @@ function MainDesktopApp() {
     }
   }, [isSettingsOpen, settingsMounted]);
 
+  return (
+    <TooltipProvider>
+      <MarkdownThemeProvider isDark={isDarkTheme}>
+        {/* Centered Floating Settings Modal (`⌘,`) with Smooth Enter/Exit */}
+        {settingsMounted && (
+          <PanelErrorBoundary
+            panelName="Settings"
+            resetKey={activeView}
+            className="fixed inset-0 z-40"
+          >
+            <SettingsView closing={settingsClosing} />
+          </PanelErrorBoundary>
+        )}
+
+        {/* Main Workspace Shell coordinated by 100% GPU WorkspaceMotionProvider */}
+        <WorkspaceMotionProvider>
+          <WorkspaceShellLayout isSettingsOpen={settingsMounted} workspacePanel={workspacePanel} />
+        </WorkspaceMotionProvider>
+
+        {/* Global Command Palette (`⌘K`), Quick Open File (`⌘P`), Export & Code Picker */}
+        <CommandPalette />
+        <QuickOpenFileDialog />
+        <RemoteFolderPickerDialog />
+        <ExportTranscriptModal />
+        <CopyCodeBlocksModal />
+        <WorktreeHandoffModal />
+        <OnboardingGuide />
+        <MediaPreviewModal />
+
+        {/* Isolated Toast & Undo Host so ephemeral toasts never re-render Settings or Workspace */}
+        <GlobalToastHost />
+      </MarkdownThemeProvider>
+    </TooltipProvider>
+  );
+}
+
+const GlobalToastHost = memo(function GlobalToastHost() {
+  const toastNotice = useOrbitSelector((s) => s.toastNotice);
+  const toastAction = useOrbitSelector((s) => s.toastAction);
+  const lastArchivedUndo = useOrbitSelector((s) => s.lastArchivedUndo);
+
+  const [renderedToast, setRenderedToast] = useState<string | null>(toastNotice);
+  const [renderedToastAction, setRenderedToastAction] = useState<ToastAction | null>(toastAction);
+  const [toastExiting, setToastExiting] = useState(false);
+  const [toastRevision, setToastRevision] = useState(0);
+  const renderedToastRef = useRef<string | null>(renderedToast);
+  renderedToastRef.current = renderedToast;
+
   useEffect(() => {
     if (!lastArchivedUndo) return;
     const onKeyDown = (e: KeyboardEvent) => {
@@ -331,47 +379,16 @@ function MainDesktopApp() {
   }, [toastNotice, toastAction]);
 
   return (
-    <TooltipProvider>
-      <MarkdownThemeProvider isDark={isDarkTheme}>
-        {/* Dedicated Full-Window Settings Center (`⌘,`) with Smooth Enter/Exit */}
-        {settingsMounted && (
-          <PanelErrorBoundary
-            panelName="Settings"
-            resetKey={`${activeView}:${settingsSection}`}
-            className="bg-canvas fixed inset-0 z-40"
-          >
-            <SettingsView closing={settingsClosing} />
-          </PanelErrorBoundary>
-        )}
-
-        {/* Main Workspace Shell coordinated by 100% GPU WorkspaceMotionProvider */}
-        <WorkspaceMotionProvider>
-          <WorkspaceShellLayout isSettingsOpen={isSettingsOpen} workspacePanel={workspacePanel} />
-        </WorkspaceMotionProvider>
-
-        {/* Global Command Palette (`⌘K`), Quick Open File (`⌘P`), Export & Code Picker */}
-        <CommandPalette />
-        <QuickOpenFileDialog />
-        <RemoteFolderPickerDialog />
-        <ExportTranscriptModal />
-        <CopyCodeBlocksModal />
-        <WorktreeHandoffModal />
-        <OnboardingGuide />
-        <MediaPreviewModal />
-
-        {/* Restrained Ephemeral Status Toast with Smooth Enter/Exit, Actions & Undo Archive */}
-        <ToastViewport
-          key={toastRevision}
-          message={renderedToast}
-          action={renderedToastAction}
-          undoEntry={lastArchivedUndo}
-          exiting={toastExiting}
-          onUndoArchive={() => orbitActions.undoLastArchive()}
-        />
-      </MarkdownThemeProvider>
-    </TooltipProvider>
+    <ToastViewport
+      key={toastRevision}
+      message={renderedToast}
+      action={renderedToastAction}
+      undoEntry={lastArchivedUndo}
+      exiting={toastExiting}
+      onUndoArchive={() => orbitActions.undoLastArchive()}
+    />
   );
-}
+});
 
 const StableFleetSidebar = memo(function StableFleetSidebar() {
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
@@ -477,29 +494,27 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
       {/* Transparent Drag Shield so embedded iframes / WebGL canvases never swallow pointer events during resize */}
       {isResizingSidebar && <div className="fixed inset-0 z-50 cursor-col-resize select-none" />}
 
-      <div className="bg-surface-base text-ink-primary relative flex h-screen w-screen overflow-clip">
+      <div inert={isSettingsOpen} className="bg-surface-base text-ink-primary relative flex h-screen w-screen overflow-clip">
         {/* Single Stationary Titlebar Sidebar Toggle (`⌘B`) — optically centered with macOS traffic lights */}
-        {!isSettingsOpen && (
-          <div
-            className={cn(
-              "pointer-events-none fixed top-0 z-30 flex h-[40px] items-center",
-              isMac ? "left-[80px] translate-y-[1px]" : "left-[12px]",
-            )}
+        <div
+          className={cn(
+            "pointer-events-none fixed top-0 z-30 flex h-[40px] items-center",
+            isMac ? "left-[80px] translate-y-[1px]" : "left-[12px]",
+          )}
+        >
+          <IconButton
+            size="md"
+            tooltip={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
+            shortcut={toggleSidebarShortcut}
+            onClick={() => orbitActions.toggleSidebar()}
+            className="pointer-events-auto"
           >
-            <IconButton
-              size="md"
-              tooltip={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
-              shortcut={toggleSidebarShortcut}
-              onClick={() => orbitActions.toggleSidebar()}
-              className="pointer-events-auto"
-            >
-              <PanelLeft className="size-[16px] stroke-[1.75]" />
-            </IconButton>
-          </div>
-        )}
+            <PanelLeft className="size-[16px] stroke-[1.75]" />
+          </IconButton>
+        </div>
 
         {/* Single Stationary Top-Right Side Panel Toggle (`⌘\`) */}
-        {!isSettingsOpen && hasSelectedHost && (
+        {hasSelectedHost && (
           <div
             className={cn(
               "pointer-events-none fixed top-0 right-[10px] z-30 flex h-[40px] items-center",

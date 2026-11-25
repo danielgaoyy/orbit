@@ -1,9 +1,8 @@
-import { memo, useCallback, useMemo, useRef } from "react";
-import { AlertTriangle, ChevronRight } from "lucide-react";
+import { memo, useMemo, useRef } from "react";
+import { AlertTriangle } from "lucide-react";
 import { MarkdownBlocksView, MarkdownLinkProvider } from "@/components/markdown-blocks";
 import { AgentMessageCard } from "@/components/stage/subagents-track";
 import { ContextBanner } from "@/components/ui/context-banner";
-import { DiffStat } from "@/components/ui/diff-stat";
 import { useLiveSecondClock } from "@/lib/live-clock";
 import type {
   ArtifactSummary,
@@ -17,7 +16,6 @@ import {
   resolveDelegationDispatches,
 } from "@/lib/subagents";
 import { useI18n } from "@/lib/i18n";
-import { formatDurationCompact } from "@/lib/timeline-coalesce";
 import {
   coalescePeerFinishes,
   computeWorkChunkDurationMs,
@@ -35,7 +33,6 @@ import {
   type TurnTimingRecord,
   type ViewportAnchorHoldFn,
   computeTotalThinkingDurationMs,
-  extractUserPromptPresentation,
   getTurnFooter,
   isCompactionMarkerTurn,
   isHiddenWakeupLabel,
@@ -238,8 +235,6 @@ export const TurnStageSection = memo(function TurnStageSection({
   parentMessageLabel,
   queuedNotificationCount = 0,
   onInterruptAndContinue = null,
-  isCollapsed = false,
-  onToggleCollapsed,
 }: {
   turn: StageTurnView;
   dispatches?: ReturnType<typeof resolveDelegationDispatches>;
@@ -269,8 +264,6 @@ export const TurnStageSection = memo(function TurnStageSection({
   parentMessageLabel?: string | null;
   queuedNotificationCount?: number;
   onInterruptAndContinue?: (() => void) | null;
-  isCollapsed?: boolean;
-  onToggleCollapsed?: (turnKey: string) => void;
 }) {
   const { t, locale } = useI18n();
   const rawSegments = useMemo(() => {
@@ -310,13 +303,17 @@ export const TurnStageSection = memo(function TurnStageSection({
 
   const isWaitingOnlyOnBackgroundTasks =
     hasLiveBackgroundTasks &&
-    ((lastRawSeg?.kind === "wakeup" && isWaitingWakeupLabel(lastRawSeg.label)) ||
+    ((lastRawSeg?.kind === "wakeup" &&
+      (isWaitingWakeupLabel(lastRawSeg.label) || /background task/i.test(lastRawSeg.label))) ||
       (Boolean(
         agentStatusLabel &&
           (isWaitingWakeupLabel(agentStatusLabel) ||
             /background task|\btimers?\b/i.test(agentStatusLabel)),
       ) &&
         (lastRawSeg === null ||
+          lastRawSeg.kind === "wakeup" ||
+          lastRawSeg.kind === "notice" ||
+          lastRawSeg.kind === "agent_message" ||
           (lastRawSeg.kind === "assistant_message" &&
             lastRawSeg.item.item_type === "assistant_message" &&
             !lastRawSeg.item.streaming))));
@@ -376,49 +373,6 @@ export const TurnStageSection = memo(function TurnStageSection({
   const promptItem =
     turn.user_prompt?.item_type === "user_prompt" ? turn.user_prompt : null;
   const footer = getTurnFooter(turn, { isActive: isTurnActive, isLastTurn, canFork: !!onRequestFork, timing });
-  const handleToggleCollapse = useCallback(() => {
-    onToggleCollapsed?.(turn.key);
-  }, [onToggleCollapsed, turn.key]);
-  const collapsedSummary = useMemo(() => {
-    if (!isCollapsed || isTurnActive) return null;
-    let preview = "";
-    if (promptItem) {
-      const pres = extractUserPromptPresentation(promptItem);
-      preview = pres.cleanText || pres.badges.map((b) => b.label).join(" ");
-    } else if (turn.agent_message?.item_type === "agent_message") {
-      preview = turn.agent_message.text;
-    } else if (turn.terminal_reply?.item_type === "assistant_message") {
-      preview = turn.terminal_reply.text;
-    }
-    const cleanPreview = preview.replace(/\s+/g, " ").trim() || t("stage.prompt");
-
-    let toolCount = 0;
-    for (const seg of turn.live_segments) {
-      if (seg.kind !== "step_group") continue;
-      for (const item of seg.items) {
-        if (item.item_type === "tool_call") toolCount += 1;
-      }
-    }
-    if (toolCount === 0) {
-      for (const step of turn.folded_steps) {
-        if (step.item_type === "tool_call") toolCount += 1;
-      }
-    }
-    let additions = 0;
-    let deletions = 0;
-    for (const diff of turn.turn_diffs) {
-      additions += diff.additions;
-      deletions += diff.deletions;
-    }
-    const durationMs =
-      timing?.durationMs ??
-      timing?.workDurationMs ??
-      turn.work_duration_ms ??
-      (turn.completed_at_ms != null && turn.started_at_ms != null
-        ? Math.max(0, turn.completed_at_ms - turn.started_at_ms)
-        : null);
-    return { cleanPreview, toolCount, additions, deletions, durationMs };
-  }, [isCollapsed, isTurnActive, promptItem, turn, timing, t]);
 
   if (isCompactionMarkerTurn(turn)) {
     return (
@@ -427,41 +381,6 @@ export const TurnStageSection = memo(function TurnStageSection({
       </div>
     );
   }
-
-  if (collapsedSummary) {
-    return (
-      <div className="min-w-0 px-[6px]">
-        <button
-          type="button"
-          onClick={handleToggleCollapse}
-          aria-expanded={false}
-          title={t("stage.expandTurnTooltip")}
-          className="border-border-subtle bg-surface-raised/65 hover:bg-surface-raised hover:border-border-default flex w-full cursor-pointer items-center gap-2.5 rounded-[10px] border px-3 py-2 text-left transition-colors"
-        >
-          <ChevronRight className="text-ink-muted size-3.5 shrink-0" />
-          <span className="text-ink-secondary min-w-0 flex-1 truncate text-[13px] leading-[18px] font-medium">
-            {collapsedSummary.cleanPreview}
-          </span>
-          <span className="text-ink-tertiary flex shrink-0 items-center gap-2 text-[11px] leading-[15px] tabular-nums">
-            {collapsedSummary.toolCount > 0 && (
-              <span>{t("stage.collapsedTurnTools", { count: collapsedSummary.toolCount })}</span>
-            )}
-            {(collapsedSummary.additions > 0 || collapsedSummary.deletions > 0) && (
-              <DiffStat
-                additions={collapsedSummary.additions}
-                deletions={collapsedSummary.deletions}
-              />
-            )}
-            {collapsedSummary.durationMs != null && collapsedSummary.durationMs >= 1000 && (
-              <span>{formatDurationCompact(collapsedSummary.durationMs)}</span>
-            )}
-          </span>
-        </button>
-      </div>
-    );
-  }
-
-  const collapseAction = !isTurnActive && onToggleCollapsed ? handleToggleCollapse : undefined;
 
   return (
     <div
@@ -477,7 +396,6 @@ export const TurnStageSection = memo(function TurnStageSection({
           holdViewport={holdViewport}
           animateEntrance={animatePromptEntrance}
           onRequestRewind={onRequestRewind}
-          onCollapseTurn={collapseAction}
           onPreviewImage={onPreviewImage}
         />
       )}
@@ -819,7 +737,6 @@ export const TurnStageSection = memo(function TurnStageSection({
               isLastTurn={isLastTurn}
               canForkWorktree={canForkWorktree}
               onRequestFork={onRequestFork}
-              onCollapseTurn={collapseAction}
             />
           )}
         </div>
@@ -857,7 +774,5 @@ export const TurnStageSection = memo(function TurnStageSection({
   prev.onOpenSubagent === next.onOpenSubagent &&
   prev.parentMessageLabel === next.parentMessageLabel &&
   prev.queuedNotificationCount === next.queuedNotificationCount &&
-  prev.onInterruptAndContinue === next.onInterruptAndContinue &&
-  prev.isCollapsed === next.isCollapsed &&
-  prev.onToggleCollapsed === next.onToggleCollapsed,
+  prev.onInterruptAndContinue === next.onInterruptAndContinue,
 );

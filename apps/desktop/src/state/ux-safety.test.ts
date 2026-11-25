@@ -509,7 +509,7 @@ describe("Wave 1A P0 UX Safety", () => {
     assert.equal(getOrbitState().pendingUnsavedFileAction?.action.kind, "reload");
   });
 
-  it("P0-6: enterToSend=false queues on Mod+Enter and force-steers only on Mod+Shift+Enter", async () => {
+  it("P0-6: resolveComposerEnterAction honors enterToSend and activeTurnSendBehavior (queue vs steer)", async () => {
     const { resolveComposerEnterAction } = await server.ssrLoadModule(
       "/src/components/composer/omni-composer.tsx",
     );
@@ -522,7 +522,7 @@ describe("Wave 1A P0 UX Safety", () => {
       ...overrides,
     });
 
-    // enterToSend === false, busy turn
+    // Default / "queue" mode, enterToSend === false, busy turn
     assert.deepEqual(
       resolveComposerEnterAction(key(), false, true),
       { submit: false, steerImmediately: false },
@@ -532,7 +532,7 @@ describe("Wave 1A P0 UX Safety", () => {
       { submit: true, steerImmediately: false },
     );
     assert.deepEqual(
-      resolveComposerEnterAction(key({ ctrlKey: true }), false, true),
+      resolveComposerEnterAction(key({ ctrlKey: true }), false, true, "queue"),
       { submit: true, steerImmediately: false },
     );
     assert.deepEqual(
@@ -540,11 +540,11 @@ describe("Wave 1A P0 UX Safety", () => {
       { submit: true, steerImmediately: true },
     );
     assert.deepEqual(
-      resolveComposerEnterAction(key({ ctrlKey: true, shiftKey: true }), false, true),
+      resolveComposerEnterAction(key({ ctrlKey: true, shiftKey: true }), false, true, "queue"),
       { submit: true, steerImmediately: true },
     );
 
-    // enterToSend === true, busy turn
+    // Default / "queue" mode, enterToSend === true, busy turn
     assert.deepEqual(
       resolveComposerEnterAction(key(), true, true),
       { submit: true, steerImmediately: false },
@@ -556,6 +556,64 @@ describe("Wave 1A P0 UX Safety", () => {
     assert.deepEqual(
       resolveComposerEnterAction(key({ metaKey: true }), true, true),
       { submit: true, steerImmediately: true },
+    );
+
+    // "steer" mode, enterToSend === true, busy turn: primary Enter steers, Mod+Enter queues
+    assert.deepEqual(
+      resolveComposerEnterAction(key(), true, true, "steer"),
+      { submit: true, steerImmediately: true },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ shiftKey: true }), true, true, "steer"),
+      { submit: false, steerImmediately: false },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ metaKey: true }), true, true, "steer"),
+      { submit: true, steerImmediately: false },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ ctrlKey: true }), true, true, "steer"),
+      { submit: true, steerImmediately: false },
+    );
+
+    // "steer" mode, enterToSend === false, busy turn: primary Mod+Enter steers, Mod+Shift+Enter queues
+    assert.deepEqual(
+      resolveComposerEnterAction(key(), false, true, "steer"),
+      { submit: false, steerImmediately: false },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ metaKey: true }), false, true, "steer"),
+      { submit: true, steerImmediately: true },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ ctrlKey: true }), false, true, "steer"),
+      { submit: true, steerImmediately: true },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ metaKey: true, shiftKey: true }), false, true, "steer"),
+      { submit: true, steerImmediately: false },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ ctrlKey: true, shiftKey: true }), false, true, "steer"),
+      { submit: true, steerImmediately: false },
+    );
+
+    // Idle turn (isTurnBusy === false): never steers in either mode
+    assert.deepEqual(
+      resolveComposerEnterAction(key(), true, false, "steer"),
+      { submit: true, steerImmediately: false },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ metaKey: true }), true, false, "queue"),
+      { submit: true, steerImmediately: false },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ metaKey: true }), false, false, "steer"),
+      { submit: true, steerImmediately: false },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ metaKey: true, shiftKey: true }), false, false, "queue"),
+      { submit: true, steerImmediately: false },
     );
   });
 
@@ -571,6 +629,552 @@ describe("Wave 1A P0 UX Safety", () => {
     assert.equal(describePlan(pausedSteps, true, 1)?.canDismiss, false);
     assert.equal(describePlan(pausedSteps, false, 1)?.canDismiss, true);
     assert.equal(describePlan(failedSteps, false, 1)?.canDismiss, true);
+  });
+
+  it("Option A: AwaitingPermission forces queueing in composer shortcuts, presentation hints, and submitComposer", async (t) => {
+    const {
+      resolveComposerEnterAction,
+      resolveComposerTurnPresentation,
+    } = await server.ssrLoadModule("/src/components/composer/omni-composer.tsx");
+    const { orbitActions, getOrbitState, composerScopeKey } = await server.ssrLoadModule(
+      "/src/state/orbit-store.ts",
+    );
+    const { orbitIpc } = await server.ssrLoadModule("/src/lib/orbit-ipc.ts");
+
+    const key = (overrides: Partial<KeyboardEvent> = {}) => ({
+      key: "Enter",
+      metaKey: false,
+      ctrlKey: false,
+      shiftKey: false,
+      altKey: false,
+      ...overrides,
+    });
+
+    // 1) Keyboard shortcuts: while awaiting permission, primary AND alternate steer shortcuts ALWAYS queue
+    for (const mode of ["queue", "steer"] as const) {
+      assert.deepEqual(
+        resolveComposerEnterAction(key(), true, true, mode, true),
+        { submit: true, steerImmediately: false },
+      );
+      assert.deepEqual(
+        resolveComposerEnterAction(key({ metaKey: true }), true, true, mode, true),
+        { submit: true, steerImmediately: false },
+      );
+      assert.deepEqual(
+        resolveComposerEnterAction(key({ metaKey: true }), false, true, mode, true),
+        { submit: true, steerImmediately: false },
+      );
+      assert.deepEqual(
+        resolveComposerEnterAction(key({ metaKey: true, shiftKey: true }), false, true, mode, true),
+        { submit: true, steerImmediately: false },
+      );
+    }
+
+    // 2) Presentation: placeholder & tooltip stay aligned when awaiting permission (even if isForegroundRunning or Steer mode)
+    for (const mode of ["queue", "steer"] as const) {
+      for (const fg of [false, true]) {
+        assert.deepEqual(
+          resolveComposerTurnPresentation({
+            isForegroundRunning: fg,
+            isAwaitingPermission: true,
+            activeTurnSendBehavior: mode,
+            hasCurrentAgent: true,
+            isDraft: false,
+          }),
+          {
+            isTurnBusy: true,
+            steerOnPrimarySubmit: false,
+            tooltipKey: "composer.queueAwaitingApprovalHint",
+            placeholderKey: "composer.placeholderAwaitingApproval",
+          },
+        );
+      }
+    }
+
+    // Foreground running (not awaiting permission): honors queue vs steer consistently across tooltip & placeholder
+    assert.deepEqual(
+      resolveComposerTurnPresentation({
+        isForegroundRunning: true,
+        isAwaitingPermission: false,
+        activeTurnSendBehavior: "queue",
+        hasCurrentAgent: true,
+        isDraft: false,
+      }),
+      {
+        isTurnBusy: true,
+        steerOnPrimarySubmit: false,
+        tooltipKey: "composer.queueFollowUpHint",
+        placeholderKey: "composer.placeholderRunning",
+      },
+    );
+    assert.deepEqual(
+      resolveComposerTurnPresentation({
+        isForegroundRunning: true,
+        isAwaitingPermission: false,
+        activeTurnSendBehavior: "steer",
+        hasCurrentAgent: true,
+        isDraft: false,
+      }),
+      {
+        isTurnBusy: true,
+        steerOnPrimarySubmit: true,
+        tooltipKey: "composer.steerFollowUpHint",
+        placeholderKey: "composer.placeholderRunningSteer",
+      },
+    );
+
+    // 3) Store submitComposer: even if caller passes steerImmediately=true, AwaitingPermission MUST enqueue safely
+    t.mock.method(orbitIpc, "composePrompt", async (input: { raw_text: string }) => ({
+      wire_prompt: input.raw_text,
+      display_prompt: input.raw_text,
+      effective_directive: null,
+      badges: [],
+      is_empty: false,
+      is_fork: false,
+      is_btw: false,
+      is_compact: false,
+      fast_mode_action: null,
+    }));
+    const sendMock = t.mock.method(orbitIpc, "sendPrompt", async () => {});
+    const enqueueMock = t.mock.method(orbitIpc, "enqueuePrompt", async () => "q_srv_1");
+
+    Object.assign(getOrbitState(), {
+      selectedHostId: "local",
+      selectedAgentId: "perm-agent",
+      isDraftNewSession: false,
+      selectedWorkspaceCwd: "/repo",
+      activeTurnSendBehavior: "steer",
+      queuedPrompts: {},
+      hostDetails: {
+        local: {
+          host: makeHostCard("local"),
+          agents: [
+            makeAgentCard("perm-agent", {
+              is_running: true,
+              is_awaiting_permission: true,
+              status_label: "Needs approval",
+            }),
+          ],
+          acp_agents: [],
+          discovered_projects: [],
+          workspaces: [],
+        },
+      },
+    });
+    const permScope = composerScopeKey(getOrbitState());
+    Object.assign(getOrbitState(), { composerDrafts: { [permScope]: "follow-up while gated" } });
+
+    await orbitActions.submitComposer(true);
+    assert.equal(sendMock.mock.callCount(), 0);
+    assert.equal(enqueueMock.mock.callCount(), 1);
+
+    // Legacy daemon without supports_server_queue: falls back to local queue, still NEVER sends steer
+    Object.assign(getOrbitState(), {
+      hostDetails: {
+        local: {
+          host: { ...makeHostCard("local"), supports_server_queue: false },
+          agents: [
+            makeAgentCard("perm-agent", {
+              is_running: false,
+              is_awaiting_permission: true,
+              status_label: "Needs approval",
+            }),
+          ],
+          acp_agents: [],
+          discovered_projects: [],
+          workspaces: [],
+        },
+      },
+      composerDrafts: { [permScope]: "legacy queued follow-up" },
+    });
+    await orbitActions.submitComposer(true);
+    assert.equal(sendMock.mock.callCount(), 0);
+    assert.equal(enqueueMock.mock.callCount(), 1);
+    assert.equal(getOrbitState().queuedPrompts[permScope]?.length, 1);
+    assert.equal(getOrbitState().queuedPrompts[permScope]?.[0]?.displayText, "legacy queued follow-up");
+
+    // Foreground running (not awaiting permission): steerImmediately=true sends activeTurnBehavior: "steer"
+    Object.assign(getOrbitState(), {
+      hostDetails: {
+        local: {
+          host: makeHostCard("local"),
+          agents: [
+            makeAgentCard("perm-agent", {
+              is_running: true,
+              is_awaiting_permission: false,
+              status_label: "Working",
+            }),
+          ],
+          acp_agents: [],
+          discovered_projects: [],
+          workspaces: [],
+        },
+      },
+      composerDrafts: { [permScope]: "steer running turn" },
+    });
+    await orbitActions.submitComposer(true);
+    assert.equal(sendMock.mock.callCount(), 1);
+    assert.equal(sendMock.mock.calls[0]?.arguments[3]?.activeTurnBehavior, "steer");
+  });
+
+  it("treats background-waiting and running-subagents-only parents as idle (isTurnBusy=false) and sends directly in both modes", async (t) => {
+    const {
+      isAgentForegroundRunning,
+      isAgentTurnBusy,
+      resolvePromptDispatchMode,
+      orbitIpc,
+    } = await server.ssrLoadModule("/src/lib/orbit-ipc.ts");
+    const { orbitActions, getOrbitState, composerScopeKey } = await server.ssrLoadModule(
+      "/src/state/orbit-store.ts",
+    );
+
+    const bgWaitingAgent = makeAgentCard("bg-only", {
+      is_running: false,
+      has_background_tasks: true,
+      is_awaiting_permission: false,
+      status_label: "Waiting for background tasks",
+    });
+    const subagentOnlyParent = makeAgentCard("subagent-only", {
+      is_running: false,
+      has_background_tasks: false,
+      has_running_subagents: true,
+      is_awaiting_permission: false,
+      status_label: "Idle",
+    });
+
+    for (const ag of [bgWaitingAgent, subagentOnlyParent]) {
+      assert.equal(isAgentForegroundRunning(ag), false);
+      assert.equal(isAgentTurnBusy(ag), false);
+      assert.equal(resolvePromptDispatchMode(ag, true, false), "send_idle");
+      assert.equal(resolvePromptDispatchMode(ag, true, true), "send_idle");
+      assert.equal(resolvePromptDispatchMode(ag, false, false), "send_idle");
+      assert.equal(resolvePromptDispatchMode(ag, false, true), "send_idle");
+    }
+
+    t.mock.method(orbitIpc, "composePrompt", async (input: { raw_text: string }) => ({
+      wire_prompt: input.raw_text,
+      display_prompt: input.raw_text,
+      effective_directive: null,
+      badges: [],
+      is_empty: false,
+      is_fork: false,
+      is_btw: false,
+      is_compact: false,
+      fast_mode_action: null,
+    }));
+    const sendMock = t.mock.method(orbitIpc, "sendPrompt", async () => {});
+    const enqueueMock = t.mock.method(orbitIpc, "enqueuePrompt", async () => "q_none");
+
+    for (const [ag, mode] of [
+      [bgWaitingAgent, "queue"],
+      [bgWaitingAgent, "steer"],
+      [subagentOnlyParent, "queue"],
+      [subagentOnlyParent, "steer"],
+    ] as const) {
+      Object.assign(getOrbitState(), {
+        selectedHostId: "local",
+        selectedAgentId: ag.agent_id,
+        isDraftNewSession: false,
+        selectedWorkspaceCwd: "/repo",
+        activeTurnSendBehavior: mode,
+        hostDetails: {
+          local: {
+            host: makeHostCard("local"),
+            agents: [ag],
+            acp_agents: [],
+            discovered_projects: [],
+            workspaces: [],
+          },
+        },
+      });
+      const scope = composerScopeKey(getOrbitState());
+      Object.assign(getOrbitState(), { composerDrafts: { [scope]: `hello ${ag.agent_id}` } });
+      await orbitActions.submitComposer(mode === "steer");
+    }
+
+    assert.equal(enqueueMock.mock.callCount(), 0);
+    assert.equal(sendMock.mock.callCount(), 4);
+    for (const call of sendMock.mock.calls) {
+      assert.equal(call.arguments[3]?.activeTurnBehavior, undefined);
+    }
+  });
+
+  it("legacy flushQueuedPromptImmediately cancels approval gate once without double-interrupting", async (t) => {
+    const { orbitActions, getOrbitState } = await server.ssrLoadModule("/src/state/orbit-store.ts");
+    const { orbitIpc } = await server.ssrLoadModule("/src/lib/orbit-ipc.ts");
+
+    const interruptMock = t.mock.method(orbitIpc, "interruptAgent", async () => {});
+    const sendMock = t.mock.method(orbitIpc, "sendPrompt", async () => {});
+
+    const scopeKey = "local::legacy-perm";
+    Object.assign(getOrbitState(), {
+      selectedHostId: "local",
+      selectedAgentId: "legacy-perm",
+      isDraftNewSession: false,
+      hostDetails: {
+        local: {
+          host: { ...makeHostCard("local"), supports_server_queue: false },
+          agents: [
+            makeAgentCard("legacy-perm", {
+              is_running: false,
+              is_awaiting_permission: true,
+              status_label: "Needs approval",
+            }),
+          ],
+          acp_agents: [],
+          discovered_projects: [],
+          workspaces: [],
+        },
+      },
+      queuedPrompts: {
+        [scopeKey]: [
+          {
+            id: "q_legacy_1",
+            wirePrompt: "override approval now",
+            displayText: "override approval now",
+            badges: [],
+            slashDirective: null,
+            contexts: [],
+            pastes: [],
+            quotes: [],
+          },
+        ],
+      },
+    });
+
+    await orbitActions.flushQueuedPromptImmediately(0);
+
+    assert.equal(interruptMock.mock.callCount(), 0, "must not call interruptAgent before sendPrompt(interrupt)");
+    assert.equal(sendMock.mock.callCount(), 1);
+    assert.equal(sendMock.mock.calls[0]?.arguments[3]?.activeTurnBehavior, "interrupt");
+    assert.equal(getOrbitState().queuedPrompts[scopeKey]?.length, 0);
+
+    // Normally running legacy turn uses activeTurnBehavior: "steer" with zero interruptAgent calls
+    Object.assign(getOrbitState(), {
+      hostDetails: {
+        local: {
+          host: { ...makeHostCard("local"), supports_server_queue: false },
+          agents: [
+            makeAgentCard("legacy-perm", {
+              is_running: true,
+              is_awaiting_permission: false,
+              status_label: "Working",
+            }),
+          ],
+          acp_agents: [],
+          discovered_projects: [],
+          workspaces: [],
+        },
+      },
+      queuedPrompts: {
+        [scopeKey]: [
+          {
+            id: "q_legacy_2",
+            wirePrompt: "steer running legacy",
+            displayText: "steer running legacy",
+            badges: [],
+            slashDirective: null,
+            contexts: [],
+            pastes: [],
+            quotes: [],
+          },
+        ],
+      },
+    });
+
+    await orbitActions.flushQueuedPromptImmediately(0);
+    assert.equal(interruptMock.mock.callCount(), 0);
+    assert.equal(sendMock.mock.callCount(), 2);
+    assert.equal(sendMock.mock.calls[1]?.arguments[3]?.activeTurnBehavior, "steer");
+  });
+
+  it("Voice helpers respect activeTurnSendBehavior, Option A permission gate, and server queue counts", async () => {
+    const {
+      resolveVoiceSendPromptSteer,
+      getEffectiveQueuedPromptCount,
+    } = await server.ssrLoadModule("/src/components/composer/omni-composer.tsx");
+
+    const baseSnap = {
+      selectedHostId: "local",
+      selectedAgentId: "v-agent",
+      selectedWorkspaceCwd: "/repo",
+      isDraftNewSession: false,
+      activeTurnSendBehavior: "steer" as const,
+      queuedPrompts: {
+        "local::v-agent": [
+          {
+            id: "local_1",
+            wirePrompt: "l1",
+            displayText: "l1",
+            badges: [],
+            slashDirective: null,
+            contexts: [],
+            pastes: [],
+            quotes: [],
+          },
+        ],
+      },
+      hostDetails: {
+        local: {
+          host: makeHostCard("local"),
+          agents: [
+            makeAgentCard("v-agent", {
+              is_running: true,
+              is_awaiting_permission: false,
+              queued_prompts: [
+                { queue_id: "sq_1", display_text: "one", badges: [], created_at: "" },
+                { queue_id: "sq_2", display_text: "two", badges: [], created_at: "" },
+                { queue_id: "sq_3", display_text: "three", badges: [], created_at: "" },
+              ],
+            }),
+          ],
+          acp_agents: [],
+          discovered_projects: [],
+          workspaces: [],
+        },
+      },
+    };
+
+    // Running + Steer mode -> steers; Running + Queue mode -> queues
+    assert.equal(resolveVoiceSendPromptSteer(baseSnap, "local", "v-agent"), true);
+    assert.equal(
+      resolveVoiceSendPromptSteer({ ...baseSnap, activeTurnSendBehavior: "queue" }, "local", "v-agent"),
+      false,
+    );
+
+    // Awaiting permission + Steer mode -> NEVER steers (Option A)
+    const awaitingSnap = {
+      ...baseSnap,
+      hostDetails: {
+        local: {
+          ...baseSnap.hostDetails.local,
+          agents: [
+            makeAgentCard("v-agent", {
+              is_running: true,
+              is_awaiting_permission: true,
+            }),
+          ],
+        },
+      },
+    };
+    assert.equal(resolveVoiceSendPromptSteer(awaitingSnap, "local", "v-agent"), false);
+
+    // queue_status: reads server queue count when supports_server_queue=true, local fallback when false
+    assert.equal(getEffectiveQueuedPromptCount(baseSnap, "local", "v-agent"), 3);
+    const legacySnap = {
+      ...baseSnap,
+      hostDetails: {
+        local: {
+          ...baseSnap.hostDetails.local,
+          host: { ...makeHostCard("local"), supports_server_queue: false },
+        },
+      },
+    };
+    assert.equal(getEffectiveQueuedPromptCount(legacySnap, "local", "v-agent"), 1);
+  });
+
+  it("secondary send paths (direct agent prompt, inline code edit, /compact) honor activeTurnSendBehavior and Option A", async (t) => {
+    const { orbitActions, getOrbitState, composerScopeKey } = await server.ssrLoadModule(
+      "/src/state/orbit-store.ts",
+    );
+    const { orbitIpc } = await server.ssrLoadModule("/src/lib/orbit-ipc.ts");
+
+    const sendMock = t.mock.method(orbitIpc, "sendPrompt", async () => {});
+    const enqueueMock = t.mock.method(orbitIpc, "enqueuePrompt", async () => "q_sec");
+    t.mock.method(orbitIpc, "composePrompt", async () => ({
+      wire_prompt: "/compact",
+      display_prompt: "/compact",
+      effective_directive: "compact",
+      badges: [],
+      is_empty: false,
+      is_fork: false,
+      is_btw: false,
+      is_compact: true,
+      fast_mode_action: null,
+    }));
+
+    const setAgentState = (
+      agentOverrides: Partial<AgentCardView>,
+      behavior: "queue" | "steer",
+      supportsServerQueue = true,
+    ) => {
+      Object.assign(getOrbitState(), {
+        selectedHostId: "local",
+        selectedAgentId: "sec-agent",
+        isDraftNewSession: false,
+        selectedWorkspaceCwd: "/repo",
+        activeTurnSendBehavior: behavior,
+        queuedPrompts: {},
+        hostDetails: {
+          local: {
+            host: { ...makeHostCard("local"), supports_server_queue: supportsServerQueue },
+            agents: [makeAgentCard("sec-agent", agentOverrides)],
+            acp_agents: [],
+            discovered_projects: [],
+            workspaces: [],
+          },
+        },
+      });
+    };
+
+    // 1) dispatchDirectAgentPrompt (Personal Agent Control View & AgentStagePane)
+    setAgentState({ is_running: true, is_awaiting_permission: false }, "queue");
+    assert.equal(await orbitActions.dispatchDirectAgentPrompt("local", "sec-agent", "do A"), "queued");
+    assert.equal(enqueueMock.mock.callCount(), 1);
+    assert.equal(sendMock.mock.callCount(), 0);
+
+    setAgentState({ is_running: true, is_awaiting_permission: false }, "steer");
+    assert.equal(await orbitActions.dispatchDirectAgentPrompt("local", "sec-agent", "do B"), "sent");
+    assert.equal(sendMock.mock.callCount(), 1);
+    assert.equal(sendMock.mock.calls[0]?.arguments[3]?.activeTurnBehavior, "steer");
+
+    setAgentState({ is_running: false, is_awaiting_permission: true }, "steer");
+    assert.equal(
+      await orbitActions.dispatchDirectAgentPrompt("local", "sec-agent", "do C", {
+        steerImmediately: true,
+      }),
+      "queued",
+    );
+    assert.equal(enqueueMock.mock.callCount(), 2);
+    assert.equal(sendMock.mock.callCount(), 1);
+
+    // 2) dispatchInlineCodeEdit honors activeTurnSendBehavior when running, queues safely when awaiting permission
+    const editParams = {
+      filePath: "src/app.ts",
+      language: "typescript",
+      startLine: 10,
+      endLine: 15,
+      selectedCode: "const x = 1;",
+      instruction: "Rename x to count",
+    };
+    setAgentState({ is_running: true, is_awaiting_permission: false }, "steer");
+    assert.equal(await orbitActions.dispatchInlineCodeEdit(editParams), "sent");
+    assert.equal(sendMock.mock.callCount(), 2);
+    assert.equal(sendMock.mock.calls[1]?.arguments[3]?.activeTurnBehavior, "steer");
+
+    setAgentState({ is_running: true, is_awaiting_permission: false }, "queue");
+    assert.equal(await orbitActions.dispatchInlineCodeEdit(editParams), "queued");
+    assert.equal(enqueueMock.mock.callCount(), 3);
+
+    setAgentState({ is_running: true, is_awaiting_permission: true }, "steer");
+    assert.equal(await orbitActions.dispatchInlineCodeEdit(editParams), "queued");
+    assert.equal(enqueueMock.mock.callCount(), 4);
+    assert.equal(sendMock.mock.callCount(), 2);
+
+    // 3) submitSlashCompact & composer /compact NEVER steer mid-permission-gate
+    setAgentState({ is_running: false, is_awaiting_permission: true }, "steer");
+    await orbitActions.submitSlashCompact("preserve auth");
+    assert.equal(enqueueMock.mock.callCount(), 5);
+    assert.equal(sendMock.mock.callCount(), 2);
+
+    const scope = composerScopeKey(getOrbitState());
+    Object.assign(getOrbitState(), {
+      composerDrafts: { [scope]: "preserve tests" },
+      slashDirectives: { [scope]: "compact" },
+    });
+    await orbitActions.submitComposer(true);
+    assert.equal(enqueueMock.mock.callCount(), 6);
+    assert.equal(sendMock.mock.callCount(), 2);
   });
 
   it("surfaces archiveWorkspace failures instead of reporting false success", async (t) => {

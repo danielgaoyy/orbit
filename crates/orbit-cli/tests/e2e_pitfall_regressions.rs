@@ -12,6 +12,7 @@
 //! 11. Antigravity open-RPC background timer/task wait settles reply into `Waiting for 1 timer` and wakes cleanly on timer completion without false stall
 //! 12. Antigravity event-driven brain watcher, late post-turn wakeup reply recovery past 3s idle settle, and post-wakeup ACP replay deduplication
 //! 13. Antigravity brain watcher deadlock freedom under concurrent FS/watch churn, Initializing reattach recovery, and confirmed workspace archive ACK
+//! 14. Cross-provider alignment: Claude bgwait_* Stage persistence + Codex synthetic plan gate Queue-Strip flush (zero deadlock) + Option A Steer during pending permission
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -192,12 +193,24 @@ def handle_control_request(frame):
 
 turn_counter = 0
 deferred_frames = collections.deque()
+bg_watch_file = None
 
 while True:
+    if bg_watch_file and os.path.exists(bg_watch_file):
+        bg_watch_file = None
+        emit({
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": "bg_reg_1",
+            "status": "completed",
+            "summary": "bg_reg_1 completed"
+        })
     if deferred_frames:
         line = deferred_frames.popleft()
     else:
-        line = read_line(None)
+        line = read_line(0.05 if bg_watch_file else None)
+        if line is None:
+            continue
         if line == "":
             break
     try:
@@ -312,6 +325,19 @@ while True:
         result_obj = res.get("result", {})
         ok = "error" not in res and not bool(result_obj.get("isError", False))
         reply_parts.append(f"SEND_OK={ok}")
+
+    bg_wait_path = kv.get("BG_WAIT_FILE")
+    if bg_wait_path:
+        bg_watch_file = bg_wait_path
+        emit({
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": "bg_reg_1",
+            "tool_use_id": "tu_bg_reg_1",
+            "task_type": "local_bash",
+            "description": "npm run dev"
+        })
+        reply_parts.append("LAUNCHED_CLAUDE_BG")
 
     if echo_tok and not reply_parts:
         reply_parts.append(f"REPLY={echo_tok}")
@@ -475,6 +501,18 @@ while True:
 
         if interrupted:
             continue
+
+        if kv.get("PROPOSE_PLAN") == "1":
+            emit({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "id": f"plan_{turn_seq}",
+                        "type": "proposedPlan",
+                        "text": '# Reg Plan\n\n- Step 1'
+                    }
+                }
+            })
 
         joined = "+".join(reply_tokens)
         emit({
@@ -1276,6 +1314,14 @@ while True:
                 emit({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "cancelled"}})
                 cancelled = True
                 break
+            elif nmethod == "session/prompt":
+                # Real `agy acp` completes the prior `session/prompt` RPC immediately with
+                # `stopReason: "end_turn"` and seamlessly injects the concurrent steer prompt
+                # without force cancellation.
+                emit({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+                PENDING_LINES.appendleft(nxt)
+                cancelled = True
+                break
             elif nrid is not None and nmethod is not None:
                 emit({"jsonrpc": "2.0", "id": nrid, "result": {}})
 
@@ -1621,7 +1667,7 @@ async fn pitfall_01_claude_no_off_by_one_on_multi_turn_interrupt_and_queue_flush
         "Turn 2 must finish with REPLY=BETA"
     );
 
-    // Turn 3: slow active turn -> wait until streaming chunk arrives -> enqueue + flush-now interrupt
+    // Turn 3: slow active turn -> wait until streaming chunk arrives -> explicit interrupt replacement
     core.send_prompt(&host_id, &agent_id, "ECHO=SLOW_CANCEL SLEEP_MS=4000");
     assert!(
         wait_until(Duration::from_secs(10), || {
@@ -1634,15 +1680,14 @@ async fn pitfall_01_claude_no_off_by_one_on_multi_turn_interrupt_and_queue_flush
         "Slow turn must begin streaming before interrupt-flush"
     );
 
-    let qid = core.enqueue_prompt(
+    core.send_prompt_with_behavior(
         &host_id,
         &agent_id,
         "ECHO=FLUSH_WINNER",
         None,
         Vec::new(),
-        None,
+        orbit_protocol::ActiveTurnBehavior::Interrupt,
     );
-    core.flush_queued_prompt_now(&host_id, &agent_id, &qid);
 
     assert!(
         wait_until(Duration::from_secs(12), || {
@@ -3477,8 +3522,8 @@ async fn pitfall_08_multi_agent_non_interrupting_delivery_and_stall_recovery() {
             .iter()
             .filter(|e| e.get("method").and_then(|v| v.as_str()) == Some("session/cancel"))
             .count(),
-        2,
-        "human preemption must issue 1 additional session/cancel (total 2)"
+        1,
+        "human steer must use non-destructive concurrent session/prompt with zero additional session/cancel (total stays 1 from Scenario B)"
     );
     let human_pos = trace_c
         .iter()
@@ -3710,8 +3755,15 @@ async fn pitfall_09_antigravity_interrupt_steer_bg_isolation_subagent_order_and_
         "call_done_py_s2 must stay Completed without hijack while call_bg_py_s2 binds bg task and PARTIAL_P9_ROLLBACK streams"
     );
 
-    // Human Steer interrupts Turn 2 mid-stream.
-    core.send_prompt(&host_id, &agent_id, "ECHO=AFTER_STEER_2");
+    // Explicit Interrupt cancels Turn 2 mid-stream (unlike non-destructive Steer).
+    core.send_prompt_with_behavior(
+        &host_id,
+        &agent_id,
+        "ECHO=AFTER_STEER_2",
+        None,
+        Vec::new(),
+        orbit_protocol::ActiveTurnBehavior::Interrupt,
+    );
     assert!(
         wait_until(Duration::from_secs(15), || {
             let c = Arc::clone(&core);
@@ -3910,14 +3962,14 @@ async fn pitfall_09_antigravity_interrupt_steer_bg_isolation_subagent_order_and_
         TimelinePayload::AssistantMessage { .. }
     ));
 
-    // Now launch live subagent that hangs until parent is interrupted.
+    // Now launch live subagent + background shell that stay active until explicitly interrupted.
     let sub_cancel_id = Uuid::new_v4().to_string();
     let gate_sub = work.join("p9_gate_sub.flag");
     core.send_prompt(
         &host_id,
         &agent_id,
         &format!(
-            "SUBAGENT_CANCEL_ID={sub_cancel_id} WAIT_FILE={} ECHO=NEVER_SUB",
+            "BG_SHELL_GATE=1 BG_TAG=s4 SUBAGENT_CANCEL_ID={sub_cancel_id} WAIT_FILE={} ECHO=NEVER_SUB",
             gate_sub.display()
         ),
     );
@@ -3952,11 +4004,93 @@ async fn pitfall_09_antigravity_interrupt_steer_bg_isolation_subagent_order_and_
                         } if call_id == "p9_sub_tool"
                     )
                 });
-                is_running_desc && has_th && has_tool
+                let st = c.agent_stage(&hid, &aid);
+                let has_bg = collect_stage_items(&st).iter().any(|it| {
+                    matches!(
+                        it,
+                        TimelineItemView::ToolCall {
+                            call_id,
+                            status: ToolCallStatus::Running,
+                            background_task: Some(_),
+                            ..
+                        } if call_id == "call_bg_py_s4"
+                    )
+                });
+                is_running_desc && has_th && has_tool && has_bg
             }
         })
         .await,
-        "native subagent Running descriptor, thinking, and tool call must stream live while parent is STILL running"
+        "native subagent and background task must stream live while parent is STILL running"
+    );
+
+    // Steering via queue-strip flush (`flush_queued_prompt_now`) while subagent + bg task run
+    // MUST NOT send `session/cancel` and MUST keep both subagent and bg task Running!
+    let cancels_before_steer = read_mock_acp_trace(&trace_path)
+        .iter()
+        .filter(|e| e.get("method").and_then(|v| v.as_str()) == Some("session/cancel"))
+        .count();
+    let gate_steer_keep = work.join("p9_gate_steer_keep.flag");
+    let qid_keep = core.enqueue_prompt(
+        &host_id,
+        &agent_id,
+        &format!(
+            "WAIT_FILE={} ECHO=STEER_KEEP_SUB_BG",
+            gate_steer_keep.display()
+        ),
+        None,
+        Vec::new(),
+        None,
+    );
+    core.flush_queued_prompt_now(&host_id, &agent_id, &qid_keep);
+    assert!(
+        wait_until(Duration::from_secs(12), || {
+            let tp = trace_path.clone();
+            async move {
+                read_mock_acp_trace(&tp).iter().any(|e| {
+                    e.get("method").and_then(|v| v.as_str()) == Some("session/prompt")
+                        && e.get("text")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|s| s.contains("STEER_KEEP_SUB_BG"))
+                })
+            }
+        })
+        .await,
+        "queue-strip steer must dispatch STEER_KEEP_SUB_BG via concurrent session/prompt"
+    );
+    let cancels_after_steer = read_mock_acp_trace(&trace_path)
+        .iter()
+        .filter(|e| e.get("method").and_then(|v| v.as_str()) == Some("session/cancel"))
+        .count();
+    assert_eq!(
+        cancels_after_steer, cancels_before_steer,
+        "queue-strip steer MUST emit zero session/cancel while subagent and bg task are running"
+    );
+    core.list_provider_subagents(&host_id, &agent_id);
+    assert!(
+        core.host_detail(&host_id)
+            .and_then(|d| d.provider_subagents.get(&agent_id).cloned())
+            .is_some_and(|list| {
+                list.iter().any(|s| {
+                    s.subagent_id == sub_cancel_id && s.status == ProviderSubagentStatus::Running
+                })
+            }),
+        "native subagent MUST remain Running after human steer"
+    );
+    assert!(
+        collect_stage_items(&core.agent_stage(&host_id, &agent_id))
+            .iter()
+            .any(|it| {
+                matches!(
+                    it,
+                    TimelineItemView::ToolCall {
+                        call_id,
+                        status: ToolCallStatus::Running,
+                        background_task: Some(_),
+                        ..
+                    } if call_id == "call_bg_py_s4"
+                )
+            }),
+        "background task MUST remain Running after human steer"
     );
 
     core.interrupt_agent(&host_id, &agent_id);
@@ -4659,6 +4793,210 @@ async fn pitfall_12_antigravity_event_driven_wakeup_late_reply_and_acp_replay_de
             .count(),
         1,
         "genuine Turn 2 command must run and complete once, got: {tool_rows:?}"
+    );
+
+    drop_core(core).await;
+    drop(rt);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pitfall_14_cross_provider_bg_wait_synthetic_plan_gate_and_permission_steer() {
+    install_mock_script(
+        &MOCK_CLAUDE_PATH,
+        ProviderKind::ClaudeCode,
+        "mock_claude_reg.py",
+        MOCK_CLAUDE_SCRIPT,
+    );
+    install_mock_script(
+        &MOCK_CODEX_PATH,
+        ProviderKind::Codex,
+        "mock_codex_reg.py",
+        MOCK_CODEX_SCRIPT,
+    );
+
+    let home = new_temp_dir("p11_h");
+    let work = new_temp_dir("p11_w");
+
+    let (addr, rt) = spawn_embedded_daemon(home.to_path_buf(), None)
+        .await
+        .expect("spawn daemon");
+    let uri = rt
+        .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("offer")
+        .to_qr_uri()
+        .expect("uri");
+    let (core, host_id) = open_and_connect_core(home.join("c11.db"), uri).await;
+
+    // ------------------------------------------------------------------------
+    // Scenario 1: Claude background bash task enters `bgwait_*` (`waiting:*`)
+    //             when foreground turn ends, stays visible in `stage.insights.background_tasks`,
+    //             and transitions cleanly to `Idle` once `task_notification` arrives.
+    // ------------------------------------------------------------------------
+    let bg_done_flag = work.join("p11_claude_bg_done.flag");
+    core.create_agent(
+        &host_id,
+        &work.to_string_lossy(),
+        ProviderKind::ClaudeCode,
+        SessionMode::FullAccess,
+        &format!("BG_WAIT_FILE={}", bg_done_flag.display()),
+        None,
+    );
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            async move {
+                c.host_detail(&hid).is_some_and(|d| {
+                    d.agents.iter().any(|a| {
+                        !a.agent_id.starts_with("opt_")
+                            && a.provider == ProviderKind::ClaudeCode
+                            && !a.is_running
+                            && a.has_background_tasks
+                    })
+                })
+            }
+        })
+        .await,
+        "Claude agent must enter waiting:* bgwait state (is_running=false, has_background_tasks=true) while bg bash runs"
+    );
+    let claude_id = core
+        .host_detail(&host_id)
+        .expect("host detail")
+        .agents
+        .into_iter()
+        .find(|a| !a.agent_id.starts_with("opt_") && a.provider == ProviderKind::ClaudeCode)
+        .expect("claude agent")
+        .agent_id;
+    core.open_agent_timeline(&host_id, &claude_id);
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = claude_id.clone();
+            async move {
+                let st = c.agent_stage(&hid, &aid);
+                st.insights.background_tasks.len() == 1
+                    && st.turns.iter().any(|t| {
+                        turn_reply_texts(t)
+                            .iter()
+                            .any(|txt| txt.contains("LAUNCHED_CLAUDE_BG"))
+                    })
+            }
+        })
+        .await,
+        "Stage insights.background_tasks must preserve running Claude bg bash task while in bgwait_*"
+    );
+
+    // Signal background bash completion -> must settle cleanly to Idle and clear background_tasks!
+    std::fs::write(&bg_done_flag, "done").expect("write bg done flag");
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = claude_id.clone();
+            async move {
+                let card_idle = c.host_detail(&hid).is_some_and(|d| {
+                    d.agents
+                        .into_iter()
+                        .find(|a| a.agent_id == aid)
+                        .is_some_and(|a| !a.is_running && !a.has_background_tasks)
+                });
+                let insights_empty = c
+                    .agent_stage(&hid, &aid)
+                    .insights
+                    .background_tasks
+                    .is_empty();
+                card_idle && insights_empty
+            }
+        })
+        .await,
+        "Claude agent must transition to Idle and clear background_tasks once last bg bash completes"
+    );
+
+    // ------------------------------------------------------------------------
+    // Scenario 2: Codex synthetic plan gate + Queue Strip `flush_queued_prompt_now`
+    //             clears the synthetic plan gate and immediately dispatches the
+    //             replacement turn with zero deadlock!
+    // ------------------------------------------------------------------------
+    core.create_agent(
+        &host_id,
+        &work.to_string_lossy(),
+        ProviderKind::Codex,
+        SessionMode::Plan,
+        "PROPOSE_PLAN=1 ECHO=P11_PLAN",
+        None,
+    );
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            async move {
+                c.host_detail(&hid).is_some_and(|d| {
+                    d.agents.iter().any(|a| {
+                        !a.agent_id.starts_with("opt_")
+                            && a.provider == ProviderKind::Codex
+                            && a.is_awaiting_permission
+                    })
+                })
+            }
+        })
+        .await,
+        "Codex Plan-mode turn must open synthetic plan gate (AwaitingPermission)"
+    );
+    let codex_id = core
+        .host_detail(&host_id)
+        .expect("host detail")
+        .agents
+        .into_iter()
+        .find(|a| !a.agent_id.starts_with("opt_") && a.provider == ProviderKind::Codex)
+        .expect("codex agent")
+        .agent_id;
+    core.open_agent_timeline(&host_id, &codex_id);
+
+    // Enqueue a follow-up prompt while synthetic plan gate is open -> stays queued (does NOT run yet).
+    let qid = core.enqueue_prompt(
+        &host_id,
+        &codex_id,
+        "ECHO=P11_UNBLOCKED_BY_FLUSH",
+        Some("Unblock plan gate".into()),
+        Vec::new(),
+        None,
+    );
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = codex_id.clone();
+            let q = qid.clone();
+            async move {
+                c.host_detail(&hid).is_some_and(|d| {
+                    d.agents
+                        .into_iter()
+                        .find(|a| a.agent_id == aid)
+                        .is_some_and(|a| {
+                            a.is_awaiting_permission
+                                && a.queued_prompts.iter().any(|item| item.queue_id == q)
+                        })
+                })
+            }
+        })
+        .await,
+        "Queued prompt must remain parked in Queue Strip while Codex synthetic plan gate is open"
+    );
+
+    // Click Send Now (`flush_queued_prompt_now`) -> cancels synthetic plan gate and immediately
+    // dispatches replacement turn (`REPLY=P11_UNBLOCKED_BY_FLUSH`), settling cleanly to Idle!
+    core.flush_queued_prompt_now(&host_id, &codex_id, &qid);
+    assert!(
+        wait_until(Duration::from_secs(12), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = codex_id.clone();
+            async move { stage_settled_with_text(&c, &hid, &aid, "REPLY=P11_UNBLOCKED_BY_FLUSH") }
+        })
+        .await,
+        "flush_queued_prompt_now on Codex synthetic plan gate must unblock and complete replacement turn with zero deadlock"
     );
 
     drop_core(core).await;

@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, ArrowLeftRight, RotateCcw, Search } from "lucide-react";
+import { memo, useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { AlertTriangle, ArrowLeftRight, Search } from "lucide-react";
 import {
   SettingCard,
   SettingGroupLabel,
@@ -30,6 +30,7 @@ interface DisplayShortcutRow {
   action: string;
   keys: string;
   actionId?: ShortcutActionId;
+  settingId?: string;
   isCustomized?: boolean;
 }
 
@@ -39,9 +40,10 @@ interface PendingConflictState {
   conflict: ShortcutActionDefinition;
 }
 
-export function ShortcutsSection() {
+export const ShortcutsSection = memo(function ShortcutsSection({ jumpTo }: { jumpTo?: string }) {
   const { locale, t } = useI18n();
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
+  const activeTurnSendBehavior = useOrbitSelector((s) => s.activeTurnSendBehavior);
   const customKeybindings = useOrbitSelector((s) => s.customKeybindings);
 
   const [query, setQuery] = useState("");
@@ -56,7 +58,9 @@ export function ShortcutsSection() {
   const mod = modSymbol();
   const shift = isMac ? "⇧" : "Shift+";
 
-  const hasAnyCustom = Object.keys(customKeybindings).length > 0;
+  useLayoutEffect(() => {
+    if (jumpTo) setQuery("");
+  }, [jumpTo]);
 
   // Capture live chord while recording
   useEffect(() => {
@@ -121,24 +125,37 @@ export function ShortcutsSection() {
         action: t(def.labelKey),
         keys: displayKeys,
         actionId: def.id,
+        settingId: def.labelKey,
         isCustomized,
       };
     });
 
     // Read-only contextual shortcuts (fixed behavior / range chords)
+    const primarySendKeys = enterToSend ? "Enter" : `${mod}Enter`;
+    const alternateSendKeys = enterToSend ? `${mod}Enter` : `${mod}${shift}Enter`;
     rows.push(
       { group: navGroup, action: t("settings.scSwitchConversation"), keys: `${mod}1 .. ${mod}9` },
       {
         group: composerGroup,
-        action: t("settings.scSendPrompt"),
-        keys: enterToSend ? "Enter" : `${mod}Enter`,
+        action:
+          activeTurnSendBehavior === "steer"
+            ? t("settings.scSendOrSteerPrompt")
+            : t("settings.scSendPrompt"),
+        keys: primarySendKeys,
       },
       {
         group: composerGroup,
         action: t("settings.scNewLine"),
         keys: enterToSend ? `${shift}Enter` : "Enter",
       },
-      { group: composerGroup, action: t("settings.scSteerAgent"), keys: `${mod}Enter` },
+      {
+        group: composerGroup,
+        action:
+          activeTurnSendBehavior === "steer"
+            ? t("settings.scQueueFollowUp")
+            : t("settings.scSteerAgent"),
+        keys: alternateSendKeys,
+      },
       { group: composerGroup, action: t("settings.scStopGeneration"), keys: "Esc Esc" },
       { group: approvalsGroup, action: t("settings.scQuickSelectOption"), keys: "1 .. 9" },
     );
@@ -161,47 +178,29 @@ export function ShortcutsSection() {
     }
     return Array.from(map.entries());
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [locale, isMac, mod, shift, query, enterToSend, customKeybindings]);
+  }, [locale, isMac, mod, shift, query, enterToSend, activeTurnSendBehavior, customKeybindings]);
 
   return (
     <div className="flex flex-col gap-5">
-      <div className="flex items-start justify-between gap-3">
-        <SettingSectionHeader
-          title={t("settings.shortcutsTitle")}
-          description={t("settings.shortcutsDesc")}
-        />
-        {hasAnyCustom && (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => {
-              orbitActions.resetAllCustomKeybindings();
-              setRecordingId(null);
-              setReservedWarning(null);
-              setPendingConflict(null);
-            }}
-            className="shrink-0 gap-1.5 text-[12px]"
-          >
-            <RotateCcw className="size-3" />
-            {t("settings.shortcutsResetAll")}
-          </Button>
-        )}
-      </div>
+      <SettingSectionHeader
+        title={t("settings.shortcutsTitle")}
+        description={t("settings.shortcutsDesc")}
+      />
 
-      <div className="relative">
+      <div className="relative" data-setting-id="settings.searchShortcutsPlaceholder">
         <Search className="text-ink-faint pointer-events-none absolute top-1/2 left-3 size-[14px] -translate-y-1/2" />
         <Input
           type="text"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
+          aria-label={t("settings.searchShortcutsPlaceholder")}
           placeholder={t("settings.searchShortcutsPlaceholder")}
           className="h-[34px] rounded-[10px] pl-8.5 text-[13px]"
         />
       </div>
 
       {groups.length === 0 ? (
-        <div className="text-muted-foreground py-8 text-center text-[13px]">
+        <div className="text-ink-muted py-8 text-center text-[13px]">
           {t("settings.noMatchingShortcuts")}
         </div>
       ) : (
@@ -218,37 +217,24 @@ export function ShortcutsSection() {
                     Boolean(item.actionId && pendingConflict?.actionId === item.actionId);
 
                   return (
-                    <div key={item.actionId ?? item.action} className="flex flex-col">
+                    <div
+                      key={item.actionId ?? item.action}
+                      data-setting-id={item.settingId}
+                      className="relative flex flex-col"
+                    >
                       <div className="flex items-center justify-between gap-4 px-4 py-2.5">
                         <div className="flex min-w-0 items-center gap-2">
-                          <span className="text-foreground truncate text-[13px]">
+                          <span className="text-ink-primary truncate text-[13px]">
                             {item.action}
                           </span>
                           {item.isCustomized && (
-                            <span className="bg-surface-recessed text-ink-tertiary rounded px-1.5 py-0.5 text-[10.5px] font-medium">
+                            <span className="bg-surface-recessed text-ink-muted rounded px-1.5 py-0.5 text-[11px] font-medium">
                               {t("settings.shortcutsCustomBadge")}
                             </span>
                           )}
                         </div>
 
                         <div className="flex shrink-0 items-center gap-1.5">
-                          {item.actionId && item.isCustomized && !isRecording && (
-                            <button
-                              type="button"
-                              title={t("settings.shortcutsResetSingle")}
-                              aria-label={t("settings.shortcutsResetSingle")}
-                              onClick={() => {
-                                orbitActions.resetCustomKeybinding(item.actionId!);
-                                setPendingConflict((cur) =>
-                                  cur?.actionId === item.actionId ? null : cur,
-                                );
-                              }}
-                              className="text-ink-faint hover:text-ink-primary hover:bg-accent inline-flex size-[24px] cursor-pointer items-center justify-center rounded-[6px] transition-colors"
-                            >
-                              <RotateCcw className="size-[12px]" />
-                            </button>
-                          )}
-
                           {item.actionId ? (
                             <button
                               type="button"
@@ -264,11 +250,12 @@ export function ShortcutsSection() {
                                 if (isRecording) setRecordingId(null);
                               }}
                               title={t("settings.shortcutsClickToRecord")}
+                              aria-label={`${item.action}: ${item.keys}`}
                               className={cn(
-                                "inline-flex h-[26px] min-w-[68px] cursor-pointer items-center justify-center rounded-[7px] border px-2 font-mono text-[11px] transition-colors",
+                                "inline-flex min-h-[26px] cursor-pointer items-center justify-center rounded-[7px] transition-colors outline-none focus-visible:ring-1 focus-visible:ring-border-strong",
                                 isRecording
-                                  ? "border-border-strong bg-surface-raised text-ink-primary ring-border-strong ring-1"
-                                  : "border-border-subtle bg-surface-recessed text-ink-secondary hover:border-border-default hover:text-ink-primary",
+                                  ? "border-border-strong bg-surface-raised text-ink-primary ring-border-strong min-w-[84px] border px-2.5 ring-1"
+                                  : "hover:bg-surface-recessed -mr-1.5 px-1.5 py-0.5",
                               )}
                             >
                               {isRecording ? (
@@ -276,7 +263,7 @@ export function ShortcutsSection() {
                                   {t("settings.shortcutsPressKeys")}
                                 </span>
                               ) : (
-                                item.keys
+                                <ShortcutKbd keys={item.keys} className="shrink-0" />
                               )}
                             </button>
                           ) : (
@@ -286,7 +273,7 @@ export function ShortcutsSection() {
                       </div>
 
                       {showReserved && reservedWarning && (
-                        <div className="border-border-subtle bg-signal-warning-bg text-signal-warning flex items-center justify-between gap-2 border-t px-4 py-2 text-[12px]">
+                        <div className="border-border-subtle bg-signal-warning-bg text-signal-warning flex items-center justify-between gap-2 border-t px-4 py-2 text-[13px]">
                           <span className="flex items-center gap-1.5">
                             <AlertTriangle className="size-3.5 shrink-0" />
                             <span>
@@ -299,7 +286,7 @@ export function ShortcutsSection() {
                       )}
 
                       {showConflict && pendingConflict && (
-                        <div className="border-border-subtle bg-signal-warning-bg text-signal-warning flex flex-wrap items-center justify-between gap-2 border-t px-4 py-2 text-[12px]">
+                        <div className="border-border-subtle bg-signal-warning-bg text-signal-warning flex flex-wrap items-center justify-between gap-2 border-t px-4 py-2 text-[13px]">
                           <span className="flex min-w-0 items-center gap-1.5">
                             <AlertTriangle className="size-3.5 shrink-0" />
                             <span className="truncate">
@@ -350,4 +337,4 @@ export function ShortcutsSection() {
       )}
     </div>
   );
-}
+});

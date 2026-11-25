@@ -1,787 +1,504 @@
-import { useState } from "react";
-import {
-  Check,
-  ChevronDown,
-  ChevronRight,
-  Download,
-  Link2,
-  Plus,
-  RefreshCw,
-  Server,
-  Sparkles,
-  Trash2,
-  Zap,
-} from "lucide-react";
+import { memo, useMemo, useRef, useState } from "react";
+import { Plus, RefreshCw, Trash2 } from "lucide-react";
+import { HostAcpSection } from "./host-acp-section";
 import {
   SettingCard,
-  SettingGroupLabel,
+  SettingDrawer,
+  SettingGroup,
+  SettingResourceRow,
   SettingRow,
-  SettingSectionHeader,
+  SettingPageHeader,
   SettingSelect,
-  type SettingSelectOption,
   ToggleSwitch,
-} from "@/components/settings/settings-primitives";
+} from "./settings-primitives";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { ProviderIcon } from "@/components/ui/provider-icons";
+import { useI18n } from "@/lib/i18n";
 import {
+  ACP_PROVIDER_META,
   PROVIDER_LIST,
-  formatProviderShortLabel,
+  orbitIpc,
   type AgentProfile,
   type OrchestrationConfig,
   type ProviderKind,
-  type SessionMode,
-  orbitIpc,
 } from "@/lib/orbit-ipc";
-import { isLocalHostCard } from "@/lib/projects";
-import { ProviderIcon } from "@/components/ui/provider-icons";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
-type PresetSessionMode = "auto" | "accept_edits" | "plan" | "full_access" | "default";
+function ProfileEditor({
+  hostId,
+  profile,
+  initialProvider,
+  close,
+}: {
+  hostId: string;
+  profile: AgentProfile | null;
+  initialProvider: ProviderKind;
+  close: () => void;
+}) {
+  const { t } = useI18n();
+  const [draft, setDraft] = useState<AgentProfile>(
+    () =>
+      profile ?? {
+        profile_id: "",
+        name: "",
+        provider: initialProvider,
+        model: null,
+        effort: null,
+        fast_mode: false,
+        mode: "accept_edits",
+        when_to_use: "",
+        system_prompt_append: null,
+        mcp_policy: { enabled: true, disabled_tools: [] },
+        created_at: "",
+        updated_at: "",
+      },
+  );
+  const [open, setOpen] = useState(true);
+  const [tools, setTools] = useState(draft.mcp_policy.disabled_tools.join(", "));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  function patch(change: Partial<AgentProfile>) {
+    setDraft((previous) => ({ ...previous, ...change }));
+  }
+  const providerOptions = PROVIDER_LIST.map((provider) => ({
+    value: provider.id,
+    label: provider.label,
+  }));
+  if (!providerOptions.some((option) => option.value === draft.provider))
+    providerOptions.push({ value: draft.provider, label: draft.acp_agent_id || draft.provider });
+  const modeOptions = [
+    { value: "default", label: t("composer.modeAlwaysAsk") },
+    { value: "auto", label: t("composer.modeAuto") },
+    { value: "accept_edits", label: t("composer.modeAcceptEdits") },
+    { value: "plan", label: t("settings.agentPlan") },
+    { value: "full_access", label: t("composer.modeFullAccess") },
+  ] as const;
+  async function save() {
+    if (saving || !draft.name.trim()) return;
+    setSaving(true);
+    setError("");
+    try {
+      const now = new Date().toISOString();
+      await orbitIpc.upsertProfile(hostId, {
+        ...draft,
+        name: draft.name.trim(),
+        model: draft.model?.trim() || null,
+        created_at: draft.created_at || now,
+        updated_at: now,
+        mcp_policy: {
+          ...draft.mcp_policy,
+          disabled_tools: tools
+            .split(",")
+            .map((name) => name.trim())
+            .filter(Boolean),
+        },
+      });
+      setOpen(false);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setSaving(false);
+    }
+  }
+  return (
+    <SettingDrawer
+      open={open}
+      onOpenChange={(next) => {
+        if (!saving) setOpen(next);
+      }}
+      onOpenChangeComplete={(visible) => {
+        if (!visible) close();
+      }}
+      title={t(profile ? "settings.agentEditProfile" : "settings.agentNewProfile")}
+    >
+      <form
+        className="grid gap-4"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void save();
+        }}
+      >
+        <Field>
+          <FieldLabel htmlFor="profile-name">{t("settings.agentName")}</FieldLabel>
+          <Input
+            id="profile-name"
+            autoFocus
+            required
+            value={draft.name}
+            onChange={(event) => patch({ name: event.target.value })}
+          />
+        </Field>
+        <Field>
+          <FieldLabel>{t("im.defaultProvider")}</FieldLabel>
+          <SettingSelect
+            align="start"
+            ariaLabel={t("im.defaultProvider")}
+            value={draft.provider}
+            options={providerOptions}
+            onChange={(provider) =>
+              patch({ provider, acp_agent_id: provider === "acp" ? draft.acp_agent_id : null })
+            }
+          />
+        </Field>
+        <Field>
+          <FieldLabel htmlFor="profile-model">{t("settings.agentModel")}</FieldLabel>
+          <Input
+            id="profile-model"
+            value={draft.model ?? ""}
+            onChange={(event) => patch({ model: event.target.value })}
+          />
+        </Field>
+        <Field>
+          <FieldLabel>{t("composer.accessPermissions")}</FieldLabel>
+          <SettingSelect
+            align="start"
+            ariaLabel={t("composer.accessPermissions")}
+            value={typeof draft.mode === "string" ? draft.mode : null}
+            placeholder={t("settings.agentCustomMode")}
+            options={modeOptions}
+            onChange={(mode) => patch({ mode })}
+          />
+        </Field>
+        <Field>
+          <FieldLabel htmlFor="profile-role">{t("settings.agentWhen")}</FieldLabel>
+          <Input
+            id="profile-role"
+            value={draft.when_to_use}
+            onChange={(event) => patch({ when_to_use: event.target.value })}
+          />
+        </Field>
+        <Field>
+          <FieldLabel htmlFor="profile-prompt">{t("settings.agentPrompt")}</FieldLabel>
+          <Textarea
+            id="profile-prompt"
+            value={draft.system_prompt_append ?? ""}
+            onChange={(event) => patch({ system_prompt_append: event.target.value || null })}
+          />
+        </Field>
+        <Field>
+          <FieldLabel htmlFor="profile-tools">{t("settings.agentDisabledTools")}</FieldLabel>
+          <Input id="profile-tools" value={tools} onChange={(event) => setTools(event.target.value)} />
+        </Field>
+        <SettingCard>
+          <SettingRow title={t("settings.agentMcpInjector")}>
+            <ToggleSwitch
+              ariaLabel={t("settings.agentMcpInjector")}
+              checked={draft.mcp_policy.enabled}
+              onChange={(enabled) => patch({ mcp_policy: { ...draft.mcp_policy, enabled } })}
+            />
+          </SettingRow>
+          <SettingRow title={t("settings.agentFast")}>
+            <ToggleSwitch
+              ariaLabel={t("settings.agentFast")}
+              checked={!!draft.fast_mode}
+              onChange={(fast_mode) => patch({ fast_mode })}
+            />
+          </SettingRow>
+        </SettingCard>
+        {error && (
+          <p role="alert" className="text-signal-danger">
+            {error}
+          </p>
+        )}
+        <div className="flex justify-end gap-2">
+          <Button type="button" variant="outline" disabled={saving} onClick={() => setOpen(false)}>
+            {t("common.cancel")}
+          </Button>
+          <Button type="submit" disabled={saving || !draft.name.trim()}>
+            {t("common.save")}
+          </Button>
+        </div>
+      </form>
+    </SettingDrawer>
+  );
+}
 
-const IDLE_TIMEOUT_OPTIONS: readonly SettingSelectOption<number>[] = [
-  { value: 600, label: "10 min" },
-  { value: 1200, label: "20 min" },
-  { value: 1800, label: "30 min" },
-  { value: 3600, label: "60 min" },
-];
+function DefaultProviderRow({ available }: { available?: readonly ProviderKind[] }) {
+  const { t } = useI18n();
+  const provider = useOrbitSelector((s) => s.draftProvider);
+  const acpAgentId = useOrbitSelector((s) => s.draftAcpAgentId);
+  const options = PROVIDER_LIST.map((item) => ({
+    value: item.id,
+    label: item.label,
+    disabled: available !== undefined && !available.includes(item.id),
+  }));
+  if (provider === "acp") {
+    options.push({value: provider, label: acpAgentId ?? ACP_PROVIDER_META.label, disabled: true});
+  }
+  return (
+    <SettingRow settingId="im.defaultProvider" title={t("im.defaultProvider")}>
+      <SettingSelect
+        value={provider}
+        options={options}
+        ariaLabel={t("im.defaultProvider")}
+        onChange={(provider) => orbitActions.setDraftConfig({ provider })}
+      />
+    </SettingRow>
+  );
+}
 
-const PROFILE_MODE_OPTIONS: readonly SettingSelectOption<PresetSessionMode>[] = [
-  { value: "auto", label: "Auto (Guardian)" },
-  { value: "accept_edits", label: "Accept Edits" },
-  { value: "plan", label: "Plan (Read-only)" },
-  { value: "full_access", label: "Full Access" },
-  { value: "default", label: "Ask" },
-];
+export function HostAgentsSection({ hostId }: { hostId: string | null }) {
+  const { t } = useI18n();
+  return (
+    <div className="flex flex-col gap-6">
+      <SettingPageHeader
+        title={t("settings.navAgents")}
+        description={t(hostId ? "settings.agentPageDesc" : "settings.hostNeeded")}
+      />
+      {hostId ? (
+        <HostAgentControls key={hostId} hostId={hostId} />
+      ) : (
+        <>
+          <SettingCard>
+            <DefaultProviderRow />
+          </SettingCard>
+          <Button
+            className="self-start"
+            size="sm"
+            variant="outline"
+            onClick={() => orbitActions.openSettings("add_host")}
+          >
+            {t("settings.connectHost")}
+          </Button>
+        </>
+      )}
+    </div>
+  );
+}
 
-const DEFAULT_ORCH_CONFIG: OrchestrationConfig = {
-  mcp_inject_enabled: true,
-  idle_cleanup_enabled: true,
-  idle_timeout_secs: 1800,
-  resume_on_startup: false,
-  resume_prompt: "Continue where you left off.",
-  installed_skills: [],
-  keep_awake_while_running: true,
-};
+const EMPTY_PROVIDERS: readonly ProviderKind[] = [];
+const EMPTY_PROFILES: readonly AgentProfile[] = [];
 
-export function HostAgentsSection({ hostId }: { hostId: string }) {
-  const fleet = useOrbitSelector((s) => s.fleet);
-  const hostCard = fleet.hosts.find((h) => h.host_id === hostId) ?? null;
-  const otherFleetHostsCount = fleet.hosts.filter((h) => h.host_id !== hostId).length;
-  const hostDetail = useOrbitSelector((s) => s.hostDetails[hostId] ?? null);
-  const draftProvider = useOrbitSelector((s) => s.draftProvider);
+const HostAgentControls = memo(function HostAgentControls({ hostId }: { hostId: string }) {
+  const { t } = useI18n();
+  const available = useOrbitSelector(
+    (s) =>
+      s.hostDetails[hostId]?.host.available_providers ??
+      s.fleet.hosts.find((card) => card.host_id === hostId)?.available_providers ??
+      EMPTY_PROVIDERS,
+  );
+  const config = useOrbitSelector((s) => s.hostDetails[hostId]?.orchestration_config);
+  const awake = useOrbitSelector((s) => s.hostDetails[hostId]?.keep_awake_status);
+  const profiles = useOrbitSelector((s) => s.hostDetails[hostId]?.profiles ?? EMPTY_PROFILES);
+  const providerCatalogs = useOrbitSelector((s) => s.hostDetails[hostId]?.provider_catalogs);
+  const [showAll, setShowAll] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [pendingConfig, setPendingConfig] = useState<OrchestrationConfig | null>(null);
+  const updateSeqRef = useRef(0);
+  const [editor, setEditor] = useState<AgentProfile | "new" | null>(null);
+  const [deleting, setDeleting] = useState<AgentProfile | null>(null);
+  const installed = useMemo(
+    () => PROVIDER_LIST.filter((provider) => available.includes(provider.id)),
+    [available],
+  );
+  const effectiveConfig = pendingConfig ?? config;
 
-  const [refreshingModels, setRefreshingModels] = useState(false);
-  const [showUninstalledProviders, setShowUninstalledProviders] = useState(false);
-
-  const showHostBadge =
-    Boolean(hostCard) &&
-    (fleet.hosts.length > 1 || (hostCard !== null && !isLocalHostCard(hostCard)));
-
-  // New Profile form state
-  const [addingProfile, setAddingProfile] = useState(false);
-  const [profName, setProfName] = useState("");
-  const [profProvider, setProfProvider] = useState<ProviderKind | null>(null);
-  const [profModel, setProfModel] = useState("");
-  const [profMode, setProfMode] = useState<SessionMode>("accept_edits");
-  const [profWhenToUse, setProfWhenToUse] = useState("");
-  const [profSystemPrompt, setProfSystemPrompt] = useState("");
-  const [profDisabledTools, setProfDisabledTools] = useState("");
-  const [profMcpEnabled, setProfMcpEnabled] = useState(true);
-  const [profFastMode, setProfFastMode] = useState(false);
-
-  // Connected Host form state
-  const [peerUri, setPeerUri] = useState("");
-  const [peerLabel, setPeerLabel] = useState("");
-
-  // Destructive confirmation state
-  const [pendingDeleteProfile, setPendingDeleteProfile] = useState<AgentProfile | null>(null);
-  const [pendingRemovePeer, setPendingRemovePeer] = useState<{
-    registration_id: string;
-    label: string;
-  } | null>(null);
-
-  const available =
-    hostDetail?.host.available_providers ?? hostCard?.available_providers ?? [];
-  const installedProviders = PROVIDER_LIST.filter((p) => available.includes(p.id));
-  const uninstalledProviders = PROVIDER_LIST.filter((p) => !available.includes(p.id));
-  const effectiveProfProvider: ProviderKind =
-    profProvider ?? installedProviders[0]?.id ?? "claude_code";
-  const profileProviderOptions: SettingSelectOption<ProviderKind>[] =
-    installedProviders.length > 0 && uninstalledProviders.length > 0
-      ? [
-          ...installedProviders.map((p) => ({
-            value: p.id,
-            label: p.label,
-            group: "Installed",
-          })),
-          ...uninstalledProviders.map((p) => ({
-            value: p.id,
-            label: p.label,
-            group: "Other Supported",
-          })),
-        ]
-      : PROVIDER_LIST.map((p) => ({ value: p.id, label: p.label }));
-  const visibleProviders =
-    installedProviders.length === 0 || showUninstalledProviders
-      ? [...installedProviders, ...uninstalledProviders]
-      : installedProviders;
-  const catalogs = hostDetail?.provider_catalogs ?? [];
-  const orchConfig = hostDetail?.orchestration_config ?? DEFAULT_ORCH_CONFIG;
-  const keepAwakeStatus = hostDetail?.keep_awake_status ?? null;
-  const keepAwakeEnabled = orchConfig.keep_awake_while_running ?? true;
-  const profiles = hostDetail?.profiles ?? [];
-  const skills = hostDetail?.orchestration_skills ?? [];
-  const connectedHosts = hostDetail?.connected_hosts ?? [];
-
-  const handleRefreshModels = async () => {
-    setRefreshingModels(true);
+  async function refresh() {
+    setRefreshing(true);
     try {
       await orbitIpc.refreshProviderModels(hostId, true);
-      orbitActions.showToast("Refreshed model catalog");
+    } catch (error) {
+      orbitActions.showToast(String(error));
     } finally {
-      window.setTimeout(() => setRefreshingModels(false), 450);
+      setRefreshing(false);
     }
-  };
-
-  const patchOrchConfig = async (patch: Partial<OrchestrationConfig>) => {
-    await orbitIpc.updateOrchestrationConfig(hostId, {
-      ...orchConfig,
-      ...patch,
-    });
-    orbitActions.showToast("Updated orchestration runtime settings");
-  };
-
-  const handleCreateProfile = async () => {
-    if (!profName.trim()) {
-      orbitActions.showToast("Profile name is required");
-      return;
+  }
+  async function update(patch: Partial<OrchestrationConfig>) {
+    if (!effectiveConfig) return;
+    const nextConfig: OrchestrationConfig = { ...effectiveConfig, ...patch };
+    const seq = ++updateSeqRef.current;
+    setPendingConfig(nextConfig);
+    try {
+      await orbitIpc.updateOrchestrationConfig(hostId, nextConfig);
+    } catch (error) {
+      orbitActions.showToast(String(error));
+    } finally {
+      if (updateSeqRef.current === seq) {
+        setPendingConfig(null);
+      }
     }
-    const now = new Date().toISOString();
-    const disabled = profDisabledTools
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const profile: AgentProfile = {
-      profile_id: "",
-      name: profName.trim(),
-      provider: effectiveProfProvider,
-      model: profModel.trim() || null,
-      effort: null,
-      fast_mode: profFastMode,
-      mode: profMode,
-      when_to_use: profWhenToUse.trim(),
-      system_prompt_append: profSystemPrompt.trim() || null,
-      mcp_policy: {
-        enabled: profMcpEnabled,
-        disabled_tools: disabled,
-      },
-      created_at: now,
-      updated_at: now,
-    };
-    await orbitIpc.upsertProfile(hostId, profile);
-    setProfName("");
-    setProfModel("");
-    setProfWhenToUse("");
-    setProfSystemPrompt("");
-    setProfDisabledTools("");
-    setProfFastMode(false);
-    setAddingProfile(false);
-    orbitActions.showToast(`Saved profile "${profile.name}"`);
-  };
-
-  const handleToggleSkill = async (skillId: string, currentlyInstalled: boolean) => {
-    const installedIds = new Set(skills.filter((s) => s.installed).map((s) => s.id));
-    if (currentlyInstalled) {
-      installedIds.delete(skillId);
-    } else {
-      installedIds.add(skillId);
-    }
-    await orbitIpc.syncOrchestrationSkills(hostId, Array.from(installedIds));
-    orbitActions.showToast(
-      currentlyInstalled ? `Removed /${skillId} skill` : `Installed /${skillId} skill`,
-    );
-  };
-
-  const handleInstallAllSkills = async () => {
-    const allIds = skills.map((s) => s.id);
-    await orbitIpc.syncOrchestrationSkills(hostId, allIds);
-    orbitActions.showToast(`Synced ${allIds.length} orchestration skills`);
-  };
-
-  const handleAddPeer = async () => {
-    if (!peerUri.trim()) {
-      orbitActions.showToast("Paste an orbit://pair/... URI");
-      return;
-    }
-    await orbitIpc.addConnectedHost(hostId, peerUri.trim(), peerLabel.trim() || null);
-    setPeerUri("");
-    setPeerLabel("");
-    orbitActions.showToast("Added connected host");
-  };
-
-  const handleSyncFleetHosts = async () => {
-    const count = await orbitIpc.syncFleetConnectedHosts(hostId);
-    orbitActions.showToast(
-      count > 0
-        ? `Synced ${count} fleet host(s) into daemon mesh`
-        : "No other fleet hosts available to sync",
-    );
-  };
-
+  }
+  const idleTimeoutSecs = effectiveConfig?.idle_timeout_secs ?? 1800;
+  const idleTimeoutOptions = useMemo(
+    () =>
+      [...new Set([600, 1200, 1800, 3600, idleTimeoutSecs])]
+        .sort((a, b) => a - b)
+        .map((value) => ({ value, label: t("settings.agentMinutes", { count: value / 60 }) })),
+    [idleTimeoutSecs, t],
+  );
+  const runtimeDisabled = !effectiveConfig;
   return (
-    <div className="space-y-6">
-      <SettingSectionHeader
-        title="Agents & Orchestration"
-        description="Installed CLIs, built-in Orbit MCP orchestration, reusable Profiles, bundled Skills, and Cross-Host Mesh."
-        badge={
-          showHostBadge && hostCard ? (
-            <span className="bg-muted text-muted-foreground rounded-md px-2 py-0.5 text-[11.5px] font-medium">
-              {hostCard.display_name}
-            </span>
-          ) : null
-        }
+    <div className="flex flex-col gap-6">
+      <SettingGroup
+        title={t("settings.agentInstalledClis")}
+        settingId="settings.agentInstalledClis"
         action={
-          <button
-            type="button"
-            disabled={refreshingModels}
-            onClick={() => void handleRefreshModels()}
-            className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:opacity-50"
-          >
-            <RefreshCw
-              className={cn("h-[13px] w-[13px]", refreshingModels && "animate-spin")}
-            />
-            <span>Refresh Models</span>
-          </button>
+          <Button size="sm" variant="outline" disabled={refreshing} onClick={() => void refresh()}>
+            <RefreshCw className={cn(refreshing && "animate-spin")} />
+            {t("settings.agentRefreshModels")}
+          </Button>
         }
-      />
-
-      {/* 1. Installed CLIs */}
-      <div className="space-y-2">
-        <SettingGroupLabel>
-          Installed CLIs ({installedProviders.length}/{PROVIDER_LIST.length})
-        </SettingGroupLabel>
+      >
         <SettingCard>
-          {visibleProviders.map((p) => {
-            const detected = available.includes(p.id);
-            const catalog = catalogs.find((c) => c.provider === p.id);
-            const modelCount = catalog?.models.length ?? 0;
-            const isDefault = detected && draftProvider === p.id;
-
+          {(showAll || !installed.length ? PROVIDER_LIST : installed).map((provider) => {
+            const count =
+              providerCatalogs?.find((catalog) => catalog.provider === provider.id)?.models
+                .length ?? 0;
             return (
-              <SettingRow
-                key={p.id}
-                title={
-                  <span className="flex items-center gap-2">
-                    <ProviderIcon provider={p.id} className="size-4" />
-                    <span>{p.label}</span>
-                  </span>
+              <SettingResourceRow
+                key={provider.id}
+                icon={<ProviderIcon provider={provider.id} className="size-4" />}
+                title={provider.label}
+                description={provider.bin}
+                status={
+                  available.includes(provider.id)
+                    ? count
+                      ? t("settings.agentModelCount", { count })
+                      : t("settings.agentInstalled")
+                    : t("settings.agentNotInstalled")
                 }
-                description={
-                  detected
-                    ? `${p.bin}${modelCount > 0 ? ` · ${modelCount} models` : ""}`
-                    : `${p.bin} not found on PATH`
-                }
-              >
-                <div className="flex items-center gap-2">
-                  {detected &&
-                    (isDefault ? (
-                      <span className="text-muted-foreground inline-flex h-[26px] items-center gap-1 rounded-md px-2 text-[11.5px] font-medium">
-                        <Check className="h-[12.5px] w-[12.5px] stroke-[2]" />
-                        <span>Default</span>
-                      </span>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => orbitActions.setDraftConfig({ provider: p.id })}
-                        className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[26px] cursor-pointer items-center rounded-md px-2 text-[11.5px] font-medium transition-colors"
-                      >
-                        Set default
-                      </button>
-                    ))}
-
-                  <span
-                    className={cn(
-                      "inline-flex h-[24px] items-center gap-1.5 rounded-md border px-2 text-[11.5px] font-medium",
-                      detected
-                        ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-                        : "border-border text-muted-foreground",
-                    )}
-                  >
-                    <span
-                      className={cn(
-                        "h-[5.5px] w-[5.5px] rounded-full",
-                        detected ? "bg-emerald-500" : "bg-zinc-400",
-                      )}
-                    />
-                    {detected ? "Ready" : "Not installed"}
-                  </span>
-                </div>
-              </SettingRow>
+              />
             );
           })}
-
-          {installedProviders.length > 0 && uninstalledProviders.length > 0 && (
-            <button
-              type="button"
-              onClick={() => setShowUninstalledProviders((v) => !v)}
-              className="text-muted-foreground hover:text-foreground hover:bg-accent/40 flex w-full cursor-pointer items-center justify-between px-4 py-2.5 text-left text-[12px] transition-colors"
-            >
-              <span>
-                {showUninstalledProviders
-                  ? "Hide uninstalled CLIs"
-                  : `${uninstalledProviders.length} more supported CLIs (not installed)`}
-              </span>
-              {showUninstalledProviders ? (
-                <ChevronDown className="size-3.5 opacity-70" />
-              ) : (
-                <ChevronRight className="size-3.5 opacity-70" />
-              )}
-            </button>
+          {installed.length > 0 && installed.length < PROVIDER_LIST.length && (
+            <Button variant="ghost" className="w-full" onClick={() => setShowAll((value) => !value)}>
+              {t(showAll ? "common.hide" : "settings.agentShowAll")}
+            </Button>
           )}
+          <DefaultProviderRow available={available} />
         </SettingCard>
-      </div>
-
-      {/* 2. Orchestration Runtime Settings */}
-      <div className="space-y-2">
-        <SettingGroupLabel>Orchestration & Runtime</SettingGroupLabel>
+      </SettingGroup>
+      <SettingGroup title={t("settings.subTabProvidersRuntime")}>
         <SettingCard>
           <SettingRow
-            title="Built-in Orbit MCP Orchestrator"
-            description="Auto-inject the local Streamable HTTP MCP server (/mcp/agents) into supported agent sessions so agents can delegate subagents, create worktrees, and schedule tasks."
+            settingId="settings.agentMcpInjector"
+            title={t("settings.agentMcpInjector")}
+            description={t("settings.agentMcpDesc")}
           >
             <ToggleSwitch
-              checked={orchConfig.mcp_inject_enabled}
-              onChange={(next) => void patchOrchConfig({ mcp_inject_enabled: next })}
-              aria-label="Built-in Orbit MCP Orchestrator"
+              ariaLabel={t("settings.agentMcpInjector")}
+              disabled={runtimeDisabled}
+              checked={effectiveConfig?.mcp_inject_enabled ?? true}
+              onChange={(mcp_inject_enabled) => void update({ mcp_inject_enabled })}
             />
           </SettingRow>
-
           <SettingRow
-            title="Idle Runtime Cleanup"
-            description="Automatically release idle provider processes after inactivity while preserving full session resume state and protecting active subagent trees."
+            settingId="settings.agentKeepAwake"
+            title={t("settings.agentKeepAwake")}
+            description={
+              awake?.active
+                ? t("settings.agentAwakeActive", { count: awake.active_agents })
+                : t("settings.agentAwakeDesc")
+            }
           >
-            <div className="flex items-center gap-2.5">
-              <SettingSelect<number>
+            <ToggleSwitch
+              ariaLabel={t("settings.agentKeepAwake")}
+              disabled={runtimeDisabled}
+              checked={effectiveConfig?.keep_awake_while_running ?? true}
+              onChange={(keep_awake_while_running) => void update({ keep_awake_while_running })}
+            />
+          </SettingRow>
+          <SettingRow
+            settingId="settings.agentIdleCleanup"
+            title={t("settings.agentIdleCleanup")}
+            description={t("settings.agentIdleDesc")}
+          >
+            <div className="flex items-center gap-2">
+              <SettingSelect
                 size="sm"
-                value={orchConfig.idle_timeout_secs}
-                options={IDLE_TIMEOUT_OPTIONS}
-                disabled={!orchConfig.idle_cleanup_enabled}
-                ariaLabel="Idle runtime cleanup timeout"
-                triggerClassName="min-w-[88px]"
-                menuClassName="min-w-[120px]"
-                onChange={(secs) => void patchOrchConfig({ idle_timeout_secs: secs })}
+                value={idleTimeoutSecs}
+                disabled={runtimeDisabled || !effectiveConfig?.idle_cleanup_enabled}
+                ariaLabel={t("settings.agentIdleCleanup")}
+                options={idleTimeoutOptions}
+                onChange={(idle_timeout_secs) => void update({ idle_timeout_secs })}
               />
               <ToggleSwitch
-                checked={orchConfig.idle_cleanup_enabled}
-                onChange={(next) => void patchOrchConfig({ idle_cleanup_enabled: next })}
-                aria-label="Idle Runtime Cleanup"
+                disabled={runtimeDisabled}
+                checked={effectiveConfig?.idle_cleanup_enabled ?? true}
+                ariaLabel={t("settings.agentIdleCleanup")}
+                onChange={(idle_cleanup_enabled) => void update({ idle_cleanup_enabled })}
               />
             </div>
           </SettingRow>
-
           <SettingRow
-            title="Auto-Resume on Daemon Startup"
-            description="Automatically send a resume prompt to non-background agents that were mid-turn if the host rebooted."
+            settingId="settings.agentAutoResume"
+            title={t("settings.agentAutoResume")}
+            description={t("settings.agentResumeDesc")}
           >
             <ToggleSwitch
-              checked={orchConfig.resume_on_startup}
-              onChange={(next) => void patchOrchConfig({ resume_on_startup: next })}
-              aria-label="Auto-Resume on Daemon Startup"
-            />
-          </SettingRow>
-
-          <SettingRow
-            title={
-              <span className="inline-flex items-center gap-2">
-                <span>Keep awake while running</span>
-                {keepAwakeStatus?.active && (
-                  <span
-                    title={
-                      keepAwakeStatus.backend && keepAwakeStatus.backend !== "noop"
-                        ? `Preventing idle sleep via ${keepAwakeStatus.backend}`
-                        : "Preventing idle sleep"
-                    }
-                    className="inline-flex h-[20px] items-center gap-1.5 rounded-full border border-emerald-500/25 bg-emerald-500/10 px-2 text-[11px] font-medium text-emerald-600 dark:text-emerald-400"
-                  >
-                    <span className="h-[5px] w-[5px] rounded-full bg-emerald-500" />
-                    <span>
-                      Active
-                      {keepAwakeStatus.active_agents > 0
-                        ? ` · ${keepAwakeStatus.active_agents}`
-                        : ""}
-                    </span>
-                  </span>
-                )}
-              </span>
-            }
-            description="Prevent system sleep while agents are active."
-          >
-            <ToggleSwitch
-              checked={keepAwakeEnabled}
-              onChange={(next) => void patchOrchConfig({ keep_awake_while_running: next })}
-              aria-label="Keep awake while running"
+              ariaLabel={t("settings.agentAutoResume")}
+              disabled={runtimeDisabled}
+              checked={effectiveConfig?.resume_on_startup ?? false}
+              onChange={(resume_on_startup) => void update({ resume_on_startup })}
             />
           </SettingRow>
         </SettingCard>
-      </div>
-
-      {/* 3. Agent Profiles */}
-      <div className="space-y-2">
-        <div className="flex items-center justify-between">
-          <SettingGroupLabel>Agent Profiles ({profiles.length})</SettingGroupLabel>
-          <button
-            type="button"
-            onClick={() => setAddingProfile((v) => !v)}
-            className="border-border hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md border px-2 text-[11.5px] font-medium"
-          >
-            <Plus className="h-[12px] w-[12px]" />
-            <span>New Profile</span>
-          </button>
-        </div>
-
-        {addingProfile && (
-          <div className="border-border bg-elevated/70 space-y-3 rounded-xl border p-3.5 text-[12.5px]">
-            <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
-              <Input
-                value={profName}
-                onChange={(e) => setProfName(e.target.value)}
-                placeholder="Profile Name (e.g. Claude Architect)"
-              />
-              <SettingSelect<ProviderKind>
-                align="start"
-                value={effectiveProfProvider}
-                options={profileProviderOptions}
-                ariaLabel="Profile provider"
-                triggerClassName="w-full min-w-0 bg-canvas"
-                onChange={(provider) => setProfProvider(provider)}
-              />
-              <Input
-                value={profModel}
-                onChange={(e) => setProfModel(e.target.value)}
-                placeholder="Model slug (optional)"
-              />
-              <SettingSelect<PresetSessionMode>
-                align="start"
-                value={typeof profMode === "string" ? profMode : "accept_edits"}
-                options={PROFILE_MODE_OPTIONS}
-                ariaLabel="Profile permission mode"
-                triggerClassName="w-full min-w-0 bg-canvas"
-                onChange={(mode) => setProfMode(mode)}
-              />
-            </div>
-            <Input
-              value={profWhenToUse}
-              onChange={(e) => setProfWhenToUse(e.target.value)}
-              placeholder="When to use (helps orchestrators pick this profile automatically)"
-            />
-            <Textarea
-              rows={2}
-              value={profSystemPrompt}
-              onChange={(e) => setProfSystemPrompt(e.target.value)}
-              placeholder="System prompt append (optional)"
-              className="min-h-[60px]"
-            />
-            <Input
-              value={profDisabledTools}
-              onChange={(e) => setProfDisabledTools(e.target.value)}
-              placeholder="Disabled MCP tools (comma-separated, e.g. delete_agent,kill_terminal)"
-              className="font-mono text-[11.5px]"
-            />
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex flex-wrap items-center gap-4">
-                <div className="inline-flex items-center gap-2">
-                  <ToggleSwitch
-                    checked={profMcpEnabled}
-                    onChange={setProfMcpEnabled}
-                    ariaLabel="Inject Orbit MCP tools"
-                  />
-                  <span
-                    className="cursor-pointer select-none"
-                    onClick={() => setProfMcpEnabled((v) => !v)}
-                  >
-                    Inject Orbit MCP tools
-                  </span>
-                </div>
-                <div
-                  className="inline-flex items-center gap-2"
-                  title="Lower latency, higher quota usage"
-                >
-                  <ToggleSwitch
-                    checked={profFastMode}
-                    onChange={setProfFastMode}
-                    ariaLabel="Fast mode"
-                  />
-                  <span
-                    className="cursor-pointer select-none"
-                    onClick={() => setProfFastMode((v) => !v)}
-                  >
-                    Fast mode
-                  </span>
-                </div>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => setAddingProfile(false)}
-                  className="border-border hover:bg-accent cursor-pointer rounded-lg border px-2.5 py-1"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void handleCreateProfile()}
-                  className="bg-foreground text-background cursor-pointer rounded-lg px-3 py-1 font-medium"
-                >
-                  Save Profile
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
+      </SettingGroup>
+      <HostAcpSection hostId={hostId} />
+      <SettingGroup
+        title={t("settings.agentProfiles")}
+        settingId="settings.agentProfiles"
+        action={
+          <Button size="sm" variant="outline" onClick={() => setEditor("new")}>
+            <Plus />
+            {t("settings.agentNewProfile")}
+          </Button>
+        }
+      >
         <SettingCard>
-          {profiles.length === 0 ? (
-            <div className="text-muted-foreground px-4 py-4 text-[12.5px]">
-              No specialist profiles yet. Create profiles like &ldquo;Claude Architect&rdquo;,
-              &ldquo;Codex Implementer&rdquo;, or &ldquo;Antigravity Reviewer&rdquo; so
-              orchestrating agents can discover and delegate by role.
-            </div>
-          ) : (
-            profiles.map((p) => (
-              <SettingRow
-                key={p.profile_id}
-                title={
-                  <span className="flex items-center gap-2">
-                    <ProviderIcon provider={p.provider} className="size-3.5" />
-                    <span>{p.name}</span>
-                    {p.model && (
-                      <code className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 text-[11px]">
-                        {p.model}
-                      </code>
-                    )}
-                    {p.fast_mode && (
-                      <span className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10.5px] font-medium text-amber-700 dark:border-amber-400/30 dark:bg-amber-400/12 dark:text-amber-300">
-                        <Zap className="size-2.5 fill-current stroke-[2]" />
-                        <span>Fast</span>
-                      </span>
-                    )}
-                  </span>
-                }
-                description={
-                  p.when_to_use ||
-                  `Mode: ${typeof p.mode === "string" ? p.mode : "custom"} · MCP ${p.mcp_policy.enabled ? "on" : "off"}`
-                }
-              >
-                <button
-                  type="button"
-                  aria-label={`Delete profile ${p.name}`}
-                  onClick={() => setPendingDeleteProfile(p)}
-                  className="text-muted-foreground hover:text-rose-500 hover:bg-accent cursor-pointer rounded-md p-1.5 transition-colors"
+          {!profiles.length && (
+            <p className="px-4 py-3 text-[13px] text-ink-secondary">{t("settings.agentNoProfiles")}</p>
+          )}
+          {profiles.map((profile) => (
+            <SettingResourceRow
+              key={profile.profile_id}
+              icon={<ProviderIcon provider={profile.provider} className="size-4" />}
+              title={profile.name}
+              description={profile.when_to_use}
+              status={[profile.model, profile.fast_mode && t("settings.agentFast")]
+                .filter(Boolean)
+                .join(" · ")}
+              onClick={() => setEditor(profile)}
+              action={
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={t("settings.agentDeleteProfile", { name: profile.name })}
+                  onClick={() => setDeleting(profile)}
                 >
-                  <Trash2 className="h-[13.5px] w-[13.5px]" />
-                </button>
-              </SettingRow>
-            ))
-          )}
-        </SettingCard>
-      </div>
-
-      {/* 4. Bundled Orchestration Skills */}
-      <div className="space-y-2">
-        <div className="flex items-center justify-between">
-          <SettingGroupLabel>Orchestration Skills</SettingGroupLabel>
-          {skills.length > 0 && (
-            <button
-              type="button"
-              onClick={() => void handleInstallAllSkills()}
-              className="border-border hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md border px-2 text-[11.5px] font-medium"
-            >
-              <Download className="h-[12px] w-[12px]" />
-              <span>Install / Update All</span>
-            </button>
-          )}
-        </div>
-        <SettingCard>
-          {skills.map((s) => (
-            <SettingRow
-              key={s.id}
-              title={
-                <span className="flex items-center gap-2">
-                  <Sparkles className="text-muted-foreground h-[13.5px] w-[13.5px]" />
-                  <span>{s.name}</span>
-                  <code className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 text-[11px]">
-                    {s.slash_command}
-                  </code>
-                  {s.outdated && (
-                    <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10.5px] text-amber-600 dark:text-amber-400">
-                      Outdated
-                    </span>
-                  )}
-                </span>
+                  <Trash2 />
+                </Button>
               }
-              description={s.description}
-            >
-              <button
-                type="button"
-                onClick={() => void handleToggleSkill(s.id, s.installed && !s.outdated)}
-                className={cn(
-                  "cursor-pointer rounded-lg border px-2.5 py-1 text-[11.5px] font-medium transition-colors",
-                  s.installed && !s.outdated
-                    ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-600 hover:bg-rose-500/10 hover:text-rose-600 dark:text-emerald-400"
-                    : "border-border hover:bg-accent text-foreground",
-                )}
-              >
-                {s.outdated ? "Update" : s.installed ? "Installed" : "Install"}
-              </button>
-            </SettingRow>
+            />
           ))}
         </SettingCard>
-      </div>
-
-      {/* 5. Connected Hosts (Cross-Host Orchestration Mesh) */}
-      <div className="space-y-2">
-        <div className="flex items-center justify-between">
-          <SettingGroupLabel>Connected Hosts Mesh ({connectedHosts.length})</SettingGroupLabel>
-          {otherFleetHostsCount > 0 && (
-            <button
-              type="button"
-              onClick={() => void handleSyncFleetHosts()}
-              className="border-border hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md border px-2 text-[11.5px] font-medium"
-            >
-              <Link2 className="h-[12px] w-[12px]" />
-              <span>Sync {otherFleetHostsCount} Fleet Host(s)</span>
-            </button>
-          )}
-        </div>
-
-        <SettingCard>
-          {connectedHosts.length === 0 ? (
-            <div className="text-muted-foreground px-4 py-3.5 text-[12.5px]">
-              No peer daemons connected yet. Register another Orbit Daemon so agents on this host
-              can delegate tasks across machines via <code className="text-[11.5px]">host_id</code>.
-            </div>
-          ) : (
-            connectedHosts.map((peer) => (
-              <SettingRow
-                key={peer.registration_id}
-                title={
-                  <span className="flex items-center gap-2">
-                    <Server className="text-muted-foreground h-[13.5px] w-[13.5px]" />
-                    <span>{peer.label}</span>
-                    <span
-                      className={cn(
-                        "rounded px-1.5 py-0.5 text-[10.5px] font-medium",
-                        peer.status === "online"
-                          ? "bg-emerald-500/12 text-emerald-600 dark:text-emerald-400"
-                          : peer.status === "connecting"
-                            ? "bg-blue-500/12 text-blue-600 dark:text-blue-400"
-                            : peer.status === "error"
-                              ? "bg-rose-500/12 text-rose-600 dark:text-rose-400"
-                              : "bg-muted text-muted-foreground",
-                      )}
-                    >
-                      {peer.status}
-                    </span>
-                  </span>
-                }
-                description={
-                  peer.last_error
-                    ? peer.last_error
-                    : `${peer.hostname ?? peer.host_id ?? "pending handshake"}${peer.available_providers.length > 0 ? ` · ${peer.available_providers.map((p) => formatProviderShortLabel(p)).join(", ")}` : ""}`
-                }
-              >
-                <div className="flex items-center gap-2.5">
-                  <ToggleSwitch
-                    checked={peer.enabled}
-                    ariaLabel={`Enable connected peer ${peer.label}`}
-                    onChange={(enabled) =>
-                      void orbitIpc.updateConnectedHost(hostId, peer.registration_id, {
-                        enabled,
-                      })
-                    }
-                  />
-                  <button
-                    type="button"
-                    aria-label={`Remove connected peer ${peer.label}`}
-                    onClick={() =>
-                      setPendingRemovePeer({
-                        registration_id: peer.registration_id,
-                        label: peer.label,
-                      })
-                    }
-                    className="text-muted-foreground hover:text-rose-500 hover:bg-accent cursor-pointer rounded-md p-1.5 transition-colors"
-                  >
-                    <Trash2 className="h-[13.5px] w-[13.5px]" />
-                  </button>
-                </div>
-              </SettingRow>
-            ))
-          )}
-
-          <div className="flex flex-wrap items-center gap-2 px-4 py-3">
-            <Input
-              value={peerLabel}
-              onChange={(e) => setPeerLabel(e.target.value)}
-              placeholder="Label (optional)"
-              className="h-[30px] w-36 text-[12px]"
-            />
-            <Input
-              value={peerUri}
-              onChange={(e) => setPeerUri(e.target.value)}
-              placeholder="Paste orbit://pair/... URI from another daemon"
-              className="h-[30px] min-w-[200px] flex-1 font-mono text-[12px]"
-            />
-            <Button type="button" size="sm" onClick={() => void handleAddPeer()}>
-              Add Peer
-            </Button>
-          </div>
-        </SettingCard>
-      </div>
-
+      </SettingGroup>
+      {editor && (
+        <ProfileEditor
+          profile={editor === "new" ? null : editor}
+          initialProvider={installed[0]?.id ?? "claude_code"}
+          hostId={hostId}
+          close={() => setEditor(null)}
+        />
+      )}
       <ConfirmDialog
-        open={pendingDeleteProfile !== null}
+        open={!!deleting}
         onOpenChange={(open) => {
-          if (!open) setPendingDeleteProfile(null);
+          if (!open) setDeleting(null);
         }}
-        title={
-          pendingDeleteProfile
-            ? `Delete profile "${pendingDeleteProfile.name}"?`
-            : "Delete agent profile?"
-        }
-        description="Orchestrating agents on this host will no longer be able to delegate tasks using this profile."
-        confirmLabel="Delete"
+        title={t("settings.agentDeleteProfile", { name: deleting?.name ?? "" })}
+        description={t("settings.agentDeleteProfileDesc")}
+        confirmLabel={t("common.delete")}
         tone="danger"
         onConfirm={async () => {
-          if (!pendingDeleteProfile) return;
-          const target = pendingDeleteProfile;
-          await orbitIpc.deleteProfile(hostId, target.profile_id);
-          orbitActions.showToast(`Deleted profile "${target.name}"`);
-        }}
-      />
-
-      <ConfirmDialog
-        open={pendingRemovePeer !== null}
-        onOpenChange={(open) => {
-          if (!open) setPendingRemovePeer(null);
-        }}
-        title={
-          pendingRemovePeer
-            ? `Remove peer "${pendingRemovePeer.label}"?`
-            : "Remove connected peer?"
-        }
-        description="Agents on this host will no longer be able to delegate tasks to this peer daemon."
-        confirmLabel="Remove peer"
-        tone="danger"
-        onConfirm={async () => {
-          if (!pendingRemovePeer) return;
-          const target = pendingRemovePeer;
-          await orbitIpc.removeConnectedHost(hostId, target.registration_id);
-          orbitActions.showToast(`Removed peer "${target.label}"`);
+          if (deleting) await orbitIpc.deleteProfile(hostId, deleting.profile_id);
         }}
       />
     </div>
   );
-}
+});

@@ -1,55 +1,66 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   BookOpen,
-  ChevronDown,
-  ChevronRight,
   Code2,
   GitFork,
   Import,
-  Loader2,
   Plus,
   RefreshCw,
-  Save,
-  Search,
-  Sparkles,
   Trash2,
-  X,
 } from "lucide-react";
 import {
   SettingCard,
-  SettingSectionHeader,
+  SettingDrawer,
+  SettingGroupLabel,
+  SettingResourceRow,
+  SettingSelect,
   ToggleSwitch,
+  useHostIsOnline,
 } from "@/components/settings/settings-primitives";
+import { OrchestrationSkills } from "@/components/settings/orchestration-skills";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Field, FieldLabel, FieldGroup } from "@/components/ui/field";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { Input } from "@/components/ui/input";
+import { ShortcutKbd } from "@/components/ui/kbd";
 import { Textarea } from "@/components/ui/textarea";
 import { isImeKeyEvent } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
 import {
   type ManagedSkillRecord,
+  type OrchestrationSkillInfo,
   type SkillSource,
   type SkillWriteScope,
   orbitIpc,
 } from "@/lib/orbit-ipc";
-import { isLocalHostCard } from "@/lib/projects";
+import { t, useLocale, type MessageKey } from "@/lib/i18n";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
-import { cn } from "@/lib/utils";
 
 type SkillSourceFilter = "all" | "user" | "project" | "claude" | "codex" | "agy" | "builtin";
 
+const EMPTY_BUNDLES: readonly OrchestrationSkillInfo[] = [];
 const EMPTY_SKILLS: readonly ManagedSkillRecord[] = [];
 
-const SOURCE_FILTERS: { id: SkillSourceFilter; label: string }[] = [
-  { id: "all", label: "All" },
-  { id: "user", label: "User" },
-  { id: "project", label: "Project" },
-  { id: "claude", label: "Claude" },
-  { id: "codex", label: "Codex" },
-  { id: "agy", label: "AGY" },
-  { id: "builtin", label: "Built-in" },
+const SOURCE_FILTERS: readonly SkillSourceFilter[] = [
+  "all",
+  "user",
+  "project",
+  "claude",
+  "codex",
+  "agy",
+  "builtin",
 ];
+const SOURCE_LABELS: Record<SkillSourceFilter, MessageKey> = {
+  all: "sidebar.filterAll",
+  user: "managedSkills.user",
+  project: "permissionRules.scopeProject",
+  claude: "managedSkills.claude",
+  codex: "managedSkills.codex",
+  agy: "managedSkills.agy",
+  builtin: "managedSkills.builtin",
+};
 
 function matchesSourceFilter(source: SkillSource, filter: SkillSourceFilter): boolean {
   switch (filter) {
@@ -70,40 +81,10 @@ function matchesSourceFilter(source: SkillSource, filter: SkillSourceFilter): bo
   }
 }
 
-function sourceBadgeLabel(source: SkillSource): string {
-  switch (source) {
-    case "orbit_user":
-      return "User";
-    case "orbit_project":
-      return "Project";
-    case "claude_user":
-      return "Claude";
-    case "claude_project":
-      return "Claude · Project";
-    case "codex_user":
-      return "Codex";
-    case "antigravity_user":
-      return "AGY";
-    case "builtin":
-      return "Built-in";
-  }
-}
-
-function sourceBadgeClass(source: SkillSource): string {
-  switch (source) {
-    case "orbit_user":
-    case "orbit_project":
-      return "border-foreground/15 bg-foreground/[0.06] text-foreground/85";
-    case "claude_user":
-    case "claude_project":
-      return "border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-300";
-    case "codex_user":
-      return "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300";
-    case "antigravity_user":
-      return "border-sky-500/25 bg-sky-500/10 text-sky-700 dark:text-sky-300";
-    case "builtin":
-      return "border-border bg-muted/60 text-muted-foreground";
-  }
+function sourceLabel(source: SkillSource): string {
+  if (source === "claude_project") return `Claude · ${t("permissionRules.scopeProject")}`;
+  const filter = SOURCE_FILTERS.find((item) => item !== "all" && matchesSourceFilter(source, item));
+  return filter ? t(SOURCE_LABELS[filter]) : source;
 }
 
 function slugifyName(raw: string): string {
@@ -117,47 +98,24 @@ function slugifyName(raw: string): string {
 
 const SLUG_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
-function formatTokenCount(tokens: number): string {
-  if (tokens >= 1000) {
-    return `${(tokens / 1000).toFixed(1)}k tok`;
-  }
-  return `${tokens} tok`;
-}
-
-export function HostSkillsSection({ hostId }: { hostId: string }) {
-  const fleet = useOrbitSelector((s) => s.fleet);
-  const hostCard = fleet.hosts.find((h) => h.host_id === hostId) ?? null;
-  const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
-  const selectedWorkspaceCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
-  const hostDetail = useOrbitSelector((s) => s.hostDetails[hostId] ?? null);
-  const storeSkills = hostDetail?.managed_skills ?? EMPTY_SKILLS;
-
-  const activeCwd = useMemo(() => {
-    const normalize = (raw?: string | null) => {
-      const t = raw?.trim();
-      return t && t !== "~" ? t : null;
-    };
-    if (selectedHostId === hostId) {
-      const c = normalize(selectedWorkspaceCwd);
-      if (c) return c;
-    }
-    const ws = hostDetail?.workspaces[0];
-    return normalize(ws?.cwd);
-  }, [selectedHostId, hostId, selectedWorkspaceCwd, hostDetail?.workspaces]);
-
-  const showHostBadge =
-    Boolean(hostCard) &&
-    (fleet.hosts.length > 1 || (hostCard !== null && !isLocalHostCard(hostCard)));
-
-  const [skills, setSkills] = useState<readonly ManagedSkillRecord[]>(storeSkills);
-  const [loading, setLoading] = useState(false);
-  const [search, setSearch] = useState("");
-  const [sourceFilter, setSourceFilter] = useState<SkillSourceFilter>("all");
-
-  // Active drawer: create or import
-  const [activeDrawer, setActiveDrawer] = useState<"none" | "create" | "import">("none");
-
-  // Create form state
+const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
+  mode,
+  onClose,
+  hostId,
+  activeCwd,
+  online,
+  existingSkillIds,
+  onMutated,
+}: {
+  mode: "none" | "create" | "import";
+  onClose: () => void;
+  hostId: string;
+  activeCwd: string | null;
+  online: boolean;
+  existingSkillIds: readonly string[];
+  onMutated: (updated: readonly ManagedSkillRecord[], openId?: string | null) => void;
+}) {
+  useLocale();
   const [newScope, setNewScope] = useState<SkillWriteScope>("user");
   const [newName, setNewName] = useState("");
   const [newSlug, setNewSlug] = useState("");
@@ -166,13 +124,300 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
   const [newBody, setNewBody] = useState("");
   const [creating, setCreating] = useState(false);
 
-  // Import form state
   const [importScope, setImportScope] = useState<SkillWriteScope>("user");
   const [importSlugOverride, setImportSlugOverride] = useState("");
   const [importSource, setImportSource] = useState("");
   const [importing, setImporting] = useState(false);
 
-  // Expanded / inline editor state
+  const isCreate = mode === "create";
+  const busy = creating || importing;
+  const writeScope = isCreate ? newScope : importScope;
+  const canSubmit =
+    (writeScope !== "project" || Boolean(activeCwd)) &&
+    (isCreate ? Boolean(newSlug.trim()) : Boolean(importSource.trim()));
+
+  const scopeOptions = useMemo(
+    () => [
+      {
+        value: "user" as const,
+        label: t("managedSkills.user"),
+        description: "~/.orbit/skills",
+      },
+      {
+        value: "project" as const,
+        label: t("permissionRules.scopeProject"),
+        disabled: !activeCwd,
+        description: activeCwd ? activeCwd + "/.orbit/skills" : t("managedSkills.needProject"),
+      },
+    ],
+    [activeCwd],
+  );
+
+  const handleCreateSkill = async () => {
+    const slug = newSlug.trim();
+    if (!SLUG_RE.test(slug)) {
+      orbitActions.showToast(t("managedSkills.slugError"));
+      return;
+    }
+    if (newScope === "project" && !activeCwd) {
+      orbitActions.showToast(t("managedSkills.needProject"));
+      return;
+    }
+    setCreating(true);
+    try {
+      const name = newName.trim() || slug;
+      const desc = newDesc.trim();
+      const body = newBody.trim() || `# ${name}\n`;
+      const updated = await orbitIpc.upsertManagedSkill(hostId, {
+        scope: newScope,
+        cwd: activeCwd,
+        slug,
+        name,
+        description: desc,
+        content: body,
+        enabled: true,
+        expectedEtag: null,
+      });
+      setNewName("");
+      setNewSlug("");
+      setSlugTouched(false);
+      setNewDesc("");
+      setNewBody("");
+      onClose();
+      const createdId = `${newScope === "project" ? "orbit_project" : "orbit_user"}:${slug}`;
+      onMutated(updated, createdId);
+    } catch (err) {
+      orbitActions.showToast(String(err));
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const handleImportSkill = async () => {
+    if (!importSource.trim()) {
+      orbitActions.showToast(t("managedSkills.importSource"));
+      return;
+    }
+    if (importScope === "project" && !activeCwd) {
+      orbitActions.showToast(t("managedSkills.needProject"));
+      return;
+    }
+    const slugOverride = importSlugOverride.trim() || null;
+    if (slugOverride && !SLUG_RE.test(slugOverride)) {
+      orbitActions.showToast(t("managedSkills.slugError"));
+      return;
+    }
+    setImporting(true);
+    try {
+      const beforeIds = new Set(existingSkillIds);
+      const updated = await orbitIpc.importManagedSkill(hostId, {
+        scope: importScope,
+        cwd: activeCwd,
+        sourceMarkdownOrPath: importSource,
+        slugOverride,
+      });
+      setImportSource("");
+      setImportSlugOverride("");
+      onClose();
+      const newlyAdded = updated.find((s) => !beforeIds.has(s.id));
+      if (newlyAdded) {
+        onMutated(updated, newlyAdded.id);
+      } else {
+        onMutated(updated, null);
+        orbitActions.showToast(t("managedSkills.imported"));
+      }
+    } catch (err) {
+      orbitActions.showToast(String(err));
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  return (
+    <SettingDrawer
+      open={mode !== "none"}
+      onOpenChange={(open) => {
+        if (!open && !busy) onClose();
+      }}
+      title={t(isCreate ? "managedSkills.create" : "managedSkills.import")}
+    >
+      <form
+        className="flex flex-col gap-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!busy && online && canSubmit) {
+            void (isCreate ? handleCreateSkill() : handleImportSkill());
+          }
+        }}
+      >
+        <FieldGroup>
+          <Field>
+            <FieldLabel>{t("managedSkills.scope")}</FieldLabel>
+            <SettingSelect<SkillWriteScope>
+              value={writeScope}
+              disabled={busy}
+              ariaLabel={t("managedSkills.scope")}
+              onChange={isCreate ? setNewScope : setImportScope}
+              options={scopeOptions}
+            />
+            <span className="text-ink-muted break-all font-mono text-[11px]">
+              {writeScope === "user" ? "~/.orbit/skills" : activeCwd + "/.orbit/skills"}
+            </span>
+          </Field>
+          {isCreate ? (
+            <>
+              <Field>
+                <FieldLabel htmlFor="managed-skill-name">{t("managedSkills.name")}</FieldLabel>
+                <Input
+                  id="managed-skill-name"
+                  value={newName}
+                  disabled={busy}
+                  onChange={(e) => {
+                    const name = e.target.value;
+                    setNewName(name);
+                    if (!slugTouched) setNewSlug(slugifyName(name));
+                  }}
+                />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="managed-skill-slug">{t("managedSkills.slug")}</FieldLabel>
+                <Input
+                  id="managed-skill-slug"
+                  value={newSlug}
+                  required
+                  pattern="[a-z0-9][a-z0-9_\-]{0,63}"
+                  disabled={busy}
+                  onChange={(e) => {
+                    setSlugTouched(true);
+                    setNewSlug(e.target.value.toLowerCase());
+                  }}
+                  className="font-mono"
+                />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="managed-skill-description">
+                  {t("managedSkills.description")}
+                </FieldLabel>
+                <Input
+                  id="managed-skill-description"
+                  value={newDesc}
+                  disabled={busy}
+                  onChange={(e) => setNewDesc(e.target.value)}
+                />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="managed-skill-body">
+                  {t("managedSkills.instructions")}
+                </FieldLabel>
+                <Textarea
+                  id="managed-skill-body"
+                  rows={8}
+                  value={newBody}
+                  disabled={busy}
+                  onChange={(e) => setNewBody(e.target.value)}
+                  className="font-mono text-[13px]"
+                />
+              </Field>
+            </>
+          ) : (
+            <>
+              <Field>
+                <FieldLabel htmlFor="managed-skill-import">
+                  {t("managedSkills.importSource")}
+                </FieldLabel>
+                <Textarea
+                  id="managed-skill-import"
+                  rows={8}
+                  value={importSource}
+                  disabled={busy}
+                  required
+                  onChange={(e) => setImportSource(e.target.value)}
+                  className="font-mono text-[13px]"
+                />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="managed-skill-import-slug">
+                  {t("managedSkills.override")}
+                </FieldLabel>
+                <Input
+                  id="managed-skill-import-slug"
+                  value={importSlugOverride}
+                  disabled={busy}
+                  onChange={(e) => setImportSlugOverride(e.target.value.toLowerCase())}
+                  className="font-mono"
+                />
+              </Field>
+            </>
+          )}
+        </FieldGroup>
+        <Button
+          type="submit"
+          size="sm"
+          disabled={!online || busy || !canSubmit}
+          className="self-end"
+        >
+          {busy && <OrbitSpinner size={13} />}
+          {t(isCreate ? "managedSkills.create" : "managedSkills.import")}
+        </Button>
+      </form>
+    </SettingDrawer>
+  );
+});
+
+export const HostSkillsSection = memo(function HostSkillsSection({
+  hostId,
+}: {
+  hostId: string;
+}) {
+  const online = useHostIsOnline(hostId);
+  const activeCwd = useOrbitSelector((s) => {
+    const cwd =
+      s.selectedHostId === hostId
+        ? s.selectedWorkspaceCwd
+        : s.hostDetails[hostId]?.workspaces[0]?.cwd;
+    return cwd && cwd !== "~" ? cwd : null;
+  });
+  const bundles = useOrbitSelector(
+    (s) => s.hostDetails[hostId]?.orchestration_skills ?? EMPTY_BUNDLES,
+  );
+  const storeSkills = useOrbitSelector(
+    (s) => s.hostDetails[hostId]?.managed_skills ?? EMPTY_SKILLS,
+  );
+  return (
+    <ManagedSkills
+      key={JSON.stringify([hostId, activeCwd])}
+      hostId={hostId}
+      activeCwd={activeCwd}
+      online={online}
+      bundles={bundles}
+      storeSkills={storeSkills}
+    />
+  );
+});
+
+function ManagedSkills({
+  hostId,
+  activeCwd,
+  online,
+  storeSkills,
+  bundles,
+}: {
+  hostId: string;
+  activeCwd: string | null;
+  online: boolean;
+  storeSkills: readonly ManagedSkillRecord[];
+  bundles: readonly OrchestrationSkillInfo[];
+}) {
+  useLocale();
+  const [skills, setSkills] = useState<readonly ManagedSkillRecord[]>(storeSkills);
+  const [loading, setLoading] = useState(false);
+  const [search, setSearch] = useState("");
+  const [sourceFilter, setSourceFilter] = useState<SkillSourceFilter>("all");
+
+  // Active drawer: create or import (form keystrokes isolated in SkillCreateImportDrawer)
+  const [activeDrawer, setActiveDrawer] = useState<"none" | "create" | "import">("none");
+
+  const [detailOpen, setDetailOpen] = useState(false);
   const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
   const [loadedSkillId, setLoadedSkillId] = useState<string | null>(null);
   const [loadingContent, setLoadingContent] = useState(false);
@@ -182,12 +427,13 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
   const [saving, setSaving] = useState(false);
   const [conflictMessage, setConflictMessage] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
-  const [pendingSkillSwitch, setPendingSkillSwitch] = useState<ManagedSkillRecord | null>(null);
+  const [discardEdits, setDiscardEdits] = useState(false);
   const [forking, setForking] = useState(false);
-  const [togglingId, setTogglingId] = useState<string | null>(null);
 
   const readSeqRef = useRef(0);
   const listSeqRef = useRef(0);
+  const toggleSeqRef = useRef(0);
+  const toggleChainRef = useRef<Promise<void>>(Promise.resolve());
   const hasLoadedScopedRef = useRef(false);
   const selectedSkillIdRef = useRef<string | null>(null);
   selectedSkillIdRef.current = selectedSkillId;
@@ -213,6 +459,7 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
   }, []);
 
   const refreshSkills = useCallback(async () => {
+    if (!online) return;
     const seq = listSeqRef.current + 1;
     listSeqRef.current = seq;
     setLoading(true);
@@ -220,25 +467,23 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
       const fresh = await orbitIpc.listManagedSkills(hostId, activeCwd);
       if (listSeqRef.current === seq) {
         hasLoadedScopedRef.current = true;
+        toggleSeqRef.current += 1;
         setSkills(fresh);
       }
     } catch (err) {
       if (listSeqRef.current === seq) {
-        orbitActions.showToast(`Failed to load skills: ${String(err)}`);
+        orbitActions.showToast(String(err));
       }
     } finally {
       if (listSeqRef.current === seq) {
         setLoading(false);
       }
     }
-  }, [hostId, activeCwd]);
+  }, [hostId, activeCwd, online]);
 
-  // Reset editor/selection cleanly when host or active project cwd changes
   useEffect(() => {
-    hasLoadedScopedRef.current = false;
-    clearEditorState();
     void refreshSkills();
-  }, [hostId, activeCwd, clearEditorState, refreshSkills]);
+  }, [refreshSkills]);
 
   const selectedSkill = useMemo(
     () => skills.find((s) => s.id === selectedSkillId) ?? null,
@@ -266,7 +511,7 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
         }
       } catch (err) {
         if (readSeqRef.current === seq) {
-          orbitActions.showToast(`Failed to read skill: ${String(err)}`);
+          orbitActions.showToast(String(err));
         }
       } finally {
         if (readSeqRef.current === seq) {
@@ -279,30 +524,16 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
 
   const isDirty = Boolean(
     selectedSkill?.editable &&
-      loadedSkillId === selectedSkill.id &&
-      !loadingContent &&
-      editorContent !== loadedContent,
+    loadedSkillId === selectedSkill.id &&
+    !loadingContent &&
+    editorContent !== loadedContent,
   );
 
-  const applySelectSkill = useCallback(
-    (skill: ManagedSkillRecord) => {
-      if (selectedSkillId === skill.id) {
-        clearEditorState();
-        return;
-      }
-      setSelectedSkillId(skill.id);
-      selectedSkillIdRef.current = skill.id;
-      void loadSkillContent(skill.id);
-    },
-    [selectedSkillId, clearEditorState, loadSkillContent],
-  );
-
-  const handleSelectSkill = (skill: ManagedSkillRecord) => {
-    if (isDirty) {
-      setPendingSkillSwitch(skill);
-      return;
-    }
-    applySelectSkill(skill);
+  const openSkillEditor = (id: string) => {
+    setSelectedSkillId(id);
+    selectedSkillIdRef.current = id;
+    setDetailOpen(true);
+    void loadSkillContent(id);
   };
 
   const handleSaveEditor = useCallback(async () => {
@@ -316,7 +547,7 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
       return;
     }
     const targetId = selectedSkill.id;
-    const targetSlug = selectedSkill.slug;
+
     const seq = readSeqRef.current;
     const scope: SkillWriteScope = selectedSkill.source === "orbit_project" ? "project" : "user";
     setSaving(true);
@@ -341,7 +572,6 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
         setEditorContent(reread.content);
         setLoadedEtag(reread.etag);
       }
-      orbitActions.showToast(`Saved /${targetSlug}`);
     } catch (err) {
       const msg = String(err);
       if (
@@ -349,9 +579,9 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
         readSeqRef.current === seq &&
         (msg.toLowerCase().includes("etag") || msg.toLowerCase().includes("conflict"))
       ) {
-        setConflictMessage("File changed on disk. Reload before saving to avoid overwriting.");
+        setConflictMessage(t("managedSkills.conflict"));
       } else {
-        orbitActions.showToast(`Save failed: ${msg}`);
+        orbitActions.showToast(msg);
       }
     } finally {
       setSaving(false);
@@ -367,29 +597,42 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
     loadedEtag,
   ]);
 
-  const handleToggleEnabled = async (skill: ManagedSkillRecord, nextEnabled: boolean) => {
-    setTogglingId(skill.id);
-    try {
-      const updated = await orbitIpc.toggleManagedSkill(hostId, skill.id, nextEnabled, activeCwd);
-      hasLoadedScopedRef.current = true;
-      setSkills(updated);
-    } catch (err) {
-      orbitActions.showToast(`Toggle failed: ${String(err)}`);
-    } finally {
-      setTogglingId(null);
-    }
-  };
+  const handleToggleEnabled = useCallback(
+    (skill: ManagedSkillRecord, nextEnabled: boolean) => {
+      const seq = ++toggleSeqRef.current;
+      setSkills((prev) =>
+        prev.map((item) => (item.id === skill.id ? { ...item, enabled: nextEnabled } : item)),
+      );
+      toggleChainRef.current = toggleChainRef.current.then(async () => {
+        try {
+          const updated = await orbitIpc.toggleManagedSkill(
+            hostId,
+            skill.id,
+            nextEnabled,
+            activeCwd,
+          );
+          if (toggleSeqRef.current === seq) {
+            hasLoadedScopedRef.current = true;
+            setSkills(updated);
+          }
+        } catch (err) {
+          setSkills((prev) =>
+            prev.map((item) =>
+              item.id === skill.id ? { ...item, enabled: !nextEnabled } : item,
+            ),
+          );
+          orbitActions.showToast(String(err));
+        }
+      });
+    },
+    [hostId, activeCwd],
+  );
 
   const handleDeleteSkill = async (skill: ManagedSkillRecord) => {
-    try {
-      const updated = await orbitIpc.deleteManagedSkill(hostId, skill.id, activeCwd);
-      hasLoadedScopedRef.current = true;
-      setSkills(updated);
-      clearEditorState();
-      orbitActions.showToast(`Deleted /${skill.slug}`);
-    } catch (err) {
-      orbitActions.showToast(`Delete failed: ${String(err)}`);
-    }
+    const updated = await orbitIpc.deleteManagedSkill(hostId, skill.id, activeCwd);
+    hasLoadedScopedRef.current = true;
+    setSkills(updated);
+    clearEditorState();
   };
 
   const handleForkToOrbit = async (skill: ManagedSkillRecord, scope: SkillWriteScope) => {
@@ -413,112 +656,42 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
       hasLoadedScopedRef.current = true;
       setSkills(updated);
       const nextId = `${scope === "project" ? "orbit_project" : "orbit_user"}:${skill.slug}`;
-      setSelectedSkillId(nextId);
-      selectedSkillIdRef.current = nextId;
-      void loadSkillContent(nextId);
-      orbitActions.showToast(
-        `Forked /${skill.slug} to Orbit ${scope === "project" ? "Project" : "User"}`,
-      );
+      openSkillEditor(nextId);
     } catch (err) {
-      orbitActions.showToast(`Fork failed: ${String(err)}`);
+      orbitActions.showToast(String(err));
     } finally {
       setForking(false);
     }
   };
 
-  const handleCreateSkill = async () => {
-    const slug = newSlug.trim();
-    if (!SLUG_RE.test(slug)) {
-      orbitActions.showToast("Slug must match ^[a-z0-9][a-z0-9_-]{0,63}$");
-      return;
-    }
-    if (newScope === "project" && !activeCwd) {
-      orbitActions.showToast("Open a project workspace first for project-scoped skills");
-      return;
-    }
-    setCreating(true);
-    try {
-      const name = newName.trim() || slug;
-      const desc = newDesc.trim();
-      const body =
-        newBody.trim() || `# ${name}\n\nDescribe the workflow, constraints, and verification steps.`;
-      const updated = await orbitIpc.upsertManagedSkill(hostId, {
-        scope: newScope,
-        cwd: activeCwd,
-        slug,
-        name,
-        description: desc,
-        content: body,
-        enabled: true,
-        expectedEtag: null,
-      });
+  const existingSkillIds = useMemo(() => skills.map((s) => s.id), [skills]);
+  const handleCloseCreateImport = useCallback(() => setActiveDrawer("none"), []);
+  const handleSkillMutated = useCallback(
+    (updated: readonly ManagedSkillRecord[], openId?: string | null) => {
       hasLoadedScopedRef.current = true;
       setSkills(updated);
-      setActiveDrawer("none");
-      setNewName("");
-      setNewSlug("");
-      setSlugTouched(false);
-      setNewDesc("");
-      setNewBody("");
-      const createdId = `${newScope === "project" ? "orbit_project" : "orbit_user"}:${slug}`;
-      setSelectedSkillId(createdId);
-      selectedSkillIdRef.current = createdId;
-      void loadSkillContent(createdId);
-      orbitActions.showToast(`Created /${slug}`);
-    } catch (err) {
-      orbitActions.showToast(`Create failed: ${String(err)}`);
-    } finally {
-      setCreating(false);
-    }
-  };
+      if (openId) openSkillEditor(openId);
+    },
+    [openSkillEditor],
+  );
 
-  const handleImportSkill = async () => {
-    if (!importSource.trim()) {
-      orbitActions.showToast("Paste Markdown or enter a local SKILL.md path");
-      return;
-    }
-    if (importScope === "project" && !activeCwd) {
-      orbitActions.showToast("Open a project workspace first for project-scoped import");
-      return;
-    }
-    const slugOverride = importSlugOverride.trim() || null;
-    if (slugOverride && !SLUG_RE.test(slugOverride)) {
-      orbitActions.showToast("Slug override must match ^[a-z0-9][a-z0-9_-]{0,63}$");
-      return;
-    }
-    setImporting(true);
-    try {
-      const beforeIds = new Set(skills.map((s) => s.id));
-      const updated = await orbitIpc.importManagedSkill(hostId, {
-        scope: importScope,
-        cwd: activeCwd,
-        sourceMarkdownOrPath: importSource,
-        slugOverride,
-      });
-      hasLoadedScopedRef.current = true;
-      setSkills(updated);
-      setActiveDrawer("none");
-      setImportSource("");
-      setImportSlugOverride("");
-      const newlyAdded = updated.find((s) => !beforeIds.has(s.id));
-      if (newlyAdded) {
-        setSelectedSkillId(newlyAdded.id);
-        selectedSkillIdRef.current = newlyAdded.id;
-        void loadSkillContent(newlyAdded.id);
-        orbitActions.showToast(`Imported /${newlyAdded.slug}`);
-      } else {
-        orbitActions.showToast("Imported skill");
-      }
-    } catch (err) {
-      orbitActions.showToast(`Import failed: ${String(err)}`);
-    } finally {
-      setImporting(false);
-    }
-  };
-
+  // The daemon lists bundled workflows in both catalogs. Match only its built-in
+  // source so separately editable user and project copies remain available.
+  const bundledRecords = useMemo(() => {
+    const ids = new Set(bundles.map((bundle) => bundle.id));
+    return new Map(
+      skills
+        .filter((skill) => skill.source === "builtin" && ids.has(skill.slug))
+        .map((skill) => [skill.slug, skill]),
+    );
+  }, [skills, bundles]);
+  const workflows = useMemo(
+    () => skills.filter((skill) => skill.source !== "builtin" || !bundledRecords.has(skill.slug)),
+    [skills, bundledRecords],
+  );
   const filterCounts = useMemo(() => {
     const counts: Record<SkillSourceFilter, number> = {
-      all: skills.length,
+      all: workflows.length,
       user: 0,
       project: 0,
       claude: 0,
@@ -526,19 +699,19 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
       agy: 0,
       builtin: 0,
     };
-    for (const s of skills) {
+    for (const s of workflows) {
       for (const f of SOURCE_FILTERS) {
-        if (f.id !== "all" && matchesSourceFilter(s.source, f.id)) {
-          counts[f.id] += 1;
+        if (f !== "all" && matchesSourceFilter(s.source, f)) {
+          counts[f] += 1;
         }
       }
     }
     return counts;
-  }, [skills]);
+  }, [workflows]);
 
   const filteredSkills = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return skills.filter((s) => {
+    return workflows.filter((s) => {
       if (!matchesSourceFilter(s.source, sourceFilter)) return false;
       if (!q) return true;
       return (
@@ -548,586 +721,320 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
         s.triggers.some((t) => t.toLowerCase().includes(q))
       );
     });
-  }, [skills, sourceFilter, search]);
-
-  const enabledCount = useMemo(() => skills.filter((s) => s.enabled).length, [skills]);
+  }, [workflows, sourceFilter, search]);
 
   return (
-    <div className="space-y-5">
-      <SettingSectionHeader
-        title="Skills"
-        description={`Discover, toggle, edit, and import SKILL.md workflows (${enabledCount}/${skills.length} enabled).`}
-        badge={
-          showHostBadge && hostCard ? (
-            <span className="bg-muted text-muted-foreground rounded-md px-2 py-0.5 text-[11.5px] font-medium">
-              {hostCard.display_name}
-            </span>
-          ) : null
-        }
-        action={
-          <div className="flex items-center gap-1.5">
-            <button
-              type="button"
-              onClick={() => setActiveDrawer((d) => (d === "import" ? "none" : "import"))}
-              className={cn(
-                "border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors",
-                activeDrawer === "import" && "bg-accent",
-              )}
-            >
-              <Import className="h-[13px] w-[13px]" />
-              <span>Import</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveDrawer((d) => (d === "create" ? "none" : "create"))}
-              className="bg-foreground text-background inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg px-2.5 text-[12px] font-medium transition-opacity hover:opacity-90"
-            >
-              <Plus className="h-[13px] w-[13px]" />
-              <span>New Skill</span>
-            </button>
-            <button
-              type="button"
-              aria-label="Refresh skills"
-              disabled={loading}
-              onClick={() => void refreshSkills()}
-              className="border-border hover:bg-accent inline-flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-lg border transition-colors disabled:opacity-50"
-            >
-              <RefreshCw className={cn("h-[13px] w-[13px]", loading && "animate-spin")} />
-            </button>
-          </div>
-        }
+    <>
+      <OrchestrationSkills
+        hostId={hostId}
+        skills={bundles}
+        online={online}
+        onSynced={() => void refreshSkills()}
+        actionsForSkill={(id) => {
+          const skill = bundledRecords.get(id);
+          if (!skill) return null;
+          return (
+            <>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => openSkillEditor(skill.id)}
+                aria-label={skill.name + " · SKILL.md"}
+              >
+                SKILL.md
+              </Button>
+              <ToggleSwitch
+                checked={skill.enabled}
+                ariaLabel={skill.name}
+                disabled={!online}
+                onChange={(next) => handleToggleEnabled(skill, next)}
+              />
+            </>
+          );
+        }}
       />
-
-      {/* Create Skill Drawer */}
-      {activeDrawer === "create" && (
-        <div className="border-border bg-background/80 space-y-3 rounded-[13px] border p-4 text-[12.5px]">
-          <div className="flex items-center justify-between">
-            <span className="text-foreground text-[13px] font-medium">New Skill</span>
-            <button
-              type="button"
-              aria-label="Close new skill drawer"
-              onClick={() => setActiveDrawer("none")}
-              className="text-muted-foreground hover:text-foreground cursor-pointer rounded p-1"
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
-          </div>
-
-          <div className="flex items-center gap-1.5">
-            {(["user", "project"] as const).map((sc) => {
-              const disabled = sc === "project" && !activeCwd;
-              return (
-                <button
-                  key={sc}
-                  type="button"
-                  disabled={disabled}
-                  title={
-                    disabled
-                      ? "Select a project workspace first"
-                      : sc === "user"
-                        ? "~/.orbit/skills"
-                        : `${activeCwd}/.orbit/skills`
-                  }
-                  onClick={() => setNewScope(sc)}
-                  className={cn(
-                    "cursor-pointer rounded-md border px-2.5 py-1 text-[11.5px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40",
-                    newScope === sc
-                      ? "border-foreground/20 bg-foreground text-background"
-                      : "border-border text-muted-foreground hover:text-foreground",
-                  )}
-                >
-                  {sc === "user" ? "User (~/.orbit/skills)" : "Project (.orbit/skills)"}
-                </button>
-              );
-            })}
-          </div>
-
-          <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
-            <Input
-              value={newName}
-              onChange={(e) => {
-                const next = e.target.value;
-                setNewName(next);
-                if (!slugTouched) setNewSlug(slugifyName(next));
-              }}
-              placeholder="Name (e.g. Release Checklist)"
-            />
-            <Input
-              value={newSlug}
-              onChange={(e) => {
-                setSlugTouched(true);
-                setNewSlug(e.target.value.toLowerCase());
-              }}
-              placeholder="slug (e.g. release-checklist)"
-              className="font-mono text-[12px]"
-            />
-          </div>
-
-          <Input
-            value={newDesc}
-            onChange={(e) => setNewDesc(e.target.value)}
-            placeholder="Short description"
-          />
-
-          <Textarea
-            rows={5}
-            value={newBody}
-            onChange={(e) => setNewBody(e.target.value)}
-            placeholder="Markdown instructions (YAML frontmatter is added automatically if omitted)"
-            className="font-mono text-[12px] leading-relaxed"
-          />
-
-          <div className="flex items-center justify-end gap-2">
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => setActiveDrawer("none")}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              size="sm"
-              disabled={creating}
-              onClick={() => void handleCreateSkill()}
-            >
-              {creating && <Loader2 className="h-3 w-3 animate-spin" />}
-              <span>Create Skill</span>
-            </Button>
-          </div>
-        </div>
-      )}
-
-      {/* Import Markdown Drawer */}
-      {activeDrawer === "import" && (
-        <div className="border-border bg-background/80 space-y-3 rounded-[13px] border p-4 text-[12.5px]">
-          <div className="flex items-center justify-between">
-            <span className="text-foreground text-[13px] font-medium">Import Markdown</span>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              aria-label="Close import drawer"
-              onClick={() => setActiveDrawer("none")}
-              className="h-[24px] w-[24px]"
-            >
-              <X className="h-3.5 w-3.5" />
-            </Button>
-          </div>
-
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-1.5">
-              {(["user", "project"] as const).map((sc) => {
-                const disabled = sc === "project" && !activeCwd;
-                return (
-                  <button
-                    key={sc}
-                    type="button"
-                    disabled={disabled}
-                    onClick={() => setImportScope(sc)}
-                    className={cn(
-                      "cursor-pointer rounded-md border px-2.5 py-1 text-[11.5px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40",
-                      importScope === sc
-                        ? "border-foreground/20 bg-foreground text-background"
-                        : "border-border text-muted-foreground hover:text-foreground",
-                    )}
-                  >
-                    {sc === "user" ? "User" : "Project"}
-                  </button>
-                );
-              })}
+      <section data-setting-id="managedSkills.title" className="flex flex-col gap-2">
+        <SettingGroupLabel
+          action={
+            <div className="flex items-center gap-1">
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label={t("common.refresh")}
+                disabled={loading || !online}
+                onClick={() => void refreshSkills()}
+              >
+                <RefreshCw />
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                data-setting-id="managedSkills.import"
+                disabled={!online}
+                onClick={() => setActiveDrawer("import")}
+              >
+                <Import data-icon="inline-start" />
+                {t("managedSkills.import")}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                data-setting-id="managedSkills.create"
+                disabled={!online}
+                onClick={() => setActiveDrawer("create")}
+              >
+                <Plus data-icon="inline-start" />
+                {t("managedSkills.create")}
+              </Button>
             </div>
-            <Input
-              value={importSlugOverride}
-              onChange={(e) => setImportSlugOverride(e.target.value.toLowerCase())}
-              placeholder="Slug override (optional)"
-              className="h-[30px] w-48 font-mono text-[11.5px]"
-            />
-          </div>
-
-          <Textarea
-            rows={5}
-            value={importSource}
-            onChange={(e) => setImportSource(e.target.value)}
-            placeholder="Paste SKILL.md Markdown content, or enter a local .md path inside your active workspace or skills directory"
-            className="font-mono text-[12px] leading-relaxed"
-          />
-
-          <div className="flex items-center justify-end gap-2">
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => setActiveDrawer("none")}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              size="sm"
-              disabled={importing}
-              onClick={() => void handleImportSkill()}
-            >
-              {importing && <Loader2 className="h-3 w-3 animate-spin" />}
-              <span>Import Skill</span>
-            </Button>
-          </div>
-        </div>
-      )}
-
-      {/* Search + Source Filter Pills */}
-      <div className="space-y-2.5">
-        <div className="relative">
-          <Search className="text-muted-foreground pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2" />
+          }
+        >
+          {t("managedSkills.title")} · {workflows.length}
+        </SettingGroupLabel>
+        <div className="flex items-center gap-2">
           <Input
+            type="search"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search skills by name, slug, or trigger…"
-            className="h-[34px] pr-8 pl-8.5"
+            aria-label={t("managedSkills.filter")}
+            placeholder={t("managedSkills.filter")}
+            className="flex-1 text-[13px]"
           />
-          {search && (
-            <button
-              type="button"
-              aria-label="Clear search"
-              onClick={() => setSearch("")}
-              className="text-muted-foreground hover:text-foreground absolute top-1/2 right-2.5 -translate-y-1/2 cursor-pointer"
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
+          <SettingSelect
+            value={sourceFilter}
+            onChange={setSourceFilter}
+            ariaLabel={t("managedSkills.source")}
+            options={SOURCE_FILTERS.filter(
+              (id) => id !== "builtin" || filterCounts.builtin > 0 || sourceFilter === id,
+            ).map((id) => ({
+              value: id,
+              label: t(SOURCE_LABELS[id]),
+              badge: String(filterCounts[id]),
+            }))}
+          />
+        </div>
+        <SettingCard>
+          {filteredSkills.length === 0 ? (
+            <p className="text-ink-muted px-4 py-5 text-center text-[13px]">
+              {t(
+                loading
+                  ? "common.loading"
+                  : workflows.length > 0
+                    ? "managedSkills.noMatches"
+                    : "managedSkills.empty",
+              )}
+            </p>
+          ) : (
+            filteredSkills.map((skill) => (
+              <SettingResourceRow
+                key={skill.id}
+                title={skill.name}
+                description={skill.description}
+                status={
+                  <span>
+                    {sourceLabel(skill.source)} · <code>/{skill.slug}</code>
+                  </span>
+                }
+                icon={<BookOpen />}
+                onClick={() => openSkillEditor(skill.id)}
+                action={
+                  <ToggleSwitch
+                    checked={skill.enabled}
+                    ariaLabel={skill.name}
+                    disabled={!online}
+                    onChange={(next) => handleToggleEnabled(skill, next)}
+                  />
+                }
+              />
+            ))
           )}
-        </div>
-
-        <div className="flex flex-wrap items-center gap-1.5">
-          {SOURCE_FILTERS.map((f) => {
-            const active = sourceFilter === f.id;
-            const count = filterCounts[f.id];
-            return (
-              <button
-                key={f.id}
-                type="button"
-                onClick={() => setSourceFilter(f.id)}
-                className={cn(
-                  "inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-full border px-2.5 text-[11.5px] font-medium transition-colors",
-                  active
-                    ? "border-foreground/20 bg-foreground text-background"
-                    : "border-border bg-background/50 text-muted-foreground hover:bg-accent hover:text-foreground",
-                )}
-              >
-                <span>{f.label}</span>
-                <span
-                  className={cn(
-                    "text-[10.5px] tabular-nums",
-                    active ? "text-background/75" : "text-muted-foreground/70",
-                  )}
-                >
-                  {count}
+        </SettingCard>
+        <SkillCreateImportDrawer
+          mode={activeDrawer}
+          onClose={handleCloseCreateImport}
+          hostId={hostId}
+          activeCwd={activeCwd}
+          online={online}
+          existingSkillIds={existingSkillIds}
+          onMutated={handleSkillMutated}
+        />
+        {selectedSkill && (
+          <SettingDrawer
+            open={detailOpen}
+            onOpenChangeComplete={(visible) => {
+              if (!visible) clearEditorState();
+            }}
+            title={selectedSkill.name}
+            description={selectedSkill.description}
+            onOpenChange={(open) => {
+              if (open || forking || saving) return;
+              if (isDirty) setDiscardEdits(true);
+              else setDetailOpen(false);
+            }}
+          >
+            <div className="flex flex-col gap-4">
+              <div className="text-ink-muted flex flex-col gap-1 text-[11px]">
+                <code className="select-text break-all">{selectedSkill.path}</code>
+                <span>
+                  {sourceLabel(selectedSkill.source)} ·{" "}
+                  {selectedSkill.approx_tokens.toLocaleString()} tokens
                 </span>
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* Discovered Skills List + Inline Editor/Preview */}
-      <SettingCard>
-        {filteredSkills.length === 0 ? (
-          <div className="text-muted-foreground px-4 py-6 text-center text-[12.5px]">
-            {skills.length === 0
-              ? "No skills discovered yet. Create or import a SKILL.md workflow to get started."
-              : "No skills match the current filter."}
-          </div>
-        ) : (
-          filteredSkills.map((skill) => {
-            const expanded = selectedSkillId === skill.id;
-            const deletingThis = confirmDeleteId === skill.id;
-            return (
-              <div key={skill.id} className="transition-colors">
-                <div className="flex items-start justify-between gap-3 px-4 py-3">
-                  <button
-                    type="button"
-                    onClick={() => handleSelectSkill(skill)}
-                    className="flex min-w-0 flex-1 cursor-pointer items-start gap-2.5 text-left"
-                  >
-                    <span className="text-muted-foreground mt-0.5 shrink-0">
-                      {expanded ? (
-                        <ChevronDown className="h-3.5 w-3.5" />
-                      ) : (
-                        <ChevronRight className="h-3.5 w-3.5" />
-                      )}
-                    </span>
-                    <div className="min-w-0 flex-1 space-y-1">
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <span
-                          className={cn(
-                            "text-[13px] font-medium",
-                            skill.enabled ? "text-foreground" : "text-muted-foreground",
-                          )}
-                        >
-                          {skill.name}
-                        </span>
-                        <code className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 font-mono text-[11px]">
-                          /{skill.slug}
-                          {skill.argument_hint ? ` ${skill.argument_hint}` : ""}
-                        </code>
-                        {skill.is_command && (
-                          <span className="border-border bg-muted/70 text-foreground/80 rounded border px-1.5 py-0.5 text-[10.5px] font-medium">
-                            Command
-                          </span>
-                        )}
-                        <span
-                          className={cn(
-                            "rounded border px-1.5 py-0.5 text-[10.5px] font-medium",
-                            sourceBadgeClass(skill.source),
-                          )}
-                        >
-                          {sourceBadgeLabel(skill.source)}
-                        </span>
-                        <span className="text-muted-foreground/80 text-[10.5px] tabular-nums">
-                          ~{formatTokenCount(skill.approx_tokens)}
-                        </span>
-                        {skill.has_scripts && (
-                          <span
-                            title="Contains scripts/ directory"
-                            className="bg-muted/70 text-muted-foreground inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px]"
-                          >
-                            <Code2 className="h-2.5 w-2.5" />
-                            <span>scripts</span>
-                          </span>
-                        )}
-                        {skill.has_references && (
-                          <span
-                            title="Contains references/ directory"
-                            className="bg-muted/70 text-muted-foreground inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px]"
-                          >
-                            <BookOpen className="h-2.5 w-2.5" />
-                            <span>refs</span>
-                          </span>
-                        )}
-                      </div>
-                      {skill.description && (
-                        <p className="text-muted-foreground line-clamp-1 text-[12px] leading-snug">
-                          {skill.description}
-                        </p>
-                      )}
-                    </div>
-                  </button>
-
-                  <div className="shrink-0 pt-0.5">
-                    <ToggleSwitch
-                      checked={skill.enabled}
-                      disabled={togglingId === skill.id}
-                      ariaLabel={`Enable ${skill.name}`}
-                      onChange={(next) => void handleToggleEnabled(skill, next)}
-                    />
-                  </div>
-                </div>
-
-                {/* Inline SKILL.md Editor / Read-only Preview */}
-                {expanded && (
-                  <div className="border-border/70 bg-muted/20 space-y-3 border-t px-4 py-3.5">
-                    <div className="flex flex-wrap items-center justify-between gap-2 text-[11.5px]">
-                      <div
-                        className="text-muted-foreground min-w-0 truncate font-mono"
-                        title={skill.path}
-                      >
-                        {skill.path}
-                      </div>
-                      <div className="flex items-center gap-1.5">
-                        {skill.editable ? (
-                          <>
-                            {isDirty && (
-                              <span className="text-[11px] font-medium text-amber-600 dark:text-amber-400">
-                                Unsaved
-                              </span>
-                            )}
-                            {isDirty && (
-                              <button
-                                type="button"
-                                onClick={() => setEditorContent(loadedContent)}
-                                className="border-border hover:bg-accent cursor-pointer rounded-md border px-2 py-1 text-[11.5px]"
-                              >
-                                Revert
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              disabled={!isDirty || saving}
-                              onClick={() => void handleSaveEditor()}
-                              className="bg-foreground text-background inline-flex cursor-pointer items-center gap-1 rounded-md px-2.5 py-1 text-[11.5px] font-medium disabled:opacity-40"
-                            >
-                              {saving ? (
-                                <Loader2 className="h-3 w-3 animate-spin" />
-                              ) : (
-                                <Save className="h-3 w-3" />
-                              )}
-                              <span>Save</span>
-                            </button>
-                            {deletingThis ? (
-                              <div className="flex items-center gap-1">
-                                <Button
-                                  type="button"
-                                  variant="destructive"
-                                  size="sm"
-                                  onClick={() => void handleDeleteSkill(skill)}
-                                  className="h-[26px] px-2 text-[11.5px]"
-                                >
-                                  Delete
-                                </Button>
-                                <Button
-                                  type="button"
-                                  variant="outline"
-                                  size="sm"
-                                  onClick={() => setConfirmDeleteId(null)}
-                                  className="h-[26px] px-2 text-[11.5px]"
-                                >
-                                  Cancel
-                                </Button>
-                              </div>
-                            ) : (
-                              <button
-                                type="button"
-                                aria-label={`Delete ${skill.name}`}
-                                onClick={() => setConfirmDeleteId(skill.id)}
-                                className="text-muted-foreground hover:text-rose-500 hover:bg-accent cursor-pointer rounded-md p-1.5"
-                              >
-                                <Trash2 className="h-3.5 w-3.5" />
-                              </button>
-                            )}
-                          </>
-                        ) : (
-                          <>
-                            <span className="text-muted-foreground text-[11px]">Read-only</span>
-                            <button
-                              type="button"
-                              disabled={forking}
-                              onClick={() => void handleForkToOrbit(skill, "user")}
-                              className="border-border bg-background hover:bg-accent inline-flex cursor-pointer items-center gap-1.5 rounded-md border px-2.5 py-1 text-[11.5px] font-medium disabled:opacity-50"
-                            >
-                              {forking ? (
-                                <Loader2 className="h-3 w-3 animate-spin" />
-                              ) : (
-                                <GitFork className="h-3 w-3" />
-                              )}
-                              <span>Fork to Orbit</span>
-                            </button>
-                            {activeCwd && (
-                              <button
-                                type="button"
-                                disabled={forking}
-                                onClick={() => void handleForkToOrbit(skill, "project")}
-                                className="border-border bg-background hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-md border px-2 py-1 text-[11.5px] disabled:opacity-50"
-                              >
-                                <span>Fork to Project</span>
-                              </button>
-                            )}
-                          </>
-                        )}
-                      </div>
-                    </div>
-
-                    {(skill.triggers.length > 0 || skill.allowed_tools.length > 0) && (
-                      <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
-                        {skill.triggers.map((t) => (
-                          <span
-                            key={`t:${t}`}
-                            className="bg-background/80 border-border text-muted-foreground rounded border px-1.5 py-0.5"
-                          >
-                            #{t}
-                          </span>
-                        ))}
-                        {skill.allowed_tools.map((tool) => (
-                          <span
-                            key={`tool:${tool}`}
-                            className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 font-mono text-[10.5px]"
-                          >
-                            {tool}
-                          </span>
-                        ))}
-                      </div>
-                    )}
-
-                    {conflictMessage && (
-                      <div className="flex items-center justify-between gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[12px] text-amber-700 dark:text-amber-300">
-                        <span className="flex items-center gap-1.5">
-                          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-                          <span>{conflictMessage}</span>
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => void loadSkillContent(skill.id)}
-                          className="cursor-pointer font-medium underline"
-                        >
-                          Reload
-                        </button>
-                      </div>
-                    )}
-
-                    {loadingContent || loadedSkillId !== skill.id ? (
-                      <div className="text-muted-foreground flex items-center gap-2 py-6 text-[12px]">
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        <span>Loading SKILL.md…</span>
-                      </div>
-                    ) : skill.editable ? (
-                      <div className="space-y-1.5">
-                        <Textarea
-                          rows={12}
-                          value={editorContent}
-                          onChange={(e) => setEditorContent(e.target.value)}
-                          onKeyDown={(e) => {
-                            if (
-                              !isImeKeyEvent(e) &&
-                              !e.altKey &&
-                              (e.metaKey || e.ctrlKey) &&
-                              e.key.toLowerCase() === "s"
-                            ) {
-                              e.preventDefault();
-                              if (isDirty) void handleSaveEditor();
-                            }
-                          }}
-                          spellCheck={false}
-                          className="p-3 font-mono text-[12px] leading-relaxed"
-                        />
-                        <div className="text-muted-foreground/75 flex items-center justify-between text-[11px]">
-                          <span className="inline-flex items-center gap-1">
-                            <Sparkles className="h-3 w-3" />
-                            <span>Type /{skill.slug} in the composer to invoke</span>
-                          </span>
-                          <span>{modSymbol()}S to save</span>
-                        </div>
-                      </div>
-                    ) : (
-                      <pre className="border-border bg-canvas/80 text-foreground/90 max-h-72 overflow-auto rounded-lg border p-3 font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap select-text">
-                        {loadedContent}
-                      </pre>
-                    )}
-                  </div>
+                <code>
+                  /{selectedSkill.slug} {selectedSkill.argument_hint}
+                </code>
+                {selectedSkill.is_command && <span>{t("managedSkills.command")}</span>}
+                {(selectedSkill.has_scripts || selectedSkill.has_references) && (
+                  <span className="inline-flex items-center gap-1.5 font-mono">
+                    <Code2 className="size-3" />
+                    {[
+                      selectedSkill.has_scripts && "scripts/",
+                      selectedSkill.has_references && "references/",
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </span>
+                )}
+                {selectedSkill.triggers.length > 0 && (
+                  <span>{selectedSkill.triggers.map((trigger) => "#" + trigger).join(" · ")}</span>
+                )}
+                {selectedSkill.allowed_tools.length > 0 && (
+                  <code>{selectedSkill.allowed_tools.join(" · ")}</code>
                 )}
               </div>
-            );
-          })
+              {conflictMessage && (
+                <div
+                  role="alert"
+                  className="border-border-subtle text-ink-primary flex items-center gap-2 rounded-lg border p-3 text-[13px]"
+                >
+                  <AlertTriangle className="size-4 shrink-0" />
+                  <span>{conflictMessage}</span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void loadSkillContent(selectedSkill.id)}
+                  >
+                    {t("sidePanel.editorConflictReload")}
+                  </Button>
+                </div>
+              )}
+              {loadingContent ? (
+                <OrbitSpinner size={14} />
+              ) : loadedSkillId !== selectedSkill.id ? (
+                <Button
+                  variant="outline"
+                  disabled={!online}
+                  onClick={() => void loadSkillContent(selectedSkill.id)}
+                >
+                  {t("sidePanel.editorConflictReload")}
+                </Button>
+              ) : selectedSkill.editable ? (
+                <>
+                  <Textarea
+                    rows={14}
+                    spellCheck={false}
+                    aria-label="SKILL.md"
+                    value={editorContent}
+                    disabled={saving || !online}
+                    onChange={(e) => setEditorContent(e.target.value)}
+                    className="font-mono text-[13px]"
+                    onKeyDown={(e) => {
+                      if (
+                        !isImeKeyEvent(e) &&
+                        !e.altKey &&
+                        (e.metaKey || e.ctrlKey) &&
+                        e.key.toLowerCase() === "s"
+                      ) {
+                        e.preventDefault();
+                        if (isDirty) void handleSaveEditor();
+                      }
+                    }}
+                  />
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      disabled={saving || !online}
+                      aria-label={t("common.delete")}
+                      onClick={() => setConfirmDeleteId(selectedSkill.id)}
+                    >
+                      <Trash2 />
+                    </Button>
+                    <div className="flex items-center gap-2">
+                      {isDirty && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          disabled={saving}
+                          onClick={() => setEditorContent(loadedContent)}
+                        >
+                          {t("review.discard")}
+                        </Button>
+                      )}
+                      <Button
+                        size="sm"
+                        disabled={!isDirty || saving || !online}
+                        onClick={() => void handleSaveEditor()}
+                      >
+                        {saving && <OrbitSpinner size={13} />}
+                        <span>{t("common.save")}</span>
+                        <ShortcutKbd keys={`${modSymbol()}S`} size="xs" variant="inverted" />
+                      </Button>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <pre className="border-border-subtle bg-surface-recessed text-ink-secondary overflow-auto rounded-lg border p-3 font-mono text-[13px] whitespace-pre-wrap select-text">
+                    {loadedContent}
+                  </pre>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={!online || forking}
+                      onClick={() => void handleForkToOrbit(selectedSkill, "user")}
+                    >
+                      <GitFork data-icon="inline-start" />
+                      {t("managedSkills.forkUser")}
+                    </Button>
+                    {activeCwd && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={!online || forking}
+                        onClick={() => void handleForkToOrbit(selectedSkill, "project")}
+                      >
+                        {t("managedSkills.forkProject")}
+                      </Button>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+            <ConfirmDialog
+              open={discardEdits}
+              onOpenChange={setDiscardEdits}
+              tone="danger"
+              title={t("review.discardFileConfirmTitle", { name: selectedSkill.name })}
+              confirmLabel={t("review.discard")}
+              onConfirm={() => {
+                setDiscardEdits(false);
+                setDetailOpen(false);
+              }}
+            />
+            <ConfirmDialog
+              open={confirmDeleteId === selectedSkill.id}
+              onOpenChange={(open) => {
+                if (!open) setConfirmDeleteId(null);
+              }}
+              tone="danger"
+              title={t("managedSkills.delete", { name: selectedSkill.name })}
+              confirmLabel={t("common.delete")}
+              onConfirm={() => handleDeleteSkill(selectedSkill)}
+            />
+          </SettingDrawer>
         )}
-      </SettingCard>
-
-      <ConfirmDialog
-        open={pendingSkillSwitch !== null}
-        onOpenChange={(open) => {
-          if (!open) setPendingSkillSwitch(null);
-        }}
-        title="Discard unsaved changes?"
-        description={
-          selectedSkill
-            ? `Your unsaved edits to /${selectedSkill.slug} will be lost.`
-            : "Your unsaved changes to this skill will be lost."
-        }
-        confirmLabel="Discard"
-        tone="danger"
-        onConfirm={() => {
-          const target = pendingSkillSwitch;
-          setPendingSkillSwitch(null);
-          if (target) applySelectSkill(target);
-        }}
-      />
-    </div>
+      </section>
+    </>
   );
 }

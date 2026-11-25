@@ -2018,7 +2018,7 @@ export function AutomationsView() {
                     >
                       {!editingSchedule && (
                         <div className="flex items-center justify-between gap-3 py-2">
-                          <div className="min-w-0">
+                          <div className={cn("min-w-0", !canUseWorktree && "opacity-55")}>
                             <div className="text-foreground text-[12px] font-medium">
                               Isolated Git worktree
                             </div>
@@ -2028,9 +2028,12 @@ export function AutomationsView() {
                                 : "Selected folder is not a Git repository"}
                             </div>
                           </div>
-                          <div className={cn(!canUseWorktree && "pointer-events-none opacity-45")}>
-                            <ToggleSwitch checked={effectiveWorktree} onChange={setWorktree} />
-                          </div>
+                          <ToggleSwitch
+                            checked={effectiveWorktree}
+                            disabled={!canUseWorktree}
+                            ariaLabel="Isolated Git worktree"
+                            onChange={setWorktree}
+                          />
                         </div>
                       )}
 

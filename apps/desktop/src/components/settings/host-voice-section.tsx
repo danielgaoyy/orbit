@@ -1,52 +1,191 @@
-import { useCallback, useEffect, useState } from "react";
-import { Check, Download, RefreshCw, ShieldCheck, Trash2, Volume2 } from "lucide-react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Mic, RefreshCw } from "lucide-react";
 import {
   SettingCard,
   SettingGroupLabel,
+  SettingPageHeader,
   SettingRow,
-  SettingSectionHeader,
   SettingSelect,
+  type SettingSelectOption,
   ToggleSwitch,
+  useHostIsOnline,
 } from "@/components/settings/settings-primitives";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { useI18n } from "@/lib/i18n";
 import {
+  type SystemAudioInputDevice,
   type VoiceConfig,
   type VoiceConfigState,
-  type VoiceSttBackend,
-  type VoiceTtsBackend,
   orbitIpc,
   parseVoiceRpcError,
 } from "@/lib/orbit-ipc";
+import {
+  type AudioInputDeviceInfo,
+  findMatchingWebDeviceId,
+  listAudioInputDevices,
+  mergeAudioInputDevices,
+  normalizeAudioDeviceName,
+  parseLabelPrefixedDeviceId,
+  requestMicrophoneLabels,
+} from "@/lib/voice-recorder";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
-function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
-  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${bytes} B`;
+const SYSTEM_DEFAULT_MIC = "default";
+const MIC_POLL_INTERVAL_MS = 2500;
+
+function sameWebDevices(
+  a: readonly AudioInputDeviceInfo[],
+  b: readonly AudioInputDeviceInfo[],
+): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i].deviceId !== b[i].deviceId || a[i].label !== b[i].label) return false;
+  }
+  return true;
 }
 
-export function HostVoiceSection({ hostId }: { hostId: string }) {
-  const { t } = useI18n();
-  const host = useOrbitSelector((s) => s.fleet.hosts.find((h) => h.host_id === hostId) ?? null);
-  const isOnline =
-    host?.connection_state === "online_direct" || host?.connection_state === "online_relay";
+function sameSystemDevices(
+  a: readonly SystemAudioInputDevice[],
+  b: readonly SystemAudioInputDevice[],
+): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (
+      a[i].name !== b[i].name ||
+      a[i].is_default !== b[i].is_default ||
+      a[i].transport !== b[i].transport
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export const HostVoiceSection = memo(function HostVoiceSection({ hostId }: { hostId: string }) {
+  const { locale, t } = useI18n();
+  const isOnline = useHostIsOnline(hostId);
+  const voiceInputDeviceId = useOrbitSelector((s) => s.voiceInputDeviceId);
 
   const [state, setState] = useState<VoiceConfigState | null>(null);
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [busyModelId, setBusyModelId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const latestConfigRef = useRef<VoiceConfig | null>(null);
+  const patchSeqRef = useRef(0);
+  const writeChainRef = useRef<Promise<void>>(Promise.resolve());
+
+  const [webAudioInputs, setWebAudioInputs] = useState<AudioInputDeviceInfo[]>([]);
+  const [systemAudioInputs, setSystemAudioInputs] = useState<SystemAudioInputDevice[]>([]);
+  const [needsMicPermission, setNeedsMicPermission] = useState(false);
+  const [micSupported, setMicSupported] = useState(true);
+  const [requestingMic, setRequestingMic] = useState(false);
+  const lastAutoProbedSignatureRef = useRef<string | null>(null);
+
+  const reconcileWebSelection = useCallback((devices: readonly AudioInputDeviceInfo[]) => {
+    const current = orbitActions.getSnapshot().voiceInputDeviceId;
+    if (!parseLabelPrefixedDeviceId(current)) return;
+    const matchedWebId = findMatchingWebDeviceId(devices, current);
+    if (matchedWebId && matchedWebId !== current) {
+      orbitActions.setVoiceInputDeviceId(matchedWebId);
+    }
+  }, []);
+
+  const refreshMicrophones = useCallback(
+    async (options?: { probe?: boolean; autoProbeOnMissing?: boolean; notifyDenied?: boolean }) => {
+      try {
+        const [webRes, sysDevices] = await Promise.all([
+          listAudioInputDevices(),
+          orbitIpc.listSystemAudioInputs(),
+        ]);
+
+        let webDevices = webRes.devices;
+        let needsPerm = webRes.needsPermission;
+        setMicSupported((prev) => (prev === webRes.supported ? prev : webRes.supported));
+        setSystemAudioInputs((prev) => (sameSystemDevices(prev, sysDevices) ? prev : sysDevices));
+
+        const initialMerged = mergeAudioInputDevices(webDevices, sysDevices);
+        const osSignature =
+          sysDevices.length > 0
+            ? sysDevices
+                .map((d) => normalizeAudioDeviceName(d.name))
+                .sort()
+                .join("|")
+            : null;
+        const shouldAutoProbe =
+          Boolean(options?.autoProbeOnMissing) &&
+          webRes.supported &&
+          Boolean(osSignature) &&
+          initialMerged.hasMissingSystemDevice &&
+          lastAutoProbedSignatureRef.current !== osSignature;
+
+        if ((options?.probe || shouldAutoProbe) && webRes.supported) {
+          if (osSignature) lastAutoProbedSignatureRef.current = osSignature;
+          const probed = await requestMicrophoneLabels();
+          if (probed.granted) {
+            webDevices = probed.devices;
+            needsPerm = false;
+          } else if (options?.notifyDenied) {
+            orbitActions.showToast(t("voice.micAccessDenied"));
+          }
+        }
+
+        setWebAudioInputs((prev) => (sameWebDevices(prev, webDevices) ? prev : webDevices));
+        setNeedsMicPermission((prev) => (prev === needsPerm ? prev : needsPerm));
+        reconcileWebSelection(webDevices);
+      } catch {
+        setWebAudioInputs([]);
+        setNeedsMicPermission(false);
+      }
+    },
+    [reconcileWebSelection, t],
+  );
+
+  useEffect(() => {
+    void refreshMicrophones({ autoProbeOnMissing: true });
+
+    const onDeviceChange = () => void refreshMicrophones({ autoProbeOnMissing: true });
+    const onWindowFocus = () => void refreshMicrophones({ autoProbeOnMissing: true });
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void refreshMicrophones({ autoProbeOnMissing: true });
+      }
+    };
+
+    const mediaDevices = typeof navigator !== "undefined" ? navigator.mediaDevices : undefined;
+    mediaDevices?.addEventListener?.("devicechange", onDeviceChange);
+    window.addEventListener("focus", onWindowFocus);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
+    // macOS WKWebView often skips `devicechange` for Bluetooth headsets; poll while Voice is open.
+    const pollId = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        void refreshMicrophones({ autoProbeOnMissing: true });
+      }
+    }, MIC_POLL_INTERVAL_MS);
+
+    return () => {
+      mediaDevices?.removeEventListener?.("devicechange", onDeviceChange);
+      window.removeEventListener("focus", onWindowFocus);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.clearInterval(pollId);
+    };
+  }, [refreshMicrophones]);
+
+  const handleRequestMicLabels = useCallback(async () => {
+    setRequestingMic(true);
+    try {
+      await refreshMicrophones({ probe: true, notifyDenied: true });
+    } finally {
+      setRequestingMic(false);
+    }
+  }, [refreshMicrophones]);
 
   const loadConfig = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       const next = await orbitIpc.getVoiceConfig(hostId);
+      latestConfigRef.current = next.config;
       setState(next);
     } catch (err) {
       setError(parseVoiceRpcError(err).message);
@@ -56,73 +195,137 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
   }, [hostId]);
 
   useEffect(() => {
-    void loadConfig();
-  }, [loadConfig]);
+    latestConfigRef.current = null;
+    patchSeqRef.current += 1;
+    if (isOnline) void loadConfig();
+    else setLoading(false);
+  }, [loadConfig, isOnline]);
 
+  // Apply changes optimistically and serialize RPC writes so rapid toggles never
+  // race or flash-disable sibling controls (like the Recognition language select).
   const patchConfig = useCallback(
-    async (patch: Partial<VoiceConfig>) => {
-      if (!state) return;
-      const nextConfig: VoiceConfig = { ...state.config, ...patch };
-      setSaving(true);
+    (patch: Partial<VoiceConfig>) => {
+      const base = latestConfigRef.current;
+      if (!base) return;
+      const prevConfig = base;
+      const nextConfig: VoiceConfig = { ...base, ...patch };
+      latestConfigRef.current = nextConfig;
+      const seq = ++patchSeqRef.current;
       setError(null);
-      try {
-        const updated = await orbitIpc.updateVoiceConfig(hostId, nextConfig);
-        setState(updated);
-      } catch (err) {
-        const msg = parseVoiceRpcError(err).message;
-        setError(msg);
-        orbitActions.showToast(msg);
-      } finally {
-        setSaving(false);
-      }
+      setState((cur) => (cur ? { ...cur, config: nextConfig } : cur));
+
+      writeChainRef.current = writeChainRef.current.then(async () => {
+        try {
+          const updated = await orbitIpc.updateVoiceConfig(hostId, nextConfig);
+          if (patchSeqRef.current === seq) {
+            latestConfigRef.current = updated.config;
+            setState(updated);
+          }
+        } catch (err) {
+          const msg = parseVoiceRpcError(err).message;
+          if (patchSeqRef.current === seq) {
+            latestConfigRef.current = prevConfig;
+            setState((cur) => (cur ? { ...cur, config: prevConfig } : cur));
+            setError(msg);
+          }
+          orbitActions.showToast(msg);
+        }
+      });
     },
-    [hostId, state],
+    [hostId],
   );
 
-  const handleDownloadModel = useCallback(
-    async (modelId: string) => {
-      setBusyModelId(modelId);
-      setError(null);
-      try {
-        const updated = await orbitIpc.downloadVoiceModel(hostId, modelId);
-        setState(updated);
-        orbitActions.showToast(t("voice.modelDownloadedToast", { id: modelId }));
-      } catch (err) {
-        const msg = parseVoiceRpcError(err).message;
-        setError(msg);
-        orbitActions.showToast(msg);
-      } finally {
-        setBusyModelId(null);
-      }
-    },
-    [hostId, t],
+  const mergedMicrophones = useMemo(
+    () => mergeAudioInputDevices(webAudioInputs, systemAudioInputs),
+    [webAudioInputs, systemAudioInputs],
   );
 
-  const handleDeleteModel = useCallback(
-    async (modelId: string) => {
-      setBusyModelId(modelId);
-      setError(null);
-      try {
-        const updated = await orbitIpc.deleteVoiceModel(hostId, modelId);
-        setState(updated);
-        orbitActions.showToast(t("voice.modelDeletedToast", { id: modelId }));
-      } catch (err) {
-        const msg = parseVoiceRpcError(err).message;
-        setError(msg);
-        orbitActions.showToast(msg);
-      } finally {
-        setBusyModelId(null);
-      }
-    },
-    [hostId, t],
+  const micOptions = useMemo<SettingSelectOption<string>[]>(() => {
+    const defaultLabel = mergedMicrophones.defaultSystemDeviceName
+      ? t("voice.micSystemDefaultNamed", { name: mergedMicrophones.defaultSystemDeviceName })
+      : t("voice.micSystemDefault");
+
+    const opts: SettingSelectOption<string>[] = [
+      { value: SYSTEM_DEFAULT_MIC, label: defaultLabel },
+      ...mergedMicrophones.devices.map((dev, idx) => ({
+        value: dev.deviceId,
+        label: dev.label || t("voice.micDeviceFallback", { index: idx + 1 }),
+      })),
+    ];
+    if (voiceInputDeviceId && !opts.some((opt) => opt.value === voiceInputDeviceId)) {
+      opts.push({
+        value: voiceInputDeviceId,
+        label: t("voice.micUnavailable"),
+      });
+    }
+    return opts;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mergedMicrophones, voiceInputDeviceId, locale]);
+
+  const languageOptions = useMemo<SettingSelectOption<string>[]>(
+    () => [
+      { value: "auto", label: t("voice.langAuto") },
+      { value: "en", label: "English" },
+      { value: "zh", label: "中文" },
+      { value: "ja", label: "日本語" },
+    ],
+    [t],
   );
 
   const cfg = state?.config;
   const languageValue = cfg?.language ?? "auto";
+  const selectedMicValue = voiceInputDeviceId ?? SYSTEM_DEFAULT_MIC;
+  const showManualDetectButton =
+    needsMicPermission && micSupported && systemAudioInputs.length === 0;
+  const voiceSubDisabled = !isOnline || Boolean(cfg && !cfg.enabled);
+  const micDisabled =
+    (!micSupported && systemAudioInputs.length === 0) || Boolean(cfg && !cfg.enabled);
+
+  const microphoneRow = (
+    <SettingRow
+      settingId="voice.microphoneTitle"
+      title={t("voice.microphoneTitle")}
+      description={t("voice.microphoneDesc")}
+      disabled={micDisabled}
+    >
+      <div className="flex items-center gap-2">
+        {showManualDetectButton && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={requestingMic || Boolean(cfg && !cfg.enabled)}
+            onClick={() => void handleRequestMicLabels()}
+          >
+            {requestingMic ? <OrbitSpinner size={12} /> : <Mic data-icon="inline-start" />}
+            {t("voice.micAllowAccess")}
+          </Button>
+        )}
+        <SettingSelect<string>
+          ariaLabel={t("voice.microphoneTitle")}
+          value={selectedMicValue}
+          disabled={micDisabled}
+          options={micOptions}
+          menuClassName="w-[280px]"
+          onOpenChange={(open) => {
+            if (open) {
+              void refreshMicrophones({
+                probe: needsMicPermission && systemAudioInputs.length === 0,
+                autoProbeOnMissing: true,
+              });
+            }
+          }}
+          onChange={(val) =>
+            orbitActions.setVoiceInputDeviceId(val === SYSTEM_DEFAULT_MIC ? null : val)
+          }
+        />
+      </div>
+    </SettingRow>
+  );
 
   return (
     <div className="flex flex-col gap-6">
-      <SettingSectionHeader
+      <SettingPageHeader
         title={t("voice.title")}
         description={t("voice.subtitle")}
         action={
@@ -130,7 +333,11 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
             variant="outline"
             size="sm"
             disabled={loading || !isOnline}
-            onClick={() => void loadConfig()}
+            onClick={() => {
+              lastAutoProbedSignatureRef.current = null;
+              void refreshMicrophones({ probe: true });
+              void loadConfig();
+            }}
           >
             <RefreshCw data-icon="inline-start" className={loading ? "animate-spin" : undefined} />
             {t("common.refresh")}
@@ -138,215 +345,76 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
         }
       />
 
-      {error && (
-        <div className="border-signal-danger/30 bg-signal-danger/8 text-signal-danger rounded-[10px] border px-3.5 py-2.5 text-[12px]">
+      {!isOnline && <p className="text-ink-muted text-[13px]">{t("voice.offline")}</p>}
+      {error && isOnline && (
+        <div className="border-signal-danger/30 bg-signal-danger/8 text-signal-danger rounded-[10px] border px-3.5 py-2.5 text-[13px]">
           {error}
         </div>
       )}
 
-      {loading && !cfg ? (
+      <div className="flex flex-col gap-2">
+        <SettingGroupLabel>{t("voice.sectionControl")}</SettingGroupLabel>
         <SettingCard>
-          <div className="text-ink-muted flex items-center gap-2.5 px-4 py-6 text-[13px]">
-            <OrbitSpinner size={14} />
-            <span>{t("common.loading")}</span>
-          </div>
-        </SettingCard>
-      ) : cfg ? (
-        <>
-          <div className="flex flex-col gap-2">
-            <SettingGroupLabel>{t("voice.sectionControl")}</SettingGroupLabel>
-            <SettingCard>
+          {loading && !cfg ? (
+            <div className="text-ink-muted flex items-center gap-2.5 px-4 py-6 text-[13px]">
+              <OrbitSpinner size={14} />
+              <span>{t("common.loading")}</span>
+            </div>
+          ) : cfg ? (
+            <>
               <SettingRow
+                settingId="voice.enableTitle"
                 title={t("voice.enableTitle")}
                 description={t("voice.enableDesc")}
               >
                 <ToggleSwitch
                   checked={cfg.enabled}
-                  disabled={saving || !isOnline}
+                  disabled={!isOnline}
                   ariaLabel={t("voice.enableTitle")}
-                  onChange={(enabled) => void patchConfig({ enabled })}
+                  onChange={(enabled) => patchConfig({ enabled })}
                 />
               </SettingRow>
 
+              {microphoneRow}
+
               <SettingRow
+                settingId="voice.languageTitle"
                 title={t("voice.languageTitle")}
                 description={t("voice.languageDesc")}
+                disabled={voiceSubDisabled}
               >
                 <SettingSelect<string>
+                  ariaLabel={t("voice.languageTitle")}
                   value={languageValue}
-                  disabled={saving || !isOnline}
+                  disabled={voiceSubDisabled}
                   onChange={(val) =>
-                    void patchConfig({ language: val === "auto" ? null : val })
+                    patchConfig({ language: val === "auto" ? null : val })
                   }
-                  options={[
-                    { value: "auto", label: t("voice.langAuto") },
-                    { value: "en", label: "English" },
-                    { value: "zh", label: "中文" },
-                    { value: "ja", label: "日本語" },
-                  ]}
+                  options={languageOptions}
                 />
               </SettingRow>
 
               <SettingRow
+                settingId="voice.autoSpeakTitle"
                 title={t("voice.autoSpeakTitle")}
                 description={t("voice.autoSpeakDesc")}
+                disabled={voiceSubDisabled}
               >
                 <ToggleSwitch
                   checked={cfg.auto_speak_responses}
-                  disabled={saving || !isOnline}
+                  disabled={voiceSubDisabled}
                   ariaLabel={t("voice.autoSpeakTitle")}
                   onChange={(auto_speak_responses) =>
-                    void patchConfig({ auto_speak_responses })
+                    patchConfig({ auto_speak_responses })
                   }
                 />
               </SettingRow>
-
-              <SettingRow
-                title={t("voice.sttBackendTitle")}
-                description={t("voice.sttBackendDesc")}
-              >
-                <SettingSelect<VoiceSttBackend>
-                  value={cfg.stt_backend}
-                  disabled={saving || !isOnline}
-                  onChange={(stt_backend) => void patchConfig({ stt_backend })}
-                  options={[
-                    { value: "local_whisper", label: t("voice.sttLocalWhisper") },
-                    { value: "local_sense_voice", label: t("voice.sttLocalSenseVoice") },
-                    { value: "open_ai_compatible", label: t("voice.backendOpenAi") },
-                    { value: "system_client_fallback", label: t("voice.sttBrowserFallback") },
-                  ]}
-                />
-              </SettingRow>
-
-              <SettingRow
-                title={t("voice.ttsBackendTitle")}
-                description={t("voice.ttsBackendDesc")}
-              >
-                <SettingSelect<VoiceTtsBackend>
-                  value={cfg.tts_backend}
-                  disabled={saving || !isOnline}
-                  onChange={(tts_backend) => void patchConfig({ tts_backend })}
-                  options={[
-                    { value: "system_native", label: t("voice.ttsSystemNative") },
-                    { value: "local_kokoro", label: t("voice.ttsLocalKokoro") },
-                    { value: "open_ai_compatible", label: t("voice.backendOpenAi") },
-                    { value: "disabled", label: t("voice.ttsDisabled") },
-                  ]}
-                />
-              </SettingRow>
-            </SettingCard>
-          </div>
-
-          {state?.capabilities && (
-            <div className="flex flex-col gap-2">
-              <SettingGroupLabel>{t("voice.sectionCapabilities")}</SettingGroupLabel>
-              <SettingCard>
-                <div className="flex flex-wrap items-center gap-2 px-4 py-3">
-                  <Badge variant={state.capabilities.local_whisper ? "secondary" : "outline"}>
-                    {state.capabilities.local_whisper ? (
-                      <Check className="text-signal-success size-3" />
-                    ) : null}
-                    Whisper
-                  </Badge>
-                  <Badge variant={state.capabilities.local_sense_voice ? "secondary" : "outline"}>
-                    {state.capabilities.local_sense_voice ? (
-                      <Check className="text-signal-success size-3" />
-                    ) : null}
-                    SenseVoice
-                  </Badge>
-                  <Badge variant={state.capabilities.local_kokoro ? "secondary" : "outline"}>
-                    {state.capabilities.local_kokoro ? (
-                      <Check className="text-signal-success size-3" />
-                    ) : null}
-                    Kokoro TTS
-                  </Badge>
-                  <Badge variant={state.capabilities.system_native_tts ? "secondary" : "outline"}>
-                    <Volume2 className="size-3" />
-                    {t("voice.ttsSystemNative")}
-                  </Badge>
-                  <Badge variant="outline">{t("voice.sttBrowserFallback")}</Badge>
-                </div>
-              </SettingCard>
-            </div>
+            </>
+          ) : (
+            microphoneRow
           )}
-
-          <div className="flex flex-col gap-2">
-            <SettingGroupLabel>{t("voice.sectionModels")}</SettingGroupLabel>
-            <SettingCard>
-              {state && state.models.length > 0 ? (
-                state.models.map((model) => {
-                  const busy = busyModelId === model.id;
-                  return (
-                    <div
-                      key={model.id}
-                      className="flex flex-col gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between"
-                    >
-                      <div className="min-w-0 flex-1 space-y-1">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="text-ink-primary text-[13px] font-medium">
-                            {model.name}
-                          </span>
-                          <Badge variant="outline" className="font-mono text-[10.5px] uppercase">
-                            {model.kind}
-                          </Badge>
-                          <span className="text-ink-muted font-mono text-[11px] tabular-nums">
-                            {formatBytes(model.size_bytes)}
-                          </span>
-                          {model.installed && (
-                            <Badge variant="secondary" className="gap-1 text-[10.5px]">
-                              <ShieldCheck className="text-signal-success size-3" />
-                              {t("voice.shaVerified")}
-                            </Badge>
-                          )}
-                        </div>
-                        <div className="text-ink-faint truncate font-mono text-[11px]">
-                          SHA-256: {model.sha256.slice(0, 16)}…
-                        </div>
-                      </div>
-
-                      <div className="flex shrink-0 items-center gap-2">
-                        {model.installed ? (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            disabled={busy || !isOnline}
-                            onClick={() => void handleDeleteModel(model.id)}
-                          >
-                            {busy ? (
-                              <OrbitSpinner size={12} />
-                            ) : (
-                              <Trash2 data-icon="inline-start" />
-                            )}
-                            {t("common.delete")}
-                          </Button>
-                        ) : (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            disabled={busy || !isOnline}
-                            onClick={() => void handleDownloadModel(model.id)}
-                          >
-                            {busy ? (
-                              <OrbitSpinner size={12} />
-                            ) : (
-                              <Download data-icon="inline-start" />
-                            )}
-                            {t("voice.downloadModel")}
-                          </Button>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })
-              ) : (
-                <div className="text-ink-muted px-4 py-5 text-[12.5px]">
-                  {t("voice.noModels")}
-                </div>
-              )}
-            </SettingCard>
-          </div>
-        </>
-      ) : null}
+        </SettingCard>
+      </div>
     </div>
   );
-}
+});

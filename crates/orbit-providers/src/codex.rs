@@ -24,8 +24,8 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 use crate::attachments::build_codex_input_items_async;
 use crate::driver::{
-    DriverCommand, DriverEvent, ProviderSessionHandle, QueuedDriverPrompt, SessionLaunchConfig,
-    emit_dropped_queued_prompts, emit_prompt_delivery,
+    DriverCommand, DriverEvent, PromptOrigin, ProviderSessionHandle, QueuedDriverPrompt,
+    SessionLaunchConfig, emit_dropped_queued_prompts, emit_prompt_delivery,
 };
 
 /// Serialize concurrent `codex app-server` SQLite state runtime startups.
@@ -551,6 +551,8 @@ async fn run_codex_actor(
     let mut had_plan_collaboration_mode = matches!(mode, SessionMode::Plan);
     let mut pending_approvals: HashMap<String, PendingCodexApproval> = HashMap::new();
     let mut pending_questions: HashMap<String, PendingCodexQuestion> = HashMap::new();
+    let mut pending_gate_order: VecDeque<String> = VecDeque::new();
+    let mut pending_human_steers: VecDeque<QueuedDriverPrompt> = VecDeque::new();
     let mut queued_prompts: VecDeque<QueuedDriverPrompt> = VecDeque::new();
     let mut pending_interrupt_replacement: Option<QueuedDriverPrompt> = None;
     let mut active_turn_message_ids: Vec<String> = Vec::new();
@@ -567,7 +569,7 @@ async fn run_codex_actor(
                         turn_id,
                         mut prompt,
                         behavior,
-                        origin: _origin,
+                        origin,
                         message_ids,
                     } => {
                         if inject_handoff_on_next_prompt {
@@ -579,12 +581,39 @@ async fn run_codex_actor(
                                 prompt = format!("{ctx}\n\n{prompt}");
                             }
                         }
+                        let has_pending_gates = !pending_approvals.is_empty()
+                            || !pending_questions.is_empty()
+                            || pending_synthetic_plan_gate.is_some();
                         if let Some(ref active_nat_tid) = native_turn_id {
                             let blocking_tid = client_turn_id
                                 .clone()
                                 .or_else(|| Some(active_nat_tid.clone()));
                             match behavior {
                                 ActiveTurnBehavior::Steer => {
+                                    // Option A: while any approval, question, or synthetic plan
+                                    // gate is pending, queue non-destructively instead of sending
+                                    // `turn/steer` mid-gate.
+                                    if has_pending_gates {
+                                        emit_prompt_delivery(
+                                            &evt_tx,
+                                            &turn_id,
+                                            &message_ids,
+                                            AgentMessageDeliveryStatus::Queued,
+                                            blocking_tid,
+                                        )
+                                        .await;
+                                        let queued = QueuedDriverPrompt {
+                                            turn_id,
+                                            prompt,
+                                            message_ids,
+                                        };
+                                        if origin == PromptOrigin::Human {
+                                            pending_human_steers.push_back(queued);
+                                        } else {
+                                            queued_prompts.push_back(queued);
+                                        }
+                                        continue;
+                                    }
                                     let input_items = build_codex_input_items_async(
                                         prompt,
                                         cfg.attachments_dir.clone(),
@@ -640,6 +669,14 @@ async fn run_codex_actor(
                                     continue;
                                 }
                                 ActiveTurnBehavior::Interrupt => {
+                                    pending_synthetic_plan_gate = None;
+                                    cancel_pending_codex_approvals_and_questions(
+                                        &shim,
+                                        &mut pending_approvals,
+                                        &mut pending_questions,
+                                        &mut pending_gate_order,
+                                    )
+                                    .await;
                                     let req_id = next_id;
                                     next_id += 1;
                                     let req = json!({
@@ -680,7 +717,7 @@ async fn run_codex_actor(
                         } else if let Some(ref blocking_ctid) = client_turn_id {
                             let blocking_tid = Some(blocking_ctid.clone());
                             match behavior {
-                                ActiveTurnBehavior::Queue | ActiveTurnBehavior::Steer => {
+                                ActiveTurnBehavior::Queue => {
                                     emit_prompt_delivery(
                                         &evt_tx,
                                         &turn_id,
@@ -695,7 +732,35 @@ async fn run_codex_actor(
                                         message_ids,
                                     });
                                 }
+                                ActiveTurnBehavior::Steer => {
+                                    emit_prompt_delivery(
+                                        &evt_tx,
+                                        &turn_id,
+                                        &message_ids,
+                                        AgentMessageDeliveryStatus::Queued,
+                                        blocking_tid,
+                                    )
+                                    .await;
+                                    let queued = QueuedDriverPrompt {
+                                        turn_id,
+                                        prompt,
+                                        message_ids,
+                                    };
+                                    if origin == PromptOrigin::Human {
+                                        pending_human_steers.push_back(queued);
+                                    } else {
+                                        queued_prompts.push_back(queued);
+                                    }
+                                }
                                 ActiveTurnBehavior::Interrupt => {
+                                    pending_synthetic_plan_gate = None;
+                                    cancel_pending_codex_approvals_and_questions(
+                                        &shim,
+                                        &mut pending_approvals,
+                                        &mut pending_questions,
+                                        &mut pending_gate_order,
+                                    )
+                                    .await;
                                     pending_interrupt_on_turn_started = true;
                                     if let Some(prev_rep) = pending_interrupt_replacement.take() {
                                         emit_prompt_delivery(
@@ -723,23 +788,64 @@ async fn run_codex_actor(
                                 }
                             }
                             continue;
-                        } else if pending_synthetic_plan_gate.is_some() {
-                            // Hold queued prompts while a synthetic turn-end plan gate is awaiting
-                            // explicit user review so queued work never executes before plan approval.
-                            emit_prompt_delivery(
-                                &evt_tx,
-                                &turn_id,
-                                &message_ids,
-                                AgentMessageDeliveryStatus::Queued,
-                                None,
-                            )
-                            .await;
-                            queued_prompts.push_back(QueuedDriverPrompt {
-                                turn_id,
-                                prompt,
-                                message_ids,
-                            });
-                            continue;
+                        } else if has_pending_gates {
+                            match behavior {
+                                ActiveTurnBehavior::Interrupt => {
+                                    // Explicit Interrupt clears any synthetic turn-end plan gate
+                                    // or orphaned approval/question gate and immediately falls
+                                    // through to dispatch the replacement turn (`turn/start`).
+                                    pending_synthetic_plan_gate = None;
+                                    cancel_pending_codex_approvals_and_questions(
+                                        &shim,
+                                        &mut pending_approvals,
+                                        &mut pending_questions,
+                                        &mut pending_gate_order,
+                                    )
+                                    .await;
+                                }
+                                ActiveTurnBehavior::Steer => {
+                                    // Option A: hold steer prompts behind open plan/approval gate
+                                    // in priority lane until user resolves or explicitly interrupts.
+                                    emit_prompt_delivery(
+                                        &evt_tx,
+                                        &turn_id,
+                                        &message_ids,
+                                        AgentMessageDeliveryStatus::Queued,
+                                        None,
+                                    )
+                                    .await;
+                                    let queued = QueuedDriverPrompt {
+                                        turn_id,
+                                        prompt,
+                                        message_ids,
+                                    };
+                                    if origin == PromptOrigin::Human {
+                                        pending_human_steers.push_back(queued);
+                                    } else {
+                                        queued_prompts.push_back(queued);
+                                    }
+                                    continue;
+                                }
+                                ActiveTurnBehavior::Queue => {
+                                    // Hold queued prompts while a synthetic turn-end plan gate is
+                                    // awaiting explicit user review so queued work never executes
+                                    // before plan approval.
+                                    emit_prompt_delivery(
+                                        &evt_tx,
+                                        &turn_id,
+                                        &message_ids,
+                                        AgentMessageDeliveryStatus::Queued,
+                                        None,
+                                    )
+                                    .await;
+                                    queued_prompts.push_back(QueuedDriverPrompt {
+                                        turn_id,
+                                        prompt,
+                                        message_ids,
+                                    });
+                                    continue;
+                                }
+                            }
                         }
 
                         pending_interrupt_on_turn_started = false;
@@ -775,6 +881,8 @@ async fn run_codex_actor(
                                 None,
                             )
                             .await;
+                            emit_dropped_queued_prompts(&evt_tx, None, &mut pending_human_steers)
+                                .await;
                             emit_dropped_queued_prompts(
                                 &evt_tx,
                                 pending_interrupt_replacement.take(),
@@ -793,12 +901,24 @@ async fn run_codex_actor(
                         .await;
                     }
                     DriverCommand::Interrupt => {
+                        emit_dropped_queued_prompts(&evt_tx, None, &mut pending_human_steers)
+                            .await;
                         emit_dropped_queued_prompts(
                             &evt_tx,
                             pending_interrupt_replacement.take(),
                             &mut queued_prompts,
                         )
                         .await;
+                        let had_rpc_gates =
+                            !pending_approvals.is_empty() || !pending_questions.is_empty();
+                        cancel_pending_codex_approvals_and_questions(
+                            &shim,
+                            &mut pending_approvals,
+                            &mut pending_questions,
+                            &mut pending_gate_order,
+                        )
+                        .await;
+                        let had_synthetic_gate = pending_synthetic_plan_gate.take().is_some();
                         if let Some(ref nat_tid) = native_turn_id {
                             pending_interrupt_on_turn_started = false;
                             let req_id = next_id;
@@ -814,9 +934,23 @@ async fn run_codex_actor(
                             let _ = shim.write_stdin_line(req.to_string()).await;
                         } else if client_turn_id.is_some() {
                             pending_interrupt_on_turn_started = true;
+                        } else if had_synthetic_gate || had_rpc_gates {
+                            let _ = evt_tx
+                                .send(DriverEvent::StatusChanged(AgentStatus::Idle))
+                                .await;
                         }
                     }
                     DriverCommand::InterruptAndDrainQueue => {
+                        let had_rpc_gates =
+                            !pending_approvals.is_empty() || !pending_questions.is_empty();
+                        cancel_pending_codex_approvals_and_questions(
+                            &shim,
+                            &mut pending_approvals,
+                            &mut pending_questions,
+                            &mut pending_gate_order,
+                        )
+                        .await;
+                        let had_synthetic_gate = pending_synthetic_plan_gate.take().is_some();
                         if let Some(ref nat_tid) = native_turn_id {
                             pending_interrupt_on_turn_started = false;
                             let req_id = next_id;
@@ -832,10 +966,10 @@ async fn run_codex_actor(
                             let _ = shim.write_stdin_line(req.to_string()).await;
                         } else if client_turn_id.is_some() {
                             pending_interrupt_on_turn_started = true;
-                        } else if pending_synthetic_plan_gate.is_none()
-                            && let Some(next_q) = pending_interrupt_replacement
-                                .take()
-                                .or_else(|| queued_prompts.pop_front())
+                        } else if let Some(next_q) = pending_interrupt_replacement
+                            .take()
+                            .or_else(|| pending_human_steers.pop_front())
+                            .or_else(|| queued_prompts.pop_front())
                         {
                             pending_interrupt_on_turn_started = false;
                             active_turn_message_ids = next_q.message_ids;
@@ -872,6 +1006,12 @@ async fn run_codex_actor(
                                 .await;
                                 emit_dropped_queued_prompts(
                                     &evt_tx,
+                                    None,
+                                    &mut pending_human_steers,
+                                )
+                                .await;
+                                emit_dropped_queued_prompts(
+                                    &evt_tx,
                                     pending_interrupt_replacement.take(),
                                     &mut queued_prompts,
                                 )
@@ -886,6 +1026,10 @@ async fn run_codex_actor(
                                 None,
                             )
                             .await;
+                        } else if had_synthetic_gate || had_rpc_gates {
+                            let _ = evt_tx
+                                .send(DriverEvent::StatusChanged(AgentStatus::Idle))
+                                .await;
                         }
                     }
                     DriverCommand::SetMode { mode: new_mode } => {
@@ -928,18 +1072,26 @@ async fn run_codex_actor(
                                 "result": { "decision": wire_dec }
                             });
                             let _ = shim.write_stdin_line(resp.to_string()).await;
-                            if let Some(ref tid) = client_turn_id {
-                                let _ = evt_tx
-                                    .send(DriverEvent::StatusChanged(AgentStatus::Running {
-                                        turn_id: tid.clone(),
-                                    }))
-                                    .await;
-                            }
+                            emit_codex_post_gate_status(
+                                &pending_approvals,
+                                &pending_questions,
+                                &pending_synthetic_plan_gate,
+                                &mut pending_gate_order,
+                                &client_turn_id,
+                                &evt_tx,
+                            )
+                            .await;
                         } else if pending_synthetic_plan_gate.as_deref() == Some(request_id.as_str()) {
                             pending_synthetic_plan_gate = None;
-                            let _ = evt_tx
-                                .send(DriverEvent::StatusChanged(AgentStatus::Idle))
-                                .await;
+                            emit_codex_post_gate_status(
+                                &pending_approvals,
+                                &pending_questions,
+                                &pending_synthetic_plan_gate,
+                                &mut pending_gate_order,
+                                &client_turn_id,
+                                &evt_tx,
+                            )
+                            .await;
                         }
                     }
                     DriverCommand::ResolvePlanApproval {
@@ -984,19 +1136,24 @@ async fn run_codex_actor(
                                 "result": { "decision": wire_dec }
                             });
                             let _ = shim.write_stdin_line(resp.to_string()).await;
-                            if let Some(ref tid) = client_turn_id {
-                                let _ = evt_tx
-                                    .send(DriverEvent::StatusChanged(AgentStatus::Running {
-                                        turn_id: tid.clone(),
-                                    }))
-                                    .await;
-                            }
+                            emit_codex_post_gate_status(
+                                &pending_approvals,
+                                &pending_questions,
+                                &pending_synthetic_plan_gate,
+                                &mut pending_gate_order,
+                                &client_turn_id,
+                                &evt_tx,
+                            )
+                            .await;
                         } else if matches!(action, orbit_protocol::PlanApprovalAction::Dismiss) {
                             // Synthetic turn-end gate dismissed: resume any queued prompts held
-                            // behind the gate, or return to Idle if none remain.
-                            if let Some(next_q) = pending_interrupt_replacement
-                                .take()
-                                .or_else(|| queued_prompts.pop_front())
+                            // behind the gate when no other gates remain, or emit post-gate status.
+                            if pending_approvals.is_empty()
+                                && pending_questions.is_empty()
+                                && let Some(next_q) = pending_interrupt_replacement
+                                    .take()
+                                    .or_else(|| pending_human_steers.pop_front())
+                                    .or_else(|| queued_prompts.pop_front())
                             {
                                 active_turn_message_ids = next_q.message_ids;
                                 if dispatch_codex_turn(
@@ -1032,6 +1189,12 @@ async fn run_codex_actor(
                                     .await;
                                     emit_dropped_queued_prompts(
                                         &evt_tx,
+                                        None,
+                                        &mut pending_human_steers,
+                                    )
+                                    .await;
+                                    emit_dropped_queued_prompts(
+                                        &evt_tx,
                                         pending_interrupt_replacement.take(),
                                         &mut queued_prompts,
                                     )
@@ -1047,9 +1210,15 @@ async fn run_codex_actor(
                                 )
                                 .await;
                             } else {
-                                let _ = evt_tx
-                                    .send(DriverEvent::StatusChanged(AgentStatus::Idle))
-                                    .await;
+                                emit_codex_post_gate_status(
+                                    &pending_approvals,
+                                    &pending_questions,
+                                    &pending_synthetic_plan_gate,
+                                    &mut pending_gate_order,
+                                    &client_turn_id,
+                                    &evt_tx,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -1065,13 +1234,15 @@ async fn run_codex_actor(
                                 "result": { "answers": ans_map }
                             });
                             let _ = shim.write_stdin_line(resp.to_string()).await;
-                            if let Some(ref tid) = client_turn_id {
-                                let _ = evt_tx
-                                    .send(DriverEvent::StatusChanged(AgentStatus::Running {
-                                        turn_id: tid.clone(),
-                                    }))
-                                    .await;
-                            }
+                            emit_codex_post_gate_status(
+                                &pending_approvals,
+                                &pending_questions,
+                                &pending_synthetic_plan_gate,
+                                &mut pending_gate_order,
+                                &client_turn_id,
+                                &evt_tx,
+                            )
+                            .await;
                         }
                     }
                     DriverCommand::Shutdown => {
@@ -1083,6 +1254,7 @@ async fn run_codex_actor(
 
             maybe_frame = shim.rx.recv() => {
                 let Some(frame) = maybe_frame else {
+                    emit_dropped_queued_prompts(&evt_tx, None, &mut pending_human_steers).await;
                     emit_dropped_queued_prompts(
                         &evt_tx,
                         pending_interrupt_replacement.take(),
@@ -1123,25 +1295,34 @@ async fn run_codex_actor(
                                 &shim,
                                 &mut pending_approvals,
                                 &mut pending_questions,
+                                &mut pending_gate_order,
                                 &evt_tx,
                             )
                             .await;
                         } else if rpc_id.is_none()
                             && let Some(m) = method
                         {
-                            if m == "turn/completed"
-                                && let Some(ref tid) =
-                                    client_turn_id.clone().or_else(|| native_turn_id.clone())
-                            {
-                                let settled_ids = std::mem::take(&mut active_turn_message_ids);
-                                emit_prompt_delivery(
-                                    &evt_tx,
-                                    tid,
-                                    &settled_ids,
-                                    AgentMessageDeliveryStatus::Settled,
-                                    None,
+                            if m == "turn/completed" {
+                                cancel_pending_codex_approvals_and_questions(
+                                    &shim,
+                                    &mut pending_approvals,
+                                    &mut pending_questions,
+                                    &mut pending_gate_order,
                                 )
                                 .await;
+                                if let Some(ref tid) =
+                                    client_turn_id.clone().or_else(|| native_turn_id.clone())
+                                {
+                                    let settled_ids = std::mem::take(&mut active_turn_message_ids);
+                                    emit_prompt_delivery(
+                                        &evt_tx,
+                                        tid,
+                                        &settled_ids,
+                                        AgentMessageDeliveryStatus::Settled,
+                                        None,
+                                    )
+                                    .await;
+                                }
                             }
                             let turn_completed = handle_codex_notification(
                                 &cfg.agent_id,
@@ -1155,6 +1336,7 @@ async fn run_codex_actor(
                                 &mut tool_detail_cache,
                                 &mut pending_proposed_plan,
                                 &mut pending_synthetic_plan_gate,
+                                &mut pending_gate_order,
                                 &mut usage_tracker,
                                 &evt_tx,
                             )
@@ -1183,6 +1365,7 @@ async fn run_codex_actor(
                                 if pending_synthetic_plan_gate.is_none()
                                     && let Some(next_q) = pending_interrupt_replacement
                                         .take()
+                                        .or_else(|| pending_human_steers.pop_front())
                                         .or_else(|| queued_prompts.pop_front())
                                 {
                                     active_turn_message_ids = next_q.message_ids;
@@ -1216,6 +1399,12 @@ async fn run_codex_actor(
                                             &dropped,
                                             AgentMessageDeliveryStatus::Dropped,
                                             None,
+                                        )
+                                        .await;
+                                        emit_dropped_queued_prompts(
+                                            &evt_tx,
+                                            None,
+                                            &mut pending_human_steers,
                                         )
                                         .await;
                                         emit_dropped_queued_prompts(
@@ -1268,6 +1457,7 @@ async fn run_codex_actor(
                                     if pending_synthetic_plan_gate.is_none()
                                         && let Some(next_q) = pending_interrupt_replacement
                                             .take()
+                                            .or_else(|| pending_human_steers.pop_front())
                                             .or_else(|| queued_prompts.pop_front())
                                     {
                                         active_turn_message_ids = next_q.message_ids;
@@ -1301,6 +1491,12 @@ async fn run_codex_actor(
                                                 &dropped,
                                                 AgentMessageDeliveryStatus::Dropped,
                                                 None,
+                                            )
+                                            .await;
+                                            emit_dropped_queued_prompts(
+                                                &evt_tx,
+                                                None,
+                                                &mut pending_human_steers,
                                             )
                                             .await;
                                             emit_dropped_queued_prompts(
@@ -1359,6 +1555,8 @@ async fn run_codex_actor(
                         }
                     }
                     ShimFrame::Exited { code } => {
+                        emit_dropped_queued_prompts(&evt_tx, None, &mut pending_human_steers)
+                            .await;
                         emit_dropped_queued_prompts(
                             &evt_tx,
                             pending_interrupt_replacement.take(),
@@ -1702,6 +1900,74 @@ impl CodexTurnUsageTracker {
     }
 }
 
+async fn cancel_pending_codex_approvals_and_questions(
+    shim: &orbit_shim::ShimClient,
+    pending_approvals: &mut HashMap<String, PendingCodexApproval>,
+    pending_questions: &mut HashMap<String, PendingCodexQuestion>,
+    pending_gate_order: &mut VecDeque<String>,
+) {
+    pending_gate_order.clear();
+    for (_, app) in pending_approvals.drain() {
+        let resp = json!({
+            "id": app.rpc_id,
+            "result": { "decision": "decline" }
+        });
+        let _ = shim.write_stdin_line(resp.to_string()).await;
+    }
+    for (_, pq) in pending_questions.drain() {
+        let resp = json!({
+            "id": pq.rpc_id,
+            "result": { "answers": {} }
+        });
+        let _ = shim.write_stdin_line(resp.to_string()).await;
+    }
+}
+
+async fn emit_codex_post_gate_status(
+    pending_approvals: &HashMap<String, PendingCodexApproval>,
+    pending_questions: &HashMap<String, PendingCodexQuestion>,
+    pending_synthetic_plan_gate: &Option<String>,
+    pending_gate_order: &mut VecDeque<String>,
+    client_turn_id: &Option<String>,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) {
+    while let Some(front) = pending_gate_order.front() {
+        let still_pending = pending_approvals.contains_key(front)
+            || pending_questions.contains_key(front)
+            || pending_synthetic_plan_gate.as_deref() == Some(front.as_str());
+        if still_pending {
+            break;
+        }
+        pending_gate_order.pop_front();
+    }
+    let next_req_id = pending_gate_order
+        .front()
+        .cloned()
+        .or_else(|| pending_approvals.keys().next().cloned())
+        .or_else(|| pending_questions.keys().next().cloned())
+        .or_else(|| pending_synthetic_plan_gate.clone());
+    if let Some(req_id) = next_req_id {
+        let _ = evt_tx
+            .send(DriverEvent::StatusChanged(
+                AgentStatus::AwaitingPermission {
+                    turn_id: client_turn_id.clone().unwrap_or_default(),
+                    request_id: req_id,
+                },
+            ))
+            .await;
+    } else if let Some(tid) = client_turn_id {
+        let _ = evt_tx
+            .send(DriverEvent::StatusChanged(AgentStatus::Running {
+                turn_id: tid.clone(),
+            }))
+            .await;
+    } else {
+        let _ = evt_tx
+            .send(DriverEvent::StatusChanged(AgentStatus::Idle))
+            .await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_codex_notification(
     parent_agent_id: &str,
@@ -1715,6 +1981,7 @@ async fn handle_codex_notification(
     tool_detail_cache: &mut HashMap<String, ToolCallDetail>,
     pending_proposed_plan: &mut Option<String>,
     pending_synthetic_plan_gate: &mut Option<String>,
+    pending_gate_order: &mut VecDeque<String>,
     usage_tracker: &mut CodexTurnUsageTracker,
     evt_tx: &mpsc::Sender<DriverEvent>,
 ) -> bool {
@@ -2041,6 +2308,7 @@ async fn handle_codex_notification(
             {
                 let req_id = format!("cplan_{}", uuid::Uuid::new_v4().simple());
                 *pending_synthetic_plan_gate = Some(req_id.clone());
+                pending_gate_order.push_back(req_id.clone());
                 let plan_title = orbit_protocol::extract_plan_title(&plan_markdown);
                 let title = plan_title
                     .clone()
@@ -2097,6 +2365,7 @@ async fn handle_codex_server_request(
     shim: &orbit_shim::ShimClient,
     pending_approvals: &mut HashMap<String, PendingCodexApproval>,
     pending_questions: &mut HashMap<String, PendingCodexQuestion>,
+    pending_gate_order: &mut VecDeque<String>,
     evt_tx: &mpsc::Sender<DriverEvent>,
 ) {
     match method {
@@ -2116,6 +2385,7 @@ async fn handle_codex_server_request(
                 .and_then(|v| v.as_str())
                 .map(ToOwned::to_owned);
             pending_approvals.insert(req_id.clone(), PendingCodexApproval { rpc_id });
+            pending_gate_order.push_back(req_id.clone());
             let _ = evt_tx
                 .send(DriverEvent::PermissionRequest {
                     request_id: req_id.clone(),
@@ -2164,6 +2434,7 @@ async fn handle_codex_server_request(
                 vec!["allow".into(), "deny".into()]
             };
             pending_approvals.insert(req_id.clone(), PendingCodexApproval { rpc_id });
+            pending_gate_order.push_back(req_id.clone());
             let _ = evt_tx
                 .send(DriverEvent::PermissionRequest {
                     request_id: req_id.clone(),
@@ -2212,6 +2483,7 @@ async fn handle_codex_server_request(
                 source: Some("codex_plan_rpc".to_string()),
             };
             pending_approvals.insert(req_id.clone(), PendingCodexApproval { rpc_id });
+            pending_gate_order.push_back(req_id.clone());
             let _ = evt_tx
                 .send(DriverEvent::PermissionRequest {
                     request_id: req_id.clone(),
@@ -2291,6 +2563,7 @@ async fn handle_codex_server_request(
                     question_ids: q_ids,
                 },
             );
+            pending_gate_order.push_back(req_id.clone());
             let _ = evt_tx
                 .send(DriverEvent::StatusChanged(
                     AgentStatus::AwaitingPermission {
@@ -4805,6 +5078,782 @@ mod tests {
         assert_eq!(
             observed_turn_model.lock().await.as_deref(),
             Some("gpt-6.1-terra")
+        );
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_steer_during_gates_startup_priority_multi_gate_and_interrupt_cancels_gates() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "o_cdx_gates_{}.sock",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
+
+        let started_turns: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let turns_bg = Arc::clone(&started_turns);
+        let steer_count = Arc::new(AtomicUsize::new(0));
+        let steer_bg = Arc::clone(&steer_count);
+        let gate_replies: Arc<tokio::sync::Mutex<Vec<(u64, Value)>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let gate_bg = Arc::clone(&gate_replies);
+        let (release_startup_tx, mut release_startup_rx) = mpsc::channel::<()>(2);
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+            let mut next_turn = 0u64;
+            let mut held_startup_rpc: Option<u64> = None;
+            let mut active_gated_turn: Option<String> = None;
+            let mut gates_answered = 0usize;
+            let mut holding_int_turn: Option<String> = None;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+
+            loop {
+                tokio::select! {
+                    Some(()) = release_startup_rx.recv() => {
+                        if let Some(rid) = held_startup_rpc.take() {
+                            next_turn += 1;
+                            let nt = format!("nt_{next_turn}");
+                            send_stdout(&mut wh, &mut seq, json!({"id": rid, "result": {"turn": {"id": nt}}})).await;
+                            send_stdout(&mut wh, &mut seq, json!({"method": "turn/started", "params": {"turn": {"id": nt}}})).await;
+                            send_stdout(&mut wh, &mut seq, json!({"method": "turn/completed", "params": {"turn": {"id": nt, "status": "completed"}}})).await;
+                        }
+                    }
+                    maybe_line = lines.next_line() => {
+                        let Ok(Some(raw)) = maybe_line else { break; };
+                        let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw) else { continue; };
+                        let Ok(val) = serde_json::from_str::<Value>(&line) else { continue; };
+                        let method = val.get("method").and_then(|v| v.as_str());
+                        if method.is_none()
+                            && let Some(rid) = val.get("id").and_then(|v| v.as_u64())
+                        {
+                            gate_bg.lock().await.push((rid, val["result"].clone()));
+                            if rid == 501 || rid == 502 {
+                                gates_answered += 1;
+                                if gates_answered == 2
+                                    && let Some(nt) = active_gated_turn.take()
+                                {
+                                    send_stdout(&mut wh, &mut seq, json!({"method": "turn/completed", "params": {"turn": {"id": nt, "status": "completed"}}})).await;
+                                }
+                            }
+                            continue;
+                        }
+                        match method.unwrap_or("") {
+                            "initialize" => {
+                                send_stdout(&mut wh, &mut seq, json!({"id": val["id"], "result": {}})).await;
+                            }
+                            "thread/start" => {
+                                send_stdout(&mut wh, &mut seq, json!({"id": val["id"], "result": {"thread": {"id": "thr_gates"}, "model": "gpt-5.4"}})).await;
+                            }
+                            "turn/start" => {
+                                let text = val.pointer("/params/input/0/text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                turns_bg.lock().await.push(text.clone());
+                                if text == "STARTUP_HOLD" {
+                                    held_startup_rpc = val["id"].as_u64();
+                                } else if text == "TWO_GATES" {
+                                    next_turn += 1;
+                                    let nt = format!("nt_{next_turn}");
+                                    active_gated_turn = Some(nt.clone());
+                                    send_stdout(&mut wh, &mut seq, json!({"id": val["id"], "result": {"turn": {"id": nt}}})).await;
+                                    send_stdout(&mut wh, &mut seq, json!({"method": "turn/started", "params": {"turn": {"id": nt}}})).await;
+                                    send_stdout(&mut wh, &mut seq, json!({
+                                        "id": 501,
+                                        "method": "item/commandExecution/requestApproval",
+                                        "params": { "command": "echo gated" }
+                                    })).await;
+                                    send_stdout(&mut wh, &mut seq, json!({
+                                        "id": 502,
+                                        "method": "item/tool/requestUserInput",
+                                        "params": {
+                                            "questions": [{
+                                                "id": "q_env",
+                                                "question": "Pick env?",
+                                                "options": [{"label": "staging"}]
+                                            }]
+                                        }
+                                    })).await;
+                                } else if text == "GATE_THEN_INTERRUPT" {
+                                    next_turn += 1;
+                                    let nt = format!("nt_{next_turn}");
+                                    holding_int_turn = Some(nt.clone());
+                                    send_stdout(&mut wh, &mut seq, json!({"id": val["id"], "result": {"turn": {"id": nt}}})).await;
+                                    send_stdout(&mut wh, &mut seq, json!({"method": "turn/started", "params": {"turn": {"id": nt}}})).await;
+                                    send_stdout(&mut wh, &mut seq, json!({
+                                        "id": 601,
+                                        "method": "item/commandExecution/requestApproval",
+                                        "params": { "command": "echo int_cmd" }
+                                    })).await;
+                                    send_stdout(&mut wh, &mut seq, json!({
+                                        "id": 602,
+                                        "method": "item/tool/requestUserInput",
+                                        "params": {
+                                            "questions": [{
+                                                "id": "q_int",
+                                                "question": "Cancel me?",
+                                                "options": [{"label": "yes"}]
+                                            }]
+                                        }
+                                    })).await;
+                                } else {
+                                    next_turn += 1;
+                                    let nt = format!("nt_{next_turn}");
+                                    send_stdout(&mut wh, &mut seq, json!({"id": val["id"], "result": {"turn": {"id": nt}}})).await;
+                                    send_stdout(&mut wh, &mut seq, json!({"method": "turn/started", "params": {"turn": {"id": nt}}})).await;
+                                    send_stdout(&mut wh, &mut seq, json!({"method": "turn/completed", "params": {"turn": {"id": nt, "status": "completed"}}})).await;
+                                }
+                            }
+                            "turn/steer" => {
+                                steer_bg.fetch_add(1, Ordering::SeqCst);
+                                send_stdout(&mut wh, &mut seq, json!({"id": val["id"], "result": {}})).await;
+                            }
+                            "turn/interrupt" => {
+                                send_stdout(&mut wh, &mut seq, json!({"id": val["id"], "result": {}})).await;
+                                if let Some(nt) = holding_int_turn.take() {
+                                    send_stdout(&mut wh, &mut seq, json!({"method": "turn/completed", "params": {"turn": {"id": nt, "status": "interrupted"}}})).await;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect");
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let (evt_tx, mut evt_rx) = mpsc::channel(128);
+        let mut cfg = sample_cfg(false);
+        cfg.agent_id = "ag_cdx_gates".into();
+        cfg.mode = SessionMode::Default;
+        cfg.shim_socket = sock_path.clone();
+        let actor = tokio::spawn(run_codex_actor(cfg, shim, false, cmd_rx, evt_tx));
+        loop {
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                    .await
+                    .expect("boot")
+                    .expect("ev"),
+                DriverEvent::StatusChanged(AgentStatus::Idle)
+            ) {
+                break;
+            }
+        }
+
+        // 1. Startup window: Human Steer must drain AHEAD of earlier Agent Queue!
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_s0".into(),
+                prompt: "STARTUP_HOLD".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: vec![],
+            })
+            .await
+            .expect("startup hold");
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_ag0".into(),
+                prompt: "AGENT_STARTUP_Q".into(),
+                behavior: ActiveTurnBehavior::Queue,
+                origin: PromptOrigin::Agent,
+                message_ids: vec!["m_ag0".into()],
+            })
+            .await
+            .expect("agent q");
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_hu0".into(),
+                prompt: "HUMAN_STARTUP_STEER".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: vec!["m_hu0".into()],
+            })
+            .await
+            .expect("human steer");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        release_startup_tx.send(()).await.expect("release startup");
+        let mut saw_ag0_settled = false;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("startup drain")
+                .expect("ev");
+            match ev {
+                DriverEvent::PromptDeliveryUpdated {
+                    message_ids,
+                    status: AgentMessageDeliveryStatus::Settled,
+                    ..
+                } if message_ids == vec!["m_ag0".to_string()] => {
+                    saw_ag0_settled = true;
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle) if saw_ag0_settled => break,
+                _ => {}
+            }
+        }
+
+        // 2. Two gates (approval + question): Steer must queue (ZERO turn/steer), resolving only
+        //    approval must keep AwaitingPermission(cq_502), resolving question resumes & drains!
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_two".into(),
+                prompt: "TWO_GATES".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: vec![],
+            })
+            .await
+            .expect("two gates");
+        let mut saw_perm = false;
+        let mut saw_q = false;
+        while !(saw_perm && saw_q) {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("two gates arrival")
+                .expect("ev");
+            match ev {
+                DriverEvent::PermissionRequest { request_id, .. } if request_id == "cperm_501" => {
+                    saw_perm = true;
+                }
+                DriverEvent::QuestionRequest { request_id, .. } if request_id == "cq_502" => {
+                    saw_q = true;
+                }
+                _ => {}
+            }
+        }
+
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_gated_steer".into(),
+                prompt: "HUMAN_STEER_BEHIND_GATES".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: vec!["m_gs".into()],
+            })
+            .await
+            .expect("gated steer");
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("gs queued")
+                .expect("ev");
+            if let DriverEvent::PromptDeliveryUpdated {
+                message_ids,
+                status,
+                ..
+            } = ev
+                && message_ids == vec!["m_gs".to_string()]
+            {
+                assert_eq!(status, AgentMessageDeliveryStatus::Queued);
+                break;
+            }
+        }
+        assert_eq!(
+            steer_count.load(Ordering::SeqCst),
+            0,
+            "Codex must NOT send turn/steer while approvals/questions are pending"
+        );
+
+        cmd_tx
+            .send(DriverCommand::ResolvePermission {
+                request_id: "cperm_501".into(),
+                decision: "allow".into(),
+            })
+            .await
+            .expect("resolve 501");
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("post 501 status")
+                .expect("ev");
+            match ev {
+                DriverEvent::StatusChanged(AgentStatus::Running { .. }) => {
+                    panic!("Codex must NOT emit Running while cq_502 question is still pending");
+                }
+                DriverEvent::StatusChanged(AgentStatus::AwaitingPermission {
+                    request_id, ..
+                }) if request_id == "cq_502" => break,
+                _ => {}
+            }
+        }
+
+        cmd_tx
+            .send(DriverCommand::AnswerQuestion {
+                request_id: "cq_502".into(),
+                answers: vec![vec!["staging".into()]],
+            })
+            .await
+            .expect("answer 502");
+        let mut saw_running_after_502 = false;
+        let mut saw_gs_settled = false;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("drain gs")
+                .expect("ev");
+            match ev {
+                DriverEvent::StatusChanged(AgentStatus::Running { turn_id })
+                    if turn_id == "t_two" =>
+                {
+                    saw_running_after_502 = true;
+                }
+                DriverEvent::PromptDeliveryUpdated {
+                    message_ids,
+                    status: AgentMessageDeliveryStatus::Settled,
+                    ..
+                } if message_ids == vec!["m_gs".to_string()] => {
+                    saw_gs_settled = true;
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle) if saw_gs_settled => break,
+                _ => {}
+            }
+        }
+        assert!(saw_running_after_502);
+        assert_eq!(steer_count.load(Ordering::SeqCst), 0);
+
+        // 3. Interrupt while approval + question are open MUST decline approval & answer empty to question!
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_int".into(),
+                prompt: "GATE_THEN_INTERRUPT".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: vec![],
+            })
+            .await
+            .expect("gate int");
+        let mut p601 = false;
+        let mut q602 = false;
+        while !(p601 && q602) {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("601+602")
+                .expect("ev");
+            match ev {
+                DriverEvent::PermissionRequest { request_id, .. } if request_id == "cperm_601" => {
+                    p601 = true;
+                }
+                DriverEvent::QuestionRequest { request_id, .. } if request_id == "cq_602" => {
+                    q602 = true;
+                }
+                _ => {}
+            }
+        }
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_int_rep".into(),
+                prompt: "AFTER_GATE_INTERRUPT".into(),
+                behavior: ActiveTurnBehavior::Interrupt,
+                origin: PromptOrigin::Human,
+                message_ids: vec!["m_int_rep".into()],
+            })
+            .await
+            .expect("interrupt gates");
+        let mut saw_int_rep_settled = false;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("int rep settle")
+                .expect("ev");
+            match ev {
+                DriverEvent::PromptDeliveryUpdated {
+                    message_ids,
+                    status: AgentMessageDeliveryStatus::Settled,
+                    ..
+                } if message_ids == vec!["m_int_rep".to_string()] => {
+                    saw_int_rep_settled = true;
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle) if saw_int_rep_settled => break,
+                _ => {}
+            }
+        }
+        let replies = gate_replies.lock().await;
+        assert!(
+            replies
+                .iter()
+                .any(|(id, res)| *id == 601 && res["decision"] == "decline"),
+            "Interrupt must decline lingering approval 601: {replies:?}"
+        );
+        assert!(
+            replies
+                .iter()
+                .any(|(id, res)| *id == 602 && res["answers"] == json!({})),
+            "Interrupt must cancel lingering question 602: {replies:?}"
+        );
+        assert_eq!(
+            *started_turns.lock().await,
+            vec![
+                "STARTUP_HOLD".to_string(),
+                "HUMAN_STARTUP_STEER".to_string(),
+                "AGENT_STARTUP_Q".to_string(),
+                "TWO_GATES".to_string(),
+                "HUMAN_STEER_BEHIND_GATES".to_string(),
+                "GATE_THEN_INTERRUPT".to_string(),
+                "AFTER_GATE_INTERRUPT".to_string(),
+            ]
+        );
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_synthetic_plan_gate_interrupt_and_interrupt_and_drain_queue_never_deadlock() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "o_cdx_plangate_{}.sock",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
+
+        let started_turns: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let turns_bg = Arc::clone(&started_turns);
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+            let mut next_turn = 0u64;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw)
+                else {
+                    continue;
+                };
+                let Ok(val) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                match val.get("method").and_then(|v| v.as_str()).unwrap_or("") {
+                    "initialize" => {
+                        send_stdout(&mut wh, &mut seq, json!({"id": val["id"], "result": {}}))
+                            .await;
+                    }
+                    "thread/start" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"id": val["id"], "result": {"thread": {"id": "thr_plan"}, "model": "gpt-5.4"}}),
+                        )
+                        .await;
+                    }
+                    "turn/start" => {
+                        next_turn += 1;
+                        let nt = format!("nt_{next_turn}");
+                        let text = val
+                            .pointer("/params/input/0/text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        turns_bg.lock().await.push(text.clone());
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"id": val["id"], "result": {"turn": {"id": nt}}}),
+                        )
+                        .await;
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"method": "turn/started", "params": {"turn": {"id": nt}}}),
+                        )
+                        .await;
+                        if text.starts_with("MAKE_PLAN") {
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "method": "item/completed",
+                                    "params": {
+                                        "item": {
+                                            "id": format!("plan_{next_turn}"),
+                                            "type": "proposedPlan",
+                                            "text": "# Plan\n\n- Step 1"
+                                        }
+                                    }
+                                }),
+                            )
+                            .await;
+                        }
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"method": "turn/completed", "params": {"turn": {"id": nt, "status": "completed"}}}),
+                        )
+                        .await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect");
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let (evt_tx, mut evt_rx) = mpsc::channel(128);
+        let mut cfg = sample_cfg(false);
+        cfg.agent_id = "ag_cdx_plan".into();
+        cfg.mode = SessionMode::Plan;
+        cfg.shim_socket = sock_path.clone();
+        let actor = tokio::spawn(run_codex_actor(cfg, shim, false, cmd_rx, evt_tx));
+        loop {
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                    .await
+                    .expect("boot")
+                    .expect("ev"),
+                DriverEvent::StatusChanged(AgentStatus::Idle)
+            ) {
+                break;
+            }
+        }
+
+        // Scenario 1: Open synthetic plan gate -> Steer queues (Option A), then explicit Interrupt
+        // clears the synthetic plan gate and immediately dispatches `turn/start` (NO deadlock!).
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "tp1".into(),
+                prompt: "MAKE_PLAN_1".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: vec![],
+            })
+            .await
+            .expect("tp1");
+        loop {
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                    .await
+                    .expect("synthetic gate 1")
+                    .expect("ev"),
+                DriverEvent::StatusChanged(AgentStatus::AwaitingPermission { .. })
+            ) {
+                break;
+            }
+        }
+
+        // Steer queues behind synthetic gate without cancelling it.
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_steer_behind".into(),
+                prompt: "STEER_QUEUED_BEHIND_PLAN".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: vec!["m_sb".into()],
+            })
+            .await
+            .expect("steer behind plan");
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("sb queued")
+                .expect("ev");
+            if let DriverEvent::PromptDeliveryUpdated {
+                message_ids,
+                status,
+                ..
+            } = ev
+                && message_ids == vec!["m_sb".to_string()]
+            {
+                assert_eq!(status, AgentMessageDeliveryStatus::Queued);
+                break;
+            }
+        }
+
+        // Explicit Interrupt clears synthetic gate and immediately dispatches replacement prompt,
+        // and once that finishes, STEER_QUEUED_BEHIND_PLAN also drains cleanly!
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_flush_now".into(),
+                prompt: "FLUSH_CLEARS_PLAN_GATE".into(),
+                behavior: ActiveTurnBehavior::Interrupt,
+                origin: PromptOrigin::Human,
+                message_ids: vec!["m_flush".into()],
+            })
+            .await
+            .expect("flush interrupt");
+        let mut saw_flush_dispatched = false;
+        let mut saw_sb_settled = false;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("flush + drain settle")
+                .expect("ev");
+            match ev {
+                DriverEvent::PromptDeliveryUpdated {
+                    message_ids,
+                    status: AgentMessageDeliveryStatus::Dispatched,
+                    ..
+                } if message_ids == vec!["m_flush".to_string()] => {
+                    saw_flush_dispatched = true;
+                }
+                DriverEvent::PromptDeliveryUpdated {
+                    message_ids,
+                    status: AgentMessageDeliveryStatus::Settled,
+                    ..
+                } if message_ids == vec!["m_sb".to_string()] => {
+                    saw_sb_settled = true;
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle) if saw_sb_settled => break,
+                _ => {}
+            }
+        }
+        assert!(saw_flush_dispatched);
+
+        // Scenario 2: DriverCommand::Interrupt clears synthetic plan gate and emits Idle.
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "tp2".into(),
+                prompt: "MAKE_PLAN_2".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: vec![],
+            })
+            .await
+            .expect("tp2");
+        loop {
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                    .await
+                    .expect("synthetic gate 2")
+                    .expect("ev"),
+                DriverEvent::StatusChanged(AgentStatus::AwaitingPermission { .. })
+            ) {
+                break;
+            }
+        }
+        cmd_tx
+            .send(DriverCommand::Interrupt)
+            .await
+            .expect("hard interrupt");
+        loop {
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                    .await
+                    .expect("idle after plan interrupt")
+                    .expect("ev"),
+                DriverEvent::StatusChanged(AgentStatus::Idle)
+            ) {
+                break;
+            }
+        }
+
+        // Scenario 3: DriverCommand::InterruptAndDrainQueue clears synthetic plan gate and drains queued prompt!
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "tp3".into(),
+                prompt: "MAKE_PLAN_3".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: vec![],
+            })
+            .await
+            .expect("tp3");
+        loop {
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                    .await
+                    .expect("synthetic gate 3")
+                    .expect("ev"),
+                DriverEvent::StatusChanged(AgentStatus::AwaitingPermission { .. })
+            ) {
+                break;
+            }
+        }
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_drain_3".into(),
+                prompt: "DRAIN_BEHIND_PLAN_3".into(),
+                behavior: ActiveTurnBehavior::Queue,
+                origin: PromptOrigin::Human,
+                message_ids: vec!["m_d3".into()],
+            })
+            .await
+            .expect("queue behind plan 3");
+        cmd_tx
+            .send(DriverCommand::InterruptAndDrainQueue)
+            .await
+            .expect("interrupt and drain plan 3");
+        let mut saw_d3_settled = false;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("d3 settle")
+                .expect("ev");
+            match ev {
+                DriverEvent::PromptDeliveryUpdated {
+                    message_ids,
+                    status: AgentMessageDeliveryStatus::Settled,
+                    ..
+                } if message_ids == vec!["m_d3".to_string()] => {
+                    saw_d3_settled = true;
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle) if saw_d3_settled => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            *started_turns.lock().await,
+            vec![
+                "MAKE_PLAN_1".to_string(),
+                "FLUSH_CLEARS_PLAN_GATE".to_string(),
+                "STEER_QUEUED_BEHIND_PLAN".to_string(),
+                "MAKE_PLAN_2".to_string(),
+                "MAKE_PLAN_3".to_string(),
+                "DRAIN_BEHIND_PLAN_3".to_string(),
+            ]
         );
 
         drop(cmd_tx);

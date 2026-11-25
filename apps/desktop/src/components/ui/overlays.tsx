@@ -80,6 +80,12 @@ export interface PopoverContentProps
   collisionPadding?: React.ComponentProps<typeof BasePopover.Positioner>["collisionPadding"];
   initialFocus?: React.ComponentProps<typeof BasePopover.Popup>["initialFocus"];
   finalFocus?: React.ComponentProps<typeof BasePopover.Popup>["finalFocus"];
+  /**
+   * Controls whether the outer popover frame renders the default `.floating-surface` card.
+   * Use `"none"` for detached multi-capsule popovers (such as the provider + model picker)
+   * whose inner cards own their own surfaces so gaps stay transparent and click-through.
+   */
+  surface?: "floating" | "none";
 }
 
 export function PopoverContent({
@@ -91,8 +97,10 @@ export function PopoverContent({
   collisionPadding,
   initialFocus,
   finalFocus,
+  surface = "floating",
   ...props
 }: PopoverContentProps) {
+  const isFrameless = surface === "none";
   return (
     <BasePopover.Portal>
       <BasePopover.Positioner
@@ -101,14 +109,17 @@ export function PopoverContent({
         sideOffset={sideOffset}
         alignOffset={alignOffset}
         collisionPadding={collisionPadding}
-        className="z-50 outline-none"
+        className={cn("z-50 outline-none", isFrameless && "pointer-events-none")}
       >
         <BasePopover.Popup
           data-slot="popover-content"
+          data-surface={surface}
           initialFocus={initialFocus}
           finalFocus={finalFocus}
           className={cn(
-            "text-ink-primary floating-surface orbit-floating-content w-72 rounded-[14px] border p-3 outline-none",
+            isFrameless
+              ? "orbit-floating-content pointer-events-none border-0 bg-transparent p-0 shadow-none outline-none"
+              : "text-ink-primary floating-surface orbit-floating-content w-72 rounded-[14px] border p-3 outline-none",
             className,
           )}
           {...props}

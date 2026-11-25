@@ -392,6 +392,7 @@ export type OverviewSectionId =
 
 export type ReviewScope = "working_tree" | "session_turns";
 export type DiffLayoutMode = "unified" | "split";
+export type ActiveTurnSendBehavior = "queue" | "steer";
 export type ThemeMode = "system" | "light" | "dark";
 export type ResolvedTheme = "light" | "dark";
 export type ActiveViewMode = "workspace" | "settings";
@@ -461,6 +462,12 @@ export type WindowedAgentStageView = AgentStageView & {
 export interface StageRunningSubagentRef {
   child_agent_id?: string | null;
   provider_subagent_id?: string | null;
+}
+
+export interface CloudSyncDeviceFlowState extends GitHubDeviceFlowStartView {
+  startedAtMs: number;
+  expiresAtMs: number;
+  clipboardCopied: boolean;
 }
 
 export interface OrbitUiState {
@@ -602,7 +609,7 @@ export interface OrbitUiState {
   pathRulesByScope: Record<string, PathRulesSnapshotView>;
   cloudSyncBusy: boolean;
   cloudSyncError: string | null;
-  cloudSyncDeviceFlow: GitHubDeviceFlowStartView | null;
+  cloudSyncDeviceFlow: CloudSyncDeviceFlowState | null;
   cloudSyncLastResult: CloudSyncResultView | null;
 
   // Pure-Rust LSP Language Servers & File Diagnostics
@@ -704,6 +711,7 @@ export interface OrbitUiState {
   theme: ThemeMode;
   resolvedTheme: ResolvedTheme;
   enterToSend: boolean;
+  activeTurnSendBehavior: ActiveTurnSendBehavior;
   notifyOnApproval: boolean;
   notifyOnTurnComplete: boolean;
   notifyOnAgentError: boolean;
@@ -715,6 +723,7 @@ export interface OrbitUiState {
   coalesceExploration: boolean;
   worktreeBranchPrefix: string;
   preferredEditor: ExternalEditorKind | null;
+  voiceInputDeviceId: string | null;
   terminalFontSize: number;
   terminalCursorStyle: TerminalCursorStyle;
   terminalScrollback: number;
@@ -726,6 +735,7 @@ export interface PersistedPrefs {
   locale?: OrbitLocale;
   theme?: ThemeMode;
   enterToSend?: boolean;
+  activeTurnSendBehavior?: ActiveTurnSendBehavior;
   customKeybindings?: Record<string, string>;
   notifyOnApproval?: boolean;
   notifyOnTurnComplete?: boolean;
@@ -738,6 +748,7 @@ export interface PersistedPrefs {
   coalesceExploration?: boolean;
   worktreeBranchPrefix?: string;
   preferredEditor?: ExternalEditorKind | null;
+  voiceInputDeviceId?: string | null;
   terminalFontSize?: number;
   terminalCursorStyle?: TerminalCursorStyle;
   terminalScrollback?: number;

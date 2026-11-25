@@ -4,6 +4,7 @@ import {
   DEFAULT_LOCALE,
   LOCALES,
   MESSAGES,
+  getI18nHandle,
   getLocale,
   interpolate,
   resolveLocale,
@@ -106,5 +107,16 @@ describe("Orbit Desktop i18n", () => {
     } finally {
       setLocale(original);
     }
+  });
+
+  it("returns referentially stable translator handles per locale so hook deps stay memoized", () => {
+    const enA = getI18nHandle("en");
+    const enB = getI18nHandle("en");
+    const zh = getI18nHandle("zh-CN");
+    assert.strictEqual(enA, enB);
+    assert.strictEqual(enA.t, enB.t);
+    assert.notStrictEqual(enA.t, zh.t);
+    assert.equal(enA.t("common.settings"), "Settings");
+    assert.equal(zh.t("common.settings"), "设置");
   });
 });

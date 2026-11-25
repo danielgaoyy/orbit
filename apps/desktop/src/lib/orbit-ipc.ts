@@ -69,6 +69,12 @@ export function formatProviderShortLabel(provider: ProviderKind | string): strin
 
 export type AcpAgentSource = "builtin_catalog" | "remote_registry" | "custom";
 
+export interface SystemAudioInputDevice {
+  name: string;
+  is_default: boolean;
+  transport?: string | null;
+}
+
 export interface AcpAgentSpec {
   id: string;
   name: string;
@@ -1383,6 +1389,59 @@ export function isAgentForegroundRunning(
 ): boolean {
   if (!agent) return false;
   return Boolean(agent.is_running) && !isAgentBackgroundWaiting(agent);
+}
+
+export type PromptDispatchMode =
+  | "send_idle"
+  | "steer"
+  | "enqueue_server"
+  | "enqueue_local";
+
+/**
+ * Returns true when an agent's current turn is actively executing in the foreground or blocked
+ * on an unanswered approval/question card. Pure background-waiting (`has_background_tasks: true`,
+ * `is_running: false`) and idle parents with running subagents (`has_running_subagents: true`,
+ * `is_running: false`) are NOT turn-busy and accept prompts directly.
+ */
+export function isAgentTurnBusy(
+  agent:
+    | Pick<
+        AgentCardView,
+        "is_running" | "has_background_tasks" | "status_label" | "is_awaiting_permission"
+      >
+    | null
+    | undefined,
+): boolean {
+  return isAgentForegroundRunning(agent) || Boolean(agent?.is_awaiting_permission);
+}
+
+/**
+ * Unified send/queue/steer dispatch contract shared across OmniComposer, Voice commands,
+ * inline code edits, `/compact`, Personal Agent Control View, and live watch panes.
+ *
+ * Option A permission-gate contract: while `agent.is_awaiting_permission` is true, prompt
+ * submission MUST ALWAYS enqueue safely (never steer or interrupt), regardless of `wantsSteer`.
+ */
+export function resolvePromptDispatchMode(
+  agent:
+    | Pick<
+        AgentCardView,
+        "is_running" | "has_background_tasks" | "status_label" | "is_awaiting_permission"
+      >
+    | null
+    | undefined,
+  supportsServerQueue: boolean,
+  wantsSteer: boolean,
+): PromptDispatchMode {
+  const foregroundRunning = isAgentForegroundRunning(agent);
+  const awaitingPermission = Boolean(agent?.is_awaiting_permission);
+  if (!foregroundRunning && !awaitingPermission) {
+    return "send_idle";
+  }
+  if (wantsSteer && !awaitingPermission) {
+    return "steer";
+  }
+  return supportsServerQueue ? "enqueue_server" : "enqueue_local";
 }
 
 /**
@@ -8009,6 +8068,16 @@ export const orbitIpc = {
       language: options?.language ?? null,
       voiceId: options?.voiceId ?? null,
     });
+  },
+
+  listSystemAudioInputs: async (): Promise<SystemAudioInputDevice[]> => {
+    if (!isTauriRuntime()) return [];
+    try {
+      const res = await invoke<SystemAudioInputDevice[]>("list_system_audio_inputs");
+      return Array.isArray(res) ? res : [];
+    } catch {
+      return [];
+    }
   },
 
   // --- M8.1 Host-Scoped Inline FIM & M8.2 Two-Stage PR Patrol ---

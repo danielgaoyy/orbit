@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Check,
@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import {
   SettingCard,
+  SettingGroup,
   SettingGroupLabel,
   SettingRow,
   SettingSelect,
@@ -64,7 +65,7 @@ function triggerTextDownload(filename: string, content: string, mimeType: string
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-export function HostSandboxAndAuditPanel({
+export const HostSandboxSection = memo(function HostSandboxSection({
   hostId,
   isOnline,
 }: {
@@ -74,53 +75,155 @@ export function HostSandboxAndAuditPanel({
   const { t } = useI18n();
   const [policy, setPolicy] = useState<SandboxPolicy | null>(null);
   const [sandboxLoaded, setSandboxLoaded] = useState(false);
-  const [savingSandbox, setSavingSandbox] = useState(false);
+  const latestPolicyRef = useRef<SandboxPolicy | null>(null);
+  const sandboxSeqRef = useRef(0);
+  const sandboxChainRef = useRef<Promise<void>>(Promise.resolve());
 
+  useEffect(() => {
+    if (!isOnline) return;
+    const loadSeq = ++sandboxSeqRef.current;
+    void orbitIpc
+      .getSandboxConfig(hostId)
+      .then((res) => {
+        if (sandboxSeqRef.current === loadSeq) {
+          latestPolicyRef.current = res;
+          setPolicy(res);
+          setSandboxLoaded(true);
+        }
+      })
+      .catch(() => undefined);
+  }, [hostId, isOnline]);
+
+  const effectivePolicy = policy ?? DEFAULT_SANDBOX_POLICY;
+
+  // Apply sandbox toggles optimistically with serialized RPC writes so changing
+  // one control never flash-disables sibling controls during the local round-trip.
+  const commitSandbox = useCallback(
+    (patch: Partial<SandboxPolicy>) => {
+      const prevPolicy = latestPolicyRef.current ?? DEFAULT_SANDBOX_POLICY;
+      const nextPolicy: SandboxPolicy = { ...prevPolicy, ...patch };
+      latestPolicyRef.current = nextPolicy;
+      const seq = ++sandboxSeqRef.current;
+      setPolicy(nextPolicy);
+
+      sandboxChainRef.current = sandboxChainRef.current.then(async () => {
+        try {
+          const updated = await orbitIpc.updateSandboxConfig(hostId, nextPolicy);
+          if (sandboxSeqRef.current === seq) {
+            const resolved = updated ?? nextPolicy;
+            latestPolicyRef.current = resolved;
+            setPolicy(resolved);
+          }
+          orbitActions.showToast(t("securityOps.sandboxSavedToast"));
+        } catch (err) {
+          if (sandboxSeqRef.current === seq) {
+            latestPolicyRef.current = prevPolicy;
+            setPolicy(prevPolicy);
+          }
+          orbitActions.showToast(err instanceof Error ? err.message : String(err));
+        }
+      });
+    },
+    [hostId, t],
+  );
+
+  const sandboxModeOptions = useMemo(
+    () => [
+      { value: "off" as const, label: t("securityOps.sandboxOff") },
+      { value: "workspace_write" as const, label: t("securityOps.sandboxWorkspaceWrite") },
+      { value: "strict_read_only" as const, label: t("securityOps.sandboxStrictReadOnly") },
+    ],
+    [t],
+  );
+
+  const activeModeLabel =
+    effectivePolicy.mode === "off"
+      ? t("securityOps.sandboxOff")
+      : effectivePolicy.mode === "strict_read_only"
+        ? t("securityOps.sandboxStrictReadOnly")
+        : t("securityOps.sandboxWorkspaceWrite");
+
+  return (
+    <SettingGroup
+      title={t("securityOps.sandboxGroup")}
+      action={
+        sandboxLoaded ? (
+          <Badge variant={effectivePolicy.mode === "off" ? "secondary" : "success"}>
+            {activeModeLabel}
+          </Badge>
+        ) : undefined
+      }
+    >
+      <SettingCard>
+        <SettingRow
+          settingId="securityOps.sandboxModeTitle"
+          title={t("securityOps.sandboxModeTitle")}
+          description={t("securityOps.sandboxModeDesc")}
+        >
+          <SettingSelect<SandboxMode>
+            value={effectivePolicy.mode}
+            disabled={!isOnline || !sandboxLoaded}
+            onChange={(mode) => commitSandbox({ mode })}
+            options={sandboxModeOptions}
+            triggerClassName="w-[180px]"
+          />
+        </SettingRow>
+
+        {effectivePolicy.mode !== "off" && (
+          <SettingRow
+            settingId="securityOps.sandboxNetworkTitle"
+            title={t("securityOps.sandboxNetworkTitle")}
+            description={t("securityOps.sandboxNetworkDesc")}
+          >
+            <ToggleSwitch
+              checked={effectivePolicy.allow_network}
+              disabled={!isOnline || !sandboxLoaded}
+              ariaLabel={t("securityOps.sandboxNetworkTitle")}
+              onChange={(allow_network) => commitSandbox({ allow_network })}
+            />
+          </SettingRow>
+        )}
+
+        {sandboxLoaded && effectivePolicy.mode !== "off" && (
+          <div className="bg-surface-recessed/45 text-ink-muted flex items-center gap-2 px-4 py-2.5 text-[11px]">
+            <Lock className="size-[13px] shrink-0 opacity-80" />
+            <span>{t("securityOps.sandboxCredentialsProtected")}</span>
+          </div>
+        )}
+      </SettingCard>
+    </SettingGroup>
+  );
+});
+
+export const HostAuditChainSection = memo(function HostAuditChainSection({
+  hostId,
+  isOnline,
+}: {
+  hostId: string;
+  isOnline: boolean;
+}) {
+  const { t } = useI18n();
   const [auditStatus, setAuditStatus] = useState<AuditChainVerification | null>(null);
   const [verifyingAudit, setVerifyingAudit] = useState(false);
   const [exportingAudit, setExportingAudit] = useState(false);
 
-  const loadSandboxAndAudit = useCallback(async () => {
-    if (!isOnline) return;
-    setVerifyingAudit(true);
-    try {
-      const [sandboxRes, auditRes] = await Promise.allSettled([
-        orbitIpc.getSandboxConfig(hostId),
-        orbitIpc.getAuditChainStatus(hostId),
-      ]);
-      if (sandboxRes.status === "fulfilled") {
-        setPolicy(sandboxRes.value);
-        setSandboxLoaded(true);
-      }
-      if (auditRes.status === "fulfilled") {
-        setAuditStatus(auditRes.value);
-      }
-    } finally {
-      setVerifyingAudit(false);
-    }
-  }, [hostId, isOnline]);
-
   useEffect(() => {
-    void loadSandboxAndAudit();
-  }, [loadSandboxAndAudit]);
-
-  const effectivePolicy = policy ?? DEFAULT_SANDBOX_POLICY;
-
-  const commitSandbox = useCallback(
-    async (nextPolicy: SandboxPolicy) => {
-      setSavingSandbox(true);
-      try {
-        const updated = await orbitIpc.updateSandboxConfig(hostId, nextPolicy);
-        setPolicy(updated ?? nextPolicy);
-        orbitActions.showToast(t("securityOps.sandboxSavedToast"));
-      } catch (err) {
-        orbitActions.showToast(err instanceof Error ? err.message : String(err));
-      } finally {
-        setSavingSandbox(false);
-      }
-    },
-    [hostId, t],
-  );
+    if (!isOnline) return;
+    let active = true;
+    setVerifyingAudit(true);
+    void orbitIpc
+      .getAuditChainStatus(hostId)
+      .then((res) => {
+        if (active) setAuditStatus(res);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (active) setVerifyingAudit(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [hostId, isOnline]);
 
   const handleVerifyAudit = useCallback(async () => {
     setVerifyingAudit(true);
@@ -144,7 +247,7 @@ export function HostSandboxAndAuditPanel({
     try {
       const lines: string[] = [];
       let afterSeq = 0;
-      for (let page = 0; page < 20; page += 1) {
+      while (true) {
         const chunk = await orbitIpc.exportAuditChain(hostId, afterSeq);
         if (chunk.jsonl.trim()) lines.push(chunk.jsonl.trimEnd());
         if (chunk.next_after_seq === null || chunk.next_after_seq <= afterSeq) break;
@@ -163,141 +266,98 @@ export function HostSandboxAndAuditPanel({
   const isAuditHealthy = auditStatus !== null && auditStatus.broken_seq === null;
 
   return (
-    <>
-      {/* OS Sandbox Policy */}
-      <div className="flex flex-col gap-2">
-        <SettingGroupLabel>{t("securityOps.sandboxGroup")}</SettingGroupLabel>
-        <SettingCard>
-          <SettingRow
-            title={t("securityOps.sandboxModeTitle")}
-            description={t("securityOps.sandboxModeDesc")}
-          >
-            <SettingSelect<SandboxMode>
-              value={effectivePolicy.mode}
-              disabled={!isOnline || savingSandbox}
-              onChange={(mode) => void commitSandbox({ ...effectivePolicy, mode })}
-              options={[
-                { value: "off", label: t("securityOps.sandboxOff") },
-                { value: "workspace_write", label: t("securityOps.sandboxWorkspaceWrite") },
-                { value: "strict_read_only", label: t("securityOps.sandboxStrictReadOnly") },
-              ]}
-            />
-          </SettingRow>
-
-          {effectivePolicy.mode !== "off" && (
-            <SettingRow
-              title={t("securityOps.sandboxNetworkTitle")}
-              description={t("securityOps.sandboxNetworkDesc")}
-            >
-              <ToggleSwitch
-                checked={effectivePolicy.allow_network}
-                disabled={!isOnline || savingSandbox}
-                ariaLabel={t("securityOps.sandboxNetworkTitle")}
-                onChange={(allow_network) =>
-                  void commitSandbox({ ...effectivePolicy, allow_network })
-                }
-              />
-            </SettingRow>
-          )}
-
-          {sandboxLoaded && effectivePolicy.mode !== "off" && (
-            <div className="text-ink-muted flex items-center gap-2 px-4 py-2.5 text-[11.5px]">
-              <Lock className="size-3.5 shrink-0 opacity-75" />
-              <span>{t("securityOps.sandboxCredentialsProtected")}</span>
-            </div>
-          )}
-        </SettingCard>
-      </div>
-
-      {/* Tamper-Evident Audit Chain */}
-      <div className="flex flex-col gap-2">
-        <SettingGroupLabel>{t("securityOps.auditChainGroup")}</SettingGroupLabel>
-        <SettingCard>
-          <div className="flex flex-col gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
-            <div className="min-w-0 space-y-1.5">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-ink-primary text-[13px] font-medium">
-                  {t("securityOps.auditChainTitle")}
-                </span>
-                {auditStatus ? (
-                  isAuditHealthy ? (
-                    <Badge
-                      variant="outline"
-                      className="border-signal-success/35 bg-signal-success/10 text-signal-success gap-1 text-[11px]"
-                    >
-                      <CheckCircle2 className="size-3" />
-                      {t("securityOps.auditChainVerified")}
-                    </Badge>
-                  ) : (
-                    <Badge
-                      variant="outline"
-                      className="border-signal-danger/40 bg-signal-danger/10 text-signal-danger gap-1 text-[11px]"
-                    >
-                      <AlertTriangle className="size-3" />
-                      {t("securityOps.auditChainBroken", { seq: auditStatus.broken_seq ?? 0 })}
-                    </Badge>
-                  )
-                ) : (
-                  <Badge variant="outline" className="text-ink-muted text-[11px]">
-                    {t("securityOps.auditChainPending")}
+    <SettingGroup title={t("securityOps.auditChainGroup")}>
+      <SettingCard>
+        <div
+          data-setting-id="securityOps.auditChainTitle"
+          className="flex flex-col gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between"
+        >
+          <div className="min-w-0 space-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-ink-primary text-[13px] font-medium">
+                {t("securityOps.auditChainTitle")}
+              </span>
+              {auditStatus ? (
+                isAuditHealthy ? (
+                  <Badge variant="success">
+                    <CheckCircle2 className="size-[12px]" />
+                    <span>{t("securityOps.auditChainVerified")}</span>
                   </Badge>
-                )}
-              </div>
-
-              {auditStatus && (
-                <div className="text-ink-secondary flex flex-wrap items-center gap-3 font-mono text-[11.5px] tabular-nums">
-                  <span>
-                    {t("securityOps.auditEntriesCount", { count: auditStatus.verified_entries })}
-                  </span>
-                  <span className="text-ink-faint">·</span>
-                  <span className="inline-flex items-center gap-1">
-                    <ShieldCheck className="text-signal-success size-3" />
-                    {t("securityOps.auditCheckpointsCount", {
-                      count: auditStatus.signed_checkpoints,
-                    })}
-                  </span>
-                </div>
+                ) : (
+                  <Badge variant="destructive">
+                    <AlertTriangle className="size-[12px]" />
+                    <span>{t("securityOps.auditChainBroken", { seq: auditStatus.broken_seq ?? 0 })}</span>
+                  </Badge>
+                )
+              ) : (
+                <Badge variant="secondary">{t("securityOps.auditChainPending")}</Badge>
               )}
             </div>
 
-            <div className="flex shrink-0 items-center gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={!isOnline || verifyingAudit}
-                onClick={() => void handleVerifyAudit()}
-              >
-                {verifyingAudit ? (
-                  <OrbitSpinner size={12} />
-                ) : (
-                  <RefreshCw data-icon="inline-start" />
-                )}
-                {t("securityOps.auditVerifyButton")}
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={!isOnline || exportingAudit}
-                onClick={() => void handleExportAudit()}
-              >
-                {exportingAudit ? (
-                  <OrbitSpinner size={12} />
-                ) : (
-                  <FileDown data-icon="inline-start" />
-                )}
-                {t("securityOps.auditExportButton")}
-              </Button>
-            </div>
+            {auditStatus && (
+              <div className="text-ink-secondary flex flex-wrap items-center gap-2.5 font-mono text-[11px] tabular-nums">
+                <span>
+                  {t("securityOps.auditEntriesCount", { count: auditStatus.verified_entries })}
+                </span>
+                <span aria-hidden className="text-ink-faint">
+                  ·
+                </span>
+                <span className="inline-flex items-center gap-1">
+                  <ShieldCheck className="text-signal-success size-[12px]" />
+                  {t("securityOps.auditCheckpointsCount", {
+                    count: auditStatus.signed_checkpoints,
+                  })}
+                </span>
+              </div>
+            )}
           </div>
-        </SettingCard>
-      </div>
-    </>
-  );
-}
 
-export function HostDiagnosticsAndMigrationPanel({
+          <div className="flex shrink-0 items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={!isOnline || verifyingAudit}
+              onClick={() => void handleVerifyAudit()}
+              className="text-[13px]"
+            >
+              {verifyingAudit ? <OrbitSpinner size={13} /> : <RefreshCw className="size-[13px]" />}
+              <span>{t("securityOps.auditVerifyButton")}</span>
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={!isOnline || exportingAudit}
+              onClick={() => void handleExportAudit()}
+              className="text-[13px]"
+            >
+              {exportingAudit ? <OrbitSpinner size={13} /> : <FileDown className="size-[13px]" />}
+              <span>{t("securityOps.auditExportButton")}</span>
+            </Button>
+          </div>
+        </div>
+      </SettingCard>
+    </SettingGroup>
+  );
+});
+
+export const HostSandboxAndAuditPanel = memo(function HostSandboxAndAuditPanel({
+  hostId,
+  isOnline,
+}: {
+  hostId: string;
+  isOnline: boolean;
+}) {
+  return (
+    <div className="flex flex-col gap-5">
+      <HostSandboxSection hostId={hostId} isOnline={isOnline} />
+      <HostAuditChainSection hostId={hostId} isOnline={isOnline} />
+    </div>
+  );
+});
+
+export const HostDiagnosticsAndMigrationPanel = memo(function HostDiagnosticsAndMigrationPanel({
   hostId,
   isOnline,
 }: {
@@ -401,6 +461,7 @@ export function HostDiagnosticsAndMigrationPanel({
         <SettingGroupLabel>{t("securityOps.diagGroup")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
+            settingId="securityOps.diagTitle"
             title={t("securityOps.diagTitle")}
             description={t("securityOps.diagDesc")}
           >
@@ -440,10 +501,11 @@ export function HostDiagnosticsAndMigrationPanel({
       </div>
 
       {/* Import from IDE / CLI */}
-      <div className="flex flex-col gap-2">
+      <div data-setting-id="securityOps.migrationGroup" className="flex flex-col gap-2">
         <SettingGroupLabel>{t("securityOps.migrationGroup")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
+            settingId="securityOps.migrationSourceTitle"
             title={t("securityOps.migrationSourceTitle")}
             description={t("securityOps.migrationSourceDesc")}
           >
@@ -467,6 +529,7 @@ export function HostDiagnosticsAndMigrationPanel({
           </SettingRow>
 
           <SettingRow
+            settingId="securityOps.migrationConflictTitle"
             title={t("securityOps.migrationConflictTitle")}
             description={t("securityOps.migrationConflictDesc")}
           >
@@ -475,6 +538,7 @@ export function HostDiagnosticsAndMigrationPanel({
               disabled={!isOnline || inspecting || executing}
               onChange={(val) => {
                 setConflict(val);
+                setPreviewItems(null);
                 setMigrationRan(false);
               }}
               options={[
@@ -487,6 +551,7 @@ export function HostDiagnosticsAndMigrationPanel({
 
           {selectedHostId === hostId && selectedCwd && selectedCwd !== "~" && (
             <SettingRow
+              settingId="securityOps.migrationScopeTitle"
               title={t("securityOps.migrationScopeTitle")}
               description={selectedCwd}
             >
@@ -494,7 +559,11 @@ export function HostDiagnosticsAndMigrationPanel({
                 checked={includeWorkspace}
                 disabled={!isOnline || inspecting || executing}
                 ariaLabel={t("securityOps.migrationScopeTitle")}
-                onChange={setIncludeWorkspace}
+                onChange={(include) => {
+                  setIncludeWorkspace(include);
+                  setPreviewItems(null);
+                  setMigrationRan(false);
+                }}
               />
             </SettingRow>
           )}
@@ -522,6 +591,7 @@ export function HostDiagnosticsAndMigrationPanel({
                   !isOnline ||
                   inspecting ||
                   executing ||
+                  migrationRan ||
                   previewItems === null ||
                   previewItems.length === 0
                 }
@@ -534,7 +604,7 @@ export function HostDiagnosticsAndMigrationPanel({
 
             {previewItems !== null && (
               previewItems.length === 0 ? (
-                <div className="text-ink-muted text-[12px]">
+                <div className="text-ink-muted text-[13px]">
                   {t("securityOps.migrationEmpty")}
                 </div>
               ) : (
@@ -550,20 +620,20 @@ export function HostDiagnosticsAndMigrationPanel({
                     {previewItems.map((item, idx) => (
                       <div
                         key={`${item.source}:${item.kind}:${item.name}:${idx}`}
-                        className="flex items-center justify-between gap-2 px-3 py-2 text-[12px]"
+                        className="flex items-center justify-between gap-2 px-3 py-2 text-[13px]"
                       >
                         <div className="flex min-w-0 items-center gap-2">
-                          <Badge variant="outline" className="shrink-0 font-mono text-[10px]">
+                          <Badge variant="outline" className="shrink-0 font-mono text-[11px]">
                             {item.source}
                           </Badge>
-                          <Badge variant="secondary" className="shrink-0 text-[10px]">
+                          <Badge variant="secondary" className="shrink-0 text-[11px]">
                             {item.kind}
                           </Badge>
-                          <span className="text-ink-primary truncate font-mono text-[11.5px]">
+                          <span className="text-ink-primary truncate font-mono text-[11px]">
                             {item.name}
                           </span>
                         </div>
-                        <Badge variant="outline" className="shrink-0 font-mono text-[10px]">
+                        <Badge variant="outline" className="shrink-0 font-mono text-[11px]">
                           {item.decision}
                         </Badge>
                       </div>
@@ -577,4 +647,4 @@ export function HostDiagnosticsAndMigrationPanel({
       </div>
     </>
   );
-}
+});

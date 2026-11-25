@@ -142,7 +142,7 @@ impl IdleRuntimeCleanup {
             {
                 return false;
             }
-            if self.orchestrator.has_pending_permissions(&cur_id).await {
+            if self.orchestrator.has_pending_human_gates(&cur_id).await {
                 return false;
             }
             for child in by_id.values() {

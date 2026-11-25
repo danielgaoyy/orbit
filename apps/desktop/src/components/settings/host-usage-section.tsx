@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Folder, RefreshCw } from "lucide-react";
 import {
   SettingCard,
   SettingGroupLabel,
-  SettingSectionHeader,
+  SettingPageHeader,
 } from "@/components/settings/settings-primitives";
-import { Badge } from "@/components/ui/badge";
+import { t, useI18n } from "@/lib/i18n";
 import { Button } from "@/components/ui/button";
 import { IconButton } from "@/components/ui/icon-button";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
@@ -17,10 +17,10 @@ import {
   type QuotaDepletionForecast,
   type UsageDailyPoint,
   type UsageInsightsSnapshot,
+  type UsageModelBreakdown,
   formatProviderLabel,
   orbitIpc,
 } from "@/lib/orbit-ipc";
-import { isLocalHostCard } from "@/lib/projects";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -52,8 +52,12 @@ function formatCompactTokens(tokens: number): string {
   return String(Math.round(tokens));
 }
 
+function formatTurns(count: number): string {
+  return t(count === 1 ? "usage.turn" : "usage.turns", { count: count.toLocaleString() });
+}
+
 function formatDurationShort(secs: number): string {
-  if (!Number.isFinite(secs) || secs <= 0) return "now";
+  if (!Number.isFinite(secs) || secs <= 0) return t("usage.now");
   const mins = Math.round(secs / 60);
   if (mins < 60) return `${Math.max(1, mins)}m`;
   const hours = Math.floor(mins / 60);
@@ -71,8 +75,8 @@ function formatResetTime(resetsAt: string | null): string | null {
   const ts = Date.parse(resetsAt);
   if (Number.isNaN(ts)) return resetsAt;
   const diffSecs = Math.round((ts - Date.now()) / 1000);
-  if (diffSecs <= 0) return "Resets soon";
-  return `Resets in ${formatDurationShort(diffSecs)}`;
+  if (diffSecs <= 0) return t("usage.resetSoon");
+  return t("usage.resetsIn", { duration: formatDurationShort(diffSecs) });
 }
 
 function formatDayShort(isoDate: string): string {
@@ -103,6 +107,19 @@ function DailyUsageBarChart({
   metric: ChartMetric;
 }) {
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
+  const chartRef = useRef<SVGSVGElement>(null);
+  const [width, setWidth] = useState(760);
+  const hasDaily = daily.length > 0;
+
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const observer = new ResizeObserver(([entry]) => {
+      if (entry.contentRect.width > 0) setWidth(Math.max(100, Math.round(entry.contentRect.width)));
+    });
+    observer.observe(chart);
+    return () => observer.disconnect();
+  }, [hasDaily]);
 
   const values = useMemo(
     () =>
@@ -128,13 +145,12 @@ function DailyUsageBarChart({
 
   if (daily.length === 0) {
     return (
-      <div className="text-ink-muted py-10 text-center text-[12.5px]">
-        No daily usage recorded yet.
+      <div className="text-ink-muted py-10 text-center text-[13px]">
+        {t("usage.noDaily")}
       </div>
     );
   }
 
-  const width = 760;
   const height = 132;
   const padLeft = 4;
   const padRight = 56;
@@ -147,13 +163,13 @@ function DailyUsageBarChart({
   const barW = Math.max(4, Math.min(28, step * 0.58));
 
   const hovered = hoveredIdx !== null ? daily[hoveredIdx] : null;
-  const labelStep = n <= 7 ? 1 : n <= 14 ? 2 : 5;
+  const labelStep = Math.max(1, Math.ceil(n * 40 / plotW));
   const formatTick = (v: number) =>
     metric === "cost" ? formatUsd(v) : formatCompactTokens(v);
 
   return (
     <div className="space-y-2.5">
-      <div className="flex min-h-[20px] items-center justify-between gap-2 text-[11.5px]">
+      <div className="flex min-h-[20px] items-center justify-between gap-2 text-[11px]">
         {hovered ? (
           <div className="text-ink-primary tabular-nums flex flex-wrap items-center gap-x-3 gap-y-0.5">
             <span className="font-mono font-medium">{hovered.date}</span>
@@ -161,30 +177,30 @@ function DailyUsageBarChart({
             <span className="text-ink-secondary font-mono">
               {formatCompactTokens(
                 hovered.input_tokens + hovered.output_tokens + hovered.cache_read_tokens,
-              )}{" "}
-              tok
+              )} {t("usage.tokens")}
             </span>
             <span className="text-ink-muted">
-              {hovered.turns} {hovered.turns === 1 ? "turn" : "turns"}
+              {formatTurns(hovered.turns)}
             </span>
           </div>
         ) : (
           <span className="text-ink-muted">
             {metric === "cost"
-              ? "Daily estimated spend · hover bars to inspect"
-              : "Daily token volume · hover bars to inspect"}
+              ? t("usage.dailySpend")
+              : t("usage.dailyTokens")}
           </span>
         )}
         <span className="text-ink-faint tabular-nums font-mono text-[11px]">
-          {maxVal > 0 ? `Peak ${formatTick(maxVal)}` : "No activity"}
+          {maxVal > 0 ? t("usage.peak", { value: formatTick(maxVal) }) : t("usage.noActivity")}
         </span>
       </div>
 
       <svg
+        ref={chartRef}
         viewBox={`0 0 ${width} ${height}`}
         className="h-[132px] w-full overflow-visible select-none"
         role="img"
-        aria-label={metric === "cost" ? "Daily spend bar chart" : "Daily token volume bar chart"}
+        aria-label={t(metric === "cost" ? "usage.dailySpend" : "usage.dailyTokens")}
         onMouseLeave={() => setHoveredIdx(null)}
       >
         {/* Peak hairline + label */}
@@ -201,7 +217,7 @@ function DailyUsageBarChart({
           <text
             x={width - padRight + 8}
             y={padTop + 3.5}
-            className="fill-ink-faint font-mono text-[9.5px]"
+            className="fill-ink-faint font-mono text-[11px]"
           >
             {formatTick(maxVal)}
           </text>
@@ -221,7 +237,7 @@ function DailyUsageBarChart({
           <text
             x={width - padRight + 8}
             y={padTop + plotH / 2 + 3.5}
-            className="fill-ink-faint font-mono text-[9.5px]"
+            className="fill-ink-faint font-mono text-[11px]"
           >
             {formatTick(maxVal / 2)}
           </text>
@@ -239,7 +255,7 @@ function DailyUsageBarChart({
         <text
           x={width - padRight + 8}
           y={padTop + plotH + 3.5}
-          className="fill-ink-faint font-mono text-[9.5px]"
+          className="fill-ink-faint font-mono text-[11px]"
         >
           0
         </text>
@@ -290,7 +306,7 @@ function DailyUsageBarChart({
                 height={barH}
                 rx={Math.min(3, barW / 2)}
                 className={cn(
-                  "transition-all duration-150",
+                  "transition-opacity duration-150 motion-reduce:transition-none",
                   val === 0
                     ? "fill-border-default/50"
                     : isHovered
@@ -320,7 +336,7 @@ function DailyUsageBarChart({
                   y={height - 4}
                   textAnchor="middle"
                   className={cn(
-                    "font-mono text-[9.5px] transition-colors",
+                    "font-mono text-[11px] transition-colors",
                     isHovered ? "fill-ink-primary font-medium" : "fill-ink-faint",
                   )}
                 >
@@ -336,10 +352,10 @@ function DailyUsageBarChart({
 }
 
 export function HostUsageSection({ hostId }: { hostId: string }) {
-  const fleet = useOrbitSelector((s) => s.fleet);
-  const hostCard = fleet.hosts.find((h) => h.host_id === hostId) ?? null;
+  const { t } = useI18n();
   const hostDetail = useOrbitSelector((s) => s.hostDetails[hostId] ?? null);
   const [rangeDays, setRangeDays] = useState<RangeDays>(7);
+  const [breakdown, setBreakdown] = useState<"provider" | "model">("provider");
   const [chartMetric, setChartMetric] = useState<ChartMetric>("cost");
   const [insights, setInsights] = useState<UsageInsightsSnapshot | null>(null);
   const [loadingInsights, setLoadingInsights] = useState(false);
@@ -351,9 +367,8 @@ export function HostUsageSection({ hostId }: { hostId: string }) {
   activeHostRef.current = hostId;
 
   const quotas = hostDetail?.quotas ?? [];
-  const showHostBadge =
-    Boolean(hostCard) &&
-    (fleet.hosts.length > 1 || (hostCard !== null && !isLocalHostCard(hostCard)));
+  const rangeRef = useRef(rangeDays);
+  rangeRef.current = rangeDays;
 
   const fetchInsights = useCallback(
     async (targetHostId: string, days: RangeDays) => {
@@ -389,58 +404,28 @@ export function HostUsageSection({ hostId }: { hostId: string }) {
   }, [hostId]);
 
   useEffect(() => {
+    setInsights(null);
     void fetchInsights(hostId, rangeDays);
   }, [fetchInsights, hostId, rangeDays]);
+
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await orbitIpc.refreshQuotas(hostId);
+    } catch {
+      // The historical ledger is available even when a live quota probe fails.
+    }
+    if (activeHostRef.current === hostId) {
+      await fetchInsights(hostId, rangeRef.current);
+      if (activeHostRef.current === hostId) setRefreshing(false);
+    }
+  }, [fetchInsights, hostId]);
 
   useEffect(() => {
     if (quotas.length > 0 || autoFetchedHostRef.current === hostId) return;
     autoFetchedHostRef.current = hostId;
-    let cancelled = false;
-    let timerId: number | null = null;
-    setRefreshing(true);
-    void (async () => {
-      try {
-        await orbitIpc.refreshQuotas(hostId);
-      } catch {
-        // Ignore transient quota probe failures
-      }
-      if (cancelled || activeHostRef.current !== hostId) return;
-      await fetchInsights(hostId, rangeDays);
-      if (cancelled || activeHostRef.current !== hostId) return;
-      timerId = window.setTimeout(() => {
-        if (!cancelled && activeHostRef.current === hostId) {
-          setRefreshing(false);
-        }
-      }, 350);
-    })();
-    return () => {
-      cancelled = true;
-      if (timerId !== null) {
-        window.clearTimeout(timerId);
-      }
-    };
-  }, [hostId, quotas.length, fetchInsights, rangeDays]);
-
-  const handleRefresh = async () => {
-    const targetHostId = hostId;
-    setRefreshing(true);
-    try {
-      try {
-        await orbitIpc.refreshQuotas(targetHostId);
-      } catch {
-        // Still reload ledger insights even if live quota probe fails
-      }
-      if (activeHostRef.current === targetHostId) {
-        await fetchInsights(targetHostId, rangeDays);
-      }
-    } finally {
-      window.setTimeout(() => {
-        if (activeHostRef.current === targetHostId) {
-          setRefreshing(false);
-        }
-      }, 350);
-    }
-  };
+    void handleRefresh();
+  }, [handleRefresh, hostId, quotas.length]);
 
   const forecastByKey = useMemo(() => {
     const map = new Map<string, QuotaDepletionForecast>();
@@ -467,77 +452,63 @@ export function HostUsageSection({ hostId }: { hostId: string }) {
     return Math.max(1, active || rangeDays);
   }, [insights?.daily, rangeDays]);
 
-  const modelTotalCost = useMemo(
-    () => (insights?.by_model ?? []).reduce((sum, r) => sum + r.cost_usd, 0),
-    [insights?.by_model],
-  );
-  const modelTotalTokens = useMemo(
-    () =>
-      (insights?.by_model ?? []).reduce(
-        (sum, r) => sum + r.input_tokens + r.output_tokens + r.cache_read_tokens,
-        0,
-      ),
-    [insights?.by_model],
-  );
-  const modelMaxMetric = useMemo(() => {
-    const rows = insights?.by_model ?? [];
-    if (modelTotalCost > 0) {
-      return Math.max(0.0001, ...rows.map((r) => r.cost_usd));
+  const modelRows = useMemo(() => {
+    const models = insights?.by_model ?? [];
+    if (breakdown === "model") {
+      return models.map((model) => usageRow(model, model.model));
     }
-    return Math.max(
-      1,
-      ...rows.map((r) => r.input_tokens + r.output_tokens + r.cache_read_tokens),
-    );
-  }, [insights?.by_model, modelTotalCost]);
+    const providers = new Map<string, BreakdownRow>();
+    for (const model of models) {
+      const row = usageRow(model, formatProviderName(model.provider));
+      const prior = providers.get(model.provider);
+      if (prior) {
+        prior.cost += row.cost;
+        prior.tokens += row.tokens;
+        prior.turns += row.turns;
+      } else {
+        providers.set(model.provider, row);
+      }
+    }
+    return [...providers.values()];
+  }, [breakdown, insights?.by_model]);
 
-  const projectTotalCost = useMemo(
-    () => (insights?.by_project ?? []).reduce((sum, r) => sum + r.cost_usd, 0),
-    [insights?.by_project],
-  );
-  const projectTotalTokens = useMemo(
-    () => (insights?.by_project ?? []).reduce((sum, r) => sum + r.total_tokens, 0),
-    [insights?.by_project],
-  );
-  const projectMaxMetric = useMemo(() => {
-    const rows = insights?.by_project ?? [];
-    if (projectTotalCost > 0) {
-      return Math.max(0.0001, ...rows.map((r) => r.cost_usd));
-    }
-    return Math.max(1, ...rows.map((r) => r.total_tokens));
-  }, [insights?.by_project, projectTotalCost]);
+  const projectRows = useMemo(() => (insights?.by_project ?? []).map((row) => ({
+    id: row.workspace_cwd,
+    label: basenameOfPath(row.workspace_cwd),
+    path: row.workspace_cwd,
+    cost: row.cost_usd,
+    tokens: row.total_tokens,
+    turns: row.turns,
+  })), [insights?.by_project]);
 
   return (
-    <div className="space-y-6">
-      <SettingSectionHeader
-        title="Usage & Quotas"
-        description="Token ledger, estimated spend, cache savings, and live subscription burn pace."
-        badge={
-          showHostBadge && hostCard ? (
-            <Badge variant="secondary">{hostCard.display_name}</Badge>
-          ) : null
-        }
+    <div className="@container min-w-0 space-y-6">
+      <SettingPageHeader
+        title={t("settings.navUsage")}
+        description={t("palette.settingsUsageSub")}
         action={
           <div className="flex items-center gap-1.5">
-            <div className="border-border-subtle bg-surface-recessed inline-flex h-[30px] items-center rounded-[8px] border p-0.5 text-[12px]">
+            <div className="border-border-subtle bg-surface-recessed inline-flex h-[30px] items-center rounded-[8px] border p-0.5 text-[13px]">
               {([7, 30] as const).map((d) => (
                 <button
                   key={d}
                   type="button"
+                  aria-pressed={rangeDays === d}
                   onClick={() => setRangeDays(d)}
                   className={cn(
-                    "cursor-pointer rounded-[6px] px-2.5 py-0.5 font-mono text-[11.5px] font-medium transition-colors",
+                    "cursor-pointer rounded-[6px] px-2.5 py-0.5 font-mono text-[11px] font-medium transition-colors",
                     rangeDays === d
                       ? "bg-surface-raised text-ink-primary shadow-2xs"
                       : "text-ink-muted hover:text-ink-primary",
                   )}
                 >
-                  {d}D
+                  {t("usage.days", { days: d })}
                 </button>
               ))}
             </div>
             <IconButton
               size="md"
-              tooltip="Refresh usage and quotas"
+              tooltip={t("usage.refresh")}
               disabled={refreshing}
               onClick={() => void handleRefresh()}
               className="border-border-subtle border"
@@ -549,17 +520,17 @@ export function HostUsageSection({ hostId }: { hostId: string }) {
       />
 
       {/* Unified Hero Telemetry Card */}
-      <SettingCard>
+      <SettingCard settingId="usage.dailyUsage">
         {/* Top Focal Metric Header */}
         <div className="flex flex-wrap items-start justify-between gap-4 px-5 py-4">
           <div className="space-y-1">
             <div className="text-ink-muted text-[11px] font-semibold tracking-[0.04em] uppercase">
               {chartMetric === "cost"
-                ? `Estimated Spend · Last ${rangeDays} Days`
-                : `Total Token Volume · Last ${rangeDays} Days`}
+                ? t("usage.spendPeriod", { days: rangeDays })
+                : t("usage.tokensPeriod", { days: rangeDays })}
             </div>
             <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-              <span className="text-ink-primary font-mono text-[28px] leading-none font-semibold tracking-[-0.03em] tabular-nums">
+              <span className="text-ink-primary font-mono text-[20px] leading-none font-semibold tracking-[-0.03em] tabular-nums">
                 {insights
                   ? chartMetric === "cost"
                     ? formatUsd(insights.total_cost_usd)
@@ -567,28 +538,28 @@ export function HostUsageSection({ hostId }: { hostId: string }) {
                   : "—"}
               </span>
               {insights && (
-                <span className="text-ink-secondary font-mono text-[12px] tabular-nums">
-                  {chartMetric === "cost"
-                    ? `${formatUsd(insights.total_cost_usd / activeDaysCount)}/active day`
-                    : `${formatCompactTokens(totalTokens / activeDaysCount)}/active day`}
+                <span className="text-ink-secondary font-mono text-[13px] tabular-nums">
+                  {t("usage.perActiveDay", { value: chartMetric === "cost"
+                    ? formatUsd(insights.total_cost_usd / activeDaysCount)
+                    : formatCompactTokens(totalTokens / activeDaysCount) })}
                   <span className="text-ink-faint mx-1.5">·</span>
-                  {insights.total_turns.toLocaleString()}{" "}
-                  {insights.total_turns === 1 ? "turn" : "turns"}
+                  {formatTurns(insights.total_turns)}
                 </span>
               )}
             </div>
           </div>
 
-          <div className="border-border-subtle bg-surface-recessed inline-flex h-[28px] items-center rounded-[7px] border p-0.5 text-[11.5px]">
+          <div className="border-border-subtle bg-surface-recessed inline-flex h-[28px] items-center rounded-[7px] border p-0.5 text-[11px]">
             {(
               [
-                { id: "cost", label: "Spend" },
-                { id: "tokens", label: "Tokens" },
+                { id: "cost", label: t("usage.spend") },
+                { id: "tokens", label: t("usage.tokens") },
               ] as const
             ).map((opt) => (
               <button
                 key={opt.id}
                 type="button"
+                aria-pressed={chartMetric === opt.id}
                 onClick={() => setChartMetric(opt.id)}
                 className={cn(
                   "cursor-pointer rounded-[5px] px-2.5 py-0.5 font-medium transition-colors",
@@ -604,29 +575,29 @@ export function HostUsageSection({ hostId }: { hostId: string }) {
         </div>
 
         {/* Hairline-Divided 3-Column Secondary Telemetry Strip */}
-        <div className="bg-surface-recessed/45 divide-border-subtle grid grid-cols-1 divide-y sm:grid-cols-3 sm:divide-x sm:divide-y-0">
+        <div className="bg-surface-recessed/45 divide-border-subtle grid grid-cols-1 divide-y @xl:grid-cols-3 @xl:divide-x @xl:divide-y-0">
           {/* Cache Efficiency */}
           <div className="px-5 py-3">
             <div className="flex items-center justify-between gap-2">
-              <span className="text-ink-muted text-[11px] font-medium">Cache Saved</span>
+              <span className="text-ink-muted text-[11px] font-medium">{t("usage.cacheSaved")}</span>
               {insights && cacheHitRatio > 0 && (
                 <span className="text-signal-success font-mono text-[11px] font-medium tabular-nums">
-                  {formatPercent(cacheHitRatio)} hit
+                  {t("usage.cacheHit", { percent: formatPercent(cacheHitRatio) })}
                 </span>
               )}
             </div>
-            <div className="text-ink-primary mt-1 font-mono text-[15px] font-semibold tracking-tight tabular-nums">
+            <div className="text-ink-primary mt-1 font-mono text-[17px] font-semibold tracking-tight tabular-nums">
               {insights ? formatUsd(insights.total_cache_savings_usd) : "—"}
             </div>
             <div className="text-ink-faint mt-0.5 font-mono text-[11px] tabular-nums">
-              {insights ? `${formatCompactTokens(cacheReadTokens)} cached read` : "—"}
+              {insights ? t("usage.cacheRead", { count: formatCompactTokens(cacheReadTokens) }) : "—"}
             </div>
           </div>
 
           {/* Token Composition */}
           <div className="px-5 py-3">
             <div className="flex items-center justify-between gap-2">
-              <span className="text-ink-muted text-[11px] font-medium">Token Composition</span>
+              <span className="text-ink-muted text-[11px] font-medium">{t("usage.composition")}</span>
               <span className="text-ink-secondary font-mono text-[11px] tabular-nums">
                 {insights ? formatCompactTokens(totalTokens) : "—"}
               </span>
@@ -637,35 +608,35 @@ export function HostUsageSection({ hostId }: { hostId: string }) {
                   <div
                     className="bg-ink-primary/75 h-full"
                     style={{ width: `${inputPct}%` }}
-                    title={`Input: ${formatCompactTokens(inputTokens)}`}
+                    title={t("usage.input", { count: formatCompactTokens(inputTokens) })}
                   />
                   <div
                     className="bg-signal-info h-full"
                     style={{ width: `${outputPct}%` }}
-                    title={`Output: ${formatCompactTokens(outputTokens)}`}
+                    title={t("usage.output", { count: formatCompactTokens(outputTokens) })}
                   />
                   <div
                     className="bg-signal-success h-full"
                     style={{ width: `${cachePct}%` }}
-                    title={`Cache Read: ${formatCompactTokens(cacheReadTokens)}`}
+                    title={t("usage.cache", { count: formatCompactTokens(cacheReadTokens) })}
                   />
                 </>
               ) : (
                 <div className="bg-border-default/60 h-full w-full" />
               )}
             </div>
-            <div className="text-ink-faint mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 font-mono text-[10.5px] tabular-nums">
+            <div className="text-ink-faint mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 font-mono text-[11px] tabular-nums">
               <span className="inline-flex items-center gap-1">
                 <span className="bg-ink-primary/75 size-1.5 rounded-full" />
-                {formatCompactTokens(inputTokens)} in
+                {t("usage.input", { count: formatCompactTokens(inputTokens) })}
               </span>
               <span className="inline-flex items-center gap-1">
                 <span className="bg-signal-info size-1.5 rounded-full" />
-                {formatCompactTokens(outputTokens)} out
+                {t("usage.output", { count: formatCompactTokens(outputTokens) })}
               </span>
               <span className="inline-flex items-center gap-1">
                 <span className="bg-signal-success size-1.5 rounded-full" />
-                {formatCompactTokens(cacheReadTokens)} cache
+                {t("usage.cache", { count: formatCompactTokens(cacheReadTokens) })}
               </span>
             </div>
           </div>
@@ -673,20 +644,20 @@ export function HostUsageSection({ hostId }: { hostId: string }) {
           {/* Turn Efficiency */}
           <div className="px-5 py-3">
             <div className="flex items-center justify-between gap-2">
-              <span className="text-ink-muted text-[11px] font-medium">Cost / Turn</span>
+              <span className="text-ink-muted text-[11px] font-medium">{t("usage.costTurn")}</span>
               <span className="text-ink-faint font-mono text-[11px] tabular-nums">
-                {insights ? `${insights.total_turns.toLocaleString()} turns` : "—"}
+                {insights ? formatTurns(insights.total_turns) : "—"}
               </span>
             </div>
-            <div className="text-ink-primary mt-1 font-mono text-[15px] font-semibold tracking-tight tabular-nums">
+            <div className="text-ink-primary mt-1 font-mono text-[17px] font-semibold tracking-tight tabular-nums">
               {insights && insights.total_turns > 0
                 ? formatUsd(insights.total_cost_usd / insights.total_turns)
                 : "—"}
             </div>
             <div className="text-ink-faint mt-0.5 font-mono text-[11px] tabular-nums">
               {insights && insights.total_turns > 0
-                ? `${formatCompactTokens(totalTokens / insights.total_turns)} avg tok/turn`
-                : "No recorded turns"}
+                ? t("usage.avgTurn", { count: formatCompactTokens(totalTokens / insights.total_turns) })
+                : t("usage.noTurns")}
             </div>
           </div>
         </div>
@@ -694,13 +665,13 @@ export function HostUsageSection({ hostId }: { hostId: string }) {
         {/* Integrated Daily Trend Chart */}
         <div className="px-5 pt-4 pb-4">
           {insightsError ? (
-            <div className="text-ink-muted py-6 text-center text-[12.5px]">
+            <div className="text-ink-muted py-6 text-center text-[13px]">
               {insightsError}
             </div>
           ) : loadingInsights && !insights ? (
-            <div className="text-ink-muted flex items-center justify-center gap-2 py-10 text-[12.5px]">
+            <div className="text-ink-muted flex items-center justify-center gap-2 py-10 text-[13px]">
               <OrbitSpinner size={14} />
-              <span>Loading telemetry…</span>
+              <span>{t("common.loading")}</span>
             </div>
           ) : (
             <DailyUsageBarChart daily={insights?.daily ?? []} metric={chartMetric} />
@@ -709,19 +680,19 @@ export function HostUsageSection({ hostId }: { hostId: string }) {
       </SettingCard>
 
       {/* Subscription Quotas & Depletion Pace */}
-      <div className="space-y-2">
-        <SettingGroupLabel>Subscription Quotas &amp; Burn Pace</SettingGroupLabel>
+      <div data-setting-id="usage.quotas" className="space-y-2">
+        <SettingGroupLabel>{t("usage.quotas")}</SettingGroupLabel>
         {quotas.length === 0 ? (
           <SettingCard>
-            <div className="text-ink-muted flex flex-col items-center gap-2.5 py-9 text-center text-[12.5px]">
+            <div className="text-ink-muted flex flex-col items-center gap-2.5 py-9 text-center text-[13px]">
               {refreshing ? (
                 <span className="inline-flex items-center gap-2">
                   <OrbitSpinner size={14} />
-                  <span>Probing live provider quotas…</span>
+                  <span>{t("usage.probing")}</span>
                 </span>
               ) : (
                 <>
-                  <span>No live subscription quota snapshots available on this host.</span>
+                  <span>{t("usage.noQuotas")}</span>
                   <Button
                     type="button"
                     variant="outline"
@@ -730,7 +701,7 @@ export function HostUsageSection({ hostId }: { hostId: string }) {
                     className="gap-1.5"
                   >
                     <RefreshCw className="h-[12.5px] w-[12.5px]" />
-                    <span>Check Quotas</span>
+                    <span>{t("usage.check")}</span>
                   </Button>
                 </>
               )}
@@ -740,7 +711,7 @@ export function HostUsageSection({ hostId }: { hostId: string }) {
           <div
             className={cn(
               "grid grid-cols-1 gap-3",
-              quotas.length > 1 && "md:grid-cols-2",
+              quotas.length > 1 && "@2xl:grid-cols-2",
             )}
           >
             {quotas.map((q) => (
@@ -753,20 +724,20 @@ export function HostUsageSection({ hostId }: { hostId: string }) {
                         {formatProviderName(q.provider)}
                       </span>
                       {q.account_label && (
-                        <span className="text-ink-faint truncate text-[11.5px]">
+                        <span className="text-ink-faint truncate text-[11px]">
                           {q.account_label}
                         </span>
                       )}
                     </div>
                     {q.credits_remaining !== null && (
-                      <span className="text-signal-success shrink-0 font-mono text-[11.5px] font-medium tabular-nums">
-                        {q.credits_remaining.toFixed(2)} credits
+                      <span className="text-signal-success shrink-0 font-mono text-[11px] font-medium tabular-nums">
+                        {t("usage.credits", { count: q.credits_remaining.toFixed(2) })}
                       </span>
                     )}
                   </div>
 
                   {q.error ? (
-                    <div className="selectable-text text-ink-muted text-[12px]">{q.error}</div>
+                    <div className="selectable-text text-ink-muted text-[13px]">{q.error}</div>
                   ) : (
                     <div className="space-y-3">
                       {q.windows.map((w) => {
@@ -777,13 +748,13 @@ export function HostUsageSection({ hostId }: { hostId: string }) {
                           forecast.estimated_depletion_secs !== null &&
                           forecast.estimated_depletion_secs !== undefined &&
                           forecast.burn_rate_pct_per_hour > 0.01
-                            ? `~${formatDurationShort(forecast.estimated_depletion_secs)} at current pace`
+                            ? t("usage.pace", { duration: formatDurationShort(forecast.estimated_depletion_secs) })
                             : null;
                         const clampedPct = Math.min(100, Math.max(0, w.used_percent));
 
                         return (
                           <div key={w.label} className="space-y-1.5">
-                            <div className="tabular-nums flex items-center justify-between gap-2 text-[12px]">
+                            <div className="tabular-nums flex items-center justify-between gap-2 text-[13px]">
                               <span className="text-ink-secondary truncate">{w.label}</span>
                               <span className="flex shrink-0 items-center gap-2">
                                 {resetLabel && (
@@ -839,7 +810,7 @@ export function HostUsageSection({ hostId }: { hostId: string }) {
                                 </span>
                                 {forecast && forecast.burn_rate_pct_per_hour > 0.01 && (
                                   <span className="text-ink-faint font-mono">
-                                    {forecast.burn_rate_pct_per_hour.toFixed(1)}%/hr
+                                    {t("usage.perHour", { percent: forecast.burn_rate_pct_per_hour.toFixed(1) })}
                                   </span>
                                 )}
                               </div>
@@ -856,151 +827,97 @@ export function HostUsageSection({ hostId }: { hostId: string }) {
         )}
       </div>
 
-      {/* Model & Project Breakdown Tables */}
-      {insights && (insights.by_model.length > 0 || insights.by_project.length > 0) && (
-        <div className="space-y-2">
-          <SettingGroupLabel>Breakdown</SettingGroupLabel>
-          <div className="grid grid-cols-1 gap-3.5 lg:grid-cols-2">
-            {/* By Model */}
-            <SettingCard>
-              <div className="flex items-center justify-between px-4 py-2.5">
-                <span className="text-ink-primary text-[12.5px] font-semibold">By Model</span>
-                <span className="text-ink-faint font-mono text-[10.5px] uppercase">
-                  Spend · Share
-                </span>
+      {insights && (modelRows.length > 0 || projectRows.length > 0) && (
+        <div className="grid grid-cols-1 items-start gap-4 @2xl:grid-cols-2">
+          <BreakdownCard
+            rows={modelRows}
+            title={
+              <div className="flex gap-1">
+                {(["provider", "model"] as const).map((group) => (
+                  <Button
+                    key={group} size="xs" variant={group === breakdown ? "secondary" : "ghost"}
+                    aria-pressed={group === breakdown}
+                    onClick={() => setBreakdown(group)}
+                  >
+                    {t(group === "provider" ? "usage.byProvider" : "usage.byModel")}
+                  </Button>
+                ))}
               </div>
-              {insights.by_model.length === 0 ? (
-                <div className="text-ink-muted px-4 py-6 text-[12.5px]">
-                  No model usage recorded.
-                </div>
-              ) : (
-                <div className="divide-border-subtle/70 divide-y">
-                  {insights.by_model.slice(0, 8).map((row) => {
-                    const rowTokens =
-                      row.input_tokens + row.output_tokens + row.cache_read_tokens;
-                    const shareRatio =
-                      modelTotalCost > 0
-                        ? row.cost_usd / modelTotalCost
-                        : modelTotalTokens > 0
-                          ? rowTokens / modelTotalTokens
-                          : 0;
-                    const barRatio =
-                      modelTotalCost > 0
-                        ? row.cost_usd / modelMaxMetric
-                        : rowTokens / modelMaxMetric;
-
-                    return (
-                      <div
-                        key={`${row.provider}::${row.model}`}
-                        className="space-y-1.5 px-4 py-2.5"
-                      >
-                        <div className="flex items-center justify-between gap-3">
-                          <div className="flex min-w-0 items-center gap-2">
-                            <ProviderIcon
-                              provider={toProviderKind(row.provider)}
-                              className="h-[14px] w-[14px] shrink-0"
-                            />
-                            <div className="min-w-0">
-                              <div className="text-ink-primary truncate font-mono text-[12px] font-medium">
-                                {row.model}
-                              </div>
-                              <div className="text-ink-faint tabular-nums font-mono text-[10.5px]">
-                                {row.turns} {row.turns === 1 ? "turn" : "turns"} ·{" "}
-                                {formatCompactTokens(rowTokens)} tok
-                              </div>
-                            </div>
-                          </div>
-                          <div className="shrink-0 text-right font-mono tabular-nums">
-                            <div className="text-ink-primary text-[12px] font-medium">
-                              {formatUsd(row.cost_usd)}
-                            </div>
-                            <div className="text-ink-faint text-[10.5px]">
-                              {formatPercent(shareRatio)}
-                            </div>
-                          </div>
-                        </div>
-                        <div className="bg-surface-recessed h-[2px] w-full overflow-hidden rounded-full">
-                          <div
-                            className="bg-ink-primary/45 h-full rounded-full"
-                            style={{ width: `${Math.max(2, Math.min(100, barRatio * 100))}%` }}
-                          />
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </SettingCard>
-
-            {/* By Project */}
-            <SettingCard>
-              <div className="flex items-center justify-between px-4 py-2.5">
-                <span className="text-ink-primary text-[12.5px] font-semibold">By Project</span>
-                <span className="text-ink-faint font-mono text-[10.5px] uppercase">
-                  Spend · Share
-                </span>
-              </div>
-              {insights.by_project.length === 0 ? (
-                <div className="text-ink-muted px-4 py-6 text-[12.5px]">
-                  No project usage recorded.
-                </div>
-              ) : (
-                <div className="divide-border-subtle/70 divide-y">
-                  {insights.by_project.slice(0, 8).map((row) => {
-                    const shareRatio =
-                      projectTotalCost > 0
-                        ? row.cost_usd / projectTotalCost
-                        : projectTotalTokens > 0
-                          ? row.total_tokens / projectTotalTokens
-                          : 0;
-                    const barRatio =
-                      projectTotalCost > 0
-                        ? row.cost_usd / projectMaxMetric
-                        : row.total_tokens / projectMaxMetric;
-
-                    return (
-                      <div
-                        key={row.workspace_cwd}
-                        title={row.workspace_cwd}
-                        className="space-y-1.5 px-4 py-2.5"
-                      >
-                        <div className="flex items-center justify-between gap-3">
-                          <div className="flex min-w-0 items-center gap-2">
-                            <Folder className="text-ink-muted h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                            <div className="min-w-0">
-                              <div className="text-ink-primary truncate text-[12.5px] font-medium">
-                                {basenameOfPath(row.workspace_cwd)}
-                              </div>
-                              <div className="text-ink-faint tabular-nums truncate font-mono text-[10.5px]">
-                                {row.turns} {row.turns === 1 ? "turn" : "turns"} ·{" "}
-                                {formatCompactTokens(row.total_tokens)} tok
-                              </div>
-                            </div>
-                          </div>
-                          <div className="shrink-0 text-right font-mono tabular-nums">
-                            <div className="text-ink-primary text-[12px] font-medium">
-                              {formatUsd(row.cost_usd)}
-                            </div>
-                            <div className="text-ink-faint text-[10.5px]">
-                              {formatPercent(shareRatio)}
-                            </div>
-                          </div>
-                        </div>
-                        <div className="bg-surface-recessed h-[2px] w-full overflow-hidden rounded-full">
-                          <div
-                            className="bg-ink-primary/45 h-full rounded-full"
-                            style={{ width: `${Math.max(2, Math.min(100, barRatio * 100))}%` }}
-                          />
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </SettingCard>
-          </div>
+            }
+          />
+          <BreakdownCard title={t("usage.byProject")} rows={projectRows} />
         </div>
       )}
     </div>
+  );
+}
+
+interface BreakdownRow {
+  id: string;
+  label: string;
+  provider?: string;
+  path?: string;
+  cost: number;
+  tokens: number;
+  turns: number;
+}
+
+function usageRow(model: UsageModelBreakdown, label: string): BreakdownRow {
+  return {
+    id: JSON.stringify([model.provider, label]),
+    label,
+    provider: model.provider,
+    cost: model.cost_usd,
+    tokens: model.input_tokens + model.output_tokens + model.cache_read_tokens,
+    turns: model.turns,
+  };
+}
+
+function BreakdownCard({ title, rows }: { title: ReactNode; rows: BreakdownRow[] }) {
+  const [expanded, setExpanded] = useState(false);
+  const totalCost = rows.reduce((sum, row) => sum + row.cost, 0);
+  const total = totalCost || rows.reduce((sum, row) => sum + row.tokens, 0);
+  const measure = (row: BreakdownRow) => totalCost > 0 ? row.cost : row.tokens;
+  const sorted = [...rows].sort((a, b) => measure(b) - measure(a));
+  const visibleRows = expanded ? sorted : sorted.slice(0, 8);
+  const peak = sorted.length ? measure(sorted[0]) : 0;
+  return (
+    <SettingCard>
+      <div className="flex min-h-[42px] items-center justify-between gap-2 px-4 py-2">
+        <div className="text-ink-primary text-[13px] font-medium">{title}</div>
+        <span className="text-ink-faint text-[11px]">{t(totalCost > 0 ? "usage.share" : "usage.tokenShare")}</span>
+      </div>
+      {sorted.length === 0 && <p className="text-ink-muted px-4 py-4 text-[13px]">{t("usage.noActivity")}</p>}
+      {visibleRows.map((row) => (
+        <div key={row.id} title={row.path} className="space-y-1.5 px-4 py-2.5">
+          <div className="flex items-center gap-2">
+            {row.provider
+              ? <ProviderIcon provider={toProviderKind(row.provider)} className="size-[14px] shrink-0" />
+              : <Folder className="text-ink-muted size-[14px] shrink-0" />}
+            <div className="min-w-0 flex-1">
+              <div className="text-ink-primary truncate text-[13px] font-medium">{row.label}</div>
+              <div className="text-ink-faint truncate font-mono text-[11px] tabular-nums">
+                {t("usage.turnsAndTokens", { turns: formatTurns(row.turns), tokens: formatCompactTokens(row.tokens) })}
+              </div>
+            </div>
+            <div className="shrink-0 text-right font-mono tabular-nums">
+              <div className="text-ink-primary text-[13px]">{totalCost > 0 ? formatUsd(row.cost) : formatCompactTokens(row.tokens)}</div>
+              <div className="text-ink-faint text-[11px]">{formatPercent(total ? measure(row) / total : 0)}</div>
+            </div>
+          </div>
+          <div className="bg-surface-recessed h-[2px] overflow-hidden rounded-full">
+            <div className="bg-ink-primary/45 h-full" style={{ width: `${peak ? measure(row) / peak * 100 : 0}%` }} />
+          </div>
+        </div>
+      ))}
+      {sorted.length > 8 && (
+        <Button
+          variant="ghost" className="w-full" aria-expanded={expanded}
+          onClick={() => setExpanded(!expanded)}
+        >
+          {expanded ? t("usage.showLess") : t("usage.showMore", { count: sorted.length - 8 })}
+        </Button>
+      )}
+    </SettingCard>
   );
 }

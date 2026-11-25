@@ -336,7 +336,7 @@ export function PermissionRulesPanel({
 
       <SettingCard>
         <div className="flex flex-col gap-2.5 px-4 py-3">
-          <div className="text-ink-secondary text-[12px] leading-[1.45]">
+          <div className="text-ink-secondary text-[13px] leading-[1.45]">
             {t("permissionRules.sectionSubtitle")}
           </div>
 
@@ -349,7 +349,7 @@ export function PermissionRulesPanel({
                 disabled={!isOnline}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder={t("permissionRules.searchPlaceholder")}
-                className="h-[30px] pl-8 text-[12px]"
+                className="h-[30px] pl-8 text-[13px]"
               />
             </div>
             <SettingSelect
@@ -366,7 +366,7 @@ export function PermissionRulesPanel({
           {rulesSnap.error && (
             <div
               role="alert"
-              className="border-signal-danger-border bg-signal-danger-bg text-signal-danger rounded-lg border px-3 py-2 text-[12px]"
+              className="border-signal-danger-border bg-signal-danger-bg text-signal-danger rounded-lg border px-3 py-2 text-[13px]"
             >
               {rulesSnap.error}
             </div>
@@ -458,7 +458,7 @@ export function PermissionRulesPanel({
                     aria-invalid={Boolean(formError && !draft.projectCwd.trim()) || undefined}
                     onChange={(e) => setDraft((prev) => ({ ...prev, projectCwd: e.target.value }))}
                     placeholder={t("permissionRules.projectPathPlaceholder")}
-                    className="h-[30px] font-mono text-[12px]"
+                    className="h-[30px] font-mono text-[13px]"
                   />
                   {uniqueWorkspacePaths.length > 0 && (
                     <div className="flex flex-wrap items-center gap-1 pt-0.5">
@@ -468,9 +468,9 @@ export function PermissionRulesPanel({
                           type="button"
                           onClick={() => setDraft((prev) => ({ ...prev, projectCwd: wsPath }))}
                           className={cn(
-                            "border-border-subtle hover:bg-accent cursor-pointer rounded-[6px] border px-2 py-0.5 font-mono text-[11px] transition-colors",
+                            "border-border-subtle hover:bg-surface-recessed cursor-pointer rounded-[6px] border px-2 py-0.5 font-mono text-[11px] transition-colors",
                             draft.projectCwd.trim() === wsPath
-                              ? "bg-accent text-ink-primary font-medium"
+                              ? "bg-surface-recessed text-ink-primary font-medium"
                               : "bg-surface-raised text-ink-muted",
                           )}
                         >
@@ -501,7 +501,7 @@ export function PermissionRulesPanel({
                       }
                     }}
                     placeholder={patternPlaceholder()}
-                    className="h-[30px] font-mono text-[12px]"
+                    className="h-[30px] font-mono text-[13px]"
                   />
                 </Field>
 
@@ -516,7 +516,7 @@ export function PermissionRulesPanel({
                     disabled={rulesSnap.saving}
                     onChange={(e) => setDraft((prev) => ({ ...prev, note: e.target.value }))}
                     placeholder={t("permissionRules.notePlaceholder")}
-                    className="h-[30px] text-[12px]"
+                    className="h-[30px] text-[13px]"
                   />
                 </Field>
               </div>
@@ -555,7 +555,7 @@ export function PermissionRulesPanel({
         )}
 
         {isLoading ? (
-          <div className="text-ink-muted flex items-center justify-center gap-2 px-4 py-8 text-[12px]">
+          <div className="text-ink-muted flex items-center justify-center gap-2 px-4 py-8 text-[13px]">
             <OrbitSpinner size={14} />
             <span>{t("permissionRules.loading")}</span>
           </div>
@@ -570,7 +570,7 @@ export function PermissionRulesPanel({
             </EmptyHeader>
           </Empty>
         ) : filteredRules.length === 0 ? (
-          <div className="text-ink-muted px-4 py-6 text-center text-[12px]">
+          <div className="text-ink-muted px-4 py-6 text-center text-[13px]">
             {t("permissionRules.noFilterMatches")}
           </div>
         ) : (
@@ -585,7 +585,7 @@ export function PermissionRulesPanel({
               return (
                 <div
                   key={rule.id}
-                  className="flex items-start justify-between gap-3 px-4 py-3 transition-colors hover:bg-accent/35"
+                  className="flex items-start justify-between gap-3 px-4 py-3 transition-colors hover:bg-surface-recessed/35"
                 >
                   <div className="flex min-w-0 flex-1 flex-col gap-1.5">
                     <div className="flex flex-wrap items-center gap-1.5">
@@ -685,7 +685,7 @@ export function PermissionRulesPanel({
         detail={
           revokeTarget ? (
             <div className="flex flex-col gap-1">
-              <div className="text-ink-primary font-mono text-[12px] font-medium break-all">
+              <div className="text-ink-primary font-mono text-[13px] font-medium break-all">
                 {revokeTarget.pattern}
               </div>
               <div className="text-ink-muted text-[11px]">

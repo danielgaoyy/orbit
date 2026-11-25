@@ -1,9 +1,14 @@
-import type { ReactNode } from "react";
+import { createContext, useContext, type ReactNode } from "react";
+import { Dialog } from "@base-ui/react/dialog";
+import { ChevronRight, RotateCcw, X } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { IconButton } from "@/components/ui/icon-button";
 import { Select, type SelectOption, type SelectProps } from "@/components/ui/select";
 import { HostStatusIndicator } from "@/components/ui/status-indicator";
 import { Switch } from "@/components/ui/switch";
 import { t } from "@/lib/i18n";
-import type { HostConnectionState } from "@/lib/orbit-ipc";
+import { isLocalHostCard } from "@/lib/projects";
+import type { HostCardView, HostConnectionState } from "@/lib/orbit-ipc";
 import { cn } from "@/lib/utils";
 
 export { HostStatusIndicator };
@@ -37,76 +42,175 @@ export type SettingSelectOption<T extends string | number> = SelectOption<T>;
 
 export function SettingSelect<T extends string | number>({
   align = "end",
+  triggerClassName,
   menuClassName,
   ...props
 }: SelectProps<T>) {
   return (
     <Select<T>
       align={align}
-      menuClassName={cn("min-w-[180px]", menuClassName)}
+      triggerClassName={cn(
+        "border-border-default bg-surface-base text-ink-primary text-[13px]",
+        triggerClassName,
+      )}
+      menuClassName={cn(
+        "settings-select-menu bg-surface-overlay border-border-default min-w-[180px]",
+        menuClassName,
+      )}
       {...props}
     />
   );
 }
 
-export function SettingSectionHeader({
+export function SettingPageHeader({
   title,
   description,
   badge,
   action,
+  breadcrumb,
+  subpage = false,
 }: {
-  title: string;
-  description: string;
+  title: ReactNode;
+  description?: ReactNode;
   badge?: ReactNode;
   action?: ReactNode;
+  breadcrumb?: ReactNode;
+  subpage?: boolean;
 }) {
+  const Heading = subpage || breadcrumb ? "h2" : "h1";
   return (
-    <div className="flex items-start justify-between gap-4 pb-1">
-      <div className="min-w-0 space-y-1">
-        <div className="flex items-center gap-2">
-          <h2 className="text-ink-primary text-[17px] font-semibold tracking-[-0.02em]">
+    <header className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2 pb-1">
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-baseline gap-2">
+          {breadcrumb && (
+            <>
+              <span className="text-ink-muted text-[13px]">{breadcrumb}</span>
+              <span aria-hidden className="text-ink-faint">
+                /
+              </span>
+            </>
+          )}
+          <Heading
+            className={cn(
+              "text-ink-primary font-semibold leading-tight tracking-[-0.025em]",
+              subpage || breadcrumb ? "text-[17px]" : "text-[20px]",
+            )}
+          >
             {title}
-          </h2>
+          </Heading>
           {badge}
         </div>
-        <p className="text-ink-secondary text-[13px] leading-relaxed">{description}</p>
+        {description && (
+          <p className="text-ink-secondary mt-1.5 text-[13px] leading-relaxed">{description}</p>
+        )}
       </div>
-      {action && <div className="shrink-0 pt-0.5">{action}</div>}
+      {action && <div className="flex shrink-0 items-center gap-2">{action}</div>}
+    </header>
+  );
+}
+
+export const SettingSectionHeader = SettingPageHeader;
+
+export function SettingGroupLabel({ children, action }: { children: ReactNode; action?: ReactNode }) {
+  return (
+    <div className="flex items-center justify-between gap-2">
+      <h3 className="text-ink-muted text-[11px] font-semibold tracking-[0.05em] uppercase">{children}</h3>
+      {action}
     </div>
   );
 }
 
-export function SettingGroupLabel({
-  children,
-  action,
-}: {
-  children: ReactNode;
-  action?: ReactNode;
-}) {
+interface SettingAnchorProps {
+  settingId?: string;
+  modified?: boolean;
+  onReset?: () => void;
+}
+
+export const ModifiedSettingsContext = createContext<{
+  modifiedIds: ReadonlySet<string>;
+  reset: (id: string) => void;
+} | null>(null);
+
+function useSettingModification({ settingId, modified, onReset }: SettingAnchorProps) {
+  const preferences = useContext(ModifiedSettingsContext);
+  const changed = modified ?? (settingId && preferences?.modifiedIds.has(settingId));
+  return {
+    changed: changed || undefined,
+    reset: changed
+      ? (onReset ?? (settingId && preferences ? () => preferences.reset(settingId) : undefined))
+      : undefined,
+  };
+}
+
+function ResetControl({ onClick }: { onClick?: () => void }) {
+  if (!onClick) return null;
   return (
-    <div className="flex items-center justify-between gap-2 px-0.5">
-      <span className="text-ink-muted text-[11px] font-semibold tracking-[0.04em] uppercase">
-        {children}
-      </span>
-      {action}
-    </div>
+    <IconButton
+      size="xs"
+      tooltip={t("common.reset")}
+      onClick={onClick}
+      className="opacity-0 group-hover/setting:opacity-100 group-focus-within/setting:opacity-100 focus-visible:opacity-100"
+    >
+      <RotateCcw />
+    </IconButton>
+  );
+}
+
+export function SettingGroup({
+  title,
+  action,
+  children,
+  settingId,
+  modified,
+  onReset,
+}: SettingAnchorProps & {
+  title: ReactNode;
+  action?: ReactNode;
+  children: ReactNode;
+}) {
+  const { changed, reset } = useSettingModification({ settingId, modified, onReset });
+  return (
+    <section data-setting-id={settingId} data-modified={changed} className="group/setting space-y-2">
+      <SettingGroupLabel
+        action={
+          <div className="flex items-center gap-2">
+            <ResetControl onClick={reset} />
+            {action}
+          </div>
+        }
+      >
+        {title}
+      </SettingGroupLabel>
+      {children}
+    </section>
   );
 }
 
 export function SettingCard({
   children,
   className,
-}: {
+  settingId,
+  modified,
+  onReset,
+}: SettingAnchorProps & {
   children: ReactNode;
   className?: string;
 }) {
+  const { changed, reset } = useSettingModification({ settingId, modified, onReset });
   return (
     <div
+      data-setting-id={settingId}
+      data-modified={changed}
       className={cn(
-        "border-border-subtle bg-surface-raised divide-border-subtle divide-y overflow-hidden rounded-[12px] border",
+        "group/setting relative border-border-subtle bg-surface-raised divide-border-subtle divide-y overflow-hidden rounded-[12px] border",
         className,
       )}
     >
+      {reset && (
+        <div className="absolute right-2 top-1 z-10 border-0">
+          <ResetControl onClick={reset} />
+        </div>
+      )}
       {children}
     </div>
   );
@@ -116,22 +220,146 @@ export function SettingRow({
   title,
   description,
   children,
+  settingId,
+  modified,
+  onReset,
+}: SettingAnchorProps & {
+  title: ReactNode;
+  description?: ReactNode;
+  children: ReactNode;
+}) {
+  const { changed, reset } = useSettingModification({ settingId, modified, onReset });
+  return (
+    <div
+      data-setting-id={settingId}
+      data-modified={changed}
+      className="group/setting flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-3.5"
+    >
+      <div className="min-w-[140px] flex-1">
+        <div className="flex items-center gap-2">
+          <div className="text-ink-primary text-[13px] font-medium">{title}</div>
+          <ResetControl onClick={reset} />
+        </div>
+        {description && (
+          <div className="text-ink-secondary mt-0.5 text-[13px] leading-[1.45]">{description}</div>
+        )}
+      </div>
+      <div className="max-w-full shrink-0">{children}</div>
+    </div>
+  );
+}
+
+interface ResourceRowProps {
+  title: ReactNode;
+  description?: ReactNode;
+  icon?: ReactNode;
+  status?: ReactNode;
+  action?: ReactNode;
+  onClick?: () => void;
+  settingId?: string;
+}
+
+export function SettingResourceRow({
+  title,
+  description,
+  icon,
+  status,
+  action,
+  onClick,
+  settingId,
+}: ResourceRowProps) {
+  const body = (
+    <>
+      {icon && <span className="text-ink-muted shrink-0">{icon}</span>}
+      <span className="min-w-0 flex-1">
+        <span className="text-ink-primary block break-words text-[13px] font-medium">{title}</span>
+        {description && (
+          <span className="text-ink-muted mt-0.5 block break-words text-[11px]">{description}</span>
+        )}
+      </span>
+      {status && <span className="text-ink-secondary shrink-0 text-[11px]">{status}</span>}
+      {onClick && <ChevronRight className="text-ink-faint size-[14px] shrink-0" />}
+    </>
+  );
+  const layout = "flex min-h-[44px] min-w-0 flex-1 items-center gap-3 px-4 py-2.5 text-left";
+  return (
+    <div data-setting-id={settingId} className="flex min-w-0 items-center">
+      {onClick ? (
+        <button
+          type="button"
+          onClick={onClick}
+          className={cn(
+            layout,
+            "cursor-pointer hover:bg-surface-recessed focus-visible:outline-border-strong focus-visible:-outline-offset-2",
+          )}
+        >
+          {body}
+        </button>
+      ) : (
+        <div className={layout}>{body}</div>
+      )}
+      {action && <div className="flex shrink-0 items-center gap-2 pr-4">{action}</div>}
+    </div>
+  );
+}
+
+export function SettingNavRow(props: ResourceRowProps & { onClick: () => void }) {
+  return <SettingResourceRow {...props} />;
+}
+
+export function SettingDrawer({
+  open,
+  onOpenChange,
+  onOpenChangeComplete,
+  title,
+  description,
+  children,
 }: {
+  open: boolean;
+  onOpenChange: (value: boolean) => void;
+  onOpenChangeComplete?: (value: boolean) => void;
   title: ReactNode;
   description?: ReactNode;
   children: ReactNode;
 }) {
   return (
-    <div className="flex flex-col gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
-      <div className="min-w-0 space-y-0.5 pr-3">
-        <div className="text-ink-primary text-[13px] font-medium">{title}</div>
-        {description && (
-          <div className="text-ink-secondary text-[12px] leading-[1.45]">{description}</div>
-        )}
-      </div>
-      <div className="shrink-0">{children}</div>
-    </div>
+    <Dialog.Root open={open} onOpenChange={onOpenChange} onOpenChangeComplete={onOpenChangeComplete}>
+      <Dialog.Portal>
+        <Dialog.Backdrop className="settings-drawer-scrim bg-ink-primary/15 fixed inset-0 z-50" />
+        <Dialog.Popup
+          data-slot="setting-drawer"
+          className="settings-drawer border-border-default bg-surface-overlay text-ink-primary fixed inset-y-0 right-0 z-50 flex w-[480px] max-w-full flex-col border-l text-[13px] outline-none"
+        >
+          <header className="border-border-subtle flex items-start gap-4 border-b p-5">
+            <div className="min-w-0 flex-1">
+              <Dialog.Title className="text-[17px] font-semibold">{title}</Dialog.Title>
+              {description && (
+                <Dialog.Description className="text-ink-secondary mt-1.5 text-[13px]">
+                  {description}
+                </Dialog.Description>
+              )}
+            </div>
+            <Dialog.Close aria-label={t("common.close")} render={<Button size="icon" variant="ghost" />}>
+              <X className="size-[16px]" />
+            </Dialog.Close>
+          </header>
+          <div className="orbit-native-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain p-5">
+            {children}
+          </div>
+        </Dialog.Popup>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
+}
+
+export function settingsHostTransport(host: HostCardView): string {
+  if (isLocalHostCard(host)) return t("common.local");
+  if (host.connection_state.endsWith("_relay")) return t("common.relay");
+  if (host.via_ssh_tunnel) return host.ssh_alias ? `SSH · ${host.ssh_alias}` : "SSH";
+  if (host.connection_state.endsWith("_direct")) return t("common.direct");
+  if (host.route_mode === "relay_only") return t("common.relay");
+  if (host.route_mode === "ssh_tunnel") return "SSH";
+  return host.route_mode === "direct_only" ? t("common.direct") : t("common.offline");
 }
 
 export function hostConnectionLabel(state: HostConnectionState): string {

@@ -159,13 +159,16 @@ describe("P0-6: Global Cmd+F yield & Settings Escape overlay guardrails", () => 
       );
     }
 
-    assert.equal(
-      hasOpenSettingsBlockingOverlay({
-        querySelector: (sel) => (sel === SETTINGS_ESCAPE_OVERLAY_SELECTOR ? {} : null),
-      }),
-      true,
-    );
-    assert.equal(hasOpenSettingsBlockingOverlay({ querySelector: () => null }), false);
+    const overlayDocument = (width: number, hidden = false) => ({
+      querySelectorAll: () => [{
+        closest: () => hidden ? {} : null,
+        getBoundingClientRect: () => ({ width, height: 40 }),
+      }],
+    }) as unknown as Pick<Document, "querySelectorAll">;
+    assert.equal(hasOpenSettingsBlockingOverlay(overlayDocument(150)), true);
+    assert.equal(hasOpenSettingsBlockingOverlay(overlayDocument(0)), false);
+    assert.equal(hasOpenSettingsBlockingOverlay(overlayDocument(150, true)), false);
+    assert.equal(hasOpenSettingsBlockingOverlay(null), false);
 
     // Bail out when an inner overlay is open
     assert.equal(
@@ -173,29 +176,26 @@ describe("P0-6: Global Cmd+F yield & Settings Escape overlay guardrails", () => 
         key: "Escape",
         activeView: "settings",
         commandPaletteOpen: false,
-        targetTagName: "DIV",
         hasBlockingOverlay: true,
       }),
       false,
     );
 
-    // Bail out when target is input/textarea, command palette open, or event already handled
+    // Plain controls yield an unhandled Escape. Open overlays and handled events take precedence.
     assert.equal(
       shouldCloseSettingsOnEscape({
         key: "Escape",
         activeView: "settings",
         commandPaletteOpen: false,
-        targetTagName: "INPUT",
         hasBlockingOverlay: false,
       }),
-      false,
+      true,
     );
     assert.equal(
       shouldCloseSettingsOnEscape({
         key: "Escape",
         activeView: "settings",
         commandPaletteOpen: true,
-        targetTagName: "DIV",
         hasBlockingOverlay: false,
       }),
       false,
@@ -206,7 +206,6 @@ describe("P0-6: Global Cmd+F yield & Settings Escape overlay guardrails", () => 
         defaultPrevented: true,
         activeView: "settings",
         commandPaletteOpen: false,
-        targetTagName: "DIV",
         hasBlockingOverlay: false,
       }),
       false,
@@ -218,7 +217,6 @@ describe("P0-6: Global Cmd+F yield & Settings Escape overlay guardrails", () => 
         key: "Escape",
         activeView: "settings",
         commandPaletteOpen: false,
-        targetTagName: "DIV",
         hasBlockingOverlay: false,
       }),
       true,

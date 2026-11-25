@@ -805,10 +805,7 @@ function CommandPaletteDialog() {
         subtitle: t("palette.settingsHostsSub"),
         keywords: "hosts pair ssh remote relay",
         icon: <Radio className="size-3.5" />,
-        run: () =>
-          orbitActions.openSettings(
-            effectiveSettingsHostId ? `host:${effectiveSettingsHostId}:connection` : "add_host",
-          ),
+        run: () => orbitActions.openSettings(effectiveSettingsHostId ? "hosts" : "add_host"),
       },
       ...(effectiveSettingsHostId
         ? [

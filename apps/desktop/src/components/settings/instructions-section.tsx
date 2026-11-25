@@ -1,9 +1,19 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type Ref,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   AlertTriangle,
   Check,
   Copy,
   FileCode2,
+  ExternalLink,
   Link2,
   Loader2,
   Plus,
@@ -11,36 +21,31 @@ import {
   RotateCcw,
   Save,
 } from "lucide-react";
+import { createPortal } from "react-dom";
+import { useI18n, type MessageKey } from "@/lib/i18n";
+import { isLocalHostCard } from "@/lib/projects";
 import { Button } from "@/components/ui/button";
 import { ShortcutKbd } from "@/components/ui/kbd";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
-import { SettingSelect, type SettingSelectOption } from "@/components/settings/settings-primitives";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
 import {
   type InstructionFileEntry,
   type InstructionFilesSnapshotView,
   type InstructionScope,
+  isTauriRuntime,
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
-const SCOPE_LABELS: Record<InstructionScope, string> = {
-  global_user: "Global",
-  repo_root: "Repo",
-  ancestor_dir: "Ancestor",
-  workspace_dir: "Local",
-  local_override: "Override",
-};
-
-const SCOPE_TONE_CLASSES: Record<InstructionScope, string> = {
-  global_user: "bg-foreground/[0.06] text-muted-foreground border-border/60",
-  repo_root: "bg-sky-500/[0.08] text-sky-700 border-sky-500/20 dark:text-sky-300",
-  ancestor_dir: "bg-violet-500/[0.08] text-violet-700 border-violet-500/20 dark:text-violet-300",
-  workspace_dir: "bg-emerald-500/[0.08] text-emerald-700 border-emerald-500/20 dark:text-emerald-300",
-  local_override: "bg-amber-500/[0.10] text-amber-700 border-amber-500/25 dark:text-amber-300",
+const SCOPE_LABELS: Record<InstructionScope, MessageKey> = {
+  global_user: "context.scopeGlobal",
+  repo_root: "context.scopeRepo",
+  ancestor_dir: "context.scopeAncestor",
+  workspace_dir: "context.scopeLocal",
+  local_override: "context.scopeOverride",
 };
 
 const PROVIDER_LABELS: Record<string, string> = {
@@ -127,94 +132,42 @@ function isEtagConflictMessage(message: string): boolean {
   return lower.includes("etag_conflict") || lower.includes("changed on disk");
 }
 
-function compactDirLabel(cwd: string): string {
-  const trimmed = cwd.replace(/\/+$/, "");
-  const parts = trimmed.split("/").filter(Boolean);
-  if (parts.length <= 2) return trimmed || "/";
-  return `…/${parts.slice(-2).join("/")}`;
+interface InstructionDraft {
+  path: string;
+  text: string;
+  etag: string | null;
+  original: string;
+  exists: boolean;
 }
 
-export function InstructionsSection() {
-  const fleet = useOrbitSelector((s) => s.fleet);
-  const hostDetails = useOrbitSelector((s) => s.hostDetails);
-  const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
-  const selectedWorkspaceCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
-  const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
-  const instructionsTarget = useOrbitSelector((s) => s.instructionsTarget);
+// Renderer-session drafts are scoped to the originating host and workspace. Only
+// restore a path that the daemon still lists for that workspace.
+const draftsByWorkspace = new Map<string, InstructionDraft>();
+
+export interface InstructionsGuard {
+  beforeChange: (action: () => void) => void;
+}
+
+export function InstructionsSection({
+  hostId: activeHostId, cwd: activeCwd, headerActions, ref,
+}: {
+  hostId: string | null;
+  cwd: string | null;
+  headerActions: HTMLDivElement | null;
+  ref: Ref<InstructionsGuard>;
+}) {
+  const { t } = useI18n();
+  const host = useOrbitSelector((s) => s.fleet.hosts.find((item) => item.host_id === activeHostId));
+  const editors = useOrbitSelector((s) => s.externalEditors);
+  const preferredEditor = useOrbitSelector((s) => s.preferredEditor);
   const activeView = useOrbitSelector((s) => s.activeView);
   const commandPaletteOpen = useOrbitSelector((s) => s.commandPaletteOpen);
-
+  const installedEditors = editors.filter((editor) =>
+    editor.installed && editor.kind !== "terminal" && editor.kind !== "file_manager",
+  );
+  const editor = installedEditors.find((item) => item.kind === preferredEditor) ?? installedEditors[0];
   const ime = useImeCompositionGuard();
   const mod = modSymbol();
-
-  const defaultHostId =
-    instructionsTarget?.hostId ?? selectedHostId ?? fleet.hosts[0]?.host_id ?? null;
-
-  const [activeHostId, setActiveHostId] = useState<string | null>(defaultHostId);
-
-  useEffect(() => {
-    if (instructionsTarget?.hostId) {
-      setActiveHostId(instructionsTarget.hostId);
-    }
-  }, [instructionsTarget?.hostId]);
-
-  const workspaceOptions = useMemo(() => {
-    if (!activeHostId) return [];
-    const detail = hostDetails[activeHostId];
-    const seen = new Set<string>();
-    const dirs: string[] = [];
-
-    const pushDir = (raw: string | null | undefined) => {
-      const cleaned = raw?.trim();
-      if (!cleaned || seen.has(cleaned)) return;
-      seen.add(cleaned);
-      dirs.push(cleaned);
-    };
-
-    if (instructionsTarget && instructionsTarget.hostId === activeHostId) {
-      pushDir(instructionsTarget.cwd);
-    }
-    if (activeHostId === selectedHostId) {
-      if (selectedAgentId && detail) {
-        const ag = (detail.agents ?? []).find((a) => a.agent_id === selectedAgentId);
-        pushDir(ag?.cwd);
-      }
-      pushDir(selectedWorkspaceCwd);
-    }
-    if (detail) {
-      for (const ws of detail.workspaces ?? []) {
-        if (!ws.archived_at) pushDir(ws.cwd);
-      }
-      for (const proj of detail.discovered_projects ?? []) {
-        pushDir(proj.path);
-      }
-      for (const ag of detail.agents ?? []) {
-        pushDir(ag.cwd);
-      }
-    }
-    return dirs;
-  }, [
-    activeHostId,
-    hostDetails,
-    instructionsTarget,
-    selectedHostId,
-    selectedAgentId,
-    selectedWorkspaceCwd,
-  ]);
-
-  const [activeCwd, setActiveCwd] = useState<string | null>(
-    () => instructionsTarget?.cwd ?? workspaceOptions[0] ?? null,
-  );
-
-  useEffect(() => {
-    if (instructionsTarget?.cwd && instructionsTarget.hostId === activeHostId) {
-      setActiveCwd(instructionsTarget.cwd);
-      return;
-    }
-    if (!activeCwd || !workspaceOptions.includes(activeCwd)) {
-      setActiveCwd(workspaceOptions[0] ?? null);
-    }
-  }, [activeHostId, activeCwd, instructionsTarget, workspaceOptions]);
 
   const [snapshot, setSnapshot] = useState<InstructionFilesSnapshotView | null>(null);
   const [listLoading, setListLoading] = useState(false);
@@ -222,6 +175,7 @@ export function InstructionsSection() {
 
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [fileLoading, setFileLoading] = useState(false);
+  const [fileReady, setFileReady] = useState(false);
   const [loadedContent, setLoadedContent] = useState("");
   const [draftContent, setDraftContent] = useState("");
   const [loadedLineEnding, setLoadedLineEnding] = useState<"lf" | "crlf">("lf");
@@ -246,6 +200,8 @@ export function InstructionsSection() {
   // Clean up all timers on unmount
   useEffect(() => {
     return () => {
+      listSeqRef.current += 1;
+      readSeqRef.current += 1;
       if (savedTimerRef.current !== null) window.clearTimeout(savedTimerRef.current);
       if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current);
       if (focusTimerRef.current !== null) window.clearTimeout(focusTimerRef.current);
@@ -253,6 +209,25 @@ export function InstructionsSection() {
   }, []);
 
   const dirty = draftContent !== loadedContent || (!loadedExists && draftContent.length > 0);
+
+  const workspaceKey = JSON.stringify([activeHostId, activeCwd]);
+  useLayoutEffect(() => {
+    if (!fileReady || !selectedPath) return;
+    const cached = draftsByWorkspace.get(workspaceKey);
+    if (!dirty) {
+      if (cached?.path === selectedPath) draftsByWorkspace.delete(workspaceKey);
+      return;
+    }
+    // Keep the original revision until the user explicitly resolves a conflict.
+    const base = etagConflict && cached?.path === selectedPath ? cached : null;
+    draftsByWorkspace.set(workspaceKey, {
+      path: selectedPath,
+      text: draftContent,
+      etag: base ? base.etag : loadedEtag,
+      original: base ? base.original : loadedContent,
+      exists: base ? base.exists : loadedExists,
+    });
+  }, [workspaceKey, selectedPath, fileReady, dirty, draftContent, loadedContent, loadedEtag, loadedExists, etagConflict]);
 
   const runWithDiscardGuard = useCallback(
     (action: () => void) => {
@@ -266,6 +241,8 @@ export function InstructionsSection() {
     [dirty],
   );
 
+  useImperativeHandle(ref, () => ({ beforeChange: runWithDiscardGuard }), [runWithDiscardGuard]);
+
   const selectedEntry: InstructionFileEntry | null = useMemo(() => {
     if (!snapshot || !selectedPath) return null;
     return (snapshot.files ?? []).find((f) => f.path === selectedPath) ?? null;
@@ -276,11 +253,14 @@ export function InstructionsSection() {
       hostId: string,
       cwd: string,
       entry: InstructionFileEntry,
-      opts?: { prefillTemplate?: boolean },
+      opts?: { prefillTemplate?: boolean; restore?: InstructionDraft },
     ) => {
       const seq = ++readSeqRef.current;
       setSelectedPath(entry.path);
+      setSaving(false);
+      setJustSaved(false);
       setFileLoading(true);
+      setFileReady(false);
       setLoadedContent("");
       setDraftContent("");
       setLoadedLineEnding("lf");
@@ -298,7 +278,14 @@ export function InstructionsSection() {
         setLoadedExists(Boolean(res.exists));
         setLoadedEtag(res.etag ?? null);
         setLoadedContent(normalized);
-        if (!res.exists && opts?.prefillTemplate) {
+        setFileReady(true);
+        if (opts?.restore) {
+          const previous = opts.restore;
+          setDraftContent(previous.text);
+          const changedOnDisk = previous.etag !== (res.etag ?? null) ||
+            previous.exists !== res.exists || previous.original !== normalized;
+          setEtagConflict(previous.text !== normalized && changedOnDisk);
+        } else if (!res.exists && opts?.prefillTemplate) {
           setDraftContent(starterTemplateForFilename(entry.filename));
         } else {
           setDraftContent(normalized);
@@ -333,14 +320,16 @@ export function InstructionsSection() {
         };
         setSnapshot(snap);
 
+        const cached = draftsByWorkspace.get(workspaceKey);
+        const nextPath = preferredPath ?? cached?.path;
         const nextSelection =
-          (preferredPath && files.find((f) => f.path === preferredPath)) ||
+          (nextPath && files.find((f) => f.path === nextPath)) ||
           files.find((f) => f.exists) ||
           files[0] ||
           null;
 
         if (nextSelection) {
-          void loadFile(hostId, cwd, nextSelection);
+          void loadFile(hostId, cwd, nextSelection, { restore: cached?.path === nextSelection.path ? cached : undefined });
         } else {
           readSeqRef.current += 1;
           setSelectedPath(null);
@@ -364,7 +353,7 @@ export function InstructionsSection() {
         }
       }
     },
-    [loadFile],
+    [loadFile, workspaceKey],
   );
 
   useEffect(() => {
@@ -389,7 +378,7 @@ export function InstructionsSection() {
 
   const handleSave = useCallback(
     async (overwriteAfterConflict = false) => {
-      if (!activeHostId || !activeCwd || !selectedPath || saving || fileLoading) return;
+      if (!activeHostId || !activeCwd || !selectedPath || saving || !fileReady || (etagConflict && !overwriteAfterConflict)) return;
       const saveReadSeq = readSeqRef.current;
       const saveListSeq = listSeqRef.current;
       const normalizedDraft = draftContent;
@@ -456,7 +445,8 @@ export function InstructionsSection() {
       activeCwd,
       selectedPath,
       saving,
-      fileLoading,
+      fileReady,
+      etagConflict,
       loadedEtag,
       loadedLineEnding,
       draftContent,
@@ -478,10 +468,10 @@ export function InstructionsSection() {
         copiedTimerRef.current = null;
         setCopiedMerged(false);
       }, 1600);
-    } catch (err) {
-      setSaveError(`Failed to copy merged instructions: ${String(err)}`);
+    } catch {
+      orbitActions.showToast(t("common.copyFailed"));
     }
-  }, [snapshot?.merged_preview]);
+  }, [snapshot?.merged_preview, t]);
 
   const handleQuickCreate = useCallback(
     (entry: InstructionFileEntry) => {
@@ -495,13 +485,9 @@ export function InstructionsSection() {
           }, 30);
         });
       };
-      if (entry.path !== selectedPath) {
-        runWithDiscardGuard(openTemplate);
-        return;
-      }
-      openTemplate();
+      runWithDiscardGuard(openTemplate);
     },
-    [activeHostId, activeCwd, selectedPath, runWithDiscardGuard, loadFile],
+    [activeHostId, activeCwd, runWithDiscardGuard, loadFile],
   );
 
   // Cmd+S / Ctrl+S shortcut strictly scoped to active Settings > Instructions view
@@ -515,7 +501,8 @@ export function InstructionsSection() {
           commandPaletteOpen ||
           discardDialogOpen ||
           !selectedPath ||
-          fileLoading ||
+          !fileReady ||
+          etagConflict ||
           saving ||
           (!dirty && loadedExists)
         ) {
@@ -532,38 +519,14 @@ export function InstructionsSection() {
     commandPaletteOpen,
     discardDialogOpen,
     selectedPath,
-    fileLoading,
+    fileReady,
+    etagConflict,
     saving,
     dirty,
     loadedExists,
     handleSave,
   ]);
 
-  const hostSelectOptions = useMemo<SettingSelectOption<string>[]>(
-    () =>
-      fleet.hosts.map((h) => ({
-        value: h.host_id,
-        label: h.display_name,
-        description: h.hostname !== h.display_name ? h.hostname : undefined,
-      })),
-    [fleet.hosts],
-  );
-
-  const cwdSelectOptions = useMemo<SettingSelectOption<string>[]>(
-    () =>
-      workspaceOptions.map((dir) => ({
-        value: dir,
-        label: compactDirLabel(dir),
-        description: dir,
-        mono: true,
-      })),
-    [workspaceOptions],
-  );
-
-  const existingFiles = useMemo(
-    () => snapshot?.files.filter((f) => f.exists) ?? [],
-    [snapshot],
-  );
 
   // Prioritize workspace targets (AGENTS.md, CLAUDE.md, AGENTS.override.md) so they are never clipped behind global entries
   const missingCreateTargets = useMemo(() => {
@@ -595,131 +558,69 @@ export function InstructionsSection() {
   );
 
   return (
-    <div className="flex h-full min-h-[540px] flex-col gap-4 select-none">
-      {/* Header Bar */}
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0 space-y-1">
-          <div className="flex items-center gap-2.5">
-            <h2 className="text-foreground text-[17.5px] font-semibold tracking-[-0.015em]">
-              Project Instructions
-            </h2>
-            {snapshot && (
-              <span className="border-border/70 bg-muted/60 text-muted-foreground inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 font-mono text-[11px] tabular-nums">
-                <span>{existingFiles.length} active</span>
-                <span className="opacity-45">·</span>
-                <span>~{formatTokensCompact(snapshot.total_tokens)}</span>
-              </span>
-            )}
-          </div>
-          <p className="text-muted-foreground text-[12.5px]">
-            Effective precedence stack from Global user rules to local overrides.
-          </p>
-        </div>
-
-        <div className="flex items-center gap-1.5">
-          <button
-            type="button"
-            disabled={!snapshot?.merged_preview}
-            onClick={() => void handleCopyMerged()}
-            className="border-border bg-background text-foreground/85 hover:bg-accent hover:text-foreground inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-45"
-          >
-            {copiedMerged ? (
-              <>
-                <Check className="h-[13px] w-[13px] text-emerald-500" />
-                <span>Copied</span>
-              </>
-            ) : (
-              <>
-                <Copy className="h-[13px] w-[13px] opacity-75" />
-                <span>Copy merged</span>
-              </>
-            )}
-          </button>
-          <button
-            type="button"
-            aria-label="Refresh instruction hierarchy"
+    <div data-setting-id="settings.subTabInstructions" className="flex min-h-0 min-w-0 flex-1 flex-col gap-3">
+      {headerActions && createPortal(
+        <div className="flex flex-wrap items-center gap-2">
+          {isTauriRuntime() && host && isLocalHostCard(host) && editor && loadedExists && selectedEntry && (
+            <Button variant="outline" size="sm" className="text-[13px] @max-[640px]:w-[30px] @max-[640px]:px-0"
+              aria-label={t("palette.openInEditor", { editor: editor.label })}
+              title={t("palette.openInEditor", { editor: editor.label })}
+              onClick={() => {
+                void orbitIpc.openInEditor(editor.kind, selectedEntry.path, null)
+                  .catch((err: unknown) => orbitActions.showToast(String(err)));
+              }}>
+              <ExternalLink data-icon="inline-start" />
+              <span className="@max-[640px]:hidden">{t("palette.openInEditor", { editor: editor.label })}</span>
+            </Button>
+          )}
+          <Button data-setting-id="context.copyMerged" variant="outline" size="sm" className="text-[13px] @max-[640px]:w-[30px] @max-[640px]:px-0"
+            aria-label={t("context.copyMerged")} title={t("context.copyMerged")}
+            disabled={!snapshot?.merged_preview} onClick={() => void handleCopyMerged()}>
+            {copiedMerged ? <Check data-icon="inline-start" /> : <Copy data-icon="inline-start" />}
+            <span className="@max-[640px]:hidden">{copiedMerged ? t("common.copied") : t("context.copyMerged")}</span>
+          </Button>
+          <Button variant="ghost" size="icon" aria-label={t("common.refresh")}
             disabled={!activeHostId || !activeCwd || listLoading}
             onClick={() => {
-              if (!activeHostId || !activeCwd) return;
-              runWithDiscardGuard(() => {
-                void loadHierarchy(activeHostId, activeCwd, selectedPath);
-              });
-            }}
-            className="border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground inline-flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-lg border transition-colors disabled:cursor-not-allowed disabled:opacity-45"
-          >
-            <RefreshCw className={cn("h-[13.5px] w-[13.5px]", listLoading && "animate-spin")} />
-          </button>
-        </div>
-      </div>
-
-      {/* Host + Workspace Selector Strip */}
-      <div className="flex flex-wrap items-center gap-2">
-        {fleet.hosts.length > 1 && (
-          <SettingSelect
-            value={activeHostId}
-            options={hostSelectOptions}
-            onChange={(hostId) => {
-              if (hostId === activeHostId) return;
-              runWithDiscardGuard(() => {
-                setActiveHostId(hostId);
-                orbitActions.setInstructionsTarget(null);
-              });
-            }}
-            placeholder="Select host…"
-            triggerClassName="min-w-[140px] max-w-[190px]"
-          />
-        )}
-        <SettingSelect
-          value={activeCwd}
-          options={cwdSelectOptions}
-          onChange={(cwd) => {
-            if (cwd === activeCwd) return;
-            runWithDiscardGuard(() => {
-              setActiveCwd(cwd);
-              if (activeHostId) {
-                orbitActions.setInstructionsTarget({ hostId: activeHostId, cwd });
+              if (activeHostId && activeCwd) {
+                runWithDiscardGuard(() => { void loadHierarchy(activeHostId, activeCwd, selectedPath); });
               }
-            });
-          }}
-          placeholder="Select workspace…"
-          disabled={cwdSelectOptions.length === 0}
-          triggerClassName="min-w-[220px] max-w-[420px] flex-1"
-          menuClassName="max-w-[420px]"
-        />
-      </div>
+            }}>
+            <RefreshCw className={cn("size-[15px]", listLoading && "animate-spin")} />
+          </Button>
+        </div>, headerActions)}
 
       {/* Error / Empty Workspace Guard */}
       {!activeHostId || !activeCwd ? (
-        <div className="border-border/70 bg-muted/25 text-muted-foreground flex flex-1 flex-col items-center justify-center gap-2 rounded-xl border border-dashed p-8 text-center">
+        <div className="border-border-subtle bg-surface-recessed text-ink-muted flex flex-1 flex-col items-center justify-center gap-2 rounded-xl border border-dashed p-8 text-center">
           <FileCode2 className="h-6 w-6 opacity-45" />
-          <p className="text-foreground/80 text-[13px] font-medium">No workspace selected</p>
-          <p className="max-w-[320px] text-[12px]">
-            Open or add a project folder on a connected host to inspect and edit its instruction
-            hierarchy.
+          <p className="text-ink-secondary text-[13px] font-medium">{t("memory.noWorkspaceTitle")}</p>
+          <p className="max-w-[320px] text-[13px]">
+            {t("context.noProjectHint")}
           </p>
         </div>
       ) : listError ? (
-        <div className="flex items-start gap-2.5 rounded-xl border border-rose-500/25 bg-rose-500/[0.06] px-3.5 py-3 text-[12.5px] text-rose-700 dark:text-rose-300">
+        <div className="flex items-start gap-2.5 rounded-xl border border-signal-danger-border bg-signal-danger-bg px-3.5 py-3 text-[13px] text-signal-danger">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           <div className="min-w-0 flex-1 break-words">{listError}</div>
         </div>
       ) : (
         /* Main Split Pane: Hierarchy Stack (Left) + Monospace Editor (Right) */
-        <div className="border-border/80 bg-background/70 flex min-h-0 flex-1 overflow-hidden rounded-xl border">
+        <div className="border-border-subtle bg-surface-base flex min-h-0 flex-1 overflow-hidden rounded-xl border">
           {/* Left Pane: Precedence Hierarchy Stack */}
-          <div className="border-border/70 bg-muted/20 flex w-[248px] shrink-0 flex-col border-r">
-            <div className="border-border/60 flex items-center justify-between border-b px-3 py-2">
-              <span className="text-muted-foreground text-[11px] font-medium tracking-wide uppercase">
-                Precedence
+          <div className="border-border-subtle bg-surface-recessed flex w-[clamp(155px,26%,260px)] shrink-0 flex-col border-r">
+            <div className="border-border-subtle flex items-center justify-between border-b px-3 py-2">
+              <span className="text-ink-muted text-[11px] font-medium tracking-wide uppercase">
+                {t("context.precedence")}
               </span>
-              <span className="text-muted-foreground/70 text-[10.5px]">Low → High</span>
+              <span className="text-ink-faint text-[11px]">{t("context.precedenceOrder")}</span>
             </div>
 
             <ScrollArea className="min-h-0 flex-1" viewportClassName="p-2">
               {listLoading && !snapshot ? (
-                <div className="text-muted-foreground flex items-center justify-center gap-2 py-8 text-[12px]">
+                <div className="text-ink-muted flex items-center justify-center gap-2 py-8 text-[13px]">
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  <span>Discovering…</span>
+                  <span>{t("common.loading")}</span>
                 </div>
               ) : (
                 <div className="space-y-1">
@@ -741,51 +642,47 @@ export function InstructionsSection() {
                         className={cn(
                           "group flex w-full cursor-pointer flex-col gap-1 rounded-lg px-2.5 py-2 text-left transition-colors",
                           isSelected
-                            ? "bg-foreground/[0.07] text-foreground dark:bg-white/[0.09]"
-                            : "text-foreground/80 hover:bg-foreground/[0.04] dark:hover:bg-white/[0.05]",
+                            ? "bg-surface-raised text-ink-primary"
+                            : "text-ink-secondary hover:bg-surface-raised",
                           !entry.exists && !isSelected && "opacity-65 hover:opacity-95",
                         )}
                       >
                         <div className="flex items-center justify-between gap-1.5">
                           <div className="flex min-w-0 items-center gap-1.5">
-                            <span className="text-muted-foreground/70 w-3.5 shrink-0 font-mono text-[10.5px] tabular-nums">
+                            <span className="text-ink-muted w-3.5 shrink-0 font-mono text-[11px] tabular-nums">
                               {entry.precedence_order}
                             </span>
-                            <span className="truncate font-mono text-[12px] font-medium">
+                            <span className="truncate font-mono text-[13px] font-medium">
                               {entry.filename}
                             </span>
                             {isDirtySelected && (
                               <span
-                                className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500"
-                                title="Unsaved changes"
+                                className="h-1.5 w-1.5 shrink-0 rounded-full bg-signal-warning"
+                                title={t("sidePanel.unsavedChanges")}
                               />
                             )}
                           </div>
                           <span
-                            className={cn(
-                              "shrink-0 rounded border px-1.5 py-[1px] text-[10px] font-medium",
-                              SCOPE_TONE_CLASSES[entry.scope],
-                            )}
+                            className="border-border-subtle bg-surface-recessed text-ink-muted shrink-0 rounded border px-1.5 py-px text-[11px] font-medium"
                           >
-                            {SCOPE_LABELS[entry.scope]}
+                            {t(SCOPE_LABELS[entry.scope])}
                           </span>
                         </div>
 
                         <div className="flex items-center justify-between gap-2 pl-5">
-                          <span className="text-muted-foreground/75 truncate font-mono text-[10.5px]">
+                          <span className="text-ink-muted truncate font-mono text-[11px]">
                             {entry.relative_path}
                           </span>
-                          <span className="text-muted-foreground/75 shrink-0 font-mono text-[10.5px] tabular-nums">
-                            {entry.exists ? formatTokensCompact(entry.approx_tokens) : "New"}
+                          <span className="text-ink-muted shrink-0 font-mono text-[11px] tabular-nums">
+                            {entry.exists ? formatTokensCompact(entry.approx_tokens) : t("context.newFile")}
                           </span>
                         </div>
 
                         {(entry.imports?.length ?? 0) > 0 && (
-                          <div className="text-muted-foreground/75 flex items-center gap-1 pl-5 text-[10.5px]">
+                          <div className="text-ink-muted flex items-center gap-1 pl-5 text-[11px]">
                             <Link2 className="h-2.5 w-2.5 shrink-0" />
                             <span>
-                              {entry.imports.length}{" "}
-                              {entry.imports.length === 1 ? "import" : "imports"}
+                              {t("context.importCount", { count: entry.imports.length })}
                             </span>
                           </div>
                         )}
@@ -796,9 +693,14 @@ export function InstructionsSection() {
               )}
             </ScrollArea>
 
+            {snapshot && (
+              <div className="border-border-subtle text-ink-muted border-t px-3 py-1.5 text-[11px] tabular-nums">
+                {t("context.activeFiles", { count: snapshot.files.filter((file) => file.exists).length })} · ~{formatTokensCompact(snapshot.total_tokens)}
+              </div>
+            )}
             {/* Quick Create Buttons for Missing Canonical Layers */}
             {missingCreateTargets.length > 0 && (
-              <div className="border-border/60 space-y-1 border-t p-2">
+              <div className="orbit-native-scroll border-border-subtle max-h-[30%] shrink-0 space-y-1 overflow-y-auto border-t p-2">
                 {missingCreateTargets.map((target) => {
                   const createLabel =
                     target.scope === "global_user" ? target.relative_path : target.filename;
@@ -807,10 +709,10 @@ export function InstructionsSection() {
                       key={`create-${target.id}`}
                       type="button"
                       onClick={() => handleQuickCreate(target)}
-                      className="text-muted-foreground hover:bg-accent hover:text-foreground flex w-full cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-left text-[11.5px] transition-colors"
+                      className="text-ink-muted hover:bg-surface-recessed hover:text-ink-primary flex w-full cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-left text-[11px] transition-colors"
                     >
                       <Plus className="h-3 w-3 shrink-0 opacity-75" />
-                      <span className="truncate font-mono">Create {createLabel}</span>
+                      <span className="truncate font-mono">{t("context.createFile", { file: createLabel })}</span>
                     </button>
                   );
                 })}
@@ -823,35 +725,32 @@ export function InstructionsSection() {
             {selectedEntry ? (
               <>
                 {/* Editor Top Toolbar */}
-                <div className="border-border/60 flex items-center justify-between gap-2 border-b px-3.5 py-2">
+                <div className="border-border-subtle flex items-center justify-between gap-2 border-b px-3.5 py-2">
                   <div className="flex min-w-0 items-center gap-2">
-                    <span className="text-foreground truncate font-mono text-[12px] font-medium">
+                    <span className="text-ink-primary truncate font-mono text-[13px] font-medium">
                       {selectedEntry.relative_path}
                     </span>
                     <span
-                      className={cn(
-                        "shrink-0 rounded border px-1.5 py-[1px] text-[10px] font-medium",
-                        SCOPE_TONE_CLASSES[selectedEntry.scope],
-                      )}
+                      className="border-border-subtle bg-surface-recessed text-ink-muted shrink-0 rounded border px-1.5 py-px text-[11px] font-medium"
                     >
-                      {SCOPE_LABELS[selectedEntry.scope]}
+                      {t(SCOPE_LABELS[selectedEntry.scope])}
                     </span>
                     {selectedEntry.provider_hint &&
                       PROVIDER_LABELS[selectedEntry.provider_hint] && (
-                        <span className="text-muted-foreground/75 hidden text-[11px] sm:inline">
+                        <span className="text-ink-muted hidden text-[11px] sm:inline">
                           {PROVIDER_LABELS[selectedEntry.provider_hint]}
                         </span>
                       )}
                     {dirty && (
-                      <span className="inline-flex items-center gap-1 text-[11px] font-medium text-amber-600 dark:text-amber-400">
-                        <span className="h-1.5 w-1.5 rounded-full bg-amber-500" />
-                        Unsaved
+                      <span className="inline-flex items-center gap-1 text-[11px] font-medium text-signal-warning">
+                        <span className="h-1.5 w-1.5 rounded-full bg-signal-warning" />
+                        {t("sidePanel.editorStatusUnsaved")}
                       </span>
                     )}
                     {!dirty && justSaved && (
-                      <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-600 dark:text-emerald-400">
+                      <span className="inline-flex items-center gap-1 text-[11px] font-medium text-signal-success">
                         <Check className="h-3 w-3" />
-                        Saved
+                        {t("sidePanel.editorStatusSaved")}
                       </span>
                     )}
                   </div>
@@ -865,25 +764,25 @@ export function InstructionsSection() {
                           setEtagConflict(false);
                           setSaveError(null);
                         }}
-                        className="text-muted-foreground hover:bg-accent hover:text-foreground inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] transition-colors"
+                        className="text-ink-muted hover:bg-surface-recessed hover:text-ink-primary inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11px] transition-colors"
                       >
                         <RotateCcw className="h-3 w-3" />
-                        <span>Revert</span>
+                        <span>{t("context.revert")}</span>
                       </button>
                     )}
                     <Button
                       type="button"
                       size="xs"
-                      disabled={saving || fileLoading || (!dirty && loadedExists)}
+                      disabled={saving || !fileReady || etagConflict || (!dirty && loadedExists)}
                       onClick={() => void handleSave(false)}
-                      className="gap-1.5 text-[11.5px]"
+                      className="gap-1.5 text-[13px]"
                     >
                       {saving ? (
                         <Loader2 className="h-3 w-3 animate-spin" />
                       ) : (
                         <Save className="h-3 w-3" />
                       )}
-                      <span>{loadedExists ? "Save" : "Create"}</span>
+                      <span>{loadedExists ? t("common.save") : t("approval.create")}</span>
                       <ShortcutKbd keys={`${mod}S`} size="xs" variant="inverted" />
                     </Button>
                   </div>
@@ -891,15 +790,15 @@ export function InstructionsSection() {
 
                 {/* Resolved @import Strip */}
                 {(selectedEntry.imports?.length ?? 0) > 0 && (
-                  <div className="border-border/50 bg-muted/25 flex flex-wrap items-center gap-1.5 border-b px-3.5 py-1.5">
-                    <span className="text-muted-foreground inline-flex items-center gap-1 text-[11px]">
+                  <div className="border-border-subtle bg-surface-recessed flex flex-wrap items-center gap-1.5 border-b px-3.5 py-1.5">
+                    <span className="text-ink-muted inline-flex items-center gap-1 text-[11px]">
                       <Link2 className="h-3 w-3" />
-                      Imports:
+                      {t("context.imports")}
                     </span>
                     {(selectedEntry.imports ?? []).map((imp) => (
                       <span
                         key={imp}
-                        className="border-border/60 bg-background/80 text-foreground/80 rounded border px-1.5 py-0.5 font-mono text-[10.5px]"
+                        className="border-border-subtle bg-surface-base text-ink-secondary rounded border px-1.5 py-0.5 font-mono text-[11px]"
                       >
                         @{imp}
                       </span>
@@ -909,26 +808,26 @@ export function InstructionsSection() {
 
                 {/* Optimistic Concurrency Etag Conflict Banner */}
                 {etagConflict && (
-                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-amber-500/30 bg-amber-500/[0.08] px-3.5 py-2 text-[12px] text-amber-800 dark:text-amber-300">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-signal-warning-border bg-signal-warning-bg px-3.5 py-2 text-[13px] text-signal-warning">
                     <div className="flex items-center gap-2">
                       <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-                      <span>File changed on disk since it was loaded.</span>
+                      <span>{t("sidePanel.editorConflictTitle")}</span>
                     </div>
                     <div className="flex items-center gap-1.5">
                       <button
                         type="button"
                         onClick={handleReloadFromDisk}
-                        className="bg-background/80 hover:bg-background cursor-pointer rounded-md border border-amber-500/35 px-2 py-0.5 text-[11.5px] font-medium transition-colors"
+                        className="bg-surface-base hover:bg-surface-base cursor-pointer rounded-md border border-signal-warning-border px-2 py-0.5 text-[11px] font-medium transition-colors"
                       >
-                        Reload from disk
+                        {t("sidePanel.editorConflictReload")}
                       </button>
                       <button
                         type="button"
                         disabled={saving}
                         onClick={() => void handleSave(true)}
-                        className="cursor-pointer rounded-md bg-amber-600 px-2 py-0.5 text-[11.5px] font-medium text-white transition-colors hover:bg-amber-700 disabled:opacity-50"
+                        className="cursor-pointer rounded-md border border-signal-warning-border bg-signal-warning-bg px-2 py-0.5 text-[13px] font-medium text-signal-warning transition-colors hover:bg-surface-raised disabled:opacity-50"
                       >
-                        Overwrite disk
+                        {t("sidePanel.editorConflictOverwrite")}
                       </button>
                     </div>
                   </div>
@@ -936,14 +835,14 @@ export function InstructionsSection() {
 
                 {/* Generic Save / Read Error Banner */}
                 {saveError && (
-                  <div className="flex items-center justify-between gap-2 border-b border-rose-500/25 bg-rose-500/[0.07] px-3.5 py-2 text-[12px] text-rose-700 dark:text-rose-300">
+                  <div className="flex items-center justify-between gap-2 border-b border-signal-danger-border bg-signal-danger-bg px-3.5 py-2 text-[13px] text-signal-danger">
                     <span className="truncate">{saveError}</span>
                     <button
                       type="button"
                       onClick={() => setSaveError(null)}
-                      className="shrink-0 cursor-pointer text-[11px] font-medium text-rose-600/80 hover:text-rose-600"
+                      className="shrink-0 cursor-pointer text-[11px] font-medium text-signal-danger hover:text-signal-danger"
                     >
-                      Dismiss
+                      {t("sidePanel.editorDismissError")}
                     </button>
                   </div>
                 )}
@@ -951,14 +850,15 @@ export function InstructionsSection() {
                 {/* Monospace Editor Surface */}
                 <div className="relative min-h-0 flex-1">
                   {fileLoading ? (
-                    <div className="text-muted-foreground flex h-full items-center justify-center gap-2 text-[12.5px]">
+                    <div className="text-ink-muted flex h-full items-center justify-center gap-2 text-[13px]">
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      <span>Loading file…</span>
+                      <span>{t("common.loading")}</span>
                     </div>
                   ) : (
                     <textarea
                       ref={textareaRef}
                       value={draftContent}
+                      disabled={!fileReady}
                       spellCheck={false}
                       onChange={(e) => setDraftContent(e.target.value)}
                       {...ime.compositionProps}
@@ -978,19 +878,20 @@ export function InstructionsSection() {
                           });
                         }
                       }}
-                      placeholder={`Write ${selectedEntry.filename} instructions… (supports @path/to/file.md imports)`}
-                      className="selectable-text text-foreground placeholder:text-muted-foreground/45 h-full w-full resize-none bg-transparent p-3.5 font-mono text-[12.5px] leading-[1.6] outline-none"
+                      aria-label={selectedEntry.filename}
+                      placeholder={t("context.editorPlaceholder", { file: selectedEntry.filename })}
+                      className="selectable-text text-ink-primary placeholder:text-ink-muted h-full w-full resize-none bg-transparent p-3.5 font-mono text-[13px] leading-[1.6] outline-none"
                     />
                   )}
                 </div>
 
                 {/* Editor Footer Status */}
-                <div className="border-border/60 bg-muted/15 text-muted-foreground flex items-center justify-between gap-2 border-t px-3.5 py-1.5 font-mono text-[11px] tabular-nums">
+                <div className="border-border-subtle bg-surface-recessed text-ink-muted flex items-center justify-between gap-2 border-t px-3.5 py-1.5 font-mono text-[11px] tabular-nums">
                   <span className="truncate opacity-75">{selectedEntry.path}</span>
                   <div className="flex shrink-0 items-center gap-2.5">
                     <span>{loadedLineEnding.toUpperCase()}</span>
                     <span className="opacity-40">·</span>
-                    <span>{liveLineCount} lines</span>
+                    <span>{t("common.linesCount", { count: liveLineCount })}</span>
                     <span className="opacity-40">·</span>
                     <span>{(liveByteSize / 1024).toFixed(1)} KB</span>
                     <span className="opacity-40">·</span>
@@ -999,8 +900,8 @@ export function InstructionsSection() {
                 </div>
               </>
             ) : (
-              <div className="text-muted-foreground flex flex-1 items-center justify-center text-[12.5px]">
-                Select an instruction layer to view or edit.
+              <div className="text-ink-muted flex flex-1 items-center justify-center text-[13px]">
+                {t("context.pickLayer")}
               </div>
             )}
           </div>
@@ -1013,15 +914,12 @@ export function InstructionsSection() {
           setDiscardDialogOpen(open);
           if (!open) pendingDiscardActionRef.current = null;
         }}
-        title="Discard unsaved changes?"
-        description={
-          selectedEntry
-            ? `Unsaved changes to ${selectedEntry.filename} will be lost.`
-            : "Unsaved changes to this instruction file will be lost."
-        }
-        confirmLabel="Discard"
+        title={t("context.discardTitle")}
+        description={selectedEntry ? t("context.discardDescription", { file: selectedEntry.filename }) : undefined}
+        confirmLabel={t("review.discard")}
         tone="danger"
         onConfirm={() => {
+          draftsByWorkspace.delete(workspaceKey);
           const action = pendingDiscardActionRef.current;
           pendingDiscardActionRef.current = null;
           action?.();

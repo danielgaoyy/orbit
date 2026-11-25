@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { AlertTriangle, ArrowLeftRight, RotateCcw, Search } from "lucide-react";
 import {
   SettingCard,
@@ -30,6 +30,7 @@ interface DisplayShortcutRow {
   action: string;
   keys: string;
   actionId?: ShortcutActionId;
+  settingId?: string;
   isCustomized?: boolean;
 }
 
@@ -39,7 +40,7 @@ interface PendingConflictState {
   conflict: ShortcutActionDefinition;
 }
 
-export function ShortcutsSection() {
+export function ShortcutsSection({ jumpTo }: { jumpTo?: string }) {
   const { locale, t } = useI18n();
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const customKeybindings = useOrbitSelector((s) => s.customKeybindings);
@@ -57,6 +58,10 @@ export function ShortcutsSection() {
   const shift = isMac ? "⇧" : "Shift+";
 
   const hasAnyCustom = Object.keys(customKeybindings).length > 0;
+
+  useLayoutEffect(() => {
+    if (jumpTo) setQuery("");
+  }, [jumpTo]);
 
   // Capture live chord while recording
   useEffect(() => {
@@ -121,6 +126,7 @@ export function ShortcutsSection() {
         action: t(def.labelKey),
         keys: displayKeys,
         actionId: def.id,
+        settingId: def.labelKey,
         isCustomized,
       };
     });
@@ -138,7 +144,7 @@ export function ShortcutsSection() {
         action: t("settings.scNewLine"),
         keys: enterToSend ? `${shift}Enter` : "Enter",
       },
-      { group: composerGroup, action: t("settings.scSteerAgent"), keys: `${mod}Enter` },
+      { group: composerGroup, action: t("settings.scSteerAgent"), keys: enterToSend ? `${mod}Enter` : `${mod}${shift}Enter` },
       { group: composerGroup, action: t("settings.scStopGeneration"), keys: "Esc Esc" },
       { group: approvalsGroup, action: t("settings.scQuickSelectOption"), keys: "1 .. 9" },
     );
@@ -181,7 +187,7 @@ export function ShortcutsSection() {
               setReservedWarning(null);
               setPendingConflict(null);
             }}
-            className="shrink-0 gap-1.5 text-[12px]"
+            className="shrink-0 gap-1.5 text-[13px]"
           >
             <RotateCcw className="size-3" />
             {t("settings.shortcutsResetAll")}
@@ -189,19 +195,20 @@ export function ShortcutsSection() {
         )}
       </div>
 
-      <div className="relative">
+      <div className="relative" data-setting-id="settings.searchShortcutsPlaceholder">
         <Search className="text-ink-faint pointer-events-none absolute top-1/2 left-3 size-[14px] -translate-y-1/2" />
         <Input
           type="text"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
+          aria-label={t("settings.searchShortcutsPlaceholder")}
           placeholder={t("settings.searchShortcutsPlaceholder")}
           className="h-[34px] rounded-[10px] pl-8.5 text-[13px]"
         />
       </div>
 
       {groups.length === 0 ? (
-        <div className="text-muted-foreground py-8 text-center text-[13px]">
+        <div className="text-ink-muted py-8 text-center text-[13px]">
           {t("settings.noMatchingShortcuts")}
         </div>
       ) : (
@@ -218,14 +225,19 @@ export function ShortcutsSection() {
                     Boolean(item.actionId && pendingConflict?.actionId === item.actionId);
 
                   return (
-                    <div key={item.actionId ?? item.action} className="flex flex-col">
+                    <div
+                      key={item.actionId ?? item.action}
+                      data-setting-id={item.settingId}
+                      data-modified={item.isCustomized || undefined}
+                      className="group/shortcut relative flex flex-col"
+                    >
                       <div className="flex items-center justify-between gap-4 px-4 py-2.5">
                         <div className="flex min-w-0 items-center gap-2">
-                          <span className="text-foreground truncate text-[13px]">
+                          <span className="text-ink-primary truncate text-[13px]">
                             {item.action}
                           </span>
                           {item.isCustomized && (
-                            <span className="bg-surface-recessed text-ink-tertiary rounded px-1.5 py-0.5 text-[10.5px] font-medium">
+                            <span className="bg-surface-recessed text-ink-muted rounded px-1.5 py-0.5 text-[11px] font-medium">
                               {t("settings.shortcutsCustomBadge")}
                             </span>
                           )}
@@ -243,7 +255,7 @@ export function ShortcutsSection() {
                                   cur?.actionId === item.actionId ? null : cur,
                                 );
                               }}
-                              className="text-ink-faint hover:text-ink-primary hover:bg-accent inline-flex size-[24px] cursor-pointer items-center justify-center rounded-[6px] transition-colors"
+                              className="text-ink-faint hover:text-ink-primary hover:bg-surface-recessed inline-flex size-[24px] cursor-pointer items-center justify-center rounded-[6px] opacity-0 group-hover/shortcut:opacity-100 group-focus-within/shortcut:opacity-100 focus-visible:opacity-100"
                             >
                               <RotateCcw className="size-[12px]" />
                             </button>
@@ -286,7 +298,7 @@ export function ShortcutsSection() {
                       </div>
 
                       {showReserved && reservedWarning && (
-                        <div className="border-border-subtle bg-signal-warning-bg text-signal-warning flex items-center justify-between gap-2 border-t px-4 py-2 text-[12px]">
+                        <div className="border-border-subtle bg-signal-warning-bg text-signal-warning flex items-center justify-between gap-2 border-t px-4 py-2 text-[13px]">
                           <span className="flex items-center gap-1.5">
                             <AlertTriangle className="size-3.5 shrink-0" />
                             <span>
@@ -299,7 +311,7 @@ export function ShortcutsSection() {
                       )}
 
                       {showConflict && pendingConflict && (
-                        <div className="border-border-subtle bg-signal-warning-bg text-signal-warning flex flex-wrap items-center justify-between gap-2 border-t px-4 py-2 text-[12px]">
+                        <div className="border-border-subtle bg-signal-warning-bg text-signal-warning flex flex-wrap items-center justify-between gap-2 border-t px-4 py-2 text-[13px]">
                           <span className="flex min-w-0 items-center gap-1.5">
                             <AlertTriangle className="size-3.5 shrink-0" />
                             <span className="truncate">

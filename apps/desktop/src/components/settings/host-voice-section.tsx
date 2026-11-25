@@ -4,10 +4,11 @@ import {
   SettingCard,
   SettingGroupLabel,
   SettingRow,
-  SettingSectionHeader,
+  SettingPageHeader,
   SettingSelect,
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
+import { isBrowserSpeechRecognitionAvailable } from "@/lib/voice-recorder";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
@@ -56,8 +57,9 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
   }, [hostId]);
 
   useEffect(() => {
-    void loadConfig();
-  }, [loadConfig]);
+    if (isOnline) void loadConfig();
+    else setLoading(false);
+  }, [loadConfig, isOnline]);
 
   const patchConfig = useCallback(
     async (patch: Partial<VoiceConfig>) => {
@@ -117,19 +119,23 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
     [hostId, t],
   );
 
+  const busy = saving || loading || busyModelId !== null;
   const cfg = state?.config;
   const languageValue = cfg?.language ?? "auto";
 
   return (
     <div className="flex flex-col gap-6">
-      <SettingSectionHeader
+      <SettingPageHeader
         title={t("voice.title")}
         description={t("voice.subtitle")}
+        badge={cfg?.stt_backend === "system_client_fallback" && (
+          <Badge variant="outline">{t("voice.sttBrowserFallback")}</Badge>
+        )}
         action={
           <Button
             variant="outline"
             size="sm"
-            disabled={loading || !isOnline}
+            disabled={busy || !isOnline}
             onClick={() => void loadConfig()}
           >
             <RefreshCw data-icon="inline-start" className={loading ? "animate-spin" : undefined} />
@@ -138,8 +144,9 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
         }
       />
 
-      {error && (
-        <div className="border-signal-danger/30 bg-signal-danger/8 text-signal-danger rounded-[10px] border px-3.5 py-2.5 text-[12px]">
+      {!isOnline && <p className="text-ink-muted text-[13px]">{t("voice.offline")}</p>}
+      {error && isOnline && (
+        <div className="border-signal-danger/30 bg-signal-danger/8 text-signal-danger rounded-[10px] border px-3.5 py-2.5 text-[13px]">
           {error}
         </div>
       )}
@@ -157,24 +164,27 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
             <SettingGroupLabel>{t("voice.sectionControl")}</SettingGroupLabel>
             <SettingCard>
               <SettingRow
+                settingId="voice.enableTitle"
                 title={t("voice.enableTitle")}
                 description={t("voice.enableDesc")}
               >
                 <ToggleSwitch
                   checked={cfg.enabled}
-                  disabled={saving || !isOnline}
+                  disabled={busy || !isOnline}
                   ariaLabel={t("voice.enableTitle")}
                   onChange={(enabled) => void patchConfig({ enabled })}
                 />
               </SettingRow>
 
               <SettingRow
+                settingId="voice.languageTitle"
                 title={t("voice.languageTitle")}
                 description={t("voice.languageDesc")}
               >
                 <SettingSelect<string>
+                  ariaLabel={t("voice.languageTitle")}
                   value={languageValue}
-                  disabled={saving || !isOnline}
+                  disabled={busy || !isOnline}
                   onChange={(val) =>
                     void patchConfig({ language: val === "auto" ? null : val })
                   }
@@ -188,12 +198,13 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
               </SettingRow>
 
               <SettingRow
+                settingId="voice.autoSpeakTitle"
                 title={t("voice.autoSpeakTitle")}
                 description={t("voice.autoSpeakDesc")}
               >
                 <ToggleSwitch
                   checked={cfg.auto_speak_responses}
-                  disabled={saving || !isOnline}
+                  disabled={busy || !isOnline}
                   ariaLabel={t("voice.autoSpeakTitle")}
                   onChange={(auto_speak_responses) =>
                     void patchConfig({ auto_speak_responses })
@@ -202,12 +213,14 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
               </SettingRow>
 
               <SettingRow
+                settingId="voice.sttBackendTitle"
                 title={t("voice.sttBackendTitle")}
                 description={t("voice.sttBackendDesc")}
               >
                 <SettingSelect<VoiceSttBackend>
+                  ariaLabel={t("voice.sttBackendTitle")}
                   value={cfg.stt_backend}
-                  disabled={saving || !isOnline}
+                  disabled={busy || !isOnline}
                   onChange={(stt_backend) => void patchConfig({ stt_backend })}
                   options={[
                     { value: "local_whisper", label: t("voice.sttLocalWhisper") },
@@ -219,12 +232,14 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
               </SettingRow>
 
               <SettingRow
+                settingId="voice.ttsBackendTitle"
                 title={t("voice.ttsBackendTitle")}
                 description={t("voice.ttsBackendDesc")}
               >
                 <SettingSelect<VoiceTtsBackend>
+                  ariaLabel={t("voice.ttsBackendTitle")}
                   value={cfg.tts_backend}
-                  disabled={saving || !isOnline}
+                  disabled={busy || !isOnline}
                   onChange={(tts_backend) => void patchConfig({ tts_backend })}
                   options={[
                     { value: "system_native", label: t("voice.ttsSystemNative") },
@@ -264,13 +279,15 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
                     <Volume2 className="size-3" />
                     {t("voice.ttsSystemNative")}
                   </Badge>
-                  <Badge variant="outline">{t("voice.sttBrowserFallback")}</Badge>
+                  {state.capabilities.system_client_fallback && isBrowserSpeechRecognitionAvailable() && cfg.stt_backend !== "system_client_fallback" && (
+                    <Badge variant="outline">{t("voice.sttBrowserFallback")}</Badge>
+                  )}
                 </div>
               </SettingCard>
             </div>
           )}
 
-          <div className="flex flex-col gap-2">
+          <div data-setting-id="voice.sectionModels" className="flex flex-col gap-2">
             <SettingGroupLabel>{t("voice.sectionModels")}</SettingGroupLabel>
             <SettingCard>
               {state && state.models.length > 0 ? (
@@ -286,14 +303,14 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
                           <span className="text-ink-primary text-[13px] font-medium">
                             {model.name}
                           </span>
-                          <Badge variant="outline" className="font-mono text-[10.5px] uppercase">
+                          <Badge variant="outline" className="font-mono text-[11px] uppercase">
                             {model.kind}
                           </Badge>
                           <span className="text-ink-muted font-mono text-[11px] tabular-nums">
                             {formatBytes(model.size_bytes)}
                           </span>
                           {model.installed && (
-                            <Badge variant="secondary" className="gap-1 text-[10.5px]">
+                            <Badge variant="secondary" className="gap-1 text-[11px]">
                               <ShieldCheck className="text-signal-success size-3" />
                               {t("voice.shaVerified")}
                             </Badge>
@@ -309,7 +326,7 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
                           <Button
                             variant="outline"
                             size="sm"
-                            disabled={busy || !isOnline}
+                            disabled={busyModelId !== null || saving || loading || !isOnline}
                             onClick={() => void handleDeleteModel(model.id)}
                           >
                             {busy ? (
@@ -323,7 +340,7 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
                           <Button
                             variant="outline"
                             size="sm"
-                            disabled={busy || !isOnline}
+                            disabled={busyModelId !== null || saving || loading || !isOnline}
                             onClick={() => void handleDownloadModel(model.id)}
                           >
                             {busy ? (
@@ -339,7 +356,7 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
                   );
                 })
               ) : (
-                <div className="text-ink-muted px-4 py-5 text-[12.5px]">
+                <div className="text-ink-muted px-4 py-5 text-[13px]">
                   {t("voice.noModels")}
                 </div>
               )}

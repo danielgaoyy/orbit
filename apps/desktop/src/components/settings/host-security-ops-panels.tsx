@@ -144,7 +144,7 @@ export function HostSandboxAndAuditPanel({
     try {
       const lines: string[] = [];
       let afterSeq = 0;
-      for (let page = 0; page < 20; page += 1) {
+      while (true) {
         const chunk = await orbitIpc.exportAuditChain(hostId, afterSeq);
         if (chunk.jsonl.trim()) lines.push(chunk.jsonl.trimEnd());
         if (chunk.next_after_seq === null || chunk.next_after_seq <= afterSeq) break;
@@ -169,12 +169,13 @@ export function HostSandboxAndAuditPanel({
         <SettingGroupLabel>{t("securityOps.sandboxGroup")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
+            settingId="securityOps.sandboxModeTitle"
             title={t("securityOps.sandboxModeTitle")}
             description={t("securityOps.sandboxModeDesc")}
           >
             <SettingSelect<SandboxMode>
               value={effectivePolicy.mode}
-              disabled={!isOnline || savingSandbox}
+              disabled={!isOnline || !sandboxLoaded || savingSandbox}
               onChange={(mode) => void commitSandbox({ ...effectivePolicy, mode })}
               options={[
                 { value: "off", label: t("securityOps.sandboxOff") },
@@ -186,12 +187,13 @@ export function HostSandboxAndAuditPanel({
 
           {effectivePolicy.mode !== "off" && (
             <SettingRow
+              settingId="securityOps.sandboxNetworkTitle"
               title={t("securityOps.sandboxNetworkTitle")}
               description={t("securityOps.sandboxNetworkDesc")}
             >
               <ToggleSwitch
                 checked={effectivePolicy.allow_network}
-                disabled={!isOnline || savingSandbox}
+                disabled={!isOnline || !sandboxLoaded || savingSandbox}
                 ariaLabel={t("securityOps.sandboxNetworkTitle")}
                 onChange={(allow_network) =>
                   void commitSandbox({ ...effectivePolicy, allow_network })
@@ -201,7 +203,7 @@ export function HostSandboxAndAuditPanel({
           )}
 
           {sandboxLoaded && effectivePolicy.mode !== "off" && (
-            <div className="text-ink-muted flex items-center gap-2 px-4 py-2.5 text-[11.5px]">
+            <div className="text-ink-muted flex items-center gap-2 px-4 py-2.5 text-[11px]">
               <Lock className="size-3.5 shrink-0 opacity-75" />
               <span>{t("securityOps.sandboxCredentialsProtected")}</span>
             </div>
@@ -213,7 +215,7 @@ export function HostSandboxAndAuditPanel({
       <div className="flex flex-col gap-2">
         <SettingGroupLabel>{t("securityOps.auditChainGroup")}</SettingGroupLabel>
         <SettingCard>
-          <div className="flex flex-col gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
+          <div data-setting-id="securityOps.auditChainTitle" className="flex flex-col gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
             <div className="min-w-0 space-y-1.5">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="text-ink-primary text-[13px] font-medium">
@@ -245,7 +247,7 @@ export function HostSandboxAndAuditPanel({
               </div>
 
               {auditStatus && (
-                <div className="text-ink-secondary flex flex-wrap items-center gap-3 font-mono text-[11.5px] tabular-nums">
+                <div className="text-ink-secondary flex flex-wrap items-center gap-3 font-mono text-[11px] tabular-nums">
                   <span>
                     {t("securityOps.auditEntriesCount", { count: auditStatus.verified_entries })}
                   </span>
@@ -401,6 +403,7 @@ export function HostDiagnosticsAndMigrationPanel({
         <SettingGroupLabel>{t("securityOps.diagGroup")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
+            settingId="securityOps.diagTitle"
             title={t("securityOps.diagTitle")}
             description={t("securityOps.diagDesc")}
           >
@@ -440,10 +443,11 @@ export function HostDiagnosticsAndMigrationPanel({
       </div>
 
       {/* Import from IDE / CLI */}
-      <div className="flex flex-col gap-2">
+      <div data-setting-id="securityOps.migrationGroup" className="flex flex-col gap-2">
         <SettingGroupLabel>{t("securityOps.migrationGroup")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
+            settingId="securityOps.migrationSourceTitle"
             title={t("securityOps.migrationSourceTitle")}
             description={t("securityOps.migrationSourceDesc")}
           >
@@ -467,6 +471,7 @@ export function HostDiagnosticsAndMigrationPanel({
           </SettingRow>
 
           <SettingRow
+            settingId="securityOps.migrationConflictTitle"
             title={t("securityOps.migrationConflictTitle")}
             description={t("securityOps.migrationConflictDesc")}
           >
@@ -475,6 +480,7 @@ export function HostDiagnosticsAndMigrationPanel({
               disabled={!isOnline || inspecting || executing}
               onChange={(val) => {
                 setConflict(val);
+                setPreviewItems(null);
                 setMigrationRan(false);
               }}
               options={[
@@ -487,6 +493,7 @@ export function HostDiagnosticsAndMigrationPanel({
 
           {selectedHostId === hostId && selectedCwd && selectedCwd !== "~" && (
             <SettingRow
+              settingId="securityOps.migrationScopeTitle"
               title={t("securityOps.migrationScopeTitle")}
               description={selectedCwd}
             >
@@ -494,7 +501,11 @@ export function HostDiagnosticsAndMigrationPanel({
                 checked={includeWorkspace}
                 disabled={!isOnline || inspecting || executing}
                 ariaLabel={t("securityOps.migrationScopeTitle")}
-                onChange={setIncludeWorkspace}
+                onChange={(include) => {
+                  setIncludeWorkspace(include);
+                  setPreviewItems(null);
+                  setMigrationRan(false);
+                }}
               />
             </SettingRow>
           )}
@@ -522,6 +533,7 @@ export function HostDiagnosticsAndMigrationPanel({
                   !isOnline ||
                   inspecting ||
                   executing ||
+                  migrationRan ||
                   previewItems === null ||
                   previewItems.length === 0
                 }
@@ -534,7 +546,7 @@ export function HostDiagnosticsAndMigrationPanel({
 
             {previewItems !== null && (
               previewItems.length === 0 ? (
-                <div className="text-ink-muted text-[12px]">
+                <div className="text-ink-muted text-[13px]">
                   {t("securityOps.migrationEmpty")}
                 </div>
               ) : (
@@ -550,20 +562,20 @@ export function HostDiagnosticsAndMigrationPanel({
                     {previewItems.map((item, idx) => (
                       <div
                         key={`${item.source}:${item.kind}:${item.name}:${idx}`}
-                        className="flex items-center justify-between gap-2 px-3 py-2 text-[12px]"
+                        className="flex items-center justify-between gap-2 px-3 py-2 text-[13px]"
                       >
                         <div className="flex min-w-0 items-center gap-2">
-                          <Badge variant="outline" className="shrink-0 font-mono text-[10px]">
+                          <Badge variant="outline" className="shrink-0 font-mono text-[11px]">
                             {item.source}
                           </Badge>
-                          <Badge variant="secondary" className="shrink-0 text-[10px]">
+                          <Badge variant="secondary" className="shrink-0 text-[11px]">
                             {item.kind}
                           </Badge>
-                          <span className="text-ink-primary truncate font-mono text-[11.5px]">
+                          <span className="text-ink-primary truncate font-mono text-[11px]">
                             {item.name}
                           </span>
                         </div>
-                        <Badge variant="outline" className="shrink-0 font-mono text-[10px]">
+                        <Badge variant="outline" className="shrink-0 font-mono text-[11px]">
                           {item.decision}
                         </Badge>
                       </div>

@@ -1,124 +1,120 @@
-import type { MessageKey } from "../../lib/i18n/locales/en.ts";
+import { en, type MessageKey } from "../../lib/i18n/locales/en.ts";
+import { ja } from "../../lib/i18n/locales/ja.ts";
+import { zhCN } from "../../lib/i18n/locales/zh-CN.ts";
+import { SETTING_ENTRIES } from "./settings-search-catalog.ts";
 
-export type HostSettingsTab =
-  | "agents"
-  | "router"
-  | "guardian"
-  | "im_channels"
-  | "skills"
-  | "plugins"
-  | "voice"
-  | "acp"
-  | "mcp"
-  | "rules"
-  | "memory"
-  | "hooks"
-  | "lsp"
-  | "usage"
-  | "connection";
+export const SETTINGS_NAV_GROUPS = [
+  { id: "preferences", labelKey: "settings.nav4Preferences" },
+  { id: "fleet_sync", labelKey: "settings.nav4FleetSync" },
+  { id: "agents_safety", labelKey: "settings.nav4AgentsSafety" },
+  { id: "context_extensions", labelKey: "settings.nav4ContextExtensions" },
+] as const satisfies readonly { id: string; labelKey: MessageKey }[];
+export type SettingsNavGroupId = (typeof SETTINGS_NAV_GROUPS)[number]["id"];
 
-export type SettingsSection =
-  | "general"
-  | "instructions"
-  | "cloud_sync"
-  | "personal_router"
-  | "appearance"
-  | "shortcuts"
-  | "notifications"
-  | "archived"
-  | "add_host"
-  | `host:${string}:${HostSettingsTab}`;
+export const SETTINGS_CORE_SECTIONS = [
+  { group: "preferences", id: "general", labelKey: "settings.navGeneral" },
+  { group: "preferences", id: "appearance", labelKey: "settings.nav4Appearance" },
+  { group: "preferences", id: "shortcuts", labelKey: "settings.subTabShortcuts" },
+  { group: "preferences", id: "notifications", labelKey: "settings.subTabNotifications" },
+  { group: "preferences", id: "voice", labelKey: "settings.subTabVoice" },
+  { group: "fleet_sync", id: "cloud_sync", labelKey: "settings.subTabCloudSync" },
+  { group: "fleet_sync", id: "hosts", labelKey: "settings.nav4Hosts" },
+  { group: "agents_safety", id: "agents", labelKey: "settings.navAgents" },
+  { group: "agents_safety", id: "personal_router", labelKey: "settings.navPersonalRouter" },
+  { group: "agents_safety", id: "safety", labelKey: "settings.nav4Safety" },
+  { group: "agents_safety", id: "usage", labelKey: "settings.navUsage" },
+  { group: "context_extensions", id: "instructions_memory", labelKey: "settings.nav4Instructions" },
+  { group: "context_extensions", id: "mcp_tools", labelKey: "settings.nav4Mcp" },
+  { group: "context_extensions", id: "skills_plugins", labelKey: "settings.nav4Skills" },
+  { group: "context_extensions", id: "im_channels", labelKey: "settings.subTabImChannels" },
+  { group: "context_extensions", id: "data_diagnostics", labelKey: "settings.nav4Data" },
+] as const satisfies readonly { group: SettingsNavGroupId; id: string; labelKey: MessageKey }[];
+export type SettingsCoreSectionId = (typeof SETTINGS_CORE_SECTIONS)[number]["id"];
 
-export type SettingsNavGroupId = "app" | "host" | "workspace";
+// Stable leaf names are also used by command-palette actions and persisted host links.
+const HOST_ROUTES = {
+  agents: "agents",
+  acp: "agents",
+  router: "personal_router",
+  safety: "safety",
+  guardian: "safety",
+  im_channels: "im_channels",
+  skills: "skills_plugins",
+  plugins: "skills_plugins",
+  voice: "voice",
+  mcp: "mcp_tools",
+  hooks: "mcp_tools",
+  lsp: "mcp_tools",
+  rules: "instructions_memory",
+  memory: "instructions_memory",
+  instructions: "instructions_memory",
+  usage: "usage",
+  connection: "hosts",
+  data_diagnostics: "data_diagnostics",
+  archived: "data_diagnostics",
+} as const satisfies Record<string, SettingsCoreSectionId>;
+export type HostSettingsTab = keyof typeof HOST_ROUTES;
+export type SettingsSubTabId = HostSettingsTab | "add_host";
 
-export interface SettingsNavGroupSpec {
-  id: SettingsNavGroupId;
-  labelKey: MessageKey;
-}
+export const LEGACY_SETTING_ANCHORS: Partial<Record<SettingsSubTabId, MessageKey>> = {
+  acp: "settings.subTabAcpRegistry",
+  guardian: "guardian.groupPolicy",
+  hooks: "hooks.title",
+  lsp: "settings.subTabLsp",
+  plugins: "plugins.title",
+  archived: "dataOps.archive",
+};
+export type SettingsPage = SettingsCoreSectionId | SettingsSubTabId;
+export type SettingsSection = SettingsPage | `host:${string}:${HostSettingsTab}`;
 
-export const SETTINGS_NAV_GROUPS: readonly SettingsNavGroupSpec[] = [
-  { id: "app", labelKey: "settings.navGroupApp" },
-  { id: "host", labelKey: "settings.navGroupHost" },
-  { id: "workspace", labelKey: "settings.navGroupWorkspace" },
-];
-
-export type SettingsCoreSectionId =
-  | "general"
-  | "appearance"
-  | "notifications_sync"
-  | "personal_router"
-  | "hosts"
-  | "agents"
-  | "usage"
-  | "instructions_rules"
-  | "capabilities";
-
-export type SettingsSubTabId =
-  | "general"
-  | "shortcuts"
-  | "connection"
-  | "add_host"
-  | "im_channels"
-  | "agents"
-  | "acp"
-  | "guardian"
-  | "usage"
-  | "instructions"
-  | "rules"
-  | "memory"
-  | "skills"
-  | "plugins"
-  | "voice"
-  | "mcp"
-  | "hooks"
-  | "lsp"
-  | "notifications"
-  | "cloud_sync"
-  | "archived";
-
-export type SettingsLegacyAlias =
-  | "hosts"
-  | "providers"
-  | "skills"
-  | "plugins"
-  | "voice"
-  | "memory"
-  | "models_agents"
-  | "context"
-  | "sync_data"
-  | "channels"
-  | "agents"
-  | "extensions"
-  | "instructions_rules"
-  | "capabilities"
-  | "notifications_sync"
-  | "connection"
-  | "router"
-  | "acp"
-  | "guardian"
-  | "usage"
-  | "rules"
-  | "mcp"
-  | "hooks"
-  | "lsp"
-  | "im_channels";
-
+// A page can contain multiple independent resources. Keep their route even when no host
+// is connected so an empty state can still offer the appropriate next action.
+const ALIASES = {
+  providers: "agents",
+  models_agents: "agents",
+  router: "personal_router",
+  channels: "im_channels",
+  extensions: "instructions",
+  context: "instructions",
+  instructions_rules: "instructions",
+  instructions_memory: "instructions",
+  capabilities: "skills",
+  skills_plugins: "skills",
+  mcp_tools: "mcp",
+  notifications_sync: "notifications",
+  sync_data: "cloud_sync",
+} as const satisfies Record<string, SettingsPage>;
+export type SettingsLegacyAlias = keyof typeof ALIASES;
 export type SettingsSectionTarget = SettingsSection | SettingsLegacyAlias;
 
-export interface SettingsSubTabSpec {
-  id: SettingsSubTabId;
-  labelKey: MessageKey;
-  requiresHost?: boolean;
-  keywords: readonly string[];
+function isHostTab(value: string): value is HostSettingsTab {
+  return Object.hasOwn(HOST_ROUTES, value);
 }
 
-export interface SettingsCoreSectionSpec {
-  id: SettingsCoreSectionId;
-  group: SettingsNavGroupId;
-  labelKey: MessageKey;
-  requiresHost?: boolean;
-  keywords: readonly string[];
-  subTabs: readonly SettingsSubTabSpec[];
+export function parseHostSettingsSection(section: string): { hostId: string; tab: HostSettingsTab } | null {
+  if (!section.startsWith("host:")) return null;
+  const separator = section.lastIndexOf(":");
+  // Only the final colon delimits the tab: host IDs may include ports and IPv6 literals.
+  if (separator <= 5) return null;
+  const tab = section.slice(separator + 1);
+  return isHostTab(tab) ? { hostId: section.slice(5, separator), tab } : null;
+}
+
+export function resolveSettingsSectionTarget(
+  target: string | undefined,
+  defaultHostId: string | null,
+  fallbackSection: SettingsSection = "general",
+): SettingsSection {
+  if (!target) return fallbackSection;
+  const explicit = parseHostSettingsSection(target);
+  if (explicit) {
+    if (explicit.tab === "router") return "personal_router";
+    return `host:${explicit.hostId}:${explicit.tab}`;
+  }
+  const page = Object.hasOwn(ALIASES, target) ? ALIASES[target as SettingsLegacyAlias] : target;
+  if (isHostTab(page)) return defaultHostId ? `host:${defaultHostId}:${page}` : page;
+  if (page === "add_host") return page;
+  return SETTINGS_CORE_SECTIONS.find(({ id }) => id === page)?.id ?? fallbackSection;
 }
 
 export interface ResolvedSettingsLocation {
@@ -128,1121 +124,92 @@ export interface ResolvedSettingsLocation {
   section: SettingsSection;
 }
 
-export interface SettingsSearchResult {
-  id: string;
+export function resolveActiveSettingsLocation(section: SettingsSection): ResolvedSettingsLocation {
+  const host = parseHostSettingsSection(section);
+  const page = host?.tab ?? section;
+  if (page === "add_host") return { section, coreSection: "hosts", subTab: page, hostId: null };
+  if (isHostTab(page)) {
+    return { section, coreSection: HOST_ROUTES[page], subTab: page, hostId: host?.hostId ?? null };
+  }
+  const coreSection = SETTINGS_CORE_SECTIONS.find(({ id }) => id === page)?.id ?? "general";
+  const subTab = Object.hasOwn(ALIASES, coreSection) ? ALIASES[coreSection as SettingsLegacyAlias] : null;
+  return { section, coreSection, subTab: subTab && isHostTab(subTab) ? subTab : null, hostId: null };
+}
+
+interface SearchEntry {
   coreSection: SettingsCoreSectionId;
-  subTab: SettingsSubTabId | null;
   labelKey: MessageKey;
+  target: SettingsPage;
+  settingId?: MessageKey;
+  keywords?: string;
+}
+
+export interface SettingsSearchResult extends SearchEntry {
+  id: string;
   parentLabelKey: MessageKey | null;
-  requiresHost: boolean;
   score: number;
 }
 
-const VALID_HOST_TABS = new Set<string>([
-  "agents",
-  "router",
-  "guardian",
-  "im_channels",
-  "skills",
-  "plugins",
-  "voice",
-  "acp",
-  "mcp",
-  "rules",
-  "memory",
-  "hooks",
-  "lsp",
-  "usage",
-  "connection",
+const hostRequiredTargets = new Set<SettingsPage>([
+  "agents", "acp", "guardian", "connection", "usage", "voice", "rules", "memory", "im_channels",
+  "mcp_tools", "mcp", "hooks", "lsp", "skills_plugins", "skills", "plugins",
 ]);
-
-const DIRECT_NON_HOST_SECTIONS = new Set<string>([
-  "general",
-  "instructions",
-  "cloud_sync",
-  "personal_router",
-  "appearance",
-  "shortcuts",
-  "notifications",
-  "archived",
-  "add_host",
-]);
-
-export const SETTINGS_CORE_SECTIONS: readonly SettingsCoreSectionSpec[] = [
-  // ── APP ────────────────────────────────────────────────────────────────────
-  {
-    id: "general",
-    group: "app",
-    labelKey: "settings.navGeneral",
-    keywords: [
-      "general",
-      "preferences",
-      "workspace",
-      "enter",
-      "editor",
-      "worktree",
-      "branch",
-      "update",
-      "version",
-      "fleet",
-      "setup",
-      "guide",
-      "onboarding",
-      "shortcuts",
-      "keybindings",
-      "hotkeys",
-      "通用",
-      "常规",
-      "更新",
-      "向导",
-      "快捷键",
-      "一般",
-      "ガイド",
-      "ショートカット",
-    ],
-    subTabs: [
-      {
-        id: "general",
-        labelKey: "settings.subTabGeneral",
-        keywords: [
-          "general",
-          "preferences",
-          "composer",
-          "enter",
-          "permissions",
-          "editor",
-          "worktree",
-          "git",
-          "branch",
-          "update",
-          "version",
-          "fleet",
-          "setup",
-          "guide",
-          "onboarding",
-          "通用",
-          "权限",
-          "编辑器",
-          "分支",
-          "更新",
-          "版本",
-          "向导",
-          "一般",
-          "アップデート",
-          "ガイド",
-        ],
-      },
-      {
-        id: "shortcuts",
-        labelKey: "settings.subTabShortcuts",
-        keywords: [
-          "shortcuts",
-          "keyboard",
-          "keybindings",
-          "hotkeys",
-          "cmd",
-          "ctrl",
-          "快捷键",
-          "键盘",
-          "ショートカット",
-          "キーボード",
-        ],
-      },
-    ],
-  },
-  {
-    id: "appearance",
-    group: "app",
-    labelKey: "settings.navAppearance",
-    keywords: [
-      "appearance",
-      "theme",
-      "dark",
-      "light",
-      "system",
-      "language",
-      "locale",
-      "i18n",
-      "english",
-      "chinese",
-      "japanese",
-      "font",
-      "typography",
-      "density",
-      "diff",
-      "split",
-      "unified",
-      "terminal",
-      "palette",
-      "contrast",
-      "cursor",
-      "scrollback",
-      "外观",
-      "主题",
-      "深色",
-      "浅色",
-      "语言",
-      "字号",
-      "终端",
-      "配色",
-      "外観",
-      "テーマ",
-      "言語",
-      "ターミナル",
-    ],
-    subTabs: [],
-  },
-  {
-    id: "notifications_sync",
-    group: "app",
-    labelKey: "settings.navNotificationsSync",
-    keywords: [
-      "notifications",
-      "push",
-      "apns",
-      "fcm",
-      "harmony",
-      "quiet hours",
-      "sound",
-      "alert",
-      "cloud",
-      "sync",
-      "github",
-      "gist",
-      "backup",
-      "archived",
-      "archive",
-      "history",
-      "data",
-      "通知",
-      "推送",
-      "提示音",
-      "云同步",
-      "同步",
-      "归档",
-      "アーカイブ",
-      "同期",
-    ],
-    subTabs: [
-      {
-        id: "notifications",
-        labelKey: "settings.subTabNotifications",
-        keywords: [
-          "notifications",
-          "push",
-          "desktop",
-          "mobile",
-          "apns",
-          "fcm",
-          "harmony",
-          "quiet hours",
-          "sound",
-          "chime",
-          "alert",
-          "通知",
-          "推送",
-          "免打扰",
-          "提示音",
-          "プッシュ",
-          "サウンド",
-        ],
-      },
-      {
-        id: "cloud_sync",
-        labelKey: "settings.subTabCloudSync",
-        keywords: [
-          "cloud",
-          "sync",
-          "github",
-          "gist",
-          "oauth",
-          "pat",
-          "e2ee",
-          "backup",
-          "passphrase",
-          "云同步",
-          "同步",
-          "备份",
-          "クラウド同期",
-          "同期",
-        ],
-      },
-      {
-        id: "archived",
-        labelKey: "settings.subTabArchived",
-        keywords: [
-          "archived",
-          "archive",
-          "threads",
-          "conversations",
-          "restore",
-          "delete",
-          "history",
-          "已归档",
-          "归档",
-          "恢复",
-          "历史",
-          "アーカイブ",
-          "復元",
-        ],
-      },
-    ],
-  },
-  {
-    id: "personal_router",
-    group: "app",
-    labelKey: "settings.navPersonalRouter",
-    keywords: [
-      "personal",
-      "agent",
-      "router",
-      "personal router",
-      "personal agent",
-      "hermes",
-      "orchestrator",
-      "chief of staff",
-      "分工师",
-      "总控台",
-      "个人助手",
-      "个人代理",
-      "ルーター",
-      "パーソナル",
-    ],
-    subTabs: [],
-  },
-
-  // ── HOST ───────────────────────────────────────────────────────────────────
-  {
-    id: "hosts",
-    group: "host",
-    labelKey: "settings.navHosts",
-    keywords: [
-      "hosts",
-      "pairing",
-      "connection",
-      "remote",
-      "ssh",
-      "relay",
-      "daemon",
-      "qr",
-      "mobile",
-      "add host",
-      "im",
-      "channels",
-      "lark",
-      "feishu",
-      "slack",
-      "telegram",
-      "discord",
-      "bot",
-      "主机",
-      "配对",
-      "连接",
-      "远程",
-      "二维码",
-      "中继",
-      "频道",
-      "飞书",
-      "ホスト",
-      "ペアリング",
-      "接続",
-      "チャンネル",
-    ],
-    subTabs: [
-      {
-        id: "connection",
-        labelKey: "settings.subTabConnectionPairing",
-        requiresHost: true,
-        keywords: [
-          "connection",
-          "pairing",
-          "host",
-          "hosts",
-          "status",
-          "qr",
-          "mobile",
-          "uri",
-          "relay",
-          "e2ee",
-          "noise",
-          "daemon",
-          "service",
-          "restart",
-          "连接",
-          "配对",
-          "主机",
-          "二维码",
-          "中继",
-          "服务",
-          "接続",
-          "ペアリング",
-          "リレー",
-        ],
-      },
-      {
-        id: "add_host",
-        labelKey: "settings.subTabConnectRemoteHost",
-        keywords: [
-          "add host",
-          "connect remote host",
-          "remote",
-          "ssh",
-          "pair",
-          "server",
-          "workstation",
-          "uri",
-          "添加主机",
-          "连接远程主机",
-          "远程",
-          "服务器",
-          "リモートホスト",
-          "ホストを追加",
-        ],
-      },
-      {
-        id: "im_channels",
-        labelKey: "settings.subTabImChannels",
-        requiresHost: true,
-        keywords: [
-          "im",
-          "channels",
-          "chat",
-          "lark",
-          "feishu",
-          "slack",
-          "telegram",
-          "discord",
-          "bot",
-          "webhook",
-          "approval card",
-          "频道",
-          "飞书",
-          "机器人",
-          "チャンネル",
-          "ボット",
-        ],
-      },
-    ],
-  },
-  {
-    id: "agents",
-    group: "host",
-    labelKey: "settings.navAgents",
-    requiresHost: true,
-    keywords: [
-      "agents",
-      "models",
-      "providers",
-      "runtime",
-      "claude",
-      "codex",
-      "antigravity",
-      "gemini",
-      "cursor",
-      "copilot",
-      "acp",
-      "registry",
-      "profiles",
-      "fast",
-      "keep awake",
-      "guardian",
-      "auto",
-      "approval",
-      "safety",
-      "risk",
-      "policy",
-      "代理",
-      "模型",
-      "提供商",
-      "审批",
-      "风控",
-      "エージェント",
-      "モデル",
-      "プロバイダ",
-    ],
-    subTabs: [
-      {
-        id: "agents",
-        labelKey: "settings.subTabProvidersRuntime",
-        requiresHost: true,
-        keywords: [
-          "providers",
-          "runtime",
-          "models",
-          "agents",
-          "claude",
-          "codex",
-          "antigravity",
-          "gemini",
-          "profiles",
-          "orchestrator",
-          "keep awake",
-          "idle",
-          "fast",
-          "提供商",
-          "运行时",
-          "模型",
-          "代理",
-          "预设",
-          "プロバイダ",
-          "ランタイム",
-          "モデル",
-        ],
-      },
-      {
-        id: "acp",
-        labelKey: "settings.subTabAcpRegistry",
-        requiresHost: true,
-        keywords: [
-          "acp",
-          "registry",
-          "agent client protocol",
-          "custom agent",
-          "external agent",
-          "注册表",
-          "レジストリ",
-        ],
-      },
-      {
-        id: "guardian",
-        labelKey: "settings.subTabGuardian",
-        requiresHost: true,
-        keywords: [
-          "guardian",
-          "auto",
-          "approval",
-          "permission",
-          "permissions",
-          "allowlist",
-          "denylist",
-          "always allow",
-          "safety",
-          "risk",
-          "policy",
-          "security",
-          "sandbox",
-          "audit",
-          "audit chain",
-          "blocked",
-          "trusted",
-          "沙箱",
-          "审计",
-          "自动审批",
-          "风险",
-          "安全",
-          "策略",
-          "自動承認",
-          "リスク",
-          "セキュリティ",
-        ],
-      },
-    ],
-  },
-  {
-    id: "usage",
-    group: "host",
-    labelKey: "settings.navUsage",
-    requiresHost: true,
-    keywords: [
-      "usage",
-      "tokens",
-      "cost",
-      "spend",
-      "quotas",
-      "insights",
-      "analytics",
-      "forecast",
-      "cache",
-      "billing",
-      "budget",
-      "burn rate",
-      "用量",
-      "配额",
-      "统计",
-      "费用",
-      "使用量",
-      "トークン",
-      "クォータ",
-    ],
-    subTabs: [],
-  },
-
-  // ── WORKSPACE ──────────────────────────────────────────────────────────────
-  {
-    id: "instructions_rules",
-    group: "workspace",
-    labelKey: "settings.navInstructionsRules",
-    keywords: [
-      "workspace",
-      "context",
-      "instructions",
-      "claude.md",
-      "agents.md",
-      "rules",
-      "glob",
-      "path",
-      "memory",
-      "prompt",
-      "工作区",
-      "上下文",
-      "项目指令",
-      "指令",
-      "规则",
-      "路径规则",
-      "ワークスペース",
-      "指示",
-      "ルール",
-    ],
-    subTabs: [
-      {
-        id: "instructions",
-        labelKey: "settings.subTabInstructions",
-        keywords: [
-          "instructions",
-          "claude.md",
-          "agents.md",
-          "imports",
-          "memory",
-          "context",
-          "prompt",
-          "项目指令",
-          "指令",
-          "上下文",
-          "指示",
-          "コンテキスト",
-        ],
-      },
-      {
-        id: "rules",
-        labelKey: "settings.subTabRules",
-        requiresHost: true,
-        keywords: [
-          "rules",
-          "glob",
-          "path",
-          "scoped",
-          "context",
-          "规则",
-          "路径规则",
-          "ルール",
-        ],
-      },
-      {
-        id: "memory",
-        labelKey: "settings.subTabMemory",
-        requiresHost: true,
-        keywords: [
-          "memory",
-          "project memory",
-          "recall",
-          "knowledge",
-          "revalidation",
-          "记忆",
-          "项目记忆",
-          "メモリ",
-          "プロジェクトメモリ",
-        ],
-      },
-    ],
-  },
-  {
-    id: "capabilities",
-    group: "workspace",
-    labelKey: "settings.navCapabilities",
-    requiresHost: true,
-    keywords: [
-      "capabilities",
-      "extensions",
-      "skills",
-      "skill.md",
-      "plugins",
-      "wasm",
-      "voice",
-      "speech",
-      "whisper",
-      "tts",
-      "stt",
-      "mcp",
-      "servers",
-      "hooks",
-      "lifecycle",
-      "lsp",
-      "language servers",
-      "扩展",
-      "能力",
-      "技能",
-      "插件",
-      "语音",
-      "钩子",
-      "语言服务器",
-      "拡張",
-      "スキル",
-      "プラグイン",
-      "音声",
-      "フック",
-      "言語サーバー",
-    ],
-    subTabs: [
-      {
-        id: "skills",
-        labelKey: "settings.subTabSkills",
-        requiresHost: true,
-        keywords: [
-          "skills",
-          "skill.md",
-          "capabilities",
-          "技能",
-          "スキル",
-        ],
-      },
-      {
-        id: "plugins",
-        labelKey: "settings.subTabPlugins",
-        requiresHost: true,
-        keywords: [
-          "plugins",
-          "wasm",
-          "extensions",
-          "sandbox",
-          "插件",
-          "扩展",
-          "プラグイン",
-        ],
-      },
-      {
-        id: "voice",
-        labelKey: "settings.subTabVoice",
-        requiresHost: true,
-        keywords: [
-          "voice",
-          "speech",
-          "dictation",
-          "whisper",
-          "kokoro",
-          "tts",
-          "stt",
-          "microphone",
-          "语音",
-          "听写",
-          "朗读",
-          "音声",
-          "マイク",
-        ],
-      },
-      {
-        id: "mcp",
-        labelKey: "settings.subTabMcp",
-        requiresHost: true,
-        keywords: [
-          "mcp",
-          "mcp servers",
-          "model context protocol",
-          "tools",
-          "servers",
-          "extensions",
-          "服务",
-          "MCP 服务",
-          "MCP サーバー",
-        ],
-      },
-      {
-        id: "hooks",
-        labelKey: "settings.subTabHooks",
-        requiresHost: true,
-        keywords: [
-          "hooks",
-          "lifecycle",
-          "pretooluse",
-          "posttooluse",
-          "automation",
-          "scripts",
-          "钩子",
-          "生命周期钩子",
-          "フック",
-        ],
-      },
-      {
-        id: "lsp",
-        labelKey: "settings.subTabLsp",
-        requiresHost: true,
-        keywords: [
-          "lsp",
-          "language servers",
-          "diagnostics",
-          "symbols",
-          "definition",
-          "rust-analyzer",
-          "typescript",
-          "语言服务器",
-          "診断",
-          "言語サーバー",
-        ],
-      },
-    ],
-  },
+export const SETTINGS_SEARCH_CATALOG: readonly SearchEntry[] = [
+  ...SETTINGS_CORE_SECTIONS.map(({ id, labelKey }) => ({ coreSection: id, target: id, labelKey })),
+  ...SETTING_ENTRIES.map(([target, labelKey, keywords]) => ({
+    coreSection: resolveActiveSettingsLocation(target).coreSection,
+    target,
+    labelKey,
+    settingId: labelKey,
+    keywords,
+  })),
 ];
 
-export function parseHostSettingsSection(
-  section: string,
-): { hostId: string; tab: HostSettingsTab } | null {
-  if (!section.startsWith("host:")) return null;
-  const lastColon = section.lastIndexOf(":");
-  if (lastColon <= 5) return null;
-  const hostId = section.slice(5, lastColon);
-  if (!hostId) return null;
-  const tab = section.slice(lastColon + 1);
-  if (!VALID_HOST_TABS.has(tab)) return null;
-  return { hostId, tab: tab as HostSettingsTab };
+const sectionLabels = new Map<SettingsCoreSectionId, MessageKey>(SETTINGS_CORE_SECTIONS.map(({ id, labelKey }) => [id, labelKey]));
+
+function matchScore(phrase: string, currentLabel: string, labels: string[], keywords: string) {
+  if (!phrase) return 0;
+  if (currentLabel === phrase) return 100;
+  if (labels.includes(phrase)) return 95;
+  if (labels.some((label) => label.startsWith(phrase))) return 80;
+  if (labels.some((label) => label.includes(phrase))) return 70;
+  if (keywords.includes(phrase)) return 60;
+  return 30;
 }
 
-export function resolveSettingsSectionTarget(
-  target: SettingsSectionTarget | string | undefined,
-  defaultHostId: string | null,
-  fallbackSection: SettingsSection = "general",
-): SettingsSection {
-  if (!target) return fallbackSection;
-
-  if (DIRECT_NON_HOST_SECTIONS.has(target)) {
-    return target as SettingsSection;
-  }
-
-  const parsedHost = parseHostSettingsSection(target);
-  if (parsedHost) {
-    if (parsedHost.tab === "router") {
-      return "personal_router";
-    }
-    return `host:${parsedHost.hostId}:${parsedHost.tab}`;
-  }
-
-  switch (target) {
-    case "hosts":
-    case "connection":
-      return defaultHostId ? `host:${defaultHostId}:connection` : "add_host";
-    case "channels":
-    case "im_channels":
-      return defaultHostId ? `host:${defaultHostId}:im_channels` : "add_host";
-    case "agents":
-    case "providers":
-    case "models_agents":
-      return defaultHostId ? `host:${defaultHostId}:agents` : "add_host";
-    case "router":
-      return "personal_router";
-    case "acp":
-      return defaultHostId ? `host:${defaultHostId}:acp` : "add_host";
-    case "guardian":
-      return defaultHostId ? `host:${defaultHostId}:guardian` : "add_host";
-    case "usage":
-      return defaultHostId ? `host:${defaultHostId}:usage` : "add_host";
-    case "extensions":
-    case "context":
-    case "instructions_rules":
-      return "instructions";
-    case "capabilities":
-      return defaultHostId ? `host:${defaultHostId}:skills` : "instructions";
-    case "rules":
-      return defaultHostId ? `host:${defaultHostId}:rules` : "instructions";
-    case "memory":
-      return defaultHostId ? `host:${defaultHostId}:memory` : "instructions";
-    case "skills":
-      return defaultHostId ? `host:${defaultHostId}:skills` : "instructions";
-    case "plugins":
-      return defaultHostId ? `host:${defaultHostId}:plugins` : "instructions";
-    case "voice":
-      return defaultHostId ? `host:${defaultHostId}:voice` : "instructions";
-    case "mcp":
-      return defaultHostId ? `host:${defaultHostId}:mcp` : "instructions";
-    case "hooks":
-      return defaultHostId ? `host:${defaultHostId}:hooks` : "instructions";
-    case "lsp":
-      return defaultHostId ? `host:${defaultHostId}:lsp` : "instructions";
-    case "notifications_sync":
-      return "notifications";
-    case "sync_data":
-      return "cloud_sync";
-    default:
-      return fallbackSection;
-  }
+function normalize(text: string): string {
+  return text.normalize("NFKC").toLowerCase().replace(/[_–-]+/gu, " ").trim();
 }
 
-export function resolveActiveSettingsLocation(
-  section: SettingsSection,
-): ResolvedSettingsLocation {
-  const parsedHost = parseHostSettingsSection(section);
-  if (parsedHost) {
-    switch (parsedHost.tab) {
-      case "connection":
-        return {
-          coreSection: "hosts",
-          subTab: "connection",
-          hostId: parsedHost.hostId,
-          section,
-        };
-      case "im_channels":
-        return {
-          coreSection: "hosts",
-          subTab: "im_channels",
-          hostId: parsedHost.hostId,
-          section,
-        };
-      case "agents":
-      case "acp":
-      case "guardian":
-        return {
-          coreSection: "agents",
-          subTab: parsedHost.tab,
-          hostId: parsedHost.hostId,
-          section,
-        };
-      case "router":
-        return {
-          coreSection: "personal_router",
-          subTab: null,
-          hostId: null,
-          section: "personal_router",
-        };
-      case "usage":
-        return {
-          coreSection: "usage",
-          subTab: null,
-          hostId: parsedHost.hostId,
-          section,
-        };
-      case "rules":
-      case "memory":
-        return {
-          coreSection: "instructions_rules",
-          subTab: parsedHost.tab,
-          hostId: parsedHost.hostId,
-          section,
-        };
-      case "skills":
-      case "plugins":
-      case "voice":
-      case "mcp":
-      case "hooks":
-      case "lsp":
-        return {
-          coreSection: "capabilities",
-          subTab: parsedHost.tab,
-          hostId: parsedHost.hostId,
-          section,
-        };
-    }
-  }
-
-  switch (section) {
-    case "general":
-      return { coreSection: "general", subTab: "general", hostId: null, section };
-    case "shortcuts":
-      return { coreSection: "general", subTab: "shortcuts", hostId: null, section };
-    case "appearance":
-      return { coreSection: "appearance", subTab: null, hostId: null, section };
-    case "add_host":
-      return { coreSection: "hosts", subTab: "add_host", hostId: null, section };
-    case "instructions":
-      return {
-        coreSection: "instructions_rules",
-        subTab: "instructions",
-        hostId: null,
-        section,
-      };
-    case "notifications":
-      return {
-        coreSection: "notifications_sync",
-        subTab: "notifications",
-        hostId: null,
-        section,
-      };
-    case "cloud_sync":
-      return {
-        coreSection: "notifications_sync",
-        subTab: "cloud_sync",
-        hostId: null,
-        section,
-      };
-    case "personal_router":
-      return {
-        coreSection: "personal_router",
-        subTab: null,
-        hostId: null,
-        section,
-      };
-    case "archived":
-      return {
-        coreSection: "notifications_sync",
-        subTab: "archived",
-        hostId: null,
-        section,
-      };
-    default:
-      return { coreSection: "general", subTab: "general", hostId: null, section: "general" };
-  }
-}
-
-export function buildSettingsSectionForTarget(
-  coreSection: SettingsCoreSectionId,
-  subTab: SettingsSubTabId | null,
-  hostId: string | null,
-): SettingsSection {
-  if (subTab) {
-    switch (subTab) {
-      case "general":
-        return "general";
-      case "shortcuts":
-        return "shortcuts";
-      case "add_host":
-        return "add_host";
-      case "instructions":
-        return "instructions";
-      case "notifications":
-        return "notifications";
-      case "cloud_sync":
-        return "cloud_sync";
-      case "archived":
-        return "archived";
-      case "connection":
-      case "im_channels":
-      case "agents":
-      case "acp":
-      case "guardian":
-      case "usage":
-        return hostId ? `host:${hostId}:${subTab}` : "add_host";
-      case "rules":
-      case "memory":
-      case "skills":
-      case "plugins":
-      case "voice":
-      case "mcp":
-      case "hooks":
-      case "lsp":
-        return hostId ? `host:${hostId}:${subTab}` : "instructions";
-    }
-  }
-
-  switch (coreSection) {
-    case "general":
-      return "general";
-    case "appearance":
-      return "appearance";
-    case "notifications_sync":
-      return "notifications";
-    case "personal_router":
-      return "personal_router";
-    case "hosts":
-      return hostId ? `host:${hostId}:connection` : "add_host";
-    case "agents":
-      return hostId ? `host:${hostId}:agents` : "add_host";
-    case "usage":
-      return hostId ? `host:${hostId}:usage` : "add_host";
-    case "instructions_rules":
-      return "instructions";
-    case "capabilities":
-      return hostId ? `host:${hostId}:skills` : "instructions";
-  }
-}
-
-export function getVisibleSubTabsForSection(
-  coreSection: SettingsCoreSectionId,
-  hasHost: boolean,
-): readonly SettingsSubTabSpec[] {
-  const spec = SETTINGS_CORE_SECTIONS.find((s) => s.id === coreSection);
-  if (!spec || spec.subTabs.length === 0) return [];
-  return spec.subTabs.filter((tab) => !tab.requiresHost || hasHost);
-}
-
-function scoreMatch(
-  query: string,
-  primaryLabel: string,
-  parentLabel: string | null,
-  keywords: readonly string[],
-): number {
-  const primary = primaryLabel.toLowerCase();
-  if (primary === query) return 100;
-  if (primary.startsWith(query)) return 85;
-  if (primary.includes(query)) return 70;
-
-  let bestKeyword = 0;
-  for (const kw of keywords) {
-    const lower = kw.toLowerCase();
-    if (lower === query) {
-      bestKeyword = Math.max(bestKeyword, 65);
-    } else if (lower.startsWith(query)) {
-      bestKeyword = Math.max(bestKeyword, 55);
-    } else if (lower.includes(query)) {
-      bestKeyword = Math.max(bestKeyword, 40);
-    }
-  }
-
-  let parentScore = 0;
-  if (parentLabel) {
-    const parent = parentLabel.toLowerCase();
-    if (parent === query) parentScore = 50;
-    else if (parent.startsWith(query)) parentScore = 45;
-    else if (parent.includes(query)) parentScore = 30;
-  }
-
-  return Math.max(bestKeyword, parentScore);
-}
+// Build the locale-independent index once. Only the query and the live modified set
+// change while typing.
+const index = SETTINGS_SEARCH_CATALOG.map((entry) => {
+  const labels = [en, zhCN, ja].map((dict) => normalize(dict[entry.labelKey] ?? entry.labelKey));
+  const keywords = normalize(entry.keywords ?? "");
+  const parentLabelKey = entry.settingId ? sectionLabels.get(entry.coreSection) ?? null : null;
+  const fields = [...labels, keywords, normalize(entry.target)];
+  if (parentLabelKey) fields.push(...[en, zhCN, ja].map((dict) => normalize(dict[parentLabelKey] ?? parentLabelKey)));
+  return { entry, fields, labels, keywords, parentLabelKey };
+});
 
 export function searchSettingsEntries(
   rawQuery: string,
-  options: {
-    t: (key: MessageKey) => string;
-    hasHost?: boolean;
-  },
+  options: { t: (key: MessageKey) => string; hasHost?: boolean; isDesktop?: boolean; modifiedIds?: ReadonlySet<string> },
 ): SettingsSearchResult[] {
-  const query = rawQuery.trim().toLowerCase();
-  if (!query) return [];
-
-  const hasHost = options.hasHost ?? true;
+  const tokens = normalize(rawQuery).split(/\s+/u).filter(Boolean);
+  const modifiedOnly = tokens.includes("@modified");
+  const terms = tokens.filter((token) => token !== "@modified");
+  if (!terms.length && !modifiedOnly) return [];
   const results: SettingsSearchResult[] = [];
+  const phrase = terms.join(" ");
+  for (const { entry, fields, labels, keywords, parentLabelKey } of index) {
+    if (options.isDesktop === false && (entry.settingId === "settings.appVersion" || entry.settingId === "settings.externalEditor")) continue;
+    if (modifiedOnly && (!entry.settingId || !options.modifiedIds?.has(entry.settingId))) continue;
+    if (options.hasHost === false && !modifiedOnly && hostRequiredTargets.has(entry.target) && entry.settingId !== "im.defaultProvider") continue;
 
-  for (const section of SETTINGS_CORE_SECTIONS) {
-    const sectionLabel = options.t(section.labelKey);
-
-    if (section.subTabs.length === 0) {
-      if (section.requiresHost && !hasHost) continue;
-      const score = scoreMatch(query, sectionLabel, null, section.keywords);
-      if (score > 0) {
-        results.push({
-          id: section.id,
-          coreSection: section.id,
-          subTab: null,
-          labelKey: section.labelKey,
-          parentLabelKey: null,
-          requiresHost: Boolean(section.requiresHost),
-          score,
-        });
-      }
-      continue;
-    }
-
-    for (const tab of section.subTabs) {
-      const requiresHost = Boolean(tab.requiresHost || section.requiresHost);
-      if (requiresHost && !hasHost) continue;
-
-      const tabLabel = options.t(tab.labelKey);
-      const showParent = tabLabel.toLowerCase() !== sectionLabel.toLowerCase();
-      const score = scoreMatch(
-        query,
-        tabLabel,
-        showParent ? sectionLabel : null,
-        tab.keywords,
-      );
-      if (score > 0) {
-        results.push({
-          id: `${section.id}:${tab.id}`,
-          coreSection: section.id,
-          subTab: tab.id,
-          labelKey: tab.labelKey,
-          parentLabelKey: showParent ? section.labelKey : null,
-          requiresHost,
-          score,
-        });
-      }
-    }
+    if (!terms.every((term) => fields.some((field) => field.includes(term)))) continue;
+    const score = matchScore(phrase, normalize(options.t(entry.labelKey) ?? entry.labelKey), labels, keywords);
+    results.push({ ...entry, id: entry.settingId ?? entry.coreSection, parentLabelKey, score });
   }
-
-  results.sort((a, b) => b.score - a.score);
-  return results;
+  return results.sort((a, b) => b.score - a.score);
 }

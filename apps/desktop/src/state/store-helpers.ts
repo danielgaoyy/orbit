@@ -1,3 +1,4 @@
+import { preferenceDefaults } from "./preference-defaults";
 import {
   type SettingsSection,
   type SettingsSectionTarget,
@@ -556,7 +557,7 @@ export function createDefaultInitialState(
     sessionScrollNonce: 0,
     pendingJumpTarget: null,
 
-    draftProvider: initialPrefs.draftProvider ?? "codex",
+    draftProvider: initialPrefs.draftProvider ?? preferenceDefaults.draftProvider,
     draftAcpAgentId: initialPrefs.draftAcpAgentId ?? null,
     draftModels: {
       ...Object.fromEntries(
@@ -569,9 +570,9 @@ export function createDefaultInitialState(
     draftMode:
       initialPrefs.draftMode && initialPrefs.draftMode !== "plan"
         ? initialPrefs.draftMode
-        : "accept_edits",
+        : preferenceDefaults.draftMode,
     draftProfileId: null,
-    draftUseWorktree: initialPrefs.draftUseWorktree ?? true,
+    draftUseWorktree: initialPrefs.draftUseWorktree ?? preferenceDefaults.draftUseWorktree,
     draftWorktreeBranch: "",
     draftWorktreeRepoPath: null,
     draftWorkspaceId: null,
@@ -610,7 +611,7 @@ export function createDefaultInitialState(
 
     reviewScope: "working_tree",
     diffStaged: false,
-    diffLayout: initialPrefs.diffLayout ?? "unified",
+    diffLayout: initialPrefs.diffLayout ?? preferenceDefaults.diffLayout,
     selectedDiffPath: null,
     gitReviews: {},
     lspServersByWorkspace: {},
@@ -717,31 +718,31 @@ export function createDefaultInitialState(
     locale: initialPrefs.locale ? resolveLocale(initialPrefs.locale) : getLocale(),
     theme: initialTheme,
     resolvedTheme: initialResolvedTheme,
-    enterToSend: initialPrefs.enterToSend ?? true,
-    notifyOnApproval: initialPrefs.notifyOnApproval ?? true,
-    notifyOnTurnComplete: initialPrefs.notifyOnTurnComplete ?? false,
-    notifyOnAgentError: initialPrefs.notifyOnAgentError ?? true,
-    notifyOnGoalFinished: initialPrefs.notifyOnGoalFinished ?? true,
-    notifySoundEnabled: initialPrefs.notifySoundEnabled ?? true,
-    notifyQuietHoursEnabled: initialPrefs.notifyQuietHoursEnabled ?? false,
+    enterToSend: initialPrefs.enterToSend ?? preferenceDefaults.enterToSend,
+    notifyOnApproval: initialPrefs.notifyOnApproval ?? preferenceDefaults.notifyOnApproval,
+    notifyOnTurnComplete: initialPrefs.notifyOnTurnComplete ?? preferenceDefaults.notifyOnTurnComplete,
+    notifyOnAgentError: initialPrefs.notifyOnAgentError ?? preferenceDefaults.notifyOnAgentError,
+    notifyOnGoalFinished: initialPrefs.notifyOnGoalFinished ?? preferenceDefaults.notifyOnGoalFinished,
+    notifySoundEnabled: initialPrefs.notifySoundEnabled ?? preferenceDefaults.notifySoundEnabled,
+    notifyQuietHoursEnabled: initialPrefs.notifyQuietHoursEnabled ?? preferenceDefaults.notifyQuietHoursEnabled,
     notifyQuietStartHour:
       typeof initialPrefs.notifyQuietStartHour === "number"
         ? Math.min(23, Math.max(0, Math.round(initialPrefs.notifyQuietStartHour)))
-        : 23,
+        : preferenceDefaults.notifyQuietStartHour,
     notifyQuietEndHour:
       typeof initialPrefs.notifyQuietEndHour === "number"
         ? Math.min(23, Math.max(0, Math.round(initialPrefs.notifyQuietEndHour)))
-        : 7,
-    coalesceExploration: initialPrefs.coalesceExploration ?? true,
-    worktreeBranchPrefix: initialPrefs.worktreeBranchPrefix ?? "auto",
-    preferredEditor: initialPrefs.preferredEditor ?? null,
+        : preferenceDefaults.notifyQuietEndHour,
+    coalesceExploration: initialPrefs.coalesceExploration ?? preferenceDefaults.coalesceExploration,
+    worktreeBranchPrefix: initialPrefs.worktreeBranchPrefix ?? preferenceDefaults.worktreeBranchPrefix,
+    preferredEditor: initialPrefs.preferredEditor ?? preferenceDefaults.preferredEditor,
     terminalFontSize:
       initialPrefs.terminalFontSize !== undefined
         ? Math.min(18, Math.max(10, Math.round(initialPrefs.terminalFontSize)))
-        : 13,
-    terminalCursorStyle: initialPrefs.terminalCursorStyle ?? "bar",
-    terminalScrollback: initialPrefs.terminalScrollback ?? 5000,
-    terminalThemeMode: initialPrefs.terminalThemeMode ?? "harmonized",
+        : preferenceDefaults.terminalFontSize,
+    terminalCursorStyle: initialPrefs.terminalCursorStyle ?? preferenceDefaults.terminalCursorStyle,
+    terminalScrollback: initialPrefs.terminalScrollback ?? preferenceDefaults.terminalScrollback,
+    terminalThemeMode: initialPrefs.terminalThemeMode ?? preferenceDefaults.terminalThemeMode,
     customKeybindings: sanitizeCustomKeybindings(initialPrefs.customKeybindings),
   };
 }

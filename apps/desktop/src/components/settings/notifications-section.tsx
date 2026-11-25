@@ -13,7 +13,7 @@ import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
-import { useI18n } from "@/lib/i18n";
+import { t, useI18n } from "@/lib/i18n";
 import { playSoftNotificationChime } from "@/lib/notification-sound";
 import type { PushPlatform, PushPreferences } from "@/lib/orbit-ipc";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
@@ -43,11 +43,11 @@ function formatPlatformLabel(platform: PushPlatform): string {
 }
 
 function formatTimestamp(ms: number | null | undefined): string {
-  if (!ms) return "Never";
+  if (!ms) return t("settings.pushNever");
   try {
     return new Date(ms).toLocaleString();
   } catch {
-    return "Unknown";
+    return t("settings.pushUnknown");
   }
 }
 
@@ -201,7 +201,7 @@ export function NotificationsSection() {
       gateway_auth_token: tokenTrimmed ? tokenTrimmed : null,
       keep_existing_gateway_token: !clearStoredToken && !tokenTrimmed,
     });
-    if (res) {
+    if (res && lastSyncedHostIdRef.current === activeHostId) {
       setDraftPrefs(res.preferences);
       setGatewayTokenInput("");
       setClearStoredToken(false);
@@ -226,16 +226,17 @@ export function NotificationsSection() {
 
       {/* Desktop System Permission */}
       <div className="space-y-2">
-        <SettingGroupLabel>Desktop Permission</SettingGroupLabel>
+        <SettingGroupLabel>{t("settings.notifyPermissionGroup")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
-            title="Desktop notifications"
+            settingId="settings.desktopNotificationPermission"
+            title={t("settings.desktopNotificationPermission")}
             description={
               permission === "granted"
-                ? "Clicking an alert brings Orbit to front and opens that session."
+                ? t("settings.notifyPermissionGranted")
                 : permission === "denied"
-                  ? "Enable notifications for Orbit in System Settings."
-                  : "Allow Orbit to deliver system notifications."
+                  ? t("settings.notifyPermissionDenied")
+                  : t("settings.notifyPermissionDefault")
             }
           >
             {permission === "granted" ? (
@@ -245,28 +246,29 @@ export function NotificationsSection() {
                   variant="outline"
                   size="xs"
                   onClick={() => orbitActions.sendTestDesktopNotification()}
-                  className="h-[28px] gap-1.5"
+                  className="h-[28px] gap-1.5 text-[13px]"
                 >
                   <Send className="h-[12px] w-[12px]" />
-                  <span>Test</span>
+                  <span>{t("settings.notifyTest")}</span>
                 </Button>
-                <span className="text-signal-success inline-flex items-center gap-1.5 text-[12.5px] font-medium">
+                <span className="text-signal-success inline-flex items-center gap-1.5 text-[13px] font-medium">
                   <Check className="h-[14px] w-[14px]" />
-                  Enabled
+                  {t("settings.notifyEnabled")}
                 </span>
               </div>
             ) : permission === "default" ? (
               <Button
                 type="button"
                 size="sm"
+                className="text-[13px]"
                 onClick={() => void ensurePermissionIfDefault()}
               >
-                <Bell className="h-[13.5px] w-[13.5px]" />
-                <span>Enable</span>
+                <Bell className="h-[14px] w-[14px]" />
+                <span>{t("settings.notifyEnable")}</span>
               </Button>
             ) : (
-              <span className="text-muted-foreground text-[12.5px]">
-                {permission === "denied" ? "Blocked" : "Unavailable"}
+              <span className="text-ink-muted text-[13px]">
+                {permission === "denied" ? t("settings.notifyBlocked") : t("settings.notifyUnavailable")}
               </span>
             )}
           </SettingRow>
@@ -275,13 +277,15 @@ export function NotificationsSection() {
 
       {/* Desktop Alert Categories & Sound */}
       <div className={cn("space-y-2", isBlocked && "opacity-55")}>
-        <SettingGroupLabel>Desktop Alerts</SettingGroupLabel>
+        <SettingGroupLabel>{t("settings.notifyDesktopEvents")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
-            title="Approval required"
-            description="Notify when an agent waits for permission or input."
+            settingId="settings.notifyApproval"
+            title={t("settings.notifyApproval")}
+            description={t("settings.notifyApprovalDesc")}
           >
             <ToggleSwitch
+              ariaLabel={t("settings.notifyApproval")}
               checked={notifyOnApproval}
               onChange={(v) => {
                 orbitActions.setNotificationPrefs({ notifyOnApproval: v });
@@ -291,10 +295,12 @@ export function NotificationsSection() {
           </SettingRow>
 
           <SettingRow
-            title="Turn completed"
-            description="Notify when a background agent finishes its turn."
+            settingId="settings.notifyTurnComplete"
+            title={t("settings.notifyTurnComplete")}
+            description={t("settings.notifyTurnCompleteDesc")}
           >
             <ToggleSwitch
+              ariaLabel={t("settings.notifyTurnComplete")}
               checked={notifyOnTurnComplete}
               onChange={(v) => {
                 orbitActions.setNotificationPrefs({ notifyOnTurnComplete: v });
@@ -304,10 +310,12 @@ export function NotificationsSection() {
           </SettingRow>
 
           <SettingRow
-            title="Agent error"
-            description="Notify when an agent stops with an error."
+            settingId="settings.notifyAgentError"
+            title={t("settings.notifyAgentError")}
+            description={t("settings.notifyAgentErrorDesc")}
           >
             <ToggleSwitch
+              ariaLabel={t("settings.notifyAgentError")}
               checked={notifyOnAgentError}
               onChange={(v) => {
                 orbitActions.setNotificationPrefs({ notifyOnAgentError: v });
@@ -317,10 +325,12 @@ export function NotificationsSection() {
           </SettingRow>
 
           <SettingRow
-            title="Goal finished"
-            description="Notify when an autonomous /goal run finishes."
+            settingId="settings.notifyGoalFinished"
+            title={t("settings.notifyGoalFinished")}
+            description={t("settings.notifyGoalFinishedDesc")}
           >
             <ToggleSwitch
+              ariaLabel={t("settings.notifyGoalFinished")}
               checked={notifyOnGoalFinished}
               onChange={(v) => {
                 orbitActions.setNotificationPrefs({ notifyOnGoalFinished: v });
@@ -330,6 +340,7 @@ export function NotificationsSection() {
           </SettingRow>
 
           <SettingRow
+            settingId="settings.notificationSoundTitle"
             title={t("settings.notificationSoundTitle")}
             description={t("settings.notificationSoundDesc")}
           >
@@ -337,12 +348,13 @@ export function NotificationsSection() {
               <button
                 type="button"
                 onClick={() => void playSoftNotificationChime("default")}
-                className="border-border text-foreground hover:bg-black/[0.04] dark:hover:bg-white/[0.06] inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors"
+                className="border-border-default text-ink-primary hover:bg-surface-recessed inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[13px] font-medium transition-colors"
               >
-                <Volume2 className="text-muted-foreground h-[12.5px] w-[12.5px]" />
+                <Volume2 className="text-ink-muted h-[13px] w-[13px]" />
                 <span>{t("settings.testSound")}</span>
               </button>
               <ToggleSwitch
+                ariaLabel={t("settings.notificationSoundTitle")}
                 checked={notifySoundEnabled}
                 onChange={(v) => orbitActions.setNotificationPrefs({ notifySoundEnabled: v })}
               />
@@ -350,15 +362,16 @@ export function NotificationsSection() {
           </SettingRow>
 
           <SettingRow
-            title="Quiet hours"
-            description="Silence desktop alerts during a daily schedule (local time)."
+            settingId="settings.notifyQuietHours"
+            title={t("settings.notifyQuietHours")}
+            description={t("settings.notifyQuietHoursDesc")}
           >
             <div className="flex items-center gap-2">
               {notifyQuietHoursEnabled && (
-                <div className="flex items-center gap-1.5 text-[12px]">
+                <div className="flex items-center gap-1.5 text-[13px]">
                   <SettingSelect<number>
                     size="sm"
-                    ariaLabel="Desktop quiet start hour"
+                    ariaLabel={t("settings.notifyQuietStart")}
                     value={notifyQuietStartHour}
                     options={HOUR_OPTIONS}
                     triggerClassName="min-w-[82px]"
@@ -367,10 +380,10 @@ export function NotificationsSection() {
                       orbitActions.setNotificationPrefs({ notifyQuietStartHour: hour })
                     }
                   />
-                  <span className="text-muted-foreground">to</span>
+                  <span className="text-ink-muted" aria-hidden>–</span>
                   <SettingSelect<number>
                     size="sm"
-                    ariaLabel="Desktop quiet end hour"
+                    ariaLabel={t("settings.notifyQuietEnd")}
                     value={notifyQuietEndHour}
                     options={HOUR_OPTIONS}
                     triggerClassName="min-w-[82px]"
@@ -382,6 +395,7 @@ export function NotificationsSection() {
                 </div>
               )}
               <ToggleSwitch
+                ariaLabel={t("settings.notifyQuietHours")}
                 checked={notifyQuietHoursEnabled}
                 onChange={(v) => orbitActions.setNotificationPrefs({ notifyQuietHoursEnabled: v })}
               />
@@ -393,11 +407,11 @@ export function NotificationsSection() {
       {/* Mobile Background Push & Gateway */}
       <div className="space-y-2">
         <div className="flex items-center justify-between">
-          <SettingGroupLabel>Mobile Push & Gateway</SettingGroupLabel>
+          <SettingGroupLabel>{t("settings.pushGroup")}</SettingGroupLabel>
           {hosts.length > 1 && (
             <SettingSelect<string>
               size="compact"
-              ariaLabel="Target host for mobile push"
+              ariaLabel={t("settings.pushTarget")}
               value={activeHostId}
               options={hostSelectOptions}
               triggerClassName="h-[26px] min-w-[132px] max-w-[200px]"
@@ -408,10 +422,12 @@ export function NotificationsSection() {
 
         <SettingCard>
           <SettingRow
-            title="Background push"
-            description="Deliver alerts to registered iOS, Android, and HarmonyOS devices."
+            settingId="settings.pushEnabled"
+            title={t("settings.pushEnabled")}
+            description={t("settings.pushEnabledDesc")}
           >
             <ToggleSwitch
+              ariaLabel={t("settings.pushEnabled")}
               checked={draftPrefs.enabled}
               disabled={!isPushReady}
               onChange={(v) => updateDraftPrefs((p) => ({ ...p, enabled: v }))}
@@ -419,17 +435,19 @@ export function NotificationsSection() {
           </SettingRow>
 
           <SettingRow
-            title="Include message preview"
-            description="Off by default — push relays receive metadata only."
+            settingId="settings.pushMessagePreview"
+            title={t("settings.pushMessagePreview")}
+            description={t("settings.pushMessagePreviewDesc")}
           >
             <div className="flex items-center gap-2">
               {!draftPrefs.include_message_preview && (
-                <span className="text-muted-foreground inline-flex items-center gap-1 text-[11.5px]">
+                <span className="text-ink-muted inline-flex items-center gap-1 text-[11px]">
                   <Shield className="h-[12px] w-[12px]" />
-                  Zero-knowledge
+                  {t("settings.pushMetadataOnly")}
                 </span>
               )}
               <ToggleSwitch
+                ariaLabel={t("settings.pushMessagePreview")}
                 checked={draftPrefs.include_message_preview}
                 disabled={!isPushReady}
                 onChange={(v) => updateDraftPrefs((p) => ({ ...p, include_message_preview: v }))}
@@ -438,31 +456,33 @@ export function NotificationsSection() {
           </SettingRow>
 
           <SettingRow
-            title="Event triggers"
-            description="Choose which daemon events dispatch mobile push."
+            settingId="settings.pushEvents"
+            title={t("settings.pushEvents")}
+            description={t("settings.pushEventsDesc")}
           >
             <div className="flex flex-wrap justify-end gap-1.5">
               {(
                 [
-                  ["notify_permission_required", "Approvals"],
-                  ["notify_turn_completed", "Turns"],
-                  ["notify_agent_error", "Errors"],
-                  ["notify_goal_finished", "Goals"],
-                  ["notify_timer_fired", "Timers"],
+                  ["notify_permission_required", t("settings.pushApprovals")],
+                  ["notify_turn_completed", t("settings.pushTurns")],
+                  ["notify_agent_error", t("settings.pushErrors")],
+                  ["notify_goal_finished", t("settings.pushGoals")],
+                  ["notify_timer_fired", t("settings.pushTimers")],
                 ] as const
               ).map(([field, label]) => {
                 const active = draftPrefs[field];
                 return (
                   <button
                     key={field}
+                    aria-pressed={active}
                     type="button"
                     disabled={!isPushReady}
                     onClick={() => updateDraftPrefs((p) => ({ ...p, [field]: !p[field] }))}
                     className={cn(
-                      "h-[26px] cursor-pointer rounded-md border px-2 text-[11.5px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+                      "h-[26px] cursor-pointer rounded-md border px-2 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50",
                       active
-                        ? "border-foreground/25 bg-foreground/10 text-foreground"
-                        : "border-border text-muted-foreground hover:text-foreground",
+                        ? "border-border-strong bg-surface-recessed text-ink-primary"
+                        : "border-border-default text-ink-muted hover:text-ink-primary",
                     )}
                   >
                     {label}
@@ -473,15 +493,16 @@ export function NotificationsSection() {
           </SettingRow>
 
           <SettingRow
-            title="Mobile quiet hours"
-            description="Host local time — pause mobile push on this host during quiet hours."
+            settingId="settings.pushQuietHours"
+            title={t("settings.pushQuietHours")}
+            description={t("settings.pushQuietHoursDesc")}
           >
             <div className="flex items-center gap-2">
               {draftPrefs.quiet_hours_enabled && (
-                <div className="flex items-center gap-1.5 text-[12px]">
+                <div className="flex items-center gap-1.5 text-[13px]">
                   <SettingSelect<number>
                     size="sm"
-                    ariaLabel="Mobile quiet start hour"
+                    ariaLabel={t("settings.notifyQuietStart")}
                     value={draftPrefs.quiet_start_hour}
                     options={HOUR_OPTIONS}
                     disabled={!isPushReady}
@@ -491,10 +512,10 @@ export function NotificationsSection() {
                       updateDraftPrefs((p) => ({ ...p, quiet_start_hour: hour }))
                     }
                   />
-                  <span className="text-muted-foreground">to</span>
+                  <span className="text-ink-muted" aria-hidden>–</span>
                   <SettingSelect<number>
                     size="sm"
-                    ariaLabel="Mobile quiet end hour"
+                    ariaLabel={t("settings.notifyQuietEnd")}
                     value={draftPrefs.quiet_end_hour}
                     options={HOUR_OPTIONS}
                     disabled={!isPushReady}
@@ -507,6 +528,7 @@ export function NotificationsSection() {
                 </div>
               )}
               <ToggleSwitch
+                ariaLabel={t("settings.pushQuietHours")}
                 checked={draftPrefs.quiet_hours_enabled}
                 disabled={!isPushReady}
                 onChange={(v) => updateDraftPrefs((p) => ({ ...p, quiet_hours_enabled: v }))}
@@ -515,9 +537,9 @@ export function NotificationsSection() {
           </SettingRow>
 
           <FieldGroup className="gap-3 px-4 py-3.5">
-            <Field>
+            <Field data-setting-id="settings.pushGatewayUrl">
               <FieldLabel htmlFor="push-gateway-url" className="text-ink-primary text-[13px]">
-                Push gateway URL
+                {t("settings.pushGatewayUrl")}
               </FieldLabel>
               <Input
                 id="push-gateway-url"
@@ -531,10 +553,10 @@ export function NotificationsSection() {
               />
             </Field>
 
-            <Field>
+            <Field data-setting-id="settings.pushGatewayToken">
               <div className="flex items-center justify-between">
                 <FieldLabel htmlFor="push-gateway-token" className="text-ink-primary text-[13px]">
-                  Gateway Bearer token
+                  {t("settings.pushGatewayToken")}
                 </FieldLabel>
                 {draftPrefs.has_gateway_auth_token && !clearStoredToken && isPushReady && (
                   <button
@@ -543,9 +565,9 @@ export function NotificationsSection() {
                       setIsDirty(true);
                       setClearStoredToken(true);
                     }}
-                    className="text-muted-foreground hover:text-foreground cursor-pointer text-[11.5px]"
+                    className="text-ink-muted hover:text-ink-primary cursor-pointer text-[11px]"
                   >
-                    Clear stored token
+                    {t("settings.pushClearToken")}
                   </button>
                 )}
               </div>
@@ -561,40 +583,42 @@ export function NotificationsSection() {
                 }}
                 placeholder={
                   draftPrefs.has_gateway_auth_token && !clearStoredToken
-                    ? "Stored token kept unless replaced"
-                    : "Optional Bearer token"
+                    ? t("settings.pushKeepToken")
+                    : t("settings.pushOptionalToken")
                 }
               />
             </Field>
 
             <div className="flex items-center justify-between pt-1">
-              <span className="text-muted-foreground text-[12px]">
+              <span className="text-ink-muted text-[13px]">
                 {pushEntry?.error
                   ? pushEntry.error
                   : !isHostOnline
-                    ? "Host offline — reconnect to update push settings."
+                    ? t("settings.pushHostOffline")
                     : pushEntry?.status !== "ready"
-                      ? "Loading host push settings…"
-                      : "HTTPS only with DNS-pinned SSRF protection."}
+                      ? t("settings.pushHostLoading")
+                      : t("settings.pushHttps")}
               </span>
               <div className="flex items-center gap-2">
                 <Button
                   type="button"
                   variant="outline"
                   size="sm"
+                  className="text-[13px]"
                   disabled={!isPushReady || pushEntry?.testing || devices.length === 0}
                   onClick={() => void orbitActions.testPushNotification(activeHostId, null)}
                 >
-                  <Send className="h-[12.5px] w-[12.5px]" />
-                  <span>{pushEntry?.testing ? "Sending…" : "Test Notification"}</span>
+                  <Send className="h-[13px] w-[13px]" />
+                  <span>{pushEntry?.testing ? t("settings.pushSending") : t("settings.pushTestNotification")}</span>
                 </Button>
                 <Button
                   type="button"
                   size="sm"
-                  disabled={!isPushReady || pushEntry?.saving}
+                  className="text-[13px]"
+                  disabled={!isDirty || !isPushReady || pushEntry?.saving}
                   onClick={() => void handleSaveMobilePrefs()}
                 >
-                  <span>{pushEntry?.saving ? "Saving…" : "Save"}</span>
+                  <span>{pushEntry?.saving ? t("settings.pushSaving") : t("common.save")}</span>
                 </Button>
               </div>
             </div>
@@ -603,33 +627,32 @@ export function NotificationsSection() {
       </div>
 
       {/* Registered Mobile Devices */}
-      <div className="space-y-2">
+      <div data-setting-id="settings.pushRegisteredDevices" className="space-y-2">
         <div className="flex items-center justify-between">
-          <SettingGroupLabel>Registered Mobile Devices</SettingGroupLabel>
+          <SettingGroupLabel>{t("settings.pushRegisteredDevices")}</SettingGroupLabel>
           {activeHostId && (
             <button
               type="button"
               onClick={() => void orbitActions.loadPushDevices(activeHostId)}
-              className="text-muted-foreground hover:text-foreground inline-flex cursor-pointer items-center gap-1 text-[11.5px]"
+              className="text-ink-muted hover:text-ink-primary inline-flex cursor-pointer items-center gap-1 text-[11px]"
             >
               <RefreshCw
                 className={cn(
-                  "h-[11.5px] w-[11.5px]",
+                  "h-[12px] w-[12px]",
                   pushEntry?.status === "loading" && "animate-spin",
                 )}
               />
-              <span>Refresh</span>
+              <span>{t("common.refresh")}</span>
             </button>
           )}
         </div>
 
         <SettingCard>
           {devices.length === 0 ? (
-            <div className="text-muted-foreground flex items-center gap-2.5 px-4 py-4 text-[12.5px]">
+            <div className="text-ink-muted flex items-center gap-2.5 px-4 py-4 text-[13px]">
               <Smartphone className="h-[15px] w-[15px] shrink-0 opacity-70" />
               <span>
-                No mobile devices registered on {activeHost?.display_name ?? "this host"} yet. Pair
-                Orbit on iOS, Android, or HarmonyOS to receive background push.
+                {t("settings.pushNoDevices", { host: activeHost?.display_name ?? t("settings.pushHostFallback") })}
               </span>
             </div>
           ) : (
@@ -639,25 +662,25 @@ export function NotificationsSection() {
                 title={
                   <span className="inline-flex items-center gap-2">
                     <span>{dev.device_name}</span>
-                    <span className="border-border text-muted-foreground rounded border px-1.5 py-0.5 text-[10.5px] font-medium">
+                    <span className="border-border-default text-ink-muted rounded border px-1.5 py-0.5 text-[11px] font-medium">
                       {formatPlatformLabel(dev.platform)}
                     </span>
                     {dev.sandbox && (
-                      <span className="border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400 rounded border px-1.5 py-0.5 text-[10.5px] font-medium">
-                        Sandbox
+                      <span className="border-signal-warning/30 bg-signal-warning-bg text-signal-warning rounded border px-1.5 py-0.5 text-[11px] font-medium">
+                        {t("settings.pushSandbox")}
                       </span>
                     )}
                     {!dev.enabled && (
-                      <span className="border-destructive/30 bg-destructive/10 text-destructive rounded border px-1.5 py-0.5 text-[10.5px] font-medium">
-                        Disabled
+                      <span className="border-signal-danger/30 bg-signal-danger-bg text-signal-danger rounded border px-1.5 py-0.5 text-[11px] font-medium">
+                        {t("settings.pushDisabled")}
                       </span>
                     )}
                   </span>
                 }
                 description={
                   dev.last_error
-                    ? `Token ${dev.masked_token} · Error: ${dev.last_error}`
-                    : `Token ${dev.masked_token} · Last delivered: ${formatTimestamp(dev.last_delivered_at_ms)}`
+                    ? t("settings.pushDeliveryError", { token: dev.masked_token, error: dev.last_error })
+                    : t("settings.pushLastDelivery", { token: dev.masked_token, time: formatTimestamp(dev.last_delivered_at_ms) })
                 }
               >
                 <div className="flex items-center gap-1.5">
@@ -667,28 +690,28 @@ export function NotificationsSection() {
                     onClick={() =>
                       void orbitActions.testPushNotification(activeHostId, dev.device_id)
                     }
-                    className="border-border text-foreground hover:bg-black/[0.04] dark:hover:bg-white/[0.06] inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md border px-2 text-[11.5px] font-medium disabled:opacity-50"
+                    className="border-border-default text-ink-primary hover:bg-surface-recessed inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md border px-2 text-[11px] font-medium disabled:opacity-50"
                   >
                     <Send className="h-[11px] w-[11px]" />
-                    <span>Test</span>
+                    <span>{t("settings.notifyTest")}</span>
                   </button>
                   <button
                     type="button"
-                    aria-label={`Remove ${dev.device_name}`}
+                    aria-label={t("settings.pushRemove", { device: dev.device_name })}
                     disabled={!isPushReady}
                     onClick={() => {
                       if (!activeHostId) return;
                       setPendingRemoveDevice({
                         hostId: activeHostId,
-                        hostName: activeHost?.display_name ?? "this host",
+                        hostName: activeHost?.display_name ?? t("settings.pushHostFallback"),
                         device_id: dev.device_id,
                         device_name: dev.device_name,
                         platform: dev.platform,
                       });
                     }}
-                    className="text-muted-foreground hover:text-destructive inline-flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:opacity-50"
+                    className="text-ink-muted hover:text-signal-danger inline-flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-md transition-colors disabled:opacity-50"
                   >
-                    <Trash2 className="h-[13.5px] w-[13.5px]" />
+                    <Trash2 className="h-[14px] w-[14px]" />
                   </button>
                 </div>
               </SettingRow>
@@ -704,9 +727,9 @@ export function NotificationsSection() {
           onOpenChange={(open) => {
             if (!open) setPendingRemoveDevice(null);
           }}
-          title={`Remove "${pendingRemoveDevice.device_name}"?`}
-          description={`This ${formatPlatformLabel(pendingRemoveDevice.platform)} device will stop receiving background push alerts from ${pendingRemoveDevice.hostName} until paired again.`}
-          confirmLabel="Remove device"
+          title={t("settings.pushRemoveTitle", { device: pendingRemoveDevice.device_name })}
+          description={t("settings.pushRemoveDesc", { platform: formatPlatformLabel(pendingRemoveDevice.platform), host: pendingRemoveDevice.hostName })}
+          confirmLabel={t("settings.pushRemoveButton")}
           tone="danger"
           onConfirm={async () => {
             const target = pendingRemoveDevice;

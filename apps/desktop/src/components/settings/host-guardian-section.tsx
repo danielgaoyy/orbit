@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
-import { Loader2, Plus, RefreshCw, ShieldCheck, X } from "lucide-react";
+import { type ReactNode, useEffect, useMemo, useState } from "react";
+import { Check, ChevronRight, Loader2, Plus, RefreshCw, ShieldCheck, X } from "lucide-react";
 import {
   SettingCard,
-  SettingGroupLabel,
+  SettingGroup,
+  SettingRow,
   SettingSectionHeader,
   SettingSelect,
   type SettingSelectOption,
@@ -37,30 +38,27 @@ function formatRiskBadge(
     case "low":
       return {
         label: t("guardian.riskLow"),
-        className: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+        className: "bg-signal-success-bg text-signal-success",
       };
     case "medium":
       return {
         label: t("guardian.riskMedium"),
-        className: "bg-amber-500/10 text-amber-800 dark:text-amber-300",
+        className: "bg-signal-warning-bg text-signal-warning",
       };
     case "high":
       return {
         label: t("guardian.riskHigh"),
-        className: "bg-rose-500/10 text-rose-700 dark:text-rose-300",
+        className: "bg-signal-danger-bg text-signal-danger",
       };
     case "critical":
       return {
         label: t("guardian.riskCritical"),
-        className: "bg-rose-500/16 text-rose-800 dark:text-rose-200 font-semibold",
+        className: "bg-signal-danger-bg text-signal-danger font-semibold",
       };
   }
 }
 
-function formatDecisionLabel(
-  decision: GuardianDecision,
-  t: (key: MessageKey) => string,
-): string {
+function formatDecisionLabel(decision: GuardianDecision, t: (key: MessageKey) => string): string {
   switch (decision) {
     case "auto_allow":
       return t("guardian.decisionAllowed");
@@ -79,18 +77,18 @@ function formatClassifierTierBadge(
     case "llm_tier2":
       return {
         label: t("guardian.tierLlm"),
-        className: "bg-sky-500/12 text-sky-700 dark:text-sky-300",
+        className: "bg-signal-info-bg text-signal-info",
       };
     case "heuristic_fallback":
     case "ai_rubric":
       return {
         label: t("guardian.tierHeuristic"),
-        className: "bg-muted text-muted-foreground",
+        className: "bg-surface-recessed text-ink-muted",
       };
     case "fail_closed":
       return {
         label: t("guardian.tierFailClosed"),
-        className: "bg-amber-500/12 text-amber-800 dark:text-amber-300",
+        className: "bg-signal-warning-bg text-signal-warning",
       };
     case "deterministic_tier1":
     case "deterministic":
@@ -98,7 +96,7 @@ function formatClassifierTierBadge(
     default:
       return {
         label: t("guardian.tierDeterministic"),
-        className: "border-border bg-background text-muted-foreground border",
+        className: "border-border-default bg-surface-base text-ink-muted border",
       };
   }
 }
@@ -151,8 +149,8 @@ function PatternListEditor({
   return (
     <div className="flex flex-col gap-2.5 px-4 py-3">
       <div>
-        <div className="text-foreground text-[13px] font-medium">{title}</div>
-        <div className="text-muted-foreground mt-0.5 text-[11px] leading-snug">{description}</div>
+        <div className="text-ink-primary text-[13px] font-medium">{title}</div>
+        <div className="text-ink-muted mt-0.5 text-[11px] leading-snug">{description}</div>
       </div>
 
       <div className="flex items-center gap-2">
@@ -168,7 +166,7 @@ function PatternListEditor({
             }
           }}
           placeholder={placeholder}
-          className="h-[30px] flex-1 font-mono text-[12px]"
+          className="h-[30px] flex-1 font-mono text-[13px]"
         />
         <Button
           type="button"
@@ -188,7 +186,7 @@ function PatternListEditor({
           {items.map((item) => (
             <span
               key={item}
-              className="border-border bg-muted/60 text-foreground inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-[11px]"
+              className="border-border-default bg-surface-recessed/60 text-ink-primary inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-[11px]"
             >
               <span className="max-w-[260px] truncate">{item}</span>
               <button
@@ -196,7 +194,7 @@ function PatternListEditor({
                 disabled={disabled}
                 aria-label={removeAriaLabel(item)}
                 onClick={() => onChange(items.filter((x) => x !== item))}
-                className="text-muted-foreground hover:text-foreground cursor-pointer disabled:opacity-45"
+                className="text-ink-muted hover:text-ink-primary cursor-pointer disabled:opacity-45"
               >
                 <X className="h-[11px] w-[11px]" />
               </button>
@@ -208,16 +206,88 @@ function PatternListEditor({
   );
 }
 
-export function HostGuardianSection({ hostId }: { hostId: string }) {
-  const { t } = useI18n();
-  const hostCard = useOrbitSelector(
-    (s) => s.fleet.hosts.find((h) => h.host_id === hostId) ?? null,
+function SafetyDisclosure({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <details className="group/disclosure rounded-xl border border-border-subtle bg-surface-raised">
+      <summary className="flex cursor-pointer list-none items-center justify-between px-4 py-3 text-[13px] font-medium text-ink-primary [&::-webkit-details-marker]:hidden">
+        {title}
+        <ChevronRight className="size-[14px] text-ink-muted transition-transform group-open/disclosure:rotate-90 motion-reduce:transition-none" />
+      </summary>
+      <div className="space-y-3 border-t border-border-subtle p-3">{children}</div>
+    </details>
   );
+}
+
+const AUTONOMY_MODES = [
+  ["default", "composer.modeAlwaysAsk", "composer.modeAlwaysAskShortDesc"],
+  ["auto", "settings.agentAutoGuardian", "composer.modeAutoShortDesc"],
+  ["accept_edits", "composer.modeAcceptEdits", "composer.modeAcceptEditsShortDesc"],
+  ["full_access", "composer.modeFullAccess", "composer.modeFullAccessShortDesc"],
+] as const;
+
+export function HostGuardianSection({ hostId }: { hostId: string | null }) {
+  const { t } = useI18n();
+  const draftMode = useOrbitSelector((s) => s.draftMode);
+  return (
+    <div className="flex flex-col gap-6">
+      <SettingSectionHeader
+        title={t("settings.nav4Safety")}
+        description={t("settings.agentSafetyDesc")}
+      />
+      <SettingGroup settingId="settings.defaultPermissions" title={t("settings.defaultPermissions")}>
+        <p className="text-[13px] text-ink-secondary">{t("settings.defaultPermissionsDesc")}</p>
+        <div
+          className="grid grid-cols-2 gap-2 lg:grid-cols-4"
+          role="group"
+          aria-label={t("settings.defaultPermissions")}
+        >
+          {AUTONOMY_MODES.map(([mode, label, description]) => {
+            const checked = mode === draftMode;
+            return (
+              <button
+                key={mode}
+                type="button"
+                aria-pressed={checked}
+                onClick={() => orbitActions.setDraftConfig({ mode })}
+                className={cn(
+                  "cursor-pointer rounded-lg border p-3 text-left focus-visible:outline-border-strong",
+                  checked
+                    ? "border-border-strong bg-surface-recessed"
+                    : "border-border-subtle bg-surface-raised hover:border-border-default",
+                )}
+              >
+                <span className="flex items-center justify-between gap-1 text-[13px] font-medium text-ink-primary">
+                  {t(label)}
+                  {checked && <Check className="size-[13px] shrink-0" />}
+                </span>
+                <span className="mt-1 block text-[11px] text-ink-secondary">{t(description)}</span>
+              </button>
+            );
+          })}
+        </div>
+      </SettingGroup>
+      {hostId ? (
+        <GuardianPolicies key={hostId} hostId={hostId} />
+      ) : (
+        <p
+          data-setting-id="guardian.groupPolicy"
+          data-setting-fallback
+          className="text-[13px] text-ink-secondary"
+        >
+          {t("guardian.offline")}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function GuardianPolicies({ hostId }: { hostId: string }) {
+  const { t } = useI18n();
+  const hostCard = useOrbitSelector((s) => s.fleet.hosts.find((h) => h.host_id === hostId) ?? null);
   const entry = useOrbitSelector((s) => s.guardianByHost[hostId] ?? null);
 
   const isOnline =
-    hostCard?.connection_state === "online_direct" ||
-    hostCard?.connection_state === "online_relay";
+    hostCard?.connection_state === "online_direct" || hostCard?.connection_state === "online_relay";
 
   useEffect(() => {
     if (isOnline && hostId) {
@@ -309,6 +379,7 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
   return (
     <div className="flex flex-col gap-5">
       <SettingSectionHeader
+        subpage
         title={t("guardian.title")}
         description={t("guardian.description")}
         action={
@@ -320,13 +391,10 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
                 void orbitActions.loadGuardianConfig(hostId);
                 void orbitActions.loadPermissionRules(hostId);
               }}
-              className="border-border bg-background hover:bg-accent text-foreground inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:opacity-50"
+              className="border-border-default bg-surface-base hover:bg-surface-recessed text-ink-primary inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[13px] font-medium transition-colors disabled:opacity-50"
             >
               <RefreshCw
-                className={cn(
-                  "h-[12.5px] w-[12.5px]",
-                  entry?.status === "loading" && "animate-spin",
-                )}
+                className={cn("h-[12.5px] w-[12.5px]", entry?.status === "loading" && "animate-spin")}
               />
               {t("guardian.refresh")}
             </button>
@@ -336,61 +404,60 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
 
       {!isOnline ? (
         <SettingCard>
-          <div className="text-muted-foreground px-4 py-6 text-center text-[13px]">
+          <div
+            data-setting-id="guardian.groupPolicy"
+            data-setting-fallback
+            className="text-ink-muted px-4 py-6 text-center text-[13px]"
+          >
             {t("guardian.offline")}
           </div>
         </SettingCard>
       ) : isLoading ? (
         <SettingCard>
-          <div className="text-muted-foreground flex items-center justify-center gap-2 px-4 py-8 text-[12.5px]">
+          <div className="text-ink-muted flex items-center justify-center gap-2 px-4 py-8 text-[13px]">
             <Loader2 className="h-[14px] w-[14px] animate-spin" />
             <span>{t("guardian.loading")}</span>
           </div>
         </SettingCard>
       ) : !config ? (
         <SettingCard>
-          <div className="text-muted-foreground px-4 py-6 text-center text-[13px]">
+          <div
+            data-setting-id="guardian.groupPolicy"
+            data-setting-fallback
+            className="text-ink-muted px-4 py-6 text-center text-[13px]"
+          >
             {entry?.error || t("guardian.loadError")}
           </div>
         </SettingCard>
       ) : (
         <>
           {entry?.error && (
-            <div className="rounded-lg border border-rose-500/25 bg-rose-500/[0.07] px-3 py-2 text-[12px] text-rose-700 dark:text-rose-300">
+            <div className="rounded-lg border border-signal-danger-border bg-signal-danger-bg px-3 py-2 text-[13px] text-signal-danger">
               {entry.error}
             </div>
           )}
 
-          <div className="flex flex-col gap-2">
-            <SettingGroupLabel>{t("guardian.groupPolicy")}</SettingGroupLabel>
-            <SettingCard>
-              <div className="divide-border divide-y">
-                <div className="flex items-center justify-between gap-4 px-4 py-3">
-                  <div className="min-w-0">
-                    <div className="text-foreground text-[13px] font-medium">
-                      {t("guardian.enableTitle")}
-                    </div>
-                    <div className="text-muted-foreground mt-0.5 text-[11px]">
-                      {t("guardian.enableDesc")}
-                    </div>
-                  </div>
+          <SafetyDisclosure title={t("guardian.groupPolicy")}>
+            <SettingCard settingId="guardian.groupPolicy">
+              <div className="divide-border-subtle divide-y">
+                <SettingRow
+                  settingId="guardian.enableTitle"
+                  title={t("guardian.enableTitle")}
+                  description={t("guardian.enableDesc")}
+                >
                   <ToggleSwitch
                     checked={config.enabled}
                     disabled={isSaving}
                     ariaLabel={t("guardian.enableTitle")}
                     onChange={(enabled) => commitConfig({ enabled })}
                   />
-                </div>
+                </SettingRow>
 
-                <div className="flex items-center justify-between gap-4 px-4 py-3">
-                  <div className="min-w-0">
-                    <div className="text-foreground text-[13px] font-medium">
-                      {t("guardian.thresholdTitle")}
-                    </div>
-                    <div className="text-muted-foreground mt-0.5 text-[11px]">
-                      {t("guardian.thresholdDesc")}
-                    </div>
-                  </div>
+                <SettingRow
+                  settingId="guardian.thresholdTitle"
+                  title={t("guardian.thresholdTitle")}
+                  description={t("guardian.thresholdDesc")}
+                >
                   <SettingSelect
                     value={effectiveMaxRisk}
                     options={maxRiskOptions}
@@ -399,51 +466,39 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
                     triggerClassName="w-[176px]"
                     menuClassName="w-[260px]"
                   />
-                </div>
+                </SettingRow>
 
-                <div className="flex items-center justify-between gap-4 px-4 py-3">
-                  <div className="min-w-0">
-                    <div className="text-foreground text-[13px] font-medium">
-                      {t("guardian.readOnlyTitle")}
-                    </div>
-                    <div className="text-muted-foreground mt-0.5 text-[11px]">
-                      {t("guardian.readOnlyDesc")}
-                    </div>
-                  </div>
+                <SettingRow
+                  settingId="guardian.readOnlyTitle"
+                  title={t("guardian.readOnlyTitle")}
+                  description={t("guardian.readOnlyDesc")}
+                >
                   <ToggleSwitch
                     checked={config.allow_read_only_tools}
                     disabled={isSaving || !config.enabled}
                     ariaLabel={t("guardian.readOnlyTitle")}
                     onChange={(allow_read_only_tools) => commitConfig({ allow_read_only_tools })}
                   />
-                </div>
+                </SettingRow>
 
-                <div className="flex items-center justify-between gap-4 px-4 py-3">
-                  <div className="min-w-0">
-                    <div className="text-foreground text-[13px] font-medium">
-                      {t("guardian.workspaceTestsTitle")}
-                    </div>
-                    <div className="text-muted-foreground mt-0.5 text-[11px]">
-                      {t("guardian.workspaceTestsDesc")}
-                    </div>
-                  </div>
+                <SettingRow
+                  settingId="guardian.workspaceTestsTitle"
+                  title={t("guardian.workspaceTestsTitle")}
+                  description={t("guardian.workspaceTestsDesc")}
+                >
                   <ToggleSwitch
                     checked={config.allow_workspace_tests}
                     disabled={isSaving || !config.enabled}
                     ariaLabel={t("guardian.workspaceTestsTitle")}
                     onChange={(allow_workspace_tests) => commitConfig({ allow_workspace_tests })}
                   />
-                </div>
+                </SettingRow>
 
-                <div className="flex items-center justify-between gap-4 px-4 py-3">
-                  <div className="min-w-0">
-                    <div className="text-foreground text-[13px] font-medium">
-                      {t("guardian.tier2Title")}
-                    </div>
-                    <div className="text-muted-foreground mt-0.5 text-[11px]">
-                      {t("guardian.tier2Desc")}
-                    </div>
-                  </div>
+                <SettingRow
+                  settingId="guardian.tier2Title"
+                  title={t("guardian.tier2Title")}
+                  description={t("guardian.tier2Desc")}
+                >
                   <ToggleSwitch
                     checked={config.use_ai_classifier_for_medium}
                     disabled={isSaving || !config.enabled}
@@ -452,16 +507,16 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
                       commitConfig({ use_ai_classifier_for_medium })
                     }
                   />
-                </div>
+                </SettingRow>
 
                 {config.use_ai_classifier_for_medium && (
                   <div className="flex flex-col gap-3 px-4 py-3">
                     <div className="flex items-center justify-between gap-4">
                       <div className="min-w-0">
-                        <div className="text-foreground text-[13px] font-medium">
+                        <div className="text-ink-primary text-[13px] font-medium">
                           {t("guardian.llmTier2Title")}
                         </div>
-                        <div className="text-muted-foreground mt-0.5 text-[11px]">
+                        <div className="text-ink-muted mt-0.5 text-[11px]">
                           {t("guardian.llmTier2Desc", { timeoutMs: String(llmTimeoutMs) })}
                         </div>
                       </div>
@@ -474,9 +529,9 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
                     </div>
 
                     {llmTier2Enabled && (
-                      <div className="border-border/70 bg-muted/25 grid grid-cols-1 gap-2.5 rounded-lg border p-3 sm:grid-cols-3">
+                      <div className="border-border-default/70 bg-surface-recessed/25 grid grid-cols-1 gap-2.5 rounded-lg border p-3 sm:grid-cols-3">
                         <div className="flex flex-col gap-1">
-                          <span className="text-muted-foreground text-[11px] font-medium">
+                          <span className="text-ink-muted text-[11px] font-medium">
                             {t("guardian.llmProviderLabel")}
                           </span>
                           <SettingSelect
@@ -488,13 +543,13 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
                                 llm_provider: val === "auto" ? null : (val as ProviderKind),
                               })
                             }
-                            triggerClassName="h-[30px] w-full text-[12px]"
+                            triggerClassName="h-[30px] w-full text-[13px]"
                             menuClassName="w-[240px]"
                           />
                         </div>
 
                         <div className="flex flex-col gap-1">
-                          <span className="text-muted-foreground text-[11px] font-medium">
+                          <span className="text-ink-muted text-[11px] font-medium">
                             {t("guardian.llmModelLabel")}
                           </span>
                           <Input
@@ -510,12 +565,12 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
                               }
                             }}
                             placeholder={t("guardian.llmModelPlaceholder")}
-                            className="h-[30px] font-mono text-[12px]"
+                            className="h-[30px] font-mono text-[13px]"
                           />
                         </div>
 
                         <div className="flex flex-col gap-1">
-                          <span className="text-muted-foreground text-[11px] font-medium">
+                          <span className="text-ink-muted text-[11px] font-medium">
                             {t("guardian.llmTimeoutLabel")}
                           </span>
                           <SettingSelect
@@ -528,7 +583,7 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
                                 commitConfig({ llm_timeout_ms: parsed });
                               }
                             }}
-                            triggerClassName="h-[30px] w-full font-mono text-[12px] tabular-nums"
+                            triggerClassName="h-[30px] w-full font-mono text-[13px] tabular-nums"
                             menuClassName="w-[180px]"
                           />
                         </div>
@@ -538,12 +593,11 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
                 )}
               </div>
             </SettingCard>
-          </div>
+          </SafetyDisclosure>
 
-          <div className="flex flex-col gap-2">
-            <SettingGroupLabel>{t("guardian.groupCustomRules")}</SettingGroupLabel>
-            <SettingCard>
-              <div className="divide-border divide-y">
+          <SafetyDisclosure title={t("guardian.groupCustomRules")}>
+            <SettingCard settingId="guardian.groupCustomRules">
+              <div className="divide-border-subtle divide-y">
                 <PatternListEditor
                   title={t("guardian.trustedPrefixesTitle")}
                   description={t("guardian.trustedPrefixesDesc")}
@@ -552,9 +606,7 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
                   removeAriaLabel={(item) => t("guardian.removeRule", { item })}
                   items={config.trusted_command_prefixes}
                   disabled={isSaving || !config.enabled}
-                  onChange={(trusted_command_prefixes) =>
-                    commitConfig({ trusted_command_prefixes })
-                  }
+                  onChange={(trusted_command_prefixes) => commitConfig({ trusted_command_prefixes })}
                 />
                 <PatternListEditor
                   title={t("guardian.blockedPatternsTitle")}
@@ -564,28 +616,21 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
                   removeAriaLabel={(item) => t("guardian.removeRule", { item })}
                   items={config.blocked_command_patterns}
                   disabled={isSaving}
-                  onChange={(blocked_command_patterns) =>
-                    commitConfig({ blocked_command_patterns })
-                  }
+                  onChange={(blocked_command_patterns) => commitConfig({ blocked_command_patterns })}
                 />
               </div>
             </SettingCard>
-          </div>
+          </SafetyDisclosure>
 
-          <PermissionRulesPanel hostId={hostId} isOnline={isOnline} />
-
-          <HostSandboxAndAuditPanel hostId={hostId} isOnline={isOnline} />
-
-          <div className="flex flex-col gap-2">
-            <SettingGroupLabel>{t("guardian.groupRecentDecisions")}</SettingGroupLabel>
-            <SettingCard>
+          <SafetyDisclosure title={t("guardian.groupRecentDecisions")}>
+            <SettingCard settingId="guardian.groupRecentDecisions">
               {audits.length === 0 ? (
-                <div className="text-muted-foreground flex items-center justify-center gap-2 px-4 py-7 text-[12.5px]">
+                <div className="text-ink-muted flex items-center justify-center gap-2 px-4 py-7 text-[13px]">
                   <ShieldCheck className="h-[14px] w-[14px] opacity-65" />
                   <span>{t("guardian.noAudits")}</span>
                 </div>
               ) : (
-                <div className="orbit-native-scroll divide-border max-h-[280px] divide-y overflow-y-auto overscroll-contain">
+                <div className="orbit-native-scroll divide-border-subtle max-h-[280px] divide-y overflow-y-auto overscroll-contain">
                   {audits.slice(0, 40).map((item) => {
                     const risk = formatRiskBadge(item.assessment.risk_level, t);
                     const tier = formatClassifierTierBadge(item.assessment.classifier_tier, t);
@@ -595,7 +640,7 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
                           <div className="flex min-w-0 items-center gap-1.5">
                             <span
                               className={cn(
-                                "shrink-0 rounded px-1.5 py-0.5 text-[10.5px] font-medium",
+                                "shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium",
                                 risk.className,
                               )}
                             >
@@ -603,28 +648,28 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
                             </span>
                             <span
                               className={cn(
-                                "shrink-0 rounded px-1.5 py-0.5 text-[10.5px] font-medium",
+                                "shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium",
                                 tier.className,
                               )}
                             >
                               {tier.label}
                             </span>
-                            <span className="text-foreground shrink-0 text-[11.5px] font-medium">
+                            <span className="text-ink-primary shrink-0 text-[11px] font-medium">
                               {formatDecisionLabel(item.assessment.decision, t)}
                             </span>
-                            <span className="text-muted-foreground/50">·</span>
-                            <span className="text-muted-foreground truncate font-mono text-[11px]">
+                            <span className="text-ink-muted/50">·</span>
+                            <span className="text-ink-muted truncate font-mono text-[11px]">
                               {item.tool_name}
                             </span>
                           </div>
-                          <span className="text-muted-foreground/75 shrink-0 font-mono text-[10.5px] tabular-nums">
+                          <span className="text-ink-muted/75 shrink-0 font-mono text-[11px] tabular-nums">
                             {item.assessment.latency_ms}ms · {formatAuditTime(item.decided_at_ms)}
                           </span>
                         </div>
-                        <div className="text-foreground/85 truncate font-mono text-[11.5px]">
+                        <div className="text-ink-primary/85 truncate font-mono text-[11px]">
                           {item.target_summary}
                         </div>
-                        <div className="text-muted-foreground truncate text-[11px]">
+                        <div className="text-ink-muted truncate text-[11px]">
                           {item.assessment.reason}
                         </div>
                       </div>
@@ -633,9 +678,17 @@ export function HostGuardianSection({ hostId }: { hostId: string }) {
                 </div>
               )}
             </SettingCard>
-          </div>
+          </SafetyDisclosure>
         </>
       )}
+      <SafetyDisclosure title={t("permissionRules.sectionTitle")}>
+        <div data-setting-id="permissionRules.sectionTitle">
+          <PermissionRulesPanel hostId={hostId} isOnline={isOnline} />
+        </div>
+      </SafetyDisclosure>
+      <SafetyDisclosure title={t("settings.agentSandboxAudit")}>
+        <HostSandboxAndAuditPanel hostId={hostId} isOnline={isOnline} />
+      </SafetyDisclosure>
     </div>
   );
 }

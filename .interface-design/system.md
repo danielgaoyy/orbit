@@ -20,8 +20,8 @@ Canonical visual, typography, motion, and spatial token reference for `apps/desk
 ### 2.1 Neutral Surfaces (OKLCH 258°)
 | Token | Light (`Alabaster Paper`) | Dark (`Obsidian Graphite`) | Usage |
 | --- | --- | --- | --- |
-| `--surface-recessed` | `#F5F6F8` | `#121318` | Code wells, terminal backdrop, diff panes, segmented tracks, settings rail |
-| `--surface-base` | `#FCFCFE` | `#17181E` | App canvas, sidebar, main conversation stage, side-panel body |
+| `--surface-recessed` | `#F5F6F8` | `#121318` | Code wells, terminal backdrop, diff panes, segmented tracks |
+| `--surface-base` | `#FCFCFE` | `#17181E` | App canvas, sidebar, main conversation stage, side-panel body, Settings rail and canvas |
 | `--surface-raised` | `#FFFFFF` | `#20222B` | Cards, Composer shell, Queue strip, Overview HUD, DecisionDock |
 | `--surface-overlay` | `#FFFFFF` | `#272A35` | Popovers, dropdowns, modals, tooltips, toasts |
 
@@ -104,4 +104,8 @@ Always compose official `shadcn/ui` (`base-nova` / `@base-ui/react`) and Orbit p
 5. **Sidebar & Side Panel** (`components/sidebar/`, `components/side-panel/`, `settings/`):
    - `Needs Attention` and `Pinned` share `SidebarConversationRow` and deduplicate below. Each row reserves a `16px` leading signal column (awaiting / error / unread / idle armed timer `<AlarmClock>` / worktree) and a single non-shifting trailing status/action cell (foreground work & running subagents spin; idle timer-waiting threads stay calm & talkable).
    - File preview (`file-viewer-tab.tsx`, `workspace-slice.ts`) uses Rust 250-line prefix highlighting, promise-deduplicated intent prefetch (`pointerdown` + `65ms` hover dwell), stale-while-revalidate cache, and a `120ms` loading grace delay.
-   - Settings uses a `236px` 3-group rail (`APP` with top-level `Personal Agent`, `HOST` with collapsed manual Relay overrides in `Host Connection`, `WORKSPACE`), zero-config `Automatic Fleet Network` in `Cloud Sync`, and harmonized terminal palettes (`--surface-recessed`).
+6. **Desktop Settings** (`components/settings/`):
+   - Settings fills the window above the mounted workspace. Back and Escape restore workspace focus. Inner dialogs, menus and active search consume Escape first. On macOS the top 40px is reserved for window dragging and traffic lights.
+   - A 240px rail shares the canvas surface and has a 1px subtle divider. Sixteen destinations sit under Preferences, Fleet & Sync, Agents & Safety, and Context & Extensions. Preference columns measure up to 720px, operational pages up to 960px, and the split Instructions editor uses the available width.
+   - Host-scoped pages show a persistent host and transport selector when the fleet includes a remote host or multiple hosts. Fleet details use a breadcrumb. Resource editors open in 480px right drawers. Page titles, subpage titles, controls and metadata use 20/17/13/11px.
+   - Settings search uses real row anchors. `@modified` matches client preferences against their defaults. A 2px marker and a reset action identify changed values. A jump opens the target disclosure, scrolls it into view and highlights it for 1.2s. Window and drawer transitions use opacity and transform, and respect reduced motion.

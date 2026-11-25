@@ -4,6 +4,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { exerciseLocalSettings, exerciseMultiHostSettings } from "./smoke-settings.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = path.resolve(__dirname, "..", "dist");
@@ -23,9 +24,6 @@ const MIME_TYPES = {
   ".json": "application/json; charset=utf-8",
   ".wasm": "application/wasm",
 };
-
-const FATAL_CONSOLE_RE =
-  /Orbit UI boundary caught error|Minified React error|Maximum update depth exceeded|The result of getSnapshot should be cached|useOrbitSelector selector returned a non-stable reference|Uncaught\b|\b(?:TypeError|ReferenceError|RangeError|SyntaxError):/;
 
 const MOCK_TAURI_INIT_SCRIPT = `(() => {
   try {
@@ -69,6 +67,12 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
     is_worktree: false,
     git_branch: "main",
     archived_at: null,
+  };
+  const routerHost = {
+    host_id: mockHost.host_id, host_name: mockHost.display_name, is_local: true, online: true,
+    hermes_installed: false, hermes_has_existing_memory: false, hermes_acp_ready: false,
+    hermes_gateway_running: false, available_providers: ["codex"], router_enabled: false,
+    recommended_score: 0,
   };
 
   const mockAgent = {
@@ -123,7 +127,13 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
           return { protocol_version: 2, core_version: "0.11.2", capabilities: [] };
         case "get_app_version":
           return "0.11.2";
+        case "export_host_pairing_uri":
+          return "orbit://pair/smoke-fixture";
+        case "render_qr_svg":
+          return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8"><path d="M1 1h3v3H1z"/></svg>';
         case "list_external_editors":
+        case "list_external_mcp_servers":
+        case "list_acp_agents":
         case "list_ssh_hosts":
         case "get_fallback_provider_catalogs":
         case "get_slash_commands":
@@ -165,6 +175,28 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
           return { applied: false, modified_files: [], total_edits: 0 };
         case "get_cloud_sync_status":
           return null;
+        case "discover_fleet_router_hosts":
+          return [routerHost];
+        case "get_personal_router_status":
+          return {
+            config: { enabled: false, provider: "codex", scope: "global_fleet",
+              pre_review_mode: "medium_risk_only", share_host_hermes_memory: false,
+              has_external_webhook_secret: false },
+            host_capabilities: routerHost, managed_workers_count: 0, pending_approvals_count: 0,
+          };
+        case "list_instruction_files":
+          return { host_id: args.hostId, cwd: args.cwd, files: [], total_tokens: 0, merged_preview: "" };
+        case "list_push_devices":
+          return { devices: [], preferences: {
+            enabled: true, notify_permission_required: true, notify_turn_completed: true,
+            notify_agent_error: true, notify_goal_finished: true, notify_timer_fired: true,
+            include_message_preview: false, quiet_hours_enabled: false, quiet_start_hour: 23,
+            quiet_end_hour: 7, push_gateway_url: null, has_gateway_auth_token: false,
+          } };
+        case "get_usage_insights":
+          return { days: args.days, total_cost_usd: 0, total_cache_savings_usd: 0, total_input_tokens: 0,
+            total_output_tokens: 0, total_cache_read_tokens: 0, total_turns: 0,
+            daily: [], by_model: [], by_project: [], forecasts: [] };
         case "preview_rewind_agent":
           return {
             agent_id: typeof args?.agentId === "string" ? args.agentId : "ag_smoke_1",
@@ -581,7 +613,46 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
   };
 })();`;
 
-const MOCK_TAURI_PAGINATED_INIT_SCRIPT = (() => {
+const MOCK_TAURI_MULTI_HOST_INIT_SCRIPT = MOCK_TAURI_INIT_SCRIPT + `(() => {
+  const invoke = window.__TAURI_INTERNALS__.invoke;
+  const remoteId = "host:ipv6:2001:db8::2";
+  const mcpServers = new Map();
+  const asRemote = (host) => ({
+    ...host,
+    host_id: remoteId,
+    display_name: "Remote Build Host",
+    hostname: "build.example",
+    is_local: false,
+    ssh_alias: "build",
+    direct_endpoints: [],
+    workspace_count: 0,
+    agent_count: 0,
+  });
+  window.__TAURI_INTERNALS__.invoke = async (cmd, args = {}) => {
+    const result = await invoke(cmd, args);
+    if (cmd === "get_fleet_overview") {
+      return { ...result, hosts: [...result.hosts, asRemote(result.hosts[0])] };
+    }
+    if (cmd === "get_host_detail" && args.hostId === remoteId) {
+      return { ...result, host: asRemote(result.host), workspaces: [], agents: [] };
+    }
+    if (cmd === "get_voice_config") window.smokeVoiceHost = args.hostId;
+    if (cmd === "list_external_mcp_servers") return mcpServers.get(args.hostId) ?? [];
+    if (cmd === "upsert_external_mcp_server") {
+      const { host_id, name, scope, transport, enabled } = args.request;
+      const servers = [
+        ...(mcpServers.get(host_id) ?? []).filter((s) => s.name !== name),
+        { id: name, name, transport, enabled, editable: true, env_keys: [], masked_env: {},
+          source_path: "mcp.json", scope: scope === "project" ? "project_dot_mcp" : "orbit_user" },
+      ];
+      mcpServers.set(host_id, servers);
+      return servers;
+    }
+    return result;
+  };
+})();`;
+
+function paginatedSessionScript({ longReplies = false } = {}) {
   const makeParagraph = (text) => [
     {
       kind: "paragraph",
@@ -620,7 +691,9 @@ const MOCK_TAURI_PAGINATED_INIT_SCRIPT = (() => {
     const promptSeq = idx * 3;
     const replySeq = idx * 3 + 1;
     const promptText = `Paginated prompt turn ${idx}`;
-    const replyText = `Paginated response ${idx}`;
+    const replyText = longReplies
+      ? `Paginated response ${idx}. `.repeat(200)
+      : `Paginated response ${idx}`;
     const replyItem = {
       item_type: "assistant_message",
       seq: replySeq,
@@ -758,7 +831,7 @@ const MOCK_TAURI_PAGINATED_INIT_SCRIPT = (() => {
     return origInvoke(cmd, args);
   };
 })();`;
-})();
+}
 
 function findChromeBinary() {
   const envBin = process.env.CHROME_BIN;
@@ -1073,11 +1146,10 @@ function formatRemoteObject(arg) {
   return `[${arg.type || "object"}]`;
 }
 
-async function runPass({ port, serverUrl, name, initScript, assertHealth }) {
+async function runPass({ port, serverUrl, name, initScript, assertHealth, exercise, colorScheme }) {
   const target = await createPageTarget(port);
   const cdp = new CdpClient(target.wsUrl);
   const exceptions = [];
-  const fatalConsoleErrors = [];
   const allConsoleErrors = [];
 
   try {
@@ -1098,9 +1170,6 @@ async function runPass({ port, serverUrl, name, initScript, assertHealth }) {
         ? params.args.map(formatRemoteObject).join(" ")
         : "";
       allConsoleErrors.push(formatted);
-      if (FATAL_CONSOLE_RE.test(formatted)) {
-        fatalConsoleErrors.push(formatted);
-      }
     });
 
     cdp.on("Log.entryAdded", (params) => {
@@ -1108,15 +1177,23 @@ async function runPass({ port, serverUrl, name, initScript, assertHealth }) {
       if (entry?.level === "error" && entry?.source === "javascript") {
         const text = entry.text || JSON.stringify(entry);
         allConsoleErrors.push(text);
-        if (FATAL_CONSOLE_RE.test(text)) {
-          fatalConsoleErrors.push(text);
-        }
       }
     });
 
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
     await cdp.send("Log.enable");
+
+    if (exercise) {
+      const { userAgent } = await cdp.send("Browser.getVersion");
+      await cdp.send("Emulation.setUserAgentOverride", { userAgent, platform: "MacIntel", acceptLanguage: "en-US" });
+      await cdp.send("Emulation.setDeviceMetricsOverride", {
+        width: 1512, height: 850, deviceScaleFactor: 1, mobile: false,
+      });
+      await cdp.send("Emulation.setEmulatedMedia", {
+        features: [{ name: "prefers-color-scheme", value: colorScheme }],
+      });
+    }
 
     if (initScript) {
       await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
@@ -1158,14 +1235,21 @@ async function runPass({ port, serverUrl, name, initScript, assertHealth }) {
     }
 
     const failures = [];
+    if (exercise) {
+      try {
+        await exercise(cdp);
+      } catch (error) {
+        failures.push(error.message);
+      }
+    }
     if (exceptions.length > 0) {
       failures.push(
         `Uncaught page exceptions (${exceptions.length}):\n  - ${exceptions.join("\n  - ")}`,
       );
     }
-    if (fatalConsoleErrors.length > 0) {
+    if (allConsoleErrors.length > 0) {
       failures.push(
-        `Fatal console errors (${fatalConsoleErrors.length}):\n  - ${fatalConsoleErrors.join("\n  - ")}`,
+        `Console errors (${allConsoleErrors.length}):\n  - ${allConsoleErrors.join("\n  - ")}`,
       );
     }
     if (health.hasErrorBoundary) {
@@ -1263,7 +1347,7 @@ async function main() {
         port,
         serverUrl,
         name: "mocked-tauri-paginated-large-session",
-        initScript: MOCK_TAURI_PAGINATED_INIT_SCRIPT,
+        initScript: paginatedSessionScript(),
         assertHealth: (health) => {
           const errs = [];
           if (!health.hasMain || !health.hasTextarea) {
@@ -1278,6 +1362,24 @@ async function main() {
           }
           return errs;
         },
+      }),
+      await runPass({
+        port,
+        serverUrl,
+        name: "mocked-tauri-local-settings",
+        initScript: paginatedSessionScript({ longReplies: true }),
+        colorScheme: "light",
+        exercise: exerciseLocalSettings,
+        assertHealth: () => [],
+      }),
+      await runPass({
+        port,
+        serverUrl,
+        name: "mocked-tauri-multi-host-settings",
+        initScript: MOCK_TAURI_MULTI_HOST_INIT_SCRIPT,
+        colorScheme: "dark",
+        exercise: exerciseMultiHostSettings,
+        assertHealth: () => [],
       }),
     ];
 

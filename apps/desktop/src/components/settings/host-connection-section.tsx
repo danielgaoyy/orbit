@@ -11,39 +11,25 @@ import {
   RefreshCw,
   Trash2,
 } from "lucide-react";
-import { PairingQrDialog } from "@/components/modals/pairing-qr-dialog";
-import { HostDiagnosticsAndMigrationPanel } from "@/components/settings/host-security-ops-panels";
+import { PairingQrCard, PairingQrDialog } from "@/components/modals/pairing-qr-dialog";
+import { ConnectedHostMesh } from "@/components/settings/connected-host-mesh";
 import {
   HostStatusIndicator,
   SettingCard,
   SettingGroupLabel,
   SettingRow,
-  SettingSectionHeader,
   hostConnectionLabel,
 } from "@/components/settings/settings-primitives";
 import { Button } from "@/components/ui/button";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Input } from "@/components/ui/input";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
-import {
-  type SshHostItem,
-  compareSemver,
-  normalizeSemver,
-  orbitIpc,
-} from "@/lib/orbit-ipc";
+import { type SshHostItem, compareSemver, normalizeSemver, orbitIpc } from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
-import {
-  orbitActions,
-  resolveFleetTargetVersion,
-  useOrbitSelector,
-} from "@/state/orbit-store";
+import { orbitActions, resolveFleetTargetVersion, useOrbitSelector } from "@/state/orbit-store";
 
 type PendingRelayConfirm =
   | { kind: "clear" }
@@ -57,7 +43,15 @@ function redactRelayForDisplay(url: string): string {
     .replace(/([?&])token=[^&#]*/gi, "$1token=***");
 }
 
-export function HostConnectionSection({ hostId }: { hostId: string }) {
+export function HostConnectionSection({
+  hostId,
+  onRemoved,
+  inlinePairing,
+}: {
+  hostId: string;
+  onRemoved: () => void;
+  inlinePairing: boolean;
+}) {
   const { t } = useI18n();
   const fleet = useOrbitSelector((s) => s.fleet);
   const sshHosts = useOrbitSelector((s) => s.sshHosts);
@@ -107,7 +101,12 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
   };
 
   const copyValue = async (field: string, value: string) => {
-    await navigator.clipboard.writeText(value);
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch (err) {
+      orbitActions.showToast(String(err));
+      return;
+    }
     setCopiedField(field);
     window.setTimeout(() => setCopiedField((prev) => (prev === field ? null : prev)), 1500);
   };
@@ -116,7 +115,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
     const val = clear || !relayInput.trim() ? null : relayInput.trim();
     await orbitIpc.updateHostRelay(host.host_id, val);
     if (clear) setRelayInput("");
-    orbitActions.showToast(val ? "Saved relay endpoint" : "Cleared relay endpoint");
+    orbitActions.showToast(t(val ? "settings.fleetRelaySaved" : "settings.fleetRelayCleared"));
   };
 
   const handleRequestSaveRelay = () => {
@@ -124,7 +123,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
       openRelayConfirm({ kind: "clear" });
       return;
     }
-    void handleSaveRelay(false);
+    void handleSaveRelay(false).catch((err) => setRelayStatusMsg(String(err)));
   };
 
   const handleShareRelayAllHosts = async (relayUrl?: string) => {
@@ -133,8 +132,8 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
     setSharingRelay(true);
     try {
       const count = await orbitActions.applyRelayToAllHosts(val);
-      setRelayStatusMsg(`Shared relay across ${count} host${count === 1 ? "" : "s"}`);
-      orbitActions.showToast(`Shared relay with ${count} host${count === 1 ? "" : "s"}`);
+      setRelayStatusMsg(t("settings.fleetRelayShared", { count }));
+      orbitActions.showToast(t("settings.fleetRelayShared", { count }));
     } catch (err) {
       setRelayStatusMsg(String(err));
       throw err;
@@ -145,7 +144,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
 
   const handleDeploySshRelay = async (ssh: SshHostItem) => {
     setDeployingSsh(ssh.alias);
-    setRelayStatusMsg(`Deploying relay to ${ssh.alias}…`);
+    setRelayStatusMsg(t("settings.fleetRelayDeploying", { host: ssh.alias }));
     try {
       const url = await orbitIpc.provisionSshRelay({
         targetHostId: host.host_id,
@@ -156,7 +155,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
       });
       setRelayInput(url);
       await orbitActions.reloadFleetAndHosts();
-      setRelayStatusMsg(`Active across fleet on ${redactRelayForDisplay(url)}`);
+      setRelayStatusMsg(t("settings.fleetRelayActive", { url: redactRelayForDisplay(url) }));
     } catch (err) {
       setRelayStatusMsg(String(err));
       throw err;
@@ -171,7 +170,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
     tunnelToken?: string,
   ) => {
     setDeployingSsh(ssh.alias);
-    setRelayStatusMsg(`Deploying Zero-Port Cloudflare Tunnel on ${ssh.alias}…`);
+    setRelayStatusMsg(t("settings.fleetCfDeploying", { host: ssh.alias }));
     try {
       const url = await orbitIpc.provisionCloudflareTunnelRelay({
         targetHostId: host.host_id,
@@ -183,7 +182,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
       });
       setRelayInput(url);
       await orbitActions.reloadFleetAndHosts();
-      setRelayStatusMsg(`Zero-port Cloudflare Tunnel active across fleet on ${redactRelayForDisplay(url)}`);
+      setRelayStatusMsg(t("settings.fleetRelayActive", { url: redactRelayForDisplay(url) }));
     } catch (err) {
       setRelayStatusMsg(String(err));
       throw err;
@@ -213,32 +212,25 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
   const handleRemoveHost = async () => {
     await orbitIpc.removeHost(host.host_id);
     await orbitActions.reloadFleetAndHosts();
-    orbitActions.setSettingsSection("general");
-    orbitActions.showToast(`Removed ${host.display_name}`);
+    onRemoved();
+    orbitActions.showToast(t("settings.fleetRemoved", { host: host.display_name }));
   };
 
   return (
-    <div className="space-y-6">
-      <SettingSectionHeader
-        title={t("settings.connectionTitle")}
-        description={t("settings.connectionDesc")}
-        badge={
-          <span className="bg-muted text-muted-foreground inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-[11.5px] font-medium">
-            <HostStatusIndicator state={host.connection_state} />
-            <span>{host.display_name}</span>
-            {isLocal && (
-              <span className="text-muted-foreground/70">· {t("common.local")}</span>
-            )}
-          </span>
-        }
-      />
-
+    <div className="flex flex-col gap-[20px]">
       {/* Status & Actions */}
       <div className="space-y-2">
-        <SettingGroupLabel>{t("settings.groupStatus")}</SettingGroupLabel>
+        <SettingGroupLabel>
+          {inlinePairing ? host.display_name : t("settings.groupStatus")}
+        </SettingGroupLabel>
         <SettingCard>
           <SettingRow
-            title={hostConnectionLabel(host.connection_state)}
+            title={
+              <span className="inline-flex items-center gap-2">
+                <HostStatusIndicator state={host.connection_state} />
+                {hostConnectionLabel(host.connection_state)}
+              </span>
+            }
             description={
               isLocal
                 ? t("settings.runningLocally")
@@ -252,11 +244,11 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
               variant="outline"
               size="sm"
               onClick={() => {
-                void orbitIpc.connectHost(host.host_id);
-                void orbitIpc.refreshHost(host.host_id);
-                orbitActions.showToast(
-                  t("settings.reconnectingHost", { host: host.display_name }),
-                );
+                void orbitIpc
+                  .connectHost(host.host_id)
+                  .then(() => orbitIpc.refreshHost(host.host_id))
+                  .catch((err) => orbitActions.showToast(String(err)));
+                orbitActions.showToast(t("settings.reconnectingHost", { host: host.display_name }));
               }}
               className="px-2.5"
             >
@@ -266,43 +258,27 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
           </SettingRow>
 
           <SettingRow
+            settingId="settings.mobilePairing"
             title={t("settings.mobilePairing")}
-            description={t("settings.mobilePairingDesc")}
+            description={t("settings.pairingQrDesc", { host: host.display_name })}
           >
-            <div className="flex items-center gap-1.5">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => setPairingQrOpen(true)}
-                className="px-2.5"
-              >
-                <QrCode className="text-muted-foreground size-[13px]" />
-                <span>{t("settings.showQr")}</span>
+            {inlinePairing ? (
+              <PairingQrCard
+                compact
+                hostId={hostId}
+                hostName={host.display_name}
+                className="max-w-[224px]"
+              />
+            ) : (
+              <Button variant="outline" size="sm" onClick={() => setPairingQrOpen(true)}>
+                <QrCode data-icon="inline-start" />
+                {t("settings.showQr")}
               </Button>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  void orbitIpc
-                    .exportHostPairingUri(host.host_id)
-                    .then((uri) => copyValue("uri", uri))
-                    .catch((err) => orbitActions.showToast(String(err)));
-                }}
-                className="px-2.5"
-              >
-                {copiedField === "uri" ? (
-                  <Check className="text-signal-success size-[13px]" />
-                ) : (
-                  <Copy className="text-muted-foreground size-[13px]" />
-                )}
-                <span>{copiedField === "uri" ? t("common.copied") : t("settings.copyUri")}</span>
-              </Button>
-            </div>
+            )}
           </SettingRow>
 
           <SettingRow
+            settingId="settings.hostService"
             title={isLocal ? t("settings.localService") : t("settings.hostService")}
             description={
               normDaemon
@@ -318,27 +294,6 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
             }
           >
             <div className="flex items-center gap-1.5">
-              {fleet.hosts.length > 1 && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  disabled={isFleetBusy}
-                  onClick={() => void orbitActions.upgradeAllConnectedHosts()}
-                  className="px-2.5"
-                >
-                  {isFleetBusy ? (
-                    <OrbitSpinner size={13} className="size-[13px]" />
-                  ) : (
-                    <ArrowUpCircle className="size-[13.5px]" />
-                  )}
-                  <span>
-                    {isFleetBusy
-                      ? t("settings.updatingAllHosts")
-                      : t("settings.updateAllHosts")}
-                  </span>
-                </Button>
-              )}
               <Button
                 type="button"
                 variant="outline"
@@ -369,75 +324,80 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
         </SettingCard>
       </div>
 
+      <ConnectedHostMesh hostId={hostId} />
+
       {/* Identity */}
-      <div className="space-y-2">
-        <SettingGroupLabel>Identity</SettingGroupLabel>
-        <SettingCard>
-          <div className="space-y-2.5 px-4 py-3.5 text-[12.5px]">
-            <div className="flex items-center justify-between gap-4">
-              <span className="text-muted-foreground shrink-0">Host ID</span>
-              <button
-                type="button"
-                onClick={() => void copyValue("id", host.host_id)}
-                className="selectable-text text-foreground/90 hover:text-foreground inline-flex min-w-0 cursor-pointer items-center gap-1.5 font-mono text-[12px]"
-              >
-                <span className="truncate">{host.host_id}</span>
-                {copiedField === "id" ? (
-                  <Check className="text-signal-success size-[12.5px] shrink-0" />
-                ) : (
-                  <Copy className="text-muted-foreground size-[12.5px] shrink-0 opacity-70" />
-                )}
-              </button>
-            </div>
+      <details className="group border-border-subtle rounded-xl border bg-surface-raised">
+        <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-[13px] font-medium">
+          <ChevronRight className="size-[13px] text-ink-muted transition-transform group-open:rotate-90" />
+          {t("settings.fleetHostIdentity")}
+        </summary>
 
-            <div className="flex items-center justify-between gap-4">
-              <span className="text-muted-foreground shrink-0">Public Key</span>
-              <button
-                type="button"
-                onClick={() => void copyValue("pubkey", host.daemon_pubkey_b64)}
-                className="selectable-text text-foreground/90 hover:text-foreground inline-flex min-w-0 cursor-pointer items-center gap-1.5 font-mono text-[12px]"
-              >
-                <span className="truncate">{host.daemon_pubkey_b64.slice(0, 26)}…</span>
-                {copiedField === "pubkey" ? (
-                  <Check className="text-signal-success size-[12.5px] shrink-0" />
-                ) : (
-                  <Copy className="text-muted-foreground size-[12.5px] shrink-0 opacity-70" />
-                )}
-              </button>
-            </div>
-
-            <div className="flex items-center justify-between gap-4">
-              <span className="text-muted-foreground shrink-0">Endpoints</span>
-              <span className="selectable-text text-foreground/85 truncate font-mono text-[12px]">
-                {host.direct_endpoints.join(", ") || "None"}
-              </span>
-            </div>
+        <div className="space-y-2.5 px-4 py-3.5 text-[13px]">
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-ink-muted shrink-0">Host ID</span>
+            <button
+              type="button"
+              onClick={() => void copyValue("id", host.host_id)}
+              className="selectable-text text-ink-primary/90 hover:text-ink-primary inline-flex min-w-0 cursor-pointer items-center gap-1.5 font-mono text-[13px]"
+            >
+              <span className="truncate">{host.host_id}</span>
+              {copiedField === "id" ? (
+                <Check className="text-signal-success size-[12.5px] shrink-0" />
+              ) : (
+                <Copy className="text-ink-muted size-[12.5px] shrink-0 opacity-70" />
+              )}
+            </button>
           </div>
-        </SettingCard>
-      </div>
+
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-ink-muted shrink-0">{t("settings.fleetPublicKey")}</span>
+            <button
+              type="button"
+              onClick={() => void copyValue("pubkey", host.daemon_pubkey_b64)}
+              className="selectable-text text-ink-primary/90 hover:text-ink-primary inline-flex min-w-0 cursor-pointer items-center gap-1.5 font-mono text-[13px]"
+            >
+              <span className="truncate">{host.daemon_pubkey_b64.slice(0, 26)}…</span>
+              {copiedField === "pubkey" ? (
+                <Check className="text-signal-success size-[12.5px] shrink-0" />
+              ) : (
+                <Copy className="text-ink-muted size-[12.5px] shrink-0 opacity-70" />
+              )}
+            </button>
+          </div>
+
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-ink-muted shrink-0">{t("settings.fleetEndpoints")}</span>
+            <span className="selectable-text text-ink-primary/85 truncate font-mono text-[13px]">
+              {host.direct_endpoints.join(", ") || "—"}
+            </span>
+          </div>
+        </div>
+      </details>
 
       {/* Advanced Network & Custom Relay (Collapsed by default; auto-managed across Fleet) */}
       <Collapsible
+        data-setting-id="settings.advancedRelayTitle"
         open={relayExpanded}
         onOpenChange={setRelayExpanded}
-        className="border-border bg-background/60 rounded-[13px] border px-4 py-3"
+        className="border-border-subtle bg-surface-raised/60 rounded-[13px] border px-4 py-3"
       >
         <CollapsibleTrigger className="group/relay flex w-full cursor-pointer items-center justify-between gap-2 text-left outline-none">
           <span className="flex min-w-0 items-center gap-2">
-            <ChevronRight className="text-muted-foreground size-3.5 shrink-0 transition-transform duration-150 group-data-[panel-open]/relay:rotate-90" />
-            <span className="text-foreground text-[12.5px] font-medium">
+            <ChevronRight className="text-ink-muted size-3.5 shrink-0 transition-transform duration-150 group-data-[panel-open]/relay:rotate-90" />
+            <span className="text-ink-primary text-[13px] font-medium">
               {t("settings.advancedRelayTitle")}
             </span>
           </span>
-          <span className="bg-muted text-muted-foreground max-w-[220px] shrink-0 truncate rounded-md px-2 py-0.5 font-mono text-[11px]">
+          <span className="bg-surface-recessed text-ink-muted max-w-[220px] shrink-0 truncate rounded-md px-2 py-0.5 font-mono text-[11px]">
             {host.relay_url
               ? redactRelayForDisplay(host.relay_url)
               : t("settings.advancedRelayAutoBadge")}
           </span>
         </CollapsibleTrigger>
 
-        <CollapsibleContent className="space-y-3 pt-3">
-          <p className="text-muted-foreground text-[12px] leading-relaxed">
+        <CollapsibleContent className="space-y-3 pt-3 transition-opacity">
+          <p className="text-ink-muted text-[13px] leading-relaxed">
             {t("settings.advancedRelayDesc")}
           </p>
 
@@ -460,20 +420,18 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
               onClick={handleRequestSaveRelay}
               className="h-[34px] px-3.5"
             >
-              Save
+              {t("settings.fleetSave")}
             </Button>
             {fleet.hosts.length > 1 && relayInput.trim() && (
               <Button
                 type="button"
                 variant="outline"
                 disabled={sharingRelay}
-                onClick={() =>
-                  openRelayConfirm({ kind: "share_all", relayUrl: relayInput.trim() })
-                }
-                className="h-[34px] gap-1.5 px-3 text-[12.5px]"
+                onClick={() => openRelayConfirm({ kind: "share_all", relayUrl: relayInput.trim() })}
+                className="h-[34px] gap-1.5 px-3 text-[13px]"
               >
                 {sharingRelay && <OrbitSpinner size={13.5} className="size-[13.5px]" />}
-                <span>Share with All Hosts</span>
+                <span>{t("settings.fleetShareRelay")}</span>
               </Button>
             )}
             {host.relay_url && (
@@ -483,7 +441,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
                 onClick={() => openRelayConfirm({ kind: "clear" })}
                 className="h-[34px] px-3"
               >
-                Clear
+                {t("settings.fleetClear")}
               </Button>
             )}
           </div>
@@ -493,27 +451,27 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
               <button
                 type="button"
                 onClick={() => setShowSshDeploy((v) => !v)}
-                className="text-muted-foreground hover:text-foreground inline-flex cursor-pointer items-center gap-1 text-[12px] font-medium transition-colors"
+                className="text-ink-muted hover:text-ink-primary inline-flex cursor-pointer items-center gap-1 text-[13px] font-medium transition-colors"
               >
                 {showSshDeploy ? (
                   <ChevronDown className="h-[13.5px] w-[13.5px]" />
                 ) : (
                   <ChevronRight className="h-[13.5px] w-[13.5px]" />
                 )}
-                <span>Deploy relay to an SSH server</span>
+                <span>{t("settings.fleetDeploySsh")}</span>
               </button>
 
               {showSshDeploy && (
                 <div className="space-y-2.5 pt-2">
-                  <div className="orbit-native-scroll border-border divide-border max-h-48 divide-y overflow-y-auto overscroll-contain rounded-[10px] border">
+                  <div className="orbit-native-scroll border-border-subtle divide-border-subtle max-h-48 divide-y overflow-y-auto overscroll-contain rounded-[10px] border">
                     {sshHosts.map((s) => (
                       <div
                         key={s.alias}
-                        className="flex items-center justify-between gap-2 px-3 py-2 text-[12.5px]"
+                        className="flex items-center justify-between gap-2 px-3 py-2 text-[13px]"
                       >
                         <div className="min-w-0 truncate">
-                          <span className="text-foreground font-medium">{s.alias}</span>
-                          <span className="selectable-text text-muted-foreground ml-2 font-mono text-[11.5px]">
+                          <span className="text-ink-primary font-medium">{s.alias}</span>
+                          <span className="selectable-text text-ink-muted ml-2 font-mono text-[11px]">
                             {s.display_target}
                           </span>
                         </div>
@@ -531,7 +489,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
                                 tunnelToken: cfTunnelToken.trim() || undefined,
                               })
                             }
-                            className="shrink-0 gap-1.5 text-[11.5px]"
+                            className="shrink-0 gap-1.5 text-[11px]"
                           >
                             {deployingSsh === s.alias ? (
                               <OrbitSpinner size={12} className="size-3" />
@@ -546,14 +504,14 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
                             size="xs"
                             disabled={deployingSsh !== null}
                             onClick={() => openRelayConfirm({ kind: "deploy_ssh", ssh: s })}
-                            className="shrink-0 gap-1.5 text-[11.5px]"
+                            className="shrink-0 gap-1.5 text-[11px]"
                           >
                             {deployingSsh === s.alias ? (
                               <OrbitSpinner size={12} className="size-3" />
                             ) : (
                               <Radio className="size-3" />
                             )}
-                            <span>Deploy</span>
+                            <span>{t("settings.fleetDeploy")}</span>
                           </Button>
                         </div>
                       </div>
@@ -564,7 +522,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
                     <button
                       type="button"
                       onClick={() => setShowCfCustom((v) => !v)}
-                      className="text-muted-foreground hover:text-foreground inline-flex cursor-pointer items-center gap-1 text-[11.5px] font-medium transition-colors"
+                      className="text-ink-muted hover:text-ink-primary inline-flex cursor-pointer items-center gap-1 text-[11px] font-medium transition-colors"
                     >
                       {showCfCustom ? (
                         <ChevronDown className="size-3" />
@@ -582,7 +540,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
                           onChange={(e) => setCfHostname(e.target.value)}
                           {...ime.compositionProps}
                           placeholder={t("settings.deployCfHostnamePlaceholder")}
-                          className="h-[32px] px-2.5 font-mono text-[12px]"
+                          className="h-[32px] px-2.5 font-mono text-[13px]"
                         />
                         <Input
                           type="password"
@@ -590,7 +548,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
                           onChange={(e) => setCfTunnelToken(e.target.value)}
                           {...ime.compositionProps}
                           placeholder={t("settings.deployCfTokenPlaceholder")}
-                          className="h-[32px] px-2.5 font-mono text-[12px]"
+                          className="h-[32px] px-2.5 font-mono text-[13px]"
                         />
                       </div>
                     )}
@@ -601,26 +559,17 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
           )}
 
           {relayStatusMsg && (
-            <div className="selectable-text text-foreground/90 text-[12px]">
-              {relayStatusMsg}
-            </div>
+            <div className="selectable-text text-ink-primary/90 text-[13px]">{relayStatusMsg}</div>
           )}
         </CollapsibleContent>
       </Collapsible>
 
-      <HostDiagnosticsAndMigrationPanel
-        hostId={host.host_id}
-        isOnline={
-          host.connection_state === "online_direct" ||
-          host.connection_state === "online_relay"
-        }
-      />
-
       {/* Danger Zone: Remove host */}
       <SettingCard>
         <SettingRow
-          title="Remove host"
-          description="Unpair this machine from Orbit Desktop."
+          settingId="settings.fleetRemoveHost"
+          title={t("settings.fleetRemoveHost")}
+          description={t("settings.fleetRemoveDesc")}
         >
           <Button
             type="button"
@@ -630,7 +579,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
             className="border-signal-danger-border text-signal-danger hover:bg-signal-danger-bg hover:text-signal-danger"
           >
             <Trash2 className="size-[13px]" />
-            <span>Remove</span>
+            <span>{t("settings.fleetRemoveHost")}</span>
           </Button>
         </SettingRow>
       </SettingCard>
@@ -638,9 +587,9 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
       <ConfirmDialog
         open={confirmRemoveOpen}
         onOpenChange={setConfirmRemoveOpen}
-        title={`Remove ${host.display_name}?`}
-        description="Unpairs this machine from Orbit Desktop. Running agents and shells on the host keep running, and you can pair it again later."
-        confirmLabel="Remove"
+        title={t("settings.fleetRemoveConfirm", { host: host.display_name })}
+        description={t("settings.fleetRemoveExplanation")}
+        confirmLabel={t("settings.fleetRemoveHost")}
         tone="danger"
         defaultAction="cancel"
         onConfirm={handleRemoveHost}
@@ -651,22 +600,22 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
         onOpenChange={setRelayConfirmOpen}
         title={
           pendingRelayConfirm?.kind === "clear"
-            ? `Clear relay for ${host.display_name}?`
+            ? t("settings.fleetClearRelayConfirm", { host: host.display_name })
             : pendingRelayConfirm?.kind === "share_all"
-              ? `Overwrite relay on all ${fleet.hosts.length} hosts?`
+              ? t("settings.fleetOverwriteRelayConfirm", { count: fleet.hosts.length })
               : pendingRelayConfirm?.kind === "deploy_ssh"
-                ? `Deploy relay to ${pendingRelayConfirm.ssh.alias}?`
+                ? t("settings.fleetDeployRelayConfirm", { host: pendingRelayConfirm.ssh.alias })
                 : pendingRelayConfirm?.kind === "deploy_cf"
                   ? t("settings.deployCfConfirmTitle", { alias: pendingRelayConfirm.ssh.alias })
                   : ""
         }
         description={
           pendingRelayConfirm?.kind === "clear"
-            ? "Removes the saved relay endpoint from this host. Remote and mobile access off your local network will stop working until a relay is configured again."
+            ? t("settings.fleetClearRelayDesc")
             : pendingRelayConfirm?.kind === "share_all"
-              ? "Replaces the saved relay endpoint across every host in your fleet. Hosts using a different relay will disconnect and reconnect through this URL."
+              ? t("settings.fleetOverwriteRelayDesc")
               : pendingRelayConfirm?.kind === "deploy_ssh"
-                ? `Installs and starts an Orbit relay service on port 7878 over SSH, then overwrites the relay endpoint on all ${fleet.hosts.length} ${fleet.hosts.length === 1 ? "host" : "hosts"} in your fleet.`
+                ? t("settings.fleetDeployRelayDesc", { count: fleet.hosts.length })
                 : pendingRelayConfirm?.kind === "deploy_cf"
                   ? t("settings.deployCfConfirmDesc", {
                       alias: pendingRelayConfirm.ssh.alias,
@@ -676,26 +625,26 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
         }
         detail={
           pendingRelayConfirm?.kind === "clear" && host.relay_url ? (
-            <span className="selectable-text font-mono text-[11.5px] break-all">
+            <span className="selectable-text font-mono text-[11px] break-all">
               {redactRelayForDisplay(host.relay_url)}
             </span>
           ) : pendingRelayConfirm?.kind === "share_all" ? (
-            <span className="selectable-text font-mono text-[11.5px] break-all">
+            <span className="selectable-text font-mono text-[11px] break-all">
               {redactRelayForDisplay(pendingRelayConfirm.relayUrl)}
             </span>
           ) : pendingRelayConfirm?.kind === "deploy_ssh" ||
             pendingRelayConfirm?.kind === "deploy_cf" ? (
-            <span className="selectable-text font-mono text-[11.5px] break-all">
+            <span className="selectable-text font-mono text-[11px] break-all">
               {pendingRelayConfirm.ssh.alias} ({pendingRelayConfirm.ssh.display_target})
             </span>
           ) : undefined
         }
         confirmLabel={
           pendingRelayConfirm?.kind === "clear"
-            ? "Clear relay"
+            ? t("settings.fleetClearRelay")
             : pendingRelayConfirm?.kind === "share_all"
-              ? "Overwrite all hosts"
-              : "Deploy & overwrite"
+              ? t("settings.fleetOverwriteRelay")
+              : t("settings.fleetDeployReplace")
         }
         tone="danger"
         defaultAction="cancel"

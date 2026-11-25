@@ -80,7 +80,7 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
         actions={
           <button
             type="button"
-            onClick={() => orbitActions.openSettings("general")}
+            onClick={() => orbitActions.openSettings("hosts")}
             className="text-ink-primary hover:bg-accent cursor-pointer rounded-[6px] px-2 py-0.5 text-[11px] font-medium transition-colors"
           >
             {t("banner.viewProgress")}

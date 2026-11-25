@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { PanelLeft, PanelRight } from "lucide-react";
 import { resyncAllAmbientAnimations } from "@/lib/animation-sync";
 import { AutomationsView } from "@/components/automations/automations-view";
@@ -80,10 +80,22 @@ function MainDesktopApp() {
   const toastAction = useOrbitSelector((s) => s.toastAction);
   const lastArchivedUndo = useOrbitSelector((s) => s.lastArchivedUndo);
 
-  // Presence state for smooth Settings modal enter & exit
+  // Keep the workspace DOM and its original keyboard focus through the Settings transition.
   const isSettingsOpen = activeView === "settings";
   const [settingsMounted, setSettingsMounted] = useState(isSettingsOpen);
   const [settingsClosing, setSettingsClosing] = useState(false);
+
+  const returnFocus = useRef<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (isSettingsOpen && !settingsMounted) {
+      returnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    } else if (!isSettingsOpen && !settingsMounted && returnFocus.current) {
+      if (returnFocus.current.isConnected && !document.querySelector('[aria-modal="true"]')) {
+        returnFocus.current.focus({ preventScroll: true });
+      }
+      returnFocus.current = null;
+    }
+  }, [isSettingsOpen, settingsMounted]);
 
   // Presence state for smooth Toast enter & exit (monotonic revision key re-triggers enter on replacement)
   const [renderedToast, setRenderedToast] = useState<string | null>(toastNotice);
@@ -346,7 +358,7 @@ function MainDesktopApp() {
 
         {/* Main Workspace Shell coordinated by 100% GPU WorkspaceMotionProvider */}
         <WorkspaceMotionProvider>
-          <WorkspaceShellLayout isSettingsOpen={isSettingsOpen} workspacePanel={workspacePanel} />
+          <WorkspaceShellLayout isSettingsOpen={settingsMounted} workspacePanel={workspacePanel} />
         </WorkspaceMotionProvider>
 
         {/* Global Command Palette (`⌘K`), Quick Open File (`⌘P`), Export & Code Picker */}
@@ -477,7 +489,7 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
       {/* Transparent Drag Shield so embedded iframes / WebGL canvases never swallow pointer events during resize */}
       {isResizingSidebar && <div className="fixed inset-0 z-50 cursor-col-resize select-none" />}
 
-      <div className="bg-surface-base text-ink-primary relative flex h-screen w-screen overflow-clip">
+      <div inert={isSettingsOpen} className="bg-surface-base text-ink-primary relative flex h-screen w-screen overflow-clip">
         {/* Single Stationary Titlebar Sidebar Toggle (`⌘B`) — optically centered with macOS traffic lights */}
         {!isSettingsOpen && (
           <div

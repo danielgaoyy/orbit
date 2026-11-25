@@ -66,11 +66,13 @@ In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight
 
 ## 3. Desktop Chrome Runtime Smoke（防前端白屏/React `#185`）
 
-[`apps/desktop/scripts/smoke-render.mjs`](../../apps/desktop/scripts/smoke-render.mjs) 启动真实静态资源服务器与无头 Chrome CDP，校验 0 console/pageerror 与非空 UI 渲染，当前固定验证 3 个场景：
+[`apps/desktop/scripts/smoke-render.mjs`](../../apps/desktop/scripts/smoke-render.mjs) 启动真实静态资源服务器与无头 Chrome CDP，校验 0 console/pageerror 与非空 UI 渲染，当前固定验证 5 个场景：
 
 1. `bare-browser-empty-host`
 2. `mocked-tauri-active-session`
 3. `mocked-tauri-paginated-large-session`（模拟 `total_turn_count: 120` 仅下发尾部 3 轮窗口 `turn_index` 117..119 的分页大图渲染）
+4. `mocked-tauri-local-settings`（全窗布局、键盘搜索与重置、抽屉关闭、草稿和焦点恢复）
+5. `mocked-tauri-multi-host-settings`（主机切换保留当前设置页、MCP 配置按主机隔离）
 
 ---
 

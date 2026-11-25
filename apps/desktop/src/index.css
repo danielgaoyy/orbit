@@ -9,7 +9,8 @@
  * Monochrome precision primary actions · WCAG-AA semantic signals
  * ============================================================================ */
 
-:root {
+:root,
+[data-orbit-theme-preview="light"] {
   /* 4-Layer Same-Hue Neutral Surfaces (Alabaster Drafting Paper) */
   --surface-base: oklch(0.992 0.002 258);
   --surface-recessed: oklch(0.962 0.003 258);
@@ -92,7 +93,8 @@
   --duration-panel-out: 225ms;
 }
 
-.dark {
+.dark,
+[data-orbit-theme-preview="dark"] {
   /* 4-Layer Same-Hue Neutral Surfaces (Deep Observatory Graphite) */
   --surface-base: oklch(0.168 0.006 258);
   --surface-recessed: oklch(0.144 0.006 258);
@@ -1039,3 +1041,57 @@ html.orbit-linux .animate-spin {
     border-inline-end-width: 0;
   }
 }
+
+/* Settings has one scrolling canvas per page. Keep its rail usable at laptop heights. */
+.settings-rail-group + .settings-rail-group {
+  margin-top: clamp(6px, 1.6vh, 16px);
+}
+@media (max-height: 740px) {
+  .settings-rail-group [data-settings-section] { height: 26px; }
+  .settings-rail-group + .settings-rail-group { margin-top: 5px; }
+}
+.settings-view [data-setting-id] { scroll-margin-block: 24px; }
+.settings-view [data-modified="true"] { box-shadow: inset 2px 0 var(--ink-muted); }
+
+[data-settings-highlight="true"] {
+  position: relative;
+  isolation: isolate;
+}
+[data-settings-highlight="true"]::after {
+  content: "";
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  border-radius: inherit;
+  background: var(--surface-recessed);
+  outline: 1px solid var(--border-strong);
+  outline-offset: -1px;
+  opacity: 0.55;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .settings-view { animation: orbit-backdrop-in 170ms var(--ease-panel); }
+  .settings-view[data-closing] { animation: orbit-backdrop-out 160ms var(--ease-exit) forwards; }
+  .settings-drawer { transition: transform 180ms var(--ease-panel), opacity 160ms var(--ease-panel); }
+  .settings-drawer[data-starting-style], .settings-drawer[data-ending-style] { transform: translateX(100%); opacity: 0; }
+  .settings-drawer-scrim { transition: opacity 160ms var(--ease-panel); }
+  .settings-drawer-scrim[data-starting-style], .settings-drawer-scrim[data-ending-style] { opacity: 0; }
+  [data-settings-highlight="true"]::after { animation: settings-jump 1200ms ease-out forwards; }
+}
+@keyframes settings-jump {
+  0% { opacity: 0; }
+  14%, 45% { opacity: 0.55; }
+  100% { opacity: 0; }
+}
+
+/* Shared shadcn controls also serve denser workspace surfaces. Use the Settings
+   type scale inside both the page and portalled resource editors. */
+:where(.settings-view, .settings-drawer) :is(
+  [data-slot="input"], [data-slot="textarea"], [data-slot="button"],
+  [data-slot="select-trigger"], [data-slot="select-trigger"] > span:first-child,
+  [data-slot="tabs-trigger"], [data-slot="field-label"]
+) { font-size: 13px; }
+:where(.settings-view, .settings-drawer) :is([data-slot="badge"], [data-slot="kbd"]) { font-size: 11px; }
+.settings-select-menu :is([data-slot="select-item"], [data-slot="select-item-label"]),
+.settings-scope-menu [data-slot="dropdown-menu-item"] { font-size: 13px; }
+.settings-select-menu :is([data-slot="select-item-description"], [data-slot="select-item-badge"]) { font-size: 11px; }

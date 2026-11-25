@@ -6,6 +6,7 @@ pub mod acp_callbacks;
 pub mod acp_generic;
 pub mod acp_providers;
 pub mod acp_registry;
+mod agy_watcher;
 pub mod antigravity;
 pub mod attachments;
 pub mod claude;

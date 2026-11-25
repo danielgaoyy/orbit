@@ -18,7 +18,7 @@
 - **Native 驱动**（`crates/orbit-providers/src/`）：
   - `claude.rs`（`stream-json` 控制协议，私钥 MCP 配置写入 `$ORBIT_HOME/runtime/claude-mcp-*.json` `0600`）
   - `codex.rs`（`app-server` JSON-RPC 2.0）
-  - `antigravity.rs`（`agy` ACP stdio + 字节偏移 transcript 流）
+  - `antigravity.rs` + `agy_watcher.rs`（`agy` ACP stdio + 字节偏移 `transcript_full.jsonl` 流：进程级单实例 `notify` 非递归叶子目录事件监听替代 200ms 轮询、`wakeup_idle_settled` / `has_in_progress_planner` 迟到唤醒回复零丢包恢复、以及 `PostWakeupAcpReplayFilter` + `session/load` `0ms` 非阻塞清空的跨轮 ACP 重放幂等去重）
   - `pi.rs`（`pi-rpc`，私钥 MCP 配置写入 `$ORBIT_HOME/runtime/mcp-pi-*.json` `0600`，经环境变量与 `cleanup_paths` 托管，零 `argv` 凭据泄露）
 - **通用 ACP 生态与客户端回调**：`acp_registry.rs`、`acp_providers.rs`、`acp_generic.rs`、`acp_callbacks.rs` 与 `readiness.rs`（34+ ACP Agent 目录，统一通过 `acp_callbacks::AcpCallbackHost` 声明并实现工作区隔离的 `fs/read_text_file`、`fs/write_text_file` 及独立进程组 `terminal/*` 回调，支持 `Drop` 自动清理）。
 - **Daemon 异步隔离、OS 文件监听与 SEP-1865 MCP Apps**：
@@ -32,7 +32,7 @@
   1. 驱动命令 `DriverCommand::SendPrompt` 显式区分 `PromptOrigin::Human` 与 `PromptOrigin::Agent`。仅人类主动改向（`Human + Steer`）可在 ACP / Antigravity 驱动上触发 `session/cancel` 抢占当前轮；来自子代理 / Peer 的异步汇报与唤醒（`Agent`）在 ACP / Antigravity 上强制走非打断 FIFO 排队（`Steer` 自动降级为 `Queue`），在 `Codex` / `Claude Code` / `Pi` 上统一通过本地/原生队列顺序投递且绝不在活跃轮中途取消正在执行的工作。
   2. 新增保队列中断 `DriverCommand::InterruptAndDrainQueue`（对应 `WireMessage::InterruptTurn { preserve_queue: true }`）：在人类判定上游长考停滞时终止当前卡死轮，但**保留**所有已排队消息继续冲刷；硬停止（`DriverCommand::Interrupt`）则取消当前轮并丢弃未投递队列。
   3. 全 6 个 Provider 驱动统一通过 `DriverEvent::PromptDeliveryUpdated` 上报权威状态流 `Queued -> Dispatched -> Settled / Dropped`（`Settled` 必须在 `StatusChanged(Idle)` 之前发射），由 `AgentOrchestrator` 持久化隐私安全日志（仅含 ID / turn ID / 时长）与时间线状态更新事件。
-  - **必跑验证**：改动此区域必跑 `pitfall_01`、`pitfall_02`、`pitfall_06`、`pitfall_08`（见 `docs/engineering/testing-and-ci.md`）。
+  - **必跑验证**：改动此区域必跑 `pitfall_01`、`pitfall_02`、`pitfall_06`、`pitfall_08`、`pitfall_09`、`pitfall_12`（见 `docs/engineering/testing-and-ci.md`）。
 
 ---
 

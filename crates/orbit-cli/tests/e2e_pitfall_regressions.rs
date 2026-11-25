@@ -10,6 +10,7 @@
 //! 9. Antigravity interrupt/steer rollback handoff, empty-queue InterruptAndDrainQueue, multi-command shell isolation, native subagent live foreground polling + cancel + restart seq preservation, stderr notices, session_info_update title, and preempted-turn usage ledger
 //! 10. Non-blocking pruned workspace watcher + async CreateAgent + optimistic/Initializing cancel settlement
 //! 11. Antigravity open-RPC background timer/task wait settles reply into `Waiting for 1 timer` and wakes cleanly on timer completion without false stall
+//! 12. Antigravity event-driven brain watcher, late post-turn wakeup reply recovery past 3s idle settle, and post-wakeup ACP replay deduplication
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -495,6 +496,7 @@ import os
 import re
 import select
 import sys
+import threading
 import time
 import urllib.request
 
@@ -678,6 +680,239 @@ while True:
     if kv.get("STDERR_MSG"):
         sys.stderr.write(kv["STDERR_MSG"].replace("_", " ") + "\n")
         sys.stderr.flush()
+
+    if kv.get("WAKEUP_LATE_REPLY_MARKER"):
+        marker_path = kv["WAKEUP_LATE_REPLY_MARKER"]
+        emit({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": SESSION_ID,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_upgrade_1",
+                    "kind": "execute",
+                    "status": "in_progress",
+                    "rawInput": {"CommandLine": "pipx upgrade hermes-agent"},
+                },
+            },
+        })
+        emit({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": SESSION_ID,
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call_upgrade_1",
+                    "kind": "execute",
+                    "status": "completed",
+                    "rawInput": {"CommandLine": "pipx upgrade hermes-agent"},
+                    "rawOutput": (
+                        f"Tool is running as a background task with task id: {SESSION_ID}/task-upgrade\n"
+                        "Task Description: Upgrade Hermes Agent\n"
+                        "Task logs are available at: file:///tmp/upgrade.log\n"
+                    ),
+                },
+            },
+        })
+        append_transcript(SESSION_ID, [
+            {
+                "step_index": 0,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "content": "",
+                "tool_calls": [
+                    {"id": "wake_init_0", "name": "run_command", "args": {"CommandLine": "pipx upgrade hermes-agent"}}
+                ],
+            },
+            {
+                "step_index": 1,
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": (
+                    f"Tool is running as a background task with task id: {SESSION_ID}/task-upgrade\n"
+                    "Task Description: Upgrade Hermes Agent\n"
+                    "Task logs are available at: file:///tmp/upgrade.log\n"
+                ),
+            },
+        ])
+        STEP_SEQ = max(STEP_SEQ, 10)
+
+        def _late_wakeup_worker(sess_id, mpath):
+            time.sleep(0.35)
+            append_transcript(sess_id, [
+                {
+                    "step_index": 2,
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "content": f"[Message] timestamp=2026-11-25T06:02:57Z sender={sess_id}/task-upgrade status=completed",
+                },
+                {
+                    "step_index": 3,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "content": "",
+                    "tool_calls": [
+                        {"name": "run_command", "args": {"CommandLine": "hermes --version"}},
+                        {"name": "run_command", "args": {"CommandLine": "hermes auth add --device"}},
+                    ],
+                },
+                {
+                    "step_index": 4,
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "content": "v0.23.4\n",
+                },
+                {
+                    "step_index": 5,
+                    "type": "GENERIC",
+                    "status": "RUNNING",
+                    "content": (
+                        f"Tool is running as a background task with task id: {sess_id}/task-oauth\n"
+                        "Task Description: OpenAI OAuth login\n"
+                        "Task logs are available at: file:///tmp/oauth.log\n"
+                    ),
+                },
+            ])
+            # Sleep past WAKEUP_IDLE_SETTLE_GRACE (3s) so UI settles into `bgwait_*`
+            # BEFORE the delayed PLANNER_RESPONSE(DONE) lands on disk.
+            time.sleep(3.5)
+            append_transcript(sess_id, [
+                {
+                    "step_index": 6,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "thinking": "Finished upgrade and started OAuth.",
+                    "content": "WAKEUP_OAUTH_CODE=1NGP-5WS34 — open https://auth.openai.com/codex/device",
+                    "tool_calls": [],
+                },
+            ])
+            with open(mpath, "w", encoding="utf-8") as mfh:
+                mfh.write("done\n")
+
+        threading.Thread(
+            target=_late_wakeup_worker,
+            args=(SESSION_ID, marker_path),
+            daemon=True,
+        ).start()
+
+    if kv.get("REPLAY_WAKEUP_ON_PROMPT") == "1":
+        # Replay prior post-turn wakeup thinking, tools (settled + running bg), and split message
+        emit({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": SESSION_ID,
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": "Finished upgrade and started OAuth."},
+                },
+            },
+        })
+        emit({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": SESSION_ID,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_replay_ver",
+                    "kind": "execute",
+                    "status": "in_progress",
+                    "rawInput": {"CommandLine": "hermes --version"},
+                },
+            },
+        })
+        emit({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": SESSION_ID,
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call_replay_ver",
+                    "kind": "execute",
+                    "status": "completed",
+                    "rawInput": {"CommandLine": "hermes --version"},
+                },
+            },
+        })
+        emit({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": SESSION_ID,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_replay_oauth",
+                    "kind": "execute",
+                    "status": "in_progress",
+                    "rawInput": {"CommandLine": "hermes auth add --device"},
+                    "rawOutput": (
+                        f"Tool is running as a background task with task id: {SESSION_ID}/task-oauth\n"
+                        "Task Description: OpenAI OAuth login\n"
+                        "Task logs are available at: file:///tmp/oauth.log\n"
+                    ),
+                },
+            },
+        })
+        for part in [
+            "WAKEUP_OAUTH_CODE=1NGP-5WS34 — ",
+            "open https://auth.openai.com/codex/device",
+        ]:
+            emit({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": SESSION_ID,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": part},
+                    },
+                },
+            })
+        # Genuine Turn 2 thinking + new tool before final Turn 2 reply (`ECHO=TURN2_OK`).
+        emit({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": SESSION_ID,
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": "Checking OAuth process now."},
+                },
+            },
+        })
+        emit({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": SESSION_ID,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_turn2_ps",
+                    "kind": "execute",
+                    "status": "in_progress",
+                    "rawInput": {"CommandLine": "ps aux | grep hermes"},
+                },
+            },
+        })
+        emit({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": SESSION_ID,
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call_turn2_ps",
+                    "kind": "execute",
+                    "status": "completed",
+                    "rawInput": {"CommandLine": "ps aux | grep hermes"},
+                    "rawOutput": {"exitCode": 0, "stdout": "pid 943613\n"},
+                },
+            },
+        })
 
     if kv.get("BG_SHELL_GATE"):
         call_suffix = kv.get("BG_TAG", "1")
@@ -4032,6 +4267,7 @@ async fn pitfall_11_antigravity_open_rpc_background_wait_settles_and_wakes_witho
         &format!("OPEN_RPC_WAKE_FILE={}", wake_file.display()),
         None,
     );
+
     assert!(
         wait_until(Duration::from_secs(15), || {
             let c = Arc::clone(&core);
@@ -4153,6 +4389,271 @@ async fn pitfall_11_antigravity_open_rpc_background_wait_settles_and_wakes_witho
     assert_ne!(
         initial_entry.0, wakeup_entry.0,
         "wakeup reply must preserve INITIAL_TIMER_ARMED as a distinct segment"
+    );
+
+    drop_core(core).await;
+    drop(rt);
+}
+
+// ============================================================================
+// PITFALL 12: Antigravity Event-Driven Wakeup, Late Reply & ACP Replay Dedup
+// ============================================================================
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pitfall_12_antigravity_event_driven_wakeup_late_reply_and_acp_replay_dedup() {
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    install_mock_script(
+        &MOCK_ANTIGRAVITY_PATH,
+        ProviderKind::Antigravity,
+        "mock_agy_reg.py",
+        MOCK_ANTIGRAVITY_SCRIPT,
+    );
+    let agy_data_dir = base_tmp_dir()
+        .join(format!("orb_reg_mocks_{}", std::process::id()))
+        .join("agy_data");
+    std::fs::create_dir_all(&agy_data_dir).expect("mkdir agy_data");
+    orbit_providers::antigravity::set_agy_data_dir_override(Some(agy_data_dir.clone()));
+
+    let home = new_temp_dir("p12_h");
+    let work = new_temp_dir("p12_w");
+    let marker_path = work.join(".late_reply_written");
+    let _ = std::fs::remove_file(&marker_path);
+
+    let (addr, rt) = spawn_embedded_daemon(home.to_path_buf(), None)
+        .await
+        .expect("spawn daemon");
+    let uri = rt
+        .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("offer")
+        .to_qr_uri()
+        .expect("uri");
+    let (core, host_id) = open_and_connect_core(home.join("c12.db"), uri).await;
+
+    // 1. Turn 1 launches background upgrade task + delayed multi-step post-turn wakeup.
+    core.create_agent(
+        &host_id,
+        &work.to_string_lossy(),
+        ProviderKind::Antigravity,
+        SessionMode::FullAccess,
+        &format!(
+            "WAKEUP_LATE_REPLY_MARKER={} ECHO=TURN1_STARTED",
+            marker_path.to_string_lossy()
+        ),
+        None,
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            async move {
+                c.host_detail(&hid).is_some_and(|d| {
+                    d.agents.iter().any(|a| {
+                        !a.agent_id.starts_with("opt_") && a.provider == ProviderKind::Antigravity
+                    })
+                })
+            }
+        })
+        .await,
+        "Antigravity agent must register"
+    );
+    let agent_id = core
+        .host_detail(&host_id)
+        .expect("host detail")
+        .agents
+        .into_iter()
+        .find(|a| !a.agent_id.starts_with("opt_") && a.provider == ProviderKind::Antigravity)
+        .expect("agent card")
+        .agent_id;
+    core.open_agent_timeline(&host_id, &agent_id);
+
+    // 2. Wakeup runs `hermes --version` and `hermes auth add --device`, then settles into
+    //    background-wait (`!is_running && has_background_tasks`) past the 3s grace BEFORE the late reply.
+    assert!(
+        wait_until(Duration::from_secs(12), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = agent_id.clone();
+            async move {
+                let waiting_bg = c.host_detail(&hid).is_some_and(|d| {
+                    d.agents
+                        .into_iter()
+                        .find(|a| a.agent_id == aid)
+                        .is_some_and(|a| !a.is_running && a.has_background_tasks)
+                });
+                let st = c.agent_stage(&hid, &aid);
+                let has_oauth_tool = collect_stage_items(&st).iter().any(|it| {
+                    matches!(
+                        it,
+                        TimelineItemView::ToolCall {
+                            detail: ToolCallDetail::Shell { command, .. },
+                            status: ToolCallStatus::Running,
+                            ..
+                        } if command.contains("hermes auth add --device")
+                    )
+                });
+                waiting_bg && has_oauth_tool
+            }
+        })
+        .await,
+        "wakeup should execute oauth start and settle into background waiting state"
+    );
+    assert!(
+        !marker_path.exists(),
+        "late PLANNER_RESPONSE marker should not exist yet when wakeup settles to waiting:*"
+    );
+
+    // 3. Wait for delayed PLANNER_RESPONSE(DONE) to hit disk past WAKEUP_IDLE_SETTLE_GRACE, then
+    //    verify OS-native AgyBrainWatcher flushes it BEFORE Turn 2 in < 1.3s (faster than 2s safety net).
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            let mp = marker_path.clone();
+            async move { mp.exists() }
+        })
+        .await,
+        "delayed PLANNER_RESPONSE marker must be written"
+    );
+    let marker_seen_at = Instant::now();
+    assert!(
+        wait_until(Duration::from_millis(1300), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = agent_id.clone();
+            async move { stage_has_text(&c, &hid, &aid, "WAKEUP_OAUTH_CODE=1NGP-5WS34") }
+        })
+        .await,
+        "event-driven watcher must flush late post-turn wakeup reply before Turn 2 (elapsed={:?})",
+        marker_seen_at.elapsed()
+    );
+
+    // 4. Send Turn 2: mock `agy` replays wakeup thought/tools/running-bg/split-message, then emits
+    //    Turn 2 thinking, `ps aux | grep hermes`, and `REPLY=TURN2_OK`.
+    core.send_prompt(
+        &host_id,
+        &agent_id,
+        "REPLAY_WAKEUP_ON_PROMPT=1 ECHO=TURN2_OK",
+    );
+    assert!(
+        wait_until(Duration::from_secs(12), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = agent_id.clone();
+            async move {
+                let st = c.agent_stage(&hid, &aid);
+                let has_ps = collect_stage_items(&st).iter().any(|it| {
+                    matches!(
+                        it,
+                        TimelineItemView::ToolCall {
+                            detail: ToolCallDetail::Shell { command, .. },
+                            status: ToolCallStatus::Completed,
+                            ..
+                        } if command.contains("ps aux | grep hermes")
+                    )
+                });
+                has_ps && stage_has_text(&c, &hid, &aid, "REPLY=TURN2_OK")
+            }
+        })
+        .await,
+        "Turn 2 must complete new tool and new reply cleanly"
+    );
+
+    // 5. Audit entire timeline across turns to guarantee zero duplicates for replayed items.
+    let final_stage = core.agent_stage(&host_id, &agent_id);
+    let mut seen_msg_ids = HashSet::new();
+    let mut seen_th_ids = HashSet::new();
+    let mut seen_tool_ids = HashSet::new();
+    let mut msg_texts = Vec::new();
+    let mut th_texts = Vec::new();
+    let mut tool_rows: Vec<(ToolCallStatus, String)> = Vec::new();
+
+    for it in collect_stage_items(&final_stage) {
+        match it {
+            TimelineItemView::AssistantMessage { item_id, text, .. }
+                if seen_msg_ids.insert(item_id.clone()) =>
+            {
+                msg_texts.push(text.clone());
+            }
+            TimelineItemView::AssistantThinking { item_id, text, .. }
+                if seen_th_ids.insert(item_id.clone()) =>
+            {
+                th_texts.push(text.clone());
+            }
+            TimelineItemView::ToolCall {
+                call_id,
+                status,
+                detail: ToolCallDetail::Shell { command, .. },
+                ..
+            } if seen_tool_ids.insert(call_id.clone()) => {
+                tool_rows.push((*status, command.clone()));
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        msg_texts
+            .iter()
+            .filter(|t| t.contains("WAKEUP_OAUTH_CODE=1NGP-5WS34"))
+            .count(),
+        1,
+        "replayed wakeup message must appear exactly once, got: {msg_texts:?}"
+    );
+    assert_eq!(
+        msg_texts
+            .iter()
+            .filter(|t| t.contains("REPLY=TURN2_OK"))
+            .count(),
+        1,
+        "Turn 2 reply must appear exactly once, got: {msg_texts:?}"
+    );
+    assert_eq!(
+        th_texts
+            .iter()
+            .filter(|t| t.contains("Finished upgrade and started OAuth."))
+            .count(),
+        1,
+        "replayed wakeup thinking must appear exactly once, got: {th_texts:?}"
+    );
+    assert_eq!(
+        th_texts
+            .iter()
+            .filter(|t| t.contains("Checking OAuth process now."))
+            .count(),
+        1,
+        "Turn 2 thinking must appear once, got: {th_texts:?}"
+    );
+    assert_eq!(
+        tool_rows
+            .iter()
+            .filter(|(_, cmd)| cmd.contains("hermes --version"))
+            .count(),
+        1,
+        "replayed completed wakeup command must appear once, got: {tool_rows:?}"
+    );
+    let oauth_cards: Vec<_> = tool_rows
+        .iter()
+        .filter(|(_, cmd)| cmd.contains("hermes auth add --device"))
+        .collect();
+    assert_eq!(
+        oauth_cards.len(),
+        1,
+        "replayed running background command must not duplicate, got: {tool_rows:?}"
+    );
+    assert_eq!(
+        oauth_cards[0].0,
+        ToolCallStatus::Running,
+        "active background OAuth task must remain Running"
+    );
+    assert_eq!(
+        tool_rows
+            .iter()
+            .filter(|(st, cmd)| *st == ToolCallStatus::Completed
+                && cmd.contains("ps aux | grep hermes"))
+            .count(),
+        1,
+        "genuine Turn 2 command must run and complete once, got: {tool_rows:?}"
     );
 
     drop_core(core).await;

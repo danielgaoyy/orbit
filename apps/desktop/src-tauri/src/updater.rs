@@ -1492,7 +1492,11 @@ pub async fn sync_local_daemon(force: bool) -> Result<LocalDaemonSyncResult, Str
             && let Ok(addr) = raw_addr.trim().parse::<std::net::SocketAddr>()
             && addr.port() > 0
         {
-            up_cmd.arg("daemon").arg("up").arg("--listen").arg(addr.to_string());
+            up_cmd
+                .arg("daemon")
+                .arg("up")
+                .arg("--listen")
+                .arg(addr.to_string());
         } else {
             up_cmd.args(["daemon", "up"]);
         }

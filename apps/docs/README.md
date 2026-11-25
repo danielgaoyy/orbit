@@ -17,3 +17,8 @@ npm run dev      # Start local dev server
 npm run build    # Static build + Pagefind search index into dist/
 npm run preview  # Preview the built static site locally
 ```
+
+## Deployment
+
+- **GitHub Pages (automatic)**: [`.github/workflows/docs-pages.yml`](../../.github/workflows/docs-pages.yml) deploys `apps/docs/dist` on every `main` push touching `apps/docs/**` to `https://danielgaoyy.github.io/orbit/`.
+- **Custom domain / Cloudflare Pages**: Set `ORBIT_DOCS_SITE=https://your-domain.example` and `ORBIT_DOCS_BASE=/` before running `npm run build` (GitHub Pages automatically injects `origin` and `base_path` via `actions/configure-pages@v5`).

@@ -1,8 +1,20 @@
 import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
 
+const docsSite = (process.env.ORBIT_DOCS_SITE || "https://danielgaoyy.github.io").replace(
+  /\/+$/,
+  "",
+);
+const rawBase = process.env.ORBIT_DOCS_BASE ?? "/orbit";
+const docsBase =
+  rawBase === "/" || rawBase === ""
+    ? "/"
+    : `/${rawBase.replace(/^\/+|\/+$/g, "")}`;
+const basePrefix = docsBase === "/" ? "" : docsBase;
+
 export default defineConfig({
-  site: "https://danielgaoyy.github.io",
+  site: docsSite,
+  base: docsBase,
   integrations: [
     starlight({
       title: {
@@ -41,7 +53,7 @@ export default defineConfig({
           tag: "meta",
           attrs: {
             property: "og:image",
-            content: "/images/orbit-desktop-dark.png",
+            content: `${docsSite}${basePrefix}/images/orbit-desktop-dark.png`,
           },
         },
         {

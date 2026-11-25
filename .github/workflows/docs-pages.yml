@@ -1,0 +1,60 @@
+name: Deploy Documentation Site to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/docs/**"
+      - ".github/workflows/docs-pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Astro Starlight Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: apps/docs/package-lock.json
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v5
+      - name: Install & Build Bilingual Docs Site
+        working-directory: apps/docs
+        env:
+          ORBIT_DOCS_SITE: ${{ steps.pages.outputs.origin }}
+          ORBIT_DOCS_BASE: ${{ steps.pages.outputs.base_path }}
+        run: |
+          npm ci
+          npm run build
+          # Disable Jekyll processing so `_astro/` assets are served verbatim
+          touch dist/.nojekyll
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: apps/docs/dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

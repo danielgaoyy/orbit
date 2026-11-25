@@ -6,7 +6,7 @@
 
 A pure-Rust, low-latency, multi-host orchestration engine and cross-platform native control plane for AI coding agents.
 
-**English** | [简体中文](README.zh-CN.md) · [Documentation & Showcase (`apps/docs`)](apps/docs/README.md)
+**English** | [简体中文](README.zh-CN.md) · [Documentation & Showcase](https://danielgaoyy.github.io/orbit/)
 
 [![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-14161D.svg)](LICENSE)
 [![Pure Rust](https://img.shields.io/badge/core-Pure%20Rust-14161D.svg)](ARCHITECTURE.md)

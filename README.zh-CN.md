@@ -6,7 +6,7 @@
 
 纯 Rust 构建的低延迟、多主机 AI 编码代理编排引擎与跨平台原生控制平面。
 
-[English](README.md) | **简体中文** · [双语门面站与文档中心（`apps/docs`）](apps/docs/README.md)
+[English](README.md) | **简体中文** · [双语官网与文档中心](https://danielgaoyy.github.io/orbit/zh-cn/)
 
 [![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-14161D.svg)](LICENSE)
 [![Pure Rust](https://img.shields.io/badge/core-Pure%20Rust-14161D.svg)](ARCHITECTURE.md)

@@ -69,6 +69,7 @@ import {
   type SlashCommandView,
   type VoiceTranscriptionResult,
   isAgentForegroundRunning,
+  isAgentTurnBusy,
   isMacDesktop,
   isTauriRuntime,
   orbitIpc,
@@ -99,6 +100,7 @@ import {
   type ContextMentionItem,
   type DiffQuoteSnippet,
   type InlineMentionTarget,
+  type OrbitUiState,
   type PastedAttachment,
   composerScopeKey,
   orbitActions,
@@ -127,13 +129,15 @@ export function resolveComposerEnterAction(
   enterToSend: boolean,
   isTurnBusy: boolean,
   activeTurnSendBehavior: ActiveTurnSendBehavior = "queue",
+  isAwaitingPermission = false,
 ): { submit: boolean; steerImmediately: boolean } {
   if (e.key !== "Enter" || e.altKey) {
     return { submit: false, steerImmediately: false };
   }
   const hasMod = e.metaKey || e.ctrlKey;
-  const steerOnPrimary = isTurnBusy && activeTurnSendBehavior === "steer";
-  const steerOnAlternate = isTurnBusy && activeTurnSendBehavior !== "steer";
+  const canSteer = isTurnBusy && !isAwaitingPermission;
+  const steerOnPrimary = canSteer && activeTurnSendBehavior === "steer";
+  const steerOnAlternate = canSteer && activeTurnSendBehavior !== "steer";
   if (enterToSend) {
     if (hasMod && !e.shiftKey) {
       return { submit: true, steerImmediately: steerOnAlternate };
@@ -151,6 +155,105 @@ export function resolveComposerEnterAction(
     return { submit: true, steerImmediately: steerOnPrimary };
   }
   return { submit: false, steerImmediately: false };
+}
+
+export interface ComposerTurnPresentation {
+  isTurnBusy: boolean;
+  steerOnPrimarySubmit: boolean;
+  tooltipKey:
+    | "composer.queueAwaitingApprovalHint"
+    | "composer.steerFollowUpHint"
+    | "composer.queueFollowUpHint"
+    | "common.send";
+  placeholderKey:
+    | "composer.placeholderAwaitingApproval"
+    | "composer.placeholderRunningSteer"
+    | "composer.placeholderRunning"
+    | "composer.placeholderFollowUp"
+    | "composer.placeholder";
+}
+
+export function resolveComposerTurnPresentation(opts: {
+  isForegroundRunning: boolean;
+  isAwaitingPermission: boolean;
+  activeTurnSendBehavior: ActiveTurnSendBehavior;
+  hasCurrentAgent: boolean;
+  isDraft: boolean;
+}): ComposerTurnPresentation {
+  const {
+    isForegroundRunning,
+    isAwaitingPermission,
+    activeTurnSendBehavior,
+    hasCurrentAgent,
+    isDraft,
+  } = opts;
+  const isTurnBusy = isForegroundRunning || isAwaitingPermission;
+
+  if (isAwaitingPermission) {
+    return {
+      isTurnBusy,
+      steerOnPrimarySubmit: false,
+      tooltipKey: "composer.queueAwaitingApprovalHint",
+      placeholderKey: "composer.placeholderAwaitingApproval",
+    };
+  }
+  if (isForegroundRunning) {
+    const steer = activeTurnSendBehavior === "steer";
+    return {
+      isTurnBusy,
+      steerOnPrimarySubmit: steer,
+      tooltipKey: steer ? "composer.steerFollowUpHint" : "composer.queueFollowUpHint",
+      placeholderKey: steer ? "composer.placeholderRunningSteer" : "composer.placeholderRunning",
+    };
+  }
+  return {
+    isTurnBusy: false,
+    steerOnPrimarySubmit: false,
+    tooltipKey: "common.send",
+    placeholderKey: !isDraft && hasCurrentAgent ? "composer.placeholderFollowUp" : "composer.placeholder",
+  };
+}
+
+export function resolveVoiceSendPromptSteer(
+  snap: Pick<OrbitUiState, "hostDetails" | "isDraftNewSession" | "activeTurnSendBehavior">,
+  hostId: string,
+  agentId: string | null,
+): boolean {
+  if (!agentId || snap.isDraftNewSession) return false;
+  const ag = snap.hostDetails[hostId]?.agents.find((a) => a.agent_id === agentId);
+  return (
+    isAgentForegroundRunning(ag) &&
+    !ag?.is_awaiting_permission &&
+    snap.activeTurnSendBehavior === "steer"
+  );
+}
+
+export function getEffectiveQueuedPromptCount(
+  snap: Pick<
+    OrbitUiState,
+    | "hostDetails"
+    | "queuedPrompts"
+    | "selectedHostId"
+    | "selectedAgentId"
+    | "selectedWorkspaceCwd"
+    | "isDraftNewSession"
+  >,
+  hostId?: string | null,
+  agentId?: string | null,
+): number {
+  const targetHostId = hostId ?? snap.selectedHostId;
+  const targetAgentId = agentId ?? (snap.isDraftNewSession ? null : snap.selectedAgentId);
+  const detail = targetHostId ? snap.hostDetails[targetHostId] : undefined;
+  if (detail?.host.supports_server_queue) {
+    if (!targetAgentId) return 0;
+    const ag = detail.agents.find((a) => a.agent_id === targetAgentId);
+    return ag?.queued_prompts?.length ?? 0;
+  }
+  const scope =
+    targetHostId && targetAgentId
+      ? `${targetHostId}::${targetAgentId}`
+      : `${targetHostId ?? "none"}::draft::${snap.selectedWorkspaceCwd || "~"}`;
+  return snap.queuedPrompts[scope]?.length ?? 0;
 }
 
 function clipboardPayloadToFile(payload: ClipboardImagePayload): File {
@@ -330,6 +433,7 @@ export const OmniComposer = memo(function OmniComposer({
   const {
     hasCurrentAgent,
     isForegroundRunning,
+    isAwaitingPermission,
     isTurnBusy,
     activeAgentMode,
     activeWorkspaceId,
@@ -341,6 +445,7 @@ export const OmniComposer = memo(function OmniComposer({
       return {
         hasCurrentAgent: false,
         isForegroundRunning: false,
+        isAwaitingPermission: false,
         isTurnBusy: false,
         activeAgentMode: null as SessionMode | null,
         activeWorkspaceId: null as string | null,
@@ -356,10 +461,13 @@ export const OmniComposer = memo(function OmniComposer({
       : modeRaw.startsWith("custom:")
         ? { custom: modeRaw.slice("custom:".length) }
         : (modeRaw as SessionMode);
+    const foregroundRunning = runningFlag === "1";
+    const awaitingPermission = permFlag === "1";
     return {
       hasCurrentAgent: true,
-      isForegroundRunning: runningFlag === "1",
-      isTurnBusy: runningFlag === "1" || permFlag === "1",
+      isForegroundRunning: foregroundRunning,
+      isAwaitingPermission: awaitingPermission,
+      isTurnBusy: foregroundRunning || awaitingPermission,
       activeAgentMode: parsedMode,
       activeWorkspaceId: wsId || null,
       activeAgentProvider: (prov || null) as ProviderKind | null,
@@ -1487,7 +1595,13 @@ export const OmniComposer = memo(function OmniComposer({
       }
     }
 
-    const enterAction = resolveComposerEnterAction(e, enterToSend, isTurnBusy, activeTurnSendBehavior);
+    const enterAction = resolveComposerEnterAction(
+      e,
+      enterToSend,
+      isTurnBusy,
+      activeTurnSendBehavior,
+      isAwaitingPermission,
+    );
     if (enterAction.submit) {
       e.preventDefault();
       triggerSubmit(enterAction.steerImmediately);
@@ -1501,7 +1615,24 @@ export const OmniComposer = memo(function OmniComposer({
     textareaRef.current?.setSelectionRange(0, 0);
   }, []);
   const handleSelectModeSilent = useCallback((mode: SessionMode) => handleSelectMode(mode, false), [handleSelectMode]);
-  const steerOnPrimarySubmit = isTurnBusy && activeTurnSendBehavior === "steer";
+  const turnPresentation = useMemo(
+    () =>
+      resolveComposerTurnPresentation({
+        isForegroundRunning,
+        isAwaitingPermission,
+        activeTurnSendBehavior,
+        hasCurrentAgent,
+        isDraft,
+      }),
+    [
+      isForegroundRunning,
+      isAwaitingPermission,
+      activeTurnSendBehavior,
+      hasCurrentAgent,
+      isDraft,
+    ],
+  );
+  const steerOnPrimarySubmit = turnPresentation.steerOnPrimarySubmit;
   const handleSubmitClick = useCallback(
     () => triggerSubmit(steerOnPrimarySubmit),
     [triggerSubmit, steerOnPrimarySubmit],
@@ -1589,7 +1720,12 @@ export const OmniComposer = memo(function OmniComposer({
           const next = cur.trim() ? `${cur.trimEnd()} ${spoken}` : spoken;
           orbitActions.setComposerDraft(next);
           if (explicitSend) {
-            void orbitActions.submitComposer().catch((err) => {
+            const steer = resolveVoiceSendPromptSteer(
+              orbitActions.getSnapshot(),
+              hostId,
+              agentId,
+            );
+            void orbitActions.submitComposer(steer).catch((err) => {
               orbitActions.showToast(err instanceof Error ? err.message : String(err));
             });
           } else {
@@ -1666,8 +1802,7 @@ export const OmniComposer = memo(function OmniComposer({
         }
         case "queue_status": {
           const snap = orbitActions.getSnapshot();
-          const scope = composerScopeKey(snap);
-          const count = snap.queuedPrompts[scope]?.length ?? 0;
+          const count = getEffectiveQueuedPromptCount(snap, hostId, agentId);
           orbitActions.showToast(
             count === 0
               ? t("composer.voiceQueueEmpty")
@@ -1732,7 +1867,12 @@ export const OmniComposer = memo(function OmniComposer({
           return;
         }
         case "cancel": {
-          if (agentId && isTurnBusy) {
+          const snap = orbitActions.getSnapshot();
+          const liveAgent = agentId
+            ? snap.hostDetails[hostId]?.agents.find((a) => a.agent_id === agentId)
+            : undefined;
+          const liveBusy = liveAgent ? isAgentTurnBusy(liveAgent) : isTurnBusy;
+          if (agentId && liveBusy) {
             void orbitIpc.interruptAgent(hostId, agentId);
             orbitActions.showToast(t("composer.voiceTurnStopped"));
           } else {
@@ -1913,11 +2053,12 @@ export const OmniComposer = memo(function OmniComposer({
     ? t("composer.uploadingAttachments")
     : isSubmitting && !localSubmission
       ? t("composer.sendingPrompt")
-      : isTurnBusy && !localSubmission
-        ? activeTurnSendBehavior === "steer"
-          ? t("composer.steerFollowUpHint", { shortcut: alternateSendShortcut })
-          : t("composer.queueFollowUpHint", { shortcut: alternateSendShortcut })
-        : t("common.send");
+      : localSubmission
+        ? t("common.send")
+        : turnPresentation.tooltipKey === "composer.steerFollowUpHint" ||
+            turnPresentation.tooltipKey === "composer.queueFollowUpHint"
+          ? t(turnPresentation.tooltipKey, { shortcut: alternateSendShortcut })
+          : t(turnPresentation.tooltipKey);
   const submitShortcut = submitBusy ? undefined : enterToSend ? "↵" : `${mod}↵`;
 
   const dynamicPlaceholder = (() => {
@@ -1943,15 +2084,10 @@ export const OmniComposer = memo(function OmniComposer({
       default:
         break;
     }
-    if (isForegroundRunning) {
-      return activeTurnSendBehavior === "steer"
-        ? t("composer.placeholderRunningSteer", { shortcut: alternateSendShortcut })
-        : t("composer.placeholderRunning", { shortcut: alternateSendShortcut });
-    }
-    if (!isDraft && hasCurrentAgent) {
-      return t("composer.placeholderFollowUp");
-    }
-    return t("composer.placeholder");
+    return turnPresentation.placeholderKey === "composer.placeholderRunningSteer" ||
+      turnPresentation.placeholderKey === "composer.placeholderRunning"
+      ? t(turnPresentation.placeholderKey, { shortcut: alternateSendShortcut })
+      : t(turnPresentation.placeholderKey);
   })();
 
   return (

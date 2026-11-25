@@ -281,6 +281,7 @@ export const ja: MessageDictionary = {
   "composer.placeholderFollowUp": "続けて入力（@ で参照、/ でアクション）",
   "composer.placeholderRunning": "続けて入力、または {shortcut} でステア…",
   "composer.placeholderRunningSteer": "実行中のエージェントへ指示、または {shortcut} でキューに追加…",
+  "composer.placeholderAwaitingApproval": "承認待ちの間に入力するとキューに追加されます…",
   "composer.placeholderBtw": "サイド質問を入力…",
   "composer.placeholderGoal": "目標を入力…",
   "composer.placeholderPlan": "計画したい内容を入力…",
@@ -424,6 +425,7 @@ export const ja: MessageDictionary = {
 
   "composer.queueFollowUpHint": "キューに追加 · {shortcut} 今すぐ指示",
   "composer.steerFollowUpHint": "今すぐ指示 · {shortcut} でキューに追加",
+  "composer.queueAwaitingApprovalHint": "キューに追加（承認後に送信）",
   "composer.sendingPrompt": "送信中…",
   "composer.uploadingAttachments": "添付ファイルをアップロード中…",
   "composer.editQueuedTooltip": "下書きに戻して編集",
@@ -2286,6 +2288,7 @@ export const ja: MessageDictionary = {
   "overview.talkToPersonalAgentPlaceholder": "パーソナルエージェントにホスト横断の指示を送信…",
   "overview.sendToPersonalAgent": "送信",
   "overview.dispatchedToPersonalAgent": "パーソナルエージェントに指示を送信しました。",
+  "overview.queuedForPersonalAgent": "パーソナルエージェントのキューに指示を追加しました。",
   "overview.setupPersonalAgentPrompt": "パーソナルエージェントを設定すると、ここから全ホストの作業を指示できます。",
   "overview.setupPersonalAgentAction": "パーソナルエージェントを設定",
   "overview.openBoard": "ボードを開く",

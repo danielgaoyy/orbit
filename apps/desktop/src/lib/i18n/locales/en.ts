@@ -280,6 +280,7 @@ export const en = {
   "composer.placeholderFollowUp": "Ask a follow-up, @ to mention, / for actions",
   "composer.placeholderRunning": "Ask a follow-up, or {shortcut} to steer…",
   "composer.placeholderRunningSteer": "Steer running agent, or {shortcut} to queue…",
+  "composer.placeholderAwaitingApproval": "Queue a follow-up while awaiting approval…",
   "composer.placeholderBtw": "Ask a side question…",
   "composer.placeholderGoal": "Describe the goal…",
   "composer.placeholderPlan": "Describe what you want to plan…",
@@ -423,6 +424,7 @@ export const en = {
 
   "composer.queueFollowUpHint": "Queue follow-up · {shortcut} steer now",
   "composer.steerFollowUpHint": "Steer now · {shortcut} queue instead",
+  "composer.queueAwaitingApprovalHint": "Queue follow-up (sends after approval)",
   "composer.sendingPrompt": "Sending…",
   "composer.uploadingAttachments": "Uploading attachments…",
   "composer.editQueuedTooltip": "Move back to draft",
@@ -2288,6 +2290,7 @@ export const en = {
   "overview.talkToPersonalAgentPlaceholder": "Instruct your Personal Agent across hosts…",
   "overview.sendToPersonalAgent": "Send",
   "overview.dispatchedToPersonalAgent": "Sent instruction to your Personal Agent.",
+  "overview.queuedForPersonalAgent": "Queued instruction for your Personal Agent.",
   "overview.setupPersonalAgentPrompt": "Set up a Personal Agent to orchestrate work across all your hosts from here.",
   "overview.setupPersonalAgentAction": "Set up Personal Agent",
   "overview.openBoard": "Open board",

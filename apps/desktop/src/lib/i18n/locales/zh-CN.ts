@@ -273,6 +273,7 @@ export const zhCN: MessageDictionary = {
   "composer.placeholderFollowUp": "继续提问，@ 引用上下文，/ 执行指令",
   "composer.placeholderRunning": "继续提问，或按 {shortcut} 立即引导…",
   "composer.placeholderRunningSteer": "输入内容引导代理，或按 {shortcut} 排队发送…",
+  "composer.placeholderAwaitingApproval": "等待审批期间可先输入，消息将自动排队…",
   "composer.placeholderBtw": "输入旁路问题…",
   "composer.placeholderGoal": "描述目标…",
   "composer.placeholderPlan": "描述你想要规划的目标或需求…",
@@ -416,6 +417,7 @@ export const zhCN: MessageDictionary = {
 
   "composer.queueFollowUpHint": "加入队列 · {shortcut} 立即引导",
   "composer.steerFollowUpHint": "立即引导 · {shortcut} 改为排队",
+  "composer.queueAwaitingApprovalHint": "加入队列（审批完成后自动发送）",
   "composer.sendingPrompt": "正在发送…",
   "composer.uploadingAttachments": "正在上传附件…",
   "composer.editQueuedTooltip": "退回输入框编辑",
@@ -2259,6 +2261,7 @@ export const zhCN: MessageDictionary = {
   "overview.talkToPersonalAgentPlaceholder": "直接向 Personal Agent 下达跨机指令…",
   "overview.sendToPersonalAgent": "发送",
   "overview.dispatchedToPersonalAgent": "已将指令发送给 Personal Agent。",
+  "overview.queuedForPersonalAgent": "已将指令加入 Personal Agent 队列。",
   "overview.setupPersonalAgentPrompt": "配置 Personal Agent 后，可在此直接统一调度多台主机上的所有任务。",
   "overview.setupPersonalAgentAction": "配置 Personal Agent",
   "overview.openBoard": "打开协作看板",

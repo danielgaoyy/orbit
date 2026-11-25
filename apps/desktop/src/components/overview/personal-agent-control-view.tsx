@@ -13,6 +13,7 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
+import { resolveComposerEnterAction } from "@/components/composer/omni-composer";
 import { AgentStagePane } from "@/components/stage/agent-stage-pane";
 import { Button } from "@/components/ui/button";
 import { DiffStat } from "@/components/ui/diff-stat";
@@ -29,6 +30,7 @@ import {
   type PendingPermissionSummary,
   type ToolCallDetail,
   isAgentForegroundRunning,
+  isAgentTurnBusy,
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { isAlwaysDecision, isDenyDecision } from "@/lib/timeline-coalesce";
@@ -132,6 +134,7 @@ export const PersonalAgentControlView = memo(function PersonalAgentControlView()
   const threadCustomTitles = useOrbitSelector((s) => s.threadCustomTitles);
   const overviewPinnedLanes = useOrbitSelector((s) => s.overviewPinnedLanes);
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
+  const activeTurnSendBehavior = useOrbitSelector((s) => s.activeTurnSendBehavior);
 
   const [busyDecisionKeys, setBusyDecisionKeys] = useState<Record<string, true>>({});
   const [batchApproving, setBatchApproving] = useState(false);
@@ -481,24 +484,26 @@ export const PersonalAgentControlView = memo(function PersonalAgentControlView()
     }
   }, [batchApproving, lowRiskBatchItems, t]);
 
-  const handleSendToPersonalAgent = useCallback(async () => {
+  const handleSendToPersonalAgent = useCallback(async (steerOverride?: boolean) => {
     const trimmed = routerPrompt.trim();
     if (!trimmed || !activePersonalAgent || sendingRouter) return;
     setSendingRouter(true);
     setRouterPrompt("");
     try {
-      await orbitIpc.sendPrompt(
+      const outcome = await orbitActions.dispatchDirectAgentPrompt(
         activePersonalAgent.hostId,
         activePersonalAgent.agent.agent_id,
         trimmed,
         {
           displayPrompt: trimmed,
-          activeTurnBehavior: isAgentForegroundRunning(activePersonalAgent.agent)
-            ? "steer"
-            : "queue",
+          steerImmediately: steerOverride,
         },
       );
-      orbitActions.showToast(t("overview.dispatchedToPersonalAgent"));
+      orbitActions.showToast(
+        outcome === "queued"
+          ? t("overview.queuedForPersonalAgent")
+          : t("overview.dispatchedToPersonalAgent"),
+      );
     } catch (err) {
       setRouterPrompt((cur) => (cur.trim() ? cur : trimmed));
       orbitActions.showToast(
@@ -903,12 +908,16 @@ export const PersonalAgentControlView = memo(function PersonalAgentControlView()
                 {...routerIme.compositionProps}
                 onKeyDown={(e) => {
                   if (routerIme.shouldIgnoreKeyDown(e)) return;
-                  const submit = enterToSend
-                    ? e.key === "Enter" && !e.shiftKey
-                    : e.key === "Enter" && (e.metaKey || e.ctrlKey);
-                  if (submit) {
+                  const enterAction = resolveComposerEnterAction(
+                    e,
+                    enterToSend,
+                    isAgentTurnBusy(activePersonalAgent.agent),
+                    activeTurnSendBehavior,
+                    Boolean(activePersonalAgent.agent.is_awaiting_permission),
+                  );
+                  if (enterAction.submit) {
                     e.preventDefault();
-                    void handleSendToPersonalAgent();
+                    void handleSendToPersonalAgent(enterAction.steerImmediately);
                   }
                 }}
                 placeholder={t("overview.talkToPersonalAgentPlaceholder")}

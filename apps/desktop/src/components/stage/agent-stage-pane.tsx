@@ -7,6 +7,7 @@ import {
   Square,
   X,
 } from "lucide-react";
+import { resolveComposerEnterAction } from "@/components/composer/omni-composer";
 import {
   ConversationViewport,
   useViewportAnchorHold,
@@ -89,6 +90,7 @@ export const AgentStagePane = memo(function AgentStagePane({
   const hostDetail = useOrbitSelector((s) => (hostId ? (s.hostDetails[hostId] ?? null) : null));
   const customTitle = useOrbitSelector((s) => s.threadCustomTitles[tKey] ?? null);
   const coalesceExploration = useOrbitSelector((s) => s.coalesceExploration);
+  const activeTurnSendBehavior = useOrbitSelector((s) => s.activeTurnSendBehavior);
   const connectionState = useOrbitSelector((s) =>
     hostId
       ? (s.fleet.hosts.find((h) => h.host_id === hostId)?.connection_state ??
@@ -103,6 +105,8 @@ export const AgentStagePane = memo(function AgentStagePane({
     : null;
   const cwd = agent?.cwd ?? fallbackCwd ?? "";
   const foregroundRunning = isAgentForegroundRunning(agent);
+  const awaitingPermission = Boolean(agent?.is_awaiting_permission);
+  const isTurnBusy = foregroundRunning || awaitingPermission;
 
   const selectSession = useMemo(
     () => createStageSessionSelector(hostId || null, agentId || null),
@@ -182,16 +186,16 @@ export const AgentStagePane = memo(function AgentStagePane({
   const lastTurn = turns[turns.length - 1];
   const contentVersion = `${turns.length}:${stage?.latest_seq ?? 0}:${lastTurn?.live_segments.length ?? 0}:${isRunning ? 1 : 0}`;
 
-  const handleSend = async () => {
+  const handleSend = async (steerOverride?: boolean) => {
     const trimmed = reply.trim();
     if (!trimmed || !hostId || !agentId || sending) return;
     setSending(true);
     setReply("");
     stickToBottomRef.current = true;
     try {
-      await orbitIpc.sendPrompt(hostId, agentId, trimmed, {
+      await orbitActions.dispatchDirectAgentPrompt(hostId, agentId, trimmed, {
         displayPrompt: trimmed,
-        activeTurnBehavior: foregroundRunning ? "steer" : "queue",
+        steerImmediately: steerOverride,
       });
     } catch (err) {
       setReply((cur) => recoverReplyDraftAfterSendError(cur, trimmed));
@@ -382,15 +386,22 @@ export const AgentStagePane = memo(function AgentStagePane({
             {...replyIme.compositionProps}
             onKeyDown={(e) => {
               if (replyIme.shouldIgnoreKeyDown(e)) return;
-              if (e.key === "Enter" && !e.shiftKey) {
+              const enterAction = resolveComposerEnterAction(
+                e,
+                true,
+                isTurnBusy,
+                activeTurnSendBehavior,
+                awaitingPermission,
+              );
+              if (enterAction.submit) {
                 e.preventDefault();
-                void handleSend();
+                void handleSend(enterAction.steerImmediately);
               }
             }}
             placeholder={t("overview.messageAgentPlaceholder", { name: handleLabel })}
             className="text-ink-primary placeholder:text-ink-faint min-w-0 flex-1 bg-transparent text-[13px] leading-[18px] outline-none"
           />
-          {foregroundRunning && !reply.trim() ? (
+          {isTurnBusy && !reply.trim() ? (
             <button
               type="button"
               title={t("overview.stopAgent")}

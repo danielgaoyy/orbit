@@ -31,10 +31,7 @@ export const SETTING_ENTRIES = [
   ["notifications", "settings.notifyQuietHours", "desktop quiet hours do not disturb 免打扰 勿扰 おやすみ"],
   ["notifications", "settings.pushEnabled", "mobile background push 移动推送 プッシュ通知"],
   ["notifications", "settings.pushMessagePreview", "push message preview 消息预览 通知プレビュー"],
-  ["notifications", "settings.pushEvents", "mobile push events 推送事件 プッシュイベント"],
   ["notifications", "settings.pushQuietHours", "mobile quiet hours 移动免打扰 モバイル静音"],
-  ["notifications", "settings.pushGatewayUrl", "push gateway endpoint 网关地址 ゲートウェイ"],
-  ["notifications", "settings.pushGatewayToken", "push gateway authentication token 网关令牌 認証トークン"],
   ["notifications", "settings.pushRegisteredDevices", "registered phone devices 已注册设备 登録端末"],
 
   ["voice", "voice.enableTitle", "dictation speech microphone 语音听写 音声入力"],

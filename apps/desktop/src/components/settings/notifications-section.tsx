@@ -11,8 +11,6 @@ import {
 } from "@/components/settings/settings-primitives";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
-import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
-import { Input } from "@/components/ui/input";
 import { t, useI18n } from "@/lib/i18n";
 import { playSoftNotificationChime } from "@/lib/notification-sound";
 import type { PushPlatform, PushPreferences } from "@/lib/orbit-ipc";
@@ -140,13 +138,8 @@ export function NotificationsSection() {
     }
   };
 
-  // Draft state for host mobile push gateway & preferences.
-  // Tracks `isDirty` so background refreshes don't clobber unsaved edits, while host switches
-  // ALWAYS reset cleanly to the newly selected host's preferences (or defaults if not loaded yet).
+  // Local mirror for host mobile push preferences; toggles & selects save immediately.
   const [draftPrefs, setDraftPrefs] = useState<PushPreferences>(DEFAULT_PUSH_PREFS);
-  const [gatewayTokenInput, setGatewayTokenInput] = useState("");
-  const [clearStoredToken, setClearStoredToken] = useState(false);
-  const [isDirty, setIsDirty] = useState(false);
   const [pendingRemoveDevice, setPendingRemoveDevice] = useState<{
     hostId: string;
     hostName: string;
@@ -173,39 +166,25 @@ export function NotificationsSection() {
     if (hostChanged) {
       lastSyncedHostIdRef.current = activeHostId;
       setDraftPrefs(pushEntry?.preferences ?? DEFAULT_PUSH_PREFS);
-      setGatewayTokenInput("");
-      setClearStoredToken(false);
-      setIsDirty(false);
       return;
     }
-    if (!isDirty && pushEntry?.preferences) {
+    if (pushEntry?.preferences) {
       setDraftPrefs(pushEntry.preferences);
-      setGatewayTokenInput("");
-      setClearStoredToken(false);
     }
-  }, [activeHostId, pushEntry?.preferences, isDirty]);
+  }, [activeHostId, pushEntry?.preferences]);
 
-  const updateDraftPrefs = (updater: (prev: PushPreferences) => PushPreferences) => {
-    setIsDirty(true);
-    setDraftPrefs(updater);
-  };
-
-  const handleSaveMobilePrefs = async () => {
+  const persistMobilePrefs = async (updater: (prev: PushPreferences) => PushPreferences) => {
     if (!activeHostId || pushEntry?.status !== "ready") return;
-    const tokenTrimmed = gatewayTokenInput.trim();
-    const res = await orbitActions.updatePushPreferences(activeHostId, {
-      preferences: {
-        ...draftPrefs,
-        push_gateway_url: draftPrefs.push_gateway_url?.trim() || null,
-      },
-      gateway_auth_token: tokenTrimmed ? tokenTrimmed : null,
-      keep_existing_gateway_token: !clearStoredToken && !tokenTrimmed,
+    const hostIdAtStart = activeHostId;
+    const nextPrefs = updater(draftPrefs);
+    setDraftPrefs(nextPrefs);
+    const res = await orbitActions.updatePushPreferences(hostIdAtStart, {
+      preferences: nextPrefs,
+      gateway_auth_token: null,
+      keep_existing_gateway_token: true,
     });
-    if (res && lastSyncedHostIdRef.current === activeHostId) {
+    if (res && lastSyncedHostIdRef.current === hostIdAtStart) {
       setDraftPrefs(res.preferences);
-      setGatewayTokenInput("");
-      setClearStoredToken(false);
-      setIsDirty(false);
     }
   };
 
@@ -404,7 +383,7 @@ export function NotificationsSection() {
         </SettingCard>
       </div>
 
-      {/* Mobile Background Push & Gateway */}
+      {/* Mobile Background Push */}
       <div className="space-y-2">
         <div className="flex items-center justify-between">
           <SettingGroupLabel>{t("settings.pushGroup")}</SettingGroupLabel>
@@ -429,8 +408,8 @@ export function NotificationsSection() {
             <ToggleSwitch
               ariaLabel={t("settings.pushEnabled")}
               checked={draftPrefs.enabled}
-              disabled={!isPushReady}
-              onChange={(v) => updateDraftPrefs((p) => ({ ...p, enabled: v }))}
+              disabled={!isPushReady || pushEntry?.saving}
+              onChange={(v) => void persistMobilePrefs((p) => ({ ...p, enabled: v }))}
             />
           </SettingRow>
 
@@ -449,46 +428,9 @@ export function NotificationsSection() {
               <ToggleSwitch
                 ariaLabel={t("settings.pushMessagePreview")}
                 checked={draftPrefs.include_message_preview}
-                disabled={!isPushReady}
-                onChange={(v) => updateDraftPrefs((p) => ({ ...p, include_message_preview: v }))}
+                disabled={!isPushReady || pushEntry?.saving}
+                onChange={(v) => void persistMobilePrefs((p) => ({ ...p, include_message_preview: v }))}
               />
-            </div>
-          </SettingRow>
-
-          <SettingRow
-            settingId="settings.pushEvents"
-            title={t("settings.pushEvents")}
-            description={t("settings.pushEventsDesc")}
-          >
-            <div className="flex flex-wrap justify-end gap-1.5">
-              {(
-                [
-                  ["notify_permission_required", t("settings.pushApprovals")],
-                  ["notify_turn_completed", t("settings.pushTurns")],
-                  ["notify_agent_error", t("settings.pushErrors")],
-                  ["notify_goal_finished", t("settings.pushGoals")],
-                  ["notify_timer_fired", t("settings.pushTimers")],
-                ] as const
-              ).map(([field, label]) => {
-                const active = draftPrefs[field];
-                return (
-                  <button
-                    key={field}
-                    aria-pressed={active}
-                    type="button"
-                    disabled={!isPushReady}
-                    onClick={() => updateDraftPrefs((p) => ({ ...p, [field]: !p[field] }))}
-                    className={cn(
-                      "h-[26px] cursor-pointer rounded-md border px-2 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50",
-                      active
-                        ? "border-border-strong bg-surface-recessed text-ink-primary"
-                        : "border-border-default text-ink-muted hover:text-ink-primary",
-                    )}
-                  >
-                    {label}
-                  </button>
-                );
-              })}
             </div>
           </SettingRow>
 
@@ -505,11 +447,11 @@ export function NotificationsSection() {
                     ariaLabel={t("settings.notifyQuietStart")}
                     value={draftPrefs.quiet_start_hour}
                     options={HOUR_OPTIONS}
-                    disabled={!isPushReady}
+                    disabled={!isPushReady || pushEntry?.saving}
                     triggerClassName="min-w-[82px]"
                     menuClassName="min-w-[104px]"
                     onChange={(hour) =>
-                      updateDraftPrefs((p) => ({ ...p, quiet_start_hour: hour }))
+                      void persistMobilePrefs((p) => ({ ...p, quiet_start_hour: hour }))
                     }
                   />
                   <span className="text-ink-muted" aria-hidden>–</span>
@@ -518,11 +460,11 @@ export function NotificationsSection() {
                     ariaLabel={t("settings.notifyQuietEnd")}
                     value={draftPrefs.quiet_end_hour}
                     options={HOUR_OPTIONS}
-                    disabled={!isPushReady}
+                    disabled={!isPushReady || pushEntry?.saving}
                     triggerClassName="min-w-[82px]"
                     menuClassName="min-w-[104px]"
                     onChange={(hour) =>
-                      updateDraftPrefs((p) => ({ ...p, quiet_end_hour: hour }))
+                      void persistMobilePrefs((p) => ({ ...p, quiet_end_hour: hour }))
                     }
                   />
                 </div>
@@ -530,66 +472,14 @@ export function NotificationsSection() {
               <ToggleSwitch
                 ariaLabel={t("settings.pushQuietHours")}
                 checked={draftPrefs.quiet_hours_enabled}
-                disabled={!isPushReady}
-                onChange={(v) => updateDraftPrefs((p) => ({ ...p, quiet_hours_enabled: v }))}
+                disabled={!isPushReady || pushEntry?.saving}
+                onChange={(v) => void persistMobilePrefs((p) => ({ ...p, quiet_hours_enabled: v }))}
               />
             </div>
           </SettingRow>
 
-          <FieldGroup className="gap-3 px-4 py-3.5">
-            <Field data-setting-id="settings.pushGatewayUrl">
-              <FieldLabel htmlFor="push-gateway-url" className="text-ink-primary text-[13px]">
-                {t("settings.pushGatewayUrl")}
-              </FieldLabel>
-              <Input
-                id="push-gateway-url"
-                type="url"
-                value={draftPrefs.push_gateway_url ?? ""}
-                disabled={!isPushReady}
-                onChange={(e) =>
-                  updateDraftPrefs((p) => ({ ...p, push_gateway_url: e.target.value }))
-                }
-                placeholder="https://push.example.com/v1/dispatch"
-              />
-            </Field>
-
-            <Field data-setting-id="settings.pushGatewayToken">
-              <div className="flex items-center justify-between">
-                <FieldLabel htmlFor="push-gateway-token" className="text-ink-primary text-[13px]">
-                  {t("settings.pushGatewayToken")}
-                </FieldLabel>
-                {draftPrefs.has_gateway_auth_token && !clearStoredToken && isPushReady && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsDirty(true);
-                      setClearStoredToken(true);
-                    }}
-                    className="text-ink-muted hover:text-ink-primary cursor-pointer text-[11px]"
-                  >
-                    {t("settings.pushClearToken")}
-                  </button>
-                )}
-              </div>
-              <Input
-                id="push-gateway-token"
-                type="password"
-                value={gatewayTokenInput}
-                disabled={!isPushReady}
-                onChange={(e) => {
-                  setIsDirty(true);
-                  setGatewayTokenInput(e.target.value);
-                  if (e.target.value) setClearStoredToken(false);
-                }}
-                placeholder={
-                  draftPrefs.has_gateway_auth_token && !clearStoredToken
-                    ? t("settings.pushKeepToken")
-                    : t("settings.pushOptionalToken")
-                }
-              />
-            </Field>
-
-            <div className="flex items-center justify-between pt-1">
+          {(pushEntry?.error || !isHostOnline || pushEntry?.status !== "ready" || devices.length > 0) && (
+            <div className="flex items-center justify-between gap-3 px-4 py-3">
               <span className="text-ink-muted text-[13px]">
                 {pushEntry?.error
                   ? pushEntry.error
@@ -597,32 +487,23 @@ export function NotificationsSection() {
                     ? t("settings.pushHostOffline")
                     : pushEntry?.status !== "ready"
                       ? t("settings.pushHostLoading")
-                      : t("settings.pushHttps")}
+                      : ""}
               </span>
-              <div className="flex items-center gap-2">
+              {devices.length > 0 && (
                 <Button
                   type="button"
                   variant="outline"
                   size="sm"
                   className="text-[13px]"
-                  disabled={!isPushReady || pushEntry?.testing || devices.length === 0}
+                  disabled={!isPushReady || pushEntry?.testing}
                   onClick={() => void orbitActions.testPushNotification(activeHostId, null)}
                 >
                   <Send className="h-[13px] w-[13px]" />
                   <span>{pushEntry?.testing ? t("settings.pushSending") : t("settings.pushTestNotification")}</span>
                 </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  className="text-[13px]"
-                  disabled={!isDirty || !isPushReady || pushEntry?.saving}
-                  onClick={() => void handleSaveMobilePrefs()}
-                >
-                  <span>{pushEntry?.saving ? t("settings.pushSaving") : t("common.save")}</span>
-                </Button>
-              </div>
+              )}
             </div>
-          </FieldGroup>
+          )}
         </SettingCard>
       </div>
 

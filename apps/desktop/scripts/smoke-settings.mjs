@@ -228,30 +228,69 @@ export async function exerciseLocalSettings(cdp) {
     );
   }
 
+  const assertNoResetButtons = async (context) => {
+    const found = await evaluate(() => ({
+      resetButtons: [...document.querySelectorAll('[data-slot="settings-view"] button')]
+        .filter((btn) =>
+          /\breset\b/i.test(
+            `${btn.getAttribute("aria-label") ?? ""} ${btn.getAttribute("title") ?? ""} ${btn.innerText ?? ""}`,
+          ),
+        )
+        .map((btn) => btn.getAttribute("aria-label") || btn.getAttribute("title") || btn.innerText),
+      modifiedAttrs: document.querySelectorAll('[data-slot="settings-view"] [data-modified]').length,
+    }));
+    assert.deepEqual(
+      found,
+      { resetButtons: [], modifiedAttrs: 0 },
+      `Expected no reset-settings controls on ${context}`,
+    );
+  };
+
   await go("general");
   const toggle = '[data-setting-id="settings.sendWithEnter"] [role="switch"]';
   await click(toggle);
   await waitFor("changed Send with Enter preference", (selector) =>
     document.querySelector(selector)?.getAttribute("aria-checked") === "false", toggle);
+  await assertNoResetButtons("General (after toggling Send with Enter)");
+
+  await go("shortcuts");
+  const cmdPaletteRecorder = '[data-setting-id="settings.scCommandPalette"] button';
+  await click(cmdPaletteRecorder);
+  await waitFor("shortcut recorder active", (selector) =>
+    document.querySelector(selector)?.getAttribute("data-orbit-shortcut-recorder") === "true", cmdPaletteRecorder);
+  await key("K", "KeyK", 9); // Alt+Shift+K
+  await waitFor("custom shortcut badge", () =>
+    document.querySelector('[data-setting-id="settings.scCommandPalette"]')?.innerText.includes("Custom"));
+  await assertNoResetButtons("Shortcuts (with custom shortcut)");
+  await click(cmdPaletteRecorder);
+  await waitFor("shortcut recorder re-opened", (selector) =>
+    document.querySelector(selector)?.getAttribute("data-orbit-shortcut-recorder") === "true", cmdPaletteRecorder);
+  await key("k", "KeyK", 4); // Mod+K back to default
+  await waitFor("custom shortcut cleared", () =>
+    !document.querySelector('[data-setting-id="settings.scCommandPalette"]')?.innerText.includes("Custom"));
+
   await go("data_diagnostics");
-  await click('[data-setting-id="dataOps.resetPreferences"] button');
-  await waitFor("Reset UI Preferences confirmation", () => Boolean(document.querySelector('[role="alertdialog"]')));
-  await key("Escape", "Escape");
-  await waitFor("confirmation cancelled without leaving Data & Diagnostics", () =>
-    !document.querySelector('[role="alertdialog"]') &&
-    document.querySelector('[data-settings-section="data_diagnostics"][aria-current="page"]'));
+  assert.equal(
+    await evaluate(() => Boolean(document.querySelector('[data-setting-id="dataOps.resetPreferences"]'))),
+    false,
+    "Data & Diagnostics should not render Reset UI preferences",
+  );
+  await assertNoResetButtons("Data & Diagnostics");
+
   await go("appearance");
   await key("f", "KeyF", 4);
   const search = 'input[aria-label="Search settings"]';
   await waitFor("keyboard focus in Settings search", (selector) => document.activeElement?.matches(selector), search);
-  await cdp.send("Input.insertText", { text: "@modified" });
-  await waitFor("modified Send with Enter result", () =>
-    document.querySelector('[data-slot="settings-view"]')?.innerText.includes("Send with Enter"));
+  await cdp.send("Input.insertText", { text: "Send with Enter" });
+  await waitFor("Send with Enter search result", () =>
+    document.querySelector("#settings-results")?.innerText.includes("Send with Enter"));
+  await assertNoResetButtons("search results");
   await key("Enter", "Enter");
-  await waitFor("jump to modified row", () =>
+  await waitFor("jump to Send with Enter row", () =>
     document.querySelector('[data-setting-id="settings.sendWithEnter"][data-settings-highlight="true"]') !== null);
-  await click('[data-setting-id="settings.sendWithEnter"] button', "Reset");
-  await waitFor("restored default", (selector) => document.querySelector(selector)?.getAttribute("aria-checked") === "true", toggle);
+  await click(toggle);
+  await waitFor("toggled Send with Enter back to true", (selector) =>
+    document.querySelector(selector)?.getAttribute("aria-checked") === "true", toggle);
 
   await key("f", "KeyF", 4);
   await cdp.send("Input.insertText", { text: "diff layout" });

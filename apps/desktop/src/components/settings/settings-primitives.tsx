@@ -1,9 +1,7 @@
 import { createContext, memo, useContext, useRef, type ReactNode } from "react";
 import { Dialog } from "@base-ui/react/dialog";
-import { ChevronRight, RotateCcw, X } from "lucide-react";
-import { useSettingModifiedState } from "@/components/settings/settings-preferences";
+import { ChevronRight, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { IconButton } from "@/components/ui/icon-button";
 import { Select, type SelectOption, type SelectProps } from "@/components/ui/select";
 import { HostStatusIndicator } from "@/components/ui/status-indicator";
 import { Switch } from "@/components/ui/switch";
@@ -142,58 +140,21 @@ export const SettingGroupLabel = memo(function SettingGroupLabel({
 
 interface SettingAnchorProps {
   settingId?: string;
-  modified?: boolean;
-  onReset?: () => void;
 }
-
-function useSettingModification({ settingId, modified, onReset }: SettingAnchorProps) {
-  const tracked = useSettingModifiedState(modified === undefined ? settingId : undefined);
-  const changed = modified ?? tracked.isModified;
-  return {
-    changed: changed || undefined,
-    reset: changed ? (onReset ?? tracked.reset) : undefined,
-  };
-}
-
-const ResetControl = memo(function ResetControl({ onClick }: { onClick?: () => void }) {
-  if (!onClick) return null;
-  return (
-    <IconButton
-      size="xs"
-      tooltip={t("common.reset")}
-      onClick={onClick}
-      className="opacity-0 group-hover/setting:opacity-100 group-focus-within/setting:opacity-100 focus-visible:opacity-100"
-    >
-      <RotateCcw />
-    </IconButton>
-  );
-});
 
 export const SettingGroup = memo(function SettingGroup({
   title,
   action,
   children,
   settingId,
-  modified,
-  onReset,
 }: SettingAnchorProps & {
   title: ReactNode;
   action?: ReactNode;
   children: ReactNode;
 }) {
-  const { changed, reset } = useSettingModification({ settingId, modified, onReset });
   return (
-    <section data-setting-id={settingId} data-modified={changed} className="group/setting space-y-2">
-      <SettingGroupLabel
-        action={
-          <div className="flex items-center gap-2">
-            <ResetControl onClick={reset} />
-            {action}
-          </div>
-        }
-      >
-        {title}
-      </SettingGroupLabel>
+    <section data-setting-id={settingId} className="space-y-2">
+      <SettingGroupLabel action={action}>{title}</SettingGroupLabel>
       {children}
     </section>
   );
@@ -203,27 +164,18 @@ export const SettingCard = memo(function SettingCard({
   children,
   className,
   settingId,
-  modified,
-  onReset,
 }: SettingAnchorProps & {
   children: ReactNode;
   className?: string;
 }) {
-  const { changed, reset } = useSettingModification({ settingId, modified, onReset });
   return (
     <div
       data-setting-id={settingId}
-      data-modified={changed}
       className={cn(
-        "group/setting relative border-border-subtle bg-surface-raised divide-border-subtle divide-y overflow-hidden rounded-[12px] border",
+        "relative border-border-subtle bg-surface-raised divide-border-subtle divide-y overflow-hidden rounded-[12px] border",
         className,
       )}
     >
-      {reset && (
-        <div className="absolute right-2 top-1 z-10 border-0">
-          <ResetControl onClick={reset} />
-        </div>
-      )}
       {children}
     </div>
   );
@@ -235,27 +187,20 @@ export const SettingRow = memo(function SettingRow({
   children,
   disabled = false,
   settingId,
-  modified,
-  onReset,
 }: SettingAnchorProps & {
   title: ReactNode;
   description?: ReactNode;
   children: ReactNode;
   disabled?: boolean;
 }) {
-  const { changed, reset } = useSettingModification({ settingId, modified, onReset });
   return (
     <div
       data-setting-id={settingId}
-      data-modified={changed}
       data-disabled={disabled ? "" : undefined}
-      className="group/setting flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-3.5"
+      className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-3.5"
     >
       <div className={cn("min-w-[140px] flex-1 transition-opacity", disabled && "opacity-55")}>
-        <div className="flex items-center gap-2">
-          <div className="text-ink-primary text-[13px] font-medium">{title}</div>
-          {!disabled && <ResetControl onClick={reset} />}
-        </div>
+        <div className="text-ink-primary text-[13px] font-medium">{title}</div>
         {description && (
           <div className="text-ink-secondary mt-0.5 text-[13px] leading-[1.45]">{description}</div>
         )}

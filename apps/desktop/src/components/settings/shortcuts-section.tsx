@@ -1,5 +1,5 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useState } from "react";
-import { AlertTriangle, ArrowLeftRight, RotateCcw, Search } from "lucide-react";
+import { AlertTriangle, ArrowLeftRight, Search } from "lucide-react";
 import {
   SettingCard,
   SettingGroupLabel,
@@ -56,8 +56,6 @@ export const ShortcutsSection = memo(function ShortcutsSection({ jumpTo }: { jum
   const isMac = isMacDesktop();
   const mod = modSymbol();
   const shift = isMac ? "⇧" : "Shift+";
-
-  const hasAnyCustom = Object.keys(customKeybindings).length > 0;
 
   useLayoutEffect(() => {
     if (jumpTo) setQuery("");
@@ -171,29 +169,10 @@ export const ShortcutsSection = memo(function ShortcutsSection({ jumpTo }: { jum
 
   return (
     <div className="flex flex-col gap-5">
-      <div className="flex items-start justify-between gap-3">
-        <SettingSectionHeader
-          title={t("settings.shortcutsTitle")}
-          description={t("settings.shortcutsDesc")}
-        />
-        {hasAnyCustom && (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => {
-              orbitActions.resetAllCustomKeybindings();
-              setRecordingId(null);
-              setReservedWarning(null);
-              setPendingConflict(null);
-            }}
-            className="shrink-0 gap-1.5 text-[13px]"
-          >
-            <RotateCcw className="size-3" />
-            {t("settings.shortcutsResetAll")}
-          </Button>
-        )}
-      </div>
+      <SettingSectionHeader
+        title={t("settings.shortcutsTitle")}
+        description={t("settings.shortcutsDesc")}
+      />
 
       <div className="relative" data-setting-id="settings.searchShortcutsPlaceholder">
         <Search className="text-ink-faint pointer-events-none absolute top-1/2 left-3 size-[14px] -translate-y-1/2" />
@@ -228,8 +207,7 @@ export const ShortcutsSection = memo(function ShortcutsSection({ jumpTo }: { jum
                     <div
                       key={item.actionId ?? item.action}
                       data-setting-id={item.settingId}
-                      data-modified={item.isCustomized || undefined}
-                      className="group/shortcut relative flex flex-col"
+                      className="relative flex flex-col"
                     >
                       <div className="flex items-center justify-between gap-4 px-4 py-2.5">
                         <div className="flex min-w-0 items-center gap-2">
@@ -244,23 +222,6 @@ export const ShortcutsSection = memo(function ShortcutsSection({ jumpTo }: { jum
                         </div>
 
                         <div className="flex shrink-0 items-center gap-1.5">
-                          {item.actionId && item.isCustomized && !isRecording && (
-                            <button
-                              type="button"
-                              title={t("settings.shortcutsResetSingle")}
-                              aria-label={t("settings.shortcutsResetSingle")}
-                              onClick={() => {
-                                orbitActions.resetCustomKeybinding(item.actionId!);
-                                setPendingConflict((cur) =>
-                                  cur?.actionId === item.actionId ? null : cur,
-                                );
-                              }}
-                              className="text-ink-faint hover:text-ink-primary hover:bg-surface-recessed inline-flex size-[24px] cursor-pointer items-center justify-center rounded-[6px] opacity-0 group-hover/shortcut:opacity-100 group-focus-within/shortcut:opacity-100 focus-visible:opacity-100"
-                            >
-                              <RotateCcw className="size-[12px]" />
-                            </button>
-                          )}
-
                           {item.actionId ? (
                             <button
                               type="button"

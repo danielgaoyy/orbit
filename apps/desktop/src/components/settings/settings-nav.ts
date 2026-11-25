@@ -181,8 +181,7 @@ function normalize(text: string): string {
   return text.normalize("NFKC").toLowerCase().replace(/[_–-]+/gu, " ").trim();
 }
 
-// Build the locale-independent index once. Only the query and the live modified set
-// change while typing.
+// Build the locale-independent index once. Only the query changes while typing.
 const index = SETTINGS_SEARCH_CATALOG.map((entry) => {
   const labels = [en, zhCN, ja].map((dict) => normalize(dict[entry.labelKey] ?? entry.labelKey));
   const keywords = normalize(entry.keywords ?? "");
@@ -194,18 +193,15 @@ const index = SETTINGS_SEARCH_CATALOG.map((entry) => {
 
 export function searchSettingsEntries(
   rawQuery: string,
-  options: { t: (key: MessageKey) => string; hasHost?: boolean; isDesktop?: boolean; modifiedIds?: ReadonlySet<string> },
+  options: { t: (key: MessageKey) => string; hasHost?: boolean; isDesktop?: boolean },
 ): SettingsSearchResult[] {
-  const tokens = normalize(rawQuery).split(/\s+/u).filter(Boolean);
-  const modifiedOnly = tokens.includes("@modified");
-  const terms = tokens.filter((token) => token !== "@modified");
-  if (!terms.length && !modifiedOnly) return [];
+  const terms = normalize(rawQuery).split(/\s+/u).filter(Boolean);
+  if (!terms.length) return [];
   const results: SettingsSearchResult[] = [];
   const phrase = terms.join(" ");
   for (const { entry, fields, labels, keywords, parentLabelKey } of index) {
     if (options.isDesktop === false && (entry.settingId === "settings.appVersion" || entry.settingId === "settings.externalEditor")) continue;
-    if (modifiedOnly && (!entry.settingId || !options.modifiedIds?.has(entry.settingId))) continue;
-    if (options.hasHost === false && !modifiedOnly && hostRequiredTargets.has(entry.target) && entry.settingId !== "im.defaultProvider") continue;
+    if (options.hasHost === false && hostRequiredTargets.has(entry.target) && entry.settingId !== "im.defaultProvider") continue;
 
     if (!terms.every((term) => fields.some((field) => field.includes(term)))) continue;
     const score = matchScore(phrase, normalize(options.t(entry.labelKey) ?? entry.labelKey), labels, keywords);

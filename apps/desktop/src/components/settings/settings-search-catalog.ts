@@ -114,5 +114,4 @@ export const SETTING_ENTRIES = [
   ["data_diagnostics", "securityOps.migrationSourceTitle", "migration source external ide 迁移来源 移行元"],
   ["data_diagnostics", "securityOps.migrationConflictTitle", "migration conflict strategy 冲突策略 競合"],
   ["data_diagnostics", "securityOps.diagTitle", "export diagnostic bundle troubleshooting logs 导出诊断包 診断ログ"],
-  ["data_diagnostics", "dataOps.resetPreferences", "reset ui preferences restore defaults 重置偏好 恢复默认 既定値に戻す"],
 ] as const satisfies readonly SettingEntry[];

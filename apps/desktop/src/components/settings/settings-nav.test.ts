@@ -126,27 +126,16 @@ describe("Settings search", () => {
     assert.equal(searchSettingsEntries("项目记忆", { t }).some((hit) => hit.settingId === "memory.title"), true);
   });
 
-  it("filters modified rows using current values and combines the filter with text", () => {
-    const modifiedIds = new Set(["settings.branchPrefix", "settings.diffLayout", "settings.defaultPermissions"]);
-    assert.deepEqual(new Set(searchSettingsEntries("@modified", { t, modifiedIds }).map((hit) => hit.id)), modifiedIds);
-    const [result] = searchSettingsEntries("diff @MODIFIED", { t, modifiedIds });
-    assert.equal(result.settingId, "settings.diffLayout");
-    assert.equal(result.target, "appearance");
-    modifiedIds.delete("settings.diffLayout");
-    assert.deepEqual(searchSettingsEntries("@modified diff", { t, modifiedIds }), []);
-    assert.deepEqual(searchSettingsEntries("@modified", { t }), []);
-  });
-
   it("omits native-only controls when searching from the web client", () => {
     const hits = searchSettingsEntries("external ide", { t, isDesktop: false });
     assert.ok(hits.every((hit) => hit.settingId !== "settings.externalEditor"));
     assert.ok(searchSettingsEntries("external ide", { t, isDesktop: true }).some((hit) => hit.settingId === "settings.externalEditor"));
   });
 
-  it("keeps hostless searches relevant while retaining modified client defaults", () => {
+  it("keeps hostless searches relevant while retaining client defaults", () => {
     assert.deepEqual(searchSettingsEntries("lsp", { t, hasHost: false }), []);
     assert.equal(searchSettingsEntries("connect remote host", { t, hasHost: false })[0]?.target, "hosts");
     assert.equal(searchSettingsEntries("hermes", { t, hasHost: false })[0]?.target, "personal_router");
-    assert.equal(searchSettingsEntries("@modified", { t, hasHost: false, modifiedIds: new Set(["im.defaultProvider"]) })[0]?.id, "im.defaultProvider");
+    assert.equal(searchSettingsEntries("default provider", { t, hasHost: false })[0]?.id, "im.defaultProvider");
   });
 });

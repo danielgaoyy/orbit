@@ -23,7 +23,6 @@ import {
   Mic,
   Palette,
   Plug,
-  RotateCcw,
   Search,
   Server,
   Settings2,
@@ -55,7 +54,6 @@ import {
   type SettingsCoreSectionId,
   type SettingsSearchResult,
 } from "./settings-nav";
-import { useModifiedSettings } from "./settings-preferences";
 import {
   HostStatusIndicator,
   SettingPageHeader,
@@ -208,8 +206,7 @@ const SettingsTopBar = memo(function SettingsTopBar({
 });
 
 /**
- * Only mounted while the user has a non-empty search query, keeping `useModifiedSettings()`
- * completely out of the hot path when browsing or editing normal settings pages.
+ * Only mounted while the user has a non-empty search query.
  */
 const SettingsSearchResults = memo(function SettingsSearchResults({
   query,
@@ -227,16 +224,14 @@ const SettingsSearchResults = memo(function SettingsSearchResults({
   resultsRef: React.MutableRefObject<SettingsSearchResult[]>;
 }) {
   const { locale, t } = useI18n();
-  const preferences = useModifiedSettings();
   const results = useMemo(
     () =>
       searchSettingsEntries(query, {
         t: (key) => translate(locale, key),
         hasHost,
         isDesktop: !isWebRuntime(),
-        modifiedIds: preferences.modifiedIds,
       }),
-    [query, hasHost, preferences.modifiedIds, locale],
+    [query, hasHost, locale],
   );
   resultsRef.current = results;
   const selected = Math.min(selectedIndex, results.length - 1);
@@ -246,31 +241,18 @@ const SettingsSearchResults = memo(function SettingsSearchResults({
       <p className="text-ink-muted px-2 pb-1 text-[11px] font-semibold">
         {t("settings.searchResultsLabel")}
       </p>
-      {results.map((result, index) => {
-        const label = t(result.labelKey);
-        return (
-          <div key={result.id} className="group/result flex items-center">
-            <ListRow
-              id={`settings-result-${index}`}
-              selected={index === selected}
-              subtitle={result.parentLabelKey && t(result.parentLabelKey)}
-              onMouseEnter={() => onSelectedIndexChange(index)}
-              onClick={() => onSelectResult(result)}
-            >
-              {label}
-            </ListRow>
-            {result.settingId && preferences.modifiedIds.has(result.settingId) && (
-              <IconButton
-                size="xs"
-                aria-label={t("settings.resetNamed", { name: label })}
-                onClick={() => preferences.reset(result.settingId!)}
-              >
-                <RotateCcw />
-              </IconButton>
-            )}
-          </div>
-        );
-      })}
+      {results.map((result, index) => (
+        <ListRow
+          key={result.id}
+          id={`settings-result-${index}`}
+          selected={index === selected}
+          subtitle={result.parentLabelKey && t(result.parentLabelKey)}
+          onMouseEnter={() => onSelectedIndexChange(index)}
+          onClick={() => onSelectResult(result)}
+        >
+          {t(result.labelKey)}
+        </ListRow>
+      ))}
       {!results.length && (
         <p className="text-ink-muted px-2 py-3 text-[13px]">{t("settings.noMatches")}</p>
       )}

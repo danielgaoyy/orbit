@@ -1247,6 +1247,7 @@ export function SharedWorkspaceMenu({
               pendingConfirm.hostId,
               pendingConfirm.workspaceId,
               false,
+              { rethrow: true },
             );
           } else if (pendingConfirm.kind === "merge") {
             await orbitActions.mergeWorkspaces(
@@ -1259,7 +1260,7 @@ export function SharedWorkspaceMenu({
               pendingConfirm.hostId,
               pendingConfirm.workspaceId,
               true,
-              { emptyDelete: true },
+              { emptyDelete: true, rethrow: true },
             );
           }
         }}

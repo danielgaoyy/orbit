@@ -81,10 +81,17 @@ export const NotificationsSection = memo(function NotificationsSection() {
   const notifyQuietStartHour = useOrbitSelector((s) => s.notifyQuietStartHour);
   const notifyQuietEndHour = useOrbitSelector((s) => s.notifyQuietEndHour);
 
-  // Primitive signature avoids re-rendering Notifications on every background agent/fleet tick.
-  const hostsKey = useOrbitSelector((s) =>
-    s.fleet.hosts.map((h) => `${h.host_id}\u0000${h.display_name}`).join("\u0001"),
-  );
+  // Primitive signature avoids re-rendering Notifications on every background agent/fleet tick
+  // without allocating any derived array inside the selector.
+  const hostsKey = useOrbitSelector((s) => {
+    let key = "";
+    for (let i = 0; i < s.fleet.hosts.length; i += 1) {
+      const h = s.fleet.hosts[i];
+      if (i > 0) key += "\u0001";
+      key += `${h.host_id}\u0000${h.display_name}`;
+    }
+    return key;
+  });
   const hosts = useMemo(
     () =>
       hostsKey

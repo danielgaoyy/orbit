@@ -10,7 +10,6 @@ import {
   Database,
   FileText,
   Keyboard,
-  ListFilter,
   MessageSquare,
   Mic,
   Palette,
@@ -244,8 +243,6 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [jump, setJump] = useState<{ section: typeof section; id: string } | null>(null);
   const searching = query.trim().length > 0;
-  const modifiedFilter = /(?:^|\s)@modified(?=\s|$)/i;
-  const filtered = modifiedFilter.test(query);
   const results = useMemo(
     () =>
       searchSettingsEntries(query, {
@@ -442,10 +439,10 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                   aria-activedescendant={searching && selected >= 0 ? `settings-result-${selected}` : undefined}
                   className={cn(
                     "h-[30px] pl-[28px] text-[13px] shadow-none",
-                    query ? "pr-[52px]" : "pr-[64px]",
+                    query ? "pr-[28px]" : "pr-[40px]",
                   )}
                 />
-                <div className="absolute right-[4px] flex items-center gap-0.5">
+                <div className="absolute right-[6px] flex items-center">
                   {query ? (
                     <IconButton
                       size="xs"
@@ -462,20 +459,6 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                       {modSymbol()}F
                     </Kbd>
                   )}
-                  <IconButton
-                    size="xs"
-                    tooltip={t("settings.showModified")}
-                    aria-pressed={filtered}
-                    active={filtered}
-                    onClick={() => {
-                      updateQuery(
-                        filtered ? query.replace(modifiedFilter, " ").trim() : ("@modified " + query).trim(),
-                      );
-                      search.current?.focus();
-                    }}
-                  >
-                    <ListFilter />
-                  </IconButton>
                 </div>
               </div>
               <nav

@@ -716,7 +716,6 @@ export const zhCN: MessageDictionary = {
   // Settings Shell & Navigation
   "settings.title": "设置",
   "settings.backToApp": "返回应用",
-  "settings.showModified": "显示已修改的设置",
   "settings.resetNamed": "重置{name}",
   "settings.hostNeeded": "连接主机后即可管理这些设置。",
   "settings.closeSettings": "关闭设置",

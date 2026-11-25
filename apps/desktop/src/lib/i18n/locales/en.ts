@@ -724,7 +724,6 @@ export const en = {
   // Settings Shell & Navigation
   "settings.title": "Settings",
   "settings.backToApp": "Back to app",
-  "settings.showModified": "Show modified settings",
   "settings.resetNamed": "Reset {name}",
   "settings.hostNeeded": "Connect a host to manage these settings.",
   "settings.closeSettings": "Close settings",

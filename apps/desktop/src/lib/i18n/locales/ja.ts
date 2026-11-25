@@ -724,7 +724,6 @@ export const ja: MessageDictionary = {
   // Settings Shell & Navigation
   "settings.title": "設定",
   "settings.backToApp": "アプリに戻る",
-  "settings.showModified": "変更した設定を表示",
   "settings.resetNamed": "{name}をリセット",
   "settings.hostNeeded": "ホストを接続すると、これらの設定を管理できます。",
   "settings.closeSettings": "設定を閉じる",

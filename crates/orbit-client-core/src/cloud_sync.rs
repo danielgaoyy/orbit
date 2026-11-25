@@ -156,6 +156,12 @@ pub enum CloudSyncError {
     MissingGistScope,
     #[error("network error communicating with GitHub: {0}")]
     Http(String),
+    #[error("GitHub API rate limit exceeded ({status}, retry in {retry_after_secs}s): {message}")]
+    RateLimited {
+        status: u16,
+        retry_after_secs: u64,
+        message: String,
+    },
     #[error("GitHub API error ({status}): {message}")]
     GitHubApi { status: u16, message: String },
     #[error("vault cryptography error: {0}")]
@@ -164,6 +170,33 @@ pub enum CloudSyncError {
     InvalidVault(String),
     #[error("storage error: {0}")]
     Storage(String),
+}
+
+impl CloudSyncError {
+    /// Suggested minimum backoff in seconds for transient/rate-limit errors, or `None` if non-retryable.
+    pub fn backoff_hint_secs(&self) -> Option<u64> {
+        match self {
+            Self::RateLimited {
+                retry_after_secs, ..
+            } => Some((*retry_after_secs).clamp(60, 3600)),
+            Self::GitHubApi { status: 409, .. } => Some(10),
+            Self::GitHubApi {
+                status: 500..=599, ..
+            }
+            | Self::Http(_) => Some(15),
+            _ => None,
+        }
+    }
+}
+
+/// Returns `true` when `url` is a legacy `ssh+relay://` endpoint without a shared `?ft=` fleet token.
+pub fn is_legacy_ssh_relay_without_ft(url: &str) -> bool {
+    let trimmed = url.trim();
+    trimmed.starts_with("ssh+relay://") && !trimmed.contains("?ft=") && !trimmed.contains("&ft=")
+}
+
+fn relay_has_fleet_token(url: &str) -> bool {
+    url.contains("?ft=") || url.contains("&ft=")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -286,6 +319,10 @@ pub struct CloudVaultPayload {
     pub preferences: HashMap<String, SyncedPreferenceEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fleet_network: Option<SyncedFleetNetwork>,
+    #[serde(default)]
+    pub require_manual_passphrase: bool,
+    #[serde(default)]
+    pub require_manual_passphrase_updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,6 +398,8 @@ pub struct PersistedCloudSyncConfig {
     #[serde(default)]
     pub require_manual_passphrase: bool,
     #[serde(default)]
+    pub require_manual_passphrase_updated_at_ms: i64,
+    #[serde(default)]
     pub cached_key_b64: Option<String>,
     #[serde(default)]
     pub cached_salt_b64: Option<String>,
@@ -401,6 +440,7 @@ impl Default for PersistedCloudSyncConfig {
             gist_html_url: None,
             key_gist_id: None,
             require_manual_passphrase: false,
+            require_manual_passphrase_updated_at_ms: 0,
             cached_key_b64: None,
             cached_salt_b64: None,
             cached_kdf_params: None,
@@ -797,6 +837,30 @@ fn push_unique_relay_url(list: &mut Vec<String>, candidate: &str) {
     }
 }
 
+fn choose_preferred_relay(winner: Option<&str>, other: Option<&str>) -> Option<String> {
+    let Some(w_raw) = winner.map(str::trim).filter(|s| !s.is_empty()) else {
+        return other
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+    };
+    if let Some(o_raw) = other.map(str::trim).filter(|s| !s.is_empty()) {
+        let w_legacy = is_legacy_ssh_relay_without_ft(w_raw);
+        let o_legacy = is_legacy_ssh_relay_without_ft(o_raw);
+        let o_has_ft = relay_has_fleet_token(o_raw);
+        let w_has_ft = relay_has_fleet_token(w_raw);
+        if w_legacy && !o_legacy && o_has_ft {
+            return Some(o_raw.to_string());
+        }
+        let w_base = w_raw.split('?').next().unwrap_or(w_raw);
+        let o_base = o_raw.split('?').next().unwrap_or(o_raw);
+        if w_base == o_base && o_has_ft && !w_has_ft {
+            return Some(o_raw.to_string());
+        }
+    }
+    Some(w_raw.to_string())
+}
+
 /// Deterministic per-entity LWW merge between the decrypted remote vault and current local state.
 #[allow(clippy::too_many_arguments)]
 pub fn merge_cloud_vault(
@@ -842,6 +906,10 @@ pub fn merge_cloud_vault_with_network(
         project_order_updated_at_ms: 0,
         preferences: HashMap::new(),
         fleet_network: None,
+        require_manual_passphrase: remote.map(|r| r.require_manual_passphrase).unwrap_or(false),
+        require_manual_passphrase_updated_at_ms: remote
+            .map(|r| r.require_manual_passphrase_updated_at_ms)
+            .unwrap_or(0),
     };
 
     let mut needs_push = remote.is_none();
@@ -931,6 +999,10 @@ pub fn merge_cloud_vault_with_network(
                         combined.bridge_host_ids =
                             union_bridge_host_ids(&host_id, &r.bridge_host_ids, &l.bridge_host_ids);
                         if l.deleted_at_ms.is_none() {
+                            combined.relay_url = choose_preferred_relay(
+                                r.relay_url.as_deref(),
+                                l.relay_url.as_deref(),
+                            );
                             let (sec, sec_ts) = merge_host_pairing_secret(r, &l, true);
                             combined.pairing_secret = sec;
                             combined.pairing_secret_updated_at_ms = sec_ts;
@@ -959,6 +1031,10 @@ pub fn merge_cloud_vault_with_network(
                         combined.bridge_host_ids =
                             union_bridge_host_ids(&host_id, &l.bridge_host_ids, &r.bridge_host_ids);
                         if r.deleted_at_ms.is_none() {
+                            combined.relay_url = choose_preferred_relay(
+                                l.relay_url.as_deref(),
+                                r.relay_url.as_deref(),
+                            );
                             let (sec, sec_ts) = merge_host_pairing_secret(r, &l, false);
                             combined.pairing_secret = sec;
                             combined.pairing_secret_updated_at_ms = sec_ts;
@@ -986,9 +1062,8 @@ pub fn merge_cloud_vault_with_network(
                         combined.direct_endpoints = eps;
                         combined.bridge_host_ids =
                             union_bridge_host_ids(&host_id, &r.bridge_host_ids, &l.bridge_host_ids);
-                        if combined.relay_url.is_none() {
-                            combined.relay_url = l.relay_url.clone();
-                        }
+                        combined.relay_url =
+                            choose_preferred_relay(r.relay_url.as_deref(), l.relay_url.as_deref());
                         if combined.custom_name.is_none() {
                             combined.custom_name = l.custom_name.clone();
                         }
@@ -1263,12 +1338,38 @@ pub fn merge_cloud_vault_with_network(
         let cur_base = cur_primary.split('?').next().unwrap_or(cur_primary);
         if let Some(upgraded) = all_relays
             .iter()
-            .find(|u| u.split('?').next().unwrap_or(u) == cur_base)
+            .find(|u| u.split('?').next().unwrap_or(u) == cur_base && relay_has_fleet_token(u))
+            .cloned()
         {
-            merged_net.primary_relay_url = Some(upgraded.clone());
+            merged_net.primary_relay_url = Some(upgraded);
+        } else if is_legacy_ssh_relay_without_ft(cur_primary)
+            && let Some(modern) = all_relays
+                .iter()
+                .enumerate()
+                .filter(|(_, u)| !is_legacy_ssh_relay_without_ft(u))
+                .max_by_key(|(idx, u)| (relay_has_fleet_token(u), std::cmp::Reverse(*idx)))
+                .map(|(_, u)| u.clone())
+        {
+            merged_net.primary_relay_url = Some(modern.clone());
+            all_relays.retain(|u| u != &modern);
+            all_relays.insert(0, modern);
+            merged_net.updated_at_ms = now_ms.max(merged_net.updated_at_ms.saturating_add(1));
         }
-    } else if let Some(first) = all_relays.first() {
-        merged_net.primary_relay_url = Some(first.clone());
+    } else if let Some(best) = all_relays
+        .iter()
+        .enumerate()
+        .max_by_key(|(idx, u)| {
+            (
+                relay_has_fleet_token(u),
+                !is_legacy_ssh_relay_without_ft(u),
+                std::cmp::Reverse(*idx),
+            )
+        })
+        .map(|(_, u)| u.clone())
+    {
+        merged_net.primary_relay_url = Some(best.clone());
+        all_relays.retain(|u| u != &best);
+        all_relays.insert(0, best);
         if merged_net.updated_at_ms == 0 {
             merged_net.updated_at_ms = now_ms;
         }
@@ -1642,9 +1743,9 @@ impl GitHubCloudClient {
             .map_err(|e| CloudSyncError::Http(e.to_string()))?;
 
         let status = resp.status();
+        let headers = resp.headers().clone();
         // Classic OAuth / classic PAT responses expose `X-OAuth-Scopes`; fine-grained PATs omit it.
-        let scopes_header = resp
-            .headers()
+        let scopes_header = headers
             .get("x-oauth-scopes")
             .and_then(|v| v.to_str().ok())
             .map(ToOwned::to_owned);
@@ -1655,15 +1756,12 @@ impl GitHubCloudClient {
             .map_err(|e| CloudSyncError::Http(format!("invalid user response: {e}")))?;
 
         if !status.is_success() {
-            let msg = body
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("invalid GitHub token")
-                .to_string();
-            return Err(CloudSyncError::GitHubApi {
-                status: status.as_u16(),
-                message: msg,
-            });
+            return Err(github_api_error_from_response(
+                status,
+                &headers,
+                &body,
+                "invalid GitHub token",
+            ));
         }
 
         if let Some(ref scopes) = scopes_header {
@@ -1740,21 +1838,19 @@ impl GitHubCloudClient {
                 .map_err(|e| CloudSyncError::Http(e.to_string()))?;
 
             let status = resp.status();
+            let headers = resp.headers().clone();
             let list: serde_json::Value = resp
                 .json()
                 .await
                 .map_err(|e| CloudSyncError::Http(format!("invalid gists list response: {e}")))?;
 
             if !status.is_success() {
-                let msg = list
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("failed to list gists")
-                    .to_string();
-                return Err(CloudSyncError::GitHubApi {
-                    status: status.as_u16(),
-                    message: msg,
-                });
+                return Err(github_api_error_from_response(
+                    status,
+                    &headers,
+                    &list,
+                    "failed to list gists",
+                ));
             }
 
             let Some(arr) = list.as_array() else {
@@ -1804,21 +1900,19 @@ impl GitHubCloudClient {
         if status.as_u16() == 404 {
             return Ok(None);
         }
+        let headers = resp.headers().clone();
         let body: serde_json::Value = resp
             .json()
             .await
             .map_err(|e| CloudSyncError::Http(format!("invalid key gist response: {e}")))?;
 
         if !status.is_success() {
-            let msg = body
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("failed to fetch auto-unlock key gist")
-                .to_string();
-            return Err(CloudSyncError::GitHubApi {
-                status: status.as_u16(),
-                message: msg,
-            });
+            return Err(github_api_error_from_response(
+                status,
+                &headers,
+                &body,
+                "failed to fetch auto-unlock key gist",
+            ));
         }
 
         let Some(file_obj) = body
@@ -1881,10 +1975,65 @@ impl GitHubCloudClient {
         token: &str,
         cached_gist_id: Option<&str>,
     ) -> Result<Option<RemoteVaultGist>, CloudSyncError> {
-        let (vault, _) = self
-            .fetch_vault_and_auto_key(token, cached_gist_id, None)
-            .await?;
-        Ok(vault)
+        if let Some(gid) = cached_gist_id.map(str::trim).filter(|s| !s.is_empty())
+            && let Some(vault) = self.fetch_gist_by_id(token, gid).await?
+        {
+            return Ok(Some(vault));
+        }
+        self.scan_gists_for_vault(token).await
+    }
+
+    async fn scan_gists_for_vault(
+        &self,
+        token: &str,
+    ) -> Result<Option<RemoteVaultGist>, CloudSyncError> {
+        for page in 1..=5u32 {
+            let url = format!("{}/gists?per_page=100&page={page}", self.api_base);
+            let resp = self
+                .http
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token.trim()))
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .send()
+                .await
+                .map_err(|e| CloudSyncError::Http(e.to_string()))?;
+
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let list: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| CloudSyncError::Http(format!("invalid gists list response: {e}")))?;
+
+            if !status.is_success() {
+                return Err(github_api_error_from_response(
+                    status,
+                    &headers,
+                    &list,
+                    "failed to list gists",
+                ));
+            }
+
+            let Some(arr) = list.as_array() else {
+                break;
+            };
+            for item in arr {
+                let Some(files) = item.get("files").and_then(|f| f.as_object()) else {
+                    continue;
+                };
+                let Some(gid) = item.get("id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if files.contains_key(CLOUD_VAULT_GIST_FILENAME) {
+                    return self.fetch_gist_by_id(token, gid).await;
+                }
+            }
+            if arr.len() < 100 {
+                break;
+            }
+        }
+        Ok(None)
     }
 
     async fn fetch_gist_by_id(
@@ -1941,8 +2090,8 @@ impl GitHubCloudClient {
         if status.as_u16() == 404 {
             return Ok(GistConditionalFetch::NotFound);
         }
-        let etag = resp
-            .headers()
+        let headers = resp.headers().clone();
+        let etag = headers
             .get(reqwest::header::ETAG)
             .and_then(|v| v.to_str().ok())
             .map(ToOwned::to_owned);
@@ -1952,15 +2101,12 @@ impl GitHubCloudClient {
             .map_err(|e| CloudSyncError::Http(format!("invalid gist response: {e}")))?;
 
         if !status.is_success() {
-            let msg = body
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("failed to fetch gist")
-                .to_string();
-            return Err(CloudSyncError::GitHubApi {
-                status: status.as_u16(),
-                message: msg,
-            });
+            return Err(github_api_error_from_response(
+                status,
+                &headers,
+                &body,
+                "failed to fetch gist",
+            ));
         }
 
         let Some(file_obj) = body
@@ -2020,13 +2166,13 @@ impl GitHubCloudClient {
         })
     }
 
-    /// Create or update the user's Orbit Encrypted Vault Secret Gist.
-    pub async fn save_vault_gist(
+    /// Create or update the user's Orbit Encrypted Vault Secret Gist, returning `(gist_id, html_url, etag)`.
+    pub async fn save_vault_gist_with_etag(
         &self,
         token: &str,
         existing_gist_id: Option<&str>,
         envelope: &EncryptedVaultEnvelope,
-    ) -> Result<(String, String), CloudSyncError> {
+    ) -> Result<(String, String, Option<String>), CloudSyncError> {
         let content = serde_json::to_string_pretty(envelope)
             .map_err(|e| CloudSyncError::InvalidVault(e.to_string()))?;
 
@@ -2079,24 +2225,26 @@ impl GitHubCloudClient {
         let status = resp.status();
         // If PATCH returned 404 (user manually deleted the gist on GitHub), transparently recreate it!
         if !creating && status.as_u16() == 404 {
-            return Box::pin(self.save_vault_gist(token, None, envelope)).await;
+            return Box::pin(self.save_vault_gist_with_etag(token, None, envelope)).await;
         }
 
+        let headers = resp.headers().clone();
+        let etag = headers
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned);
         let body: serde_json::Value = resp
             .json()
             .await
             .map_err(|e| CloudSyncError::Http(format!("invalid gist save response: {e}")))?;
 
         if !status.is_success() {
-            let msg = body
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("failed to save vault gist")
-                .to_string();
-            return Err(CloudSyncError::GitHubApi {
-                status: status.as_u16(),
-                message: msg,
-            });
+            return Err(github_api_error_from_response(
+                status,
+                &headers,
+                &body,
+                "failed to save vault gist",
+            ));
         }
 
         let id = body
@@ -2109,6 +2257,19 @@ impl GitHubCloudClient {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        Ok((id, html_url, etag))
+    }
+
+    /// Create or update the user's Orbit Encrypted Vault Secret Gist.
+    pub async fn save_vault_gist(
+        &self,
+        token: &str,
+        existing_gist_id: Option<&str>,
+        envelope: &EncryptedVaultEnvelope,
+    ) -> Result<(String, String), CloudSyncError> {
+        let (id, html_url, _) = self
+            .save_vault_gist_with_etag(token, existing_gist_id, envelope)
+            .await?;
         Ok((id, html_url))
     }
 
@@ -2183,21 +2344,19 @@ impl GitHubCloudClient {
             return Box::pin(self.save_auto_unlock_key_gist(token, None, key)).await;
         }
 
+        let headers = resp.headers().clone();
         let body: serde_json::Value = resp
             .json()
             .await
             .map_err(|e| CloudSyncError::Http(format!("invalid key gist save response: {e}")))?;
 
         if !status.is_success() {
-            let msg = body
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("failed to save auto-unlock key gist")
-                .to_string();
-            return Err(CloudSyncError::GitHubApi {
-                status: status.as_u16(),
-                message: msg,
-            });
+            return Err(github_api_error_from_response(
+                status,
+                &headers,
+                &body,
+                "failed to save auto-unlock key gist",
+            ));
         }
 
         body.get("id")
@@ -2226,20 +2385,75 @@ impl GitHubCloudClient {
         if status.is_success() || status.as_u16() == 404 {
             return Ok(());
         }
-        let msg = resp
-            .json::<serde_json::Value>()
-            .await
-            .ok()
-            .and_then(|v| {
-                v.get("message")
-                    .and_then(|m| m.as_str())
-                    .map(ToOwned::to_owned)
-            })
-            .unwrap_or_else(|| "failed to delete gist".to_string());
-        Err(CloudSyncError::GitHubApi {
-            status: status.as_u16(),
-            message: msg,
-        })
+        let headers = resp.headers().clone();
+        let body = resp.json::<serde_json::Value>().await.unwrap_or_default();
+        Err(github_api_error_from_response(
+            status,
+            &headers,
+            &body,
+            "failed to delete gist",
+        ))
+    }
+}
+
+fn parse_rate_limit_retry_after_secs(
+    headers: &reqwest::header::HeaderMap,
+    now_unix_secs: u64,
+) -> u64 {
+    if let Some(secs) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        return secs.clamp(60, 3600);
+    }
+    if let Some(reset_ts) = headers
+        .get("x-ratelimit-reset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        let delta = reset_ts.saturating_sub(now_unix_secs).saturating_add(5);
+        return delta.clamp(60, 3600);
+    }
+    300
+}
+
+fn github_api_error_from_response(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: &serde_json::Value,
+    fallback: &str,
+) -> CloudSyncError {
+    let message = body
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or(fallback)
+        .to_string();
+    let status_u16 = status.as_u16();
+    let remaining_zero = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim() == "0");
+    let has_retry_after = headers.contains_key(reqwest::header::RETRY_AFTER);
+    let msg_rate_limited = message.to_ascii_lowercase().contains("rate limit");
+    if status_u16 == 429
+        || (status_u16 == 403 && (remaining_zero || msg_rate_limited || has_retry_after))
+    {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let retry_after_secs = parse_rate_limit_retry_after_secs(headers, now_secs);
+        CloudSyncError::RateLimited {
+            status: status_u16,
+            retry_after_secs,
+            message,
+        }
+    } else {
+        CloudSyncError::GitHubApi {
+            status: status_u16,
+            message,
+        }
     }
 }
 
@@ -2307,6 +2521,20 @@ pub fn decrypt_remote_with_cached_key(
     Ok(payload)
 }
 
+/// Encrypt a `CloudVaultPayload` with `key` and upload it to GitHub Secret Gist, returning `(gist_id, html_url, etag)`.
+pub async fn push_vault_payload_with_etag(
+    client: &GitHubCloudClient,
+    token: &str,
+    existing_gist_id: Option<&str>,
+    key: &DerivedVaultKey,
+    payload: &CloudVaultPayload,
+) -> Result<(String, String, Option<String>), CloudSyncError> {
+    let envelope = encrypt_vault_json(key, payload, payload.updated_at_ms)?;
+    client
+        .save_vault_gist_with_etag(token, existing_gist_id, &envelope)
+        .await
+}
+
 /// Encrypt a `CloudVaultPayload` with `key` and upload it to GitHub Secret Gist.
 pub async fn push_vault_payload(
     client: &GitHubCloudClient,
@@ -2315,10 +2543,9 @@ pub async fn push_vault_payload(
     key: &DerivedVaultKey,
     payload: &CloudVaultPayload,
 ) -> Result<(String, String), CloudSyncError> {
-    let envelope = encrypt_vault_json(key, payload, payload.updated_at_ms)?;
-    client
-        .save_vault_gist(token, existing_gist_id, &envelope)
-        .await
+    let (id, html_url, _) =
+        push_vault_payload_with_etag(client, token, existing_gist_id, key, payload).await?;
+    Ok((id, html_url))
 }
 
 #[cfg(test)]
@@ -2730,6 +2957,7 @@ mod tests {
             project_order_updated_at_ms: 0,
             preferences: HashMap::new(),
             fleet_network: None,
+            ..Default::default()
         };
 
         let local = LocalHostSyncRecord {
@@ -2907,5 +3135,181 @@ mod tests {
             derived_key_from_auto_unlock(&remote_key, Some(&dummy_vault)).expect("recover key");
         assert_eq!(recovered.salt_b64, vault_salt);
         assert_eq!(&*recovered.key_b64(), &*key.key_b64());
+    }
+
+    #[test]
+    fn merge_with_network_upgrades_legacy_ssh_primary_relay_to_modern_ft_relay() {
+        let legacy = "ssh+relay://ec2-user@13.228.27.154:22/7878?key=old";
+        let modern = "wss://cayman-connectivity.trycloudflare.com?ft=tok_modern";
+        let remote = CloudVaultPayload {
+            schema_version: CLOUD_VAULT_SCHEMA_VERSION,
+            revision: 12,
+            updated_at_ms: 5000,
+            fleet_network: Some(SyncedFleetNetwork {
+                primary_relay_url: Some(legacy.into()),
+                relay_urls: vec![legacy.into(), modern.into()],
+                primary_relay_host_id: Some("host_old".into()),
+                updated_at_ms: 5000,
+            }),
+            ..Default::default()
+        };
+
+        let outcome = merge_cloud_vault_with_network(
+            Some(&remote),
+            &[],
+            &[],
+            &[],
+            &HashMap::new(),
+            &CloudSyncLocalMeta::default(),
+            None,
+            6000,
+        );
+        let net = outcome.merged.fleet_network.expect("fleet network");
+        assert_eq!(net.primary_relay_url.as_deref(), Some(modern));
+        assert_eq!(net.relay_urls.first().map(String::as_str), Some(modern));
+        assert!(net.updated_at_ms >= 6000);
+        assert!(outcome.needs_push);
+        assert!(outcome.fleet_network_changed.is_some());
+    }
+
+    #[test]
+    fn merge_hosts_prefers_modern_ft_relay_over_legacy_ssh_without_ping_pong() {
+        let legacy = "ssh+relay://ec2-user@13.228.27.154:22/7878?key=old";
+        let modern = "wss://cayman-connectivity.trycloudflare.com?ft=tok_modern";
+
+        // Stale remote metadata has newer timestamp (t=4000) with dead legacy ssh+relay://,
+        // while local host (t=3000) has modern ?ft= relay -> modern MUST win & push!
+        let mut remote = CloudVaultPayload {
+            schema_version: CLOUD_VAULT_SCHEMA_VERSION,
+            revision: 7,
+            updated_at_ms: 4000,
+            ..Default::default()
+        };
+        remote.hosts.insert(
+            "host_spark".into(),
+            SyncedHostEntry {
+                host_id: "host_spark".into(),
+                hostname: "spark-8a6c".into(),
+                daemon_pubkey_b64: "pub_spark".into(),
+                direct_endpoints: vec![],
+                relay_url: Some(legacy.into()),
+                pairing_secret: "sec_spark".into(),
+                pairing_secret_updated_at_ms: 1000,
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: Some("auto".into()),
+                remote_daemon_port: Some(6868),
+                custom_direct_endpoint: None,
+                os_arch: None,
+                bridge_host_ids: Vec::new(),
+                updated_at_ms: 4000,
+                deleted_at_ms: None,
+            },
+        );
+        let mut local_spark =
+            sample_local_host("host_spark", "spark-8a6c", vec![], Some(modern), 3000);
+        local_spark.profile.daemon_pubkey_b64 = "pub_spark".into();
+        local_spark.profile.pairing_secret = "sec_spark".into();
+        local_spark.profile.meta.pairing_secret_updated_at_ms = 1000;
+        local_spark.profile.meta.route_mode = Some("auto".into());
+        local_spark.profile.meta.remote_daemon_port = Some(6868);
+
+        let outcome = merge_cloud_vault_with_network(
+            Some(&remote),
+            &[local_spark.clone()],
+            &[],
+            &[],
+            &HashMap::new(),
+            &CloudSyncLocalMeta::default(),
+            None,
+            5000,
+        );
+        assert_eq!(
+            outcome.merged.hosts["host_spark"].relay_url.as_deref(),
+            Some(modern)
+        );
+        assert!(outcome.needs_push);
+
+        // Next sync after remote converges to modern -> no ping-pong push
+        let outcome2 = merge_cloud_vault_with_network(
+            Some(&outcome.merged),
+            &[local_spark],
+            &[],
+            &[],
+            &HashMap::new(),
+            &CloudSyncLocalMeta::default(),
+            outcome.merged.fleet_network.as_ref(),
+            6000,
+        );
+        assert!(!outcome2.needs_push);
+        assert_eq!(
+            outcome2.merged.hosts["host_spark"].relay_url.as_deref(),
+            Some(modern)
+        );
+    }
+
+    #[test]
+    fn github_api_error_parses_403_and_429_rate_limit_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "0".parse().expect("hdr"));
+        let reset_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("now")
+            .as_secs()
+            + 120;
+        headers.insert(
+            "x-ratelimit-reset",
+            reset_at.to_string().parse().expect("hdr"),
+        );
+        let body = serde_json::json!({
+            "message": "API rate limit exceeded for user ID 123"
+        });
+        let err = github_api_error_from_response(
+            reqwest::StatusCode::FORBIDDEN,
+            &headers,
+            &body,
+            "fallback",
+        );
+        match err {
+            CloudSyncError::RateLimited {
+                status,
+                retry_after_secs,
+                ..
+            } => {
+                assert_eq!(status, 403);
+                assert!((110..=140).contains(&retry_after_secs));
+                assert_eq!(err.backoff_hint_secs(), Some(retry_after_secs));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+
+        let mut headers_429 = reqwest::header::HeaderMap::new();
+        headers_429.insert(reqwest::header::RETRY_AFTER, "180".parse().expect("hdr"));
+        let err_429 = github_api_error_from_response(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            &headers_429,
+            &serde_json::json!({"message": "secondary rate limit"}),
+            "fallback",
+        );
+        assert!(matches!(
+            err_429,
+            CloudSyncError::RateLimited {
+                status: 429,
+                retry_after_secs: 180,
+                ..
+            }
+        ));
+
+        let err_401 = github_api_error_from_response(
+            reqwest::StatusCode::UNAUTHORIZED,
+            &reqwest::header::HeaderMap::new(),
+            &serde_json::json!({"message": "Bad credentials"}),
+            "fallback",
+        );
+        assert!(matches!(
+            err_401,
+            CloudSyncError::GitHubApi { status: 401, .. }
+        ));
+        assert_eq!(err_401.backoff_hint_secs(), None);
     }
 }

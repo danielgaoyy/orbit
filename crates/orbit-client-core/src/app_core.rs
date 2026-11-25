@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -57,18 +57,13 @@ use crate::cloud_sync::{
     CloudSyncStatusView, DevicePollOutcome, GistConditionalFetch, GitHubCloudClient,
     GitHubDeviceFlowStartView, LocalHostSyncRecord, PersistedCloudSyncConfig,
     SyncedPreferenceEntry, decrypt_remote_with_cached_key, filter_shareable_endpoints,
-    generate_sync_passphrase, is_loopback_endpoint, load_fleet_network_from_store,
-    load_sync_config_from_store, load_sync_meta_from_store, load_sync_prefs_from_store,
-    merge_cloud_vault_with_network, now_unix_ms, push_vault_payload, resolve_github_client_id,
-    save_fleet_network_to_store, save_sync_config_to_store, save_sync_meta_to_store,
-    save_sync_prefs_to_store, stored_host_from_synced, unlock_remote_vault_with_passphrase,
-    vault_fingerprint,
+    generate_sync_passphrase, is_legacy_ssh_relay_without_ft, is_loopback_endpoint,
+    load_fleet_network_from_store, load_sync_config_from_store, load_sync_meta_from_store,
+    load_sync_prefs_from_store, merge_cloud_vault_with_network, now_unix_ms,
+    push_vault_payload_with_etag, resolve_github_client_id, save_fleet_network_to_store,
+    save_sync_config_to_store, save_sync_meta_to_store, save_sync_prefs_to_store,
+    stored_host_from_synced, unlock_remote_vault_with_passphrase, vault_fingerprint,
 };
-
-fn is_legacy_ssh_relay_without_ft(url: &str) -> bool {
-    let trimmed = url.trim();
-    trimmed.starts_with("ssh+relay://") && !trimmed.contains("?ft=") && !trimmed.contains("&ft=")
-}
 pub use crate::contract::{
     AuditChainExportView, BrowserActionResponseView, BrowserSessionsSnapshotView,
     CancelWorkflowRunRequest, ControlGoalRunRequest, ConversationSearchHit,
@@ -96,8 +91,8 @@ pub use crate::viewmodel::{
 use crate::desktop_ops::{
     StagedAttachmentInfo, bootstrap_ssh_host_and_pair, discover_local_daemon_pairing_uri,
     extract_ws_port, normalize_relay_input, provision_ssh_tunnel_relay_with_home,
-    read_local_daemon_identity, read_local_workspace_file, read_local_workspace_file_with_writable,
-    resolve_orbit_home_dir, stage_local_attachment,
+    read_local_daemon_identity, read_local_daemon_relay_url, read_local_workspace_file,
+    read_local_workspace_file_with_writable, resolve_orbit_home_dir, stage_local_attachment,
 };
 use crate::render::{
     DiffFileView, HighlightedLineView, RichBlockView, TerminalGridEmulator, TerminalScreenView,
@@ -106,8 +101,14 @@ use crate::render::{
 };
 use crate::stage::{self, SessionInsightsView, StageTurnView};
 use crate::{
-    ClientCoreError, ClientInboundEvent, HostSessionHandle, connect_smart, connect_via_peer_bridge,
+    ClientCoreError, ClientInboundEvent, HostSessionHandle, connect_smart_with_fallback_relays,
+    connect_via_peer_bridge,
 };
+
+const CLOUD_AUTO_SYNC_URGENT_DEBOUNCE_MS: u64 = 1_500;
+const CLOUD_AUTO_SYNC_URGENT_MIN_INTERVAL_MS: u64 = 5_000;
+const CLOUD_AUTO_SYNC_THROTTLED_MIN_INTERVAL_MS: u64 = 30_000;
+const CLOUD_SYNC_ETAG_POLL_INTERVAL_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubscribeOptions {
@@ -835,6 +836,7 @@ struct HostMemoryState {
     os_arch: Option<String>,
     reconnect_attempt: u32,
     ssh_heal_attempted: bool,
+    pending_relay_override: bool,
     connecting_in_flight: bool,
     reconnect_scheduled: bool,
     session_gen: u64,
@@ -1093,6 +1095,7 @@ impl HostMemoryState {
             os_arch: None,
             reconnect_attempt: 0,
             ssh_heal_attempted: false,
+            pending_relay_override: false,
             connecting_in_flight: false,
             reconnect_scheduled: false,
             session_gen: 0,
@@ -1669,7 +1672,11 @@ pub struct OrbitAppCore {
     revision: Arc<AtomicU64>,
     cloud_sync_client: Arc<RwLock<GitHubCloudClient>>,
     cloud_sync_in_flight: Arc<AtomicBool>,
+    cloud_sync_auto_scheduled: Arc<AtomicBool>,
+    cloud_sync_urgent_pending: Arc<AtomicBool>,
     cloud_sync_last_auto_ms: Arc<AtomicU64>,
+    cloud_sync_backoff_until_ms: Arc<AtomicU64>,
+    cloud_sync_consecutive_errors: Arc<AtomicU32>,
     cloud_sync_mutex: Arc<tokio::sync::Mutex<()>>,
     fleet_relay_fabric_in_flight: Arc<AtomicBool>,
     fleet_relay_auto_attempted: Arc<AtomicBool>,
@@ -1961,7 +1968,11 @@ impl OrbitAppCore {
             revision: Arc::new(AtomicU64::new(1)),
             cloud_sync_client: Arc::new(RwLock::new(GitHubCloudClient::new())),
             cloud_sync_in_flight: Arc::new(AtomicBool::new(false)),
+            cloud_sync_auto_scheduled: Arc::new(AtomicBool::new(false)),
+            cloud_sync_urgent_pending: Arc::new(AtomicBool::new(false)),
             cloud_sync_last_auto_ms: Arc::new(AtomicU64::new(0)),
+            cloud_sync_backoff_until_ms: Arc::new(AtomicU64::new(0)),
+            cloud_sync_consecutive_errors: Arc::new(AtomicU32::new(0)),
             cloud_sync_mutex: Arc::new(tokio::sync::Mutex::new(())),
             fleet_relay_fabric_in_flight: Arc::new(AtomicBool::new(false)),
             fleet_relay_auto_attempted: Arc::new(AtomicBool::new(false)),
@@ -4848,6 +4859,11 @@ impl OrbitAppCore {
         } else {
             h.profile.pairing_secret.clone()
         };
+        let relay_url = if h.is_local {
+            read_local_daemon_relay_url().or_else(|| h.profile.relay_url.clone())
+        } else {
+            h.profile.relay_url.clone()
+        };
         if pairing_secret.trim().is_empty() {
             return Err(ClientCoreError::Handshake(
                 "host has no persisted pairing secret — run `orbit pair` on the host and re-pair"
@@ -4859,7 +4875,7 @@ impl OrbitAppCore {
             hostname: h.profile.effective_display_name(),
             daemon_pubkey_b64: h.profile.daemon_pubkey_b64.clone(),
             direct_endpoints: h.profile.direct_endpoints.clone(),
-            relay_url: h.profile.relay_url.clone(),
+            relay_url,
             pairing_secret,
         };
         Ok(offer.to_qr_uri()?)
@@ -4945,6 +4961,9 @@ impl OrbitAppCore {
             }
             let relay_changed = raw_relay_url.is_some() && h.profile.relay_url != prev_relay;
             let new_relay = h.profile.relay_url.clone();
+            if relay_changed {
+                h.pending_relay_override = true;
+            }
             h.ssh_heal_attempted = false;
             (h.to_card(), h.to_stored_host(), relay_changed, new_relay)
         };
@@ -5021,6 +5040,9 @@ impl OrbitAppCore {
                 .map_err(|_| ClientCoreError::LockPoisoned)?;
             let mut items = Vec::with_capacity(guard.len());
             for (host_id, h) in guard.iter_mut() {
+                if h.profile.relay_url != new_relay {
+                    h.pending_relay_override = true;
+                }
                 h.profile.relay_url = new_relay.clone();
                 h.ssh_heal_attempted = false;
                 let is_online = h.session.is_some();
@@ -5140,8 +5162,34 @@ impl OrbitAppCore {
         };
         self.emit(|revision| CoreNotification::FleetChanged { revision });
 
+        let fallback_relays: Vec<String> =
+            if !is_local_host && profile.route_mode != HostRouteMode::DirectOnly {
+                load_fleet_network_from_store(&self.store)
+                    .map(|net| {
+                        let mut list = Vec::new();
+                        if let Some(primary) = net.primary_relay_url
+                            && !is_legacy_ssh_relay_without_ft(&primary)
+                        {
+                            list.push(primary);
+                        }
+                        for u in net.relay_urls {
+                            if !is_legacy_ssh_relay_without_ft(&u) && !list.contains(&u) {
+                                list.push(u);
+                            }
+                        }
+                        list
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
         let connect_res = if !is_local_host && has_online_bridge {
-            let smart_fut = connect_smart(&profile, Some(self.store.clone()));
+            let smart_fut = connect_smart_with_fallback_relays(
+                &profile,
+                &fallback_relays,
+                Some(self.store.clone()),
+            );
             tokio::pin!(smart_fut);
             let mut smart_err_early = None;
             let race_winner = tokio::select! {
@@ -5192,7 +5240,13 @@ impl OrbitAppCore {
                 }
             }
         } else {
-            match connect_smart(&profile, Some(self.store.clone())).await {
+            match connect_smart_with_fallback_relays(
+                &profile,
+                &fallback_relays,
+                Some(self.store.clone()),
+            )
+            .await
+            {
                 Ok(handle) => Ok(handle),
                 Err(smart_err) if !smart_err.is_auth_error() => {
                     if let Some(bridged) = self
@@ -5750,6 +5804,7 @@ impl OrbitAppCore {
         let mut migrated_opt_pref: Option<(String, String)> = None;
         let mut rewound_seen_reset: Option<(String, u64)> = None;
         let mut adopted_daemon_relay = false;
+        let mut adopted_modern_relay: Option<String> = None;
         let mut schedule_vault_refresh = false;
         let mut persist_has_older: Option<(String, bool)> = None;
         let mut history_page_to_persist: Option<Vec<TimelineEvent>> = None;
@@ -5766,11 +5821,27 @@ impl OrbitAppCore {
                     if !host.available_providers.is_empty() {
                         state.available_providers = host.available_providers;
                     }
-                    if state.profile.relay_url.is_none()
-                        && let Some(daemon_relay) = normalize_relay_input(host.relay_url.as_deref())
-                    {
-                        state.profile.relay_url = Some(daemon_relay);
-                        adopted_daemon_relay = true;
+                    let has_pending_relay_override = state.pending_relay_override
+                        || state
+                            .transient_requests
+                            .iter()
+                            .any(|m| matches!(m, WireMessage::ConfigureHostRelay { .. }));
+                    if let Some(daemon_relay) = normalize_relay_input(host.relay_url.as_deref()) {
+                        if should_adopt_daemon_relay(
+                            state.profile.relay_url.as_deref(),
+                            &daemon_relay,
+                            state.is_local,
+                            has_pending_relay_override,
+                        ) {
+                            state.profile.relay_url = Some(daemon_relay.clone());
+                            adopted_daemon_relay = true;
+                        }
+                        if !is_legacy_ssh_relay_without_ft(&daemon_relay)
+                            && (state.profile.relay_url.as_deref() == Some(daemon_relay.as_str())
+                                || !has_pending_relay_override)
+                        {
+                            adopted_modern_relay = Some(daemon_relay);
+                        }
                     }
                     for ep in filter_shareable_endpoints(&host.direct_endpoints) {
                         if !state.profile.direct_endpoints.contains(&ep) {
@@ -6859,7 +6930,9 @@ impl OrbitAppCore {
                     }
                     push_notify_timeline(agent_id);
                 }
-                WireMessage::HostRelayConfigured { .. } => {}
+                WireMessage::HostRelayConfigured { .. } => {
+                    state.pending_relay_override = false;
+                }
                 WireMessage::TimelineLive { event } => {
                     let agent_id = event.agent_id.clone();
                     state.observe_outline_prompt(&event);
@@ -8192,13 +8265,36 @@ impl OrbitAppCore {
             self.schedule_cloud_auto_sync(true);
         }
 
+        let mut promoted_fleet_relay: Option<String> = None;
+        if let Some(modern) = adopted_modern_relay {
+            let mut net = load_fleet_network_from_store(&self.store).unwrap_or_default();
+            if net
+                .primary_relay_url
+                .as_deref()
+                .is_none_or(is_legacy_ssh_relay_without_ft)
+            {
+                let now_ms = now_unix_ms();
+                net.primary_relay_url = Some(modern.clone());
+                net.primary_relay_host_id = Some(host_id.to_string());
+                net.relay_urls.retain(|u| u != &modern);
+                net.relay_urls.insert(0, modern.clone());
+                net.relay_urls.truncate(8);
+                net.updated_at_ms = now_ms.max(net.updated_at_ms.saturating_add(1));
+                let _ = save_fleet_network_to_store(&self.store, &net);
+                promoted_fleet_relay = Some(modern);
+            }
+        }
+
         if let Some(stored) = host_to_persist {
             let _ = self.store.upsert_client_host(&stored);
-            if adopted_daemon_relay {
+            if adopted_daemon_relay || promoted_fleet_relay.is_some() {
                 let now_ms = now_unix_ms();
                 self.record_cloud_meta_mutation(|meta| meta.record_host_mutated(host_id, now_ms));
                 self.schedule_cloud_auto_sync(false);
             }
+        }
+        if let Some(ref relay) = promoted_fleet_relay {
+            self.propagate_fleet_relay_to_online_hosts(relay);
         }
         if let Some((ag_id, has_older)) = persist_has_older {
             let _ = self.store.set_replica_has_older(&ag_id, has_older);
@@ -12318,32 +12414,62 @@ impl OrbitAppCore {
         let _reset = ResetAtomicBoolGuard(&self.fleet_relay_fabric_in_flight);
 
         let mut net = load_fleet_network_from_store(&self.store).unwrap_or_default();
-        if net.primary_relay_url.is_none() {
-            // Adopt any existing saved host's relay_url into the shared fleet network first,
+        let primary_missing_or_legacy = net
+            .primary_relay_url
+            .as_deref()
+            .is_none_or(is_legacy_ssh_relay_without_ft);
+        if primary_missing_or_legacy {
+            let had_legacy_primary = net.primary_relay_url.is_some();
+            // Adopt any existing saved host's relay_url, fleet relay_urls, or local daemon config,
             // preferring modern `ft=` / Cloudflare / HTTPS relays over legacy allowlist-only `ssh+relay://`.
-            let candidate = self.hosts.read().ok().and_then(|g| {
-                let mut candidates: Vec<(bool, String, String)> =
-                    g.values()
-                        .filter_map(|h| {
-                            let url =
-                                h.profile.relay_url.as_deref().and_then(|u| {
-                                    orbit_relay_transport::normalize_relay_url(u).ok()
-                                })?;
-                            let legacy = is_legacy_ssh_relay_without_ft(&url);
-                            Some((!legacy, url, h.profile.host_id.clone()))
-                        })
-                        .collect();
-                candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
-                candidates.into_iter().next().map(|(_, u, id)| (u, id))
-            });
-            if let Some((url, host_id)) = candidate {
-                net.primary_relay_url = Some(url.clone());
-                net.primary_relay_host_id = Some(host_id);
-                if !net.relay_urls.contains(&url) {
-                    net.relay_urls.push(url);
+            let mut candidates: Vec<(bool, bool, usize, String, Option<String>)> = Vec::new();
+            let mut push_cand = |raw: &str, host_id: Option<String>| {
+                if let Ok(url) = orbit_relay_transport::normalize_relay_url(raw) {
+                    let has_ft = url.contains("?ft=") || url.contains("&ft=");
+                    let non_legacy = !is_legacy_ssh_relay_without_ft(&url);
+                    let idx = candidates.len();
+                    candidates.push((has_ft, non_legacy, idx, url, host_id));
                 }
+            };
+            if let Some((local_hid, local_pub)) = read_local_daemon_identity()
+                && self.hosts.read().ok().is_some_and(|g| {
+                    g.get(&local_hid)
+                        .is_some_and(|h| h.profile.daemon_pubkey_b64 == local_pub)
+                })
+                && let Some(local_relay) = read_local_daemon_relay_url()
+            {
+                push_cand(&local_relay, Some(local_hid));
+            }
+            if let Ok(g) = self.hosts.read() {
+                for h in g.values() {
+                    if let Some(ref raw) = h.profile.relay_url {
+                        push_cand(raw, Some(h.profile.host_id.clone()));
+                    }
+                }
+            }
+            for raw in &net.relay_urls {
+                push_cand(raw, None);
+            }
+            candidates.sort_by_key(|(has_ft, non_legacy, idx, _, _)| {
+                (
+                    std::cmp::Reverse(*has_ft),
+                    std::cmp::Reverse(*non_legacy),
+                    *idx,
+                )
+            });
+            if let Some((_, non_legacy, _, url, host_id)) = candidates.into_iter().next()
+                && (!had_legacy_primary || non_legacy)
+            {
+                net.primary_relay_url = Some(url.clone());
+                if let Some(hid) = host_id {
+                    net.primary_relay_host_id = Some(hid);
+                }
+                net.relay_urls.retain(|u| u != &url);
+                net.relay_urls.insert(0, url);
+                net.relay_urls.truncate(8);
                 net.updated_at_ms = now_unix_ms();
                 let _ = save_fleet_network_to_store(&self.store, &net);
+                self.schedule_cloud_auto_sync(false);
             }
         }
 
@@ -12421,6 +12547,7 @@ impl OrbitAppCore {
             return;
         }
         let mut to_push: Vec<(String, HostSessionHandle, StoredHostProfile)> = Vec::new();
+        let mut offline_updated: Vec<(String, StoredHostProfile)> = Vec::new();
         let relay_base = relay_url.split('?').next().unwrap_or(relay_url);
         let relay_has_ft = relay_url.contains("?ft=") || relay_url.contains("&ft=");
         if let Ok(mut guard) = self.hosts.write() {
@@ -12440,13 +12567,13 @@ impl OrbitAppCore {
                     if let Some(ref session) = h.session {
                         to_push.push((hid.clone(), session.clone(), stored));
                     } else {
-                        let _ = self.store.upsert_client_host(&stored);
+                        offline_updated.push((hid.clone(), stored));
                     }
                 }
             }
         }
         let now_ms = now_unix_ms();
-        let pushed_any = !to_push.is_empty();
+        let changed_any = !to_push.is_empty() || !offline_updated.is_empty();
         for (hid, session, stored) in to_push {
             let _ = self.store.upsert_client_host(&stored);
             self.record_cloud_meta_mutation(|meta| {
@@ -12462,8 +12589,15 @@ impl OrbitAppCore {
                     .await;
             });
         }
-        if pushed_any && self.cloud_sync_status().state == crate::cloud_sync::CloudSyncState::Ready
-        {
+        for (hid, stored) in offline_updated {
+            let _ = self.store.upsert_client_host(&stored);
+            self.record_cloud_meta_mutation(|meta| {
+                meta.record_host_mutated(&hid, now_ms);
+            });
+            self.connect_host_async(hid);
+        }
+        if changed_any {
+            self.emit(|revision| CoreNotification::FleetChanged { revision });
             self.schedule_cloud_auto_sync(false);
         }
     }
@@ -22278,6 +22412,7 @@ impl OrbitAppCore {
         })?;
 
         let mut cfg = existing_cfg;
+        self.reset_cloud_sync_backoff();
         let account_changed = cfg.github_login.as_deref() != Some(user.login.as_str());
         if account_changed {
             cfg.clear_derived_key();
@@ -22415,6 +22550,7 @@ impl OrbitAppCore {
         })?;
 
         let mut cfg = existing_cfg;
+        self.reset_cloud_sync_backoff();
         let account_changed = cfg.github_login.as_deref() != Some(user.login.as_str());
         if account_changed {
             cfg.clear_derived_key();
@@ -22490,6 +22626,7 @@ impl OrbitAppCore {
     ) -> Result<CloudSyncStatusView, ClientCoreError> {
         let mut cfg = load_sync_config_from_store(&self.store);
         cfg.require_manual_passphrase = require_manual;
+        cfg.require_manual_passphrase_updated_at_ms = now_unix_ms();
         if let Some(token) = cfg
             .github_access_token
             .clone()
@@ -22522,8 +22659,100 @@ impl OrbitAppCore {
             }
         }
         save_sync_config_to_store(&self.store, &cfg)?;
+        self.reset_cloud_sync_backoff();
         self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.schedule_cloud_auto_sync(false);
         Ok(cfg.to_status_view(self.cloud_sync_in_flight.load(Ordering::SeqCst)))
+    }
+
+    fn reset_cloud_sync_backoff(&self) {
+        self.cloud_sync_consecutive_errors
+            .store(0, Ordering::SeqCst);
+        self.cloud_sync_backoff_until_ms.store(0, Ordering::SeqCst);
+    }
+
+    fn record_cloud_sync_success(&self) {
+        self.reset_cloud_sync_backoff();
+        self.cloud_sync_last_auto_ms
+            .store(unix_ms_now(), Ordering::SeqCst);
+    }
+
+    fn record_cloud_sync_failure(&self, err: &CloudSyncError) {
+        let attempt = self
+            .cloud_sync_consecutive_errors
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        let delay_ms = match err {
+            CloudSyncError::RateLimited {
+                retry_after_secs, ..
+            } => (*retry_after_secs).clamp(60, 3600).saturating_mul(1_000),
+            CloudSyncError::GitHubApi { status: 401, .. }
+            | CloudSyncError::NotSignedIn
+            | CloudSyncError::VaultLocked
+            | CloudSyncError::PassphraseRotationRequired => 300_000,
+            _ => {
+                let exp_shift = attempt.saturating_sub(1).min(4);
+                let exp_ms = 5_000u64.saturating_mul(1u64 << exp_shift).min(300_000);
+                let hint_ms = err.backoff_hint_secs().unwrap_or(0).saturating_mul(1_000);
+                exp_ms.max(hint_ms).min(300_000)
+            }
+        };
+        let until = unix_ms_now().saturating_add(delay_ms);
+        self.cloud_sync_backoff_until_ms
+            .fetch_max(until, Ordering::SeqCst);
+    }
+
+    async fn ensure_auto_unlock_key_gist_locked(
+        &self,
+        client: &GitHubCloudClient,
+        token: &str,
+        cfg: &mut PersistedCloudSyncConfig,
+        key: &orbit_crypto::DerivedVaultKey,
+        remote_gist: Option<&crate::cloud_sync::RemoteVaultGist>,
+        remote_auto_key: Option<&crate::cloud_sync::RemoteAutoUnlockKey>,
+    ) -> Result<bool, CloudSyncError> {
+        if cfg.require_manual_passphrase {
+            return Ok(false);
+        }
+        if let Some(ak) = remote_auto_key {
+            let matches = crate::cloud_sync::derived_key_from_auto_unlock(ak, remote_gist)
+                .is_ok_and(|k| k.key_b64() == key.key_b64());
+            if matches {
+                let changed = cfg.key_gist_id.as_deref() != Some(ak.gist_id.as_str());
+                cfg.key_gist_id = Some(ak.gist_id.clone());
+                return Ok(changed);
+            }
+            match client
+                .save_auto_unlock_key_gist(token, Some(&ak.gist_id), key)
+                .await
+            {
+                Ok(kid) => {
+                    cfg.key_gist_id = Some(kid);
+                    return Ok(true);
+                }
+                Err(err @ CloudSyncError::RateLimited { .. }) => return Err(err),
+                Err(err) => {
+                    tracing::warn!(error = %err, "Failed to update stale auto-unlock key gist");
+                    return Ok(false);
+                }
+            }
+        }
+        if cfg.key_gist_id.is_none() {
+            match client.save_auto_unlock_key_gist(token, None, key).await {
+                Ok(kid) => {
+                    cfg.key_gist_id = Some(kid);
+                    return Ok(true);
+                }
+                Err(err @ CloudSyncError::RateLimited { .. }) => return Err(err),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "Failed to backfill auto-unlock key gist; continuing vault sync"
+                    );
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Unlock (or initialize) the E2EE Cloud Vault with the user's Sync Passphrase and perform an immediate sync.
@@ -22547,25 +22776,78 @@ impl OrbitAppCore {
     }
 
     /// Trigger a non-blocking background Cloud Sync (used after local mutations or foreground resume).
+    /// Coalesces concurrent bursts into a single-flight debounced task and respects API rate-limit backoff.
     pub fn schedule_cloud_auto_sync(self: &Arc<Self>, throttled: bool) {
-        let dirty = self.store.cloud_dirty_revision().ok().flatten().is_some();
         let cfg = load_sync_config_from_store(&self.store);
         if !cfg.auto_sync_enabled || !cfg.is_signed_in() || cfg.derived_key().is_none() {
             return;
         }
-        let now = unix_ms_now();
-        if throttled && !dirty {
-            let last = self.cloud_sync_last_auto_ms.load(Ordering::SeqCst);
-            if now.saturating_sub(last) < 30_000 {
-                return;
-            }
+        if !throttled {
+            self.cloud_sync_urgent_pending.store(true, Ordering::SeqCst);
         }
-        self.cloud_sync_last_auto_ms.store(now, Ordering::SeqCst);
+        if self
+            .cloud_sync_auto_scheduled
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
         let core = Arc::clone(self);
         self.runtime.spawn(async move {
-            if !throttled {
-                tokio::time::sleep(Duration::from_millis(1200)).await;
+            let mut urgent_debounce_until: Option<u64> = if !throttled {
+                Some(unix_ms_now().saturating_add(CLOUD_AUTO_SYNC_URGENT_DEBOUNCE_MS))
+            } else {
+                None
+            };
+            loop {
+                let latest_cfg = load_sync_config_from_store(&core.store);
+                if !latest_cfg.auto_sync_enabled
+                    || !latest_cfg.is_signed_in()
+                    || latest_cfg.derived_key().is_none()
+                {
+                    core.cloud_sync_auto_scheduled
+                        .store(false, Ordering::SeqCst);
+                    core.cloud_sync_urgent_pending
+                        .store(false, Ordering::SeqCst);
+                    return;
+                }
+                let now = unix_ms_now();
+                let is_urgent = core.cloud_sync_urgent_pending.load(Ordering::SeqCst);
+                if is_urgent && urgent_debounce_until.is_none() {
+                    urgent_debounce_until =
+                        Some(now.saturating_add(CLOUD_AUTO_SYNC_URGENT_DEBOUNCE_MS));
+                }
+                let last = core.cloud_sync_last_auto_ms.load(Ordering::SeqCst);
+                let backoff_until = core.cloud_sync_backoff_until_ms.load(Ordering::SeqCst);
+                let min_interval = if is_urgent {
+                    CLOUD_AUTO_SYNC_URGENT_MIN_INTERVAL_MS
+                } else {
+                    CLOUD_AUTO_SYNC_THROTTLED_MIN_INTERVAL_MS
+                };
+                let cooldown_target = if last == 0 {
+                    now
+                } else {
+                    last.saturating_add(min_interval)
+                };
+                let debounce_target = urgent_debounce_until.unwrap_or(now);
+                let target = cooldown_target.max(debounce_target).max(backoff_until);
+                if now >= target {
+                    break;
+                }
+                let remaining = target.saturating_sub(now);
+                let slice_ms = if !is_urgent && backoff_until <= cooldown_target {
+                    remaining.min(1_000)
+                } else {
+                    remaining.min(5_000)
+                };
+                tokio::time::sleep(Duration::from_millis(slice_ms)).await;
             }
+            core.cloud_sync_last_auto_ms
+                .store(unix_ms_now(), Ordering::SeqCst);
+            core.cloud_sync_auto_scheduled
+                .store(false, Ordering::SeqCst);
+            core.cloud_sync_urgent_pending
+                .store(false, Ordering::SeqCst);
             if let Err(err) = core.cloud_sync_now_async().await {
                 tracing::debug!(error = %err, "Background cloud auto-sync skipped/failed");
             }
@@ -22577,6 +22859,7 @@ impl OrbitAppCore {
         &self,
         clear_local_hosts: bool,
     ) -> Result<CloudSyncStatusView, ClientCoreError> {
+        self.reset_cloud_sync_backoff();
         let prev = load_sync_config_from_store(&self.store);
         let cleared = PersistedCloudSyncConfig {
             github_client_id: prev.github_client_id,
@@ -22655,10 +22938,15 @@ impl OrbitAppCore {
         self.cloud_sync_in_flight.store(true, Ordering::SeqCst);
         let res = self.cloud_sync_unlock_inner(passphrase).await;
         self.cloud_sync_in_flight.store(false, Ordering::SeqCst);
-        if let Err(ref err) = res {
-            let mut cfg = load_sync_config_from_store(&self.store);
-            cfg.last_error = Some(err.to_string());
-            let _ = save_sync_config_to_store(&self.store, &cfg);
+        match &res {
+            Ok(_) => self.record_cloud_sync_success(),
+            Err(err) => {
+                self.record_cloud_sync_failure(err);
+                let mut cfg = load_sync_config_from_store(&self.store);
+                cfg.last_error = Some(format_cloud_sync_error(err));
+                let _ = save_sync_config_to_store(&self.store, &cfg);
+                self.emit(|revision| CoreNotification::FleetChanged { revision });
+            }
         }
         res
     }
@@ -22690,6 +22978,24 @@ impl OrbitAppCore {
             cfg.remote_vault_exists = true;
         }
         cfg.last_error = None;
+        reconcile_manual_passphrase_from_remote(&mut cfg, remote_payload.as_ref());
+        if !cfg.require_manual_passphrase && cfg.key_gist_id.is_none() {
+            let remote_auto_key = client
+                .fetch_vault_and_auto_key(&token, cfg.gist_id.as_deref(), None)
+                .await
+                .ok()
+                .and_then(|(_, ak)| ak);
+            let _ = self
+                .ensure_auto_unlock_key_gist_locked(
+                    &client,
+                    &token,
+                    &mut cfg,
+                    &key,
+                    remote_gist.as_ref(),
+                    remote_auto_key.as_ref(),
+                )
+                .await?;
+        }
         save_sync_config_to_store(&self.store, &cfg)?;
 
         self.merge_apply_and_push_locked(&client, &token, &key, &mut cfg, remote_payload.as_ref())
@@ -22701,19 +23007,18 @@ impl OrbitAppCore {
         self.cloud_sync_in_flight.store(true, Ordering::SeqCst);
         let res = self.cloud_sync_now_inner().await;
         self.cloud_sync_in_flight.store(false, Ordering::SeqCst);
-        if let Err(ref err) = res {
-            let mut cfg = load_sync_config_from_store(&self.store);
-            if matches!(err, CloudSyncError::PassphraseRotationRequired) {
-                cfg.clear_derived_key();
-            }
-            cfg.last_error = Some(match err {
-                CloudSyncError::GitHubApi { status: 401, .. } => {
-                    "GitHub authorization expired or revoked (401) — sign in again to resume Cloud Sync (your vault and passphrase stay intact).".to_string()
+        match &res {
+            Ok(_) => self.record_cloud_sync_success(),
+            Err(err) => {
+                self.record_cloud_sync_failure(err);
+                let mut cfg = load_sync_config_from_store(&self.store);
+                if matches!(err, CloudSyncError::PassphraseRotationRequired) {
+                    cfg.clear_derived_key();
                 }
-                _ => err.to_string(),
-            });
-            let _ = save_sync_config_to_store(&self.store, &cfg);
-            self.emit(|revision| CoreNotification::FleetChanged { revision });
+                cfg.last_error = Some(format_cloud_sync_error(err));
+                let _ = save_sync_config_to_store(&self.store, &cfg);
+                self.emit(|revision| CoreNotification::FleetChanged { revision });
+            }
         }
         res
     }
@@ -22727,9 +23032,24 @@ impl OrbitAppCore {
             .ok_or(CloudSyncError::NotSignedIn)?;
 
         let client = self.cloud_client();
-        let (remote_gist, remote_auto_key) = client
-            .fetch_vault_and_auto_key(&token, cfg.gist_id.as_deref(), cfg.key_gist_id.as_deref())
-            .await?;
+        let need_key_lookup = cfg.derived_key().is_none()
+            || (!cfg.require_manual_passphrase && cfg.key_gist_id.is_none());
+        let (remote_gist, remote_auto_key) = if !need_key_lookup && cfg.gist_id.is_some() {
+            (
+                client
+                    .fetch_vault_gist(&token, cfg.gist_id.as_deref())
+                    .await?,
+                None,
+            )
+        } else {
+            client
+                .fetch_vault_and_auto_key(
+                    &token,
+                    cfg.gist_id.as_deref(),
+                    cfg.key_gist_id.as_deref(),
+                )
+                .await?
+        };
 
         let key = if let Some(cached) = cfg.derived_key() {
             cached
@@ -22756,6 +23076,27 @@ impl OrbitAppCore {
             None
         };
 
+        let mut cfg_updated =
+            reconcile_manual_passphrase_from_remote(&mut cfg, remote_payload.as_ref());
+        if !cfg.require_manual_passphrase
+            && (cfg.key_gist_id.is_none() || remote_auto_key.is_some())
+            && self
+                .ensure_auto_unlock_key_gist_locked(
+                    &client,
+                    &token,
+                    &mut cfg,
+                    &key,
+                    remote_gist.as_ref(),
+                    remote_auto_key.as_ref(),
+                )
+                .await?
+        {
+            cfg_updated = true;
+        }
+        if cfg_updated {
+            save_sync_config_to_store(&self.store, &cfg)?;
+        }
+
         self.merge_apply_and_push_locked(&client, &token, &key, &mut cfg, remote_payload.as_ref())
             .await
     }
@@ -22769,6 +23110,7 @@ impl OrbitAppCore {
         remote_payload: Option<&crate::cloud_sync::CloudVaultPayload>,
     ) -> Result<CloudSyncResultView, CloudSyncError> {
         let now_ms = now_unix_ms();
+        reconcile_manual_passphrase_from_remote(cfg, remote_payload);
         let mut local_meta = load_sync_meta_from_store(&self.store);
         let mut local_prefs = load_sync_prefs_from_store(&self.store);
         for pref in self
@@ -22807,39 +23149,70 @@ impl OrbitAppCore {
         }
         let local_fleet_network = load_fleet_network_from_store(&self.store);
 
-        // Authoritatively prefer this machine's persisted `$ORBIT_HOME/pairing-secret` over any
-        // cached or remote synced value before merging so rotated secrets never roll back.
-        // Resolve identity and pairing-secret from the EXACT same Orbit home directory.
+        // Authoritatively prefer this machine's persisted `$ORBIT_HOME/pairing-secret` and
+        // `$ORBIT_HOME/config.json` relay_url over any cached or remote synced value before merging
+        // so rotated secrets or upgraded Cloudflare relays never roll back.
         let (local_daemon_id, local_daemon_secret) = read_local_host_identity_and_secret();
+        let local_daemon_relay = read_local_daemon_relay_url();
         let mut refreshed_local_stored: Option<StoredHostProfile> = None;
-        if let (Some((local_hid, local_pub)), Some(local_secret)) =
-            (local_daemon_id.as_ref(), local_daemon_secret.as_ref())
+        let mut refreshed_local_ts: Option<(String, i64)> = None;
+        if let Some((local_hid, local_pub)) = local_daemon_id.as_ref()
             && let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(local_hid)
             && h.profile.daemon_pubkey_b64 == *local_pub
         {
-            let remote_secret_ts = remote_payload
+            let remote_host_ts = remote_payload
                 .and_then(|r| r.hosts.get(local_hid))
-                .map(|r| r.pairing_secret_updated_at_ms)
+                .map(|r| r.updated_at_ms)
                 .unwrap_or(0);
-            let remote_secret_differs = remote_payload
-                .and_then(|r| r.hosts.get(local_hid))
-                .is_some_and(|r| r.pairing_secret != *local_secret);
-            if h.profile.pairing_secret != *local_secret
-                || (remote_secret_differs
-                    && h.profile.pairing_secret_updated_at_ms <= remote_secret_ts)
+            if let Some(local_secret) = local_daemon_secret.as_ref() {
+                let remote_secret_ts = remote_payload
+                    .and_then(|r| r.hosts.get(local_hid))
+                    .map(|r| r.pairing_secret_updated_at_ms)
+                    .unwrap_or(0);
+                let remote_secret_differs = remote_payload
+                    .and_then(|r| r.hosts.get(local_hid))
+                    .is_some_and(|r| r.pairing_secret != *local_secret);
+                if h.profile.pairing_secret != *local_secret
+                    || (remote_secret_differs
+                        && h.profile.pairing_secret_updated_at_ms <= remote_secret_ts)
+                {
+                    let fresh_ts = now_ms
+                        .max(h.profile.pairing_secret_updated_at_ms.saturating_add(1))
+                        .max(remote_secret_ts.saturating_add(1));
+                    h.profile.pairing_secret = local_secret.clone();
+                    h.profile.pairing_secret_updated_at_ms = fresh_ts;
+                    h.is_local = true;
+                    refreshed_local_stored = Some(h.to_stored_host());
+                }
+            }
+            if let Some(ref daemon_relay) = local_daemon_relay
+                && should_adopt_daemon_relay(
+                    h.profile.relay_url.as_deref(),
+                    daemon_relay,
+                    true,
+                    h.pending_relay_override,
+                )
             {
+                let existing_meta_ts = local_meta
+                    .host_updated_at_ms
+                    .get(local_hid)
+                    .copied()
+                    .unwrap_or(0);
                 let fresh_ts = now_ms
-                    .max(h.profile.pairing_secret_updated_at_ms.saturating_add(1))
-                    .max(remote_secret_ts.saturating_add(1));
-                h.profile.pairing_secret = local_secret.clone();
-                h.profile.pairing_secret_updated_at_ms = fresh_ts;
+                    .max(remote_host_ts.saturating_add(1))
+                    .max(existing_meta_ts.saturating_add(1));
+                h.profile.relay_url = Some(daemon_relay.clone());
                 h.is_local = true;
                 refreshed_local_stored = Some(h.to_stored_host());
+                refreshed_local_ts = Some((local_hid.clone(), fresh_ts));
             }
         }
         if let Some(ref stored) = refreshed_local_stored {
             let _ = self.store.upsert_client_host(stored);
+        }
+        if let Some((ref hid, ts)) = refreshed_local_ts {
+            local_meta.record_host_mutated(hid, ts);
         }
 
         // Snapshot local hosts, projects, and project order without holding locks across `.await`
@@ -22895,6 +23268,18 @@ impl OrbitAppCore {
             local_fleet_network.as_ref(),
             now_ms,
         );
+        outcome.merged.require_manual_passphrase = cfg.require_manual_passphrase;
+        outcome.merged.require_manual_passphrase_updated_at_ms =
+            cfg.require_manual_passphrase_updated_at_ms;
+        let remote_manual_differs = remote_payload.is_some_and(|r| {
+            r.require_manual_passphrase != cfg.require_manual_passphrase
+                || r.require_manual_passphrase_updated_at_ms
+                    != cfg.require_manual_passphrase_updated_at_ms
+        });
+        if remote_manual_differs && !outcome.needs_push {
+            outcome.merged.revision = outcome.merged.revision.saturating_add(1);
+            outcome.needs_push = true;
+        }
 
         // Apply remote host changes locally
         let mut hosts_to_connect: Vec<String> = Vec::new();
@@ -23121,13 +23506,18 @@ impl OrbitAppCore {
 
         // Push encrypted vault to GitHub Secret Gist if local state contributed new changes
         if outcome.needs_push {
-            let (gid, html_url) =
-                push_vault_payload(client, token, cfg.gist_id.as_deref(), key, &outcome.merged)
-                    .await?;
+            let (gid, html_url, etag) = push_vault_payload_with_etag(
+                client,
+                token,
+                cfg.gist_id.as_deref(),
+                key,
+                &outcome.merged,
+            )
+            .await?;
             cfg.gist_id = Some(gid);
             cfg.gist_html_url = Some(html_url);
             cfg.remote_vault_exists = true;
-            cfg.last_etag = None;
+            cfg.last_etag = etag;
 
             // Broadcast immediate Vault change notification over any shared online Daemons so
             // sibling devices signed into the same account pull immediately without waiting for poll.
@@ -23208,10 +23598,14 @@ impl OrbitAppCore {
     fn spawn_cloud_sync_etag_poller(self: &Arc<Self>) {
         let core = Arc::clone(self);
         self.runtime.spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(CLOUD_SYNC_ETAG_POLL_INTERVAL_SECS));
             interval.tick().await;
             loop {
                 interval.tick().await;
+                if unix_ms_now() < core.cloud_sync_backoff_until_ms.load(Ordering::SeqCst) {
+                    continue;
+                }
                 let cfg = load_sync_config_from_store(&core.store);
                 if !cfg.auto_sync_enabled
                     || !cfg.is_signed_in()
@@ -23241,7 +23635,7 @@ impl OrbitAppCore {
                 {
                     Ok(GistConditionalFetch::NotModified) => {
                         if core.store.cloud_dirty_revision().ok().flatten().is_some() {
-                            let _ = core.cloud_sync_now_async().await;
+                            core.schedule_cloud_auto_sync(true);
                         }
                         continue;
                     }
@@ -23255,6 +23649,10 @@ impl OrbitAppCore {
                         fresh_cfg.remote_vault_exists = true;
                         let sync_res = match decrypt_remote_with_cached_key(&key, &gist) {
                             Ok(payload) => {
+                                reconcile_manual_passphrase_from_remote(
+                                    &mut fresh_cfg,
+                                    Some(&payload),
+                                );
                                 core.merge_apply_and_push_locked(
                                     &client,
                                     &token,
@@ -23267,11 +23665,35 @@ impl OrbitAppCore {
                             Err(e) => Err(e),
                         };
                         core.cloud_sync_in_flight.store(false, Ordering::SeqCst);
-                        if let Err(err) = sync_res {
-                            tracing::debug!(error = %err, "ETag conditional vault refresh failed");
+                        match sync_res {
+                            Ok(_) => core.record_cloud_sync_success(),
+                            Err(err) => {
+                                core.record_cloud_sync_failure(&err);
+                                tracing::debug!(error = %err, "ETag conditional vault refresh failed");
+                                if matches!(err, CloudSyncError::PassphraseRotationRequired) {
+                                    fresh_cfg.clear_derived_key();
+                                }
+                                fresh_cfg.last_error = Some(format_cloud_sync_error(&err));
+                                let _ = save_sync_config_to_store(&core.store, &fresh_cfg);
+                                core.emit(|revision| CoreNotification::FleetChanged { revision });
+                            }
                         }
                     }
-                    Ok(GistConditionalFetch::NotFound) | Err(_) => continue,
+                    Ok(GistConditionalFetch::NotFound) => continue,
+                    Err(err) => {
+                        core.record_cloud_sync_failure(&err);
+                        if matches!(
+                            err,
+                            CloudSyncError::RateLimited { .. }
+                                | CloudSyncError::GitHubApi { status: 401, .. }
+                        ) {
+                            let mut latest_cfg = load_sync_config_from_store(&core.store);
+                            latest_cfg.last_error = Some(format_cloud_sync_error(&err));
+                            let _ = save_sync_config_to_store(&core.store, &latest_cfg);
+                            core.emit(|revision| CoreNotification::FleetChanged { revision });
+                        }
+                        continue;
+                    }
                 }
             }
         });
@@ -23316,6 +23738,68 @@ fn read_local_host_identity_and_secret() -> (Option<(String, String)>, Option<St
     let identity = read_local_host_identity_pair_in(&orbit_dir);
     let secret = crate::desktop_ops::read_local_daemon_pairing_secret_in(&orbit_dir);
     (identity, secret)
+}
+
+fn should_adopt_daemon_relay(
+    current: Option<&str>,
+    daemon_relay: &str,
+    is_local: bool,
+    has_pending_override: bool,
+) -> bool {
+    let daemon_trimmed = daemon_relay.trim();
+    if daemon_trimmed.is_empty() || has_pending_override {
+        return false;
+    }
+    let Some(cur) = current.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    if cur == daemon_trimmed {
+        return false;
+    }
+    if is_legacy_ssh_relay_without_ft(cur) && !is_legacy_ssh_relay_without_ft(daemon_trimmed) {
+        return true;
+    }
+    is_local && !is_legacy_ssh_relay_without_ft(daemon_trimmed)
+}
+
+fn reconcile_manual_passphrase_from_remote(
+    cfg: &mut PersistedCloudSyncConfig,
+    remote_payload: Option<&crate::cloud_sync::CloudVaultPayload>,
+) -> bool {
+    let Some(remote) = remote_payload else {
+        return false;
+    };
+    if remote.require_manual_passphrase_updated_at_ms > cfg.require_manual_passphrase_updated_at_ms
+    {
+        cfg.require_manual_passphrase = remote.require_manual_passphrase;
+        cfg.require_manual_passphrase_updated_at_ms =
+            remote.require_manual_passphrase_updated_at_ms;
+        if cfg.require_manual_passphrase {
+            cfg.key_gist_id = None;
+        }
+        return true;
+    }
+    if remote.require_manual_passphrase_updated_at_ms == 0
+        && cfg.require_manual_passphrase_updated_at_ms == 0
+        && remote.require_manual_passphrase
+        && !cfg.require_manual_passphrase
+    {
+        cfg.require_manual_passphrase = true;
+        cfg.key_gist_id = None;
+        return true;
+    }
+    false
+}
+
+fn format_cloud_sync_error(err: &CloudSyncError) -> String {
+    match err {
+        CloudSyncError::RateLimited {
+            retry_after_secs, ..
+        } => format!(
+            "GitHub API rate limit exceeded; cloud auto-sync paused for ~{retry_after_secs}s"
+        ),
+        _ => err.to_string(),
+    }
 }
 
 const EAGER_FILE_HIGHLIGHT_LINES: usize = 250;
@@ -25262,7 +25746,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(3), async {
                 while core.store.list_pending_outbox("mobile-host").expect("rows")[0].attempts == 0
                 {
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             })
             .await
@@ -25288,7 +25772,7 @@ mod tests {
                     .has_pending_outbox("mobile-host")
                     .expect("pending")
                 {
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             })
             .await
@@ -33096,5 +33580,730 @@ mod tests {
                 || patrol_err.to_ascii_lowercase().contains("lost")
                 || !patrol_err.is_empty()
         );
+    }
+
+    #[test]
+    fn welcome_upgrades_legacy_ssh_relay_to_modern_cloudflare_relay_and_promotes_fleet_primary() {
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("open core");
+        let kp1 = orbit_crypto::HostIdentityKeypair::generate().expect("kp1");
+        let kp2 = orbit_crypto::HostIdentityKeypair::generate().expect("kp2");
+        let h1 = kp1.host_id().expect("h1");
+        let h2 = kp2.host_id().expect("h2");
+        let legacy_url = "ssh+relay://ec2-user@198.51.100.42:22/7878?key=old";
+        let modern_url = "wss://cayman-welcome-upgrade.trycloudflare.com?ft=fleet_secret_w1";
+
+        assert!(!should_adopt_daemon_relay(
+            Some(legacy_url),
+            modern_url,
+            false,
+            true
+        ));
+        assert!(should_adopt_daemon_relay(
+            Some(legacy_url),
+            modern_url,
+            false,
+            false
+        ));
+        assert!(should_adopt_daemon_relay(
+            Some("wss://old-cf.trycloudflare.com?ft=fleet_secret_w1"),
+            modern_url,
+            true,
+            false
+        ));
+        assert!(!should_adopt_daemon_relay(
+            Some("wss://custom-other.trycloudflare.com?ft=fleet_secret_w1"),
+            modern_url,
+            false,
+            false
+        ));
+
+        for (hid, name, pubkey, sec) in [
+            (&h1, "spark-box", kp1.public_key_b64.clone(), "s1"),
+            (&h2, "mac-box", kp2.public_key_b64.clone(), "s2"),
+        ] {
+            let offer = PairingOffer {
+                host_id: hid.clone(),
+                hostname: name.into(),
+                daemon_pubkey_b64: pubkey,
+                direct_endpoints: vec![],
+                relay_url: Some(legacy_url.into()),
+                pairing_secret: sec.into(),
+            };
+            core.pair_host(&offer.to_qr_uri().expect("uri"))
+                .expect("pair");
+        }
+
+        let stale_net = crate::cloud_sync::SyncedFleetNetwork {
+            primary_relay_url: Some(legacy_url.into()),
+            primary_relay_host_id: Some(h2.clone()),
+            relay_urls: vec![legacy_url.into()],
+            updated_at_ms: 100,
+        };
+        save_fleet_network_to_store(&core.store, &stale_net).expect("save fleet network");
+
+        core.handle_inbound_wire(
+            &h1,
+            WireMessage::Welcome {
+                host: orbit_protocol::HostInfo {
+                    host_id: h1.clone(),
+                    hostname: "spark-box".into(),
+                    os: "linux".into(),
+                    arch: "aarch64".into(),
+                    public_key_b64: kp1.public_key_b64.clone(),
+                    protocol_version: orbit_protocol::PROTOCOL_VERSION,
+                    daemon_version: "0.11.0".into(),
+                    available_providers: vec![],
+                    relay_url: Some(modern_url.into()),
+                    direct_endpoints: vec!["ws://127.0.0.1:6868/ws".into()],
+                },
+            },
+        );
+
+        {
+            let guard = core.hosts.read().expect("read hosts");
+            assert_eq!(
+                guard.get(&h1).expect("h1").profile.relay_url.as_deref(),
+                Some(modern_url)
+            );
+            assert_eq!(
+                guard.get(&h2).expect("h2").profile.relay_url.as_deref(),
+                Some(modern_url)
+            );
+        }
+        let persisted_net =
+            load_fleet_network_from_store(&core.store).expect("persisted fleet network");
+        assert_eq!(persisted_net.primary_relay_url.as_deref(), Some(modern_url));
+        assert_eq!(
+            persisted_net.primary_relay_host_id.as_deref(),
+            Some(h1.as_str())
+        );
+
+        // Pending manual relay override must protect against stale Welcome overwrite until ack.
+        let manual_url = "wss://manual-override.trycloudflare.com?ft=fleet_secret_w1";
+        {
+            let mut guard = core.hosts.write().expect("write hosts");
+            let h = guard.get_mut(&h1).expect("h1");
+            h.profile.relay_url = Some(manual_url.into());
+            h.pending_relay_override = true;
+        }
+        core.handle_inbound_wire(
+            &h1,
+            WireMessage::Welcome {
+                host: orbit_protocol::HostInfo {
+                    host_id: h1.clone(),
+                    hostname: "spark-box".into(),
+                    os: "linux".into(),
+                    arch: "aarch64".into(),
+                    public_key_b64: kp1.public_key_b64,
+                    protocol_version: orbit_protocol::PROTOCOL_VERSION,
+                    daemon_version: "0.11.0".into(),
+                    available_providers: vec![],
+                    relay_url: Some(modern_url.into()),
+                    direct_endpoints: vec![],
+                },
+            },
+        );
+        assert_eq!(
+            core.hosts
+                .read()
+                .expect("read")
+                .get(&h1)
+                .expect("h1")
+                .profile
+                .relay_url
+                .as_deref(),
+            Some(manual_url)
+        );
+        core.handle_inbound_wire(
+            &h1,
+            WireMessage::HostRelayConfigured {
+                request_id: Uuid::new_v4(),
+                relay_url: Some(manual_url.into()),
+            },
+        );
+        assert!(
+            !core
+                .hosts
+                .read()
+                .expect("read")
+                .get(&h1)
+                .expect("h1")
+                .pending_relay_override
+        );
+    }
+
+    #[test]
+    fn ensure_fleet_relay_fabric_upgrades_legacy_primary_and_propagates_to_offline_hosts() {
+        let tmp_db =
+            std::env::temp_dir().join(format!("orbit-relay-fabric-upgrade-{}.db", Uuid::new_v4()));
+        {
+            let core = OrbitAppCore::open_with_options_and_key(&tmp_db, false, Some([7; 32]))
+                .expect("open core");
+            let kp1 = orbit_crypto::HostIdentityKeypair::generate().expect("kp1");
+            let kp2 = orbit_crypto::HostIdentityKeypair::generate().expect("kp2");
+            let h1 = kp1.host_id().expect("h1");
+            let h2 = kp2.host_id().expect("h2");
+            let legacy_url = "ssh+relay://ec2-user@198.51.100.42:22/7878?key=old";
+            let modern_url = "wss://fabric-modern.trycloudflare.com?ft=fleet_secret_f2";
+
+            core.pair_host(
+                &PairingOffer {
+                    host_id: h1.clone(),
+                    hostname: "offline-legacy".into(),
+                    daemon_pubkey_b64: kp1.public_key_b64,
+                    direct_endpoints: vec![],
+                    relay_url: Some(legacy_url.into()),
+                    pairing_secret: "s1".into(),
+                }
+                .to_qr_uri()
+                .expect("u1"),
+            )
+            .expect("p1");
+            core.pair_host(
+                &PairingOffer {
+                    host_id: h2.clone(),
+                    hostname: "modern-host".into(),
+                    daemon_pubkey_b64: kp2.public_key_b64,
+                    direct_endpoints: vec![],
+                    relay_url: Some(modern_url.into()),
+                    pairing_secret: "s2".into(),
+                }
+                .to_qr_uri()
+                .expect("u2"),
+            )
+            .expect("p2");
+
+            save_fleet_network_to_store(
+                &core.store,
+                &crate::cloud_sync::SyncedFleetNetwork {
+                    primary_relay_url: Some(legacy_url.into()),
+                    primary_relay_host_id: Some(h1.clone()),
+                    relay_urls: vec![legacy_url.into()],
+                    updated_at_ms: 10,
+                },
+            )
+            .expect("seed legacy fleet net");
+
+            core.runtime
+                .block_on(core.ensure_fleet_relay_fabric_async());
+
+            let upgraded_net =
+                load_fleet_network_from_store(&core.store).expect("upgraded fleet network");
+            assert_eq!(upgraded_net.primary_relay_url.as_deref(), Some(modern_url));
+            assert_eq!(
+                core.hosts
+                    .read()
+                    .expect("read")
+                    .get(&h1)
+                    .expect("h1")
+                    .profile
+                    .relay_url
+                    .as_deref(),
+                Some(modern_url)
+            );
+            let persisted_hosts = core
+                .store
+                .list_client_hosts()
+                .expect("list persisted hosts");
+            let stored_h1 = persisted_hosts
+                .iter()
+                .find(|h| h.host_id == h1)
+                .expect("stored h1");
+            assert_eq!(stored_h1.relay_url.as_deref(), Some(modern_url));
+        }
+        let _ = std::fs::remove_file(&tmp_db);
+    }
+
+    #[test]
+    fn cloud_sync_backfills_auto_unlock_key_gist_for_pre_v011_vault_and_respects_manual_mode() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Default)]
+        struct MockBackfillGist {
+            vault_content: Mutex<Option<String>>,
+            key_content: Mutex<Option<String>>,
+        }
+
+        let state = Arc::new(MockBackfillGist::default());
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let base_url = rt.block_on({
+            let state = Arc::clone(&state);
+            async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let addr = listener.local_addr().expect("addr");
+                tokio::spawn(async move {
+                    loop {
+                        let Ok((mut sock, _)) = listener.accept().await else {
+                            break;
+                        };
+                        let st = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 65_536];
+                            let n = sock.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let first_line = req.lines().next().unwrap_or("");
+                            let parts: Vec<&str> = first_line.split_whitespace().collect();
+                            let method = parts.first().copied().unwrap_or("");
+                            let path = parts.get(1).copied().unwrap_or("");
+                            let body_str = req.split("\r\n\r\n").nth(1).unwrap_or("");
+
+                            let (status, headers, resp_body) = match (method, path) {
+                                ("GET", "/user") => (
+                                    "200 OK",
+                                    "X-OAuth-Scopes: gist\r\n",
+                                    serde_json::json!({
+                                        "login": "octocat",
+                                        "name": "The Octocat",
+                                        "avatar_url": null
+                                    })
+                                    .to_string(),
+                                ),
+                                ("GET", p) if p.starts_with("/gists?") => {
+                                    let mut items = Vec::new();
+                                    if st.vault_content.lock().expect("lock").is_some() {
+                                        items.push(serde_json::json!({
+                                            "id": "gist_vault_1",
+                                            "html_url": "https://gist.github.com/octocat/gist_vault_1",
+                                            "files": { crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME: {} }
+                                        }));
+                                    }
+                                    if st.key_content.lock().expect("lock").is_some() {
+                                        items.push(serde_json::json!({
+                                            "id": "gist_key_1",
+                                            "html_url": "https://gist.github.com/octocat/gist_key_1",
+                                            "files": { crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME: {} }
+                                        }));
+                                    }
+                                    ("200 OK", "", serde_json::Value::Array(items).to_string())
+                                }
+                                ("GET", "/gists/gist_vault_1") => {
+                                    if let Some(c) = st.vault_content.lock().expect("lock").clone() {
+                                        (
+                                            "200 OK",
+                                            "ETag: \"v1\"\r\n",
+                                            serde_json::json!({
+                                                "id": "gist_vault_1",
+                                                "html_url": "https://gist.github.com/octocat/gist_vault_1",
+                                                "files": {
+                                                    crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME: {
+                                                        "content": c,
+                                                        "truncated": false
+                                                    }
+                                                }
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        ("404 Not Found", "", "{}".into())
+                                    }
+                                }
+                                ("GET", "/gists/gist_key_1") => {
+                                    if let Some(c) = st.key_content.lock().expect("lock").clone() {
+                                        (
+                                            "200 OK",
+                                            "",
+                                            serde_json::json!({
+                                                "id": "gist_key_1",
+                                                "html_url": "https://gist.github.com/octocat/gist_key_1",
+                                                "files": {
+                                                    crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME: {
+                                                        "content": c,
+                                                        "truncated": false
+                                                    }
+                                                }
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        ("404 Not Found", "", "{}".into())
+                                    }
+                                }
+                                ("POST", "/gists") | ("PATCH", "/gists/gist_key_1") | ("PATCH", "/gists/gist_vault_1") => {
+                                    let parsed: serde_json::Value =
+                                        serde_json::from_str(body_str).unwrap_or_default();
+                                    if let Some(c) = parsed["files"]
+                                        [crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME]["content"]
+                                        .as_str()
+                                    {
+                                        *st.key_content.lock().expect("lock") = Some(c.to_string());
+                                        (
+                                            "200 OK",
+                                            "",
+                                            serde_json::json!({
+                                                "id": "gist_key_1",
+                                                "html_url": "https://gist.github.com/octocat/gist_key_1"
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        let c = parsed["files"]
+                                            [crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME]["content"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        *st.vault_content.lock().expect("lock") = Some(c);
+                                        (
+                                            "200 OK",
+                                            "ETag: \"v2\"\r\n",
+                                            serde_json::json!({
+                                                "id": "gist_vault_1",
+                                                "html_url": "https://gist.github.com/octocat/gist_vault_1"
+                                            })
+                                            .to_string(),
+                                        )
+                                    }
+                                }
+                                ("DELETE", "/gists/gist_key_1") => {
+                                    *st.key_content.lock().expect("lock") = None;
+                                    ("204 No Content", "", String::new())
+                                }
+                                _ => ("404 Not Found", "", "{}".into()),
+                            };
+                            let raw = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                                resp_body.len()
+                            );
+                            let _ = sock.write_all(raw.as_bytes()).await;
+                        });
+                    }
+                });
+                format!("http://{addr}")
+            }
+        });
+
+        // 1. Seed a pre-v0.11.0 passphrase-protected vault with NO key gist yet.
+        let salt = orbit_crypto::generate_vault_salt_b64();
+        let seed_key = orbit_crypto::derive_vault_key(
+            "legacy-passphrase-123",
+            &salt,
+            orbit_crypto::VaultKdfParams::default(),
+        )
+        .expect("derive seed key");
+        let seed_payload = crate::cloud_sync::CloudVaultPayload {
+            schema_version: crate::cloud_sync::CLOUD_VAULT_SCHEMA_VERSION,
+            revision: 1,
+            updated_at_ms: now_unix_ms(),
+            ..Default::default()
+        };
+        let seed_client = GitHubCloudClient::with_bases(&base_url, &base_url);
+        rt.block_on(crate::cloud_sync::push_vault_payload(
+            &seed_client,
+            "gho_pre_v011",
+            None,
+            &seed_key,
+            &seed_payload,
+        ))
+        .expect("seed pre-v0.11.0 vault");
+        assert!(state.key_content.lock().expect("lock").is_none());
+
+        // 2. Device A logs in (Locked because key gist is absent) and unlocks -> key gist backfilled!
+        let device_a = OrbitAppCore::open_in_memory_with_discovery(false).expect("device a");
+        device_a.set_cloud_sync_github_bases_for_test(&base_url, &base_url);
+        let st_locked = device_a
+            .cloud_sync_login_with_token("gho_pre_v011")
+            .expect("login a");
+        assert_eq!(st_locked.state, crate::cloud_sync::CloudSyncState::Locked);
+        device_a
+            .cloud_sync_unlock_with_passphrase("legacy-passphrase-123")
+            .expect("unlock a");
+        assert!(state.key_content.lock().expect("lock").is_some());
+        assert!(
+            load_sync_config_from_store(&device_a.store)
+                .key_gist_id
+                .is_some()
+        );
+
+        // 3. Cached-key device upgrading from v0.10.x (key_gist_id=None, key cached) also backfills on sync.
+        *state.key_content.lock().expect("lock") = None;
+        {
+            let mut cfg = load_sync_config_from_store(&device_a.store);
+            cfg.key_gist_id = None;
+            save_sync_config_to_store(&device_a.store, &cfg).expect("clear key gist id");
+        }
+        device_a.cloud_sync_now().expect("sync backfills key gist");
+        assert!(state.key_content.lock().expect("lock").is_some());
+
+        // 4. Enabling manual mode deletes key gist & propagates flag so peer C does NOT recreate it.
+        device_a
+            .cloud_sync_set_manual_passphrase_mode(true)
+            .expect("enable manual");
+        device_a.cloud_sync_now().expect("push manual flag");
+        assert!(state.key_content.lock().expect("lock").is_none());
+
+        let device_c = OrbitAppCore::open_in_memory_with_discovery(false).expect("device c");
+        device_c.set_cloud_sync_github_bases_for_test(&base_url, &base_url);
+        let st_c = device_c
+            .cloud_sync_login_with_token("gho_pre_v011")
+            .expect("login c");
+        assert_eq!(st_c.state, crate::cloud_sync::CloudSyncState::Locked);
+        device_c
+            .cloud_sync_unlock_with_passphrase("legacy-passphrase-123")
+            .expect("unlock c");
+        assert!(!device_c.cloud_sync_status().instant_unlock_enabled);
+        assert!(state.key_content.lock().expect("lock").is_none());
+    }
+
+    #[test]
+    fn cloud_sync_auto_scheduler_coalesces_dirty_bursts_and_backs_off_on_rate_limit() {
+        use std::sync::atomic::{AtomicBool, AtomicU32};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Default)]
+        struct MockStormServer {
+            vault_content: Mutex<Option<String>>,
+            key_content: Mutex<Option<String>>,
+            gists_list_calls: AtomicU32,
+            get_vault_calls: AtomicU32,
+            patch_vault_calls: AtomicU32,
+            force_rate_limit: AtomicBool,
+        }
+
+        let state = Arc::new(MockStormServer::default());
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let base_url = rt.block_on({
+            let state = Arc::clone(&state);
+            async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let addr = listener.local_addr().expect("addr");
+                tokio::spawn(async move {
+                    loop {
+                        let Ok((mut sock, _)) = listener.accept().await else {
+                            break;
+                        };
+                        let st = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 65_536];
+                            let n = sock.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let first_line = req.lines().next().unwrap_or("");
+                            let parts: Vec<&str> = first_line.split_whitespace().collect();
+                            let method = parts.first().copied().unwrap_or("");
+                            let path = parts.get(1).copied().unwrap_or("");
+                            let body_str = req.split("\r\n\r\n").nth(1).unwrap_or("");
+
+                            if st.force_rate_limit.load(Ordering::SeqCst)
+                                && (path.starts_with("/gists"))
+                            {
+                                let reset_ts = (now_unix_ms() / 1000).saturating_add(180);
+                                let rl_headers = format!(
+                                    "x-ratelimit-remaining: 0\r\nx-ratelimit-reset: {reset_ts}\r\n"
+                                );
+                                let body = serde_json::json!({
+                                    "message": "API rate limit exceeded for user ID 1"
+                                })
+                                .to_string();
+                                let raw = format!(
+                                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n{rl_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                );
+                                let _ = sock.write_all(raw.as_bytes()).await;
+                                return;
+                            }
+
+                            let (status, headers, resp_body) = match (method, path) {
+                                ("GET", "/user") => (
+                                    "200 OK",
+                                    "X-OAuth-Scopes: gist\r\n",
+                                    serde_json::json!({
+                                        "login": "octocat",
+                                        "name": "The Octocat",
+                                        "avatar_url": null
+                                    })
+                                    .to_string(),
+                                ),
+                                ("GET", p) if p.starts_with("/gists?") => {
+                                    st.gists_list_calls.fetch_add(1, Ordering::SeqCst);
+                                    let mut items = Vec::new();
+                                    if st.vault_content.lock().expect("lock").is_some() {
+                                        items.push(serde_json::json!({
+                                            "id": "gist_vault_1",
+                                            "html_url": "https://gist.github.com/octocat/gist_vault_1",
+                                            "files": { crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME: {} }
+                                        }));
+                                    }
+                                    if st.key_content.lock().expect("lock").is_some() {
+                                        items.push(serde_json::json!({
+                                            "id": "gist_key_1",
+                                            "html_url": "https://gist.github.com/octocat/gist_key_1",
+                                            "files": { crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME: {} }
+                                        }));
+                                    }
+                                    ("200 OK", "", serde_json::Value::Array(items).to_string())
+                                }
+                                ("GET", "/gists/gist_vault_1") => {
+                                    st.get_vault_calls.fetch_add(1, Ordering::SeqCst);
+                                    if let Some(c) = st.vault_content.lock().expect("lock").clone() {
+                                        (
+                                            "200 OK",
+                                            "ETag: \"etag_get_1\"\r\n",
+                                            serde_json::json!({
+                                                "id": "gist_vault_1",
+                                                "html_url": "https://gist.github.com/octocat/gist_vault_1",
+                                                "files": {
+                                                    crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME: {
+                                                        "content": c,
+                                                        "truncated": false
+                                                    }
+                                                }
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        ("404 Not Found", "", "{}".into())
+                                    }
+                                }
+                                ("GET", "/gists/gist_key_1") => {
+                                    if let Some(c) = st.key_content.lock().expect("lock").clone() {
+                                        (
+                                            "200 OK",
+                                            "",
+                                            serde_json::json!({
+                                                "id": "gist_key_1",
+                                                "html_url": "https://gist.github.com/octocat/gist_key_1",
+                                                "files": {
+                                                    crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME: {
+                                                        "content": c,
+                                                        "truncated": false
+                                                    }
+                                                }
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        ("404 Not Found", "", "{}".into())
+                                    }
+                                }
+                                ("POST", "/gists") | ("PATCH", "/gists/gist_key_1") | ("PATCH", "/gists/gist_vault_1") => {
+                                    let parsed: serde_json::Value =
+                                        serde_json::from_str(body_str).unwrap_or_default();
+                                    if let Some(c) = parsed["files"]
+                                        [crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME]["content"]
+                                        .as_str()
+                                    {
+                                        *st.key_content.lock().expect("lock") = Some(c.to_string());
+                                        (
+                                            "200 OK",
+                                            "",
+                                            serde_json::json!({
+                                                "id": "gist_key_1",
+                                                "html_url": "https://gist.github.com/octocat/gist_key_1"
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        st.patch_vault_calls.fetch_add(1, Ordering::SeqCst);
+                                        let c = parsed["files"]
+                                            [crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME]["content"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        *st.vault_content.lock().expect("lock") = Some(c);
+                                        (
+                                            "200 OK",
+                                            "ETag: \"etag_push_1\"\r\n",
+                                            serde_json::json!({
+                                                "id": "gist_vault_1",
+                                                "html_url": "https://gist.github.com/octocat/gist_vault_1"
+                                            })
+                                            .to_string(),
+                                        )
+                                    }
+                                }
+                                _ => ("404 Not Found", "", "{}".into()),
+                            };
+                            let raw = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                                resp_body.len()
+                            );
+                            let _ = sock.write_all(raw.as_bytes()).await;
+                        });
+                    }
+                });
+                format!("http://{addr}")
+            }
+        });
+
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("core");
+        core.set_cloud_sync_github_bases_for_test(&base_url, &base_url);
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("kp");
+        core.pair_host(
+            &PairingOffer {
+                host_id: kp.host_id().expect("hid"),
+                hostname: "storm-box".into(),
+                daemon_pubkey_b64: kp.public_key_b64,
+                direct_endpoints: vec![],
+                relay_url: Some("wss://storm.trycloudflare.com?ft=tok".into()),
+                pairing_secret: "sec".into(),
+            }
+            .to_qr_uri()
+            .expect("uri"),
+        )
+        .expect("pair");
+        core.cloud_sync_login_with_token("gho_storm_tok")
+            .expect("login");
+
+        let cfg_after_login = load_sync_config_from_store(&core.store);
+        assert_eq!(
+            cfg_after_login.last_etag.as_deref(),
+            Some("\"etag_push_1\"")
+        );
+
+        // Reset counters & last_auto_ms, then fire a burst of dirty auto-sync triggers.
+        state.gists_list_calls.store(0, Ordering::SeqCst);
+        state.get_vault_calls.store(0, Ordering::SeqCst);
+        state.patch_vault_calls.store(0, Ordering::SeqCst);
+        core.cloud_sync_last_auto_ms.store(0, Ordering::SeqCst);
+
+        core.cloud_sync_update_preferences(HashMap::from([(
+            "theme".to_string(),
+            serde_json::json!("dark"),
+        )]))
+        .expect("update pref");
+        for i in 0..20 {
+            core.schedule_cloud_auto_sync(i % 2 == 0);
+        }
+
+        core.runtime.block_on(async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+            while tokio::time::Instant::now() < deadline {
+                if core.cloud_sync_last_auto_ms.load(Ordering::SeqCst) > 0
+                    && !core.cloud_sync_in_flight.load(Ordering::SeqCst)
+                    && state.patch_vault_calls.load(Ordering::SeqCst) >= 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        });
+
+        assert_eq!(state.gists_list_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.get_vault_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.patch_vault_calls.load(Ordering::SeqCst), 1);
+
+        // Simulated 403 rate limit records backoff window and user-facing message.
+        state.force_rate_limit.store(true, Ordering::SeqCst);
+        let now_before = unix_ms_now();
+        let err = core.cloud_sync_now().expect_err("expected 403 rate limit");
+        assert!(err.to_string().to_ascii_lowercase().contains("rate"));
+        assert!(
+            core.cloud_sync_backoff_until_ms.load(Ordering::SeqCst)
+                >= now_before.saturating_add(50_000)
+        );
+        let err_msg = core
+            .cloud_sync_status()
+            .last_error
+            .expect("last_error recorded");
+        assert!(err_msg.contains("rate limit") && err_msg.contains("paused"));
     }
 }

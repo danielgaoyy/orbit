@@ -1274,8 +1274,83 @@ async fn try_connect_direct_endpoints(
         .unwrap_or(ClientCoreError::Unreachable))
 }
 
+fn build_relay_candidates(profile_relay: Option<&str>, fallback_relays: &[String]) -> Vec<String> {
+    let mut modern_fallbacks: Vec<String> = Vec::new();
+    for raw in fallback_relays {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || crate::cloud_sync::is_legacy_ssh_relay_without_ft(trimmed) {
+            continue;
+        }
+        if !modern_fallbacks.iter().any(|existing| existing == trimmed) {
+            modern_fallbacks.push(trimmed.to_string());
+        }
+    }
+
+    let mut ordered = Vec::new();
+    if let Some(primary) = profile_relay.map(str::trim).filter(|s| !s.is_empty()) {
+        if crate::cloud_sync::is_legacy_ssh_relay_without_ft(primary) {
+            // Legacy allowlist-only ssh+relay:// without `?ft=` stalls for 12s when dead;
+            // try modern fleet relays (`?ft=` / Cloudflare Tunnel) before falling back to legacy SSH.
+            for fb in modern_fallbacks {
+                if fb != primary && !ordered.contains(&fb) {
+                    ordered.push(fb);
+                }
+            }
+            ordered.push(primary.to_string());
+        } else {
+            ordered.push(primary.to_string());
+            for fb in modern_fallbacks {
+                if !ordered.contains(&fb) {
+                    ordered.push(fb);
+                }
+            }
+        }
+    } else {
+        ordered.extend(modern_fallbacks);
+    }
+    ordered
+}
+
+async fn try_connect_relay_candidates(
+    profile: &SavedHostProfile,
+    fallback_relays: &[String],
+    replica: Option<Arc<OrbitStore>>,
+) -> Result<HostSessionHandle, ClientCoreError> {
+    let candidates = build_relay_candidates(profile.relay_url.as_deref(), fallback_relays);
+    if candidates.is_empty() {
+        return Err(ClientCoreError::Unreachable);
+    }
+    let mut first_err = None;
+    for relay_url in candidates {
+        match connect_via_relay_with_host_id(
+            &profile.host_id,
+            &relay_url,
+            &profile.daemon_pubkey_b64,
+            &profile.pairing_secret,
+            replica.clone(),
+        )
+        .await
+        {
+            Ok(h) => return Ok(h),
+            Err(e)
+                if e.is_auth_error()
+                    || matches!(e, ClientCoreError::HostIdentityMismatch { .. }) =>
+            {
+                return Err(e);
+            }
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    Err(first_err.unwrap_or(ClientCoreError::Unreachable))
+}
+
 async fn connect_auto(
     profile: &SavedHostProfile,
+    fallback_relays: &[String],
     replica: Option<Arc<OrbitStore>>,
     has_ssh: bool,
 ) -> Result<HostSessionHandle, ClientCoreError> {
@@ -1320,16 +1395,8 @@ async fn connect_auto(
         }
     }
 
-    if let Some(ref relay_url) = profile.relay_url {
-        match connect_via_relay_with_host_id(
-            &profile.host_id,
-            relay_url,
-            &profile.daemon_pubkey_b64,
-            &profile.pairing_secret,
-            replica,
-        )
-        .await
-        {
+    if !build_relay_candidates(profile.relay_url.as_deref(), fallback_relays).is_empty() {
+        match try_connect_relay_candidates(profile, fallback_relays, replica).await {
             Ok(h) => return Ok(h),
             Err(e) if e.is_auth_error() => return Err(e),
             Err(e) => return Err(mismatch_err.or(auth_err).unwrap_or(e)),
@@ -1342,12 +1409,12 @@ async fn connect_auto(
         .unwrap_or(ClientCoreError::Unreachable))
 }
 
-/// Smart connector supporting `HostRouteMode` (`Auto`, `SshTunnel`, `DirectOnly`, `RelayOnly`):
-/// - When an `ssh_alias` (`devbox`) is configured on Desktop in `Auto` mode, connects via dedicated SSH tunnel FIRST!
-/// - On mobile (`!macos && !linux`), `SshTunnel` degrades gracefully to the `Auto` route (Direct -> E2EE Relay).
-/// - Otherwise probes Direct WS -> SSH Tunnel -> Noise E2EE Relay.
-pub async fn connect_smart(
+/// Smart connector supporting `HostRouteMode` (`Auto`, `SshTunnel`, `DirectOnly`, `RelayOnly`),
+/// racing or falling back across additional modern account-wide `fallback_relays` when a host's
+/// cached `relay_url` is unset or a dead legacy `ssh+relay://` endpoint.
+pub async fn connect_smart_with_fallback_relays(
     profile: &SavedHostProfile,
+    fallback_relays: &[String],
     replica: Option<Arc<OrbitStore>>,
 ) -> Result<HostSessionHandle, ClientCoreError> {
     let desktop_ssh_supported = cfg!(any(target_os = "macos", target_os = "linux"));
@@ -1363,28 +1430,32 @@ pub async fn connect_smart(
             if desktop_ssh_supported {
                 try_connect_ssh_tunnel(profile, replica).await
             } else {
-                connect_auto(profile, replica, false).await
+                connect_auto(profile, fallback_relays, replica, false).await
             }
         }
         HostRouteMode::DirectOnly => try_connect_direct_endpoints(profile, replica).await,
         HostRouteMode::RelayOnly => {
-            if let Some(ref relay_url) = profile.relay_url {
-                connect_via_relay_with_host_id(
-                    &profile.host_id,
-                    relay_url,
-                    &profile.daemon_pubkey_b64,
-                    &profile.pairing_secret,
-                    replica,
-                )
-                .await
-            } else {
+            if build_relay_candidates(profile.relay_url.as_deref(), fallback_relays).is_empty() {
                 Err(ClientCoreError::Handshake(
                     "No E2EE relay URL configured".into(),
                 ))
+            } else {
+                try_connect_relay_candidates(profile, fallback_relays, replica).await
             }
         }
-        HostRouteMode::Auto => connect_auto(profile, replica, has_ssh).await,
+        HostRouteMode::Auto => connect_auto(profile, fallback_relays, replica, has_ssh).await,
     }
+}
+
+/// Smart connector supporting `HostRouteMode` (`Auto`, `SshTunnel`, `DirectOnly`, `RelayOnly`):
+/// - When an `ssh_alias` (`devbox`) is configured on Desktop in `Auto` mode, connects via dedicated SSH tunnel FIRST!
+/// - On mobile (`!macos && !linux`), `SshTunnel` degrades gracefully to the `Auto` route (Direct -> E2EE Relay).
+/// - Otherwise probes Direct WS -> SSH Tunnel -> Noise E2EE Relay.
+pub async fn connect_smart(
+    profile: &SavedHostProfile,
+    replica: Option<Arc<OrbitStore>>,
+) -> Result<HostSessionHandle, ClientCoreError> {
+    connect_smart_with_fallback_relays(profile, &[], replica).await
 }
 
 async fn retry_replica_write<F>(mut op: F) -> Result<(), orbit_store::StoreError>

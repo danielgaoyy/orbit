@@ -13,9 +13,9 @@ use orbit_client_core::cloud_sync::{
     LocalHostSyncRecord, PersistedCloudSyncConfig, SyncedHostEntry, decode_device_link_uri,
     decrypt_remote_with_cached_key, delete_cli_sync_config, derived_key_from_auto_unlock,
     encode_device_link_uri, filter_shareable_endpoints, generate_sync_passphrase,
-    load_cli_sync_config, load_fleet_network_from_store, now_unix_ms, push_vault_payload,
-    resolve_github_client_id, save_cli_sync_config, save_fleet_network_to_store,
-    save_sync_config_to_store, unlock_remote_vault_with_passphrase,
+    is_legacy_ssh_relay_without_ft, load_cli_sync_config, load_fleet_network_from_store,
+    now_unix_ms, push_vault_payload_with_etag, resolve_github_client_id, save_cli_sync_config,
+    save_fleet_network_to_store, save_sync_config_to_store, unlock_remote_vault_with_passphrase,
 };
 use orbit_client_core::desktop_ops::open_external_url;
 use orbit_crypto::PairingOffer;
@@ -171,11 +171,17 @@ pub async fn cmd_login(home_dir: &Path, opts: LoginOptions) -> anyhow::Result<()
             && let Ok(store) = OrbitStore::open(home_dir.join("desktop-client.sqlite"))
         {
             let mut net = load_fleet_network_from_store(&store).unwrap_or_default();
-            if net.primary_relay_url.is_none() {
+            if net.primary_relay_url.is_none()
+                || (net
+                    .primary_relay_url
+                    .as_deref()
+                    .is_some_and(is_legacy_ssh_relay_without_ft)
+                    && !is_legacy_ssh_relay_without_ft(&normalized))
+            {
                 net.primary_relay_url = Some(normalized.clone());
-                if !net.relay_urls.contains(&normalized) {
-                    net.relay_urls.push(normalized);
-                }
+                net.relay_urls.retain(|u| u != &normalized);
+                net.relay_urls.insert(0, normalized);
+                net.relay_urls.truncate(8);
                 net.updated_at_ms = now_unix_ms();
                 let _ = save_fleet_network_to_store(&store, &net);
             }
@@ -190,6 +196,7 @@ pub async fn cmd_login(home_dir: &Path, opts: LoginOptions) -> anyhow::Result<()
         } else {
             None
         };
+        reconcile_cli_manual_passphrase_from_remote(&mut cfg, remote_payload.as_ref());
         let summary = execute_cli_sync(
             home_dir,
             &client,
@@ -223,6 +230,7 @@ pub async fn cmd_login(home_dir: &Path, opts: LoginOptions) -> anyhow::Result<()
 
     if opts.manual_passphrase {
         cfg.require_manual_passphrase = true;
+        cfg.require_manual_passphrase_updated_at_ms = now_unix_ms();
     }
 
     // 1. Obtain GitHub access token (PAT override, reuse valid local token unless `--reauth`,
@@ -406,6 +414,18 @@ pub async fn cmd_login(home_dir: &Path, opts: LoginOptions) -> anyhow::Result<()
         cfg.gist_html_url = Some(gist.html_url.clone());
         cfg.remote_vault_exists = true;
     }
+    if !opts.manual_passphrase {
+        reconcile_cli_manual_passphrase_from_remote(&mut cfg, remote_payload.as_ref());
+        ensure_cli_auto_unlock_key_gist(
+            &client,
+            &token,
+            &mut cfg,
+            &key,
+            remote_gist.as_ref(),
+            remote_auto_key.as_ref(),
+        )
+        .await;
+    }
 
     let summary = execute_cli_sync(
         home_dir,
@@ -460,9 +480,20 @@ pub async fn cmd_sync(home_dir: &Path, opts: SyncOptions) -> anyhow::Result<()> 
         })?;
 
     let client = GitHubCloudClient::new();
-    let (remote_gist, remote_auto_key) = client
-        .fetch_vault_and_auto_key(&token, cfg.gist_id.as_deref(), cfg.key_gist_id.as_deref())
-        .await?;
+    let need_key_lookup = cfg.derived_key().is_none()
+        || (!cfg.require_manual_passphrase && cfg.key_gist_id.is_none());
+    let (remote_gist, remote_auto_key) = if !need_key_lookup && cfg.gist_id.is_some() {
+        (
+            client
+                .fetch_vault_gist(&token, cfg.gist_id.as_deref())
+                .await?,
+            None,
+        )
+    } else {
+        client
+            .fetch_vault_and_auto_key(&token, cfg.gist_id.as_deref(), cfg.key_gist_id.as_deref())
+            .await?
+    };
 
     let key = if let Some(cached) = cfg.derived_key() {
         cached
@@ -488,6 +519,19 @@ pub async fn cmd_sync(home_dir: &Path, opts: SyncOptions) -> anyhow::Result<()> 
         cfg.remote_vault_exists = false;
         None
     };
+
+    reconcile_cli_manual_passphrase_from_remote(&mut cfg, remote_payload.as_ref());
+    if !cfg.require_manual_passphrase {
+        ensure_cli_auto_unlock_key_gist(
+            &client,
+            &token,
+            &mut cfg,
+            &key,
+            remote_gist.as_ref(),
+            remote_auto_key.as_ref(),
+        )
+        .await;
+    }
 
     let summary = execute_cli_sync(
         home_dir,
@@ -583,6 +627,60 @@ pub async fn cmd_logout(
     Ok(())
 }
 
+fn reconcile_cli_manual_passphrase_from_remote(
+    cfg: &mut PersistedCloudSyncConfig,
+    remote_payload: Option<&CloudVaultPayload>,
+) {
+    if let Some(remote) = remote_payload
+        && remote.require_manual_passphrase_updated_at_ms
+            > cfg.require_manual_passphrase_updated_at_ms
+    {
+        cfg.require_manual_passphrase = remote.require_manual_passphrase;
+        cfg.require_manual_passphrase_updated_at_ms =
+            remote.require_manual_passphrase_updated_at_ms;
+        if cfg.require_manual_passphrase {
+            cfg.key_gist_id = None;
+        }
+    }
+}
+
+async fn ensure_cli_auto_unlock_key_gist(
+    client: &GitHubCloudClient,
+    token: &str,
+    cfg: &mut PersistedCloudSyncConfig,
+    key: &orbit_crypto::DerivedVaultKey,
+    remote_gist: Option<&orbit_client_core::cloud_sync::RemoteVaultGist>,
+    remote_auto_key: Option<&orbit_client_core::cloud_sync::RemoteAutoUnlockKey>,
+) {
+    if cfg.require_manual_passphrase {
+        return;
+    }
+    if let Some(ak) = remote_auto_key {
+        let matches = derived_key_from_auto_unlock(ak, remote_gist)
+            .is_ok_and(|k| k.key_b64() == key.key_b64());
+        if matches {
+            cfg.key_gist_id = Some(ak.gist_id.clone());
+        } else {
+            match client
+                .save_auto_unlock_key_gist(token, Some(&ak.gist_id), key)
+                .await
+            {
+                Ok(kid) => cfg.key_gist_id = Some(kid),
+                Err(err) => {
+                    eprintln!("[!] Warning: failed to update stale auto-unlock key gist: {err}");
+                }
+            }
+        }
+    } else if cfg.key_gist_id.is_none() {
+        match client.save_auto_unlock_key_gist(token, None, key).await {
+            Ok(kid) => cfg.key_gist_id = Some(kid),
+            Err(err) => {
+                eprintln!("[!] Warning: failed to publish auto-unlock key gist: {err}");
+            }
+        }
+    }
+}
+
 struct CliSyncSummary {
     registered_host_id: Option<String>,
     pushed_remote: bool,
@@ -670,6 +768,17 @@ async fn execute_cli_sync(
                 )
                 .max(remote_secret_ts.saturating_add(1));
         }
+        if let Some(local_relay) = DaemonPersistedConfig::load(home_dir).relay_url
+            && existing.profile.relay_url.as_deref().is_none_or(|cur| {
+                cur != local_relay
+                    && (is_legacy_ssh_relay_without_ft(cur)
+                        && !is_legacy_ssh_relay_without_ft(&local_relay))
+            })
+        {
+            existing.profile.relay_url = Some(local_relay);
+            existing.updated_at_ms = now_ms.max(existing.updated_at_ms.saturating_add(1));
+            local_meta.record_host_mutated(local_hid, existing.updated_at_ms);
+        }
     }
 
     let local_hosts: Vec<LocalHostSyncRecord> = local_hosts_map.into_values().collect();
@@ -693,6 +802,19 @@ async fn execute_cli_sync(
         local_fleet_network.as_ref(),
         now_ms,
     );
+
+    outcome.merged.require_manual_passphrase = cfg.require_manual_passphrase;
+    outcome.merged.require_manual_passphrase_updated_at_ms =
+        cfg.require_manual_passphrase_updated_at_ms;
+    if let Some(remote) = remote_payload
+        && (remote.require_manual_passphrase != outcome.merged.require_manual_passphrase
+            || remote.require_manual_passphrase_updated_at_ms
+                != outcome.merged.require_manual_passphrase_updated_at_ms)
+        && !outcome.needs_push
+    {
+        outcome.needs_push = true;
+        outcome.merged.revision = outcome.merged.revision.saturating_add(1);
+    }
 
     // Authoritatively prefer this machine's persisted `$ORBIT_HOME/pairing-secret` over any
     // stale remote synced value even when pulling this host into a fresh local store.
@@ -767,12 +889,18 @@ async fn execute_cli_sync(
     let _ = orbit_client_core::cloud_sync::save_sync_meta_to_store(&store, &local_meta);
 
     if outcome.needs_push {
-        let (gid, html_url) =
-            push_vault_payload(client, &token, cfg.gist_id.as_deref(), key, &outcome.merged)
-                .await?;
+        let (gid, html_url, etag) = push_vault_payload_with_etag(
+            client,
+            &token,
+            cfg.gist_id.as_deref(),
+            key,
+            &outcome.merged,
+        )
+        .await?;
         cfg.gist_id = Some(gid);
         cfg.gist_html_url = Some(html_url);
         cfg.remote_vault_exists = true;
+        cfg.last_etag = etag;
     }
 
     let mut active_hosts: Vec<SyncedHostEntry> = outcome
@@ -938,7 +1066,10 @@ async fn register_synced_hosts_into_local_daemon_mesh(
     if let Some(relay_url) = fleet_primary_relay
         && orbit_daemon::DaemonPersistedConfig::load(home_dir)
             .relay_url
-            .is_none()
+            .as_deref()
+            .is_none_or(|cur| {
+                is_legacy_ssh_relay_without_ft(cur) && !is_legacy_ssh_relay_without_ft(relay_url)
+            })
     {
         let req_id = Uuid::new_v4();
         let _ = conn

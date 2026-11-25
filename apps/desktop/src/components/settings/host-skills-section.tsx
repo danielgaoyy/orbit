@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   BookOpen,
@@ -16,6 +16,7 @@ import {
   SettingResourceRow,
   SettingSelect,
   ToggleSwitch,
+  useHostIsOnline,
 } from "@/components/settings/settings-primitives";
 import { OrchestrationSkills } from "@/components/settings/orchestration-skills";
 import { Button } from "@/components/ui/button";
@@ -97,27 +98,292 @@ function slugifyName(raw: string): string {
 
 const SLUG_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
-export function HostSkillsSection({ hostId }: { hostId: string }) {
-  const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
-  const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
-  const hostDetail = useOrbitSelector((s) => s.hostDetails[hostId] ?? null);
-  const state = useOrbitSelector(
-    (s) => s.fleet.hosts.find((host) => host.host_id === hostId)?.connection_state,
+const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
+  mode,
+  onClose,
+  hostId,
+  activeCwd,
+  online,
+  existingSkillIds,
+  onMutated,
+}: {
+  mode: "none" | "create" | "import";
+  onClose: () => void;
+  hostId: string;
+  activeCwd: string | null;
+  online: boolean;
+  existingSkillIds: readonly string[];
+  onMutated: (updated: readonly ManagedSkillRecord[], openId?: string | null) => void;
+}) {
+  useLocale();
+  const [newScope, setNewScope] = useState<SkillWriteScope>("user");
+  const [newName, setNewName] = useState("");
+  const [newSlug, setNewSlug] = useState("");
+  const [slugTouched, setSlugTouched] = useState(false);
+  const [newDesc, setNewDesc] = useState("");
+  const [newBody, setNewBody] = useState("");
+  const [creating, setCreating] = useState(false);
+
+  const [importScope, setImportScope] = useState<SkillWriteScope>("user");
+  const [importSlugOverride, setImportSlugOverride] = useState("");
+  const [importSource, setImportSource] = useState("");
+  const [importing, setImporting] = useState(false);
+
+  const isCreate = mode === "create";
+  const busy = creating || importing;
+  const writeScope = isCreate ? newScope : importScope;
+
+  const scopeOptions = useMemo(
+    () => [
+      {
+        value: "user" as const,
+        label: t("managedSkills.user"),
+        description: "~/.orbit/skills",
+      },
+      {
+        value: "project" as const,
+        label: t("permissionRules.scopeProject"),
+        disabled: !activeCwd,
+        description: activeCwd ? activeCwd + "/.orbit/skills" : t("managedSkills.needProject"),
+      },
+    ],
+    [activeCwd],
   );
-  const online = state === "online_direct" || state === "online_relay";
-  const cwd = selectedHostId === hostId ? selectedCwd : hostDetail?.workspaces[0]?.cwd;
-  const activeCwd = cwd && cwd !== "~" ? cwd : null;
+
+  const handleCreateSkill = async () => {
+    const slug = newSlug.trim();
+    if (!SLUG_RE.test(slug)) {
+      orbitActions.showToast(t("managedSkills.slugError"));
+      return;
+    }
+    if (newScope === "project" && !activeCwd) {
+      orbitActions.showToast(t("managedSkills.needProject"));
+      return;
+    }
+    setCreating(true);
+    try {
+      const name = newName.trim() || slug;
+      const desc = newDesc.trim();
+      const body = newBody.trim() || `# ${name}\n`;
+      const updated = await orbitIpc.upsertManagedSkill(hostId, {
+        scope: newScope,
+        cwd: activeCwd,
+        slug,
+        name,
+        description: desc,
+        content: body,
+        enabled: true,
+        expectedEtag: null,
+      });
+      setNewName("");
+      setNewSlug("");
+      setSlugTouched(false);
+      setNewDesc("");
+      setNewBody("");
+      onClose();
+      const createdId = `${newScope === "project" ? "orbit_project" : "orbit_user"}:${slug}`;
+      onMutated(updated, createdId);
+    } catch (err) {
+      orbitActions.showToast(String(err));
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const handleImportSkill = async () => {
+    if (!importSource.trim()) {
+      orbitActions.showToast(t("managedSkills.importSource"));
+      return;
+    }
+    if (importScope === "project" && !activeCwd) {
+      orbitActions.showToast(t("managedSkills.needProject"));
+      return;
+    }
+    const slugOverride = importSlugOverride.trim() || null;
+    if (slugOverride && !SLUG_RE.test(slugOverride)) {
+      orbitActions.showToast(t("managedSkills.slugError"));
+      return;
+    }
+    setImporting(true);
+    try {
+      const beforeIds = new Set(existingSkillIds);
+      const updated = await orbitIpc.importManagedSkill(hostId, {
+        scope: importScope,
+        cwd: activeCwd,
+        sourceMarkdownOrPath: importSource,
+        slugOverride,
+      });
+      setImportSource("");
+      setImportSlugOverride("");
+      onClose();
+      const newlyAdded = updated.find((s) => !beforeIds.has(s.id));
+      if (newlyAdded) {
+        onMutated(updated, newlyAdded.id);
+      } else {
+        onMutated(updated, null);
+        orbitActions.showToast(t("managedSkills.imported"));
+      }
+    } catch (err) {
+      orbitActions.showToast(String(err));
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  return (
+    <SettingDrawer
+      open={mode !== "none"}
+      onOpenChange={(open) => {
+        if (!open && !busy) onClose();
+      }}
+      title={t(isCreate ? "managedSkills.create" : "managedSkills.import")}
+    >
+      <form
+        className="flex flex-col gap-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!busy && online) void (isCreate ? handleCreateSkill() : handleImportSkill());
+        }}
+      >
+        <FieldGroup>
+          <Field>
+            <FieldLabel>{t("managedSkills.scope")}</FieldLabel>
+            <SettingSelect<SkillWriteScope>
+              value={writeScope}
+              disabled={busy}
+              ariaLabel={t("managedSkills.scope")}
+              onChange={isCreate ? setNewScope : setImportScope}
+              options={scopeOptions}
+            />
+            <span className="text-ink-muted break-all font-mono text-[11px]">
+              {writeScope === "user" ? "~/.orbit/skills" : activeCwd + "/.orbit/skills"}
+            </span>
+          </Field>
+          {isCreate ? (
+            <>
+              <Field>
+                <FieldLabel htmlFor="managed-skill-name">{t("managedSkills.name")}</FieldLabel>
+                <Input
+                  id="managed-skill-name"
+                  value={newName}
+                  disabled={busy}
+                  onChange={(e) => {
+                    const name = e.target.value;
+                    setNewName(name);
+                    if (!slugTouched) setNewSlug(slugifyName(name));
+                  }}
+                />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="managed-skill-slug">{t("managedSkills.slug")}</FieldLabel>
+                <Input
+                  id="managed-skill-slug"
+                  value={newSlug}
+                  required
+                  pattern="[a-z0-9][a-z0-9_\-]{0,63}"
+                  disabled={busy}
+                  onChange={(e) => {
+                    setSlugTouched(true);
+                    setNewSlug(e.target.value.toLowerCase());
+                  }}
+                  className="font-mono"
+                />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="managed-skill-description">
+                  {t("managedSkills.description")}
+                </FieldLabel>
+                <Input
+                  id="managed-skill-description"
+                  value={newDesc}
+                  disabled={busy}
+                  onChange={(e) => setNewDesc(e.target.value)}
+                />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="managed-skill-body">
+                  {t("managedSkills.instructions")}
+                </FieldLabel>
+                <Textarea
+                  id="managed-skill-body"
+                  rows={8}
+                  value={newBody}
+                  disabled={busy}
+                  onChange={(e) => setNewBody(e.target.value)}
+                  className="font-mono text-[13px]"
+                />
+              </Field>
+            </>
+          ) : (
+            <>
+              <Field>
+                <FieldLabel htmlFor="managed-skill-import">
+                  {t("managedSkills.importSource")}
+                </FieldLabel>
+                <Textarea
+                  id="managed-skill-import"
+                  rows={8}
+                  value={importSource}
+                  disabled={busy}
+                  required
+                  onChange={(e) => setImportSource(e.target.value)}
+                  className="font-mono text-[13px]"
+                />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="managed-skill-import-slug">
+                  {t("managedSkills.override")}
+                </FieldLabel>
+                <Input
+                  id="managed-skill-import-slug"
+                  value={importSlugOverride}
+                  disabled={busy}
+                  onChange={(e) => setImportSlugOverride(e.target.value.toLowerCase())}
+                  className="font-mono"
+                />
+              </Field>
+            </>
+          )}
+        </FieldGroup>
+        <Button type="submit" size="sm" disabled={!online || busy} className="self-end">
+          {busy && <OrbitSpinner size={13} />}
+          {t(isCreate ? "managedSkills.create" : "managedSkills.import")}
+        </Button>
+      </form>
+    </SettingDrawer>
+  );
+});
+
+export const HostSkillsSection = memo(function HostSkillsSection({
+  hostId,
+}: {
+  hostId: string;
+}) {
+  const online = useHostIsOnline(hostId);
+  const activeCwd = useOrbitSelector((s) => {
+    const cwd =
+      s.selectedHostId === hostId
+        ? s.selectedWorkspaceCwd
+        : s.hostDetails[hostId]?.workspaces[0]?.cwd;
+    return cwd && cwd !== "~" ? cwd : null;
+  });
+  const bundles = useOrbitSelector(
+    (s) => s.hostDetails[hostId]?.orchestration_skills ?? EMPTY_BUNDLES,
+  );
+  const storeSkills = useOrbitSelector(
+    (s) => s.hostDetails[hostId]?.managed_skills ?? EMPTY_SKILLS,
+  );
   return (
     <ManagedSkills
       key={JSON.stringify([hostId, activeCwd])}
       hostId={hostId}
       activeCwd={activeCwd}
       online={online}
-      bundles={hostDetail?.orchestration_skills ?? EMPTY_BUNDLES}
-      storeSkills={hostDetail?.managed_skills ?? EMPTY_SKILLS}
+      bundles={bundles}
+      storeSkills={storeSkills}
     />
   );
-}
+});
 
 function ManagedSkills({
   hostId,
@@ -138,23 +404,8 @@ function ManagedSkills({
   const [search, setSearch] = useState("");
   const [sourceFilter, setSourceFilter] = useState<SkillSourceFilter>("all");
 
-  // Active drawer: create or import
+  // Active drawer: create or import (form keystrokes isolated in SkillCreateImportDrawer)
   const [activeDrawer, setActiveDrawer] = useState<"none" | "create" | "import">("none");
-
-  // Create form state
-  const [newScope, setNewScope] = useState<SkillWriteScope>("user");
-  const [newName, setNewName] = useState("");
-  const [newSlug, setNewSlug] = useState("");
-  const [slugTouched, setSlugTouched] = useState(false);
-  const [newDesc, setNewDesc] = useState("");
-  const [newBody, setNewBody] = useState("");
-  const [creating, setCreating] = useState(false);
-
-  // Import form state
-  const [importScope, setImportScope] = useState<SkillWriteScope>("user");
-  const [importSlugOverride, setImportSlugOverride] = useState("");
-  const [importSource, setImportSource] = useState("");
-  const [importing, setImporting] = useState(false);
 
   const [detailOpen, setDetailOpen] = useState(false);
   const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
@@ -383,88 +634,16 @@ function ManagedSkills({
     }
   };
 
-  const handleCreateSkill = async () => {
-    const slug = newSlug.trim();
-    if (!SLUG_RE.test(slug)) {
-      orbitActions.showToast(t("managedSkills.slugError"));
-      return;
-    }
-    if (newScope === "project" && !activeCwd) {
-      orbitActions.showToast(t("managedSkills.needProject"));
-      return;
-    }
-    setCreating(true);
-    try {
-      const name = newName.trim() || slug;
-      const desc = newDesc.trim();
-      const body = newBody.trim() || `# ${name}\n`;
-      const updated = await orbitIpc.upsertManagedSkill(hostId, {
-        scope: newScope,
-        cwd: activeCwd,
-        slug,
-        name,
-        description: desc,
-        content: body,
-        enabled: true,
-        expectedEtag: null,
-      });
+  const existingSkillIds = useMemo(() => skills.map((s) => s.id), [skills]);
+  const handleCloseCreateImport = useCallback(() => setActiveDrawer("none"), []);
+  const handleSkillMutated = useCallback(
+    (updated: readonly ManagedSkillRecord[], openId?: string | null) => {
       hasLoadedScopedRef.current = true;
       setSkills(updated);
-      setActiveDrawer("none");
-      setNewName("");
-      setNewSlug("");
-      setSlugTouched(false);
-      setNewDesc("");
-      setNewBody("");
-      const createdId = `${newScope === "project" ? "orbit_project" : "orbit_user"}:${slug}`;
-      openSkillEditor(createdId);
-    } catch (err) {
-      orbitActions.showToast(String(err));
-    } finally {
-      setCreating(false);
-    }
-  };
-
-  const handleImportSkill = async () => {
-    if (!importSource.trim()) {
-      orbitActions.showToast(t("managedSkills.importSource"));
-      return;
-    }
-    if (importScope === "project" && !activeCwd) {
-      orbitActions.showToast(t("managedSkills.needProject"));
-      return;
-    }
-    const slugOverride = importSlugOverride.trim() || null;
-    if (slugOverride && !SLUG_RE.test(slugOverride)) {
-      orbitActions.showToast(t("managedSkills.slugError"));
-      return;
-    }
-    setImporting(true);
-    try {
-      const beforeIds = new Set(skills.map((s) => s.id));
-      const updated = await orbitIpc.importManagedSkill(hostId, {
-        scope: importScope,
-        cwd: activeCwd,
-        sourceMarkdownOrPath: importSource,
-        slugOverride,
-      });
-      hasLoadedScopedRef.current = true;
-      setSkills(updated);
-      setActiveDrawer("none");
-      setImportSource("");
-      setImportSlugOverride("");
-      const newlyAdded = updated.find((s) => !beforeIds.has(s.id));
-      if (newlyAdded) {
-        openSkillEditor(newlyAdded.id);
-      } else {
-        orbitActions.showToast(t("managedSkills.imported"));
-      }
-    } catch (err) {
-      orbitActions.showToast(String(err));
-    } finally {
-      setImporting(false);
-    }
-  };
+      if (openId) openSkillEditor(openId);
+    },
+    [openSkillEditor],
+  );
 
   // The daemon lists bundled workflows in both catalogs. Match only its built-in
   // source so separately editable user and project copies remain available.
@@ -513,10 +692,6 @@ function ManagedSkills({
       );
     });
   }, [workflows, sourceFilter, search]);
-
-  const isCreate = activeDrawer === "create";
-  const busy = importing || creating;
-  const writeScope = isCreate ? newScope : importScope;
 
   return (
     <>
@@ -644,140 +819,15 @@ function ManagedSkills({
             ))
           )}
         </SettingCard>
-        <SettingDrawer
-          open={activeDrawer !== "none"}
-          onOpenChange={(open) => {
-            if (!open && !busy) setActiveDrawer("none");
-          }}
-          title={t(isCreate ? "managedSkills.create" : "managedSkills.import")}
-        >
-          <form
-            className="flex flex-col gap-4"
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (!busy && online) void (isCreate ? handleCreateSkill() : handleImportSkill());
-            }}
-          >
-            <FieldGroup>
-              <Field>
-                <FieldLabel>{t("managedSkills.scope")}</FieldLabel>
-                <SettingSelect<SkillWriteScope>
-                  value={writeScope}
-                  disabled={busy}
-                  ariaLabel={t("managedSkills.scope")}
-                  onChange={isCreate ? setNewScope : setImportScope}
-                  options={[
-                    {
-                      value: "user",
-                      label: t("managedSkills.user"),
-                      description: "~/.orbit/skills",
-                    },
-                    {
-                      value: "project",
-                      label: t("permissionRules.scopeProject"),
-                      disabled: !activeCwd,
-                      description: activeCwd
-                        ? activeCwd + "/.orbit/skills"
-                        : t("managedSkills.needProject"),
-                    },
-                  ]}
-                />
-                <span className="text-ink-muted break-all font-mono text-[11px]">
-                  {writeScope === "user" ? "~/.orbit/skills" : activeCwd + "/.orbit/skills"}
-                </span>
-              </Field>
-              {isCreate ? (
-                <>
-                  <Field>
-                    <FieldLabel htmlFor="managed-skill-name">{t("managedSkills.name")}</FieldLabel>
-                    <Input
-                      id="managed-skill-name"
-                      value={newName}
-                      disabled={busy}
-                      onChange={(e) => {
-                        const name = e.target.value;
-                        setNewName(name);
-                        if (!slugTouched) setNewSlug(slugifyName(name));
-                      }}
-                    />
-                  </Field>
-                  <Field>
-                    <FieldLabel htmlFor="managed-skill-slug">{t("managedSkills.slug")}</FieldLabel>
-                    <Input
-                      id="managed-skill-slug"
-                      value={newSlug}
-                      required
-                      pattern="[a-z0-9][a-z0-9_\-]{0,63}"
-                      disabled={busy}
-                      onChange={(e) => {
-                        setSlugTouched(true);
-                        setNewSlug(e.target.value.toLowerCase());
-                      }}
-                      className="font-mono"
-                    />
-                  </Field>
-                  <Field>
-                    <FieldLabel htmlFor="managed-skill-description">
-                      {t("managedSkills.description")}
-                    </FieldLabel>
-                    <Input
-                      id="managed-skill-description"
-                      value={newDesc}
-                      disabled={busy}
-                      onChange={(e) => setNewDesc(e.target.value)}
-                    />
-                  </Field>
-                  <Field>
-                    <FieldLabel htmlFor="managed-skill-body">
-                      {t("managedSkills.instructions")}
-                    </FieldLabel>
-                    <Textarea
-                      id="managed-skill-body"
-                      rows={8}
-                      value={newBody}
-                      disabled={busy}
-                      onChange={(e) => setNewBody(e.target.value)}
-                      className="font-mono text-[13px]"
-                    />
-                  </Field>
-                </>
-              ) : (
-                <>
-                  <Field>
-                    <FieldLabel htmlFor="managed-skill-import">
-                      {t("managedSkills.importSource")}
-                    </FieldLabel>
-                    <Textarea
-                      id="managed-skill-import"
-                      rows={8}
-                      value={importSource}
-                      disabled={busy}
-                      required
-                      onChange={(e) => setImportSource(e.target.value)}
-                      className="font-mono text-[13px]"
-                    />
-                  </Field>
-                  <Field>
-                    <FieldLabel htmlFor="managed-skill-import-slug">
-                      {t("managedSkills.override")}
-                    </FieldLabel>
-                    <Input
-                      id="managed-skill-import-slug"
-                      value={importSlugOverride}
-                      disabled={busy}
-                      onChange={(e) => setImportSlugOverride(e.target.value.toLowerCase())}
-                      className="font-mono"
-                    />
-                  </Field>
-                </>
-              )}
-            </FieldGroup>
-            <Button type="submit" size="sm" disabled={!online || busy} className="self-end">
-              {busy && <OrbitSpinner size={13} />}
-              {t(isCreate ? "managedSkills.create" : "managedSkills.import")}
-            </Button>
-          </form>
-        </SettingDrawer>
+        <SkillCreateImportDrawer
+          mode={activeDrawer}
+          onClose={handleCloseCreateImport}
+          hostId={hostId}
+          activeCwd={activeCwd}
+          online={online}
+          existingSkillIds={existingSkillIds}
+          onMutated={handleSkillMutated}
+        />
         {selectedSkill && (
           <SettingDrawer
             open={detailOpen}

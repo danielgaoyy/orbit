@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { Plus, RefreshCw, Trash2 } from "lucide-react";
 import { HostAcpSection } from "./host-acp-section";
 import {
@@ -271,20 +271,30 @@ export function HostAgentsSection({ hostId }: { hostId: string | null }) {
   );
 }
 
-function HostAgentControls({ hostId }: { hostId: string }) {
+const EMPTY_PROVIDERS: readonly ProviderKind[] = [];
+const EMPTY_PROFILES: readonly AgentProfile[] = [];
+
+const HostAgentControls = memo(function HostAgentControls({ hostId }: { hostId: string }) {
   const { t } = useI18n();
-  const detail = useOrbitSelector((s) => s.hostDetails[hostId]);
-  const host = useOrbitSelector((s) => s.fleet.hosts.find((card) => card.host_id === hostId));
+  const available = useOrbitSelector(
+    (s) =>
+      s.hostDetails[hostId]?.host.available_providers ??
+      s.fleet.hosts.find((card) => card.host_id === hostId)?.available_providers ??
+      EMPTY_PROVIDERS,
+  );
+  const config = useOrbitSelector((s) => s.hostDetails[hostId]?.orchestration_config);
+  const awake = useOrbitSelector((s) => s.hostDetails[hostId]?.keep_awake_status);
+  const profiles = useOrbitSelector((s) => s.hostDetails[hostId]?.profiles ?? EMPTY_PROFILES);
+  const providerCatalogs = useOrbitSelector((s) => s.hostDetails[hostId]?.provider_catalogs);
   const [showAll, setShowAll] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [editor, setEditor] = useState<AgentProfile | "new" | null>(null);
   const [deleting, setDeleting] = useState<AgentProfile | null>(null);
-  const available = detail?.host.available_providers ?? host?.available_providers ?? [];
-  const installed = PROVIDER_LIST.filter((provider) => available.includes(provider.id));
-  const config = detail?.orchestration_config;
-  const awake = detail?.keep_awake_status;
-  const profiles = detail?.profiles ?? [];
+  const installed = useMemo(
+    () => PROVIDER_LIST.filter((provider) => available.includes(provider.id)),
+    [available],
+  );
 
   async function refresh() {
     setRefreshing(true);
@@ -323,7 +333,7 @@ function HostAgentControls({ hostId }: { hostId: string }) {
         <SettingCard>
           {(showAll || !installed.length ? PROVIDER_LIST : installed).map((provider) => {
             const count =
-              detail?.provider_catalogs?.find((catalog) => catalog.provider === provider.id)?.models
+              providerCatalogs?.find((catalog) => catalog.provider === provider.id)?.models
                 .length ?? 0;
             return (
               <SettingResourceRow
@@ -479,4 +489,4 @@ function HostAgentControls({ hostId }: { hostId: string }) {
       />
     </div>
   );
-}
+});

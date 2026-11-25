@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { memo, useEffect, useMemo, useRef } from "react";
 import { ArrowRight, Compass } from "lucide-react";
 import {
   SettingCard, SettingGroupLabel, SettingRow, SettingSectionHeader, SettingSelect,
@@ -16,7 +16,7 @@ const languageOptions = LOCALES.map((item) => ({
   description: item.nativeName !== item.englishName ? item.englishName : undefined,
 }));
 
-export function GeneralSection() {
+export const GeneralSection = memo(function GeneralSection() {
   const { locale, t } = useI18n();
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const draftUseWorktree = useOrbitSelector((s) => s.draftUseWorktree);
@@ -54,9 +54,13 @@ export function GeneralSection() {
   }, [releaseUpdateInfo, checkingUpdate, isBrowserOffline]);
 
   // Synced preferences may contain a custom prefix from another client.
-  const branchOptions = prefixOptions.some((item) => item.value === worktreeBranchPrefix)
-    ? prefixOptions
-    : [...prefixOptions, { value: worktreeBranchPrefix, label: worktreeBranchPrefix, mono: true }];
+  const branchOptions = useMemo(
+    () =>
+      prefixOptions.some((item) => item.value === worktreeBranchPrefix)
+        ? prefixOptions
+        : [...prefixOptions, { value: worktreeBranchPrefix, label: worktreeBranchPrefix, mono: true }],
+    [prefixOptions, worktreeBranchPrefix],
+  );
 
   const installedEditors = useMemo(
     () => externalEditors.filter((ed) => ed.installed),
@@ -238,4 +242,4 @@ export function GeneralSection() {
       </div>
     </div>
   );
-}
+});

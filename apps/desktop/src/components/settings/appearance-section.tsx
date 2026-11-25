@@ -1,3 +1,4 @@
+import { memo, useMemo } from "react";
 import {
   SettingCard,
   SettingGroupLabel,
@@ -30,29 +31,35 @@ function ThemePreviewSwatch({ mode }: { mode: ThemeMode }) {
   );
 }
 
-export function AppearanceSection() {
+export const AppearanceSection = memo(function AppearanceSection() {
   const { t } = useI18n();
   const theme = useOrbitSelector((s) => s.theme);
   const diffLayout = useOrbitSelector((s) => s.diffLayout);
 
-  const themeOptions: { id: ThemeMode; label: string }[] = [
-    { id: "system", label: t("settings.themeSystem") },
-    { id: "light", label: t("settings.themeLight") },
-    { id: "dark", label: t("settings.themeDark") },
-  ];
+  const themeOptions = useMemo<{ id: ThemeMode; label: string }[]>(
+    () => [
+      { id: "system", label: t("settings.themeSystem") },
+      { id: "light", label: t("settings.themeLight") },
+      { id: "dark", label: t("settings.themeDark") },
+    ],
+    [t],
+  );
 
-  const diffLayoutOptions: SettingSelectOption<"unified" | "split">[] = [
-    {
-      value: "unified",
-      label: t("settings.diffUnified"),
-      description: t("settings.diffUnifiedDesc"),
-    },
-    {
-      value: "split",
-      label: t("settings.diffSplit"),
-      description: t("settings.diffSplitDesc"),
-    },
-  ];
+  const diffLayoutOptions = useMemo<SettingSelectOption<"unified" | "split">[]>(
+    () => [
+      {
+        value: "unified",
+        label: t("settings.diffUnified"),
+        description: t("settings.diffUnifiedDesc"),
+      },
+      {
+        value: "split",
+        label: t("settings.diffSplit"),
+        description: t("settings.diffSplitDesc"),
+      },
+    ],
+    [t],
+  );
 
   return (
     <div className="space-y-6">
@@ -113,4 +120,4 @@ export function AppearanceSection() {
       </div>
     </div>
   );
-}
+});

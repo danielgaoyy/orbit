@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -20,6 +20,7 @@ import {
   SettingSelect,
   type SettingSelectOption,
   ToggleSwitch,
+  useHostIsOnline,
 } from "@/components/settings/settings-primitives";
 import { Button } from "@/components/ui/button";
 import { IconButton } from "@/components/ui/icon-button";
@@ -674,7 +675,7 @@ function HookEditorDrawer({
   );
 }
 
-export function HostHooksSection({
+export const HostHooksSection = memo(function HostHooksSection({
   hostId,
   workspaceCwd: effectiveCwd = null,
 }: {
@@ -682,9 +683,7 @@ export function HostHooksSection({
   workspaceCwd?: string | null;
 }) {
   const { t } = useI18n();
-  const hostCard = useOrbitSelector(
-    (s) => s.fleet.hosts.find((h) => h.host_id === hostId) ?? null,
-  );
+  const isOnline = useHostIsOnline(hostId);
   const scopeKey = `${hostId}::${effectiveCwd ?? "__global__"}`;
   const entry = useOrbitSelector(
     (s) => s.lifecycleHooksByScope[scopeKey] ?? null,
@@ -693,10 +692,6 @@ export function HostHooksSection({
   const recentExecutions = entry?.recentExecutions ?? EMPTY_EXECUTIONS;
   const projectTrusted = entry?.projectHooksTrusted ?? false;
   const isLoading = entry?.status === "loading";
-
-  const isOnline =
-    hostCard?.connection_state === "online_direct" ||
-    hostCard?.connection_state === "online_relay";
 
   const [editor, setEditor] = useState<{
     open: boolean;
@@ -1083,4 +1078,4 @@ export function HostHooksSection({
       )}
     </section>
   );
-}
+});

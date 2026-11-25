@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import {
   ArrowUpCircle,
   Check,
@@ -43,7 +43,7 @@ function redactRelayForDisplay(url: string): string {
     .replace(/([?&])token=[^&#]*/gi, "$1token=***");
 }
 
-export function HostConnectionSection({
+export const HostConnectionSection = memo(function HostConnectionSection({
   hostId,
   onRemoved,
   inlinePairing,
@@ -53,13 +53,13 @@ export function HostConnectionSection({
   inlinePairing: boolean;
 }) {
   const { t } = useI18n();
-  const fleet = useOrbitSelector((s) => s.fleet);
+  const host = useOrbitSelector((s) => s.fleet.hosts.find((h) => h.host_id === hostId) ?? null);
+  const hostCount = useOrbitSelector((s) => s.fleet.hosts.length);
   const sshHosts = useOrbitSelector((s) => s.sshHosts);
   const appVersion = useOrbitSelector((s) => s.appVersion);
   const releaseUpdateInfo = useOrbitSelector((s) => s.releaseUpdateInfo);
   const fleetUpdate = useOrbitSelector((s) => s.fleetUpdate);
   const upgradeState = useOrbitSelector((s) => s.hostUpgradeStates[hostId] ?? null);
-  const host = fleet.hosts.find((h) => h.host_id === hostId) ?? null;
 
   const [relayInput, setRelayInput] = useState(host?.relay_url ?? "");
   const [relayStatusMsg, setRelayStatusMsg] = useState<string | null>(null);
@@ -422,7 +422,7 @@ export function HostConnectionSection({
             >
               {t("settings.fleetSave")}
             </Button>
-            {fleet.hosts.length > 1 && relayInput.trim() && (
+            {hostCount > 1 && relayInput.trim() && (
               <Button
                 type="button"
                 variant="outline"
@@ -602,7 +602,7 @@ export function HostConnectionSection({
           pendingRelayConfirm?.kind === "clear"
             ? t("settings.fleetClearRelayConfirm", { host: host.display_name })
             : pendingRelayConfirm?.kind === "share_all"
-              ? t("settings.fleetOverwriteRelayConfirm", { count: fleet.hosts.length })
+              ? t("settings.fleetOverwriteRelayConfirm", { count: hostCount })
               : pendingRelayConfirm?.kind === "deploy_ssh"
                 ? t("settings.fleetDeployRelayConfirm", { host: pendingRelayConfirm.ssh.alias })
                 : pendingRelayConfirm?.kind === "deploy_cf"
@@ -615,11 +615,11 @@ export function HostConnectionSection({
             : pendingRelayConfirm?.kind === "share_all"
               ? t("settings.fleetOverwriteRelayDesc")
               : pendingRelayConfirm?.kind === "deploy_ssh"
-                ? t("settings.fleetDeployRelayDesc", { count: fleet.hosts.length })
+                ? t("settings.fleetDeployRelayDesc", { count: hostCount })
                 : pendingRelayConfirm?.kind === "deploy_cf"
                   ? t("settings.deployCfConfirmDesc", {
                       alias: pendingRelayConfirm.ssh.alias,
-                      count: fleet.hosts.length,
+                      count: hostCount,
                     })
                   : undefined
         }
@@ -674,4 +674,4 @@ export function HostConnectionSection({
       />
     </div>
   );
-}
+});

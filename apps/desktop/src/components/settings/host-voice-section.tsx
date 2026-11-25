@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Mic, RefreshCw } from "lucide-react";
 import {
   SettingCard,
@@ -8,6 +8,7 @@ import {
   SettingSelect,
   type SettingSelectOption,
   ToggleSwitch,
+  useHostIsOnline,
 } from "@/components/settings/settings-primitives";
 import { Button } from "@/components/ui/button";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
@@ -33,12 +34,38 @@ import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 const SYSTEM_DEFAULT_MIC = "default";
 const MIC_POLL_INTERVAL_MS = 2500;
 
-export function HostVoiceSection({ hostId }: { hostId: string }) {
+function sameWebDevices(
+  a: readonly AudioInputDeviceInfo[],
+  b: readonly AudioInputDeviceInfo[],
+): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i].deviceId !== b[i].deviceId || a[i].label !== b[i].label) return false;
+  }
+  return true;
+}
+
+function sameSystemDevices(
+  a: readonly SystemAudioInputDevice[],
+  b: readonly SystemAudioInputDevice[],
+): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (
+      a[i].name !== b[i].name ||
+      a[i].is_default !== b[i].is_default ||
+      a[i].transport !== b[i].transport
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export const HostVoiceSection = memo(function HostVoiceSection({ hostId }: { hostId: string }) {
   const { locale, t } = useI18n();
-  const host = useOrbitSelector((s) => s.fleet.hosts.find((h) => h.host_id === hostId) ?? null);
+  const isOnline = useHostIsOnline(hostId);
   const voiceInputDeviceId = useOrbitSelector((s) => s.voiceInputDeviceId);
-  const isOnline =
-    host?.connection_state === "online_direct" || host?.connection_state === "online_relay";
 
   const [state, setState] = useState<VoiceConfigState | null>(null);
   const [loading, setLoading] = useState(true);
@@ -71,8 +98,8 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
 
         let webDevices = webRes.devices;
         let needsPerm = webRes.needsPermission;
-        setMicSupported(webRes.supported);
-        setSystemAudioInputs(sysDevices);
+        setMicSupported((prev) => (prev === webRes.supported ? prev : webRes.supported));
+        setSystemAudioInputs((prev) => (sameSystemDevices(prev, sysDevices) ? prev : sysDevices));
 
         const initialMerged = mergeAudioInputDevices(webDevices, sysDevices);
         const osSignature =
@@ -100,8 +127,8 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
           }
         }
 
-        setWebAudioInputs(webDevices);
-        setNeedsMicPermission(needsPerm);
+        setWebAudioInputs((prev) => (sameWebDevices(prev, webDevices) ? prev : webDevices));
+        setNeedsMicPermission((prev) => (prev === needsPerm ? prev : needsPerm));
         reconcileWebSelection(webDevices);
       } catch {
         setWebAudioInputs([]);
@@ -215,6 +242,16 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
     return opts;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mergedMicrophones, voiceInputDeviceId, locale]);
+
+  const languageOptions = useMemo<SettingSelectOption<string>[]>(
+    () => [
+      { value: "auto", label: t("voice.langAuto") },
+      { value: "en", label: "English" },
+      { value: "zh", label: "中文" },
+      { value: "ja", label: "日本語" },
+    ],
+    [t],
+  );
 
   const busy = saving || loading;
   const cfg = state?.config;
@@ -330,12 +367,7 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
                   onChange={(val) =>
                     void patchConfig({ language: val === "auto" ? null : val })
                   }
-                  options={[
-                    { value: "auto", label: t("voice.langAuto") },
-                    { value: "en", label: "English" },
-                    { value: "zh", label: "中文" },
-                    { value: "ja", label: "日本語" },
-                  ]}
+                  options={languageOptions}
                 />
               </SettingRow>
 
@@ -361,4 +393,4 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
       </div>
     </div>
   );
-}
+});

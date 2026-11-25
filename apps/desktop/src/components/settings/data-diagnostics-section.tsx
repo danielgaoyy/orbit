@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import { ArchivedSection } from "@/components/settings/archived-section";
 import { HostDiagnosticsAndMigrationPanel } from "@/components/settings/host-security-ops-panels";
 import { useModifiedSettings } from "@/components/settings/settings-preferences";
@@ -6,21 +6,23 @@ import {
   SettingCard,
   SettingPageHeader,
   SettingRow,
+  useHostIsOnline,
 } from "@/components/settings/settings-primitives";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { useI18n } from "@/lib/i18n";
 import { useOrbitSelector } from "@/state/orbit-store";
 
-export function DataDiagnosticsSection({ hostId }: { hostId: string | null }) {
+export const DataDiagnosticsSection = memo(function DataDiagnosticsSection({
+  hostId,
+}: {
+  hostId: string | null;
+}) {
   const { t } = useI18n();
-  const state = useOrbitSelector(
-    (s) => s.fleet.hosts.find((host) => host.host_id === hostId)?.connection_state,
-  );
+  const online = useHostIsOnline(hostId);
   const projectCwd = useOrbitSelector((s) =>
     s.selectedHostId === hostId ? s.selectedWorkspaceCwd : null,
   );
-  const online = state === "online_direct" || state === "online_relay";
   const { resetAll, modifiedIds } = useModifiedSettings();
   const [confirmReset, setConfirmReset] = useState(false);
   return (
@@ -61,4 +63,4 @@ export function DataDiagnosticsSection({ hostId }: { hostId: string | null }) {
       />
     </div>
   );
-}
+});

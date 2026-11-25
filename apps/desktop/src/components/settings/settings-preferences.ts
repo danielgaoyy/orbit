@@ -60,8 +60,14 @@ const resettable: readonly ResettableSetting[] = [
   })),
 ];
 
+const resettableById = new Map<string, ResettableSetting>(
+  resettable.map((item) => [item.id, item]),
+);
+
+const NEVER_MODIFIED = (): boolean => false;
+
 function reset(id: string) {
-  resettable.find((item) => item.id === id)?.reset();
+  resettableById.get(id)?.reset();
 }
 
 function resetAll() {
@@ -69,6 +75,19 @@ function resetAll() {
   for (const item of resettable) {
     if (item.modified(snapshot)) item.reset();
   }
+}
+
+// Fine-grained per-row subscription: toggling one preference only notifies its own row.
+export function useSettingModifiedState(settingId?: string): {
+  isModified: boolean;
+  reset?: () => void;
+} {
+  const entry = settingId ? resettableById.get(settingId) : undefined;
+  const isModified = useOrbitSelector(entry ? entry.modified : NEVER_MODIFIED);
+  return {
+    isModified,
+    reset: isModified && entry ? entry.reset : undefined,
+  };
 }
 
 // A primitive snapshot keeps React 19 subscriptions stable across unrelated store updates.

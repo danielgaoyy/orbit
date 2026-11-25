@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   Check,
@@ -39,19 +39,26 @@ import { cn } from "@/lib/utils";
 
 type LoginMethodTab = "device" | "token" | "link";
 
-export function CloudSyncSection() {
+export const CloudSyncSection = memo(function CloudSyncSection() {
   const { t, locale } = useI18n();
   const status = useOrbitSelector((s) => s.cloudSyncStatus);
   const busy = useOrbitSelector((s) => s.cloudSyncBusy);
   const storeError = useOrbitSelector((s) => s.cloudSyncError);
   const deviceFlow = useOrbitSelector((s) => s.cloudSyncDeviceFlow);
   const lastResult = useOrbitSelector((s) => s.cloudSyncLastResult);
-  const hosts = useOrbitSelector((s) => s.fleet.hosts);
+  const allRemoteHostsLackReachability = useOrbitSelector((s) => {
+    const hosts = s.fleet.hosts;
+    if (hosts.length <= 1) return false;
+    return !hosts.some(
+      (h) => Boolean((h.relay_url ?? "").trim()) || Boolean((h.ssh_alias ?? "").trim()),
+    );
+  });
 
   const [selectedMethod, setLoginTab] = useState<LoginMethodTab | null>(null);
   const loginTab =
     selectedMethod ?? (status?.github_oauth_configured === false ? "token" : "device");
   const [clientIdInput, setClientIdInput] = useState("");
+  const syncedClientIdRef = useRef<string | null>(null);
   const [tokenInput, setTokenInput] = useState("");
   const [deviceLinkInput, setDeviceLinkInput] = useState("");
   const [passphraseInput, setPassphraseInput] = useState("");
@@ -74,10 +81,12 @@ export function CloudSyncSection() {
   }, []);
 
   useEffect(() => {
-    if (status?.github_client_id_override && !clientIdInput) {
-      setClientIdInput(status.github_client_id_override);
+    const override = status?.github_client_id_override ?? null;
+    if (override && syncedClientIdRef.current !== override) {
+      syncedClientIdRef.current = override;
+      setClientIdInput((prev) => prev || override);
     }
-  }, [status?.github_client_id_override, clientIdInput]);
+  }, [status?.github_client_id_override]);
 
   useEffect(() => {
     if (!linkQrOpen) {
@@ -123,10 +132,6 @@ export function CloudSyncSection() {
   const isAuthExpiredError = Boolean(
     displayError && /401|bad credentials|expired|revoked|unauthorized/i.test(displayError),
   );
-  const hostsWithReachableFabric = hosts.filter(
-    (h) => Boolean((h.relay_url ?? "").trim()) || Boolean((h.ssh_alias ?? "").trim()),
-  );
-  const allRemoteHostsLackReachability = hosts.length > 1 && hostsWithReachableFabric.length === 0;
 
   const markCopied = async (which: "code" | "key" | "cli" | "link", text: string) => {
     try {
@@ -728,4 +733,4 @@ export function CloudSyncSection() {
       </Dialog>
     </div>
   );
-}
+});

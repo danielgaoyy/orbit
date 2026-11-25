@@ -1,3 +1,4 @@
+import { memo, useMemo } from "react";
 import { Plus } from "lucide-react";
 import { AddHostSection } from "@/components/settings/add-host-section";
 import { FleetUpgrades } from "@/components/settings/fleet-upgrades";
@@ -5,24 +6,26 @@ import { HostConnectionSection } from "@/components/settings/host-connection-sec
 import { SettingDrawer, SettingPageHeader } from "@/components/settings/settings-primitives";
 import { Button } from "@/components/ui/button";
 import { useI18n } from "@/lib/i18n";
-import type { HostCardView } from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
-import { orbitActions } from "@/state/orbit-store";
+import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
-export function HostsFleetSection({
-  hosts,
+export const HostsFleetSection = memo(function HostsFleetSection({
   hostId,
   view,
   onSelectHost,
   onOverview,
 }: {
-  hosts: HostCardView[];
   hostId: string | null;
   view: "overview" | "connection" | "add_host";
   onSelectHost: (id: string) => void;
   onOverview: () => void;
 }) {
   const { t } = useI18n();
+  const rawHosts = useOrbitSelector((s) => s.fleet.hosts);
+  const hosts = useMemo(
+    () => [...rawHosts].sort((a, b) => Number(isLocalHostCard(b)) - Number(isLocalHostCard(a))),
+    [rawHosts],
+  );
   const localOnly = hosts.length === 1 && isLocalHostCard(hosts[0]);
   const detail = view === "connection" ? hosts.find((h) => h.host_id === hostId) : null;
   if (view === "connection" && !detail) {
@@ -97,4 +100,4 @@ export function HostsFleetSection({
       </SettingDrawer>
     </div>
   );
-}
+});

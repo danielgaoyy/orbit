@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
   Check,
   Copy,
@@ -19,6 +19,7 @@ import {
   SettingSelect,
   type SettingSelectOption,
   ToggleSwitch,
+  useHostIsOnline,
 } from "@/components/settings/settings-primitives";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -745,9 +746,129 @@ function ChannelForm({
   );
 }
 
-export function HostImChannelsSection({ hostId }: { hostId: string }) {
+const ImTestMessageDrawer = memo(function ImTestMessageDrawer({
+  hostId,
+  channel,
+  baseWebhookUrl,
+  isOnline,
+  copiedId,
+  onCopyWebhook,
+  onClose,
+}: {
+  hostId: string;
+  channel: ImChannelRecord | null;
+  baseWebhookUrl: string;
+  isOnline: boolean;
+  copiedId: string | null;
+  onCopyWebhook: (channelId: string, fullUrl: string) => void;
+  onClose: () => void;
+}) {
   const { t } = useI18n();
-  const host = useOrbitSelector((s) => s.fleet.hosts.find((h) => h.host_id === hostId) ?? null);
+  const [testChatId, setTestChatId] = useState(channel?.allowed_chat_ids[0] ?? "");
+  const [testMessage, setTestMessage] = useState(() => t("im.testMessageDefault"));
+  const [testBusy, setTestBusy] = useState(false);
+  const [testResult, setTestResult] = useState<{
+    channelId: string;
+    ok: boolean;
+    detail: string;
+  } | null>(null);
+
+  const handleSendTest = async (ch: ImChannelRecord) => {
+    if (!testChatId.trim()) return;
+    setTestBusy(true);
+    const res = await orbitActions.testImChannel(
+      hostId,
+      ch.channel_id,
+      testChatId.trim(),
+      (testMessage || t("im.testMessageDefault")).trim(),
+    );
+    setTestBusy(false);
+    setTestResult({ channelId: ch.channel_id, ok: res.ok, detail: res.detail });
+  };
+
+  return (
+    <SettingDrawer
+      open={Boolean(channel)}
+      title={t("im.testChannelTitle", { name: channel?.name ?? "" })}
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      {channel && (
+        <div className="flex flex-col gap-5">
+          <div className="text-ink-secondary flex flex-col gap-1 text-[13px]">
+            <span>
+              {PLATFORM_META[channel.platform].label} ·{" "}
+              {resolveTransportMode(channel) === "webhook"
+                ? t("im.modeBadgeWebhook")
+                : channel.platform === "telegram"
+                  ? t("im.modeBadgePolling")
+                  : t("im.modeBadgeWs")}
+            </span>
+            {channel.status_message && <span>{channel.status_message}</span>}
+            <span>{t("im.allowlistSummary", {
+              chats: channel.allowed_chat_ids.length, users: channel.allowed_user_ids.length,
+            })}</span>
+            <span>{t("im.messagesCount", { count: channel.message_count })}</span>
+            <code className="text-ink-muted break-all text-[11px]">{channel.default_workspace_cwd}</code>
+          </div>
+          {resolveTransportMode(channel) === "webhook" && (
+            <div className="bg-surface-recessed flex items-center justify-between gap-2 rounded-lg p-3">
+              <code className="min-w-0 break-all text-[11px]">{baseWebhookUrl}{channel.webhook_path}</code>
+              <IconButton
+                size="sm"
+                tooltip={t("im.copyWebhookUrl")}
+                onClick={() => onCopyWebhook(channel.channel_id, baseWebhookUrl + channel.webhook_path)}
+              >
+                {copiedId === channel.channel_id ? <Check /> : <Copy />}
+              </IconButton>
+            </div>
+          )}
+          <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor="im-test-chat">{t("im.testChatLabel")}</FieldLabel>
+              <Input
+                id="im-test-chat"
+                value={testChatId}
+                onChange={(e) => setTestChatId(e.target.value)}
+                placeholder={PLATFORM_META[channel.platform].chatPlaceholder}
+              />
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="im-test-message">{t("im.testMessagePlaceholder")}</FieldLabel>
+              <Input
+                id="im-test-message"
+                value={testMessage}
+                onChange={(e) => setTestMessage(e.target.value)}
+              />
+            </Field>
+          </FieldGroup>
+          <Button
+            type="button" size="sm" className="self-end"
+            disabled={!isOnline || testBusy || !testChatId.trim()}
+            onClick={() => void handleSendTest(channel)}
+          >
+            {testBusy ? <Loader2 className="animate-spin" /> : <Send data-icon="inline-start" />}
+            {t("common.send")}
+          </Button>
+          {testResult?.channelId === channel.channel_id && (
+            <p role="status" className={testResult.ok ? "text-signal-success" : "text-signal-danger"}>
+              {testResult.detail}
+            </p>
+          )}
+        </div>
+      )}
+    </SettingDrawer>
+  );
+});
+
+export const HostImChannelsSection = memo(function HostImChannelsSection({
+  hostId,
+}: {
+  hostId: string;
+}) {
+  const { t } = useI18n();
+  const isOnline = useHostIsOnline(hostId);
   const hostDetail = useOrbitSelector((s) => s.hostDetails[hostId] ?? null);
   const fleetProjects = useOrbitSelector((s) => s.fleet.projects);
   const imState = useOrbitSelector((s) => s.imChannelsByHost[hostId]);
@@ -758,22 +879,12 @@ export function HostImChannelsSection({ hostId }: { hostId: string }) {
   const loading = imState?.status === "loading" && channels.length === 0;
   const saving = Boolean(imState?.saving);
   const error = imState?.error ?? null;
-  const isOnline =
-    host?.connection_state === "online_direct" || host?.connection_state === "online_relay";
 
   const [drawerInitial, setDrawerInitial] = useState<ChannelFormState | null>(null);
   const [formServerError, setFormServerError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
-  const [testChatId, setTestChatId] = useState("");
-  const [testMessage, setTestMessage] = useState("");
-  const [testBusy, setTestBusy] = useState(false);
-  const [testResult, setTestResult] = useState<{
-    channelId: string;
-    ok: boolean;
-    detail: string;
-  } | null>(null);
 
   useEffect(() => {
     if (hostId && isOnline) {
@@ -899,7 +1010,7 @@ export function HostImChannelsSection({ hostId }: { hostId: string }) {
     });
   };
 
-  const handleCopyWebhook = async (channelId: string, fullUrl: string) => {
+  const handleCopyWebhook = useCallback(async (channelId: string, fullUrl: string) => {
     try {
       if (!navigator.clipboard?.writeText) return;
       await navigator.clipboard.writeText(fullUrl);
@@ -910,20 +1021,9 @@ export function HostImChannelsSection({ hostId }: { hostId: string }) {
     } catch {
       // Clipboard API denied or unavailable; do not mark as copied
     }
-  };
+  }, []);
 
-  const handleSendTest = async (ch: ImChannelRecord) => {
-    if (!testChatId.trim()) return;
-    setTestBusy(true);
-    const res = await orbitActions.testImChannel(
-      hostId,
-      ch.channel_id,
-      testChatId.trim(),
-      (testMessage || t("im.testMessageDefault")).trim(),
-    );
-    setTestBusy(false);
-    setTestResult({ channelId: ch.channel_id, ok: res.ok, detail: res.detail });
-  };
+  const handleCloseTestDrawer = useCallback(() => setTestingId(null), []);
 
   const bindingsCountByChannel = useMemo(() => {
     const counts = new Map<string, number>();
@@ -1059,12 +1159,7 @@ export function HostImChannelsSection({ hostId }: { hostId: string }) {
                         size="sm"
                         tooltip={t("im.test")}
                         disabled={!isOnline || saving}
-                        onClick={() => {
-                          setTestingId(ch.channel_id);
-                          setTestChatId(ch.allowed_chat_ids[0] ?? "");
-                          setTestMessage(t("im.testMessageDefault"));
-                          setTestResult(null);
-                        }}
+                        onClick={() => setTestingId(ch.channel_id)}
                       >
                         <Send />
                       </IconButton>
@@ -1105,61 +1200,16 @@ export function HostImChannelsSection({ hostId }: { hostId: string }) {
         }}
       />
 
-      <SettingDrawer
-        open={Boolean(testChannel)}
-        title={t("im.testChannelTitle", { name: testChannel?.name ?? "" })}
-        onOpenChange={(open) => { if (!open) setTestingId(null); }}
-      >
-        {testChannel && (
-          <div className="flex flex-col gap-5">
-            <div className="text-ink-secondary flex flex-col gap-1 text-[13px]">
-              <span>{PLATFORM_META[testChannel.platform].label} · {formatTransportLabel(testChannel)}</span>
-              {testChannel.status_message && <span>{testChannel.status_message}</span>}
-              <span>{t("im.allowlistSummary", {
-                chats: testChannel.allowed_chat_ids.length, users: testChannel.allowed_user_ids.length,
-              })}</span>
-              <span>{t("im.messagesCount", { count: testChannel.message_count })}</span>
-              <code className="text-ink-muted break-all text-[11px]">{testChannel.default_workspace_cwd}</code>
-            </div>
-            {resolveTransportMode(testChannel) === "webhook" && (
-              <div className="bg-surface-recessed flex items-center justify-between gap-2 rounded-lg p-3">
-                <code className="min-w-0 break-all text-[11px]">{baseWebhookUrl}{testChannel.webhook_path}</code>
-                <IconButton
-                  size="sm"
-                  tooltip={t("im.copyWebhookUrl")}
-                  onClick={() => void handleCopyWebhook(testChannel.channel_id, baseWebhookUrl + testChannel.webhook_path)}
-                >
-                  {copiedId === testChannel.channel_id ? <Check /> : <Copy />}
-                </IconButton>
-              </div>
-            )}
-            <FieldGroup>
-              <Field>
-                <FieldLabel htmlFor="im-test-chat">{t("im.testChatLabel")}</FieldLabel>
-                <Input id="im-test-chat" value={testChatId} onChange={(e) => setTestChatId(e.target.value)}
-                  placeholder={PLATFORM_META[testChannel.platform].chatPlaceholder} />
-              </Field>
-              <Field>
-                <FieldLabel htmlFor="im-test-message">{t("im.testMessagePlaceholder")}</FieldLabel>
-                <Input id="im-test-message" value={testMessage} onChange={(e) => setTestMessage(e.target.value)} />
-              </Field>
-            </FieldGroup>
-            <Button
-              type="button" size="sm" className="self-end"
-              disabled={!isOnline || testBusy || !testChatId.trim()}
-              onClick={() => void handleSendTest(testChannel)}
-            >
-              {testBusy ? <Loader2 className="animate-spin" /> : <Send data-icon="inline-start" />}
-              {t("common.send")}
-            </Button>
-            {testResult?.channelId === testChannel.channel_id && (
-              <p role="status" className={testResult.ok ? "text-signal-success" : "text-signal-danger"}>
-                {testResult.detail}
-              </p>
-            )}
-          </div>
-        )}
-      </SettingDrawer>
+      <ImTestMessageDrawer
+        key={testChannel?.channel_id ?? "closed"}
+        hostId={hostId}
+        channel={testChannel ?? null}
+        baseWebhookUrl={baseWebhookUrl}
+        isOnline={isOnline}
+        copiedId={copiedId}
+        onCopyWebhook={handleCopyWebhook}
+        onClose={handleCloseTestDrawer}
+      />
 
       <SettingDrawer
         open={Boolean(drawerInitial)}
@@ -1188,4 +1238,4 @@ export function HostImChannelsSection({ hostId }: { hostId: string }) {
       </SettingDrawer>
     </div>
   );
-}
+});

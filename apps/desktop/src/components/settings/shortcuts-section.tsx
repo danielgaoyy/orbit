@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { AlertTriangle, ArrowLeftRight, RotateCcw, Search } from "lucide-react";
 import {
   SettingCard,
@@ -40,7 +40,7 @@ interface PendingConflictState {
   conflict: ShortcutActionDefinition;
 }
 
-export function ShortcutsSection({ jumpTo }: { jumpTo?: string }) {
+export const ShortcutsSection = memo(function ShortcutsSection({ jumpTo }: { jumpTo?: string }) {
   const { locale, t } = useI18n();
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const customKeybindings = useOrbitSelector((s) => s.customKeybindings);
@@ -363,4 +363,4 @@ export function ShortcutsSection({ jumpTo }: { jumpTo?: string }) {
       )}
     </div>
   );
-}
+});

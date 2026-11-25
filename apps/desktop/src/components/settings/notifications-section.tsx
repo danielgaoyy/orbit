@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { Bell, Check, RefreshCw, Send, Shield, Smartphone, Trash2, Volume2 } from "lucide-react";
 import {
   SettingCard,
@@ -8,6 +8,7 @@ import {
   SettingSelect,
   type SettingSelectOption,
   ToggleSwitch,
+  useHostIsOnline,
 } from "@/components/settings/settings-primitives";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -70,7 +71,7 @@ const DEFAULT_PUSH_PREFS: PushPreferences = {
   has_gateway_auth_token: false,
 };
 
-export function NotificationsSection() {
+export const NotificationsSection = memo(function NotificationsSection() {
   const notifyOnApproval = useOrbitSelector((s) => s.notifyOnApproval);
   const notifyOnTurnComplete = useOrbitSelector((s) => s.notifyOnTurnComplete);
   const notifyOnAgentError = useOrbitSelector((s) => s.notifyOnAgentError);
@@ -80,9 +81,24 @@ export function NotificationsSection() {
   const notifyQuietStartHour = useOrbitSelector((s) => s.notifyQuietStartHour);
   const notifyQuietEndHour = useOrbitSelector((s) => s.notifyQuietEndHour);
 
-  const hosts = useOrbitSelector((s) => s.fleet.hosts);
+  // Primitive signature avoids re-rendering Notifications on every background agent/fleet tick.
+  const hostsKey = useOrbitSelector((s) =>
+    s.fleet.hosts.map((h) => `${h.host_id}\u0000${h.display_name}`).join("\u0001"),
+  );
+  const hosts = useMemo(
+    () =>
+      hostsKey
+        ? hostsKey.split("\u0001").map((entry) => {
+            const sep = entry.indexOf("\u0000");
+            return {
+              host_id: sep >= 0 ? entry.slice(0, sep) : entry,
+              display_name: sep >= 0 ? entry.slice(sep + 1) : entry,
+            };
+          })
+        : [],
+    [hostsKey],
+  );
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
-  const pushByHost = useOrbitSelector((s) => s.pushByHost);
 
   const [targetHostId, setTargetHostId] = useState<string>(
     () => selectedHostId ?? hosts[0]?.host_id ?? "",
@@ -101,7 +117,10 @@ export function NotificationsSection() {
     [hosts, targetHostId],
   );
   const activeHostId = activeHost?.host_id ?? "";
-  const pushEntry = activeHostId ? pushByHost[activeHostId] : undefined;
+  const isHostOnline = useHostIsOnline(activeHostId);
+  const pushEntry = useOrbitSelector((s) =>
+    activeHostId ? s.pushByHost[activeHostId] : undefined,
+  );
 
   useEffect(() => {
     if (activeHostId) {
@@ -138,8 +157,11 @@ export function NotificationsSection() {
     }
   };
 
-  // Local mirror for host mobile push preferences; toggles & selects save immediately.
-  const [draftPrefs, setDraftPrefs] = useState<PushPreferences>(DEFAULT_PUSH_PREFS);
+  // Optimistic override only while an update RPC is in flight (avoids 4x mirror useEffect loops).
+  const [pendingPrefs, setPendingPrefs] = useState<{
+    hostId: string;
+    prefs: PushPreferences;
+  } | null>(null);
   const [pendingRemoveDevice, setPendingRemoveDevice] = useState<{
     hostId: string;
     hostName: string;
@@ -147,7 +169,6 @@ export function NotificationsSection() {
     device_name: string;
     platform: PushPlatform;
   } | null>(null);
-  const lastSyncedHostIdRef = useRef<string>(activeHostId);
 
   useEffect(() => {
     if (!pendingRemoveDevice) return;
@@ -161,39 +182,30 @@ export function NotificationsSection() {
     [hosts],
   );
 
-  useEffect(() => {
-    const hostChanged = lastSyncedHostIdRef.current !== activeHostId;
-    if (hostChanged) {
-      lastSyncedHostIdRef.current = activeHostId;
-      setDraftPrefs(pushEntry?.preferences ?? DEFAULT_PUSH_PREFS);
-      return;
-    }
-    if (pushEntry?.preferences) {
-      setDraftPrefs(pushEntry.preferences);
-    }
-  }, [activeHostId, pushEntry?.preferences]);
+  const draftPrefs =
+    pendingPrefs && pendingPrefs.hostId === activeHostId
+      ? pendingPrefs.prefs
+      : (pushEntry?.preferences ?? DEFAULT_PUSH_PREFS);
 
   const persistMobilePrefs = async (updater: (prev: PushPreferences) => PushPreferences) => {
     if (!activeHostId || pushEntry?.status !== "ready") return;
     const hostIdAtStart = activeHostId;
     const nextPrefs = updater(draftPrefs);
-    setDraftPrefs(nextPrefs);
-    const res = await orbitActions.updatePushPreferences(hostIdAtStart, {
-      preferences: nextPrefs,
-      gateway_auth_token: null,
-      keep_existing_gateway_token: true,
-    });
-    if (res && lastSyncedHostIdRef.current === hostIdAtStart) {
-      setDraftPrefs(res.preferences);
+    setPendingPrefs({ hostId: hostIdAtStart, prefs: nextPrefs });
+    try {
+      await orbitActions.updatePushPreferences(hostIdAtStart, {
+        preferences: nextPrefs,
+        gateway_auth_token: null,
+        keep_existing_gateway_token: true,
+      });
+    } finally {
+      setPendingPrefs((cur) => (cur?.hostId === hostIdAtStart ? null : cur));
     }
   };
 
   const { t } = useI18n();
   const isBlocked = permission === "denied" || permission === "unsupported";
   const devices = pushEntry?.devices ?? [];
-  const isHostOnline =
-    activeHost?.connection_state === "online_direct" ||
-    activeHost?.connection_state === "online_relay";
   const isPushReady = isHostOnline && pushEntry?.status === "ready";
 
   return (
@@ -621,4 +633,4 @@ export function NotificationsSection() {
       )}
     </div>
   );
-}
+});

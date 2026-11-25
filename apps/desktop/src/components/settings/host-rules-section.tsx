@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   BookOpen,
@@ -478,17 +478,21 @@ function RuleEditorModal({
   );
 }
 
-export function HostRulesSection({ hostId, cwd: activeCwd }: { hostId: string; cwd: string }) {
-  const pathRulesByScope = useOrbitSelector((s) => s.pathRulesByScope);
+export const HostRulesSection = memo(function HostRulesSection({
+  hostId,
+  cwd: activeCwd,
+}: {
+  hostId: string;
+  cwd: string;
+}) {
+  const scopeKey = `${hostId}::${activeCwd}`;
+  const snapshot = useOrbitSelector((s) => s.pathRulesByScope[scopeKey] ?? null);
   const refreshSeqRef = useRef(0);
   const [loading, setLoading] = useState(false);
   const [togglingIds, setTogglingIds] = useState<Set<string>>(() => new Set());
   const [modalState, setModalState] = useState<
     { open: false } | { open: true; editing: PathScopedRule | null }
   >({ open: false });
-
-  const scopeKey = `${hostId}::${activeCwd}`;
-  const snapshot = pathRulesByScope[scopeKey] ?? null;
 
   const refresh = useCallback(async () => {
     const seq = refreshSeqRef.current + 1;
@@ -740,4 +744,4 @@ export function HostRulesSection({ hostId, cwd: activeCwd }: { hostId: string; c
       )}
     </div>
   );
-}
+});

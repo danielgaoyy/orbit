@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useMemo, useState } from "react";
+import { memo, type ReactNode, useEffect, useMemo, useState } from "react";
 import { Check, ChevronRight, Loader2, Plus, RefreshCw, ShieldCheck, X } from "lucide-react";
 import {
   SettingCard,
@@ -8,6 +8,7 @@ import {
   SettingSelect,
   type SettingSelectOption,
   ToggleSwitch,
+  useHostIsOnline,
 } from "@/components/settings/settings-primitives";
 import { PermissionRulesPanel } from "@/components/settings/permission-rules-panel";
 import { HostSandboxAndAuditPanel } from "@/components/settings/host-security-ops-panels";
@@ -225,7 +226,11 @@ const AUTONOMY_MODES = [
   ["full_access", "composer.modeFullAccess", "composer.modeFullAccessShortDesc"],
 ] as const;
 
-export function HostGuardianSection({ hostId }: { hostId: string | null }) {
+export const HostGuardianSection = memo(function HostGuardianSection({
+  hostId,
+}: {
+  hostId: string | null;
+}) {
   const { t } = useI18n();
   const draftMode = useOrbitSelector((s) => s.draftMode);
   return (
@@ -279,15 +284,12 @@ export function HostGuardianSection({ hostId }: { hostId: string | null }) {
       )}
     </div>
   );
-}
+});
 
-function GuardianPolicies({ hostId }: { hostId: string }) {
+const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: string }) {
   const { t } = useI18n();
-  const hostCard = useOrbitSelector((s) => s.fleet.hosts.find((h) => h.host_id === hostId) ?? null);
+  const isOnline = useHostIsOnline(hostId);
   const entry = useOrbitSelector((s) => s.guardianByHost[hostId] ?? null);
-
-  const isOnline =
-    hostCard?.connection_state === "online_direct" || hostCard?.connection_state === "online_relay";
 
   useEffect(() => {
     if (isOnline && hostId) {
@@ -691,4 +693,4 @@ function GuardianPolicies({ hostId }: { hostId: string }) {
       </SafetyDisclosure>
     </div>
   );
-}
+});

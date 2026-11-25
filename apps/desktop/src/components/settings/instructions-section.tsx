@@ -1,6 +1,8 @@
 import {
+  memo,
   type Ref,
   useCallback,
+  useDeferredValue,
   useEffect,
   useImperativeHandle,
   useLayoutEffect,
@@ -148,7 +150,9 @@ export interface InstructionsGuard {
   beforeChange: (action: () => void) => void;
 }
 
-export function InstructionsSection({
+const utf8Encoder = new TextEncoder();
+
+export const InstructionsSection = memo(function InstructionsSection({
   hostId: activeHostId, cwd: activeCwd, headerActions, ref,
 }: {
   hostId: string | null;
@@ -157,15 +161,20 @@ export function InstructionsSection({
   ref: Ref<InstructionsGuard>;
 }) {
   const { t } = useI18n();
-  const host = useOrbitSelector((s) => s.fleet.hosts.find((item) => item.host_id === activeHostId));
+  const isLocalHost = useOrbitSelector((s) => {
+    const item = s.fleet.hosts.find((h) => h.host_id === activeHostId);
+    return Boolean(item && isLocalHostCard(item));
+  });
   const editors = useOrbitSelector((s) => s.externalEditors);
   const preferredEditor = useOrbitSelector((s) => s.preferredEditor);
   const activeView = useOrbitSelector((s) => s.activeView);
   const commandPaletteOpen = useOrbitSelector((s) => s.commandPaletteOpen);
-  const installedEditors = editors.filter((editor) =>
-    editor.installed && editor.kind !== "terminal" && editor.kind !== "file_manager",
-  );
-  const editor = installedEditors.find((item) => item.kind === preferredEditor) ?? installedEditors[0];
+  const editor = useMemo(() => {
+    const installed = editors.filter(
+      (item) => item.installed && item.kind !== "terminal" && item.kind !== "file_manager",
+    );
+    return installed.find((item) => item.kind === preferredEditor) ?? installed[0];
+  }, [editors, preferredEditor]);
   const ime = useImeCompositionGuard();
   const mod = modSymbol();
 
@@ -542,26 +551,30 @@ export function InstructionsSection({
     return [...workspaceTargets, ...globalTargets];
   }, [snapshot]);
 
-  const liveWireContent = useMemo(
-    () =>
-      loadedLineEnding === "crlf" ? draftContent.replace(/\r?\n/g, "\r\n") : draftContent,
-    [draftContent, loadedLineEnding],
+  const deferredDraftContent = useDeferredValue(draftContent);
+  const liveDraftTokens = useMemo(
+    () => estimateTokensClient(deferredDraftContent),
+    [deferredDraftContent],
   );
-  const liveDraftTokens = useMemo(() => estimateTokensClient(draftContent), [draftContent]);
   const liveLineCount = useMemo(
-    () => (draftContent.length === 0 ? 0 : draftContent.split("\n").length),
-    [draftContent],
+    () => (deferredDraftContent.length === 0 ? 0 : deferredDraftContent.split("\n").length),
+    [deferredDraftContent],
   );
   const liveByteSize = useMemo(
-    () => new TextEncoder().encode(liveWireContent).length,
-    [liveWireContent],
+    () =>
+      utf8Encoder.encode(
+        loadedLineEnding === "crlf"
+          ? deferredDraftContent.replace(/\r?\n/g, "\r\n")
+          : deferredDraftContent,
+      ).length,
+    [deferredDraftContent, loadedLineEnding],
   );
 
   return (
     <div data-setting-id="settings.subTabInstructions" className="flex min-h-0 min-w-0 flex-1 flex-col gap-3">
       {headerActions && createPortal(
         <div className="flex flex-wrap items-center gap-2">
-          {isTauriRuntime() && host && isLocalHostCard(host) && editor && loadedExists && selectedEntry && (
+          {isTauriRuntime() && isLocalHost && editor && loadedExists && selectedEntry && (
             <Button variant="outline" size="sm" className="text-[13px] @max-[640px]:w-[30px] @max-[640px]:px-0"
               aria-label={t("palette.openInEditor", { editor: editor.label })}
               title={t("palette.openInEditor", { editor: editor.label })}
@@ -927,4 +940,4 @@ export function InstructionsSection({
       />
     </div>
   );
-}
+});

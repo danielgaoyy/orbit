@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { Bot, Check, ChevronRight, Copy, ExternalLink, RefreshCw, Server } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -38,7 +38,9 @@ function formatHermesVersion(raw?: string | null): string {
   return trimmed.replace(/^(?:hermes\s+agent|hermes)\s+/i, "").trim() || trimmed;
 }
 
-export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionProps) {
+export const HostPersonalRouterSection = memo(function HostPersonalRouterSection({
+  hostId,
+}: HostPersonalRouterSectionProps) {
   const { t } = useI18n();
   const [status, setStatus] = useState<RouterStatusSnapshot | null>(null);
   const [fleetHosts, setFleetHosts] = useState<RouterHostCapabilities[]>([]);
@@ -77,8 +79,8 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
     fleetHosts[0]?.host_id ??
     null;
 
-  const scanFleetHosts = useCallback(async () => {
-    setDiscovering(true);
+  const scanFleetHosts = useCallback(async (options?: { silent?: boolean }) => {
+    if (!options?.silent) setDiscovering(true);
     try {
       const [hosts, primary] = await Promise.all([
         orbitIpc.discoverFleetRouterHosts(),
@@ -87,25 +89,31 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
       setFleetHosts(hosts);
       setPrimarySelection(primary);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (!options?.silent) setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setDiscovering(false);
+      if (!options?.silent) setDiscovering(false);
     }
   }, []);
 
+  const loadedHostRef = useRef<string | null>(null);
   const loadStatus = useCallback(async (targetHostId: string | null) => {
     const request = ++requestRef.current;
     setBridgeBundle(null);
     setWebhookSecretDraft("");
-    setStatus(null);
     if (!targetHostId) {
+      loadedHostRef.current = null;
+      setStatus(null);
       setLoading(false);
       return;
     }
-    setLoading(true);
+    if (loadedHostRef.current !== targetHostId) {
+      setStatus(null);
+      setLoading(true);
+    }
     try {
       const snap = await orbitIpc.getPersonalRouterStatus(targetHostId);
       if (request !== requestRef.current) return;
+      loadedHostRef.current = targetHostId;
       setStatus(snap);
       setDraft(snap.config);
     } catch (err) {
@@ -143,6 +151,7 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
     setError(null);
     try {
       const snap = await orbitIpc.configurePersonalRouter(effectiveHostId, nextCfg, true);
+      loadedHostRef.current = effectiveHostId;
       setStatus(snap);
       setDraft(snap.config);
       if (snap.router_agent?.agent_id) {
@@ -153,7 +162,7 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
         });
         setPrimarySelection(nextPrimary);
       }
-      void scanFleetHosts();
+      void scanFleetHosts({ silent: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -176,6 +185,7 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
         activate,
         webhookSecretDraft.trim() ? webhookSecretDraft.trim() : undefined,
       );
+      loadedHostRef.current = effectiveHostId;
       setStatus(snap);
       setDraft(snap.config);
       setWebhookSecretDraft("");
@@ -189,7 +199,7 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
         orbitActions.selectAgent(effectiveHostId, snap.router_agent.agent_id);
         orbitActions.closeSettings();
       }
-      void scanFleetHosts();
+      void scanFleetHosts({ silent: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -527,4 +537,4 @@ export function HostPersonalRouterSection({ hostId }: HostPersonalRouterSectionP
       )}
     </div>
   );
-}
+});

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Brain,
@@ -14,6 +14,7 @@ import {
   SettingGroupLabel,
   SettingSectionHeader,
   SettingSelect,
+  useHostIsOnline,
 } from "@/components/settings/settings-primitives";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -38,7 +39,7 @@ import {
   type ProjectMemorySearchHit,
   orbitIpc,
 } from "@/lib/orbit-ipc";
-import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { orbitActions } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 const ALL_CATEGORIES: readonly MemoryCategory[] = [
@@ -66,11 +67,183 @@ interface MemoryRowEntry {
   score: number | null;
 }
 
-export function HostMemorySection({ hostId, cwd: activeCwd }: { hostId: string; cwd: string }) {
+const MemoryEditorDialog = memo(function MemoryEditorDialog({
+  open,
+  onOpenChange,
+  hostId,
+  activeCwd,
+  editingItem,
+  categoryLabel,
+  onSaved,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  hostId: string;
+  activeCwd: string;
+  editingItem: ProjectMemoryItem | null;
+  categoryLabel: (cat: MemoryCategory) => string;
+  onSaved: () => Promise<void>;
+}) {
   const { t } = useI18n();
-  const host = useOrbitSelector((s) => s.fleet.hosts.find((h) => h.host_id === hostId) ?? null);
-  const isOnline =
-    host?.connection_state === "online_direct" || host?.connection_state === "online_relay";
+  const [draftTitle, setDraftTitle] = useState(editingItem?.title ?? "");
+  const [draftContent, setDraftContent] = useState(editingItem?.content ?? "");
+  const [draftCategory, setDraftCategory] = useState<MemoryCategory>(
+    editingItem?.category ?? "convention",
+  );
+  const [draftStatus, setDraftStatus] = useState<MemoryStatus>(
+    editingItem?.status ?? "confirmed",
+  );
+  const [draftFilePaths, setDraftFilePaths] = useState(
+    editingItem ? editingItem.file_paths.join(", ") : "",
+  );
+  const [draftTags, setDraftTags] = useState(editingItem ? editingItem.tags.join(", ") : "");
+  const [saving, setSaving] = useState(false);
+
+  const categoryOptions = useMemo(
+    () => ALL_CATEGORIES.map((cat) => ({ value: cat, label: categoryLabel(cat) })),
+    [categoryLabel],
+  );
+  const statusOptions = useMemo(
+    () => [
+      { value: "confirmed" as const, label: t("memory.statusConfirmed") },
+      { value: "hypothesis" as const, label: t("memory.statusHypothesis") },
+      { value: "needs_revalidation" as const, label: t("memory.statusNeedsRevalidation") },
+    ],
+    [t],
+  );
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeCwd || !draftTitle.trim() || !draftContent.trim()) return;
+    setSaving(true);
+    try {
+      await orbitIpc.upsertProjectMemory({
+        host_id: hostId,
+        cwd: activeCwd,
+        id: editingItem?.id ?? null,
+        title: draftTitle.trim(),
+        content: draftContent.trim(),
+        category: draftCategory,
+        status: draftStatus,
+        file_paths: splitCommaList(draftFilePaths),
+        tags: splitCommaList(draftTags),
+      });
+      onOpenChange(false);
+      orbitActions.showToast(t("memory.savedToast"));
+      await onSaved();
+    } catch (err) {
+      orbitActions.showToast(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-[520px]">
+        <DialogHeader>
+          <DialogTitle>
+            {editingItem ? t("memory.editDialogTitle") : t("memory.createDialogTitle")}
+          </DialogTitle>
+          <DialogDescription>{activeCwd}</DialogDescription>
+        </DialogHeader>
+        <form onSubmit={(e) => void handleSubmit(e)} className="flex flex-col gap-4 pt-1">
+          <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor="memory-title">{t("memory.fieldTitle")}</FieldLabel>
+              <Input
+                id="memory-title"
+                value={draftTitle}
+                onChange={(e) => setDraftTitle(e.target.value)}
+                placeholder={t("memory.fieldTitlePlaceholder")}
+                required
+              />
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="memory-content">{t("memory.fieldContent")}</FieldLabel>
+              <Textarea
+                id="memory-content"
+                rows={4}
+                value={draftContent}
+                onChange={(e) => setDraftContent(e.target.value)}
+                placeholder={t("memory.fieldContentPlaceholder")}
+                required
+              />
+            </Field>
+            <div className="grid grid-cols-2 gap-3">
+              <Field>
+                <FieldLabel>{t("memory.fieldCategory")}</FieldLabel>
+                <SettingSelect<MemoryCategory>
+                  align="start"
+                  value={draftCategory}
+                  onChange={setDraftCategory}
+                  options={categoryOptions}
+                />
+              </Field>
+              <Field>
+                <FieldLabel>{t("memory.fieldStatus")}</FieldLabel>
+                <SettingSelect<MemoryStatus>
+                  align="start"
+                  value={draftStatus}
+                  onChange={setDraftStatus}
+                  options={statusOptions}
+                />
+              </Field>
+            </div>
+            <Field>
+              <FieldLabel htmlFor="memory-files">{t("memory.fieldFiles")}</FieldLabel>
+              <Input
+                id="memory-files"
+                value={draftFilePaths}
+                onChange={(e) => setDraftFilePaths(e.target.value)}
+                placeholder="src/auth.rs, docs/spec.md"
+                className="font-mono text-[13px]"
+              />
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="memory-tags">{t("memory.fieldTags")}</FieldLabel>
+              <Input
+                id="memory-tags"
+                value={draftTags}
+                onChange={(e) => setDraftTags(e.target.value)}
+                placeholder="rust, security"
+              />
+            </Field>
+          </FieldGroup>
+          <div className="flex justify-end gap-2 pt-1">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={saving}
+              onClick={() => onOpenChange(false)}
+            >
+              {t("common.cancel")}
+            </Button>
+            <Button
+              type="submit"
+              size="sm"
+              disabled={saving || !draftTitle.trim() || !draftContent.trim()}
+            >
+              {saving && <OrbitSpinner size={12} />}
+              {t("common.save")}
+            </Button>
+          </div>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+});
+
+export const HostMemorySection = memo(function HostMemorySection({
+  hostId,
+  cwd: activeCwd,
+}: {
+  hostId: string;
+  cwd: string;
+}) {
+  const { t } = useI18n();
+  const isOnline = useHostIsOnline(hostId);
 
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<MemoryStatus | "all">("all");
@@ -81,16 +254,12 @@ export function HostMemorySection({ hostId, cwd: activeCwd }: { hostId: string; 
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ProjectMemoryItem | null>(null);
 
-  // Create / Edit Dialog state
-  const [editorOpen, setEditorOpen] = useState(false);
-  const [editingItem, setEditingItem] = useState<ProjectMemoryItem | null>(null);
-  const [draftTitle, setDraftTitle] = useState("");
-  const [draftContent, setDraftContent] = useState("");
-  const [draftCategory, setDraftCategory] = useState<MemoryCategory>("convention");
-  const [draftStatus, setDraftStatus] = useState<MemoryStatus>("confirmed");
-  const [draftFilePaths, setDraftFilePaths] = useState("");
-  const [draftTags, setDraftTags] = useState("");
-  const [saving, setSaving] = useState(false);
+  // Create / Edit Dialog target (form keystrokes live isolated inside MemoryEditorDialog)
+  const [editorState, setEditorState] = useState<{
+    open: boolean;
+    item: ProjectMemoryItem | null;
+    nonce: number;
+  }>({ open: false, item: null, nonce: 0 });
 
   const request = useRef(0);
   const loadMemories = useCallback(async () => {
@@ -143,53 +312,17 @@ export function HostMemorySection({ hostId, cwd: activeCwd }: { hostId: string; 
     };
   }, [loadMemories, searchQuery]);
 
-  const openCreateDialog = () => {
-    setEditingItem(null);
-    setDraftTitle("");
-    setDraftContent("");
-    setDraftCategory("convention");
-    setDraftStatus("confirmed");
-    setDraftFilePaths("");
-    setDraftTags("");
-    setEditorOpen(true);
-  };
+  const openCreateDialog = useCallback(() => {
+    setEditorState((prev) => ({ open: true, item: null, nonce: prev.nonce + 1 }));
+  }, []);
 
-  const openEditDialog = (item: ProjectMemoryItem) => {
-    setEditingItem(item);
-    setDraftTitle(item.title);
-    setDraftContent(item.content);
-    setDraftCategory(item.category);
-    setDraftStatus(item.status);
-    setDraftFilePaths(item.file_paths.join(", "));
-    setDraftTags(item.tags.join(", "));
-    setEditorOpen(true);
-  };
+  const openEditDialog = useCallback((item: ProjectMemoryItem) => {
+    setEditorState((prev) => ({ open: true, item, nonce: prev.nonce + 1 }));
+  }, []);
 
-  const handleSaveMemory = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!activeCwd || !draftTitle.trim() || !draftContent.trim()) return;
-    setSaving(true);
-    try {
-      await orbitIpc.upsertProjectMemory({
-        host_id: hostId,
-        cwd: activeCwd,
-        id: editingItem?.id ?? null,
-        title: draftTitle.trim(),
-        content: draftContent.trim(),
-        category: draftCategory,
-        status: draftStatus,
-        file_paths: splitCommaList(draftFilePaths),
-        tags: splitCommaList(draftTags),
-      });
-      setEditorOpen(false);
-      orbitActions.showToast(t("memory.savedToast"));
-      await loadMemories();
-    } catch (err) {
-      orbitActions.showToast(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSaving(false);
-    }
-  };
+  const handleEditorOpenChange = useCallback((open: boolean) => {
+    setEditorState((prev) => (prev.open === open ? prev : { ...prev, open }));
+  }, []);
 
   const handleConfirmMemory = useCallback(
     async (item: ProjectMemoryItem) => {
@@ -218,22 +351,25 @@ export function HostMemorySection({ hostId, cwd: activeCwd }: { hostId: string; 
     orbitActions.showToast(t("memory.deletedToast"));
   }, [activeCwd, deleteTarget, hostId, t]);
 
-  const categoryLabel = (cat: MemoryCategory): string => {
-    switch (cat) {
-      case "architecture":
-        return t("memory.catArchitecture");
-      case "convention":
-        return t("memory.catConvention");
-      case "debugging":
-        return t("memory.catDebugging");
-      case "workflow":
-        return t("memory.catWorkflow");
-      case "decision":
-        return t("memory.catDecision");
-      case "preference":
-        return t("memory.catPreference");
-    }
-  };
+  const categoryLabel = useCallback(
+    (cat: MemoryCategory): string => {
+      switch (cat) {
+        case "architecture":
+          return t("memory.catArchitecture");
+        case "convention":
+          return t("memory.catConvention");
+        case "debugging":
+          return t("memory.catDebugging");
+        case "workflow":
+          return t("memory.catWorkflow");
+        case "decision":
+          return t("memory.catDecision");
+        case "preference":
+          return t("memory.catPreference");
+      }
+    },
+    [t],
+  );
 
   const statusLabel = (st: MemoryStatus): string => {
     switch (st) {
@@ -485,107 +621,19 @@ export function HostMemorySection({ hostId, cwd: activeCwd }: { hostId: string; 
         )}
       </div>
 
-      {/* Create / Edit Project Memory Dialog */}
-      <Dialog open={editorOpen} onOpenChange={setEditorOpen}>
-        <DialogContent className="max-w-[520px]">
-          <DialogHeader>
-            <DialogTitle>
-              {editingItem ? t("memory.editDialogTitle") : t("memory.createDialogTitle")}
-            </DialogTitle>
-            <DialogDescription>{activeCwd}</DialogDescription>
-          </DialogHeader>
-          <form onSubmit={(e) => void handleSaveMemory(e)} className="flex flex-col gap-4 pt-1">
-            <FieldGroup>
-              <Field>
-                <FieldLabel htmlFor="memory-title">{t("memory.fieldTitle")}</FieldLabel>
-                <Input
-                  id="memory-title"
-                  value={draftTitle}
-                  onChange={(e) => setDraftTitle(e.target.value)}
-                  placeholder={t("memory.fieldTitlePlaceholder")}
-                  required
-                />
-              </Field>
-              <Field>
-                <FieldLabel htmlFor="memory-content">{t("memory.fieldContent")}</FieldLabel>
-                <Textarea
-                  id="memory-content"
-                  rows={4}
-                  value={draftContent}
-                  onChange={(e) => setDraftContent(e.target.value)}
-                  placeholder={t("memory.fieldContentPlaceholder")}
-                  required
-                />
-              </Field>
-              <div className="grid grid-cols-2 gap-3">
-                <Field>
-                  <FieldLabel>{t("memory.fieldCategory")}</FieldLabel>
-                  <SettingSelect<MemoryCategory>
-                    align="start"
-                    value={draftCategory}
-                    onChange={setDraftCategory}
-                    options={ALL_CATEGORIES.map((cat) => ({
-                      value: cat,
-                      label: categoryLabel(cat),
-                    }))}
-                  />
-                </Field>
-                <Field>
-                  <FieldLabel>{t("memory.fieldStatus")}</FieldLabel>
-                  <SettingSelect<MemoryStatus>
-                    align="start"
-                    value={draftStatus}
-                    onChange={setDraftStatus}
-                    options={[
-                      { value: "confirmed", label: t("memory.statusConfirmed") },
-                      { value: "hypothesis", label: t("memory.statusHypothesis") },
-                      { value: "needs_revalidation", label: t("memory.statusNeedsRevalidation") },
-                    ]}
-                  />
-                </Field>
-              </div>
-              <Field>
-                <FieldLabel htmlFor="memory-files">{t("memory.fieldFiles")}</FieldLabel>
-                <Input
-                  id="memory-files"
-                  value={draftFilePaths}
-                  onChange={(e) => setDraftFilePaths(e.target.value)}
-                  placeholder="src/auth.rs, docs/spec.md"
-                  className="font-mono text-[13px]"
-                />
-              </Field>
-              <Field>
-                <FieldLabel htmlFor="memory-tags">{t("memory.fieldTags")}</FieldLabel>
-                <Input
-                  id="memory-tags"
-                  value={draftTags}
-                  onChange={(e) => setDraftTags(e.target.value)}
-                  placeholder="rust, security"
-                />
-              </Field>
-            </FieldGroup>
-            <div className="flex justify-end gap-2 pt-1">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={saving}
-                onClick={() => setEditorOpen(false)}
-              >
-                {t("common.cancel")}
-              </Button>
-              <Button
-                type="submit"
-                size="sm"
-                disabled={saving || !draftTitle.trim() || !draftContent.trim()}
-              >
-                {saving && <OrbitSpinner size={12} />}
-                {t("common.save")}
-              </Button>
-            </div>
-          </form>
-        </DialogContent>
-      </Dialog>
+      {/* Create / Edit Project Memory Dialog (isolated form state) */}
+      {editorState.open && (
+        <MemoryEditorDialog
+          key={`${editorState.item?.id ?? "new"}:${editorState.nonce}`}
+          open={editorState.open}
+          onOpenChange={handleEditorOpenChange}
+          hostId={hostId}
+          activeCwd={activeCwd}
+          editingItem={editorState.item}
+          categoryLabel={categoryLabel}
+          onSaved={loadMemories}
+        />
+      )}
 
       <ConfirmDialog
         open={Boolean(deleteTarget)}
@@ -603,4 +651,4 @@ export function HostMemorySection({ hostId, cwd: activeCwd }: { hostId: string; 
       />
     </div>
   );
-}
+});

@@ -1,6 +1,7 @@
-import { createContext, useContext, useRef, type ReactNode } from "react";
+import { createContext, memo, useContext, useRef, type ReactNode } from "react";
 import { Dialog } from "@base-ui/react/dialog";
 import { ChevronRight, RotateCcw, X } from "lucide-react";
+import { useSettingModifiedState } from "@/components/settings/settings-preferences";
 import { Button } from "@/components/ui/button";
 import { IconButton } from "@/components/ui/icon-button";
 import { Select, type SelectOption, type SelectProps } from "@/components/ui/select";
@@ -10,10 +11,23 @@ import { t } from "@/lib/i18n";
 import { isLocalHostCard } from "@/lib/projects";
 import type { HostCardView, HostConnectionState } from "@/lib/orbit-ipc";
 import { cn } from "@/lib/utils";
+import { useOrbitSelector } from "@/state/orbit-store";
 
 export { HostStatusIndicator };
 
-export function ToggleSwitch({
+/**
+ * Subscribe strictly to a host's boolean online state rather than the volatile
+ * `HostCardView` object, avoiding re-renders on unrelated agent/fleet ticks.
+ */
+export function useHostIsOnline(hostId: string | null | undefined): boolean {
+  return useOrbitSelector((s) => {
+    if (!hostId) return false;
+    const state = s.fleet.hosts.find((h) => h.host_id === hostId)?.connection_state;
+    return state === "online_direct" || state === "online_relay";
+  });
+}
+
+export const ToggleSwitch = memo(function ToggleSwitch({
   checked,
   onChange,
   disabled = false,
@@ -36,7 +50,7 @@ export function ToggleSwitch({
       }}
     />
   );
-}
+});
 
 export type SettingSelectOption<T extends string | number> = SelectOption<T>;
 
@@ -62,7 +76,7 @@ export function SettingSelect<T extends string | number>({
   );
 }
 
-export function SettingPageHeader({
+export const SettingPageHeader = memo(function SettingPageHeader({
   title,
   description,
   badge,
@@ -107,18 +121,24 @@ export function SettingPageHeader({
       {action && <div className="flex shrink-0 items-center gap-2">{action}</div>}
     </header>
   );
-}
+});
 
 export const SettingSectionHeader = SettingPageHeader;
 
-export function SettingGroupLabel({ children, action }: { children: ReactNode; action?: ReactNode }) {
+export const SettingGroupLabel = memo(function SettingGroupLabel({
+  children,
+  action,
+}: {
+  children: ReactNode;
+  action?: ReactNode;
+}) {
   return (
     <div className="flex items-center justify-between gap-2">
       <h3 className="text-ink-muted text-[11px] font-semibold tracking-[0.05em] uppercase">{children}</h3>
       {action}
     </div>
   );
-}
+});
 
 interface SettingAnchorProps {
   settingId?: string;
@@ -126,23 +146,16 @@ interface SettingAnchorProps {
   onReset?: () => void;
 }
 
-export const ModifiedSettingsContext = createContext<{
-  modifiedIds: ReadonlySet<string>;
-  reset: (id: string) => void;
-} | null>(null);
-
 function useSettingModification({ settingId, modified, onReset }: SettingAnchorProps) {
-  const preferences = useContext(ModifiedSettingsContext);
-  const changed = modified ?? (settingId && preferences?.modifiedIds.has(settingId));
+  const tracked = useSettingModifiedState(modified === undefined ? settingId : undefined);
+  const changed = modified ?? tracked.isModified;
   return {
     changed: changed || undefined,
-    reset: changed
-      ? (onReset ?? (settingId && preferences ? () => preferences.reset(settingId) : undefined))
-      : undefined,
+    reset: changed ? (onReset ?? tracked.reset) : undefined,
   };
 }
 
-function ResetControl({ onClick }: { onClick?: () => void }) {
+const ResetControl = memo(function ResetControl({ onClick }: { onClick?: () => void }) {
   if (!onClick) return null;
   return (
     <IconButton
@@ -154,9 +167,9 @@ function ResetControl({ onClick }: { onClick?: () => void }) {
       <RotateCcw />
     </IconButton>
   );
-}
+});
 
-export function SettingGroup({
+export const SettingGroup = memo(function SettingGroup({
   title,
   action,
   children,
@@ -184,9 +197,9 @@ export function SettingGroup({
       {children}
     </section>
   );
-}
+});
 
-export function SettingCard({
+export const SettingCard = memo(function SettingCard({
   children,
   className,
   settingId,
@@ -214,9 +227,9 @@ export function SettingCard({
       {children}
     </div>
   );
-}
+});
 
-export function SettingRow({
+export const SettingRow = memo(function SettingRow({
   title,
   description,
   children,
@@ -247,7 +260,7 @@ export function SettingRow({
       <div className="max-w-full shrink-0">{children}</div>
     </div>
   );
-}
+});
 
 interface ResourceRowProps {
   title: ReactNode;
@@ -259,7 +272,7 @@ interface ResourceRowProps {
   settingId?: string;
 }
 
-export function SettingResourceRow({
+export const SettingResourceRow = memo(function SettingResourceRow({
   title,
   description,
   icon,
@@ -301,7 +314,7 @@ export function SettingResourceRow({
       {action && <div className="flex shrink-0 items-center gap-2 pr-4">{action}</div>}
     </div>
   );
-}
+});
 
 export function SettingNavRow(props: ResourceRowProps & { onClick: () => void }) {
   return <SettingResourceRow {...props} />;

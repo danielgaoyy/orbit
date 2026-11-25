@@ -121,8 +121,34 @@ export function t(key: MessageKey, params?: TranslationParams): string {
   return translate(currentLocale, key, params);
 }
 
+const TRANSLATORS: Record<
+  OrbitLocale,
+  (key: MessageKey, params?: TranslationParams) => string
+> = {
+  en: (key, params) => translate("en", key, params),
+  "zh-CN": (key, params) => translate("zh-CN", key, params),
+  ja: (key, params) => translate("ja", key, params),
+};
+
+const I18N_HANDLES: Record<
+  OrbitLocale,
+  {
+    locale: OrbitLocale;
+    setLocale: (next: OrbitLocale) => void;
+    t: (key: MessageKey, params?: TranslationParams) => string;
+  }
+> = {
+  en: { locale: "en", setLocale, t: TRANSLATORS.en },
+  "zh-CN": { locale: "zh-CN", setLocale, t: TRANSLATORS["zh-CN"] },
+  ja: { locale: "ja", setLocale, t: TRANSLATORS.ja },
+};
+
 export function useLocale(): OrbitLocale {
   return useSyncExternalStore(subscribeLocale, getLocale, () => DEFAULT_LOCALE);
+}
+
+export function getI18nHandle(locale: OrbitLocale) {
+  return I18N_HANDLES[locale] ?? I18N_HANDLES[DEFAULT_LOCALE];
 }
 
 export function useI18n(): {
@@ -131,9 +157,5 @@ export function useI18n(): {
   t: (key: MessageKey, params?: TranslationParams) => string;
 } {
   const locale = useLocale();
-  return {
-    locale,
-    setLocale,
-    t: (key: MessageKey, params?: TranslationParams) => translate(locale, key, params),
-  };
+  return getI18nHandle(locale);
 }

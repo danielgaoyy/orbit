@@ -74,11 +74,7 @@ export default function App() {
 function MainDesktopApp() {
   const isDarkTheme = useOrbitSelector((s) => s.resolvedTheme === "dark");
   const activeView = useOrbitSelector((s) => s.activeView);
-  const settingsSection = useOrbitSelector((s) => s.settingsSection);
   const workspacePanel = useOrbitSelector((s) => s.workspacePanel);
-  const toastNotice = useOrbitSelector((s) => s.toastNotice);
-  const toastAction = useOrbitSelector((s) => s.toastAction);
-  const lastArchivedUndo = useOrbitSelector((s) => s.lastArchivedUndo);
 
   // Keep the workspace DOM and its original keyboard focus through the Settings transition.
   const isSettingsOpen = activeView === "settings";
@@ -96,14 +92,6 @@ function MainDesktopApp() {
       returnFocus.current = null;
     }
   }, [isSettingsOpen, settingsMounted]);
-
-  // Presence state for smooth Toast enter & exit (monotonic revision key re-triggers enter on replacement)
-  const [renderedToast, setRenderedToast] = useState<string | null>(toastNotice);
-  const [renderedToastAction, setRenderedToastAction] = useState<ToastAction | null>(toastAction);
-  const [toastExiting, setToastExiting] = useState(false);
-  const [toastRevision, setToastRevision] = useState(0);
-  const renderedToastRef = useRef<string | null>(renderedToast);
-  renderedToastRef.current = renderedToast;
 
   useGlobalErgonomicKeybindings();
 
@@ -293,6 +281,54 @@ function MainDesktopApp() {
     }
   }, [isSettingsOpen, settingsMounted]);
 
+  return (
+    <TooltipProvider>
+      <MarkdownThemeProvider isDark={isDarkTheme}>
+        {/* Centered Floating Settings Modal (`⌘,`) with Smooth Enter/Exit */}
+        {settingsMounted && (
+          <PanelErrorBoundary
+            panelName="Settings"
+            resetKey={activeView}
+            className="fixed inset-0 z-40"
+          >
+            <SettingsView closing={settingsClosing} />
+          </PanelErrorBoundary>
+        )}
+
+        {/* Main Workspace Shell coordinated by 100% GPU WorkspaceMotionProvider */}
+        <WorkspaceMotionProvider>
+          <WorkspaceShellLayout isSettingsOpen={settingsMounted} workspacePanel={workspacePanel} />
+        </WorkspaceMotionProvider>
+
+        {/* Global Command Palette (`⌘K`), Quick Open File (`⌘P`), Export & Code Picker */}
+        <CommandPalette />
+        <QuickOpenFileDialog />
+        <RemoteFolderPickerDialog />
+        <ExportTranscriptModal />
+        <CopyCodeBlocksModal />
+        <WorktreeHandoffModal />
+        <OnboardingGuide />
+        <MediaPreviewModal />
+
+        {/* Isolated Toast & Undo Host so ephemeral toasts never re-render Settings or Workspace */}
+        <GlobalToastHost />
+      </MarkdownThemeProvider>
+    </TooltipProvider>
+  );
+}
+
+const GlobalToastHost = memo(function GlobalToastHost() {
+  const toastNotice = useOrbitSelector((s) => s.toastNotice);
+  const toastAction = useOrbitSelector((s) => s.toastAction);
+  const lastArchivedUndo = useOrbitSelector((s) => s.lastArchivedUndo);
+
+  const [renderedToast, setRenderedToast] = useState<string | null>(toastNotice);
+  const [renderedToastAction, setRenderedToastAction] = useState<ToastAction | null>(toastAction);
+  const [toastExiting, setToastExiting] = useState(false);
+  const [toastRevision, setToastRevision] = useState(0);
+  const renderedToastRef = useRef<string | null>(renderedToast);
+  renderedToastRef.current = renderedToast;
+
   useEffect(() => {
     if (!lastArchivedUndo) return;
     const onKeyDown = (e: KeyboardEvent) => {
@@ -343,47 +379,16 @@ function MainDesktopApp() {
   }, [toastNotice, toastAction]);
 
   return (
-    <TooltipProvider>
-      <MarkdownThemeProvider isDark={isDarkTheme}>
-        {/* Centered Floating Settings Modal (`⌘,`) with Smooth Enter/Exit */}
-        {settingsMounted && (
-          <PanelErrorBoundary
-            panelName="Settings"
-            resetKey={`${activeView}:${settingsSection}`}
-            className="fixed inset-0 z-40"
-          >
-            <SettingsView closing={settingsClosing} />
-          </PanelErrorBoundary>
-        )}
-
-        {/* Main Workspace Shell coordinated by 100% GPU WorkspaceMotionProvider */}
-        <WorkspaceMotionProvider>
-          <WorkspaceShellLayout isSettingsOpen={settingsMounted} workspacePanel={workspacePanel} />
-        </WorkspaceMotionProvider>
-
-        {/* Global Command Palette (`⌘K`), Quick Open File (`⌘P`), Export & Code Picker */}
-        <CommandPalette />
-        <QuickOpenFileDialog />
-        <RemoteFolderPickerDialog />
-        <ExportTranscriptModal />
-        <CopyCodeBlocksModal />
-        <WorktreeHandoffModal />
-        <OnboardingGuide />
-        <MediaPreviewModal />
-
-        {/* Restrained Ephemeral Status Toast with Smooth Enter/Exit, Actions & Undo Archive */}
-        <ToastViewport
-          key={toastRevision}
-          message={renderedToast}
-          action={renderedToastAction}
-          undoEntry={lastArchivedUndo}
-          exiting={toastExiting}
-          onUndoArchive={() => orbitActions.undoLastArchive()}
-        />
-      </MarkdownThemeProvider>
-    </TooltipProvider>
+    <ToastViewport
+      key={toastRevision}
+      message={renderedToast}
+      action={renderedToastAction}
+      undoEntry={lastArchivedUndo}
+      exiting={toastExiting}
+      onUndoArchive={() => orbitActions.undoLastArchive()}
+    />
   );
-}
+});
 
 const StableFleetSidebar = memo(function StableFleetSidebar() {
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -19,6 +19,7 @@ import {
   SettingDrawer,
   SettingResourceRow,
   ToggleSwitch,
+  useHostIsOnline,
 } from "@/components/settings/settings-primitives";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -39,14 +40,110 @@ function notifyPluginsChanged(hostId: string): void {
   }
 }
 
-export function HostPluginsSection({ hostId }: { hostId: string }) {
+const InstallPluginDrawer = memo(function InstallPluginDrawer({
+  open,
+  onOpenChange,
+  hostId,
+  isOnline,
+  onInstalled,
+  onError,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  hostId: string;
+  isOnline: boolean;
+  onInstalled: (pluginId: string) => Promise<void>;
+  onError: (msg: string | null) => void;
+}) {
   const { t } = useI18n();
-  const host = useOrbitSelector((s) => s.fleet.hosts.find((h) => h.host_id === hostId) ?? null);
+  const [sourcePath, setSourcePath] = useState("");
+  const [enableOnInstall, setEnableOnInstall] = useState(false);
+  const [installing, setInstalling] = useState(false);
+
+  const handleInstall = async () => {
+    const trimmed = sourcePath.trim();
+    if (!trimmed || installing || !isOnline) return;
+    setInstalling(true);
+    onError(null);
+    try {
+      const installed = await orbitIpc.installPlugin(hostId, trimmed, enableOnInstall);
+      setSourcePath("");
+      onOpenChange(false);
+      orbitActions.showToast(t("plugins.installedToast", { name: installed.manifest.name }));
+      await onInstalled(installed.manifest.id);
+      notifyPluginsChanged(hostId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      onError(msg);
+      orbitActions.showToast(msg);
+    } finally {
+      setInstalling(false);
+    }
+  };
+
+  return (
+    <SettingDrawer
+      open={open}
+      onOpenChange={(next) => {
+        if (!installing) onOpenChange(next);
+      }}
+      title={t("plugins.installSection")}
+    >
+      <form
+        className="flex flex-col gap-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void handleInstall();
+        }}
+      >
+        <Field>
+          <FieldLabel htmlFor="plugin-source">{t("managedSkills.pluginSource")}</FieldLabel>
+          <Input
+            id="plugin-source"
+            value={sourcePath}
+            onChange={(e) => setSourcePath(e.target.value)}
+            placeholder={t("plugins.installPlaceholder")}
+            disabled={installing || !isOnline}
+            className="font-mono text-[13px]"
+          />
+        </Field>
+        <SettingCard>
+          <SettingRow
+            title={t("plugins.enableAfterInstallTitle")}
+            description={t("plugins.enableAfterInstallDesc")}
+          >
+            <ToggleSwitch
+              checked={enableOnInstall}
+              disabled={installing || !isOnline}
+              ariaLabel={t("plugins.enableAfterInstallTitle")}
+              onChange={setEnableOnInstall}
+            />
+          </SettingRow>
+        </SettingCard>
+        <Button
+          type="submit"
+          size="sm"
+          className="self-end"
+          disabled={installing || !isOnline || !sourcePath.trim()}
+        >
+          {installing && <OrbitSpinner size={13} />}
+          {t("plugins.installButton")}
+        </Button>
+      </form>
+    </SettingDrawer>
+  );
+});
+
+export const HostPluginsSection = memo(function HostPluginsSection({
+  hostId,
+}: {
+  hostId: string;
+}) {
+  const { t } = useI18n();
+  const isOnline = useHostIsOnline(hostId);
   const selectedCwd = useOrbitSelector((s) =>
     s.selectedHostId === hostId ? s.selectedWorkspaceCwd : null,
   );
-  const isOnline =
-    host?.connection_state === "online_direct" || host?.connection_state === "online_relay";
   const effectiveCwd = selectedCwd && selectedCwd !== "~" ? selectedCwd : null;
 
   const [plugins, setPlugins] = useState<InstalledPluginView[]>([]);
@@ -55,9 +152,6 @@ export function HostPluginsSection({ hostId }: { hostId: string }) {
   const [installOpen, setInstallOpen] = useState(false);
   const [detailOpen, setDetailOpen] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [sourcePath, setSourcePath] = useState("");
-  const [enableOnInstall, setEnableOnInstall] = useState(false);
-  const [installing, setInstalling] = useState(false);
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [uninstallTarget, setUninstallTarget] = useState<InstalledPluginView | null>(null);
   const [previewPluginIds, setPreviewPluginIds] = useState<Record<string, boolean>>({});
@@ -85,28 +179,14 @@ export function HostPluginsSection({ hostId }: { hostId: string }) {
     void loadPlugins();
   }, [loadPlugins]);
 
-  const handleInstall = useCallback(async () => {
-    const trimmed = sourcePath.trim();
-    if (!trimmed) return;
-    setInstalling(true);
-    setError(null);
-    try {
-      const installed = await orbitIpc.installPlugin(hostId, trimmed, enableOnInstall);
-      setSourcePath("");
-      setInstallOpen(false);
-      setSelectedId(installed.manifest.id);
+  const handleInstalled = useCallback(
+    async (pluginId: string) => {
+      setSelectedId(pluginId);
       setDetailOpen(true);
-      orbitActions.showToast(t("plugins.installedToast", { name: installed.manifest.name }));
       await loadPlugins();
-      notifyPluginsChanged(hostId);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setError(msg);
-      orbitActions.showToast(msg);
-    } finally {
-      setInstalling(false);
-    }
-  }, [enableOnInstall, hostId, loadPlugins, sourcePath, t]);
+    },
+    [loadPlugins],
+  );
 
   const handleToggleEnabled = useCallback(
     async (plugin: InstalledPluginView, nextEnabled: boolean) => {
@@ -240,55 +320,14 @@ export function HostPluginsSection({ hostId }: { hostId: string }) {
         )}
       </SettingCard>
 
-      <SettingDrawer
+      <InstallPluginDrawer
         open={installOpen}
-        onOpenChange={(open) => {
-          if (!installing) setInstallOpen(open);
-        }}
-        title={t("plugins.installSection")}
-      >
-        <form
-          className="flex flex-col gap-4"
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (!installing && isOnline && sourcePath.trim()) void handleInstall();
-          }}
-        >
-          <Field>
-            <FieldLabel htmlFor="plugin-source">{t("managedSkills.pluginSource")}</FieldLabel>
-            <Input
-              id="plugin-source"
-              value={sourcePath}
-              onChange={(e) => setSourcePath(e.target.value)}
-              placeholder={t("plugins.installPlaceholder")}
-              disabled={installing || !isOnline}
-              className="font-mono text-[13px]"
-            />
-          </Field>
-          <SettingCard>
-            <SettingRow
-              title={t("plugins.enableAfterInstallTitle")}
-              description={t("plugins.enableAfterInstallDesc")}
-            >
-              <ToggleSwitch
-                checked={enableOnInstall}
-                disabled={installing || !isOnline}
-                ariaLabel={t("plugins.enableAfterInstallTitle")}
-                onChange={setEnableOnInstall}
-              />
-            </SettingRow>
-          </SettingCard>
-          <Button
-            type="submit"
-            size="sm"
-            className="self-end"
-            disabled={installing || !isOnline || !sourcePath.trim()}
-          >
-            {installing && <OrbitSpinner size={13} />}
-            {t("plugins.installButton")}
-          </Button>
-        </form>
-      </SettingDrawer>
+        onOpenChange={setInstallOpen}
+        hostId={hostId}
+        isOnline={isOnline}
+        onInstalled={handleInstalled}
+        onError={setError}
+      />
       {manifest && selected && (
         <SettingDrawer
           open={detailOpen}
@@ -448,4 +487,4 @@ export function HostPluginsSection({ hostId }: { hostId: string }) {
       />
     </section>
   );
-}
+});

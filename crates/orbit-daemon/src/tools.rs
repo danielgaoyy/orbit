@@ -761,8 +761,15 @@ async fn execute_tool_inner(
     args: &Value,
 ) -> anyhow::Result<Value> {
     let caller = caller_agent_id.and_then(|id| rt.store.get_agent(id).ok().flatten());
-    let target_host =
-        resolve_target_host_id(rt, args.get("host_id").and_then(|v| v.as_str())).await?;
+    let target_host = if name == "list_projects"
+        && matches!(
+            args.get("host_id").and_then(|v| v.as_str()),
+            Some("all") | Some("*")
+        ) {
+        None
+    } else {
+        resolve_target_host_id(rt, args.get("host_id").and_then(|v| v.as_str())).await?
+    };
 
     match name {
         "orbit_memory" => {
@@ -1689,6 +1696,7 @@ async fn execute_tool_inner(
                             WireMessage::PreviewWorktreeHandoff {
                                 request_id: req_id,
                                 workspace_id,
+                                source_agent_id: resolved_agent_id.clone(),
                                 direction,
                                 target_workspace_id,
                                 include_committed,
@@ -1731,6 +1739,7 @@ async fn execute_tool_inner(
                         WireMessage::ExecuteWorktreeHandoff {
                             request_id: req_id,
                             workspace_id,
+                            source_agent_id: resolved_agent_id,
                             direction,
                             mode,
                             target_workspace_id,
@@ -2277,13 +2286,25 @@ async fn execute_tool_inner(
                     "agent permission resolution only permits `allow` or `deny` (persistent `allow_always` grants require explicit human approval)"
                 );
             }
-            // Enforce 3-Tier Guardian + Personal Router Pre-Review ceiling when called by PersonalRouter
+            // Enforce 3-Tier Guardian + Personal Router Pre-Review ceiling & worker ownership when called by PersonalRouter
             if let Some(cid) = caller_agent_id
                 && rt
                     .personal_router
                     .is_authorized_global_router(cid, target_host.is_some())
                     .await
             {
+                if target_host.is_none() {
+                    let target_agent = rt.store.get_agent(&agent_id)?;
+                    if target_agent
+                        .as_ref()
+                        .and_then(|a| a.parent_agent_id.as_deref())
+                        != Some(cid)
+                    {
+                        anyhow::bail!(
+                            "Personal Router can only resolve permissions for workers it spawned (`parent_agent_id == router_id`); escalate unrelated session `{agent_id}` to the human"
+                        );
+                    }
+                }
                 let pending_assessment = if target_host.is_none() {
                     rt.orchestrator
                         .list_pending_permissions(Some(&agent_id))

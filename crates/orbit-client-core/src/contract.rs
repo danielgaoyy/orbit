@@ -408,6 +408,8 @@ fn default_include_committed_true() -> bool {
 pub struct PreviewWorktreeHandoffRequest {
     pub host_id: String,
     pub workspace_id: String,
+    #[serde(default)]
+    pub source_agent_id: Option<String>,
     pub direction: WorktreeHandoffDirection,
     #[serde(default)]
     pub target_workspace_id: Option<String>,
@@ -419,6 +421,8 @@ pub struct PreviewWorktreeHandoffRequest {
 pub struct ExecuteWorktreeHandoffRequest {
     pub host_id: String,
     pub workspace_id: String,
+    #[serde(default)]
+    pub source_agent_id: Option<String>,
     pub direction: WorktreeHandoffDirection,
     pub mode: WorktreeHandoffMode,
     #[serde(default)]

@@ -376,6 +376,7 @@ export const FileViewerTab = memo(function FileViewerTab({
     count: isCodeViewActive ? codeLineCount : 0,
     getScrollElement: () => codeViewportRef.current,
     estimateSize: () => 20,
+    useAnimationFrameWithResizeObserver: true,
     overscan: 28,
   });
 

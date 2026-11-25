@@ -314,6 +314,10 @@ pub fn claude_model_supports_fast_mode(model_id: &str) -> bool {
     false
 }
 
+fn shell_quote_claude_hook_arg(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn build_claude_launch_args(
     cfg: &SessionLaunchConfig,
     start_mode: ClaudeSessionStartMode<'_>,
@@ -360,6 +364,13 @@ fn build_claude_launch_args(
         args.push("--mcp-config".to_string());
         args.push(path.to_string_lossy().to_string());
     }
+    if cfg.mcp_spec.is_some() {
+        args.push("--allowedTools".to_string());
+        args.push(
+            "mcp__orbit__workspace_board,mcp__orbit__workspace_peers,mcp__orbit__list_hosts,mcp__orbit__list_projects,mcp__orbit__inspect_project_context,mcp__orbit__orbit_memory,mcp__orbit__orbit_plugin"
+                .to_string(),
+        );
+    }
     if let Some(ref sys_append) = cfg.system_prompt_append
         && !sys_append.trim().is_empty()
     {
@@ -368,6 +379,42 @@ fn build_claude_launch_args(
     }
     if cfg.fast_mode {
         apply_claude_settings_json(&mut args, "fastMode", Value::Bool(true));
+    }
+    if cfg
+        .extra_env
+        .get("ORBIT_PRE_TOOL_HOOK")
+        .is_some_and(|v| v == "1")
+    {
+        let mut cmd_parts = vec![shell_quote_claude_hook_arg(
+            &cfg.orbit_exe.to_string_lossy(),
+        )];
+        if let Some(home_dir) = cfg.runtime_dir.parent()
+            && !home_dir.as_os_str().is_empty()
+        {
+            cmd_parts.push("--home".to_string());
+            cmd_parts.push(shell_quote_claude_hook_arg(&home_dir.to_string_lossy()));
+        }
+        cmd_parts.push("internal-pre-tool-use".to_string());
+        cmd_parts.push("--agent-id".to_string());
+        cmd_parts.push(shell_quote_claude_hook_arg(&cfg.agent_id));
+        let hook_cmd = cmd_parts.join(" ");
+        apply_claude_settings_json(
+            &mut args,
+            "hooks",
+            json!({
+                "PreToolUse": [
+                    {
+                        "matcher": "*",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": hook_cmd
+                            }
+                        ]
+                    }
+                ]
+            }),
+        );
     }
     args
 }
@@ -669,22 +716,41 @@ fn hydrate_reattached_claude_bg_tasks(
     bg_tool_uses: &mut HashMap<String, BackgroundTaskInfo>,
 ) {
     for item in persisted {
-        let task_id = item
-            .info
+        tool_cache.insert(item.call_id.clone(), item.detail.clone());
+        let Some(ref bg_info) = item.info else {
+            continue;
+        };
+        let task_id = bg_info
             .task_id
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| item.call_id.clone());
-        tool_cache.insert(item.call_id.clone(), item.detail.clone());
         bg_tool_use_to_task.insert(item.call_id.clone(), task_id.clone());
-        bg_tool_uses.insert(item.call_id.clone(), item.info.clone());
+        bg_tool_uses.insert(item.call_id.clone(), bg_info.clone());
         bg_bash_tasks.insert(
             task_id,
-            (item.call_id.clone(), item.detail.clone(), item.info.clone()),
+            (item.call_id.clone(), item.detail.clone(), bg_info.clone()),
         );
     }
+}
+
+fn sanitize_claude_visible_text(raw: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("[ede_diagnostic]")
+            || trimmed.starts_with("[Request interrupted by user")
+            || trimmed == "Interrupted by user"
+            || trimmed == "Interrupted by user."
+        {
+            continue;
+        }
+        kept.push(line);
+    }
+    let out = kept.join("\n");
+    out.trim_matches('\n').to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1035,6 +1101,7 @@ async fn run_claude_actor(
     let mut autonomous_wakeup_turn_id: Option<String> = None;
     let mut bg_wait_turn_id: Option<String> = None;
     let mut user_interrupted = false;
+    let mut steer_interrupt_sent_for_turn = false;
     let mut declared_tasks: HashMap<String, ProviderSubagentDescriptor> = HashMap::new();
     let mut tool_use_to_task: HashMap<String, String> = HashMap::new();
     let mut bg_bash_tasks: HashMap<String, (String, ToolCallDetail, BackgroundTaskInfo)> =
@@ -1175,12 +1242,12 @@ async fn run_claude_actor(
                                     // through to dispatch the replacement turn directly.
                                 }
                                 ActiveTurnBehavior::Steer => {
-                                    // Option A: while a permission/question/plan approval is
-                                    // pending, or during a post-turn autonomous wakeup (where
-                                    // writing a mid-wakeup user frame risks off-by-one settlement
-                                    // against the wakeup's `"result"`), queue non-destructively in
-                                    // priority order instead of injecting mid-gate.
-                                    if has_pending_gates || !has_active_foreground {
+                                    if origin == PromptOrigin::Human {
+                                        // Serialize human Claude steers: instead of injecting an
+                                        // untracked `"priority":"next"` frame mid-turn (which
+                                        // triggers off-by-one `"result"` correlation across rapid
+                                        // chained steers), interrupt once and run the steer sequentially
+                                        // under its own tracked `active_turn_id` (`BUG-002`).
                                         emit_prompt_delivery(
                                             &evt_tx,
                                             &turn_id,
@@ -1189,16 +1256,44 @@ async fn run_claude_actor(
                                             blocking_tid_opt,
                                         )
                                         .await;
-                                        let queued = QueuedDriverPrompt {
+                                        pending_human_steers.push_back(QueuedDriverPrompt {
                                             turn_id,
                                             prompt,
                                             message_ids,
-                                        };
-                                        if origin == PromptOrigin::Human {
-                                            pending_human_steers.push_back(queued);
-                                        } else {
-                                            queued_prompts.push_back(queued);
+                                        });
+                                        if !has_pending_gates
+                                            && (has_active_foreground || has_active_wakeup)
+                                            && !steer_interrupt_sent_for_turn
+                                        {
+                                            steer_interrupt_sent_for_turn = true;
+                                            let rid = format!("ctrl_{ctrl_seq}");
+                                            ctrl_seq += 1;
+                                            let req = json!({
+                                                "request_id": rid,
+                                                "type": "control_request",
+                                                "request": {
+                                                    "subtype": "interrupt",
+                                                    "cancel_queued": false
+                                                }
+                                            });
+                                            let _ = shim.write_stdin_line(req.to_string()).await;
                                         }
+                                        continue;
+                                    }
+                                    if has_pending_gates {
+                                        emit_prompt_delivery(
+                                            &evt_tx,
+                                            &turn_id,
+                                            &message_ids,
+                                            AgentMessageDeliveryStatus::Queued,
+                                            blocking_tid_opt,
+                                        )
+                                        .await;
+                                        queued_prompts.push_back(QueuedDriverPrompt {
+                                            turn_id,
+                                            prompt,
+                                            message_ids,
+                                        });
                                         continue;
                                     }
                                     let blocking_tid = active_turn_id
@@ -1271,6 +1366,7 @@ async fn run_claude_actor(
                         }
 
                         bg_wait_turn_id = None;
+                        steer_interrupt_sent_for_turn = false;
                         active_turn_id = Some(turn_id.clone());
                         active_turn_message_ids = message_ids;
                         streamed_blocks.clear();
@@ -1382,6 +1478,7 @@ async fn run_claude_actor(
                             .or_else(|| queued_prompts.pop_front())
                         {
                             bg_wait_turn_id = None;
+                            steer_interrupt_sent_for_turn = false;
                             active_turn_id = Some(next_q.turn_id.clone());
                             active_turn_message_ids = next_q.message_ids;
                             streamed_blocks.clear();
@@ -2110,14 +2207,17 @@ async fn run_claude_actor(
                                                     .entry(idx)
                                                     .or_insert_with(|| ("text".into(), String::new()));
                                                 entry.1.push_str(chunk);
-                                                emitted_text_in_turn = true;
-                                                let _ = evt_tx
-                                                    .send(DriverEvent::AssistantText {
-                                                        item_id: format!("{active_msg_id}_{idx}"),
-                                                        text: entry.1.clone(),
-                                                        streaming: true,
-                                                    })
-                                                    .await;
+                                                let cleaned = sanitize_claude_visible_text(&entry.1);
+                                                if !cleaned.is_empty() {
+                                                    emitted_text_in_turn = true;
+                                                    let _ = evt_tx
+                                                        .send(DriverEvent::AssistantText {
+                                                            item_id: format!("{active_msg_id}_{idx}"),
+                                                            text: cleaned,
+                                                            streaming: true,
+                                                        })
+                                                        .await;
+                                                }
                                             }
                                         } else if dtype == "thinking_delta" {
                                             let chunk = ev
@@ -2142,16 +2242,18 @@ async fn run_claude_actor(
                                         let idx = ev.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
                                         if let Some((btype, full_txt)) = streamed_blocks.get(&idx)
                                             && btype == "text"
-                                            && !full_txt.is_empty()
                                         {
-                                            last_assistant_text = Some(full_txt.clone());
-                                            let _ = evt_tx
-                                                .send(DriverEvent::AssistantText {
-                                                    item_id: format!("{active_msg_id}_{idx}"),
-                                                    text: full_txt.clone(),
-                                                    streaming: false,
-                                                })
-                                                .await;
+                                            let cleaned = sanitize_claude_visible_text(full_txt);
+                                            if !cleaned.is_empty() {
+                                                last_assistant_text = Some(cleaned.clone());
+                                                let _ = evt_tx
+                                                    .send(DriverEvent::AssistantText {
+                                                        item_id: format!("{active_msg_id}_{idx}"),
+                                                        text: cleaned,
+                                                        streaming: false,
+                                                    })
+                                                    .await;
+                                            }
                                         }
                                     }
                                     _ => {}
@@ -2280,17 +2382,19 @@ async fn run_claude_actor(
                                         } else if btype == "text"
                                             && streamed_blocks.is_empty()
                                             && let Some(txt) = b.get("text").and_then(|v| v.as_str())
-                                            && !txt.is_empty()
                                         {
-                                            emitted_text_in_turn = true;
-                                            last_assistant_text = Some(txt.to_string());
-                                            let _ = evt_tx
-                                                .send(DriverEvent::AssistantText {
-                                                    item_id: format!("{mid}_{i}"),
-                                                    text: txt.to_string(),
-                                                    streaming: false,
-                                                })
-                                                .await;
+                                            let cleaned = sanitize_claude_visible_text(txt);
+                                            if !cleaned.is_empty() {
+                                                emitted_text_in_turn = true;
+                                                last_assistant_text = Some(cleaned.clone());
+                                                let _ = evt_tx
+                                                    .send(DriverEvent::AssistantText {
+                                                        item_id: format!("{mid}_{i}"),
+                                                        text: cleaned,
+                                                        streaming: false,
+                                                    })
+                                                    .await;
+                                            }
                                         }
                                     }
                                 }
@@ -2342,7 +2446,7 @@ async fn run_claude_actor(
                                                 Some(other) => other,
                                                 None => ToolCallDetail::Generic {
                                                     tool_name: "tool".into(),
-                                                    arguments_json: out_text,
+                                                    arguments_json: "{}".into(),
                                                 },
                                             };
                                             if keep_running_bg {
@@ -2431,6 +2535,9 @@ async fn run_claude_actor(
                             "result" => {
                                 let finished_tid = active_turn_id.take();
                                 let _finished_wakeup_tid = autonomous_wakeup_turn_id.take();
+                                let turn_interrupted_for_steer =
+                                    std::mem::take(&mut steer_interrupt_sent_for_turn);
+                                let was_user_interrupted = user_interrupted;
                                 pending_perms.clear();
                                 pending_perm_order.clear();
                                 let settled_ids = std::mem::take(&mut active_turn_message_ids);
@@ -2498,16 +2605,20 @@ async fn run_claude_actor(
                                 if !is_err
                                     && subtype == "success"
                                     && !emitted_text_in_turn
+                                    && !was_user_interrupted
+                                    && !turn_interrupted_for_steer
                                     && let Some(res_txt) = val.get("result").and_then(|v| v.as_str())
-                                    && !res_txt.trim().is_empty()
                                 {
-                                    let _ = evt_tx
-                                        .send(DriverEvent::AssistantText {
-                                            item_id: format!("slash_{}", Uuid::new_v4().simple()),
-                                            text: res_txt.to_string(),
-                                            streaming: false,
-                                        })
-                                        .await;
+                                    let cleaned = sanitize_claude_visible_text(res_txt);
+                                    if !cleaned.trim().is_empty() {
+                                        let _ = evt_tx
+                                            .send(DriverEvent::AssistantText {
+                                                item_id: format!("slash_{}", Uuid::new_v4().simple()),
+                                                text: cleaned,
+                                                streaming: false,
+                                            })
+                                            .await;
+                                    }
                                 }
 
                                 // Drain interrupted-replacement, priority human steer, or accepted
@@ -2518,6 +2629,7 @@ async fn run_claude_actor(
                                     .or_else(|| queued_prompts.pop_front())
                                 {
                                     bg_wait_turn_id = None;
+                                    steer_interrupt_sent_for_turn = false;
                                     active_turn_id = Some(next_q.turn_id.clone());
                                     active_turn_message_ids = next_q.message_ids;
                                     streamed_blocks.clear();
@@ -2571,9 +2683,15 @@ async fn run_claude_actor(
                                         None,
                                     )
                                     .await;
+                                } else if was_user_interrupted {
+                                    bg_wait_turn_id = None;
+                                    user_interrupted = false;
+                                    let _ = evt_tx
+                                        .send(DriverEvent::StatusChanged(AgentStatus::Idle))
+                                        .await;
                                 } else if is_err || subtype != "success" {
                                     bg_wait_turn_id = None;
-                                    let err_msg = val
+                                    let raw_err = val
                                         .get("result")
                                         .and_then(|v| v.as_str())
                                         .map(ToOwned::to_owned)
@@ -2585,6 +2703,12 @@ async fn run_claude_actor(
                                                 .map(ToOwned::to_owned)
                                         })
                                         .unwrap_or_else(|| format!("Claude turn failed ({subtype})"));
+                                    let cleaned_err = sanitize_claude_visible_text(&raw_err);
+                                    let err_msg = if cleaned_err.is_empty() {
+                                        format!("Claude turn failed ({subtype})")
+                                    } else {
+                                        cleaned_err
+                                    };
                                     let _ = evt_tx
                                         .send(DriverEvent::StatusChanged(AgentStatus::Error {
                                             message: err_msg,
@@ -2965,7 +3089,7 @@ async fn handle_claude_control_request(
         .await;
 }
 
-fn map_claude_tool_detail(
+pub fn map_claude_tool_detail(
     name: &str,
     input: &Value,
     output_preview: Option<String>,
@@ -3059,7 +3183,7 @@ fn looks_like_claude_bg_launch(text: &str) -> bool {
 
 fn extract_claude_tool_result_text(v: &Value) -> String {
     if let Some(s) = v.as_str() {
-        return truncate_claude(s, 800);
+        return truncate_claude(&sanitize_claude_visible_text(s), 800);
     }
     if let Some(arr) = v.as_array() {
         let joined: String = arr
@@ -3067,7 +3191,7 @@ fn extract_claude_tool_result_text(v: &Value) -> String {
             .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
             .collect::<Vec<_>>()
             .join("\n");
-        return truncate_claude(&joined, 800);
+        return truncate_claude(&sanitize_claude_visible_text(&joined), 800);
     }
     String::new()
 }
@@ -4301,11 +4425,11 @@ mod tests {
                 exit_code: None,
                 output_preview: None,
             },
-            info: BackgroundTaskInfo {
+            info: Some(BackgroundTaskInfo {
                 task_id: Some("bash_task_42".into()),
                 label: Some("Run workspace tests".into()),
                 log_path: Some("/tmp/bash_42.log".into()),
-            },
+            }),
         }];
         hydrate_reattached_claude_bg_tasks(
             &persisted,
@@ -5097,6 +5221,226 @@ mod tests {
                 ("SLOW_2".into(), None),
                 ("Q2".into(), None),
                 ("Q3".into(), None),
+            ]
+        );
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[tokio::test]
+    async fn claude_human_chained_steer_x3_serializes_without_dropping_final_turn() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "o_cld_steer3_{}.sock",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
+
+        type SeenPrompts = Arc<tokio::sync::Mutex<Vec<(String, Option<String>)>>>;
+        let prompts_seen: SeenPrompts = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let prompts_bg = Arc::clone(&prompts_seen);
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+
+            let mut holding_slow = false;
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw)
+                else {
+                    continue;
+                };
+                let Ok(val) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let ty = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match ty {
+                    "user" => {
+                        let text = val
+                            .pointer("/message/content/0/text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let priority = val
+                            .get("priority")
+                            .and_then(|v| v.as_str())
+                            .map(ToOwned::to_owned);
+                        prompts_bg.lock().await.push((text.clone(), priority));
+                        if text.starts_with("SLOW_") {
+                            holding_slow = true;
+                        } else {
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "type": "result",
+                                    "subtype": "success",
+                                    "is_error": false,
+                                    "result": format!("ok:{text}")
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                    "control_request"
+                        if val.pointer("/request/subtype").and_then(|v| v.as_str())
+                            == Some("interrupt") =>
+                    {
+                        let rid = val["request_id"].clone();
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "type": "control_response",
+                                "response": { "subtype": "success", "request_id": rid }
+                            }),
+                        )
+                        .await;
+                        if holding_slow {
+                            holding_slow = false;
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "type": "result",
+                                    "subtype": "success",
+                                    "is_error": false,
+                                    "result": "interrupted"
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect");
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let (evt_tx, mut evt_rx) = mpsc::channel(128);
+        let mut cfg = sample_cfg(false);
+        cfg.agent_id = "ag_cld_steer3".into();
+        cfg.shim_socket = sock_path.clone();
+        let actor = tokio::spawn(run_claude_actor(
+            cfg,
+            "sess_cld_steer3".into(),
+            shim,
+            false,
+            false,
+            false,
+            None,
+            None,
+            cmd_rx,
+            evt_tx,
+        ));
+
+        loop {
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                    .await
+                    .expect("boot")
+                    .expect("ev"),
+                DriverEvent::StatusChanged(AgentStatus::Idle)
+            ) {
+                break;
+            }
+        }
+
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_base".into(),
+                prompt: "SLOW_BASE".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: vec!["msg_base".into()],
+            })
+            .await
+            .expect("base");
+        for (idx, (tid, prompt, mid)) in [
+            ("t_sa", "STEER_A", "msg_sa"),
+            ("t_sb", "STEER_B", "msg_sb"),
+            ("t_sc", "STEER_C_FINAL", "msg_sc"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if idx == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            cmd_tx
+                .send(DriverCommand::SendPrompt {
+                    turn_id: tid.into(),
+                    prompt: prompt.into(),
+                    behavior: ActiveTurnBehavior::Steer,
+                    origin: PromptOrigin::Human,
+                    message_ids: vec![mid.into()],
+                })
+                .await
+                .expect("steer");
+        }
+
+        let mut sc_states = Vec::new();
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("idle")
+                .expect("ev");
+            match ev {
+                DriverEvent::PromptDeliveryUpdated {
+                    message_ids,
+                    status,
+                    ..
+                } if message_ids == vec!["msg_sc".to_string()] => {
+                    sc_states.push(status);
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle)
+                    if sc_states.contains(&AgentMessageDeliveryStatus::Settled) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            sc_states,
+            vec![
+                AgentMessageDeliveryStatus::Queued,
+                AgentMessageDeliveryStatus::Dispatched,
+                AgentMessageDeliveryStatus::Settled,
+            ]
+        );
+        assert_eq!(
+            *prompts_seen.lock().await,
+            vec![
+                ("SLOW_BASE".into(), None),
+                ("STEER_A".into(), None),
+                ("STEER_B".into(), None),
+                ("STEER_C_FINAL".into(), None),
             ]
         );
 

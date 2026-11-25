@@ -350,7 +350,7 @@ export function SettingDrawer({
       <Dialog.Portal container={portalContainer ?? undefined}>
         <Dialog.Backdrop
           className={cn(
-            "settings-drawer-scrim bg-ink-primary/15 inset-0 z-50",
+            "settings-drawer-scrim pointer-events-auto bg-ink-primary/15 inset-0 z-50",
             contained ? "absolute" : "fixed",
           )}
         />
@@ -367,7 +367,7 @@ export function SettingDrawer({
             return popup;
           }}
           className={cn(
-            "settings-drawer border-border-default bg-surface-overlay text-ink-primary inset-y-0 right-0 z-50 flex w-[480px] max-w-full flex-col border-l text-[13px] outline-none",
+            "settings-drawer pointer-events-auto border-border-default bg-surface-overlay text-ink-primary inset-y-0 right-0 z-50 flex w-[480px] max-w-full flex-col border-l text-[13px] outline-none",
             contained ? "absolute shadow-xl" : "fixed",
           )}
         >

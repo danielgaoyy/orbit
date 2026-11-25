@@ -919,6 +919,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func cancelWorkflowRun(hostId: String, runId: String) throws  -> FfiWorkflowRunRecord
     
+    func cloudSyncEnableManualPassphrase(passphrase: String) throws  -> FfiCloudSyncStatus
+    
     func cloudSyncExportDeviceLinkUri() throws  -> String
     
     func cloudSyncGeneratePassphrase()  -> String
@@ -1579,6 +1581,16 @@ open func cancelWorkflowRun(hostId: String, runId: String)throws  -> FfiWorkflow
             self.uniffiCloneHandle(),
         FfiConverterString.lower(hostId),
         FfiConverterString.lower(runId),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncEnableManualPassphrase(passphrase: String)throws  -> FfiCloudSyncStatus  {
+    return try  FfiConverterTypeFfiCloudSyncStatus_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_enable_manual_passphrase(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(passphrase),uniffiCallStatus
     )
 })
 }
@@ -27293,6 +27305,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cancel_workflow_run() != 30638) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_enable_manual_passphrase() != 11631) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_export_device_link_uri() != 50707) {

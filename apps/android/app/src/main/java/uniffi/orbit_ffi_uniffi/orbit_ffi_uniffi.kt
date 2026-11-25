@@ -30,8 +30,6 @@ import java.nio.CharBuffer
 import java.nio.charset.CodingErrorAction
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ConcurrentHashMap
-import android.os.Build
-import androidx.annotation.RequiresApi
 import java.util.concurrent.atomic.AtomicBoolean
 
 // This is a helper for safely working with byte buffers returned from the Rust code.
@@ -771,6 +769,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cancel_workflow_run(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_enable_manual_passphrase(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_export_device_link_uri(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_generate_passphrase(
@@ -1250,6 +1250,8 @@ internal object UniffiLib {
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cancel_conditional_timer(`ptr`: Long,`hostId`: RustBuffer.ByValue,`timerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cancel_workflow_run(`ptr`: Long,`hostId`: RustBuffer.ByValue,`runId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_enable_manual_passphrase(`ptr`: Long,`passphrase`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_export_device_link_uri(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1863,6 +1865,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cancel_workflow_run() and 0xFFFF) != 30638) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_enable_manual_passphrase() and 0xFFFF) != 11631) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_export_device_link_uri() and 0xFFFF) != 50707) {
@@ -2636,28 +2641,28 @@ private class UniffiJnaCleanable(
 // using Android or not.
 // There are further runtime checks to chose the correct implementation
 // of the cleaner.
-
-
 private fun UniffiCleaner.Companion.create(): UniffiCleaner =
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-        AndroidSystemCleaner()
-    } else {
+    try {
+        // For safety's sake: if the library hasn't been run in android_cleaner = true
+        // mode, but is being run on Android, then we still need to think about
+        // Android API versions.
+        // So we check if java.lang.ref.Cleaner is there, and use that…
+        java.lang.Class.forName("java.lang.ref.Cleaner")
+        JavaLangRefCleaner()
+    } catch (e: ClassNotFoundException) {
+        // … otherwise, fallback to the JNA cleaner.
         UniffiJnaCleaner()
     }
 
-// The SystemCleaner, available from API Level 33.
-// Some API Level 33 OSes do not support using it, so we require API Level 34.
-@RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-private class AndroidSystemCleaner : UniffiCleaner {
-    val cleaner = android.system.SystemCleaner.cleaner()
+private class JavaLangRefCleaner : UniffiCleaner {
+    val cleaner = java.lang.ref.Cleaner.create()
 
     override fun register(value: Any, cleanUpTask: Runnable): UniffiCleaner.Cleanable =
-        AndroidSystemCleanable(cleaner.register(value, cleanUpTask))
+        JavaLangRefCleanable(cleaner.register(value, cleanUpTask))
 }
 
-@RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-private class AndroidSystemCleanable(
-    private val cleanable: java.lang.ref.Cleaner.Cleanable,
+private class JavaLangRefCleanable(
+    val cleanable: java.lang.ref.Cleaner.Cleanable
 ) : UniffiCleaner.Cleanable {
     override fun clean() = cleanable.clean()
 }
@@ -3393,6 +3398,8 @@ public interface OrbitMobileCoreInterface {
     fun `cancelConditionalTimer`(`hostId`: kotlin.String, `timerId`: kotlin.String): FfiConditionalTimerRecord
     
     fun `cancelWorkflowRun`(`hostId`: kotlin.String, `runId`: kotlin.String): FfiWorkflowRunRecord
+    
+    fun `cloudSyncEnableManualPassphrase`(`passphrase`: kotlin.String): FfiCloudSyncStatus
     
     fun `cloudSyncExportDeviceLinkUri`(): kotlin.String
     
@@ -4133,6 +4140,21 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
         
         FfiConverterString.lower(`hostId`),
         FfiConverterString.lower(`runId`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncEnableManualPassphrase`(`passphrase`: kotlin.String): FfiCloudSyncStatus {
+            return FfiConverterTypeFfiCloudSyncStatus.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_enable_manual_passphrase(
+        it,
+        
+        FfiConverterString.lower(`passphrase`),_status)
 }
     }
     )

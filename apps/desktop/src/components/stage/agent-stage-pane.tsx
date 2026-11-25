@@ -448,14 +448,27 @@ export const AgentStagePane = memo(function AgentStagePane({
               <Square className="size-[10px] fill-current" />
             </button>
           ) : (
-            <button
-              type="button"
-              disabled={!reply.trim() || sending}
-              onClick={() => void handleSend()}
-              className="bg-action-primary-bg text-action-primary-fg hover:bg-action-primary-hover inline-flex size-[24px] cursor-pointer items-center justify-center rounded-full transition-colors disabled:opacity-35"
-            >
-              <ArrowUp className="size-[13px] stroke-[2.15]" />
-            </button>
+            <div className="flex shrink-0 items-center gap-1">
+              {isTurnBusy && (
+                <button
+                  type="button"
+                  title={t("overview.stopAgent")}
+                  aria-label={t("overview.stopAgent")}
+                  onClick={() => void orbitIpc.interruptAgent(hostId, agentId)}
+                  className="bg-signal-danger-bg text-signal-danger hover:bg-signal-danger/20 inline-flex size-[24px] cursor-pointer items-center justify-center rounded-full transition-colors"
+                >
+                  <Square className="size-[10px] fill-current" />
+                </button>
+              )}
+              <button
+                type="button"
+                disabled={!reply.trim() || sending}
+                onClick={() => void handleSend()}
+                className="bg-action-primary-bg text-action-primary-fg hover:bg-action-primary-hover inline-flex size-[24px] cursor-pointer items-center justify-center rounded-full transition-colors disabled:opacity-35"
+              >
+                <ArrowUp className="size-[13px] stroke-[2.15]" />
+              </button>
+            </div>
           )}
         </div>
       </div>

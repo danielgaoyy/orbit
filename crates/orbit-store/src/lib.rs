@@ -562,6 +562,12 @@ impl OrbitStore {
 
             CREATE INDEX IF NOT EXISTS idx_agent_queued_prompts_agent
                 ON agent_queued_prompts (agent_id, sort_order);
+
+            CREATE TABLE IF NOT EXISTS composer_drafts (
+                draft_key     TEXT PRIMARY KEY,
+                draft_json    TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
             ",
         )?;
         // Non-destructive forward-compatible column migrations for pre-existing databases
@@ -1535,14 +1541,11 @@ impl OrbitStore {
                 }
             };
             let is_turn_scoped_late_finalization = match &payload {
-                TimelinePayload::AssistantMessage {
-                    item_id,
-                    streaming: false,
-                    ..
-                }
+                TimelinePayload::AssistantMessage { item_id, .. }
                 | TimelinePayload::AssistantThinking { item_id, .. } => {
                     !item_id.is_empty() && !is_legacy_shared_item_id(item_id)
                 }
+                TimelinePayload::ToolCall { call_id, .. } => !call_id.is_empty(),
                 _ => false,
             };
             if is_turn_scoped_late_finalization && boundary_seq > 0 && superseded_seqs.is_empty() {
@@ -1677,12 +1680,43 @@ impl OrbitStore {
         ))
     }
 
-    /// Returns all persisted background-task `ToolCall` entries for `agent_id` whose latest
-    /// chronological status in `timeline_events` is still `ToolCallStatus::Running`.
-    pub fn list_running_background_tool_calls(
+    /// Returns true if a `UserPrompt` with `message_id` is already persisted for `agent_id`.
+    pub fn has_user_prompt_message_id(
         &self,
         agent_id: &str,
-    ) -> Result<Vec<(String, ToolCallDetail, BackgroundTaskInfo)>, StoreError> {
+        message_id: &str,
+    ) -> Result<bool, StoreError> {
+        if message_id.trim().is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT payload_json
+             FROM timeline_events
+             WHERE agent_id = ?1
+               AND event_type = 'user_prompt'",
+        )?;
+        let mut rows = stmt.query(params![agent_id])?;
+        while let Some(row) = rows.next()? {
+            let payload_str: String = row.get(0)?;
+            if let Ok(TimelinePayload::UserPrompt {
+                message_id: existing_id,
+                ..
+            }) = serde_json::from_str::<TimelinePayload>(&payload_str)
+                && existing_id == message_id
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Returns all persisted `ToolCall` entries for `agent_id` (both foreground and background)
+    /// whose latest chronological status in `timeline_events` is still `ToolCallStatus::Running`.
+    pub fn list_open_running_tool_calls(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<(String, ToolCallDetail, Option<BackgroundTaskInfo>)>, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let mut stmt = conn.prepare(
             "SELECT seq, payload_json
@@ -1695,7 +1729,7 @@ impl OrbitStore {
             Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?))
         })?;
 
-        let mut open_by_call: HashMap<String, (u64, ToolCallDetail, BackgroundTaskInfo)> =
+        let mut open_by_call: HashMap<String, (u64, ToolCallDetail, Option<BackgroundTaskInfo>)> =
             HashMap::new();
         let mut finished_task_ids: HashSet<String> = HashSet::new();
 
@@ -1711,15 +1745,13 @@ impl OrbitStore {
                 continue;
             };
             if status == ToolCallStatus::Running {
-                if let Some(bg) = background_task {
-                    let already_finished = bg
-                        .task_id
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .is_some_and(|tid| finished_task_ids.contains(tid));
-                    if !already_finished {
-                        open_by_call.insert(call_id, (seq, detail, bg));
-                    }
+                let already_finished = background_task
+                    .as_ref()
+                    .and_then(|bg| bg.task_id.as_deref())
+                    .filter(|s| !s.is_empty())
+                    .is_some_and(|tid| finished_task_ids.contains(tid));
+                if !already_finished {
+                    open_by_call.insert(call_id, (seq, detail, background_task));
                 }
             } else {
                 open_by_call.remove(&call_id);
@@ -1729,12 +1761,14 @@ impl OrbitStore {
                     .filter(|s| !s.is_empty())
                 {
                     finished_task_ids.insert(tid.to_string());
-                    open_by_call.retain(|_, (_, _, bg)| bg.task_id.as_deref() != Some(tid));
+                    open_by_call.retain(|_, (_, _, bg)| {
+                        bg.as_ref().and_then(|b| b.task_id.as_deref()) != Some(tid)
+                    });
                 }
             }
         }
 
-        let mut out: Vec<(u64, String, ToolCallDetail, BackgroundTaskInfo)> = open_by_call
+        let mut out: Vec<(u64, String, ToolCallDetail, Option<BackgroundTaskInfo>)> = open_by_call
             .into_iter()
             .map(|(cid, (seq, det, bg))| (seq, cid, det, bg))
             .collect();
@@ -1742,6 +1776,19 @@ impl OrbitStore {
         Ok(out
             .into_iter()
             .map(|(_, cid, det, bg)| (cid, det, bg))
+            .collect())
+    }
+
+    /// Returns all persisted background-task `ToolCall` entries for `agent_id` whose latest
+    /// chronological status in `timeline_events` is still `ToolCallStatus::Running`.
+    pub fn list_running_background_tool_calls(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<(String, ToolCallDetail, BackgroundTaskInfo)>, StoreError> {
+        Ok(self
+            .list_open_running_tool_calls(agent_id)?
+            .into_iter()
+            .filter_map(|(cid, det, bg)| bg.map(|info| (cid, det, info)))
             .collect())
     }
 

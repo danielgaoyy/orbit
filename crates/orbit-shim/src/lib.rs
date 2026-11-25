@@ -390,6 +390,18 @@ fn parse_windows_tasklist_csv_match(
 
 const STDIO_RING_CAPACITY: usize = 256;
 const PTY_SNAPSHOT_BYTES: usize = 64 * 1024;
+const SHIM_SESSION_ENV_KEY: &str = "ORBIT_SHIM_SESSION_ID";
+
+fn generate_shim_session_marker() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    let mut hex = String::with_capacity(32);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ShimPidRecord {
@@ -398,6 +410,8 @@ struct ShimPidRecord {
     child_pid: Option<u32>,
     #[serde(default)]
     child_pgid: Option<u32>,
+    #[serde(default)]
+    session_marker: Option<String>,
 }
 
 /// Derive the `.pid` sidecar path corresponding to a shim `.sock` path.
@@ -410,11 +424,13 @@ fn write_pid_file(
     shim_pid: u32,
     child_pid: Option<u32>,
     child_pgid: Option<u32>,
+    session_marker: Option<&str>,
 ) {
     let rec = ShimPidRecord {
         shim_pid,
         child_pid,
         child_pgid,
+        session_marker: session_marker.map(str::to_string),
     };
     if let Ok(json) = serde_json::to_string(&rec) {
         let path = pid_file_path(socket_path);
@@ -595,25 +611,181 @@ fn is_orbit_shim_process(_pid: u32, _socket_path: &Path) -> bool {
     false
 }
 
-/// Terminate a child and its process group, returning `(reaped, exit_code)` where `reaped` is
-/// `true` only once `child.wait()` has confirmed the child actually exited.
-async fn terminate_child_process_group(child: &mut tokio::process::Child) -> (bool, Option<i32>) {
+#[cfg(unix)]
+fn collect_descendant_and_marked_pids(root_pids: &[u32], marker: Option<&str>) -> Vec<u32> {
+    let self_pid = std::process::id();
+    let needle = marker
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|m| format!("{SHIM_SESSION_ENV_KEY}={m}"));
+
+    let mut children_by_ppid: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut parent_of: HashMap<u32, u32> = HashMap::new();
+    let mut marked_pids: Vec<u32> = Vec::new();
+
+    if let Ok(out) = std::process::Command::new("ps")
+        .args(["-eo", "pid=,ppid="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        && out.status.success()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut parts = line.split_whitespace();
+            let Some(pid) = parts.next().and_then(|p| p.parse::<u32>().ok()) else {
+                continue;
+            };
+            let Some(ppid) = parts.next().and_then(|p| p.parse::<u32>().ok()) else {
+                continue;
+            };
+            if pid <= 1 || pid == self_pid {
+                continue;
+            }
+            parent_of.insert(pid, ppid);
+            children_by_ppid.entry(ppid).or_default().push(pid);
+        }
+    }
+
+    // Build self ancestor chain so a runaway match never signals our own ancestors.
+    let mut ancestors = std::collections::HashSet::new();
+    ancestors.insert(self_pid);
+    let mut cur = self_pid;
+    for _ in 0..64 {
+        let Some(&ppid) = parent_of.get(&cur) else {
+            break;
+        };
+        if ppid <= 1 || !ancestors.insert(ppid) {
+            break;
+        }
+        cur = ppid;
+    }
+
+    if let Some(ref marker_kv) = needle {
+        #[cfg(target_os = "linux")]
+        {
+            for &pid in parent_of.keys() {
+                if ancestors.contains(&pid) {
+                    continue;
+                }
+                if let Ok(raw) = std::fs::read(format!("/proc/{pid}/environ"))
+                    && raw
+                        .split(|&b| b == 0)
+                        .any(|entry| entry == marker_kv.as_bytes())
+                {
+                    marked_pids.push(pid);
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if let Ok(out) = std::process::Command::new("ps")
+                .args(["-eww", "-o", "pid=,command="])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                && out.status.success()
+            {
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                    let trimmed = line.trim_start();
+                    let Some((pid_str, rest)) = trimmed.split_once(char::is_whitespace) else {
+                        continue;
+                    };
+                    let Ok(pid) = pid_str.parse::<u32>() else {
+                        continue;
+                    };
+                    if pid <= 1 || ancestors.contains(&pid) {
+                        continue;
+                    }
+                    if rest.split_whitespace().any(|tok| tok == marker_kv.as_str()) {
+                        marked_pids.push(pid);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut targets = std::collections::HashSet::new();
+    let mut queue: VecDeque<u32> = VecDeque::new();
+    for &root in root_pids {
+        if root > 1 && !ancestors.contains(&root) && targets.insert(root) {
+            queue.push_back(root);
+        }
+    }
+    for pid in marked_pids {
+        if pid > 1 && !ancestors.contains(&pid) && targets.insert(pid) {
+            queue.push_back(pid);
+        }
+    }
+    while let Some(pid) = queue.pop_front() {
+        if let Some(kids) = children_by_ppid.get(&pid) {
+            for &kid in kids {
+                if kid > 1 && !ancestors.contains(&kid) && targets.insert(kid) {
+                    queue.push_back(kid);
+                }
+            }
+        }
+    }
+    let mut ordered: Vec<u32> = targets.into_iter().collect();
+    ordered.sort_unstable_by(|a, b| b.cmp(a));
+    ordered
+}
+
+#[cfg(unix)]
+fn signal_descendants_and_marked(root_pids: &[u32], marker: Option<&str>, signal: &str) {
+    for pid in collect_descendant_and_marked_pids(root_pids, marker) {
+        signal_pid(pid, signal);
+        signal_pid_group(pid, signal);
+    }
+}
+
+/// Terminate a child, its process group, and any backgrounded/detached descendants sharing its
+/// session marker, returning `(reaped, exit_code)` where `reaped` is `true` only once
+/// `child.wait()` has confirmed the child actually exited.
+async fn terminate_child_process_group(
+    child: &mut tokio::process::Child,
+    session_marker: Option<&str>,
+) -> (bool, Option<i32>) {
     #[cfg(unix)]
     let child_pid = child.id();
+    #[cfg(unix)]
+    let extra_targets = child_pid
+        .map(|pid| collect_descendant_and_marked_pids(&[pid], session_marker))
+        .unwrap_or_default();
     #[cfg(unix)]
     if let Some(pid) = child_pid {
         // Child was spawned with `process_group(0)` so its PGID equals its PID.
         signal_pid_group(pid, "-TERM");
+        for &target in &extra_targets {
+            signal_pid(target, "-TERM");
+            signal_pid_group(target, "-TERM");
+        }
         if let Ok(Ok(status)) = tokio::time::timeout(Duration::from_millis(150), child.wait()).await
         {
             signal_pid_group(pid, "-KILL");
+            for &target in &extra_targets {
+                signal_pid(target, "-KILL");
+                signal_pid_group(target, "-KILL");
+            }
+            if let Some(m) = session_marker {
+                signal_descendants_and_marked(&[], Some(m), "-KILL");
+            }
             return (true, status.code());
         }
         signal_pid_group(pid, "-KILL");
+        for &target in &extra_targets {
+            signal_pid(target, "-KILL");
+            signal_pid_group(target, "-KILL");
+        }
+        if let Some(m) = session_marker {
+            signal_descendants_and_marked(&[], Some(m), "-KILL");
+        }
     }
     #[cfg(windows)]
-    if let Some(pid) = child.id() {
-        kill_process_tree_async(pid).await;
+    {
+        let _ = session_marker;
+        if let Some(pid) = child.id() {
+            kill_process_tree_async(pid).await;
+        }
     }
     let _ = child.kill().await;
     match tokio::time::timeout(Duration::from_secs(1), child.wait()).await {
@@ -629,14 +801,31 @@ async fn reap_recorded_shim_pid(rec: &ShimPidRecord, socket_path: &Path) {
             return;
         }
         if !is_pid_alive(rec.shim_pid) || !is_orbit_shim_process(rec.shim_pid, socket_path) {
+            if let Some(marker) = rec.session_marker.as_deref() {
+                signal_descendants_and_marked(&[], Some(marker), "-KILL");
+            }
             return;
         }
         let safe_child_pgid = rec
             .child_pgid
             .filter(|&pgid| pgid > 1 && pgid != std::process::id() && pgid != rec.shim_pid);
+        let marker = rec.session_marker.as_deref();
+        let snapshot_roots: Vec<u32> = [rec.child_pid, Some(rec.shim_pid)]
+            .into_iter()
+            .flatten()
+            .filter(|&p| p > 1 && p != std::process::id())
+            .collect();
+        let initial_descendants = collect_descendant_and_marked_pids(&snapshot_roots, marker);
         // Give a recently signalled shim a brief grace window to exit on its own.
         for _ in 0..6 {
             if !is_pid_alive(rec.shim_pid) {
+                for pid in &initial_descendants {
+                    signal_pid(*pid, "-KILL");
+                    signal_pid_group(*pid, "-KILL");
+                }
+                if let Some(m) = marker {
+                    signal_descendants_and_marked(&[], Some(m), "-KILL");
+                }
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -644,11 +833,26 @@ async fn reap_recorded_shim_pid(rec: &ShimPidRecord, socket_path: &Path) {
         if let Some(pgid) = safe_child_pgid {
             signal_pid_group(pgid, "-TERM");
         }
+        for &pid in &initial_descendants {
+            if pid != rec.shim_pid {
+                signal_pid(pid, "-TERM");
+                signal_pid_group(pid, "-TERM");
+            }
+        }
         signal_pid(rec.shim_pid, "-TERM");
         for _ in 0..8 {
             if !is_pid_alive(rec.shim_pid) {
                 if let Some(pgid) = safe_child_pgid {
                     signal_pid_group(pgid, "-KILL");
+                }
+                for &pid in &initial_descendants {
+                    if pid != rec.shim_pid {
+                        signal_pid(pid, "-KILL");
+                        signal_pid_group(pid, "-KILL");
+                    }
+                }
+                if let Some(m) = marker {
+                    signal_descendants_and_marked(&[], Some(m), "-KILL");
                 }
                 return;
             }
@@ -656,6 +860,15 @@ async fn reap_recorded_shim_pid(rec: &ShimPidRecord, socket_path: &Path) {
         }
         if let Some(pgid) = safe_child_pgid {
             signal_pid_group(pgid, "-KILL");
+        }
+        for &pid in &initial_descendants {
+            if pid != rec.shim_pid {
+                signal_pid(pid, "-KILL");
+                signal_pid_group(pid, "-KILL");
+            }
+        }
+        if let Some(m) = marker {
+            signal_descendants_and_marked(&[], Some(m), "-KILL");
         }
         signal_pid(rec.shim_pid, "-KILL");
         for _ in 0..4 {
@@ -1224,26 +1437,33 @@ pub async fn probe_existing_shim(socket_path: &Path) -> bool {
     if !socket_path.exists() {
         return false;
     }
-    // On Windows loopback TCP, a closed port takes ~1-2s of SYN retries before WSAECONNREFUSED.
-    let timeout = if cfg!(unix) {
-        Duration::from_millis(300)
+    // On Unix give a loaded shim up to 1.5s across two attempts before giving up; on Windows
+    // loopback TCP a closed port takes ~1-2s of SYN retries before WSAECONNREFUSED.
+    let (timeout, max_attempts) = if cfg!(unix) {
+        (Duration::from_millis(750), 2)
     } else {
-        Duration::from_millis(3000)
+        (Duration::from_millis(3000), 1)
     };
-    match tokio::time::timeout(timeout, connect_shim_stream(socket_path)).await {
-        Ok(Ok(_stream)) => true,
-        Ok(Err(err))
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-            ) =>
-        {
-            let _ = std::fs::remove_file(socket_path);
-            let _ = std::fs::remove_file(pid_file_path(socket_path));
-            false
+    for attempt in 0..max_attempts {
+        match tokio::time::timeout(timeout, connect_shim_stream(socket_path)).await {
+            Ok(Ok(_stream)) => return true,
+            Ok(Err(err))
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                let _ = std::fs::remove_file(socket_path);
+                let _ = std::fs::remove_file(pid_file_path(socket_path));
+                return false;
+            }
+            _ if attempt + 1 < max_attempts => {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+            _ => return false,
         }
-        _ => false,
     }
+    false
 }
 
 /// Attempt to reconnect to an already-running `orbit shim` UDS socket (e.g. after Daemon hot-restart).
@@ -1660,7 +1880,15 @@ impl SpawnedChildGuard {
     }
 
     fn disarm(&mut self) {
-        self.child = None;
+        if let Some(mut child) = self.child.take()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            // Reap the detached child asynchronously once it exits so terminated shims
+            // never accumulate as `<defunct>` zombies under the daemon.
+            handle.spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
     }
 
     async fn kill_and_reap(&mut self) {
@@ -1686,7 +1914,7 @@ impl SpawnedChildGuard {
             }
         }
 
-        let (reaped, _) = terminate_child_process_group(child).await;
+        let (reaped, _) = terminate_child_process_group(child, None).await;
 
         // Re-read the `.pid` sidecar after terminating the shim in case it finished
         // spawning and recording its provider child right before exiting.
@@ -2108,7 +2336,14 @@ async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), S
     prepare_socket_path(socket_path)?;
     let listener = ShimListener::bind(socket_path).await?;
     let _socket_guard = SocketCleanupGuard::new(socket_path.to_path_buf());
-    write_pid_file(socket_path, std::process::id(), None, None);
+    let session_marker = generate_shim_session_marker();
+    write_pid_file(
+        socket_path,
+        std::process::id(),
+        None,
+        None,
+        Some(&session_marker),
+    );
 
     let mut cmd = Command::new(&spec.program);
     #[cfg(windows)]
@@ -2126,6 +2361,7 @@ async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), S
     cmd.args(&spec.args)
         .current_dir(&spec.cwd)
         .envs(&spec.env)
+        .env(SHIM_SESSION_ENV_KEY, &session_marker)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2146,7 +2382,13 @@ async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), S
     let child_pgid = child_pid;
     #[cfg(not(unix))]
     let child_pgid = None;
-    write_pid_file(socket_path, std::process::id(), child_pid, child_pgid);
+    write_pid_file(
+        socket_path,
+        std::process::id(),
+        child_pid,
+        child_pgid,
+        Some(&session_marker),
+    );
     let mut child_stdin = child.stdin.take().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::BrokenPipe, "missing child stdin")
     })?;
@@ -2232,7 +2474,7 @@ async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), S
                 }
             }
             _ = kill_rx.recv() => {
-                let (reaped, code) = terminate_child_process_group(&mut child).await;
+                let (reaped, code) = terminate_child_process_group(&mut child, Some(&session_marker)).await;
                 if reaped {
                     unlink_cleanup_paths(&spec.cleanup_paths);
                 }
@@ -2241,6 +2483,8 @@ async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), S
                 break;
             }
             wait_res = child.wait() => {
+                #[cfg(unix)]
+                signal_descendants_and_marked(&[], Some(&session_marker), "-TERM");
                 let code = match wait_res {
                     Ok(status) => {
                         unlink_cleanup_paths(&spec.cleanup_paths);
@@ -2308,7 +2552,14 @@ async fn run_pty_shim(
     prepare_socket_path(socket_path)?;
     let listener = ShimListener::bind(socket_path).await?;
     let _socket_guard = SocketCleanupGuard::new(socket_path.to_path_buf());
-    write_pid_file(socket_path, std::process::id(), None, None);
+    let pty_session_marker = generate_shim_session_marker();
+    write_pid_file(
+        socket_path,
+        std::process::id(),
+        None,
+        None,
+        Some(&pty_session_marker),
+    );
 
     let pty_system = NativePtySystem::default();
     let pair = pty_system
@@ -2338,6 +2589,7 @@ async fn run_pty_shim(
     for (k, v) in build_pty_env_pairs(&spec.program, &spec.env) {
         cmd.env(k, v);
     }
+    cmd.env(SHIM_SESSION_ENV_KEY, &pty_session_marker);
 
     let mut reader = pair
         .master
@@ -2359,6 +2611,7 @@ async fn run_pty_shim(
         std::process::id(),
         pty_child_pid,
         pty_child_pid,
+        Some(&pty_session_marker),
     );
     let mut child_killer = child.clone_killer();
     drop(pair.slave);
@@ -2402,14 +2655,22 @@ async fn run_pty_shim(
 
     let (kill_tx, mut kill_rx) = mpsc::channel::<()>(1);
     spawn_optional_parent_watchdog(&spec, kill_tx.clone());
+    // Decouple blocking PTY master writes from the control channel so a stalled PTY write
+    // never starves `ShimFrame::Kill` or `PtyResize`.
+    let (pty_write_tx, mut pty_write_rx) = mpsc::channel::<Vec<u8>>(256);
+    std::thread::spawn(move || {
+        while let Some(bytes) = pty_write_rx.blocking_recv() {
+            let _ = writer.write_all(&bytes);
+            let _ = writer.flush();
+        }
+    });
     let master_ctrl = master.clone();
     tokio::spawn(async move {
         while let Some(frame) = in_rx.recv().await {
             match frame {
                 ShimFrame::PtyInput { data_b64 } => {
                     if let Ok(bytes) = B64.decode(data_b64) {
-                        let _ = writer.write_all(&bytes);
-                        let _ = writer.flush();
+                        let _ = pty_write_tx.try_send(bytes);
                     }
                 }
                 ShimFrame::PtyResize { cols, rows } => {
@@ -2456,6 +2717,8 @@ async fn run_pty_shim(
             _ = kill_rx.recv() => {
                 #[cfg(unix)]
                 if let Some(pid) = pty_child_pid {
+                    let roots = [pid];
+                    signal_descendants_and_marked(&roots, Some(&pty_session_marker), "-TERM");
                     signal_pid_group(pid, "-TERM");
                 }
                 #[cfg(windows)]
@@ -2465,7 +2728,9 @@ async fn run_pty_shim(
                 let _ = child_killer.kill();
                 #[cfg(unix)]
                 if let Some(pid) = pty_child_pid {
+                    let roots = [pid];
                     signal_pid_group(pid, "-KILL");
+                    signal_descendants_and_marked(&roots, Some(&pty_session_marker), "-KILL");
                 }
                 if matches!(
                     tokio::time::timeout(Duration::from_secs(1), exit_rx.recv()).await,
@@ -3351,6 +3616,7 @@ mod tests {
             shim_pid: pid,
             child_pid: Some(pid),
             child_pgid: Some(pid),
+            session_marker: None,
         };
         reap_recorded_shim_pid(&stale_rec, &sock_path).await;
         assert!(
@@ -3862,7 +4128,13 @@ mod tests {
             .kill_on_drop(false);
         let mut provider_child = provider_cmd.spawn().expect("spawn provider");
         let provider_pid = provider_child.id().expect("provider pid");
-        write_pid_file(&sock_path, shim_pid, Some(provider_pid), Some(provider_pid));
+        write_pid_file(
+            &sock_path,
+            shim_pid,
+            Some(provider_pid),
+            Some(provider_pid),
+            None,
+        );
 
         // Give shells a moment to install their TERM traps.
         tokio::time::sleep(Duration::from_millis(40)).await;

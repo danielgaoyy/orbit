@@ -188,7 +188,15 @@ export function useImeCompositionGuard() {
   }, []);
 
   const shouldIgnoreKeyDown = useCallback((e: React.KeyboardEvent): boolean => {
-    return shouldIgnoreImeKeyDown(stateRef.current, e, performance.now());
+    const blockedByActiveIme = isImeKeyEvent(e) || stateRef.current.isComposing;
+    const ignored = shouldIgnoreImeKeyDown(stateRef.current, e, performance.now());
+    // Prevent WKWebView's synthetic post-composition Enter echo from inserting stray
+    // newlines in textareas or submitting forms across all callers uniformly (BUG-023a),
+    // without blocking Enter during active IME composition itself.
+    if (ignored && !blockedByActiveIme && e.key === "Enter") {
+      e.preventDefault();
+    }
+    return ignored;
   }, []);
 
   return {

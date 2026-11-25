@@ -1640,6 +1640,7 @@ export const ja: MessageDictionary = {
   "stage.revertFiles": "ファイルの変更を元に戻す",
   "stage.stopActiveTurn": "実行中のターンを先に停止します。",
   "stage.outline": "会話の目次",
+  "stage.earlierPromptCountOne": "以前のプロンプト 1 件",
   "stage.earlierPromptCount": "以前のプロンプト {count} 件",
   "stage.earlierPrompts": "以前のプロンプト",
   "stage.jumpToPrompt": "プロンプト {num} に移動：{preview}",

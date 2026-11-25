@@ -141,7 +141,12 @@ impl ConnectedHostsManager {
             if let Some(l) = label.filter(|s| !s.trim().is_empty()) {
                 ex.label = l;
             }
-            ex.direct_endpoints = offer.direct_endpoints;
+            ex.direct_endpoints = offer
+                .direct_endpoints
+                .into_iter()
+                .map(|ep| orbit_crypto::normalize_ws_endpoint(&ep))
+                .filter(|ep| !ep.is_empty())
+                .collect();
             ex.relay_url = offer.relay_url;
             ex.pairing_secret = offer.pairing_secret;
             if clean_ssh_alias.is_some() {
@@ -161,7 +166,12 @@ impl ConnectedHostsManager {
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or(offer.hostname),
                 daemon_pubkey_b64: offer.daemon_pubkey_b64,
-                direct_endpoints: offer.direct_endpoints,
+                direct_endpoints: offer
+                    .direct_endpoints
+                    .into_iter()
+                    .map(|ep| orbit_crypto::normalize_ws_endpoint(&ep))
+                    .filter(|ep| !ep.is_empty())
+                    .collect(),
                 relay_url: offer.relay_url,
                 pairing_secret: offer.pairing_secret,
                 ssh_alias: clean_ssh_alias,
@@ -722,14 +732,7 @@ pub(crate) async fn open_ssh_forward_tunnel(
 }
 
 fn direct_ws_to_e2ee_url(ep: &str) -> String {
-    let trimmed = ep.trim().trim_end_matches('/');
-    if let Some(prefix) = trimmed.strip_suffix("/ws") {
-        format!("{prefix}/ws/e2ee")
-    } else if trimmed.ends_with("/ws/e2ee") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/ws/e2ee")
-    }
+    orbit_crypto::normalize_e2ee_ws_endpoint(ep)
 }
 
 /// Dial an upstream peer's raw Noise_NK E2EE WebSocket stream (used by Peer-Bridged tunneling)
@@ -886,7 +889,8 @@ async fn connect_direct_peer(
         anyhow::bail!("missing pairing_secret for direct peer WebSocket authentication");
     }
 
-    let mut req = ws_url.into_client_request()?;
+    let normalized_url = orbit_crypto::normalize_ws_endpoint(ws_url);
+    let mut req = normalized_url.as_str().into_client_request()?;
     let auth_header = HeaderValue::from_str(&format!("Bearer {secret}"))
         .map_err(|e| anyhow::anyhow!("invalid pairing_secret header value: {e}"))?;
     req.headers_mut().insert(AUTHORIZATION, auth_header);

@@ -430,6 +430,7 @@ export interface PendingJumpTarget {
 export interface WorktreeHandoffDialogTarget {
   hostId: string;
   workspaceId: string;
+  sourceAgentId?: string | null;
   direction: WorktreeHandoffDirection;
   defaultMode?: WorktreeHandoffMode;
   sourceCwd?: string;

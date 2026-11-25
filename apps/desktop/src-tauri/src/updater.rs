@@ -1481,9 +1481,29 @@ pub async fn sync_local_daemon(force: bool) -> Result<LocalDaemonSyncResult, Str
         return Err("Local orbit binary is not installed".to_string());
     }
 
-    // 3. Hot-restart local daemon cleanly (all `orbit shim` sessions survive uninterrupted)
-    let out = tokio::process::Command::new(&install_path)
-        .args(["daemon", "up"])
+    // 3. Hot-restart local daemon cleanly (preserving custom ORBIT_HOME + listen addr if set; all `orbit shim` sessions survive uninterrupted)
+    let mut up_cmd = tokio::process::Command::new(&install_path);
+    if let Some(custom_home) = std::env::var_os("ORBIT_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        up_cmd.arg("--home").arg(&custom_home);
+        if let Ok(raw_addr) = std::fs::read_to_string(custom_home.join("daemon.addr"))
+            && let Ok(addr) = raw_addr.trim().parse::<std::net::SocketAddr>()
+            && addr.port() > 0
+        {
+            up_cmd
+                .arg("daemon")
+                .arg("up")
+                .arg("--listen")
+                .arg(addr.to_string());
+        } else {
+            up_cmd.args(["daemon", "up"]);
+        }
+    } else {
+        up_cmd.args(["daemon", "up"]);
+    }
+    let out = up_cmd
         .output()
         .await
         .map_err(|e| format!("Failed to run `orbit daemon up`: {e}"))?;

@@ -306,6 +306,10 @@ export interface BoardDraftSyncInput {
   currentDraft: string;
 }
 
+function normalizeBoardText(text: string): string {
+  return text.replace(/\r\n/g, "\n");
+}
+
 export function reconcileBoardDraft(input: BoardDraftSyncInput): {
   nextDraft: string;
   shouldExitEdit: boolean;
@@ -313,10 +317,13 @@ export function reconcileBoardDraft(input: BoardDraftSyncInput): {
   if (input.prevScopeKey !== input.nextScopeKey) {
     return { nextDraft: input.nextServerContent, shouldExitEdit: true };
   }
-  if (input.prevServerContent === input.nextServerContent) {
+  const prevNorm = normalizeBoardText(input.prevServerContent);
+  const nextNorm = normalizeBoardText(input.nextServerContent);
+  const curNorm = normalizeBoardText(input.currentDraft);
+  if (prevNorm === nextNorm) {
     return { nextDraft: input.currentDraft, shouldExitEdit: false };
   }
-  const wasDirty = input.currentDraft !== input.prevServerContent;
+  const wasDirty = curNorm !== prevNorm && curNorm !== nextNorm;
   return {
     nextDraft: wasDirty ? input.currentDraft : input.nextServerContent,
     shouldExitEdit: false,

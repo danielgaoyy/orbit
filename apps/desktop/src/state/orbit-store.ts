@@ -1,6 +1,7 @@
 import { preferenceDefaults } from "./preference-defaults";
 import { useCallback, useRef, useSyncExternalStore } from "react";
 import {
+  DRAFTS_STORAGE_KEY,
   createDraftPersistenceController,
   hasNonEmptyScopeDraft,
 } from "@/lib/draft-persistence";
@@ -177,7 +178,15 @@ let disposed = false;
 let initialized = false;
 let autoInitScheduled = false;
 
-const draftPersistence = createDraftPersistenceController(() => kernel.getState());
+const draftPersistence = createDraftPersistenceController(() => kernel.getState(), {
+  onPersistPayload: (json) => {
+    if (json === null) {
+      void orbitIpc.deleteComposerDraft(DRAFTS_STORAGE_KEY);
+    } else {
+      void orbitIpc.setComposerDraft(DRAFTS_STORAGE_KEY, json);
+    }
+  },
+});
 const initialDrafts = draftPersistence.hydrate(initialPrefs.archivedThreads);
 if (hmrData?.draftUpdatedAtByScope) {
   draftPersistence.restoreUpdatedAtByScope(hmrData.draftUpdatedAtByScope);

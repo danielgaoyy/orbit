@@ -151,10 +151,16 @@ impl OrbitProviderLlmBackend {
         agent_provider: Option<ProviderKind>,
         requested_model: Option<&str>,
     ) -> Result<(ProviderKind, Option<String>), String> {
+        let readiness = orbit_providers::probe_local_provider_readiness();
         let chosen =
             resolve_hardened_provider_with_availability(requested_provider, agent_provider, |p| {
                 !orbit_providers::is_provider_overridden(p)
                     && orbit_providers::find_provider_executable(p).is_some()
+                    && readiness.iter().any(|entry| {
+                        entry.kind == p
+                            && entry.auth_status
+                                == orbit_providers::ProviderAuthStatus::Authenticated
+                    })
             })?;
 
         let explicit_model = requested_model

@@ -152,7 +152,11 @@ export const ContextOccupancyPill = memo(function ContextOccupancyPill() {
 
   const fetchBreakdown = useCallback(
     async (targetHostId: string | null, targetAgentId: string | null) => {
-      if (!targetHostId || !targetAgentId) return;
+      if (!targetHostId || !targetAgentId || targetAgentId.startsWith("opt_")) {
+        setBreakdown(null);
+        setLoadFailed(false);
+        return;
+      }
       const seq = ++reqSeqRef.current;
       try {
         const next = await orbitActions.getContextOccupancy(targetHostId, targetAgentId);

@@ -1640,6 +1640,7 @@ export const en = {
   "stage.revertFiles": "Revert file changes",
   "stage.stopActiveTurn": "Active turn will be stopped first.",
   "stage.outline": "Conversation outline",
+  "stage.earlierPromptCountOne": "1 earlier prompt",
   "stage.earlierPromptCount": "{count} earlier prompts",
   "stage.earlierPrompts": "Earlier prompts",
   "stage.jumpToPrompt": "Jump to prompt {num}: {preview}",

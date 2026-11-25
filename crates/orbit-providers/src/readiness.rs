@@ -223,6 +223,34 @@ fn probe_claude_auth(
         return ProviderAuthStatus::Authenticated;
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("security")
+            .args([
+                "find-generic-password",
+                "-w",
+                "-s",
+                "Claude Code-credentials",
+            ])
+            .output()
+            && out.status.success()
+        {
+            let raw = String::from_utf8_lossy(&out.stdout);
+            if let Ok(creds) = serde_json::from_str::<Value>(raw.trim()) {
+                let has_oauth = creds.get("claudeAiOauth").is_some_and(|v| {
+                    v.get("accessToken").is_some_and(json_string_non_empty)
+                        || json_object_non_empty(v)
+                });
+                let has_direct_token = creds.get("accessToken").is_some_and(json_string_non_empty)
+                    || creds.get("refreshToken").is_some_and(json_string_non_empty)
+                    || creds.get("apiKey").is_some_and(json_string_non_empty);
+                if has_oauth || has_direct_token {
+                    return ProviderAuthStatus::Authenticated;
+                }
+            }
+        }
+    }
+
     ProviderAuthStatus::Unauthenticated
 }
 

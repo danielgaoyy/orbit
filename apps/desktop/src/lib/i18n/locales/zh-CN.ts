@@ -1616,6 +1616,7 @@ export const zhCN: MessageDictionary = {
   "stage.revertFiles": "还原文件更改",
   "stage.stopActiveTurn": "将先停止当前轮次。",
   "stage.outline": "对话大纲",
+  "stage.earlierPromptCountOne": "之前的 1 条提示词",
   "stage.earlierPromptCount": "之前的 {count} 条提示词",
   "stage.earlierPrompts": "之前的提示词",
   "stage.jumpToPrompt": "跳转到第 {num} 条提示词：{preview}",

@@ -200,6 +200,14 @@ export function selectPendingDecisions(
   for (const sa of subagents.all) {
     if (!sa.isManaged || !sa.childAgentId) continue;
     const childDetail = state.hostDetails[sa.childHostId];
+    const childAgent = childDetail?.agents.find((a) => a.agent_id === sa.childAgentId);
+    if (!childAgent || childAgent.archived_at_rfc3339) continue;
+    if (
+      (sa.status === "failed" || sa.status === "canceled") &&
+      !childAgent.is_awaiting_permission
+    ) {
+      continue;
+    }
     const pendingList = childDetail?.pending_permissions ?? [];
     for (const perm of pendingList) {
       if (perm.agent_id !== sa.childAgentId) continue;

@@ -5340,6 +5340,7 @@ impl OrbitAppCore {
 
                 // Spawn inbound listener BEFORE sending initial bootstrap RPCs so replies drain immediately.
                 let loop_core = Arc::clone(self);
+                let loop_handle = handle.clone();
                 let owned_host_id = host_id.to_string();
                 tokio::spawn(async move {
                     loop {
@@ -5377,11 +5378,35 @@ impl OrbitAppCore {
                                     host_id = %owned_host_id,
                                     conn_gen,
                                     skipped,
-                                    "Host inbound event channel lagged; reconnecting for authoritative resync"
+                                    "Host inbound event channel lagged; requesting in-place authoritative resync without dropping connection"
                                 );
-                                loop_core
-                                    .handle_unexpected_disconnect(&owned_host_id, Some(conn_gen));
-                                break;
+                                let _ = loop_handle
+                                    .send_wire(WireMessage::GetHostSyncState {
+                                        request_id: Uuid::new_v4(),
+                                    })
+                                    .await;
+                                let _ = loop_handle
+                                    .send_wire(WireMessage::ListWorkspaces {
+                                        request_id: Uuid::new_v4(),
+                                        include_archived: true,
+                                        include_background: false,
+                                    })
+                                    .await;
+                                let _ = loop_handle
+                                    .send_wire(WireMessage::ListAgents {
+                                        request_id: Uuid::new_v4(),
+                                        workspace_id: None,
+                                        include_archived: true,
+                                        include_background: false,
+                                        parent_agent_id: None,
+                                    })
+                                    .await;
+                                let _ = loop_handle
+                                    .send_wire(WireMessage::ListPendingPermissions {
+                                        request_id: Uuid::new_v4(),
+                                        agent_id: None,
+                                    })
+                                    .await;
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                                 loop_core
@@ -6066,6 +6091,9 @@ impl OrbitAppCore {
                         ));
                     }
                     state.last_created_agent_id = Some(ag_id.clone());
+                    if !matches!(agent.status, AgentStatus::AwaitingPermission { .. }) {
+                        state.pending_permissions.retain(|p| p.agent_id != ag_id);
+                    }
                     state.agents.insert(ag_id.clone(), agent);
                     auto_subscribe_agent = Some(ag_id.clone());
                     notify_fleet = true;
@@ -6226,16 +6254,14 @@ impl OrbitAppCore {
                     if agent.read_seq > 0 || pin_sync.is_some() {
                         server_pref_syncs.push((ag_id.clone(), agent.read_seq, pin_sync));
                     }
-                    let perms_pruned = if matches!(
-                        agent.status,
-                        AgentStatus::Idle | AgentStatus::Closed | AgentStatus::Error { .. }
-                    ) {
-                        let before = state.pending_permissions.len();
-                        state.pending_permissions.retain(|p| p.agent_id != ag_id);
-                        state.pending_permissions.len() != before
-                    } else {
-                        false
-                    };
+                    let perms_pruned =
+                        if !matches!(agent.status, AgentStatus::AwaitingPermission { .. }) {
+                            let before = state.pending_permissions.len();
+                            state.pending_permissions.retain(|p| p.agent_id != ag_id);
+                            state.pending_permissions.len() != before
+                        } else {
+                            false
+                        };
                     state.agents.insert(ag_id.clone(), agent);
                     if !stage_fields_unchanged || unread_badge_changed || perms_pruned {
                         notify_fleet = true;
@@ -6251,6 +6277,7 @@ impl OrbitAppCore {
                         .get(&agent_id)
                         .and_then(|a| a.parent_agent_id.clone());
                     state.agents.remove(&agent_id);
+                    state.pending_permissions.retain(|p| p.agent_id != agent_id);
                     state.cancelled_optimistic_agents.remove(&agent_id);
                     state.timelines.remove(&agent_id);
                     state.full_outline_prompts.remove(&agent_id);
@@ -14542,7 +14569,7 @@ impl OrbitAppCore {
         Some(resolved_slot)
     }
 
-    pub fn kill_terminal(&self, host_id: &str, terminal_id: &str) {
+    pub fn kill_terminal(self: &Arc<Self>, host_id: &str, terminal_id: &str) {
         let _ = self.store.delete_terminal(terminal_id);
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
@@ -14574,7 +14601,7 @@ impl OrbitAppCore {
                 });
             }
         }
-        self.dispatch_wire(
+        self.dispatch_wire_queued(
             host_id,
             WireMessage::KillTerminal {
                 request_id: Uuid::new_v4(),
@@ -15441,6 +15468,7 @@ impl OrbitAppCore {
                 .send_wire(WireMessage::PreviewWorktreeHandoff {
                     request_id: req_id,
                     workspace_id: req.workspace_id,
+                    source_agent_id: req.source_agent_id,
                     direction: req.direction,
                     target_workspace_id: req.target_workspace_id,
                     include_committed: req.include_committed,
@@ -15527,6 +15555,7 @@ impl OrbitAppCore {
                 .send_wire(WireMessage::ExecuteWorktreeHandoff {
                     request_id: req_id,
                     workspace_id: req.workspace_id,
+                    source_agent_id: req.source_agent_id,
                     direction: req.direction,
                     mode: req.mode,
                     target_workspace_id: req.target_workspace_id,
@@ -20318,6 +20347,27 @@ impl OrbitAppCore {
             .map_err(|_| "usage insights task cancelled".to_string())?
     }
 
+    /// Persist a per-conversation composer draft in SQLite (`composer_drafts`).
+    pub fn set_composer_draft(&self, draft_key: &str, draft_json: &str) -> Result<(), String> {
+        self.store
+            .set_composer_draft(draft_key, draft_json, unix_ms_now() as i64)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Load a previously persisted composer draft from SQLite (`composer_drafts`).
+    pub fn get_composer_draft(&self, draft_key: &str) -> Result<Option<String>, String> {
+        self.store
+            .get_composer_draft(draft_key)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Delete a persisted composer draft from SQLite (`composer_drafts`).
+    pub fn delete_composer_draft(&self, draft_key: &str) -> Result<(), String> {
+        self.store
+            .delete_composer_draft(draft_key)
+            .map_err(|e| e.to_string())
+    }
+
     /// Fetch live context-window occupancy breakdown for an agent on any connected host.
     pub async fn get_context_occupancy_on_host(
         self: &Arc<Self>,
@@ -20326,6 +20376,16 @@ impl OrbitAppCore {
     ) -> Result<ContextOccupancyBreakdown, String> {
         let host_id = host_id.to_string();
         let agent_id = agent_id.to_string();
+        if agent_id.starts_with("opt_") {
+            return Ok(ContextOccupancyBreakdown {
+                agent_id,
+                model: String::new(),
+                context_window_tokens: 0,
+                total_used_tokens: 0,
+                occupancy_percent: 0.0,
+                segments: Vec::new(),
+            });
+        }
         let session = {
             let guard = self
                 .hosts

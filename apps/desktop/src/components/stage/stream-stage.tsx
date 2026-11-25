@@ -70,6 +70,7 @@ import {
   SCROLL_FAST_LEADING_PX,
   SCROLL_LEADING_PX,
   SCROLL_TRAILING_PX,
+  STAGE_JUMP_LATEST_THRESHOLD_PX,
   type ScrollVelocityState,
   type StageScrollUiStore,
   type StageTimingHistory,
@@ -729,6 +730,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
       : 0,
     overscan: 0,
     useScrollendEvent: true,
+    useAnimationFrameWithResizeObserver: true,
     directDomUpdates: true,
   });
 
@@ -1414,6 +1416,21 @@ export function StreamStage() {
     [capturePrependPosition],
   );
 
+  const snapScrollerToBottom = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    lastObservedScrollTopRef.current = el.scrollTop;
+  }, []);
+
+  const canAutoFollow = useCallback((turnAppended = false) => {
+    const now = performance.now();
+    return stickToBottomRef.current && !programmaticScrollRef.current &&
+      !loadingEarlierTurnsRef.current && !holdActiveRef.current && !restoringPrependRef.current &&
+      (isLatestTurnActiveRef.current || now < sessionEntryLockUntilRef.current ||
+       now < turnSettleUntilRef.current || turnAppended);
+  }, []);
+
   const syncScrollMetrics = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -1441,7 +1458,7 @@ export function StreamStage() {
         programmaticScrollTimerRef.current = null;
       }
     }
-    const state = computeStageScrollState({
+    const rawState = computeStageScrollState({
       currentTop,
       previousTop: clampedAtBottomByViewportGrow ? currentTop : prevTop,
       distanceFromBottom,
@@ -1450,6 +1467,29 @@ export function StreamStage() {
       isShellLayoutMoving: isShellLayoutMovingRef.current,
       hasTurns,
     });
+    // If the session is idle (auto-follow inactive) and layout/virtualizer/dock growth pushed
+    // the viewport past the jump threshold while stickToBottom remained true, detach so the
+    // Scroll-to-latest button and bottom occlusion affordance surface reliably.
+    const idleDiverged =
+      rawState.stickToBottom &&
+      hasTurns &&
+      !programmatic &&
+      !holdActiveRef.current &&
+      !restoringPrependRef.current &&
+      !isShellLayoutMovingRef.current &&
+      distanceFromBottom > STAGE_JUMP_LATEST_THRESHOLD_PX &&
+      !canAutoFollow();
+    const state = idleDiverged
+      ? computeStageScrollState({
+          currentTop,
+          previousTop: clampedAtBottomByViewportGrow ? currentTop : prevTop,
+          distanceFromBottom,
+          stickToBottom: false,
+          holdActive: false,
+          isShellLayoutMoving: false,
+          hasTurns,
+        })
+      : rawState;
     stickToBottomRef.current = state.stickToBottom;
 
     if (
@@ -1501,22 +1541,7 @@ export function StreamStage() {
       showJumpLatest: !programmatic && state.showJumpLatest,
       activePromptSeq: nextActiveSeq,
     });
-  }, [scrollUiStore, triggerLoadEarlierTurns, capturePrependPosition]);
-
-  const snapScrollerToBottom = useCallback(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    el.scrollTop = el.scrollHeight;
-    lastObservedScrollTopRef.current = el.scrollTop;
-  }, []);
-
-  const canAutoFollow = useCallback((turnAppended = false) => {
-    const now = performance.now();
-    return stickToBottomRef.current && !programmaticScrollRef.current &&
-      !loadingEarlierTurnsRef.current && !holdActiveRef.current && !restoringPrependRef.current &&
-      (isLatestTurnActiveRef.current || now < sessionEntryLockUntilRef.current ||
-       now < turnSettleUntilRef.current || turnAppended);
-  }, []);
+  }, [canAutoFollow, scrollUiStore, triggerLoadEarlierTurns, capturePrependPosition]);
 
   const scheduleBottomSync = useCallback(() => {
     if (bottomSyncRafRef.current !== null) return;
@@ -1602,47 +1627,51 @@ export function StreamStage() {
 
     let lastScrollHeight = scrollerEl.scrollHeight;
     let lastClientHeight = scrollerEl.clientHeight;
+    let rafId: number | null = null;
 
     const ro = new ResizeObserver(() => {
-      const sh = scrollerEl.scrollHeight;
-      const ch = scrollerEl.clientHeight;
-      const clientShrankBy = lastClientHeight - ch;
-      const heightChanged = sh !== lastScrollHeight || ch !== lastClientHeight;
-      lastScrollHeight = sh;
-      lastClientHeight = ch;
+      if (rafId !== null) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = null;
+        const sh = scrollerEl.scrollHeight;
+        const ch = scrollerEl.clientHeight;
+        const clientShrankBy = lastClientHeight - ch;
+        const heightChanged = sh !== lastScrollHeight || ch !== lastClientHeight;
+        lastScrollHeight = sh;
+        lastClientHeight = ch;
 
-      if (heightChanged) {
-        if (canAutoFollow()) {
-          const targetTop = Math.max(0, sh - ch);
-          if (Math.abs(scrollerEl.scrollTop - targetTop) > 0.5) {
-            scrollerEl.scrollTop = targetTop;
+        if (heightChanged) {
+          if (canAutoFollow()) {
+            snapScrollerToBottom();
+            // Coalesce state sync onto the single scroll rAF instead of running both
+            // `bottomSyncRafRef` and `scrollRafRef` on every streaming frame.
+            handleScroll();
+          } else if (
+            clientShrankBy > 0.5 &&
+            stickToBottomRef.current &&
+            !programmaticScrollRef.current &&
+            !holdActiveRef.current &&
+            !restoringPrependRef.current
+          ) {
+            // Bottom dock/shelf grew (e.g. expanding ComposerPlanShelf or multi-line composer);
+            // keep the bottom line visible right above it even when the session is idle.
+            scrollerEl.scrollTop += clientShrankBy;
             lastObservedScrollTopRef.current = scrollerEl.scrollTop;
+            handleScroll();
+          } else {
+            scheduleBottomSync();
           }
-          // Coalesce state sync onto the single scroll rAF instead of running both
-          // `bottomSyncRafRef` and `scrollRafRef` on every streaming frame.
-          handleScroll();
-        } else if (
-          clientShrankBy > 0.5 &&
-          stickToBottomRef.current &&
-          !programmaticScrollRef.current &&
-          !holdActiveRef.current &&
-          !restoringPrependRef.current
-        ) {
-          // Bottom dock/shelf grew (e.g. expanding ComposerPlanShelf or multi-line composer);
-          // keep the bottom line visible right above it even when the session is idle.
-          scrollerEl.scrollTop += clientShrankBy;
-          lastObservedScrollTopRef.current = scrollerEl.scrollTop;
-          handleScroll();
         } else {
-          scheduleBottomSync();
+          handleScroll();
         }
-      } else {
-        handleScroll();
-      }
+      });
     });
     ro.observe(contentEl);
     ro.observe(scrollerEl);
-    return () => ro.disconnect();
+    return () => {
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
+      ro.disconnect();
+    };
   }, [
     isDraft,
     selectedHostId,
@@ -1710,9 +1739,21 @@ export function StreamStage() {
 
   const jumpToPromptSeq = useCallback(
     (seq: number) => {
+      const markProgrammaticJump = () => {
+        programmaticScrollRef.current = true;
+        if (programmaticScrollTimerRef.current !== null) {
+          window.clearTimeout(programmaticScrollTimerRef.current);
+        }
+        programmaticScrollTimerRef.current = window.setTimeout(() => {
+          programmaticScrollTimerRef.current = null;
+          programmaticScrollRef.current = false;
+        }, 700);
+      };
+
       const loaded = loadedOutlineAnchorsRef.current.find((p) => p.seq === seq);
       if (loaded) {
         interruptFollow();
+        markProgrammaticJump();
         scrollUiStore.update({ activePromptSeq: seq });
         jumpToTurnRef.current?.({ index: loaded.turnIndex, align: "start", behavior: "smooth" });
         return;
@@ -1742,9 +1783,11 @@ export function StreamStage() {
           }
           if (finalMatch.index >= 0) {
             const idx = finalMatch.index;
+            markProgrammaticJump();
             jumpToTurnRef.current?.({ index: idx, align: "start", behavior: "auto" });
             window.requestAnimationFrame(() => {
               if (outlineJumpReqIdRef.current !== reqId) return;
+              markProgrammaticJump();
               jumpToTurnRef.current?.({ index: idx, align: "start", behavior: "auto" });
               syncScrollMetrics();
             });

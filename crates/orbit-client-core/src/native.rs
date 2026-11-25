@@ -434,7 +434,8 @@ pub fn build_authenticated_ws_request(
             "missing pairing_secret for direct WebSocket authentication".into(),
         ));
     }
-    let mut req = ws_url.into_client_request()?;
+    let normalized_url = orbit_crypto::normalize_ws_endpoint(ws_url);
+    let mut req = normalized_url.as_str().into_client_request()?;
     let header_val = HeaderValue::from_str(&format!("Bearer {secret}")).map_err(|e| {
         ClientCoreError::Unauthorized(format!("invalid pairing_secret header: {e}"))
     })?;
@@ -532,7 +533,7 @@ async fn connect_direct_with_host_id(
     }
 
     let (out_tx, mut out_rx) = mpsc::channel::<OutboundPayload>(256);
-    let (events_tx, _) = broadcast::channel::<ClientInboundEvent>(512);
+    let (events_tx, _) = broadcast::channel::<ClientInboundEvent>(4096);
 
     // 10s WebSocket Ping keepalive so SSH tunnels & NAT routers never drop idle sessions
     let ping_tx = out_tx.clone();
@@ -1015,7 +1016,7 @@ async fn complete_e2ee_session_tasks(
     }
 
     let (out_tx, mut out_rx) = mpsc::channel::<OutboundPayload>(256);
-    let (events_tx, _) = broadcast::channel::<ClientInboundEvent>(512);
+    let (events_tx, _) = broadcast::channel::<ClientInboundEvent>(4096);
 
     let ping_tx = out_tx.clone();
     tokio::spawn(async move {
@@ -1219,10 +1220,11 @@ async fn try_connect_direct_endpoints(
     }
     raw_endpoints.extend(profile.direct_endpoints.iter().cloned());
 
-    // Deduplicate while preserving order
+    // Deduplicate (and normalize bare `host:port` endpoints) while preserving order
     let mut endpoints: Vec<String> = Vec::with_capacity(raw_endpoints.len());
-    for ep in raw_endpoints {
-        if !endpoints.contains(&ep) {
+    for raw_ep in raw_endpoints {
+        let ep = orbit_crypto::normalize_ws_endpoint(&raw_ep);
+        if !ep.is_empty() && !endpoints.contains(&ep) {
             endpoints.push(ep);
         }
     }

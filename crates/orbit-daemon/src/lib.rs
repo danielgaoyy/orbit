@@ -173,6 +173,9 @@ fn is_valid_pairing_secret(raw: &str) -> bool {
 }
 
 pub const DAEMON_ADDR_FILENAME: &str = "daemon.addr";
+pub const DAEMON_LOCK_FILENAME: &str = "daemon.lock";
+pub const DAEMON_PID_FILENAME: &str = "daemon.pid";
+pub const DAEMON_RELAY_FILENAME: &str = "daemon.relay";
 
 #[cfg(unix)]
 fn enforce_unix_permissions(path: &Path, mode: u32) -> std::io::Result<()> {
@@ -1124,6 +1127,7 @@ impl DaemonRuntime {
                     cfg.relay_url = normalized.clone()
                 })?;
             }
+            write_live_relay_file(&self.home_dir, normalized.as_deref());
 
             let mut task_guard = self.relay_task.lock().await;
             let current = self.relay_url.read().await.clone();
@@ -1158,6 +1162,81 @@ impl DaemonRuntime {
         if let Some(handle) = self.relay_task.lock().await.take() {
             handle.abort();
         }
+        write_live_relay_file(&self.home_dir, None);
+    }
+}
+
+fn write_live_relay_file(home_dir: &Path, relay_url: Option<&str>) {
+    let relay_file = home_dir.join(DAEMON_RELAY_FILENAME);
+    match relay_url.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(url) => {
+            if std::fs::write(&relay_file, format!("{url}\n")).is_ok() {
+                #[cfg(unix)]
+                let _ = enforce_unix_permissions(&relay_file, 0o600);
+            }
+        }
+        None => {
+            let _ = std::fs::remove_file(&relay_file);
+        }
+    }
+}
+
+/// Read the active live Relay URL from `$ORBIT_HOME/daemon.relay` (covers foreground `--relay` flags).
+pub fn read_live_daemon_relay(home_dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(home_dir.join(DAEMON_RELAY_FILENAME)).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+struct DaemonInstanceLockGuard {
+    _file: std::fs::File,
+    home_dir: PathBuf,
+}
+
+impl DaemonInstanceLockGuard {
+    fn acquire(home_dir: &Path) -> anyhow::Result<Self> {
+        use std::io::Write;
+        ensure_private_dir(home_dir)?;
+        let lock_path = home_dir.join(DAEMON_LOCK_FILENAME);
+        let mut lock_opts = std::fs::OpenOptions::new();
+        lock_opts.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            lock_opts.mode(0o600);
+        }
+        let mut file = lock_opts.open(&lock_path)?;
+        file.try_lock().map_err(|err| {
+            let existing_pid = std::fs::read_to_string(home_dir.join(DAEMON_PID_FILENAME))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            anyhow::anyhow!(
+                "another orbit daemon instance is already running for {}{} ({err})",
+                home_dir.display(),
+                existing_pid
+                    .map(|pid| format!(" (pid {pid})"))
+                    .unwrap_or_default()
+            )
+        })?;
+        let _ = file.set_len(0);
+        let _ = writeln!(file, "{}", std::process::id());
+        let _ = file.flush();
+        let pid_path = home_dir.join(DAEMON_PID_FILENAME);
+        if std::fs::write(&pid_path, format!("{}\n", std::process::id())).is_ok() {
+            #[cfg(unix)]
+            let _ = enforce_unix_permissions(&pid_path, 0o600);
+        }
+        Ok(Self {
+            _file: file,
+            home_dir: home_dir.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for DaemonInstanceLockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.home_dir.join(DAEMON_PID_FILENAME));
+        let _ = std::fs::remove_file(self.home_dir.join(DAEMON_RELAY_FILENAME));
     }
 }
 
@@ -1230,6 +1309,10 @@ fn build_http_router(runtime: Arc<DaemonRuntime>, web: Option<Router>) -> Router
         .route("/ws", get(ws_handler))
         .route("/ws/e2ee", get(ws_e2ee_handler))
         .route("/mcp/agents", post(crate::mcp::mcp_agents_handler))
+        .route(
+            "/internal/pre-tool-use",
+            post(internal_pre_tool_use_handler),
+        )
         .route(
             "/webhooks/{trigger_id}",
             post(crate::triggers::webhook_ingress_handler).layer(DefaultBodyLimit::max(
@@ -1321,6 +1404,7 @@ pub async fn run_daemon_until_with_web(
     web: Option<Router>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    let _instance_lock = DaemonInstanceLockGuard::acquire(&config.home_dir)?;
     let persisted = DaemonPersistedConfig::load(&config.home_dir);
     let effective_relay = config.relay_url.or_else(|| persisted.relay_url.clone());
     let cleaned_sockets =
@@ -1469,6 +1553,47 @@ pub async fn spawn_embedded_daemon(
     });
 
     Ok((addr, runtime))
+}
+
+#[derive(serde::Deserialize)]
+struct InternalPreToolUseReq {
+    agent_id: String,
+    tool_name: String,
+    #[serde(default)]
+    tool_input: serde_json::Value,
+    #[serde(default)]
+    tool_use_id: Option<String>,
+}
+
+async fn internal_pre_tool_use_handler(
+    State(rt): State<Arc<DaemonRuntime>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<InternalPreToolUseReq>,
+) -> axum::response::Response {
+    if !peer.ip().is_loopback()
+        || validate_request_origin(&headers).is_err()
+        || !verify_bearer_token(&headers, &rt.mcp_token)
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Some(reason) = rt
+        .orchestrator
+        .evaluate_claude_pre_tool_use(
+            &body.agent_id,
+            &body.tool_name,
+            &body.tool_input,
+            body.tool_use_id.as_deref(),
+        )
+        .await
+    {
+        return axum::Json(serde_json::json!({
+            "decision": "deny",
+            "reason": reason
+        }))
+        .into_response();
+    }
+    axum::Json(serde_json::json!({ "decision": "allow" })).into_response()
 }
 
 async fn metrics_handler(
@@ -2955,6 +3080,12 @@ async fn run_client_session_loop(
                     DaemonBroadcast::AgentUpdated(agent) => {
                         Some(WireMessage::AgentUpdated { agent })
                     }
+                    DaemonBroadcast::PendingPermissionsChanged(permissions) => {
+                        Some(WireMessage::PendingPermissionsSnapshot {
+                            request_id: Uuid::nil(),
+                            permissions,
+                        })
+                    }
                     DaemonBroadcast::AgentDeleted(agent_id) => {
                         subscribed_agents
                             .lock()
@@ -3922,6 +4053,7 @@ async fn handle_wire_rpc(
         WireMessage::PreviewWorktreeHandoff {
             request_id,
             workspace_id,
+            source_agent_id,
             direction,
             target_workspace_id,
             include_committed,
@@ -3931,8 +4063,9 @@ async fn handle_wire_rpc(
             let zstd = *use_zstd;
             tokio::spawn(async move {
                 let reply = match orch
-                    .preview_worktree_handoff(
+                    .preview_worktree_handoff_with_agent(
                         &workspace_id,
+                        source_agent_id.as_deref(),
                         direction,
                         target_workspace_id.as_deref(),
                         include_committed,
@@ -3968,6 +4101,7 @@ async fn handle_wire_rpc(
         WireMessage::ExecuteWorktreeHandoff {
             request_id,
             workspace_id,
+            source_agent_id,
             direction,
             mode,
             target_workspace_id,
@@ -3982,7 +4116,7 @@ async fn handle_wire_rpc(
                 let reply = match orch
                     .execute_worktree_handoff(crate::manager::ExecuteWorktreeHandoffSpec {
                         workspace_id,
-                        source_agent_id: None,
+                        source_agent_id,
                         direction,
                         mode,
                         target_workspace_id,
@@ -9826,6 +9960,17 @@ async fn bind_terminal_stream_to_client(
         prev_handle.abort();
     }
 
+    let prefix_snapshot_clear = |data: Vec<u8>| -> Vec<u8> {
+        const CLEAR_SEQ: &[u8] = b"\x1b[0m\x1b[2J\x1b[3J\x1b[H";
+        if data.starts_with(b"\x1b[0m\x1b[2J") {
+            return data;
+        }
+        let mut out = Vec::with_capacity(CLEAR_SEQ.len() + data.len());
+        out.extend_from_slice(CLEAR_SEQ);
+        out.extend_from_slice(&data);
+        out
+    };
+
     let tx_clone = out_tx.clone();
     let orchestrator = Arc::clone(&runtime.orchestrator);
     let tid_owned = terminal_id.to_string();
@@ -9834,7 +9979,7 @@ async fn bind_terminal_stream_to_client(
             && tx_clone
                 .send(SessionFrame::Terminal(TerminalBinaryFrame::Snapshot {
                     slot,
-                    data: snap,
+                    data: prefix_snapshot_clear(snap),
                 }))
                 .await
                 .is_err()
@@ -9847,7 +9992,7 @@ async fn bind_terminal_stream_to_client(
                     if tx_clone
                         .send(SessionFrame::Terminal(TerminalBinaryFrame::Snapshot {
                             slot,
-                            data,
+                            data: prefix_snapshot_clear(data),
                         }))
                         .await
                         .is_err()
@@ -9879,7 +10024,7 @@ async fn bind_terminal_stream_to_client(
                         && tx_clone
                             .send(SessionFrame::Terminal(TerminalBinaryFrame::Snapshot {
                                 slot,
-                                data: fresh,
+                                data: prefix_snapshot_clear(fresh),
                             }))
                             .await
                             .is_err()
@@ -10100,15 +10245,23 @@ impl DaemonRuntime {
         }
 
         let port = *self.listen_port.read().await;
+        let live_listen = read_live_daemon_addr(&self.home_dir);
         let default_home = home.join(".orbit");
         let is_default_home = crate::platform::canonicalize_clean(&self.home_dir)
             .unwrap_or_else(|_| self.home_dir.clone())
             == crate::platform::canonicalize_clean(&default_home).unwrap_or(default_home);
 
         let restart_relay = detect_running_local_relay(&self.home_dir).await;
+        let active_relay_url = self.relay_url.read().await.clone();
         let custom_home = (!is_default_home).then_some(self.home_dir.as_path());
-        let restart_script =
-            build_self_upgrade_restart_script(&install_path, custom_home, port, restart_relay);
+        let restart_script = build_self_upgrade_restart_script_with_opts(
+            &install_path,
+            custom_home,
+            live_listen,
+            port,
+            active_relay_url.as_deref(),
+            restart_relay,
+        );
 
         // Persist exact shim frame cursors before launching the hot-restart script so reattached
         // shims resume strictly after the last consumed frame with zero history replay.
@@ -10116,15 +10269,20 @@ impl DaemonRuntime {
 
         #[cfg(unix)]
         {
+            // Double-fork via subshell `&` and wait on the immediate `sh` wrapper so an active
+            // daemon waiting to exit never retains a `<defunct>` zombie `sh` child.
+            let detached_script = format!("({restart_script}) </dev/null >/dev/null 2>&1 &");
             let mut cmd = std::process::Command::new("sh");
-            cmd.args(["-c", &restart_script])
+            cmd.args(["-c", &detached_script])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
-            cmd.spawn()
+            let mut child = cmd
+                .spawn()
                 .map_err(|e| anyhow::anyhow!("Failed to spawn daemon hot-restart: {e}"))?;
+            let _ = child.wait();
         }
         #[cfg(windows)]
         {
@@ -10397,27 +10555,54 @@ async fn detect_running_local_relay(home_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn build_self_upgrade_restart_script(
+#[cfg_attr(not(unix), allow(dead_code))]
+fn build_self_upgrade_restart_script_with_opts(
     install_path: &Path,
     custom_home_dir: Option<&Path>,
+    listen_addr: Option<SocketAddr>,
     port: u16,
+    relay_url: Option<&str>,
     restart_relay: bool,
 ) -> String {
     let sq_bin = shell_single_quote(&install_path.to_string_lossy());
     let home_flag = custom_home_dir
         .map(|h| format!(" --home {}", shell_single_quote(&h.to_string_lossy())))
         .unwrap_or_default();
-    let port_flag = if port > 0 {
+    let listen_flag = if let Some(addr) = listen_addr {
+        format!(" --listen {}", shell_single_quote(&addr.to_string()))
+    } else if port > 0 {
         format!(" --port {port}")
     } else {
         String::new()
     };
+    let relay_flag = relay_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|r| format!(" --relay {}", shell_single_quote(r)))
+        .unwrap_or_default();
     let relay_suffix = if restart_relay {
         format!(" && ({sq_bin}{home_flag} relay up >/dev/null 2>&1 || true)")
     } else {
         String::new()
     };
-    format!("sleep 0.35 && {sq_bin}{home_flag} daemon up{port_flag}{relay_suffix}")
+    format!("sleep 0.35 && {sq_bin}{home_flag} daemon up{listen_flag}{relay_flag}{relay_suffix}")
+}
+
+#[cfg(test)]
+fn build_self_upgrade_restart_script(
+    install_path: &Path,
+    custom_home_dir: Option<&Path>,
+    port: u16,
+    restart_relay: bool,
+) -> String {
+    build_self_upgrade_restart_script_with_opts(
+        install_path,
+        custom_home_dir,
+        None,
+        port,
+        None,
+        restart_relay,
+    )
 }
 
 /// Strictly validate a release semver tag (`X.Y.Z` with optional `-prerelease`) before
@@ -10455,6 +10640,16 @@ fn is_valid_release_semver(ver: &str) -> bool {
     true
 }
 
+fn is_user_home_dir_path(candidate: &Path) -> bool {
+    let Some(home) = crate::platform::resolve_user_home_dir() else {
+        return false;
+    };
+    let canon_home = std::fs::canonicalize(&home).unwrap_or(home);
+    let canon_candidate =
+        std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
+    canon_candidate == canon_home
+}
+
 async fn authorize_optional_skills_cwd(
     store: &Arc<OrbitStore>,
     cwd: Option<String>,
@@ -10467,12 +10662,15 @@ async fn authorize_optional_skills_cwd(
         return Ok(None);
     }
     let expanded = expand_host_path(trimmed);
+    if is_user_home_dir_path(&expanded) {
+        return Ok(None);
+    }
     let canonical = authorize_workspace_mutation_cwd(store, &expanded).await?;
     Ok(Some(canonical.to_string_lossy().to_string()))
 }
 
 /// Authorize `cwd` for Path Rules RPCs:
-/// - Empty or `"~"` maps to `Ok(None)` (`UserGlobal`-only `~/.orbit/rules/*.md`).
+/// - Empty, `"~"`, or expanded `$HOME` maps to `Ok(None)` (`UserGlobal`-only `~/.orbit/rules/*.md`).
 /// - Any other path MUST pass `authorize_workspace_mutation_cwd` BEFORE any filesystem access.
 async fn authorize_path_rules_cwd(
     store: &Arc<OrbitStore>,
@@ -10483,6 +10681,9 @@ async fn authorize_path_rules_cwd(
         return Ok(None);
     }
     let resolved = expand_host_path(trimmed);
+    if is_user_home_dir_path(&resolved) {
+        return Ok(None);
+    }
     authorize_workspace_mutation_cwd(store, &resolved)
         .await
         .map(Some)

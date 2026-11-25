@@ -439,6 +439,11 @@ pub fn resolve_server_url(home_dir: &Path, explicit_server: Option<String>) -> S
     if let Some(s) = explicit_server.filter(|v| !v.trim().is_empty()) {
         return s;
     }
+    if let Some(live_addr) = orbit_daemon::read_live_daemon_addr(home_dir) {
+        let ip = crate::service::connectable_ip_for_bind(live_addr.ip());
+        let sock = std::net::SocketAddr::new(ip, live_addr.port());
+        return format!("ws://{sock}/ws");
+    }
     let port = orbit_daemon::read_live_daemon_port(home_dir);
     format!("ws://127.0.0.1:{port}/ws")
 }
@@ -1015,6 +1020,7 @@ pub async fn cmd_workspace(
                     WireMessage::PreviewWorktreeHandoff {
                         request_id: req_id,
                         workspace_id,
+                        source_agent_id: None,
                         direction,
                         target_workspace_id,
                         include_committed,
@@ -1073,6 +1079,7 @@ pub async fn cmd_workspace(
                     WireMessage::ExecuteWorktreeHandoff {
                         request_id: req_id,
                         workspace_id,
+                        source_agent_id: None,
                         direction,
                         mode,
                         target_workspace_id,

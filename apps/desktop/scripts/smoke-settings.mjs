@@ -152,6 +152,81 @@ export async function exerciseLocalSettings(cdp) {
     document.querySelector('[data-settings-section="hosts"][aria-current="page"]'));
   await go("voice");
   assert.equal(await evaluate(() => Boolean(document.querySelector('[data-slot="settings-scope-bar"]'))), false);
+  const voiceDisabledCheck = await evaluate(async () => {
+    const sw = document.querySelector('[data-setting-id="voice.autoSpeakTitle"] [role="switch"]');
+    const langTrigger = document.querySelector('[data-setting-id="voice.languageTitle"] [data-slot="select-trigger"]');
+    if (!sw || !langTrigger) return { ok: false, reason: "missing voice controls" };
+    const before = sw.getAttribute("aria-checked");
+    const hasDataDisabled = sw.hasAttribute("data-disabled");
+    const opacity = Number.parseFloat(getComputedStyle(sw).opacity);
+    const langDisabled = Boolean(langTrigger.disabled || langTrigger.hasAttribute("data-disabled"));
+    const rect = sw.getBoundingClientRect();
+    return { ok: true, before, hasDataDisabled, opacity, langDisabled, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  });
+  assert.ok(voiceDisabledCheck.ok, `Voice disabled check setup failed: ${voiceDisabledCheck.reason}`);
+  assert.equal(voiceDisabledCheck.hasDataDisabled, true, "Disabled Voice switch must carry data-disabled");
+  assert.ok(voiceDisabledCheck.opacity < 0.6, `Disabled Switch must visually dim via data-[disabled] (got opacity=${voiceDisabledCheck.opacity})`);
+  assert.equal(voiceDisabledCheck.langDisabled, true, "Recognition language select must be disabled when Voice is off");
+  await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: voiceDisabledCheck.x, y: voiceDisabledCheck.y });
+  for (const type of ["mousePressed", "mouseReleased"]) {
+    await cdp.send("Input.dispatchMouseEvent", { type, x: voiceDisabledCheck.x, y: voiceDisabledCheck.y, button: "left", clickCount: 1 });
+  }
+  assert.equal(
+    await evaluate(() => document.querySelector('[data-setting-id="voice.autoSpeakTitle"] [role="switch"]')?.getAttribute("aria-checked")),
+    voiceDisabledCheck.before,
+    "Clicking a disabled Switch must never toggle its checked state",
+  );
+
+  await go("notifications");
+  const notifDisabledCheck = await evaluate(() => {
+    const permission = typeof Notification !== "undefined" ? Notification.permission : "unsupported";
+    const sw = document.querySelector('[data-setting-id="settings.notifyApproval"] [role="switch"]');
+    const soundBtn = document.querySelector('[data-setting-id="settings.notificationSoundTitle"] button');
+    const mobilePreviewSw = document.querySelector('[data-setting-id="settings.pushMessagePreview"] [role="switch"]');
+    if (!sw || !soundBtn || !mobilePreviewSw) return { ok: false, reason: "missing notifications controls" };
+    const swRect = sw.getBoundingClientRect();
+    const mRect = mobilePreviewSw.getBoundingClientRect();
+    return {
+      ok: true,
+      permission,
+      desktopDisabled: sw.hasAttribute("data-disabled"),
+      desktopOpacity: Number.parseFloat(getComputedStyle(sw).opacity),
+      desktopBefore: sw.getAttribute("aria-checked"),
+      soundBtnDisabled: Boolean(soundBtn.disabled),
+      desktopPoint: { x: swRect.left + swRect.width / 2, y: swRect.top + swRect.height / 2 },
+      mobilePreviewDisabled: mobilePreviewSw.hasAttribute("data-disabled"),
+      mobilePreviewOpacity: Number.parseFloat(getComputedStyle(mobilePreviewSw).opacity),
+      mobilePreviewBefore: mobilePreviewSw.getAttribute("aria-checked"),
+      mobilePoint: { x: mRect.left + mRect.width / 2, y: mRect.top + mRect.height / 2 },
+    };
+  });
+  assert.ok(notifDisabledCheck.ok, `Notifications disabled check setup failed: ${notifDisabledCheck.reason}`);
+  if (notifDisabledCheck.permission === "denied" || notifDisabledCheck.permission === "unsupported") {
+    assert.equal(notifDisabledCheck.desktopDisabled, true, "Blocked desktop notification switches must be disabled");
+    assert.ok(notifDisabledCheck.desktopOpacity < 0.6, `Blocked desktop notification switch must dim (got opacity=${notifDisabledCheck.desktopOpacity})`);
+    assert.equal(notifDisabledCheck.soundBtnDisabled, true, "Blocked desktop notification Test Sound button must be disabled");
+    await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", ...notifDisabledCheck.desktopPoint });
+    for (const type of ["mousePressed", "mouseReleased"]) {
+      await cdp.send("Input.dispatchMouseEvent", { type, ...notifDisabledCheck.desktopPoint, button: "left", clickCount: 1 });
+    }
+    assert.equal(
+      await evaluate(() => document.querySelector('[data-setting-id="settings.notifyApproval"] [role="switch"]')?.getAttribute("aria-checked")),
+      notifDisabledCheck.desktopBefore,
+      "Clicking a disabled Notifications desktop switch must never toggle its state",
+    );
+  }
+  if (notifDisabledCheck.mobilePreviewDisabled) {
+    assert.ok(notifDisabledCheck.mobilePreviewOpacity < 0.6, `Disabled mobile push switch must dim (got opacity=${notifDisabledCheck.mobilePreviewOpacity})`);
+    await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", ...notifDisabledCheck.mobilePoint });
+    for (const type of ["mousePressed", "mouseReleased"]) {
+      await cdp.send("Input.dispatchMouseEvent", { type, ...notifDisabledCheck.mobilePoint, button: "left", clickCount: 1 });
+    }
+    assert.equal(
+      await evaluate(() => document.querySelector('[data-setting-id="settings.pushMessagePreview"] [role="switch"]')?.getAttribute("aria-checked")),
+      notifDisabledCheck.mobilePreviewBefore,
+      "Clicking a disabled mobile push switch must never toggle its state",
+    );
+  }
 
   await go("general");
   const toggle = '[data-setting-id="settings.sendWithEnter"] [role="switch"]';

@@ -174,22 +174,21 @@ export const GeneralSection = memo(function GeneralSection() {
             />
           </SettingRow>
 
-          <div className={!draftUseWorktree ? "opacity-55" : undefined}>
-            <SettingRow
-              settingId="settings.branchPrefix"
-              title={t("settings.branchPrefix")}
-              description={t("settings.branchPrefixDesc")}
-            >
-              <SettingSelect
-                ariaLabel={t("settings.branchPrefix")}
-                value={worktreeBranchPrefix}
-                options={branchOptions}
-                disabled={!draftUseWorktree}
-                onChange={(pfx) => orbitActions.setWorktreePrefs({ worktreeBranchPrefix: pfx })}
-                menuClassName="w-[200px]"
-              />
-            </SettingRow>
-          </div>
+          <SettingRow
+            settingId="settings.branchPrefix"
+            title={t("settings.branchPrefix")}
+            description={t("settings.branchPrefixDesc")}
+            disabled={!draftUseWorktree}
+          >
+            <SettingSelect
+              ariaLabel={t("settings.branchPrefix")}
+              value={worktreeBranchPrefix}
+              options={branchOptions}
+              disabled={!draftUseWorktree}
+              onChange={(pfx) => orbitActions.setWorktreePrefs({ worktreeBranchPrefix: pfx })}
+              menuClassName="w-[200px]"
+            />
+          </SettingRow>
         </SettingCard>
       </div>
 

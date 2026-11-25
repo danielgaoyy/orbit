@@ -10,12 +10,17 @@ export interface SwitchProps
 /**
  * Official shadcn/ui `<Switch>` primitive powered by `@base-ui/react/switch`.
  */
-export function Switch({ className, ...props }: SwitchProps) {
+export function Switch({ className, disabled, onCheckedChange, ...props }: SwitchProps) {
   return (
     <BaseSwitch.Root
       data-slot="switch"
+      disabled={disabled}
+      onCheckedChange={(checked, eventDetails) => {
+        if (disabled) return;
+        onCheckedChange?.(checked, eventDetails);
+      }}
       className={cn(
-        "peer focus-visible:ring-ring/45 bg-border-strong/65 data-[checked]:bg-action-primary-bg inline-flex h-[22px] w-[38px] shrink-0 cursor-pointer items-center rounded-full border border-transparent p-[1px] transition-colors duration-150 outline-none focus-visible:ring-1 disabled:cursor-not-allowed disabled:opacity-50",
+        "peer focus-visible:ring-ring/45 bg-border-strong/65 data-[checked]:bg-action-primary-bg inline-flex h-[22px] w-[38px] shrink-0 cursor-pointer items-center rounded-full border border-transparent p-[1px] transition-colors duration-150 outline-none focus-visible:ring-1 disabled:cursor-not-allowed disabled:opacity-45 data-[disabled]:cursor-not-allowed data-[disabled]:opacity-45",
         className,
       )}
       {...props}

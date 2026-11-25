@@ -277,12 +277,16 @@ export const HostVoiceSection = memo(function HostVoiceSection({ hostId }: { hos
   const selectedMicValue = voiceInputDeviceId ?? SYSTEM_DEFAULT_MIC;
   const showManualDetectButton =
     needsMicPermission && micSupported && systemAudioInputs.length === 0;
+  const voiceSubDisabled = !isOnline || Boolean(cfg && !cfg.enabled);
+  const micDisabled =
+    (!micSupported && systemAudioInputs.length === 0) || Boolean(cfg && !cfg.enabled);
 
   const microphoneRow = (
     <SettingRow
       settingId="voice.microphoneTitle"
       title={t("voice.microphoneTitle")}
       description={t("voice.microphoneDesc")}
+      disabled={micDisabled}
     >
       <div className="flex items-center gap-2">
         {showManualDetectButton && (
@@ -290,7 +294,7 @@ export const HostVoiceSection = memo(function HostVoiceSection({ hostId }: { hos
             type="button"
             variant="outline"
             size="sm"
-            disabled={requestingMic}
+            disabled={requestingMic || Boolean(cfg && !cfg.enabled)}
             onClick={() => void handleRequestMicLabels()}
           >
             {requestingMic ? <OrbitSpinner size={12} /> : <Mic data-icon="inline-start" />}
@@ -300,7 +304,7 @@ export const HostVoiceSection = memo(function HostVoiceSection({ hostId }: { hos
         <SettingSelect<string>
           ariaLabel={t("voice.microphoneTitle")}
           value={selectedMicValue}
-          disabled={!micSupported && systemAudioInputs.length === 0}
+          disabled={micDisabled}
           options={micOptions}
           menuClassName="w-[280px]"
           onOpenChange={(open) => {
@@ -377,11 +381,12 @@ export const HostVoiceSection = memo(function HostVoiceSection({ hostId }: { hos
                 settingId="voice.languageTitle"
                 title={t("voice.languageTitle")}
                 description={t("voice.languageDesc")}
+                disabled={voiceSubDisabled}
               >
                 <SettingSelect<string>
                   ariaLabel={t("voice.languageTitle")}
                   value={languageValue}
-                  disabled={!isOnline}
+                  disabled={voiceSubDisabled}
                   onChange={(val) =>
                     patchConfig({ language: val === "auto" ? null : val })
                   }
@@ -393,10 +398,11 @@ export const HostVoiceSection = memo(function HostVoiceSection({ hostId }: { hos
                 settingId="voice.autoSpeakTitle"
                 title={t("voice.autoSpeakTitle")}
                 description={t("voice.autoSpeakDesc")}
+                disabled={voiceSubDisabled}
               >
                 <ToggleSwitch
                   checked={cfg.auto_speak_responses}
-                  disabled={!isOnline}
+                  disabled={voiceSubDisabled}
                   ariaLabel={t("voice.autoSpeakTitle")}
                   onChange={(auto_speak_responses) =>
                     patchConfig({ auto_speak_responses })

@@ -233,6 +233,7 @@ export const SettingRow = memo(function SettingRow({
   title,
   description,
   children,
+  disabled = false,
   settingId,
   modified,
   onReset,
@@ -240,18 +241,20 @@ export const SettingRow = memo(function SettingRow({
   title: ReactNode;
   description?: ReactNode;
   children: ReactNode;
+  disabled?: boolean;
 }) {
   const { changed, reset } = useSettingModification({ settingId, modified, onReset });
   return (
     <div
       data-setting-id={settingId}
       data-modified={changed}
+      data-disabled={disabled ? "" : undefined}
       className="group/setting flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-3.5"
     >
-      <div className="min-w-[140px] flex-1">
+      <div className={cn("min-w-[140px] flex-1 transition-opacity", disabled && "opacity-55")}>
         <div className="flex items-center gap-2">
           <div className="text-ink-primary text-[13px] font-medium">{title}</div>
-          <ResetControl onClick={reset} />
+          {!disabled && <ResetControl onClick={reset} />}
         </div>
         {description && (
           <div className="text-ink-secondary mt-0.5 text-[13px] leading-[1.45]">{description}</div>

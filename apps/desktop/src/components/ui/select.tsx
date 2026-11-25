@@ -125,9 +125,11 @@ export function Select<T extends string | number>({
       value={value}
       disabled={disabled}
       modal={false}
-      onOpenChange={(open) => onOpenChange?.(open)}
+      onOpenChange={(open) => {
+        if (!disabled) onOpenChange?.(open);
+      }}
       onValueChange={(next) => {
-        if (next !== null && next !== value) {
+        if (!disabled && next !== null && next !== value) {
           onChange(next);
         }
       }}
@@ -136,7 +138,7 @@ export function Select<T extends string | number>({
         aria-label={ariaLabel ?? ariaLabelAttr}
         data-slot="select-trigger"
         className={cn(
-          "border-border bg-background text-foreground hover:bg-accent/70 focus-visible:ring-foreground/20 flex cursor-pointer items-center justify-between border font-medium transition-colors outline-none focus-visible:ring-1 disabled:pointer-events-none disabled:opacity-45",
+          "border-border bg-background text-foreground hover:bg-accent/70 focus-visible:ring-foreground/20 flex cursor-pointer items-center justify-between border font-medium transition-colors outline-none focus-visible:ring-1 disabled:pointer-events-none disabled:opacity-45 data-[disabled]:pointer-events-none data-[disabled]:opacity-45",
           sizeClass,
           triggerClassName,
         )}

@@ -457,6 +457,7 @@ const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: st
                   settingId="guardian.thresholdTitle"
                   title={t("guardian.thresholdTitle")}
                   description={t("guardian.thresholdDesc")}
+                  disabled={!config.enabled}
                 >
                   <SettingSelect
                     value={effectiveMaxRisk}
@@ -472,6 +473,7 @@ const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: st
                   settingId="guardian.readOnlyTitle"
                   title={t("guardian.readOnlyTitle")}
                   description={t("guardian.readOnlyDesc")}
+                  disabled={!config.enabled}
                 >
                   <ToggleSwitch
                     checked={config.allow_read_only_tools}
@@ -485,6 +487,7 @@ const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: st
                   settingId="guardian.workspaceTestsTitle"
                   title={t("guardian.workspaceTestsTitle")}
                   description={t("guardian.workspaceTestsDesc")}
+                  disabled={!config.enabled}
                 >
                   <ToggleSwitch
                     checked={config.allow_workspace_tests}
@@ -498,6 +501,7 @@ const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: st
                   settingId="guardian.tier2Title"
                   title={t("guardian.tier2Title")}
                   description={t("guardian.tier2Desc")}
+                  disabled={!config.enabled}
                 >
                   <ToggleSwitch
                     checked={config.use_ai_classifier_for_medium}
@@ -512,7 +516,7 @@ const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: st
                 {config.use_ai_classifier_for_medium && (
                   <div className="flex flex-col gap-3 px-4 py-3">
                     <div className="flex items-center justify-between gap-4">
-                      <div className="min-w-0">
+                      <div className={cn("min-w-0 transition-opacity", !config.enabled && "opacity-55")}>
                         <div className="text-ink-primary text-[13px] font-medium">
                           {t("guardian.llmTier2Title")}
                         </div>

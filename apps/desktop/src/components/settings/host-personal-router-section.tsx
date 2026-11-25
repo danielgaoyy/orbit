@@ -426,9 +426,10 @@ export const HostPersonalRouterSection = memo(function HostPersonalRouterSection
               disabled={pending || !status}
               className="space-y-3 border-t border-border-subtle px-4 py-3"
             >
-              <SettingRow title={t("settings.personalAgentScopeLabel")}>
+              <SettingRow title={t("settings.personalAgentScopeLabel")} disabled={pending || !status}>
                 <SettingSelect<RouterScope>
                   value={draft.scope}
+                  disabled={pending || !status}
                   ariaLabel={t("settings.personalAgentScopeLabel")}
                   options={[
                     { value: "global_fleet", label: t("settings.agentFleetScope") },
@@ -437,9 +438,10 @@ export const HostPersonalRouterSection = memo(function HostPersonalRouterSection
                   onChange={(scope) => setDraft((d) => ({ ...d, scope }))}
                 />
               </SettingRow>
-              <SettingRow title={t("settings.personalAgentGuardianLabel")}>
+              <SettingRow title={t("settings.personalAgentGuardianLabel")} disabled={pending || !status}>
                 <SettingSelect<RouterPreReviewMode>
                   value={draft.pre_review_mode}
+                  disabled={pending || !status}
                   ariaLabel={t("settings.personalAgentGuardianLabel")}
                   options={[
                     { value: "medium_risk_only", label: t("settings.agentReviewMedium") },
@@ -449,9 +451,10 @@ export const HostPersonalRouterSection = memo(function HostPersonalRouterSection
                   onChange={(pre_review_mode) => setDraft((d) => ({ ...d, pre_review_mode }))}
                 />
               </SettingRow>
-              <SettingRow title={t("settings.personalAgentShareHermesMemory")}>
+              <SettingRow title={t("settings.personalAgentShareHermesMemory")} disabled={pending || !status}>
                 <ToggleSwitch
                   checked={draft.share_host_hermes_memory}
+                  disabled={pending || !status}
                   ariaLabel={t("settings.personalAgentShareHermesMemory")}
                   onChange={(share_host_hermes_memory) =>
                     setDraft((d) => ({ ...d, share_host_hermes_memory }))

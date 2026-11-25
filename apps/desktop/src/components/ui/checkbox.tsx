@@ -37,10 +37,12 @@ export function Checkbox({
       checked={checked}
       disabled={disabled}
       aria-label={ariaLabel ?? ariaLabelAttr}
-      onCheckedChange={(next) => onCheckedChange(Boolean(next))}
+      onCheckedChange={(next) => {
+        if (!disabled) onCheckedChange(Boolean(next));
+      }}
       data-slot="checkbox"
       className={cn(
-        "border-border-strong bg-surface-base hover:border-ink-tertiary focus-visible:ring-ring/45 data-[checked]:border-action-primary-bg data-[checked]:bg-action-primary-bg data-[checked]:text-action-primary-fg inline-flex shrink-0 cursor-pointer items-center justify-center rounded-[4.5px] border transition-colors duration-150 outline-none focus-visible:ring-1 disabled:pointer-events-none disabled:opacity-45",
+        "border-border-strong bg-surface-base hover:border-ink-tertiary focus-visible:ring-ring/45 data-[checked]:border-action-primary-bg data-[checked]:bg-action-primary-bg data-[checked]:text-action-primary-fg inline-flex shrink-0 cursor-pointer items-center justify-center rounded-[4.5px] border transition-colors duration-150 outline-none focus-visible:ring-1 disabled:pointer-events-none disabled:opacity-45 data-[disabled]:pointer-events-none data-[disabled]:opacity-45",
         size === "sm" ? "size-[14px]" : "size-[15px]",
         className,
       )}

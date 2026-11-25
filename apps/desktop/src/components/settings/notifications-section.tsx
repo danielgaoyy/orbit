@@ -190,7 +190,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
       : (pushEntry?.preferences ?? DEFAULT_PUSH_PREFS);
 
   const persistMobilePrefs = async (updater: (prev: PushPreferences) => PushPreferences) => {
-    if (!activeHostId || pushEntry?.status !== "ready") return;
+    if (!activeHostId || !isHostOnline || pushEntry?.status !== "ready") return;
     const hostIdAtStart = activeHostId;
     const nextPrefs = updater(draftPrefs);
     const seq = ++mobileSaveSeqRef.current;
@@ -212,6 +212,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
   const isBlocked = permission === "denied" || permission === "unsupported";
   const devices = pushEntry?.devices ?? [];
   const isPushReady = isHostOnline && pushEntry?.status === "ready";
+  const isMobileSubDisabled = !isPushReady || !draftPrefs.enabled;
 
   return (
     <div className="space-y-6">
@@ -272,17 +273,19 @@ export const NotificationsSection = memo(function NotificationsSection() {
       </div>
 
       {/* Desktop Alert Categories & Sound */}
-      <div className={cn("space-y-2", isBlocked && "opacity-55")}>
+      <div className="space-y-2">
         <SettingGroupLabel>{t("settings.notifyDesktopEvents")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
             settingId="settings.notifyApproval"
             title={t("settings.notifyApproval")}
             description={t("settings.notifyApprovalDesc")}
+            disabled={isBlocked}
           >
             <ToggleSwitch
               ariaLabel={t("settings.notifyApproval")}
               checked={notifyOnApproval}
+              disabled={isBlocked}
               onChange={(v) => {
                 orbitActions.setNotificationPrefs({ notifyOnApproval: v });
                 if (v) void ensurePermissionIfDefault();
@@ -294,10 +297,12 @@ export const NotificationsSection = memo(function NotificationsSection() {
             settingId="settings.notifyTurnComplete"
             title={t("settings.notifyTurnComplete")}
             description={t("settings.notifyTurnCompleteDesc")}
+            disabled={isBlocked}
           >
             <ToggleSwitch
               ariaLabel={t("settings.notifyTurnComplete")}
               checked={notifyOnTurnComplete}
+              disabled={isBlocked}
               onChange={(v) => {
                 orbitActions.setNotificationPrefs({ notifyOnTurnComplete: v });
                 if (v) void ensurePermissionIfDefault();
@@ -309,10 +314,12 @@ export const NotificationsSection = memo(function NotificationsSection() {
             settingId="settings.notifyAgentError"
             title={t("settings.notifyAgentError")}
             description={t("settings.notifyAgentErrorDesc")}
+            disabled={isBlocked}
           >
             <ToggleSwitch
               ariaLabel={t("settings.notifyAgentError")}
               checked={notifyOnAgentError}
+              disabled={isBlocked}
               onChange={(v) => {
                 orbitActions.setNotificationPrefs({ notifyOnAgentError: v });
                 if (v) void ensurePermissionIfDefault();
@@ -324,10 +331,12 @@ export const NotificationsSection = memo(function NotificationsSection() {
             settingId="settings.notifyGoalFinished"
             title={t("settings.notifyGoalFinished")}
             description={t("settings.notifyGoalFinishedDesc")}
+            disabled={isBlocked}
           >
             <ToggleSwitch
               ariaLabel={t("settings.notifyGoalFinished")}
               checked={notifyOnGoalFinished}
+              disabled={isBlocked}
               onChange={(v) => {
                 orbitActions.setNotificationPrefs({ notifyOnGoalFinished: v });
                 if (v) void ensurePermissionIfDefault();
@@ -339,12 +348,14 @@ export const NotificationsSection = memo(function NotificationsSection() {
             settingId="settings.notificationSoundTitle"
             title={t("settings.notificationSoundTitle")}
             description={t("settings.notificationSoundDesc")}
+            disabled={isBlocked}
           >
             <div className="flex items-center gap-2.5">
               <button
                 type="button"
+                disabled={isBlocked}
                 onClick={() => void playSoftNotificationChime("default")}
-                className="border-border-default text-ink-primary hover:bg-surface-recessed inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[13px] font-medium transition-colors"
+                className="border-border-default text-ink-primary hover:bg-surface-recessed inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[13px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-45"
               >
                 <Volume2 className="text-ink-muted h-[13px] w-[13px]" />
                 <span>{t("settings.testSound")}</span>
@@ -352,6 +363,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
               <ToggleSwitch
                 ariaLabel={t("settings.notificationSoundTitle")}
                 checked={notifySoundEnabled}
+                disabled={isBlocked}
                 onChange={(v) => orbitActions.setNotificationPrefs({ notifySoundEnabled: v })}
               />
             </div>
@@ -361,6 +373,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
             settingId="settings.notifyQuietHours"
             title={t("settings.notifyQuietHours")}
             description={t("settings.notifyQuietHoursDesc")}
+            disabled={isBlocked}
           >
             <div className="flex items-center gap-2">
               {notifyQuietHoursEnabled && (
@@ -370,6 +383,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
                     ariaLabel={t("settings.notifyQuietStart")}
                     value={notifyQuietStartHour}
                     options={HOUR_OPTIONS}
+                    disabled={isBlocked}
                     triggerClassName="min-w-[82px]"
                     menuClassName="min-w-[104px]"
                     onChange={(hour) =>
@@ -382,6 +396,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
                     ariaLabel={t("settings.notifyQuietEnd")}
                     value={notifyQuietEndHour}
                     options={HOUR_OPTIONS}
+                    disabled={isBlocked}
                     triggerClassName="min-w-[82px]"
                     menuClassName="min-w-[104px]"
                     onChange={(hour) =>
@@ -393,6 +408,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
               <ToggleSwitch
                 ariaLabel={t("settings.notifyQuietHours")}
                 checked={notifyQuietHoursEnabled}
+                disabled={isBlocked}
                 onChange={(v) => orbitActions.setNotificationPrefs({ notifyQuietHoursEnabled: v })}
               />
             </div>
@@ -421,6 +437,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
             settingId="settings.pushEnabled"
             title={t("settings.pushEnabled")}
             description={t("settings.pushEnabledDesc")}
+            disabled={!isPushReady}
           >
             <ToggleSwitch
               ariaLabel={t("settings.pushEnabled")}
@@ -434,10 +451,11 @@ export const NotificationsSection = memo(function NotificationsSection() {
             settingId="settings.pushMessagePreview"
             title={t("settings.pushMessagePreview")}
             description={t("settings.pushMessagePreviewDesc")}
+            disabled={isMobileSubDisabled}
           >
             <div className="flex items-center gap-2">
               {!draftPrefs.include_message_preview && (
-                <span className="text-ink-muted inline-flex items-center gap-1 text-[11px]">
+                <span className={cn("text-ink-muted inline-flex items-center gap-1 text-[11px]", isMobileSubDisabled && "opacity-55")}>
                   <Shield className="h-[12px] w-[12px]" />
                   {t("settings.pushMetadataOnly")}
                 </span>
@@ -445,7 +463,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
               <ToggleSwitch
                 ariaLabel={t("settings.pushMessagePreview")}
                 checked={draftPrefs.include_message_preview}
-                disabled={!isPushReady}
+                disabled={isMobileSubDisabled}
                 onChange={(v) => void persistMobilePrefs((p) => ({ ...p, include_message_preview: v }))}
               />
             </div>
@@ -455,6 +473,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
             settingId="settings.pushQuietHours"
             title={t("settings.pushQuietHours")}
             description={t("settings.pushQuietHoursDesc")}
+            disabled={isMobileSubDisabled}
           >
             <div className="flex items-center gap-2">
               {draftPrefs.quiet_hours_enabled && (
@@ -464,7 +483,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
                     ariaLabel={t("settings.notifyQuietStart")}
                     value={draftPrefs.quiet_start_hour}
                     options={HOUR_OPTIONS}
-                    disabled={!isPushReady}
+                    disabled={isMobileSubDisabled}
                     triggerClassName="min-w-[82px]"
                     menuClassName="min-w-[104px]"
                     onChange={(hour) =>
@@ -477,7 +496,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
                     ariaLabel={t("settings.notifyQuietEnd")}
                     value={draftPrefs.quiet_end_hour}
                     options={HOUR_OPTIONS}
-                    disabled={!isPushReady}
+                    disabled={isMobileSubDisabled}
                     triggerClassName="min-w-[82px]"
                     menuClassName="min-w-[104px]"
                     onChange={(hour) =>
@@ -489,7 +508,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
               <ToggleSwitch
                 ariaLabel={t("settings.pushQuietHours")}
                 checked={draftPrefs.quiet_hours_enabled}
-                disabled={!isPushReady}
+                disabled={isMobileSubDisabled}
                 onChange={(v) => void persistMobilePrefs((p) => ({ ...p, quiet_hours_enabled: v }))}
               />
             </div>

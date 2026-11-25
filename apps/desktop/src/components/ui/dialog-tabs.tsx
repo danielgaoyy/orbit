@@ -130,7 +130,7 @@ function TabsTrigger({ className, ...props }: React.ComponentProps<typeof BaseTa
     <BaseTabs.Tab
       data-slot="tabs-trigger"
       className={cn(
-        "hover:text-ink-primary data-[active]:bg-surface-raised data-[active]:text-ink-primary inline-flex h-[24px] cursor-pointer items-center justify-center gap-1.5 rounded-[6px] px-2.5 py-0 text-[12px] font-medium whitespace-nowrap transition-colors outline-none focus-visible:ring-1 focus-visible:ring-ring/45 data-[active]:shadow-2xs",
+        "hover:text-ink-primary data-[active]:bg-surface-raised data-[active]:text-ink-primary inline-flex h-[24px] cursor-pointer items-center justify-center gap-1.5 rounded-[6px] px-2.5 py-0 text-[12px] font-medium whitespace-nowrap transition-colors outline-none focus-visible:ring-1 focus-visible:ring-ring/45 disabled:pointer-events-none disabled:opacity-45 data-[disabled]:pointer-events-none data-[disabled]:opacity-45 data-[active]:shadow-2xs",
         className,
       )}
       {...props}

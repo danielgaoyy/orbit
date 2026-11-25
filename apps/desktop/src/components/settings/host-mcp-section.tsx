@@ -524,6 +524,7 @@ function McpServerDrawer({
             </FieldLabel>
             <ToggleSwitch
               checked={enabled}
+              disabled={saving}
               onChange={setEnabled}
               ariaLabel={t("devTools.enabled")}
             />

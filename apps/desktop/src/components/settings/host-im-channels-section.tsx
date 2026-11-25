@@ -473,10 +473,16 @@ function ChannelForm({
                 {t("im.credentials")}
               </span>
               {isEditing && hasAnySavedSecret && (
-                <label className="text-ink-muted flex cursor-pointer items-center gap-1.5 text-[11px] select-none">
+                <label
+                  className={cn(
+                    "text-ink-muted flex cursor-pointer items-center gap-1.5 text-[11px] select-none",
+                    saving && "pointer-events-none opacity-55",
+                  )}
+                >
                   <Checkbox
                     size="sm"
                     checked={form.clearExistingSecrets}
+                    disabled={saving}
                     onCheckedChange={(checked) =>
                       setForm((f) => ({ ...f, clearExistingSecrets: checked }))
                     }

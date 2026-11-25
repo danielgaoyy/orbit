@@ -671,7 +671,8 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
         collisionPadding={12}
         initialFocus={false}
         finalFocus={false}
-        className="w-auto overflow-visible border-0 bg-transparent p-0 !shadow-none"
+        surface="none"
+        className="w-auto overflow-visible"
       >
         <div className="flex items-start gap-1.5">
           {/* Detached Top-Aligned Left Agent Icon Capsule — wraps installed providers tightly */}
@@ -679,7 +680,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
             <div
               onMouseEnter={() => scheduleFlyoutRow(null, null, true)}
               className={cn(
-                "orbit-native-scroll text-popover-foreground floating-surface border-border-default flex max-h-[min(420px,calc(var(--available-height,540px)-8px))] flex-col items-center gap-0.5 overflow-y-auto overscroll-contain rounded-[11px] border p-1",
+                "orbit-native-scroll text-popover-foreground floating-surface border-border-default pointer-events-auto flex max-h-[min(420px,calc(var(--available-height,540px)-8px))] flex-col items-center gap-0.5 overflow-y-auto overscroll-contain rounded-[11px] border p-1",
               )}
             >
               {detectedProviders.map((p) => {
@@ -755,7 +756,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
           {/* Compact Model Menu Card — shadcn-scale density, Level-2/3 cascading flyouts anchored flush */}
           <div
             ref={modelPopoverRef}
-            className="text-popover-foreground floating-surface border-border-default relative w-[226px] rounded-[11px] border p-1"
+            className="text-popover-foreground floating-surface border-border-default pointer-events-auto relative w-[226px] rounded-[11px] border p-1"
           >
             <div
               onMouseEnter={() => scheduleFlyoutRow(null, null, true)}

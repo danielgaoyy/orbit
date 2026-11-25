@@ -2337,12 +2337,13 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
           const resolvedEffort =
             effectiveProvider === "acp"
               ? null
-              : (resolvedSel?.selected_effort ??
-                resolveSupportedEffortForModel(
-                  spec,
-                  submitTarget.draftEffort,
-                  cat.configured_default_effort,
-                ));
+              : resolvedSel !== null
+                ? resolvedSel.selected_effort
+                : resolveSupportedEffortForModel(
+                    spec,
+                    submitTarget.draftEffort,
+                    cat.configured_default_effort,
+                  );
           const supportsFast =
             effectiveProvider === "acp" || effectiveProvider === "antigravity"
               ? false

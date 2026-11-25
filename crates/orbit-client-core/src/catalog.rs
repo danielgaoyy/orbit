@@ -33,17 +33,7 @@ const CLAUDE_XHIGH_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::Max,
 ];
 
-const CLAUDE_XHIGH_OFF_EFFORTS: &[ReasoningEffort] = &[
-    ReasoningEffort::Off,
-    ReasoningEffort::Low,
-    ReasoningEffort::Medium,
-    ReasoningEffort::High,
-    ReasoningEffort::Xhigh,
-    ReasoningEffort::Max,
-];
-
-const CLAUDE_STD_OFF_EFFORTS: &[ReasoningEffort] = &[
-    ReasoningEffort::Off,
+const CLAUDE_STD_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::Low,
     ReasoningEffort::Medium,
     ReasoningEffort::High,
@@ -246,6 +236,15 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                 ),
                 make_spec(
+                    "claude-fable-5-1",
+                    "Fable 5.1",
+                    "Fable 5.1 · High-capability creative & architectural reasoning",
+                    false,
+                    Some(ReasoningEffort::Medium),
+                    CLAUDE_XHIGH_EFFORTS,
+                    false,
+                ),
+                make_spec(
                     "claude-sonnet-5-5",
                     "Sonnet 5.5",
                     "Sonnet 5.5 · Best for everyday tasks",
@@ -260,7 +259,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     "Haiku 5.5 · Fastest for quick answers",
                     false,
                     Some(ReasoningEffort::Medium),
-                    CLAUDE_XHIGH_OFF_EFFORTS,
+                    CLAUDE_XHIGH_EFFORTS,
                     false,
                 ),
                 make_spec(
@@ -269,7 +268,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     "Opus 5 · Previous release",
                     false,
                     Some(ReasoningEffort::High),
-                    CLAUDE_XHIGH_OFF_EFFORTS,
+                    CLAUDE_XHIGH_EFFORTS,
                     true,
                 ),
                 make_spec(
@@ -278,7 +277,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     "Sonnet 5 · Previous release",
                     false,
                     Some(ReasoningEffort::High),
-                    CLAUDE_XHIGH_OFF_EFFORTS,
+                    CLAUDE_XHIGH_EFFORTS,
                     false,
                 ),
                 make_spec(
@@ -287,7 +286,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     "Opus 4.8 · Previous release",
                     false,
                     Some(ReasoningEffort::High),
-                    CLAUDE_XHIGH_OFF_EFFORTS,
+                    CLAUDE_XHIGH_EFFORTS,
                     true,
                 ),
                 make_spec(
@@ -296,7 +295,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     "Opus 4.6 · Most capable for complex work",
                     false,
                     Some(ReasoningEffort::High),
-                    CLAUDE_STD_OFF_EFFORTS,
+                    CLAUDE_STD_EFFORTS,
                     true,
                 ),
                 make_spec(
@@ -305,7 +304,7 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     "Sonnet 4.6 · Best for everyday tasks",
                     false,
                     Some(ReasoningEffort::High),
-                    CLAUDE_STD_OFF_EFFORTS,
+                    CLAUDE_STD_EFFORTS,
                     false,
                 ),
                 make_spec(
@@ -321,14 +320,23 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
         },
         ProviderKind::Antigravity => ProviderModelCatalog {
             provider: ProviderKind::Antigravity,
-            configured_default_model: Some("gemini-4-carbon".to_string()),
-            configured_default_effort: Some(ReasoningEffort::Medium),
+            configured_default_model: Some("gemini-4-neon".to_string()),
+            configured_default_effort: Some(ReasoningEffort::High),
             models: vec![
+                make_spec(
+                    "gemini-4-neon",
+                    "Gemini 4 Neon",
+                    "Next-generation flagship reasoning & coding",
+                    true,
+                    Some(ReasoningEffort::High),
+                    AGY_XHIGH_EFFORTS,
+                    true,
+                ),
                 make_spec(
                     "gemini-4-carbon",
                     "Gemini 4 Carbon",
                     "Flagship reasoning & multi-file software engineering",
-                    true,
+                    false,
                     Some(ReasoningEffort::Medium),
                     AGY_STD_EFFORTS,
                     true,
@@ -350,6 +358,15 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     Some(ReasoningEffort::High),
                     AGY_XHIGH_EFFORTS,
                     true,
+                ),
+                make_spec(
+                    "gemini-pro-orchestrator-neon",
+                    "Orchestrator (Neon)",
+                    "Multi-agent coordinator powered by Neon",
+                    false,
+                    None,
+                    &[],
+                    false,
                 ),
                 make_spec(
                     "gemini-pro-orchestrator",
@@ -394,6 +411,15 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                     false,
                     Some(ReasoningEffort::Medium),
                     AGY_STD_EFFORTS,
+                    false,
+                ),
+                make_spec(
+                    "gpt-oss-120b-medium",
+                    "GPT-OSS 120B (Medium)",
+                    "Open-weights coding & general reasoning model",
+                    false,
+                    None,
+                    &[],
                     false,
                 ),
             ],
@@ -1253,10 +1279,10 @@ mod tests {
             models: Vec::new(),
         };
         let merged = effective_provider_catalogs(&[custom_codex, empty_claude]);
-        assert_eq!(merged[0].models.len(), 10);
+        assert_eq!(merged[0].models.len(), 11);
         assert_eq!(merged[1].models.len(), 1);
         assert_eq!(merged[1].models[0].id, "gpt-custom");
-        assert_eq!(merged[2].models.len(), 8);
+        assert_eq!(merged[2].models.len(), 11);
     }
 
     #[test]
@@ -1414,6 +1440,28 @@ mod tests {
         assert!(orch_res.thinking_options.is_empty());
         assert!(!orch_res.supports_fast_mode);
 
+        let orch_neon_res = resolve_model_selection(
+            &catalogs,
+            ProviderKind::Antigravity,
+            Some("gemini-pro-orchestrator-neon"),
+            Some(ReasoningEffort::High),
+        );
+        assert_eq!(
+            orch_neon_res.selected_model_id.as_deref(),
+            Some("gemini-pro-orchestrator-neon")
+        );
+        assert_eq!(orch_neon_res.selected_effort, None);
+        assert!(orch_neon_res.thinking_options.is_empty());
+        assert!(!orch_neon_res.supports_fast_mode);
+
+        let agy_default_res =
+            resolve_model_selection(&catalogs, ProviderKind::Antigravity, None, None);
+        assert_eq!(
+            agy_default_res.selected_model_id.as_deref(),
+            Some("gemini-4-neon")
+        );
+        assert_eq!(agy_default_res.selected_effort, Some(ReasoningEffort::High));
+
         // Regression test (P0 #1): active models on new providers are never wiped by legacy core
         // RETIRED_MODEL_SLUGS, while legacy Antigravity still resets retired `gemini-2.5-pro`.
         let gemini_res = resolve_model_selection(
@@ -1460,7 +1508,7 @@ mod tests {
         );
         assert_eq!(
             agy_retired.selected_model_id.as_deref(),
-            Some("gemini-4-carbon")
+            Some("gemini-4-neon")
         );
     }
 

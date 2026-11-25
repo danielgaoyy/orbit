@@ -43,7 +43,7 @@ In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight
 
 ## 2. `e2e_pitfall_regressions` 历史踩坑回归清单
 
-[`crates/orbit-cli/tests/e2e_pitfall_regressions.rs`](../../crates/orbit-cli/tests/e2e_pitfall_regressions.rs) 固化了过往生产故障的自动化端到端拦截（其中基于 Unix Python mock / 进程组的 6 条通过 `#[cfg(unix)]` 门控，跨平台 3 条在 Linux/macOS/Windows 均运行）：
+[`crates/orbit-cli/tests/e2e_pitfall_regressions.rs`](../../crates/orbit-cli/tests/e2e_pitfall_regressions.rs) 固化了过往生产故障的自动化端到端拦截（其中基于 Unix Python mock / 进程组的 10 条通过 `#[cfg(unix)]` 门控，跨平台 3 条在 Linux/macOS/Windows 均运行）：
 
 | 用例名 | 平台 | 覆盖的历史生产故障 |
 | --- | --- | --- |
@@ -57,6 +57,9 @@ In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight
 | `pitfall_08_multi_agent_non_interrupting_delivery_and_stall_recovery` | Unix | Antigravity + Codex + Claude 多代理非打断异步投递（`0 session/cancel` + `Queued -> Dispatched -> Settled` FIFO）、纯思考停滞检测（`latest_visible_progress_ms < latest_activity_ms`）+ 保队列打断继续（`interrupt_agent_and_continue`）及人类抢占重排优先顺序 |
 | `pitfall_09_antigravity_interrupt_steer_bg_isolation_subagent_order_and_stderr` | Unix | Antigravity 会话标题实时同步（`session_info_update`）、多命令 Shell 与后台任务隔离防劫持、打断/Steer 事务回滚上下文交接 + 原位 `bg_task` 收敛 + 抢占轮次用量补记（`usage_ledger`）、空队列 `InterruptAndDrainQueue` 干净回 `Idle`、原生子代理前后台实时轮询 + 中途取消 + 重启回放 `seq` 保序及致命 `stderr` 错误提示上浮 |
 | `pitfall_10_nonblocking_workspace_watcher_and_initializing_cancel` | Unix | 异步剪枝/限流工作区文件监听不阻塞 `CreateAgent` 与同连接 `Ping/Pong`、消除会话循环头阻塞、以及 `opt_*` / `Initializing` 阶段取消链路干净回落到 `Idle` |
+| `pitfall_11_antigravity_open_rpc_background_wait_settles_and_wakes_without_stall` | Unix | Antigravity 在 `session/prompt` 持长挂起等待后台定时器期间，已生成回复即时收敛为 `streaming: false` 并转入 `Waiting for 1 timer` 静止态、定时器触发后经同一长连接唤醒续写独立回复并干净回到 `Idle` |
+| `pitfall_12_antigravity_event_driven_wakeup_late_reply_and_acp_replay_dedup` | Unix | Antigravity OS 事件驱动（`notify`）监听唤醒：`WAKEUP_IDLE_SETTLE_GRACE` 回落后迟到 `PLANNER_RESPONSE` 零等待自动冲刷恢复、以及新一轮提示词触发 `agy` ACP 重放历史唤醒消息/思考/工具/运行中后台任务的幂等去重与真实回复保留 |
+| `pitfall_13_cross_provider_bg_wait_synthetic_plan_gate_and_permission_steer` | Unix | 跨 Provider 交互语义对齐：Claude `bgwait_*` 后台任务等待态 Stage 持久展示、Codex 合成计划审批门（`plan_approval`）排队队列冲刷零死锁、以及待审批门期间人类 Steer 走 Option A 无损排队不丢失 |
 
 > **编写规则**：凡修复涉及消息流转、分端状态同步、Relay 建连或并行协作的生产 Bug，必须在同一 PR 中新增最小复现回归用例。
 

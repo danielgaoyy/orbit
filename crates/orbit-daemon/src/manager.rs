@@ -21,8 +21,8 @@ use orbit_protocol::{
 };
 use orbit_providers::{
     DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, PromptOrigin,
-    SessionLaunchConfig, find_provider_executable, provider_model_supports_fast_mode,
-    spawn_provider_session,
+    SessionLaunchConfig, clamp_provider_model_effort, find_provider_executable,
+    provider_model_supports_fast_mode, spawn_provider_session,
 };
 use orbit_shim::{
     ShimClient, ShimFrame, ShimMode, ShimSpawnSpec, connect_existing_shim, kill_existing_shim,
@@ -4135,6 +4135,16 @@ impl AgentOrchestrator {
         provider_model_supports_fast_mode(provider, model, cached.as_deref())
     }
 
+    async fn clamp_effort_for_model(
+        &self,
+        provider: ProviderKind,
+        model: Option<&str>,
+        current_effort: Option<ReasoningEffort>,
+    ) -> Option<Option<ReasoningEffort>> {
+        let cached = self.provider_catalogs.read().await;
+        clamp_provider_model_effort(provider, model, current_effort, cached.as_deref()).await
+    }
+
     pub async fn set_agent_config(
         &self,
         agent_id: &str,
@@ -4186,27 +4196,37 @@ impl AgentOrchestrator {
     ) -> anyhow::Result<()> {
         let aid = agent_id.to_string();
         let existing_opt = self.try_store(move |s| s.get_agent(&aid)).await?;
-        let clear_fast = if let Some(existing) = existing_opt {
+        let (clear_fast, clamped_effort) = if let Some(existing) = existing_opt {
             let supports_fast = self
                 .model_supports_fast_mode(existing.provider, model.as_deref())
                 .await;
-            if existing.fast_mode && !supports_fast {
+            let clear_fast = if existing.fast_mode && !supports_fast {
                 Some(false)
             } else {
                 None
-            }
+            };
+            let clamped_effort = self
+                .clamp_effort_for_model(existing.provider, model.as_deref(), existing.effort)
+                .await;
+            (clear_fast, clamped_effort)
         } else {
-            None
+            (None, None)
         };
         let aid_upd = agent_id.to_string();
         let model_db = model.clone();
-        self.try_store(move |s| s.update_agent_model(&aid_upd, model_db.as_deref(), clear_fast))
-            .await?;
+        self.try_store(move |s| {
+            if let Some(next_effort) = clamped_effort {
+                s.update_agent_config(&aid_upd, model_db.as_deref(), next_effort, clear_fast)
+            } else {
+                s.update_agent_model(&aid_upd, model_db.as_deref(), clear_fast)
+            }
+        })
+        .await?;
         if let Some(tx) = self.live_agent_tx(agent_id).await {
             let _ = tx
                 .send(DriverCommand::SetConfig {
                     model,
-                    effort: None,
+                    effort: clamped_effort.flatten(),
                     fast_mode: clear_fast,
                 })
                 .await;
@@ -4265,6 +4285,15 @@ impl AgentOrchestrator {
             }
         };
 
+        let clamped_effort = if effort.is_none() && model.is_some() {
+            self.clamp_effort_for_model(existing.provider, effective_model, existing.effort)
+                .await
+        } else {
+            None
+        };
+        let effective_effort_db = effort.map(Some).or(clamped_effort);
+        let driver_effort = effort.or_else(|| clamped_effort.flatten());
+
         let clean_handle = handle.map(|h| sanitize_handle(&h));
         let mut effective_labels = labels;
         // Explicit user/API title edits automatically lock the title against future AI auto-naming
@@ -4282,7 +4311,7 @@ impl AgentOrchestrator {
                 &aid_upd,
                 title.as_deref(),
                 model_db.as_deref().map(Some),
-                effort.map(Some),
+                effective_effort_db,
                 mode_db.as_ref(),
                 effective_labels.as_ref(),
                 clean_handle.as_deref(),
@@ -4295,11 +4324,15 @@ impl AgentOrchestrator {
             if let Some(md) = mode {
                 let _ = tx.send(DriverCommand::SetMode { mode: md }).await;
             }
-            if model.is_some() || effort.is_some() || effective_fast_mode.is_some() {
+            if model.is_some()
+                || effort.is_some()
+                || clamped_effort.is_some()
+                || effective_fast_mode.is_some()
+            {
                 let _ = tx
                     .send(DriverCommand::SetConfig {
                         model,
-                        effort,
+                        effort: driver_effort,
                         fast_mode: effective_fast_mode,
                     })
                     .await;
@@ -7608,17 +7641,28 @@ impl AgentOrchestrator {
                 model,
             } => {
                 let aid = agent_id.to_string();
-                let _ = self
+                let normalized_model = model
+                    .map(|m| m.trim().to_string())
+                    .filter(|m| !m.is_empty());
+                if let Ok(Some(updated)) = self
                     .with_store(move |s| {
                         let _ = s.set_persistence_ref(&aid, &persistence_ref);
-                        if let Some(m) = model
+                        if let Some(ref m) = normalized_model
                             && let Ok(Some(mut ag)) = s.get_agent(&aid)
+                            && ag.model.as_deref() != Some(m.as_str())
                         {
-                            ag.model = Some(m);
+                            ag.model = Some(m.clone());
                             let _ = s.upsert_agent(&ag, Some(&persistence_ref));
+                            return Some(ag);
                         }
+                        None
                     })
-                    .await;
+                    .await
+                {
+                    let _ = self
+                        .broadcast_tx
+                        .send(DaemonBroadcast::AgentUpdated(updated));
+                }
                 return;
             }
             DriverEvent::SessionTitleUpdated { title } => {
@@ -15219,6 +15263,374 @@ diff --git a/config/prod.env b/config/prod.env\n\
         }
         assert!(saw_status_tl, "expected StatusChanged(Idle) broadcast");
         assert!(saw_agent_upd, "expected AgentUpdated(Idle) broadcast");
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[tokio::test]
+    async fn session_initialized_broadcasts_agent_updated_only_when_model_changes() {
+        let (home_dir, store, orch) = test_orchestrator("sess_init_bcast").await;
+        let ws_dir = home_dir.join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("create repo");
+        let now = Utc::now();
+
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_sess_init".into(),
+                title: "Session Init Repo".into(),
+                cwd: ws_dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+
+        let mk_ag = |agent_id: &str, provider: ProviderKind, model: Option<&str>| AgentSummary {
+            agent_id: agent_id.into(),
+            workspace_id: "ws_sess_init".into(),
+            cwd: ws_dir.to_string_lossy().to_string(),
+            title: "Session Init Agent".into(),
+            provider,
+            model: model.map(ToOwned::to_owned),
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::FullAccess,
+            status: AgentStatus::Initializing,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
+        };
+
+        store
+            .upsert_agent(
+                &mk_ag(
+                    "ag_orch_init",
+                    ProviderKind::Antigravity,
+                    Some("gemini-pro-orchestrator-neon"),
+                ),
+                None,
+            )
+            .expect("upsert agy agent");
+        store
+            .upsert_agent(&mk_ag("ag_codex_backfill", ProviderKind::Codex, None), None)
+            .expect("upsert codex agent");
+
+        let gen_agy = orch.bump_generation("ag_orch_init").await;
+        let gen_codex = orch.bump_generation("ag_codex_backfill").await;
+        let mut bcast_rx = orch.broadcast_tx.subscribe();
+
+        // Empty or unchanged SessionInitialized model must not overwrite or emit AgentUpdated.
+        orch.ingest_driver_event(
+            "ag_orch_init",
+            gen_agy,
+            DriverEvent::SessionInitialized {
+                persistence_ref: "traj_orch_1".into(),
+                model: Some("   ".into()),
+            },
+        )
+        .await;
+        orch.ingest_driver_event(
+            "ag_orch_init",
+            gen_agy,
+            DriverEvent::SessionInitialized {
+                persistence_ref: "traj_orch_1".into(),
+                model: Some("gemini-pro-orchestrator-neon".into()),
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                bcast_rx.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "unchanged or blank SessionInitialized model should not broadcast AgentUpdated"
+        );
+        assert_eq!(
+            store
+                .get_agent("ag_orch_init")
+                .expect("get")
+                .expect("present")
+                .model
+                .as_deref(),
+            Some("gemini-pro-orchestrator-neon")
+        );
+
+        // First-time default model discovery must update SQLite and broadcast AgentUpdated.
+        orch.ingest_driver_event(
+            "ag_codex_backfill",
+            gen_codex,
+            DriverEvent::SessionInitialized {
+                persistence_ref: "thr_codex_1".into(),
+                model: Some("gpt-6.2-sol".into()),
+            },
+        )
+        .await;
+        assert_eq!(
+            store
+                .get_agent("ag_codex_backfill")
+                .expect("get")
+                .expect("present")
+                .model
+                .as_deref(),
+            Some("gpt-6.2-sol")
+        );
+        let msg = bcast_rx
+            .try_recv()
+            .expect("expected AgentUpdated broadcast when model backfilled");
+        assert!(matches!(
+            msg,
+            DaemonBroadcast::AgentUpdated(ref ag)
+                if ag.agent_id == "ag_codex_backfill"
+                    && ag.model.as_deref() == Some("gpt-6.2-sol")
+        ));
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[tokio::test]
+    async fn set_agent_model_clamps_incompatible_effort_against_catalog() {
+        let (home_dir, store, orch) = test_orchestrator("clamp_effort").await;
+        let ws_dir = home_dir.join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("create repo");
+        let now = Utc::now();
+
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_clamp".into(),
+                title: "Clamp Repo".into(),
+                cwd: ws_dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+
+        let mk_ag = |agent_id: &str,
+                     provider: ProviderKind,
+                     model: &str,
+                     effort: ReasoningEffort| AgentSummary {
+            agent_id: agent_id.into(),
+            workspace_id: "ws_clamp".into(),
+            cwd: ws_dir.to_string_lossy().to_string(),
+            title: "Clamp Agent".into(),
+            provider,
+            model: Some(model.into()),
+            effort: Some(effort),
+            fast_mode: false,
+            mode: SessionMode::AcceptEdits,
+            status: AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
+        };
+
+        store
+            .upsert_agent(
+                &mk_ag(
+                    "ag_agy_clamp",
+                    ProviderKind::Antigravity,
+                    "gemini-4-neon",
+                    ReasoningEffort::Xhigh,
+                ),
+                None,
+            )
+            .expect("upsert agy");
+        store
+            .upsert_agent(
+                &mk_ag(
+                    "ag_codex_clamp",
+                    ProviderKind::Codex,
+                    "gpt-6.2-sol",
+                    ReasoningEffort::Ultra,
+                ),
+                None,
+            )
+            .expect("upsert codex");
+
+        let (agy_tx, mut agy_rx) = mpsc::channel(8);
+        let done1 = Arc::new(tokio::sync::Notify::new());
+        done1.notify_one();
+        let dummy1 = tokio::spawn(std::future::pending::<()>());
+        orch.live_agents.write().await.insert(
+            "ag_agy_clamp".into(),
+            LiveAgentEntry {
+                generation: 1,
+                cmd_tx: agy_tx,
+                done_notify: done1,
+                ingest_abort: dummy1.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+
+        let (codex_tx, mut codex_rx) = mpsc::channel(8);
+        let done2 = Arc::new(tokio::sync::Notify::new());
+        done2.notify_one();
+        let dummy2 = tokio::spawn(std::future::pending::<()>());
+        orch.live_agents.write().await.insert(
+            "ag_codex_clamp".into(),
+            LiveAgentEntry {
+                generation: 1,
+                cmd_tx: codex_tx,
+                done_notify: done2,
+                ingest_abort: dummy2.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+
+        // Switching from Gemini 4 Neon (Xhigh) -> Gemini 4 Carbon (max High, default Medium) clamps to Medium.
+        orch.set_agent_model("ag_agy_clamp", Some("gemini-4-carbon".into()))
+            .await
+            .expect("set_agent_model carbon");
+        let saved_carbon = store.get_agent("ag_agy_clamp").expect("get").expect("some");
+        assert_eq!(saved_carbon.model.as_deref(), Some("gemini-4-carbon"));
+        assert_eq!(saved_carbon.effort, Some(ReasoningEffort::Medium));
+        assert!(matches!(
+            agy_rx.try_recv().expect("driver SetConfig carbon"),
+            DriverCommand::SetConfig {
+                model: Some(ref m),
+                effort: Some(ReasoningEffort::Medium),
+                ..
+            } if m == "gemini-4-carbon"
+        ));
+
+        // Switching to Orchestrator (Neon) clears effort to None.
+        orch.set_agent_model("ag_agy_clamp", Some("gemini-pro-orchestrator-neon".into()))
+            .await
+            .expect("set_agent_model orchestrator neon");
+        let saved_orch = store.get_agent("ag_agy_clamp").expect("get").expect("some");
+        assert_eq!(
+            saved_orch.model.as_deref(),
+            Some("gemini-pro-orchestrator-neon")
+        );
+        assert_eq!(saved_orch.effort, None);
+        assert!(matches!(
+            agy_rx.try_recv().expect("driver SetConfig orch"),
+            DriverCommand::SetConfig {
+                model: Some(ref m),
+                effort: None,
+                ..
+            } if m == "gemini-pro-orchestrator-neon"
+        ));
+
+        // Populate deterministic Codex catalog so unit tests remain isolated from host `~/.codex/config.toml`.
+        *orch.provider_catalogs.write().await = Some(vec![ProviderModelCatalog {
+            provider: ProviderKind::Codex,
+            configured_default_model: Some("gpt-6.2-sol".into()),
+            configured_default_effort: Some(ReasoningEffort::Medium),
+            models: vec![orbit_protocol::ProviderModelSpec {
+                id: "gpt-6-luna".into(),
+                label: "GPT 6 Luna".into(),
+                description: "Fast Codex model without Ultra".into(),
+                is_default: false,
+                default_effort: Some(ReasoningEffort::Medium),
+                thinking_options: [
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                    ReasoningEffort::Xhigh,
+                    ReasoningEffort::Max,
+                ]
+                .into_iter()
+                .map(|eff| orbit_protocol::ThinkingOptionSpec {
+                    effort: eff,
+                    label: eff.display_label().to_string(),
+                    description: None,
+                    is_default: eff == ReasoningEffort::Medium,
+                })
+                .collect(),
+                supports_fast_mode: true,
+            }],
+        }]);
+
+        // Switching Codex from gpt-6.2-sol (Ultra) -> gpt-6-luna (no Ultra) via update_agent clamps effort.
+        let updated_luna = orch
+            .update_agent(
+                "ag_codex_clamp",
+                None,
+                Some("gpt-6-luna".into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("update_agent luna");
+        assert_eq!(updated_luna.model.as_deref(), Some("gpt-6-luna"));
+        assert_eq!(updated_luna.effort, Some(ReasoningEffort::Medium));
+        assert!(matches!(
+            codex_rx.try_recv().expect("driver SetConfig luna"),
+            DriverCommand::SetConfig {
+                model: Some(ref m),
+                effort: Some(ReasoningEffort::Medium),
+                ..
+            } if m == "gpt-6-luna"
+        ));
 
         let _ = std::fs::remove_dir_all(&home_dir);
     }

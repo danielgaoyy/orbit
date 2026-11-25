@@ -76,7 +76,7 @@
   --destructive: var(--signal-danger);
   --border: var(--border-subtle);
   --input: var(--border-default);
-  --ring: var(--signal-info);
+  --ring: oklch(0.45 0.008 258);
 
   /* Global Motion System Tokens (Critically Damped, Natural Deceleration) */
   --ease-out-expo: cubic-bezier(0.23, 1, 0.32, 1);
@@ -156,7 +156,7 @@
   --destructive: var(--signal-danger);
   --border: var(--border-subtle);
   --input: var(--border-default);
-  --ring: var(--signal-info);
+  --ring: oklch(0.68 0.008 258);
 }
 
 @theme inline {
@@ -224,7 +224,7 @@
 
 @layer base {
   * {
-    @apply border-border outline-ring/50;
+    @apply border-border;
   }
 
   html,
@@ -258,6 +258,38 @@
   .select-none {
     user-select: none;
     -webkit-user-select: none;
+  }
+
+  /* Suppress native OS/WebKit blue focus outlines on all button-like controls; keyboard focus uses monochrome tokens */
+  button,
+  button:focus,
+  button:focus-visible,
+  [role="button"],
+  [role="button"]:focus,
+  [role="button"]:focus-visible,
+  [role="menuitem"],
+  [role="menuitem"]:focus,
+  [role="menuitem"]:focus-visible,
+  [role="option"],
+  [role="option"]:focus,
+  [role="option"]:focus-visible,
+  [role="tab"],
+  [role="tab"]:focus,
+  [role="tab"]:focus-visible,
+  [role="switch"],
+  [role="switch"]:focus,
+  [role="switch"]:focus-visible,
+  [role="checkbox"],
+  [role="checkbox"]:focus,
+  [role="checkbox"]:focus-visible,
+  [role="radio"],
+  [role="radio"]:focus,
+  [role="radio"]:focus-visible,
+  summary,
+  summary:focus,
+  summary:focus-visible {
+    outline: none;
+    -webkit-tap-highlight-color: transparent;
   }
 
   ::selection {

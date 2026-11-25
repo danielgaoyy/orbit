@@ -1,4 +1,4 @@
-import { createContext, useContext, type ReactNode } from "react";
+import { createContext, useContext, useRef, type ReactNode } from "react";
 import { Dialog } from "@base-ui/react/dialog";
 import { ChevronRight, RotateCcw, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -290,7 +290,7 @@ export function SettingResourceRow({
           onClick={onClick}
           className={cn(
             layout,
-            "cursor-pointer hover:bg-surface-recessed focus-visible:outline-border-strong focus-visible:-outline-offset-2",
+            "cursor-pointer outline-none hover:bg-surface-recessed focus-visible:bg-surface-recessed focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring/40",
           )}
         >
           {body}
@@ -326,6 +326,7 @@ export function SettingDrawer({
 }) {
   const portalContainer = useContext(SettingsDrawerPortalContext);
   const contained = Boolean(portalContainer);
+  const popupRef = useRef<HTMLDivElement>(null);
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange} onOpenChangeComplete={onOpenChangeComplete}>
       <Dialog.Portal container={portalContainer ?? undefined}>
@@ -336,7 +337,17 @@ export function SettingDrawer({
           )}
         />
         <Dialog.Popup
+          ref={popupRef}
           data-slot="setting-drawer"
+          initialFocus={() => {
+            const popup = popupRef.current;
+            if (!popup) return false;
+            const active = document.activeElement;
+            if (active instanceof HTMLElement && active !== popup && popup.contains(active)) {
+              return false;
+            }
+            return popup;
+          }}
           className={cn(
             "settings-drawer border-border-default bg-surface-overlay text-ink-primary inset-y-0 right-0 z-50 flex w-[480px] max-w-full flex-col border-l text-[13px] outline-none",
             contained ? "absolute shadow-xl" : "fixed",

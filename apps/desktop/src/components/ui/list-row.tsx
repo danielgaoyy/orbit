@@ -33,7 +33,7 @@ export const ListRow = React.forwardRef<HTMLButtonElement, ListRowProps>(functio
       type={type}
       data-selected={selected ? "true" : undefined}
       className={cn(
-        "group/listrow flex w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-45",
+        "group/listrow flex w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 text-left transition-colors outline-none focus-visible:ring-1 focus-visible:ring-ring/45 disabled:pointer-events-none disabled:opacity-45",
         subtitle
           ? "min-h-[40px] py-1.5"
           : density === "compact"

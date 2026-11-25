@@ -1,4 +1,12 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react";
 import {
   BarChart3,
   Bell,
@@ -235,10 +243,14 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
   const scoped = scopedPages.has(coreSection);
   const splitEditor = coreSection === "instructions_memory" && subTab !== "rules" && subTab !== "memory";
 
-  const closeBtn = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
   const search = useRef<HTMLInputElement>(null);
   const canvas = useRef<HTMLDivElement>(null);
   const [dialogHost, setDialogHost] = useState<HTMLDivElement | null>(null);
+  const setDialogRef = useCallback((node: HTMLDivElement | null) => {
+    dialogRef.current = node;
+    setDialogHost(node);
+  }, []);
   const [query, setQuery] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [jump, setJump] = useState<{ section: typeof section; id: string } | null>(null);
@@ -272,7 +284,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
   };
 
   useLayoutEffect(() => {
-    closeBtn.current?.focus({ preventScroll: true });
+    dialogRef.current?.focus({ preventScroll: true });
   }, []);
   useLayoutEffect(() => {
     if (canvas.current) canvas.current.scrollTop = 0;
@@ -411,13 +423,14 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
           className="settings-backdrop fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-5 select-none dark:bg-black/55"
         >
           <div
-            ref={setDialogHost}
+            ref={setDialogRef}
             role="dialog"
             aria-modal="true"
             aria-label={t("common.settings")}
+            tabIndex={-1}
             data-slot="settings-view"
             data-closing={closing || undefined}
-            className="settings-view settings-dialog border-border-default bg-surface-base text-ink-primary floating-surface relative flex h-[min(820px,88vh)] w-[min(1180px,92vw)] overflow-hidden rounded-[16px] border text-[13px]"
+            className="settings-view settings-dialog border-border-default bg-surface-base text-ink-primary floating-surface relative flex h-[min(820px,88vh)] w-[min(1180px,92vw)] overflow-hidden rounded-[16px] border text-[13px] outline-none"
           >
             <aside className="border-border-subtle flex w-[240px] max-w-[38vw] shrink-0 flex-col border-r px-[12px] pt-[14px]">
               <div className="text-ink-primary px-2 pb-2.5 text-[15px] leading-[20px] font-semibold tracking-[-0.015em]">
@@ -549,7 +562,6 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                   <div />
                 )}
                 <IconButton
-                  ref={closeBtn}
                   size="md"
                   tooltip={t("settings.closeSettings")}
                   shortcut="Esc"

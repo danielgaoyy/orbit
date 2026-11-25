@@ -108,10 +108,21 @@ export async function exerciseLocalSettings(cdp) {
     const close = window.smokeFindControl('[data-slot="settings-view"] button', "Close settings");
     return shell?.getAttribute("role") === "dialog" &&
       shell.getAttribute("aria-modal") === "true" &&
+      document.activeElement === shell &&
+      document.activeElement !== close &&
       rect && rect.left > 0 && rect.top > 0 &&
       rect.right < innerWidth && rect.bottom < innerHeight &&
       rail?.getBoundingClientRect().width === 240 && Boolean(close);
   });
+  const buttonFocusSafe = await evaluate(() => {
+    const styles = getComputedStyle(document.documentElement);
+    const ring = styles.getPropertyValue("--ring").trim();
+    const signalInfo = styles.getPropertyValue("--signal-info").trim();
+    const close = window.smokeFindControl('[data-slot="settings-view"] button', "Close settings");
+    const closeOutline = close ? getComputedStyle(close).outlineStyle : null;
+    return Boolean(ring) && ring !== signalInfo && closeOutline === "none";
+  });
+  assert.ok(buttonFocusSafe, "Buttons should never render a native browser outline or blue signal-info ring");
   const railFits = await evaluate(() => {
     const shellRect = document.querySelector('[data-slot="settings-view"]')?.getBoundingClientRect();
     if (!shellRect) return false;
@@ -132,7 +143,10 @@ export async function exerciseLocalSettings(cdp) {
   await waitFor("inline local pairing QR", () =>
     document.querySelector('[data-setting-id="settings.mobilePairing"] img')?.naturalWidth > 0);
   await click('[data-setting-id="settings.fleetConnectHost"]', "Connect remote host");
-  await waitFor("host connection drawer", () => Boolean(document.querySelector('[data-slot="setting-drawer"]')));
+  await waitFor("host connection drawer without focusing close button", () => {
+    const drawer = document.querySelector('[data-slot="setting-drawer"]');
+    return Boolean(drawer) && document.activeElement?.getAttribute("aria-label") !== "Close";
+  });
   await key("Escape", "Escape");
   await waitFor("host overview retained", () => !document.querySelector('[data-slot="setting-drawer"]') &&
     document.querySelector('[data-settings-section="hosts"][aria-current="page"]'));

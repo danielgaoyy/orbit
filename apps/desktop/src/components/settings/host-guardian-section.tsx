@@ -250,7 +250,7 @@ export function HostGuardianSection({ hostId }: { hostId: string | null }) {
                 aria-pressed={checked}
                 onClick={() => orbitActions.setDraftConfig({ mode })}
                 className={cn(
-                  "cursor-pointer rounded-lg border p-3 text-left focus-visible:outline-border-strong",
+                  "cursor-pointer rounded-lg border p-3 text-left outline-none focus-visible:ring-1 focus-visible:ring-ring/45",
                   checked
                     ? "border-border-strong bg-surface-recessed"
                     : "border-border-subtle bg-surface-raised hover:border-border-default",

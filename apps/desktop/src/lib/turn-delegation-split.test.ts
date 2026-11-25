@@ -7,6 +7,7 @@ import {
   extractFallbackDispatchCall,
   extractStateChangeMilestoneCall,
   isDelegationMilestoneToolCall,
+  isTimelineAgentMessageHidden,
   splitStepGroupChronologically,
   summarizeWorkChunk,
 } from "./turn-delegation-split.ts";
@@ -99,7 +100,7 @@ describe("turn-delegation-split", () => {
     assert.equal(res.chunks[0]?.items, items);
   });
 
-  it("extracts trailing send_message out of reads+commands and removes 'used a tool' from summary", () => {
+  it("keeps outgoing send_message inside the folded work group without fragmenting steps", () => {
     const items: TimelineItemView[] = [];
     for (let i = 1; i <= 26; i += 1) {
       items.push(makeReadTool(i, `/repo/file_${i}.rs`));
@@ -110,24 +111,13 @@ describe("turn-delegation-split", () => {
     items.push(makeSendMessageTool(46, "{}"));
 
     const res = splitStepGroupChronologically(items);
-    assert.equal(res.hasDelegations, true);
-    assert.equal(res.chunks.length, 2);
-
-    const [workChunk, delegationChunk] = res.chunks;
-    assert.equal(workChunk.kind, "work");
-    assert.equal(workChunk.items.length, 45);
-    assert.equal(delegationChunk.kind, "delegation");
-    assert.equal(delegationChunk.items.length, 1);
-    assert.equal(delegationChunk.items[0].call_id, "msg-46");
-
-    const summary = summarizeWorkChunk(workChunk.items);
-    assert.equal(summary.label, "Read 26 files, ran 19 commands");
-    assert.equal(summary.counts.other_tool_count, 0);
-    assert.equal(summary.counts.read_file_count, 26);
-    assert.equal(summary.counts.command_count, 19);
+    assert.equal(res.hasDelegations, false);
+    assert.equal(res.chunks.length, 1);
+    assert.equal(res.chunks[0].kind, "work");
+    assert.equal(res.chunks[0].items.length, 46);
   });
 
-  it("splits interleaved work -> parallel subagents -> follow-up work in strict chronological order", () => {
+  it("keeps subagent dispatches folded inside work groups alongside reads and commands", () => {
     const items: TimelineItemView[] = [
       makeReadTool(1, "/repo/AGENTS.md"),
       makeReadTool(2, "/repo/Cargo.toml"),
@@ -137,32 +127,26 @@ describe("turn-delegation-split", () => {
     ];
 
     const res = splitStepGroupChronologically(items);
-    assert.equal(res.hasDelegations, true);
-    assert.equal(res.chunks.length, 3);
+    assert.equal(res.hasDelegations, false);
+    assert.equal(res.chunks.length, 1);
     assert.equal(res.chunks[0].kind, "work");
-    assert.equal(res.chunks[0].items.length, 2);
-    assert.equal(res.chunks[1].kind, "delegation");
-    assert.equal(res.chunks[1].items.length, 2);
-    assert.equal(res.chunks[2].kind, "work");
-    assert.equal(res.chunks[2].items.length, 1);
-
-    assert.equal(summarizeWorkChunk(res.chunks[0].items).label, "Read 2 files");
-    assert.equal(summarizeWorkChunk(res.chunks[2].items).label, "Ran a command");
+    assert.equal(res.chunks[0].items.length, 5);
+    assert.equal(summarizeWorkChunk(res.chunks[0].items).label, "Ran agents, read files, ran a command");
   });
 
-  it("renders pure-delegation step groups with zero empty work chunks", () => {
+  it("keeps pure-subagent step groups folded inside one work chunk", () => {
     const items: TimelineItemView[] = [
       makeSubagentTool(10, "Researcher A"),
       makeSubagentTool(11, "Researcher B"),
     ];
     const res = splitStepGroupChronologically(items);
-    assert.equal(res.hasDelegations, true);
+    assert.equal(res.hasDelegations, false);
     assert.equal(res.chunks.length, 1);
-    assert.equal(res.chunks[0].kind, "delegation");
+    assert.equal(res.chunks[0].kind, "work");
     assert.equal(res.chunks[0].items.length, 2);
   });
 
-  it("preserves failed generic invoke_subagent calls and extracts fallback dispatch metadata", () => {
+  it("keeps failed generic invoke_subagent inside the folded work group while still extracting fallback metadata", () => {
     const failedDispatch: TimelineItemView = {
       item_type: "tool_call",
       seq: 20,
@@ -180,12 +164,12 @@ describe("turn-delegation-split", () => {
       diff_files: [],
     };
 
-    assert.equal(isDelegationMilestoneToolCall(failedDispatch), true);
+    assert.equal(isDelegationMilestoneToolCall(failedDispatch), false);
     const res = splitStepGroupChronologically([failedDispatch]);
     assert.equal(res.chunks.length, 1);
-    assert.equal(res.chunks[0].kind, "delegation");
+    assert.equal(res.chunks[0].kind, "work");
 
-    const info = extractFallbackDispatchCall(res.chunks[0].items[0]);
+    const info = extractFallbackDispatchCall(failedDispatch);
     assert.ok(info);
     assert.equal(info.label, "Rust Reviewer");
     assert.equal(info.preview, "Review crates/orbit-cli");
@@ -264,14 +248,14 @@ describe("turn-delegation-split", () => {
   });
 });
 
-it("promotes a space-normalized dispatch before its managed child arrives", () => {
+it("keeps space-normalized create_agent folded inside work while still extracting fallback metadata", () => {
   const item: TimelineItemView = {
     item_type: "tool_call", seq: 1, call_id: "new", status: "running", diff_files: [],
     summary_title: "Run mcp orbit create agent",
     detail: { kind: "generic", tool_name: "Run mcp orbit create agent",
       arguments_json: '{"toolSummary":"Build reviewer","initial_prompt":"Check build"}' },
   };
-  assert.equal(splitStepGroupChronologically([item]).chunks[0]?.kind, "delegation");
+  assert.equal(splitStepGroupChronologically([item]).chunks[0]?.kind, "work");
   assert.deepEqual(extractFallbackDispatchCall(item), {
     callId: "new", label: "Build reviewer", preview: "Check build", status: "running",
   });
@@ -345,58 +329,68 @@ function work(seq: number): Extract<TurnLiveSegmentView, { kind: "step_group" }>
   };
 }
 
-it("attaches a finish to the turn-opening report and rejoins only the work split by that finish", () => {
+it("suppresses hidden finish and direct messages while rejoining split step groups", () => {
   const report = message(1, "direct_message");
   const first = { ...work(2), has_following_content: true };
   const last = work(4);
-  const finish = message(3, "finish_notification", { event: "finished", source_host_id: "local" });
-  const { segments, finishStatuses } = coalescePeerFinishes(report, [first, segment(finish), last], "local");
-  assert.equal(finishStatuses.get(report), "completed");
-  assert.equal(segments.length, 1);
-  const [steps] = segments;
-  assert.equal(steps.kind, "step_group");
-  assert.equal(steps.key, first.key);
-  assert.deepEqual(steps.items.map(it => it.seq), [2, 4]);
-  assert.equal(steps.summary.counts.command_count, 2);
-  assert.equal(steps.has_following_content, false);
-  assert.equal(first.items.length, 1);
+  for (const hidden of [
+    message(3, "finish_notification", { event: "finished", source_host_id: "local" }),
+    message(3, "direct_message", { source_title: "Parent" }),
+  ]) {
+    const { segments } = coalescePeerFinishes(report, [first, segment(hidden), last], "local");
+    assert.equal(segments.length, 1);
+    const [steps] = segments;
+    assert.equal(steps.kind, "step_group");
+    assert.equal(steps.key, first.key);
+    assert.deepEqual(steps.items.map(it => it.seq), [2, 4]);
+    assert.equal(steps.summary.counts.command_count, 2);
+    assert.equal(steps.has_following_content, false);
+    assert.equal(first.items.length, 1);
+  }
 });
 
-it("attaches canceled and completed finishes to each peer's latest preceding direct report", () => {
-  const old = message(1, "direct_message");
-  const latest = message(2, "direct_message");
-  const remote = message(3, "direct_message", { source_host_id: "remote" });
-  const other = message(4, "direct_message", { source_agent_id: "other" });
-  const finishes = [
-    message(5, "finish_notification", { event: "cancelled" }),
-    message(6, "finish_notification", { event: "closed", source_host_id: "remote" }),
-    message(7, "finish_notification", { event: "finished", source_agent_id: "other" }),
-  ];
-  const { segments, finishStatuses } = coalescePeerFinishes(old, [latest, remote, other, ...finishes].map(segment), "local");
-  assert.deepEqual(segments.map(seg => seg.key), [latest.message_id, remote.message_id, other.message_id]);
-  assert.deepEqual([...finishStatuses], [[latest, "canceled"], [remote, "canceled"], [other, "completed"]]);
-});
-
-it("retains unmatched, failed, and permission notifications even when a report has the same display name", () => {
+it("suppresses direct messages and routine/queued finish notifications while retaining failed, permission, and heartbeat items", () => {
   const report = message(1, "direct_message", { source_title: "Reviewer" });
   const permission = { child_agent_id: "ag_reporter", permission_request_id: "req", title: "Read file", allowed_decisions: [] };
+
+  // Failed and permission finish notifications stay visible (resolved permissions hide at render time)
   for (const fields of [
     { event: "errored" }, { event: "error" }, { event: "failed" },
     { text: "Agent ag_reporter (Reviewer) failed.\n\n<agent-response>Details</agent-response>" },
     { event: "finished", text: "Agent ag_reporter (Reviewer) finished.\n\nError: disconnected\n<agent-response>Details</agent-response>" },
     { event: "finished", text: "Report ready\nError: build lost its worker" },
-    { permission_context: permission }, { event: "permission_required" },
-    { source_agent_id: null }, { source_agent_id: "other" }, { source_host_id: "remote" },
+    { permission_context: permission },
   ]) {
-    const finish = segment(message(2, "finish_notification", { source_title: "Reviewer", ...fields }));
+    const finishItem = message(2, "finish_notification", { source_title: "Reviewer", ...fields });
+    assert.equal(isTimelineAgentMessageHidden(finishItem), false);
+    const finish = segment(finishItem);
     const result = coalescePeerFinishes(report, [finish], "local");
     assert.deepEqual(result.segments, [finish]);
-    assert.equal(result.finishStatuses.size, 0);
   }
+
+  // Routine/queued finish notifications and direct inter-agent messages are suppressed
+  for (const hiddenItem of [
+    message(3, "finish_notification", { source_title: "Reviewer", event: "finished", source_agent_id: null }),
+    message(3, "finish_notification", { source_title: "Reviewer", event: "finished", source_agent_id: "other" }),
+    message(3, "finish_notification", { source_title: "Reviewer", event: "canceled", source_host_id: "remote" }),
+    message(3, "finish_notification", { source_title: "Reviewer", event: "finished" }),
+    message(3, "finish_notification", { source_title: "Reviewer", event: "finished", delivery_status: "queued" }),
+    report,
+    message(5, "direct_message", { source_title: "Parent", text: "Proceeding with your decisions" }),
+  ]) {
+    assert.equal(isTimelineAgentMessageHidden(hiddenItem), true);
+    const result = coalescePeerFinishes(null, [work(2), segment(hiddenItem), work(4)], "local");
+    assert.equal(result.segments.length, 1);
+    assert.equal(result.segments[0]?.kind, "step_group");
+    if (result.segments[0]?.kind === "step_group") {
+      assert.deepEqual(result.segments[0].items.map((it) => it.seq), [2, 4]);
+    }
+  }
+
+  // Heartbeats and permission-context direct messages remain visible
+  assert.equal(isTimelineAgentMessageHidden(message(4, "heartbeat")), false);
+  assert.equal(isTimelineAgentMessageHidden(message(6, "direct_message", { permission_context: permission })), false);
+  const heartbeatSeg = segment(message(4, "heartbeat"));
   const finish = segment(message(2, "finish_notification"));
-  for (const opening of [null, message(1, "heartbeat"), { ...report, permission_context: permission }]) {
-    assert.deepEqual(coalescePeerFinishes(opening, [finish], "local").segments, [finish]);
-  }
-  const laterReport = segment(message(3, "direct_message"));
-  assert.deepEqual(coalescePeerFinishes(null, [finish, laterReport], "local").segments, [finish, laterReport]);
+  assert.deepEqual(coalescePeerFinishes(null, [finish, heartbeatSeg], "local").segments, [heartbeatSeg]);
 });

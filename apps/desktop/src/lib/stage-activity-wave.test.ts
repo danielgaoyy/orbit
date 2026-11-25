@@ -246,12 +246,13 @@ describe("summarizeStageLiveActivity", () => {
     assert.equal(goalOnlyIdle?.text, "Goal active");
     assert.equal(goalOnlyIdle?.primarySection, "goals");
 
-    // During foreground streaming, timers & goals stay suppressed to avoid duplicating Thinking…
+    // During foreground streaming, non-blocking background items (subagents, bg tasks, timers, goals)
+    // stay suppressed so the stream never stacks a second animated status row below live steps.
     assert.equal(
       summarizeStageLiveActivity({
-        runningSubagentsCount: 0,
+        runningSubagentsCount: 1,
         awaitingSubagentsCount: 0,
-        runningBackgroundTasks: [],
+        runningBackgroundTasks: [{ id: "bg-1", title: "dev server" }],
         armedTimersCount: 2,
         hasActiveGoal: true,
         isForegroundRunning: true,
@@ -259,19 +260,18 @@ describe("summarizeStageLiveActivity", () => {
       null,
     );
 
-    // Concurrent subagents/bg tasks STILL surface while foreground is running.
-    const concurrentDuringStreaming = summarizeStageLiveActivity({
-      runningSubagentsCount: 1,
-      awaitingSubagentsCount: 0,
+    // Blocking awaiting-approval subagents STILL surface while foreground is running.
+    const awaitingDuringStreaming = summarizeStageLiveActivity({
+      runningSubagentsCount: 2,
+      awaitingSubagentsCount: 1,
       runningBackgroundTasks: [{ id: "bg-1", title: "dev server" }],
       armedTimersCount: 2,
       hasActiveGoal: true,
       isForegroundRunning: true,
     });
-    assert.equal(
-      concurrentDuringStreaming?.text,
-      "1 subagent running · 1 background task running",
-    );
+    assert.equal(awaitingDuringStreaming?.text, "1 subagent awaiting approval");
+    assert.equal(awaitingDuringStreaming?.tone, "warning");
+    assert.equal(awaitingDuringStreaming?.secondaryHint, null);
   });
 
   it("summarizes active subagents prioritizing awaiting_permission for firstActive and tracking soleActive", () => {
@@ -294,7 +294,7 @@ describe("summarizeStageLiveActivity", () => {
 });
 
 describe("StageActivityWave SSR rendering and interactions", () => {
-  it("renders nothing when idle and calm ripple-wave markup with status accessibility when active", async () => {
+  it("renders nothing when idle and calm text-only status markup with accessibility when active", async () => {
     const { StageActivityWave } = await server.ssrLoadModule(
       "/src/components/stage/stage-activity-wave.tsx",
     );
@@ -323,9 +323,10 @@ describe("StageActivityWave SSR rendering and interactions", () => {
     assert.match(active.html, /data-slot="stage-activity-wave"/);
     assert.match(active.html, /role="status"/);
     assert.match(active.html, /aria-live="polite"/);
-    assert.match(active.html, /data-slot="stage-activity-wave-orb"/);
-    assert.match(active.html, /orbit-activity-ripple-ring/);
-    assert.match(active.html, /orbit-activity-ripple-ring-delayed/);
+    assert.doesNotMatch(
+      active.html,
+      /data-slot="stage-activity-wave-dot"|animate-pulse|orbit-activity-ripple-ring/,
+    );
     assert.match(active.html, /data-overview-trigger="true"/);
     assert.match(active.html, /inline-flex max-w-full/);
     assert.match(active.html, /shimmer/);
@@ -336,7 +337,7 @@ describe("StageActivityWave SSR rendering and interactions", () => {
     active.clicks[0]();
     assert.equal(clicked, 1);
 
-    // Warning state shifts orb & awaiting text to warning tone without a clickable button when onClick omitted.
+    // Warning state shifts awaiting text to warning tone without a leading dot or clickable button when onClick omitted.
     const awaiting = renderWave(StageActivityWave, {
       runningSubagentsCount: 0,
       awaitingSubagentsCount: 1,
@@ -346,6 +347,7 @@ describe("StageActivityWave SSR rendering and interactions", () => {
     });
     assert.match(awaiting.html, /data-tone="warning"/);
     assert.match(awaiting.html, /text-signal-warning/);
+    assert.doesNotMatch(awaiting.html, /stage-activity-wave-dot|animate-pulse/);
     assert.match(awaiting.html, /1 subagent awaiting approval/);
     assert.match(awaiting.html, /1 background task running/);
     assert.doesNotMatch(awaiting.html, /<button\b|Overview/);
@@ -432,16 +434,29 @@ describe("StageActivityWave SSR rendering and interactions", () => {
     assert.equal(popoverClosedWave.clicks.length, 1);
     assert.equal(popoverClosedWave.html.match(/<button\b/g)?.length, 1);
 
-    // 4. Idle + foreground running renders bottom cushion spacer only
+    // 4. Foreground running with only non-blocking subagents/tasks renders bottom cushion spacer only
     const spacer = renderWave(StreamStageActivityWave, {
       hostId: "local",
       agentId: "parent",
-      sessionSubagents: [],
-      runningBackgroundTasks: [],
+      sessionSubagents: [soleChild],
+      runningBackgroundTasks: [{ id: "bg-1", title: "cargo test" }],
       isForegroundRunning: true,
     });
     assert.match(spacer.html, /h-\[32px\]/);
     assert.doesNotMatch(spacer.html, /data-slot="stage-activity-wave"/);
+
+    // 5. Foreground running WITH an awaiting-approval subagent still surfaces warning line
+    const awaitingDuringForeground = renderWave(StreamStageActivityWave, {
+      hostId: "local",
+      agentId: "parent",
+      sessionSubagents: [{ ...soleChild, status: "awaiting_permission" }],
+      runningBackgroundTasks: [{ id: "bg-1", title: "cargo test" }],
+      isForegroundRunning: true,
+    });
+    assert.match(awaitingDuringForeground.html, /data-slot="stage-activity-wave"/);
+    assert.match(awaitingDuringForeground.html, /data-tone="warning"/);
+    assert.match(awaitingDuringForeground.html, /1 subagent awaiting approval/);
+    assert.doesNotMatch(awaitingDuringForeground.html, /background task/);
   });
 
   it("suppresses duplicate background-wait trailing activity inside TurnStageSection", async () => {

@@ -24,12 +24,10 @@ import {
   DialogDescription,
   DialogHeader,
   DialogTitle,
-  Tabs,
-  TabsList,
-  TabsTrigger,
 } from "@/components/ui/dialog-tabs";
 import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
+import { Segmented } from "@/components/ui/segmented";
 import { Textarea } from "@/components/ui/textarea";
 import type {
   PathScopedRule,
@@ -270,7 +268,7 @@ function RuleEditorModal({
 
         <form
           onSubmit={(e) => void handleSubmit(e)}
-          className="orbit-native-scroll flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto overscroll-contain px-5 pb-5"
+          className="orbit-native-scroll flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overscroll-contain px-5 pb-5"
         >
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <Field>
@@ -308,21 +306,20 @@ function RuleEditorModal({
               <FieldLabel>{t("context.triggerMode")}</FieldLabel>
               <span className="text-ink-muted text-[11px]">{activeHint && t(activeHint)}</span>
             </div>
-            <Tabs
+            <Segmented<RuleTriggerMode>
               value={triggerMode}
               onValueChange={(next) => {
-                setTriggerMode(next as RuleTriggerMode);
+                setTriggerMode(next);
                 setConfirmDiscard(false);
               }}
-            >
-              <TabsList className="grid w-full grid-cols-4">
-                {TRIGGER_GROUPS.map((g) => (
-                  <TabsTrigger key={g.mode} value={g.mode} disabled={busy} className="text-[13px]">
-                    {t(g.label)}
-                  </TabsTrigger>
-                ))}
-              </TabsList>
-            </Tabs>
+              ariaLabel={t("context.triggerMode")}
+              disabled={busy}
+              fullWidth
+              options={TRIGGER_GROUPS.map((g) => ({
+                value: g.mode,
+                label: t(g.label),
+              }))}
+            />
           </Field>
 
           {triggerMode === "glob_auto_attach" && (
@@ -386,7 +383,7 @@ function RuleEditorModal({
             />
           </Field>
 
-          <Field orientation="horizontal" className="pt-0.5">
+          <Field orientation="horizontal" className="pt-1">
             <FieldLabel className="text-[13px] font-normal">{t("context.enabled")}</FieldLabel>
             <ToggleSwitch
               checked={enabled}
@@ -408,7 +405,7 @@ function RuleEditorModal({
           {confirmDiscard && (
             <div className="flex items-center justify-between gap-2 rounded-[8px] border border-signal-warning-border bg-signal-warning-bg px-3 py-2 text-[13px]">
               <span className="text-signal-warning">{t("context.discardTitle")}</span>
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-2">
                 <Button
                   type="button"
                   variant="ghost"
@@ -429,7 +426,7 @@ function RuleEditorModal({
             </div>
           )}
 
-          <div className="border-border-subtle mt-1 flex items-center justify-between gap-2 border-t pt-3.5">
+          <div className="border-border-subtle mt-1 flex items-center justify-between gap-2 border-t pt-3">
             <div>
               {editing && !confirmDelete && (
                 <Button
@@ -445,7 +442,7 @@ function RuleEditorModal({
                 </Button>
               )}
               {editing && confirmDelete && (
-                <div className="flex items-center gap-1.5">
+                <div className="flex items-center gap-2">
                   <Button
                     type="button"
                     variant="destructive"
@@ -494,17 +491,21 @@ export const HostRulesSection = memo(function HostRulesSection({
 }) {
   const scopeKey = `${hostId}::${activeCwd}`;
   const snapshot = useOrbitSelector((s) => s.pathRulesByScope[scopeKey] ?? null);
+  const snapshotRef = useRef(snapshot);
+  snapshotRef.current = snapshot;
   const refreshSeqRef = useRef(0);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(() => !snapshot);
   const [togglingIds, setTogglingIds] = useState<Set<string>>(() => new Set());
   const [modalState, setModalState] = useState<
     { open: false } | { open: true; editing: PathScopedRule | null }
   >({ open: false });
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (options?: { silent?: boolean }) => {
     const seq = refreshSeqRef.current + 1;
     refreshSeqRef.current = seq;
-    setLoading(true);
+    if (!options?.silent) {
+      setLoading(true);
+    }
     try {
       await orbitActions.refreshPathRules(hostId, activeCwd);
     } finally {
@@ -515,7 +516,7 @@ export const HostRulesSection = memo(function HostRulesSection({
   }, [hostId, activeCwd]);
 
   useEffect(() => {
-    void refresh();
+    void refresh({ silent: Boolean(snapshotRef.current) });
   }, [refresh]);
 
   const rules = snapshot?.rules ?? [];
@@ -567,7 +568,7 @@ export const HostRulesSection = memo(function HostRulesSection({
         title={t("context.pathRules")}
         description={t("context.pathRulesDescription")}
         action={
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-2">
             <button
               type="button"
               aria-label={t("common.refresh")}
@@ -580,7 +581,7 @@ export const HostRulesSection = memo(function HostRulesSection({
             <button
               type="button"
               onClick={() => setModalState({ open: true, editing: null })}
-              className="bg-ink-primary text-surface-base hover:opacity-90 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-[8px] px-2.5 text-[13px] font-medium transition-opacity"
+              className="bg-ink-primary text-surface-base hover:opacity-90 inline-flex h-[30px] cursor-pointer items-center gap-2 rounded-[8px] px-3 text-[13px] font-medium transition-opacity"
             >
               <Plus className="h-[14px] w-[14px] stroke-[2]" />
               {t("context.newRule")}
@@ -592,10 +593,10 @@ export const HostRulesSection = memo(function HostRulesSection({
       <SettingCard>
         <div data-setting-id="context.ruleBudget" className="space-y-2 px-4 py-3">
           <div className="flex items-center justify-between gap-2 text-[13px]">
-            <span className="text-ink-muted flex items-center gap-1.5">
+            <span className="text-ink-muted flex items-center gap-2">
               {t("context.ruleBudget")}
               {budgetWarning && (
-                <span className="inline-flex items-center gap-1 rounded bg-signal-warning-bg px-1.5 py-0.5 text-[11px] font-medium text-signal-warning">
+                <span className="inline-flex items-center gap-1 rounded bg-signal-warning-bg px-2 py-1 text-[11px] font-medium text-signal-warning">
                   <AlertTriangle className="h-3 w-3" />
                   {t("context.highBudget")}
                 </span>
@@ -642,7 +643,7 @@ export const HostRulesSection = memo(function HostRulesSection({
             <button
               type="button"
               onClick={() => setModalState({ open: true, editing: null })}
-              className="border-border-subtle bg-surface-base hover:bg-surface-recessed mt-1.5 inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-[8px] border px-3 text-[13px] font-medium transition-colors"
+              className="border-border-subtle bg-surface-base hover:bg-surface-recessed mt-2 inline-flex h-[30px] cursor-pointer items-center gap-2 rounded-[8px] border px-3 text-[13px] font-medium transition-colors"
             >
               <Plus className="h-3.5 w-3.5" />
               {t("permissionRules.addRule")}
@@ -650,9 +651,9 @@ export const HostRulesSection = memo(function HostRulesSection({
           </div>
         </SettingCard>
       ) : (
-        <div className="space-y-5">
+        <div className="space-y-6">
           {groupedRules.map((group) => (
-            <div key={group.mode} className="space-y-2">
+            <div key={group.mode} className="space-y-3">
               <SettingGroupLabel
                 action={
                   <span className="text-ink-muted text-[11px]">{t(group.hint)}</span>
@@ -670,11 +671,11 @@ export const HostRulesSection = memo(function HostRulesSection({
                     )}
                   >
                     <div className="min-w-0 flex-1 space-y-1">
-                      <div className="flex flex-wrap items-center gap-1.5">
+                      <div className="flex flex-wrap items-center gap-2">
                         <span className="text-ink-primary font-mono text-[13px] font-medium">
                           {rule.name}
                         </span>
-                        <span className="bg-surface-recessed text-ink-muted rounded px-1.5 py-0.5 text-[11px] font-medium">
+                        <span className="bg-surface-recessed text-ink-muted rounded px-2 py-1 text-[11px] font-medium">
                           {scopeBadgeLabel(rule.scope)}
                         </span>
                         <span className="text-ink-muted font-mono text-[11px] tabular-nums">
@@ -689,11 +690,11 @@ export const HostRulesSection = memo(function HostRulesSection({
                       )}
 
                       {rule.globs.length > 0 && (
-                        <div className="flex flex-wrap gap-1 pt-0.5">
+                        <div className="flex flex-wrap gap-1 pt-1">
                           {rule.globs.map((g) => (
                             <span
                               key={g}
-                              className="border-border-subtle bg-surface-base text-ink-muted rounded-[5px] border px-1.5 py-0.5 font-mono text-[11px]"
+                              className="border-border-subtle bg-surface-base text-ink-muted rounded-[5px] border px-2 py-1 font-mono text-[11px]"
                             >
                               {g}
                             </span>
@@ -702,7 +703,7 @@ export const HostRulesSection = memo(function HostRulesSection({
                       )}
                     </div>
 
-                    <div className="flex shrink-0 items-center gap-2 pt-0.5">
+                    <div className="flex shrink-0 items-center gap-2 pt-1">
                       <button
                         type="button"
                         aria-label={t("context.editRule", { name: rule.name })}

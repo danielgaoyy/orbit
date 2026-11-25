@@ -1451,7 +1451,9 @@ function StickyQuestionDockCard({
               <ShortcutKbd keys={`${mod}↵`} size="xs" variant="subtle" />
               <span>{t("common.submit")}</span>
             </>
-          ) : registerGlobalShortcuts && singleOptionCount > 0 ? (
+          ) : registerGlobalShortcuts && singleOptionCount === 1 ? (
+            t("approval.digitShortcutHintSingle")
+          ) : registerGlobalShortcuts && singleOptionCount > 1 ? (
             t("approval.digitShortcutHint", { count: singleOptionCount })
           ) : (
             t("approval.chooseOptionOrWrite")

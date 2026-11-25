@@ -436,6 +436,10 @@ pub struct UpsertManagedSkillRequest {
     pub enabled: bool,
     #[serde(default)]
     pub expected_etag: Option<String>,
+    /// Create-only intent: refuse to overwrite an existing skill at this slug. Defaults to `false`
+    /// so deserializing an older payload keeps the previous upsert semantics.
+    #[serde(default)]
+    pub create_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -447,6 +451,12 @@ pub struct ImportManagedSkillRequest {
     pub source_markdown_or_path: String,
     #[serde(default)]
     pub slug_override: Option<String>,
+    /// Optimistic version check for an explicit replace of an existing skill.
+    #[serde(default)]
+    pub expected_etag: Option<String>,
+    /// Create-only intent: refuse to overwrite an existing skill at the resolved slug.
+    #[serde(default)]
+    pub create_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6216,8 +6226,18 @@ impl OrbitAppCore {
                     if agent.read_seq > 0 || pin_sync.is_some() {
                         server_pref_syncs.push((ag_id.clone(), agent.read_seq, pin_sync));
                     }
+                    let perms_pruned = if matches!(
+                        agent.status,
+                        AgentStatus::Idle | AgentStatus::Closed | AgentStatus::Error { .. }
+                    ) {
+                        let before = state.pending_permissions.len();
+                        state.pending_permissions.retain(|p| p.agent_id != ag_id);
+                        state.pending_permissions.len() != before
+                    } else {
+                        false
+                    };
                     state.agents.insert(ag_id.clone(), agent);
-                    if !stage_fields_unchanged || unread_badge_changed {
+                    if !stage_fields_unchanged || unread_badge_changed || perms_pruned {
                         notify_fleet = true;
                         notify_host = true;
                     }
@@ -6239,6 +6259,7 @@ impl OrbitAppCore {
                     state.timeline_loading_older.remove(&agent_id);
                     state.pending_tail_catchups.remove(&agent_id);
                     state.conditional_timers.retain(|t| t.agent_id != agent_id);
+                    state.pending_permissions.retain(|p| p.agent_id != agent_id);
                     state.provider_subagents.remove(&agent_id);
                     state
                         .provider_subagent_timelines
@@ -11991,6 +12012,7 @@ impl OrbitAppCore {
                 headers: req.headers,
                 keep_existing_secrets: req.keep_existing_secrets,
                 enabled: req.enabled,
+                create_only: req.create_only,
             },
             10,
         )
@@ -12951,6 +12973,7 @@ impl OrbitAppCore {
                 content: req.content,
                 enabled: req.enabled,
                 expected_etag: req.expected_etag,
+                create_only: req.create_only,
             }
         })
         .await
@@ -13005,6 +13028,8 @@ impl OrbitAppCore {
                 cwd,
                 source_markdown_or_path: req.source_markdown_or_path,
                 slug_override: req.slug_override,
+                expected_etag: req.expected_etag,
+                create_only: req.create_only,
             }
         })
         .await
@@ -22738,51 +22763,317 @@ impl OrbitAppCore {
         self.cloud_sync_now()
     }
 
+    /// Enable manual passphrase mode on new devices after proving that `passphrase` can decrypt
+    /// the remote vault. If `passphrase` already decrypts the remote vault (Path A), no
+    /// re-encryption is performed; otherwise (Path B) the vault is decrypted with the locally
+    /// cached key, re-encrypted with a fresh key derived from `passphrase`, pushed, and read back
+    /// to verify decryption before the remote auto-unlock key gist is deleted.
+    pub fn cloud_sync_enable_manual_passphrase(
+        self: &Arc<Self>,
+        passphrase: &str,
+    ) -> Result<CloudSyncStatusView, ClientCoreError> {
+        let core = Arc::clone(self);
+        let pass = passphrase.to_string();
+        self.runtime
+            .block_on(core.cloud_sync_enable_manual_passphrase_async(&pass))
+            .map_err(Into::into)
+    }
+
+    async fn cloud_sync_enable_manual_passphrase_async(
+        self: &Arc<Self>,
+        passphrase: &str,
+    ) -> Result<CloudSyncStatusView, CloudSyncError> {
+        let _guard = self.cloud_sync_mutex.lock().await;
+        self.cloud_sync_in_flight.store(true, Ordering::SeqCst);
+        let res = self
+            .cloud_sync_enable_manual_passphrase_inner(passphrase)
+            .await;
+        self.cloud_sync_in_flight.store(false, Ordering::SeqCst);
+        res
+    }
+
+    async fn cloud_sync_enable_manual_passphrase_inner(
+        self: &Arc<Self>,
+        passphrase: &str,
+    ) -> Result<CloudSyncStatusView, CloudSyncError> {
+        // 1. Preconditions: signed in, non-empty trimmed passphrase, cached local key.
+        // Never mutate local or remote state if any precondition fails.
+        let mut cfg = load_sync_config_from_store(&self.store);
+        let token = cfg
+            .github_access_token
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or(CloudSyncError::NotSignedIn)?;
+
+        let trimmed_pass = passphrase.trim();
+        if trimmed_pass.is_empty() {
+            return Err(CloudSyncError::Crypto(
+                orbit_crypto::VaultCryptoError::EmptyPassphrase,
+            ));
+        }
+
+        let cached_key = cfg.derived_key().ok_or(CloudSyncError::VaultLocked)?;
+
+        // 2. Fetch the current remote vault gist (capturing its ETag when cached `gist_id` is known).
+        let client = self.cloud_client();
+        let (remote_gist, remote_etag) = if let Some(gid) = cfg
+            .gist_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            match client
+                .fetch_vault_gist_conditional(&token, gid, None)
+                .await?
+            {
+                GistConditionalFetch::Updated { gist, etag } => (Some(*gist), etag),
+                GistConditionalFetch::NotModified | GistConditionalFetch::NotFound => {
+                    (client.fetch_vault_gist(&token, None).await?, None)
+                }
+            }
+        } else {
+            (client.fetch_vault_gist(&token, None).await?, None)
+        };
+        let remote_gist = remote_gist.ok_or_else(|| {
+            CloudSyncError::InvalidVault(
+                "no remote cloud vault exists yet — sync once before enabling manual passphrase mode"
+                    .into(),
+            )
+        })?;
+
+        let now_ms = now_unix_ms();
+
+        // 3. Path A: prove whether `trimmed_pass` already decrypts the current remote vault.
+        let direct_verified = orbit_crypto::derive_vault_key(
+            trimmed_pass,
+            &remote_gist.envelope.salt_b64,
+            remote_gist.envelope.kdf_params,
+        )
+        .ok()
+        .and_then(|candidate_key| {
+            orbit_crypto::decrypt_vault_json::<crate::cloud_sync::CloudVaultPayload>(
+                &candidate_key,
+                &remote_gist.envelope,
+            )
+            .ok()
+            .map(|payload| (candidate_key, payload))
+        });
+
+        let (manual_ts, pushed_manual_flag) = if let Some((verified_key, remote_payload)) =
+            direct_verified
+        {
+            // Path A succeeded without re-encryption: remote salt stays untouched.
+            cfg.set_derived_key(&verified_key);
+            cfg.gist_id = Some(remote_gist.gist_id.clone());
+            cfg.gist_html_url = Some(remote_gist.html_url.clone());
+            cfg.remote_vault_exists = true;
+            let manual_ts = now_ms
+                .max(
+                    cfg.require_manual_passphrase_updated_at_ms
+                        .saturating_add(1),
+                )
+                .max(
+                    remote_payload
+                        .require_manual_passphrase_updated_at_ms
+                        .saturating_add(1),
+                );
+            (manual_ts, false)
+        } else {
+            // 4. Path B: guard against stale local cache before re-encrypting & pushing.
+            if let Some(local_etag) = cfg
+                .last_etag
+                .as_deref()
+                .and_then(normalize_etag_for_compare)
+                && let Some(cur_remote_etag) =
+                    remote_etag.as_deref().and_then(normalize_etag_for_compare)
+                && local_etag != cur_remote_etag
+            {
+                return Err(CloudSyncError::InvalidVault(
+                    "remote cloud vault was updated on another device — run Sync Now before enabling manual passphrase mode"
+                        .into(),
+                ));
+            }
+            // Decrypt remote payload with locally cached key, re-encrypt with a fresh key derived
+            // from `trimmed_pass`, push, then re-fetch and verify decryption before touching the
+            // auto-unlock key gist.
+            let remote_payload = decrypt_remote_with_cached_key(&cached_key, &remote_gist)?;
+            let manual_ts = now_ms
+                .max(
+                    cfg.require_manual_passphrase_updated_at_ms
+                        .saturating_add(1),
+                )
+                .max(
+                    remote_payload
+                        .require_manual_passphrase_updated_at_ms
+                        .saturating_add(1),
+                );
+            let mut next_payload = remote_payload.clone();
+            next_payload.require_manual_passphrase = true;
+            next_payload.require_manual_passphrase_updated_at_ms = manual_ts;
+            next_payload.revision = next_payload.revision.saturating_add(1);
+            next_payload.updated_at_ms = next_payload.updated_at_ms.max(now_ms);
+
+            let new_key = orbit_crypto::derive_new_vault_key(trimmed_pass)?;
+            let (pushed_gid, pushed_html_url, pushed_etag) = push_vault_payload_with_etag(
+                &client,
+                &token,
+                Some(remote_gist.gist_id.as_str()),
+                &new_key,
+                &next_payload,
+            )
+            .await?;
+
+            // Mandatory read-back verification before auto-key may ever be deleted.
+            let verified_gist = client
+                    .fetch_vault_gist(&token, Some(&pushed_gid))
+                    .await
+                    .map_err(|err| {
+                        CloudSyncError::InvalidVault(format!(
+                            "vault was re-encrypted with the new passphrase, but verification failed ({err}); save your passphrase and retry"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        CloudSyncError::InvalidVault(
+                            "vault was re-encrypted with the new passphrase, but verification failed; save your passphrase and retry"
+                                .into(),
+                        )
+                    })?;
+
+            let envelope_matches_new_key = verified_gist.envelope.salt_b64 == new_key.salt_b64
+                && verified_gist.envelope.kdf_params == new_key.kdf_params;
+            let verified_payload = if envelope_matches_new_key {
+                orbit_crypto::derive_vault_key(
+                    trimmed_pass,
+                    &verified_gist.envelope.salt_b64,
+                    verified_gist.envelope.kdf_params,
+                )
+                .ok()
+                .and_then(|re_derived| {
+                    orbit_crypto::decrypt_vault_json::<crate::cloud_sync::CloudVaultPayload>(
+                        &re_derived,
+                        &verified_gist.envelope,
+                    )
+                    .ok()
+                })
+            } else {
+                None
+            };
+
+            let Some(verified_payload) = verified_payload.filter(|p| *p == next_payload) else {
+                return Err(CloudSyncError::InvalidVault(
+                        "vault was re-encrypted with the new passphrase, but verification failed; save your passphrase and retry"
+                            .into(),
+                    ));
+            };
+            debug_assert_eq!(verified_payload.hosts, remote_payload.hosts);
+            debug_assert_eq!(verified_payload.projects, remote_payload.projects);
+            debug_assert_eq!(verified_payload.project_order, remote_payload.project_order);
+            debug_assert_eq!(verified_payload.preferences, remote_payload.preferences);
+            debug_assert_eq!(verified_payload.fleet_network, remote_payload.fleet_network);
+
+            // Persist the verified new key before deleting auto-key so a transient delete error
+            // keeps the local device unlocked and ready to retry via Path A.
+            cfg.set_derived_key(&new_key);
+            cfg.gist_id = Some(pushed_gid);
+            cfg.gist_html_url = Some(pushed_html_url);
+            cfg.remote_vault_exists = true;
+            cfg.last_etag = pushed_etag;
+            cfg.last_vault_revision = next_payload.revision;
+            save_sync_config_to_store(&self.store, &cfg)?;
+            (manual_ts, true)
+        };
+
+        // 5. Verification has succeeded — now delete the remote auto-unlock key gist.
+        let key_gid = if let Some(gid) = cfg.key_gist_id.clone().filter(|s| !s.trim().is_empty()) {
+            Some(gid)
+        } else {
+            client
+                .fetch_vault_and_auto_key(&token, cfg.gist_id.as_deref(), None)
+                .await?
+                .1
+                .map(|found| found.gist_id)
+        };
+        if let Some(ref gid) = key_gid {
+            client.delete_gist(&token, gid).await?;
+        }
+
+        cfg.key_gist_id = None;
+        cfg.require_manual_passphrase = true;
+        cfg.require_manual_passphrase_updated_at_ms = manual_ts;
+        cfg.last_error = None;
+        save_sync_config_to_store(&self.store, &cfg)?;
+        self.reset_cloud_sync_backoff();
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        if !pushed_manual_flag {
+            self.schedule_cloud_auto_sync(false);
+        }
+        Ok(cfg.to_status_view(false))
+    }
+
     /// Toggle whether Cloud Sync requires manual passphrase entry on new devices
     /// (defaults to `false` = Dual-Gist Instant Unlock).
+    ///
+    /// Enabling manual passphrase mode (`require_manual == true`) is unconditionally rejected
+    /// here because deleting the auto-unlock key without verifying a passphrase can permanently
+    /// lock out zero-passphrase vaults. Callers must use [`Self::cloud_sync_enable_manual_passphrase`]
+    /// with a verified passphrase instead.
     pub fn cloud_sync_set_manual_passphrase_mode(
         self: &Arc<Self>,
         require_manual: bool,
     ) -> Result<CloudSyncStatusView, ClientCoreError> {
+        if require_manual {
+            return Err(CloudSyncError::InvalidVault(
+                "enabling manual passphrase mode requires providing and verifying a sync passphrase"
+                    .into(),
+            )
+            .into());
+        }
+        let core = Arc::clone(self);
+        self.runtime
+            .block_on(core.cloud_sync_disable_manual_passphrase_async())
+            .map_err(Into::into)
+    }
+
+    async fn cloud_sync_disable_manual_passphrase_async(
+        self: &Arc<Self>,
+    ) -> Result<CloudSyncStatusView, CloudSyncError> {
+        let guard = self.cloud_sync_mutex.lock().await;
+        self.cloud_sync_in_flight.store(true, Ordering::SeqCst);
+        let res = self.cloud_sync_disable_manual_passphrase_inner().await;
+        self.cloud_sync_in_flight.store(false, Ordering::SeqCst);
+        drop(guard);
+        if res.is_ok() {
+            self.emit(|revision| CoreNotification::FleetChanged { revision });
+            self.schedule_cloud_auto_sync(false);
+        }
+        res
+    }
+
+    async fn cloud_sync_disable_manual_passphrase_inner(
+        self: &Arc<Self>,
+    ) -> Result<CloudSyncStatusView, CloudSyncError> {
         let mut cfg = load_sync_config_from_store(&self.store);
-        cfg.require_manual_passphrase = require_manual;
-        cfg.require_manual_passphrase_updated_at_ms = now_unix_ms();
+        cfg.require_manual_passphrase = false;
+        cfg.require_manual_passphrase_updated_at_ms = now_unix_ms().max(
+            cfg.require_manual_passphrase_updated_at_ms
+                .saturating_add(1),
+        );
         if let Some(token) = cfg
             .github_access_token
             .clone()
             .filter(|s| !s.trim().is_empty())
+            && let Some(key) = cfg.derived_key()
         {
             let client = self.cloud_client();
-            if require_manual {
-                let mut key_gid = cfg.key_gist_id.take();
-                self.runtime.block_on(async {
-                    if key_gid.is_none()
-                        && let Ok((_, Some(found))) = client
-                            .fetch_vault_and_auto_key(&token, cfg.gist_id.as_deref(), None)
-                            .await
-                    {
-                        key_gid = Some(found.gist_id);
-                    }
-                    if let Some(ref gid) = key_gid {
-                        client.delete_gist(&token, gid).await?;
-                    }
-                    Ok::<_, CloudSyncError>(())
-                })?;
-            } else if let Some(key) = cfg.derived_key() {
-                let existing_kid = cfg.key_gist_id.clone();
-                let published_kid = self.runtime.block_on(client.save_auto_unlock_key_gist(
-                    &token,
-                    existing_kid.as_deref(),
-                    &key,
-                ))?;
-                cfg.key_gist_id = Some(published_kid);
-            }
+            let existing_kid = cfg.key_gist_id.clone();
+            let published_kid = client
+                .save_auto_unlock_key_gist(&token, existing_kid.as_deref(), &key)
+                .await?;
+            cfg.key_gist_id = Some(published_kid);
         }
         save_sync_config_to_store(&self.store, &cfg)?;
         self.reset_cloud_sync_backoff();
-        self.emit(|revision| CoreNotification::FleetChanged { revision });
-        self.schedule_cloud_auto_sync(false);
-        Ok(cfg.to_status_view(self.cloud_sync_in_flight.load(Ordering::SeqCst)))
+        Ok(cfg.to_status_view(false))
     }
 
     fn reset_cloud_sync_backoff(&self) {
@@ -23154,22 +23445,35 @@ impl OrbitAppCore {
         let client = self.cloud_client();
         let need_key_lookup = cfg.derived_key().is_none()
             || (!cfg.require_manual_passphrase && cfg.key_gist_id.is_none());
-        let (remote_gist, remote_auto_key) = if !need_key_lookup && cfg.gist_id.is_some() {
-            (
-                client
-                    .fetch_vault_gist(&token, cfg.gist_id.as_deref())
-                    .await?,
-                None,
-            )
+        let (remote_gist, remote_auto_key, fetched_etag) = if !need_key_lookup
+            && let Some(gid) = cfg
+                .gist_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            match client
+                .fetch_vault_gist_conditional(&token, gid, None)
+                .await?
+            {
+                GistConditionalFetch::Updated { gist, etag } => (Some(*gist), None, etag),
+                GistConditionalFetch::NotModified | GistConditionalFetch::NotFound => {
+                    (client.fetch_vault_gist(&token, None).await?, None, None)
+                }
+            }
         } else {
-            client
+            let (gist, auto_key) = client
                 .fetch_vault_and_auto_key(
                     &token,
                     cfg.gist_id.as_deref(),
                     cfg.key_gist_id.as_deref(),
                 )
-                .await?
+                .await?;
+            (gist, auto_key, None)
         };
+        if let Some(etag) = fetched_etag {
+            cfg.last_etag = Some(etag);
+        }
 
         let key = if let Some(cached) = cfg.derived_key() {
             cached
@@ -23880,6 +24184,16 @@ fn should_adopt_daemon_relay(
         return true;
     }
     is_local && !is_legacy_ssh_relay_without_ft(daemon_trimmed)
+}
+
+fn normalize_etag_for_compare(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    let stripped = trimmed.strip_prefix("W/").unwrap_or(trimmed).trim();
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped)
+    }
 }
 
 fn reconcile_manual_passphrase_from_remote(
@@ -27543,6 +27857,126 @@ mod tests {
     }
 
     #[test]
+    fn agent_updated_closed_and_deleted_prune_stale_pending_permissions() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let now = Utc::now();
+        {
+            let mut guard = core.hosts.write().expect("lock");
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h1".into(),
+                hostname: "dev".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 7474,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                pairing_secret: String::new(),
+                pairing_secret_updated_at_ms: 0,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.agents.insert(
+                "ag_child".into(),
+                AgentSummary {
+                    agent_id: "ag_child".into(),
+                    workspace_id: "ws1".into(),
+                    cwd: "/repo".into(),
+                    title: "Child".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    acp_agent_id: None,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::FullAccess,
+                    status: AgentStatus::AwaitingPermission {
+                        turn_id: "t1".into(),
+                        request_id: "perm_stale".into(),
+                    },
+                    parent_agent_id: Some("ag_parent".into()),
+                    parent_host_id: None,
+                    latest_seq: 10,
+                    timeline_epoch: 1,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::Permission,
+                    last_activity_at: Some(now),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    task_summary: None,
+                    cluster_suggestion: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    queued_prompts: Vec::new(),
+                },
+            );
+            mem.pending_permissions.push(PendingPermissionSummary {
+                agent_id: "ag_child".into(),
+                agent_title: "Child".into(),
+                workspace_id: "ws1".into(),
+                request_id: "perm_stale".into(),
+                title: "AskUserQuestion".into(),
+                detail: ToolCallDetail::Shell {
+                    command: "echo hi".into(),
+                    cwd: None,
+                    exit_code: None,
+                    output_preview: None,
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                created_at: now,
+                guardian_assessment: None,
+                plan_approval: None,
+                human_only: false,
+            });
+            mem.pending_permissions.push(PendingPermissionSummary {
+                agent_id: "ag_other".into(),
+                agent_title: "Other".into(),
+                workspace_id: "ws1".into(),
+                request_id: "perm_other".into(),
+                title: "Shell".into(),
+                detail: ToolCallDetail::Shell {
+                    command: "ls".into(),
+                    cwd: None,
+                    exit_code: None,
+                    output_preview: None,
+                },
+                allowed_decisions: vec!["allow".into()],
+                created_at: now,
+                guardian_assessment: None,
+                plan_approval: None,
+                human_only: false,
+            });
+            guard.insert("h1".into(), mem);
+        }
+
+        let mut closed = core.hosts.read().expect("lock")["h1"].agents["ag_child"].clone();
+        closed.status = AgentStatus::Closed;
+        closed.attention = AttentionState::None;
+        core.handle_inbound_wire("h1", WireMessage::AgentUpdated { agent: closed });
+
+        let detail = core.host_detail("h1").expect("detail");
+        assert_eq!(detail.pending_permissions.len(), 1);
+        assert_eq!(detail.pending_permissions[0].agent_id, "ag_other");
+
+        core.handle_inbound_wire(
+            "h1",
+            WireMessage::AgentDeleted {
+                agent_id: "ag_other".into(),
+            },
+        );
+        let detail_after_del = core.host_detail("h1").expect("detail");
+        assert!(detail_after_del.pending_permissions.is_empty());
+    }
+
+    #[test]
     fn fleet_sidebar_thread_prefs_opt_migration_and_multislot_terminal() {
         let core = OrbitAppCore::open_in_memory().expect("open core");
         let now = Utc::now();
@@ -28550,6 +28984,7 @@ mod tests {
                     parent_subagent_id: None,
                     title: "Researcher".into(),
                     subtitle: Some("Investigating".into()),
+                    model: None,
                     status: orbit_protocol::ProviderSubagentStatus::Running,
                     created_at: now,
                     updated_at: now,
@@ -28759,6 +29194,7 @@ mod tests {
                     parent_subagent_id: None,
                     title: "Finished Worker".into(),
                     subtitle: None,
+                    model: None,
                     status: orbit_protocol::ProviderSubagentStatus::Completed,
                     created_at: now,
                     updated_at: now,
@@ -28857,6 +29293,7 @@ mod tests {
                 parent_subagent_id: None,
                 title: format!("Worker {idx}"),
                 subtitle: None,
+                model: None,
                 status,
                 created_at: now,
                 updated_at: now,
@@ -28937,6 +29374,7 @@ mod tests {
                     parent_subagent_id: None,
                     title: "Inspected Finished Subagent".into(),
                     subtitle: None,
+                    model: None,
                     status: orbit_protocol::ProviderSubagentStatus::Completed,
                     created_at: now,
                     updated_at: now,
@@ -28981,6 +29419,7 @@ mod tests {
                         parent_subagent_id: None,
                         title: format!("Other {idx}"),
                         subtitle: None,
+                        model: None,
                         status: orbit_protocol::ProviderSubagentStatus::Completed,
                         created_at: now,
                         updated_at: now,
@@ -29040,6 +29479,7 @@ mod tests {
                     parent_subagent_id: None,
                     title: "Failing Worker".into(),
                     subtitle: None,
+                    model: None,
                     status: orbit_protocol::ProviderSubagentStatus::Failed,
                     created_at: now,
                     updated_at: now,
@@ -29694,12 +30134,16 @@ mod tests {
             }
         });
 
-        // --- Device A: Opt into manual passphrase mode, sign in via Device Flow, pair 2 hosts, pin project, sync ---
+        // --- Device A: Pre-configure manual passphrase mode before Device Flow sign-in, pair 2 hosts, pin project, sync ---
         let device_a = OrbitAppCore::open_in_memory().expect("device a");
         device_a.set_cloud_sync_github_bases_for_test(&base_url, &base_url);
-        let manual_st = device_a
-            .cloud_sync_set_manual_passphrase_mode(true)
-            .expect("manual mode");
+        {
+            let mut cfg = load_sync_config_from_store(&device_a.store);
+            cfg.require_manual_passphrase = true;
+            cfg.require_manual_passphrase_updated_at_ms = now_unix_ms();
+            save_sync_config_to_store(&device_a.store, &cfg).expect("seed manual mode");
+        }
+        let manual_st = device_a.cloud_sync_status();
         assert!(!manual_st.instant_unlock_enabled);
 
         let started = device_a
@@ -30070,9 +30514,9 @@ mod tests {
         );
         assert_eq!(device_c.fleet_overview().hosts[0].host_id, h1_id);
 
-        // (d) Enabling manual passphrase mode deletes remote key gist -> Device D lands in Locked
+        // (d) Enabling manual passphrase mode verifies & re-encrypts vault, deletes remote key gist -> Device D lands in Locked and can unlock with the new passphrase
         let manual_a = device_a
-            .cloud_sync_set_manual_passphrase_mode(true)
+            .cloud_sync_enable_manual_passphrase("manual-device-d-passphrase")
             .expect("enable manual");
         assert!(!manual_a.instant_unlock_enabled);
         assert!(state.key_content.lock().expect("lock").is_none());
@@ -30084,6 +30528,11 @@ mod tests {
             .expect("login d");
         assert_eq!(st_d.state, crate::cloud_sync::CloudSyncState::Locked);
         assert!(st_d.remote_vault_exists);
+        let unlock_d = device_d
+            .cloud_sync_unlock_with_passphrase("manual-device-d-passphrase")
+            .expect("unlock d with new passphrase");
+        assert_eq!(unlock_d.hosts_added, 1);
+        assert_eq!(device_d.fleet_overview().hosts[0].host_id, h1_id);
     }
 
     #[test]
@@ -31574,6 +32023,7 @@ mod tests {
                     parent_subagent_id: None,
                     title: sid.clone(),
                     subtitle: None,
+                    model: None,
                     status: orbit_protocol::ProviderSubagentStatus::Completed,
                     created_at: now,
                     updated_at: now,
@@ -31836,6 +32286,7 @@ mod tests {
                     parent_subagent_id: None,
                     title: "Codebase Researcher".into(),
                     subtitle: None,
+                    model: None,
                     status: orbit_protocol::ProviderSubagentStatus::Running,
                     created_at: now,
                     updated_at: now,
@@ -31853,6 +32304,7 @@ mod tests {
                     parent_subagent_id: None,
                     title: "Codebase Researcher".into(),
                     subtitle: None,
+                    model: None,
                     status: orbit_protocol::ProviderSubagentStatus::Completed,
                     created_at: now,
                     updated_at: now,
@@ -34148,9 +34600,9 @@ mod tests {
         device_a.cloud_sync_now().expect("sync backfills key gist");
         assert!(state.key_content.lock().expect("lock").is_some());
 
-        // 4. Enabling manual mode deletes key gist & propagates flag so peer C does NOT recreate it.
+        // 4. Enabling manual mode verifies passphrase, deletes key gist & propagates flag so peer C does NOT recreate it.
         device_a
-            .cloud_sync_set_manual_passphrase_mode(true)
+            .cloud_sync_enable_manual_passphrase("legacy-passphrase-123")
             .expect("enable manual");
         device_a.cloud_sync_now().expect("push manual flag");
         assert!(state.key_content.lock().expect("lock").is_none());
@@ -34697,5 +35149,1477 @@ mod tests {
             saw_replaced_interrupt,
             "interrupting stale opt_* ID after replacement must forward InterruptTurn to real agent_id"
         );
+    }
+
+    #[test]
+    fn cloud_sync_enable_manual_passphrase_reencrypts_random_vault_and_survives_logout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Default)]
+        struct MockGistState {
+            vault_content: Mutex<Option<String>>,
+            key_content: Mutex<Option<String>>,
+        }
+
+        let state = Arc::new(MockGistState::default());
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let base_url = rt.block_on({
+            let state = Arc::clone(&state);
+            async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let addr = listener.local_addr().expect("addr");
+                tokio::spawn(async move {
+                    loop {
+                        let Ok((mut sock, _)) = listener.accept().await else {
+                            break;
+                        };
+                        let st = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 65_536];
+                            let n = sock.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let first_line = req.lines().next().unwrap_or("");
+                            let parts: Vec<&str> = first_line.split_whitespace().collect();
+                            let method = parts.first().copied().unwrap_or("");
+                            let path = parts.get(1).copied().unwrap_or("");
+                            let body_str = req.split("\r\n\r\n").nth(1).unwrap_or("");
+
+                            let (status, headers, resp_body) = match (method, path) {
+                                ("GET", "/user") => (
+                                    "200 OK",
+                                    "X-OAuth-Scopes: gist\r\n",
+                                    serde_json::json!({
+                                        "login": "octocat",
+                                        "name": "The Octocat",
+                                        "avatar_url": null
+                                    })
+                                    .to_string(),
+                                ),
+                                ("GET", p) if p.starts_with("/gists?") => {
+                                    let mut items = Vec::new();
+                                    if st.vault_content.lock().expect("lock").is_some() {
+                                        items.push(serde_json::json!({
+                                            "id": "gist_vault_reg",
+                                            "html_url": "https://gist.github.com/octocat/gist_vault_reg",
+                                            "files": { crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME: {} }
+                                        }));
+                                    }
+                                    if st.key_content.lock().expect("lock").is_some() {
+                                        items.push(serde_json::json!({
+                                            "id": "gist_key_reg",
+                                            "html_url": "https://gist.github.com/octocat/gist_key_reg",
+                                            "files": { crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME: {} }
+                                        }));
+                                    }
+                                    ("200 OK", "", serde_json::Value::Array(items).to_string())
+                                }
+                                ("GET", "/gists/gist_vault_reg") => {
+                                    if let Some(c) = st.vault_content.lock().expect("lock").clone() {
+                                        (
+                                            "200 OK",
+                                            "ETag: \"v-reg-2\"\r\n",
+                                            serde_json::json!({
+                                                "id": "gist_vault_reg",
+                                                "html_url": "https://gist.github.com/octocat/gist_vault_reg",
+                                                "files": {
+                                                    crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME: {
+                                                        "content": c,
+                                                        "truncated": false
+                                                    }
+                                                }
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        ("404 Not Found", "", "{}".into())
+                                    }
+                                }
+                                ("GET", "/gists/gist_key_reg") => {
+                                    if let Some(c) = st.key_content.lock().expect("lock").clone() {
+                                        (
+                                            "200 OK",
+                                            "",
+                                            serde_json::json!({
+                                                "id": "gist_key_reg",
+                                                "html_url": "https://gist.github.com/octocat/gist_key_reg",
+                                                "files": {
+                                                    crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME: {
+                                                        "content": c,
+                                                        "truncated": false
+                                                    }
+                                                }
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        ("404 Not Found", "", "{}".into())
+                                    }
+                                }
+                                ("POST", "/gists")
+                                | ("PATCH", "/gists/gist_key_reg")
+                                | ("PATCH", "/gists/gist_vault_reg") => {
+                                    let parsed: serde_json::Value =
+                                        serde_json::from_str(body_str).unwrap_or_default();
+                                    if let Some(c) = parsed["files"]
+                                        [crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME]["content"]
+                                        .as_str()
+                                    {
+                                        *st.key_content.lock().expect("lock") = Some(c.to_string());
+                                        (
+                                            "200 OK",
+                                            "",
+                                            serde_json::json!({
+                                                "id": "gist_key_reg",
+                                                "html_url": "https://gist.github.com/octocat/gist_key_reg"
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        let c = parsed["files"]
+                                            [crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME]["content"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        *st.vault_content.lock().expect("lock") = Some(c);
+                                        (
+                                            "200 OK",
+                                            "ETag: \"v-reg-2\"\r\n",
+                                            serde_json::json!({
+                                                "id": "gist_vault_reg",
+                                                "html_url": "https://gist.github.com/octocat/gist_vault_reg"
+                                            })
+                                            .to_string(),
+                                        )
+                                    }
+                                }
+                                ("DELETE", "/gists/gist_key_reg") => {
+                                    *st.key_content.lock().expect("lock") = None;
+                                    ("204 No Content", "", String::new())
+                                }
+                                _ => ("404 Not Found", "", "{}".into()),
+                            };
+                            let raw = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                                resp_body.len()
+                            );
+                            let _ = sock.write_all(raw.as_bytes()).await;
+                        });
+                    }
+                });
+                format!("http://{addr}")
+            }
+        });
+
+        // 1. Zero-passphrase setup (random vault key) with real fleet/project/preference data.
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("open core");
+        core.set_cloud_sync_github_bases_for_test(&base_url, &base_url);
+
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("kp");
+        let host_id = kp.host_id().expect("host_id");
+        let offer = PairingOffer {
+            host_id: host_id.clone(),
+            hostname: "precious-workstation".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: vec!["ws://192.168.10.20:6868/ws".into()],
+            relay_url: Some("wss://relay.example.com?ft=tok123".into()),
+            pairing_secret: "secret_xyz".into(),
+        };
+        core.pair_host(&offer.to_qr_uri().expect("pair uri"))
+            .expect("pair host");
+        let proj = core
+            .upsert_project(
+                None,
+                &host_id,
+                "MissionCriticalRepo",
+                vec!["/srv/repo".into()],
+            )
+            .expect("upsert project");
+        core.cloud_sync_update_preferences(HashMap::from([(
+            "theme".to_string(),
+            serde_json::json!("dark"),
+        )]))
+        .expect("update prefs");
+
+        let login_status = core
+            .cloud_sync_login_with_token("gho_random_vault_tok")
+            .expect("zero-passphrase login");
+        assert_eq!(login_status.state, crate::cloud_sync::CloudSyncState::Ready);
+        assert!(login_status.instant_unlock_enabled);
+        assert!(state.key_content.lock().expect("lock").is_some());
+        assert!(state.vault_content.lock().expect("lock").is_some());
+
+        // 2. Enable manual passphrase mode with a new recovery passphrase.
+        let manual_status = core
+            .cloud_sync_enable_manual_passphrase("orbit-recovery-pass-2026")
+            .expect("enable manual passphrase");
+        assert_eq!(
+            manual_status.state,
+            crate::cloud_sync::CloudSyncState::Ready
+        );
+        assert!(!manual_status.instant_unlock_enabled);
+        assert!(
+            state.key_content.lock().expect("lock").is_none(),
+            "auto-key must be deleted after passphrase verification succeeds"
+        );
+        assert!(
+            load_sync_config_from_store(&core.store).require_manual_passphrase,
+            "persisted config must record require_manual_passphrase = true"
+        );
+
+        // 3. Sign out and wipe local hosts/projects, simulating fresh sign-in after logout.
+        core.cloud_sync_logout(true).expect("logout");
+        assert!(core.fleet_overview().hosts.is_empty());
+        assert!(core.fleet_overview().projects.is_empty());
+
+        // 4. Sign back in -> Locked, then unlock with the new passphrase and verify full recovery.
+        let relogin = core
+            .cloud_sync_login_with_token("gho_random_vault_tok")
+            .expect("re-login");
+        assert_eq!(relogin.state, crate::cloud_sync::CloudSyncState::Locked);
+        assert!(relogin.remote_vault_exists);
+
+        let unlocked = core
+            .cloud_sync_unlock_with_passphrase("orbit-recovery-pass-2026")
+            .expect("unlock with new passphrase");
+        assert_eq!(unlocked.hosts_added, 1);
+        assert_eq!(unlocked.projects_added, 1);
+
+        let fleet = core.fleet_overview();
+        assert_eq!(fleet.hosts.len(), 1);
+        assert_eq!(fleet.hosts[0].host_id, host_id);
+        assert_eq!(fleet.hosts[0].hostname, "precious-workstation");
+        assert_eq!(fleet.projects.len(), 1);
+        assert_eq!(fleet.projects[0].project_id, proj.project_id);
+        assert_eq!(fleet.projects[0].name, "MissionCriticalRepo");
+        assert_eq!(
+            core.cloud_sync_get_preferences().get("theme"),
+            Some(&serde_json::json!("dark"))
+        );
+        assert!(
+            !core.cloud_sync_status().instant_unlock_enabled,
+            "manual passphrase mode must stay enabled after re-login"
+        );
+        assert!(
+            state.key_content.lock().expect("lock").is_none(),
+            "auto-key must not be silently recreated after unlock"
+        );
+    }
+
+    #[test]
+    fn cloud_sync_enable_manual_passphrase_path_a_keeps_salt_without_reencrypting() {
+        use std::sync::atomic::AtomicU32;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Default)]
+        struct MockPathAServer {
+            vault_content: Mutex<Option<String>>,
+            key_content: Mutex<Option<String>>,
+            patch_vault_calls: AtomicU32,
+            delete_key_calls: AtomicU32,
+        }
+
+        let state = Arc::new(MockPathAServer::default());
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let base_url = rt.block_on({
+            let state = Arc::clone(&state);
+            async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let addr = listener.local_addr().expect("addr");
+                tokio::spawn(async move {
+                    loop {
+                        let Ok((mut sock, _)) = listener.accept().await else {
+                            break;
+                        };
+                        let st = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 65_536];
+                            let n = sock.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let first_line = req.lines().next().unwrap_or("");
+                            let parts: Vec<&str> = first_line.split_whitespace().collect();
+                            let method = parts.first().copied().unwrap_or("");
+                            let path = parts.get(1).copied().unwrap_or("");
+                            let body_str = req.split("\r\n\r\n").nth(1).unwrap_or("");
+
+                            let (status, headers, resp_body) = match (method, path) {
+                                ("GET", "/user") => (
+                                    "200 OK",
+                                    "X-OAuth-Scopes: gist\r\n",
+                                    serde_json::json!({
+                                        "login": "octocat",
+                                        "name": "The Octocat",
+                                        "avatar_url": null
+                                    })
+                                    .to_string(),
+                                ),
+                                ("GET", p) if p.starts_with("/gists?") => {
+                                    let mut items = Vec::new();
+                                    if st.vault_content.lock().expect("lock").is_some() {
+                                        items.push(serde_json::json!({
+                                            "id": "gist_vault_a",
+                                            "html_url": "https://gist.github.com/octocat/gist_vault_a",
+                                            "files": { crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME: {} }
+                                        }));
+                                    }
+                                    if st.key_content.lock().expect("lock").is_some() {
+                                        items.push(serde_json::json!({
+                                            "id": "gist_key_a",
+                                            "html_url": "https://gist.github.com/octocat/gist_key_a",
+                                            "files": { crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME: {} }
+                                        }));
+                                    }
+                                    ("200 OK", "", serde_json::Value::Array(items).to_string())
+                                }
+                                ("GET", "/gists/gist_vault_a") => {
+                                    if let Some(c) = st.vault_content.lock().expect("lock").clone() {
+                                        (
+                                            "200 OK",
+                                            "ETag: \"va1\"\r\n",
+                                            serde_json::json!({
+                                                "id": "gist_vault_a",
+                                                "html_url": "https://gist.github.com/octocat/gist_vault_a",
+                                                "files": {
+                                                    crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME: {
+                                                        "content": c,
+                                                        "truncated": false
+                                                    }
+                                                }
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        ("404 Not Found", "", "{}".into())
+                                    }
+                                }
+                                ("GET", "/gists/gist_key_a") => {
+                                    if let Some(c) = st.key_content.lock().expect("lock").clone() {
+                                        (
+                                            "200 OK",
+                                            "",
+                                            serde_json::json!({
+                                                "id": "gist_key_a",
+                                                "html_url": "https://gist.github.com/octocat/gist_key_a",
+                                                "files": {
+                                                    crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME: {
+                                                        "content": c,
+                                                        "truncated": false
+                                                    }
+                                                }
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        ("404 Not Found", "", "{}".into())
+                                    }
+                                }
+                                ("POST", "/gists") | ("PATCH", "/gists/gist_key_a") => {
+                                    let parsed: serde_json::Value =
+                                        serde_json::from_str(body_str).unwrap_or_default();
+                                    if let Some(c) = parsed["files"]
+                                        [crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME]["content"]
+                                        .as_str()
+                                    {
+                                        *st.key_content.lock().expect("lock") = Some(c.to_string());
+                                        (
+                                            "200 OK",
+                                            "",
+                                            serde_json::json!({
+                                                "id": "gist_key_a",
+                                                "html_url": "https://gist.github.com/octocat/gist_key_a"
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        let c = parsed["files"]
+                                            [crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME]["content"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        *st.vault_content.lock().expect("lock") = Some(c);
+                                        (
+                                            "200 OK",
+                                            "ETag: \"va1\"\r\n",
+                                            serde_json::json!({
+                                                "id": "gist_vault_a",
+                                                "html_url": "https://gist.github.com/octocat/gist_vault_a"
+                                            })
+                                            .to_string(),
+                                        )
+                                    }
+                                }
+                                ("PATCH", "/gists/gist_vault_a") => {
+                                    st.patch_vault_calls.fetch_add(1, Ordering::SeqCst);
+                                    let parsed: serde_json::Value =
+                                        serde_json::from_str(body_str).unwrap_or_default();
+                                    let c = parsed["files"]
+                                        [crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME]["content"]
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .to_string();
+                                    *st.vault_content.lock().expect("lock") = Some(c);
+                                    (
+                                        "200 OK",
+                                        "ETag: \"va2\"\r\n",
+                                        serde_json::json!({
+                                            "id": "gist_vault_a",
+                                            "html_url": "https://gist.github.com/octocat/gist_vault_a"
+                                        })
+                                        .to_string(),
+                                    )
+                                }
+                                ("DELETE", "/gists/gist_key_a") => {
+                                    st.delete_key_calls.fetch_add(1, Ordering::SeqCst);
+                                    *st.key_content.lock().expect("lock") = None;
+                                    ("204 No Content", "", String::new())
+                                }
+                                _ => ("404 Not Found", "", "{}".into()),
+                            };
+                            let raw = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                                resp_body.len()
+                            );
+                            let _ = sock.write_all(raw.as_bytes()).await;
+                        });
+                    }
+                });
+                format!("http://{addr}")
+            }
+        });
+
+        // Seed a passphrase-derived vault plus its companion auto-unlock key gist.
+        let seed_key =
+            orbit_crypto::derive_new_vault_key("existing-vault-pass").expect("derive seed key");
+        let original_salt = seed_key.salt_b64.clone();
+        let seed_payload = crate::cloud_sync::CloudVaultPayload {
+            schema_version: crate::cloud_sync::CLOUD_VAULT_SCHEMA_VERSION,
+            revision: 1,
+            updated_at_ms: now_unix_ms(),
+            ..Default::default()
+        };
+        let seed_client = GitHubCloudClient::with_bases(&base_url, &base_url);
+        rt.block_on(async {
+            crate::cloud_sync::push_vault_payload(
+                &seed_client,
+                "gho_path_a",
+                None,
+                &seed_key,
+                &seed_payload,
+            )
+            .await
+            .expect("seed vault");
+            seed_client
+                .save_auto_unlock_key_gist("gho_path_a", None, &seed_key)
+                .await
+                .expect("seed auto key");
+        });
+
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("core");
+        core.set_cloud_sync_github_bases_for_test(&base_url, &base_url);
+        let st = core
+            .cloud_sync_login_with_token("gho_path_a")
+            .expect("login");
+        assert_eq!(st.state, crate::cloud_sync::CloudSyncState::Ready);
+        assert!(state.key_content.lock().expect("lock").is_some());
+
+        let patches_before = state.patch_vault_calls.load(Ordering::SeqCst);
+        let enabled = core
+            .cloud_sync_enable_manual_passphrase("existing-vault-pass")
+            .expect("path A enable manual");
+        assert!(!enabled.instant_unlock_enabled);
+        assert!(state.key_content.lock().expect("lock").is_none());
+        assert_eq!(state.delete_key_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.patch_vault_calls.load(Ordering::SeqCst),
+            patches_before,
+            "Path A must not re-encrypt or PATCH the vault"
+        );
+
+        let raw_env = state
+            .vault_content
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("vault still present");
+        let env: orbit_crypto::EncryptedVaultEnvelope =
+            serde_json::from_str(&raw_env).expect("parse envelope");
+        assert_eq!(
+            env.salt_b64, original_salt,
+            "Path A must preserve the existing remote envelope salt"
+        );
+    }
+
+    #[test]
+    fn cloud_sync_enable_manual_passphrase_keeps_auto_key_when_verification_fails() {
+        use std::sync::atomic::{AtomicBool, AtomicU32};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Default)]
+        struct MockVerifyFailServer {
+            vault_content: Mutex<Option<String>>,
+            key_content: Mutex<Option<String>>,
+            return_stale_on_patch: AtomicBool,
+            corrupt_after_patch: AtomicBool,
+            corrupt_next_get: AtomicBool,
+            delete_key_calls: AtomicU32,
+        }
+
+        let state = Arc::new(MockVerifyFailServer::default());
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let base_url = rt.block_on({
+            let state = Arc::clone(&state);
+            async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let addr = listener.local_addr().expect("addr");
+                tokio::spawn(async move {
+                    loop {
+                        let Ok((mut sock, _)) = listener.accept().await else {
+                            break;
+                        };
+                        let st = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 65_536];
+                            let n = sock.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let first_line = req.lines().next().unwrap_or("");
+                            let parts: Vec<&str> = first_line.split_whitespace().collect();
+                            let method = parts.first().copied().unwrap_or("");
+                            let path = parts.get(1).copied().unwrap_or("");
+                            let body_str = req.split("\r\n\r\n").nth(1).unwrap_or("");
+
+                            let (status, headers, resp_body) = match (method, path) {
+                                ("GET", "/user") => (
+                                    "200 OK",
+                                    "X-OAuth-Scopes: gist\r\n",
+                                    serde_json::json!({
+                                        "login": "octocat",
+                                        "name": "The Octocat",
+                                        "avatar_url": null
+                                    })
+                                    .to_string(),
+                                ),
+                                ("GET", p) if p.starts_with("/gists?") => {
+                                    let mut items = Vec::new();
+                                    if st.vault_content.lock().expect("lock").is_some() {
+                                        items.push(serde_json::json!({
+                                            "id": "gist_vault_vf",
+                                            "html_url": "https://gist.github.com/octocat/gist_vault_vf",
+                                            "files": { crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME: {} }
+                                        }));
+                                    }
+                                    if st.key_content.lock().expect("lock").is_some() {
+                                        items.push(serde_json::json!({
+                                            "id": "gist_key_vf",
+                                            "html_url": "https://gist.github.com/octocat/gist_key_vf",
+                                            "files": { crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME: {} }
+                                        }));
+                                    }
+                                    ("200 OK", "", serde_json::Value::Array(items).to_string())
+                                }
+                                ("GET", "/gists/gist_vault_vf") => {
+                                    if let Some(mut c) =
+                                        st.vault_content.lock().expect("lock").clone()
+                                    {
+                                        if st.corrupt_next_get.swap(false, Ordering::SeqCst)
+                                            && let Ok(mut env) = serde_json::from_str::<
+                                                orbit_crypto::EncryptedVaultEnvelope,
+                                            >(&c)
+                                        {
+                                            env.ciphertext_b64 = "AAAA".into();
+                                            c = serde_json::to_string(&env).unwrap_or(c);
+                                        }
+                                        (
+                                            "200 OK",
+                                            "ETag: \"vf1\"\r\n",
+                                            serde_json::json!({
+                                                "id": "gist_vault_vf",
+                                                "html_url": "https://gist.github.com/octocat/gist_vault_vf",
+                                                "files": {
+                                                    crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME: {
+                                                        "content": c,
+                                                        "truncated": false
+                                                    }
+                                                }
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        ("404 Not Found", "", "{}".into())
+                                    }
+                                }
+                                ("GET", "/gists/gist_key_vf") => {
+                                    if let Some(c) = st.key_content.lock().expect("lock").clone() {
+                                        (
+                                            "200 OK",
+                                            "",
+                                            serde_json::json!({
+                                                "id": "gist_key_vf",
+                                                "html_url": "https://gist.github.com/octocat/gist_key_vf",
+                                                "files": {
+                                                    crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME: {
+                                                        "content": c,
+                                                        "truncated": false
+                                                    }
+                                                }
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        ("404 Not Found", "", "{}".into())
+                                    }
+                                }
+                                ("POST", "/gists") | ("PATCH", "/gists/gist_key_vf") => {
+                                    let parsed: serde_json::Value =
+                                        serde_json::from_str(body_str).unwrap_or_default();
+                                    if let Some(c) = parsed["files"]
+                                        [crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME]["content"]
+                                        .as_str()
+                                    {
+                                        *st.key_content.lock().expect("lock") = Some(c.to_string());
+                                        (
+                                            "200 OK",
+                                            "",
+                                            serde_json::json!({
+                                                "id": "gist_key_vf",
+                                                "html_url": "https://gist.github.com/octocat/gist_key_vf"
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        let c = parsed["files"]
+                                            [crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME]["content"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        *st.vault_content.lock().expect("lock") = Some(c);
+                                        (
+                                            "200 OK",
+                                            "ETag: \"vf1\"\r\n",
+                                            serde_json::json!({
+                                                "id": "gist_vault_vf",
+                                                "html_url": "https://gist.github.com/octocat/gist_vault_vf"
+                                            })
+                                            .to_string(),
+                                        )
+                                    }
+                                }
+                                ("PATCH", "/gists/gist_vault_vf") => {
+                                    if !st.return_stale_on_patch.load(Ordering::SeqCst) {
+                                        let parsed: serde_json::Value =
+                                            serde_json::from_str(body_str).unwrap_or_default();
+                                        let c = parsed["files"]
+                                            [crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME]["content"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        *st.vault_content.lock().expect("lock") = Some(c);
+                                        if st.corrupt_after_patch.swap(false, Ordering::SeqCst) {
+                                            st.corrupt_next_get.store(true, Ordering::SeqCst);
+                                        }
+                                    } else {
+                                        // Simulate stale remote envelope: keep old content on server.
+                                    }
+                                    (
+                                        "200 OK",
+                                        "ETag: \"vf2\"\r\n",
+                                        serde_json::json!({
+                                            "id": "gist_vault_vf",
+                                            "html_url": "https://gist.github.com/octocat/gist_vault_vf"
+                                        })
+                                        .to_string(),
+                                    )
+                                }
+                                ("DELETE", "/gists/gist_key_vf") => {
+                                    st.delete_key_calls.fetch_add(1, Ordering::SeqCst);
+                                    *st.key_content.lock().expect("lock") = None;
+                                    ("204 No Content", "", String::new())
+                                }
+                                _ => ("404 Not Found", "", "{}".into()),
+                            };
+                            let raw = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                                resp_body.len()
+                            );
+                            let _ = sock.write_all(raw.as_bytes()).await;
+                        });
+                    }
+                });
+                format!("http://{addr}")
+            }
+        });
+
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("core");
+        core.set_cloud_sync_github_bases_for_test(&base_url, &base_url);
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("kp");
+        let host_id = kp.host_id().expect("host_id");
+        let offer = PairingOffer {
+            host_id: host_id.clone(),
+            hostname: "survives-verify-fail".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: vec!["ws://192.168.1.99:6868/ws".into()],
+            relay_url: None,
+            pairing_secret: "sec_vf".into(),
+        };
+        core.pair_host(&offer.to_qr_uri().expect("uri"))
+            .expect("pair");
+        core.cloud_sync_login_with_token("gho_verify_fail")
+            .expect("login");
+        assert!(state.key_content.lock().expect("lock").is_some());
+
+        // Case 1: server returns stale (old) envelope on read-back after PATCH.
+        state.return_stale_on_patch.store(true, Ordering::SeqCst);
+        let err = core
+            .cloud_sync_enable_manual_passphrase("new-pass-stale")
+            .expect_err("stale readback must fail verification");
+        assert!(
+            err.to_string().contains("verification failed"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(state.delete_key_calls.load(Ordering::SeqCst), 0);
+        assert!(state.key_content.lock().expect("lock").is_some());
+        assert!(!load_sync_config_from_store(&core.store).require_manual_passphrase);
+        assert!(core.cloud_sync_status().instant_unlock_enabled);
+
+        // Vault must still auto-unlock on a fresh device because auto-key was preserved.
+        let fresh = OrbitAppCore::open_in_memory_with_discovery(false).expect("fresh");
+        fresh.set_cloud_sync_github_bases_for_test(&base_url, &base_url);
+        let fresh_st = fresh
+            .cloud_sync_login_with_token("gho_verify_fail")
+            .expect("fresh auto-unlock");
+        assert_eq!(fresh_st.state, crate::cloud_sync::CloudSyncState::Ready);
+        assert_eq!(fresh.fleet_overview().hosts.len(), 1);
+        assert_eq!(fresh.fleet_overview().hosts[0].host_id, host_id);
+
+        // Case 2: server accepts PATCH, then returns corrupted ciphertext on read-back.
+        state.return_stale_on_patch.store(false, Ordering::SeqCst);
+        state.corrupt_after_patch.store(true, Ordering::SeqCst);
+        let err2 = core
+            .cloud_sync_enable_manual_passphrase("new-pass-corrupt")
+            .expect_err("tampered readback must fail verification");
+        assert!(
+            err2.to_string().contains("verification failed"),
+            "unexpected error: {err2}"
+        );
+        assert_eq!(state.delete_key_calls.load(Ordering::SeqCst), 0);
+        assert!(state.key_content.lock().expect("lock").is_some());
+        assert!(!load_sync_config_from_store(&core.store).require_manual_passphrase);
+    }
+
+    #[test]
+    fn cloud_sync_set_manual_passphrase_mode_true_is_rejected_and_false_still_works() {
+        use std::sync::atomic::AtomicU32;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Default)]
+        struct MockRejectServer {
+            vault_content: Mutex<Option<String>>,
+            key_content: Mutex<Option<String>>,
+            delete_key_calls: AtomicU32,
+        }
+
+        let state = Arc::new(MockRejectServer::default());
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let base_url = rt.block_on({
+            let state = Arc::clone(&state);
+            async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let addr = listener.local_addr().expect("addr");
+                tokio::spawn(async move {
+                    loop {
+                        let Ok((mut sock, _)) = listener.accept().await else {
+                            break;
+                        };
+                        let st = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 65_536];
+                            let n = sock.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let first_line = req.lines().next().unwrap_or("");
+                            let parts: Vec<&str> = first_line.split_whitespace().collect();
+                            let method = parts.first().copied().unwrap_or("");
+                            let path = parts.get(1).copied().unwrap_or("");
+                            let body_str = req.split("\r\n\r\n").nth(1).unwrap_or("");
+
+                            let (status, headers, resp_body) = match (method, path) {
+                                ("GET", "/user") => (
+                                    "200 OK",
+                                    "X-OAuth-Scopes: gist\r\n",
+                                    serde_json::json!({
+                                        "login": "octocat",
+                                        "name": "The Octocat",
+                                        "avatar_url": null
+                                    })
+                                    .to_string(),
+                                ),
+                                ("GET", p) if p.starts_with("/gists?") => {
+                                    let mut items = Vec::new();
+                                    if st.vault_content.lock().expect("lock").is_some() {
+                                        items.push(serde_json::json!({
+                                            "id": "gist_vault_rej",
+                                            "html_url": "https://gist.github.com/octocat/gist_vault_rej",
+                                            "files": { crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME: {} }
+                                        }));
+                                    }
+                                    if st.key_content.lock().expect("lock").is_some() {
+                                        items.push(serde_json::json!({
+                                            "id": "gist_key_rej",
+                                            "html_url": "https://gist.github.com/octocat/gist_key_rej",
+                                            "files": { crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME: {} }
+                                        }));
+                                    }
+                                    ("200 OK", "", serde_json::Value::Array(items).to_string())
+                                }
+                                ("GET", "/gists/gist_vault_rej") => {
+                                    if let Some(c) = st.vault_content.lock().expect("lock").clone() {
+                                        (
+                                            "200 OK",
+                                            "ETag: \"rej2\"\r\n",
+                                            serde_json::json!({
+                                                "id": "gist_vault_rej",
+                                                "html_url": "https://gist.github.com/octocat/gist_vault_rej",
+                                                "files": {
+                                                    crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME: {
+                                                        "content": c,
+                                                        "truncated": false
+                                                    }
+                                                }
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        ("404 Not Found", "", "{}".into())
+                                    }
+                                }
+                                ("GET", "/gists/gist_key_rej") => {
+                                    if let Some(c) = st.key_content.lock().expect("lock").clone() {
+                                        (
+                                            "200 OK",
+                                            "",
+                                            serde_json::json!({
+                                                "id": "gist_key_rej",
+                                                "html_url": "https://gist.github.com/octocat/gist_key_rej",
+                                                "files": {
+                                                    crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME: {
+                                                        "content": c,
+                                                        "truncated": false
+                                                    }
+                                                }
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        ("404 Not Found", "", "{}".into())
+                                    }
+                                }
+                                ("POST", "/gists")
+                                | ("PATCH", "/gists/gist_key_rej")
+                                | ("PATCH", "/gists/gist_vault_rej") => {
+                                    let parsed: serde_json::Value =
+                                        serde_json::from_str(body_str).unwrap_or_default();
+                                    if let Some(c) = parsed["files"]
+                                        [crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME]["content"]
+                                        .as_str()
+                                    {
+                                        *st.key_content.lock().expect("lock") = Some(c.to_string());
+                                        (
+                                            "200 OK",
+                                            "",
+                                            serde_json::json!({
+                                                "id": "gist_key_rej",
+                                                "html_url": "https://gist.github.com/octocat/gist_key_rej"
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        let c = parsed["files"]
+                                            [crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME]["content"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        *st.vault_content.lock().expect("lock") = Some(c);
+                                        (
+                                            "200 OK",
+                                            "ETag: \"rej2\"\r\n",
+                                            serde_json::json!({
+                                                "id": "gist_vault_rej",
+                                                "html_url": "https://gist.github.com/octocat/gist_vault_rej"
+                                            })
+                                            .to_string(),
+                                        )
+                                    }
+                                }
+                                ("DELETE", "/gists/gist_key_rej") => {
+                                    st.delete_key_calls.fetch_add(1, Ordering::SeqCst);
+                                    *st.key_content.lock().expect("lock") = None;
+                                    ("204 No Content", "", String::new())
+                                }
+                                _ => ("404 Not Found", "", "{}".into()),
+                            };
+                            let raw = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                                resp_body.len()
+                            );
+                            let _ = sock.write_all(raw.as_bytes()).await;
+                        });
+                    }
+                });
+                format!("http://{addr}")
+            }
+        });
+
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("core");
+        core.set_cloud_sync_github_bases_for_test(&base_url, &base_url);
+
+        // Signed-out call to set_manual_passphrase_mode(true) is also rejected without mutating config.
+        assert!(core.cloud_sync_set_manual_passphrase_mode(true).is_err());
+        assert!(!load_sync_config_from_store(&core.store).require_manual_passphrase);
+
+        // Signed-in zero-passphrase vault: legacy set_manual_passphrase_mode(true) must reject and keep auto-key.
+        core.cloud_sync_login_with_token("gho_rej_tok")
+            .expect("login");
+        let key_before = state.key_content.lock().expect("lock").clone();
+        assert!(key_before.is_some());
+        let cfg_before = load_sync_config_from_store(&core.store);
+
+        let err = core
+            .cloud_sync_set_manual_passphrase_mode(true)
+            .expect_err("legacy true entry must be rejected");
+        assert!(
+            err.to_string().contains("passphrase"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(state.delete_key_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.key_content.lock().expect("lock").clone(), key_before);
+        let cfg_after = load_sync_config_from_store(&core.store);
+        assert_eq!(
+            cfg_after.require_manual_passphrase,
+            cfg_before.require_manual_passphrase
+        );
+        assert_eq!(
+            cfg_after.require_manual_passphrase_updated_at_ms,
+            cfg_before.require_manual_passphrase_updated_at_ms
+        );
+        assert_eq!(cfg_after.key_gist_id, cfg_before.key_gist_id);
+
+        // Turning manual mode ON via the verified API and then OFF via set_manual_passphrase_mode(false) still works.
+        let manual = core
+            .cloud_sync_enable_manual_passphrase("verified-pass-for-toggle")
+            .expect("enable manual via verified api");
+        assert!(!manual.instant_unlock_enabled);
+        assert!(state.key_content.lock().expect("lock").is_none());
+
+        let instant = core
+            .cloud_sync_set_manual_passphrase_mode(false)
+            .expect("disable manual mode republishes auto-key");
+        assert!(instant.instant_unlock_enabled);
+        assert!(state.key_content.lock().expect("lock").is_some());
+    }
+
+    #[test]
+    fn cloud_sync_disable_manual_passphrase_serializes_with_cloud_sync_mutex() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let published_key_content: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let base_url = rt.block_on({
+            let published_key_content = Arc::clone(&published_key_content);
+            async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let addr = listener.local_addr().expect("addr");
+                tokio::spawn(async move {
+                    loop {
+                        let Ok((mut sock, _)) = listener.accept().await else {
+                            break;
+                        };
+                        let published = Arc::clone(&published_key_content);
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 65_536];
+                            let n = sock.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let body_str = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(body_str).unwrap_or_default();
+                            if let Some(content) = parsed["files"]
+                                [crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME]["content"]
+                                .as_str()
+                            {
+                                *published.lock().expect("lock") = Some(content.to_string());
+                            }
+                            let resp_body = serde_json::json!({
+                                "id": "gist_key_serialized",
+                                "html_url": "https://gist.github.com/octocat/gist_key_serialized"
+                            })
+                            .to_string();
+                            let raw = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                                resp_body.len()
+                            );
+                            let _ = sock.write_all(raw.as_bytes()).await;
+                        });
+                    }
+                });
+                format!("http://{addr}")
+            }
+        });
+
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("core");
+        core.set_cloud_sync_github_bases_for_test(&base_url, &base_url);
+
+        // Seed signed-in manual-passphrase state with an initial key and auto-sync disabled so
+        // no background auto-sync task interferes with assertions.
+        let old_key = orbit_crypto::generate_random_vault_key();
+        let mut initial_cfg = PersistedCloudSyncConfig {
+            github_access_token: Some("gho_mutex_tok".into()),
+            github_login: Some("octocat".into()),
+            gist_id: Some("gist_vault_old".into()),
+            require_manual_passphrase: true,
+            require_manual_passphrase_updated_at_ms: 100,
+            auto_sync_enabled: false,
+            ..PersistedCloudSyncConfig::default()
+        };
+        initial_cfg.set_derived_key(&old_key);
+        save_sync_config_to_store(&core.store, &initial_cfg).expect("save initial");
+
+        // Hold `cloud_sync_mutex` to simulate an active sync / passphrase rotation in flight.
+        let hold_guard = core
+            .runtime
+            .block_on(Arc::clone(&core.cloud_sync_mutex).lock_owned());
+
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let core = Arc::clone(&core);
+            let started = Arc::clone(&started);
+            let finished = Arc::clone(&finished);
+            std::thread::spawn(move || {
+                started.store(true, Ordering::SeqCst);
+                let res = core.cloud_sync_set_manual_passphrase_mode(false);
+                finished.store(true, Ordering::SeqCst);
+                res
+            })
+        };
+
+        while !started.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "cloud_sync_set_manual_passphrase_mode(false) must wait for cloud_sync_mutex"
+        );
+        assert!(
+            load_sync_config_from_store(&core.store).require_manual_passphrase,
+            "config must not be mutated before acquiring cloud_sync_mutex"
+        );
+
+        // While still holding the lock, simulate the in-flight operation rotating the vault key
+        // and updating `gist_id` + `last_etag`.
+        let rotated_key = orbit_crypto::generate_random_vault_key();
+        let mut rotated_cfg = load_sync_config_from_store(&core.store);
+        rotated_cfg.gist_id = Some("gist_vault_rotated".into());
+        rotated_cfg.last_etag = Some("\"rot_etag_2\"".into());
+        rotated_cfg.set_derived_key(&rotated_key);
+        save_sync_config_to_store(&core.store, &rotated_cfg).expect("save rotated");
+
+        // Release the lock and let `cloud_sync_set_manual_passphrase_mode(false)` proceed.
+        drop(hold_guard);
+
+        let status = worker
+            .join()
+            .expect("worker thread join")
+            .expect("disable manual passphrase should succeed");
+        assert!(status.instant_unlock_enabled);
+        assert_eq!(status.state, crate::cloud_sync::CloudSyncState::Ready);
+        assert!(
+            !core.cloud_sync_in_flight.load(Ordering::SeqCst),
+            "cloud_sync_in_flight must be cleared after completion"
+        );
+
+        let persisted = load_sync_config_from_store(&core.store);
+        assert!(!persisted.require_manual_passphrase);
+        assert_eq!(persisted.gist_id.as_deref(), Some("gist_vault_rotated"));
+        assert_eq!(persisted.last_etag.as_deref(), Some("\"rot_etag_2\""));
+        assert_eq!(
+            persisted.key_gist_id.as_deref(),
+            Some("gist_key_serialized")
+        );
+        assert_eq!(
+            persisted.derived_key().expect("key").key_b64(),
+            rotated_key.key_b64(),
+            "rotated key must not be clobbered by stale pre-lock config"
+        );
+
+        let uploaded = published_key_content
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("auto-unlock key gist must be published");
+        assert!(
+            uploaded.contains(rotated_key.key_b64().as_str()),
+            "published auto-unlock key gist must contain the rotated key"
+        );
+    }
+
+    #[test]
+    fn cloud_sync_enable_manual_passphrase_preconditions_leave_state_unchanged() {
+        use std::sync::atomic::AtomicU32;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Default)]
+        struct CountingServer {
+            requests: AtomicU32,
+        }
+
+        let state = Arc::new(CountingServer::default());
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let base_url = rt.block_on({
+            let state = Arc::clone(&state);
+            async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let addr = listener.local_addr().expect("addr");
+                tokio::spawn(async move {
+                    loop {
+                        let Ok((mut sock, _)) = listener.accept().await else {
+                            break;
+                        };
+                        let st = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let _ = sock.read(&mut buf).await;
+                            st.requests.fetch_add(1, Ordering::SeqCst);
+                            let raw = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                            let _ = sock.write_all(raw.as_bytes()).await;
+                        });
+                    }
+                });
+                format!("http://{addr}")
+            }
+        });
+
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("core");
+        core.set_cloud_sync_github_bases_for_test(&base_url, &base_url);
+
+        // (a) Signed out -> error, config unchanged, 0 remote calls.
+        let cfg_signed_out = load_sync_config_from_store(&core.store);
+        assert!(
+            core.cloud_sync_enable_manual_passphrase("some-pass")
+                .is_err()
+        );
+        assert_eq!(state.requests.load(Ordering::SeqCst), 0);
+        let after_signed_out = load_sync_config_from_store(&core.store);
+        assert_eq!(
+            after_signed_out.require_manual_passphrase,
+            cfg_signed_out.require_manual_passphrase
+        );
+        assert_eq!(after_signed_out.last_error, cfg_signed_out.last_error);
+
+        // (b) Signed in + unlocked, empty / whitespace passphrase -> error, config unchanged, 0 remote calls.
+        {
+            let mut cfg = load_sync_config_from_store(&core.store);
+            cfg.github_access_token = Some("gho_precond_tok".into());
+            cfg.github_login = Some("octocat".into());
+            cfg.key_gist_id = Some("gist_key_pre".into());
+            let key = orbit_crypto::generate_random_vault_key();
+            cfg.set_derived_key(&key);
+            save_sync_config_to_store(&core.store, &cfg).expect("seed unlocked cfg");
+        }
+        let cfg_unlocked = load_sync_config_from_store(&core.store);
+        assert!(core.cloud_sync_enable_manual_passphrase("").is_err());
+        assert!(
+            core.cloud_sync_enable_manual_passphrase("   \t\n ")
+                .is_err()
+        );
+        assert_eq!(state.requests.load(Ordering::SeqCst), 0);
+        let after_empty = load_sync_config_from_store(&core.store);
+        assert_eq!(after_empty.key_gist_id, cfg_unlocked.key_gist_id);
+        assert_eq!(after_empty.cached_key_b64, cfg_unlocked.cached_key_b64);
+        assert!(!after_empty.require_manual_passphrase);
+        assert_eq!(after_empty.last_error, cfg_unlocked.last_error);
+
+        // (c) Signed in + locked (no cached derived key) -> error, config unchanged, 0 remote calls.
+        {
+            let mut cfg = load_sync_config_from_store(&core.store);
+            cfg.clear_derived_key();
+            save_sync_config_to_store(&core.store, &cfg).expect("seed locked cfg");
+        }
+        let cfg_locked = load_sync_config_from_store(&core.store);
+        assert!(
+            core.cloud_sync_enable_manual_passphrase("valid-pass")
+                .is_err()
+        );
+        assert_eq!(state.requests.load(Ordering::SeqCst), 0);
+        let after_locked = load_sync_config_from_store(&core.store);
+        assert_eq!(after_locked.key_gist_id, cfg_locked.key_gist_id);
+        assert!(after_locked.cached_key_b64.is_none());
+        assert!(!after_locked.require_manual_passphrase);
+        assert_eq!(after_locked.last_error, cfg_locked.last_error);
+    }
+
+    #[test]
+    fn cloud_sync_enable_manual_passphrase_rejects_stale_etag_until_synced() {
+        use std::sync::atomic::AtomicU32;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct MockEtagServer {
+            vault_content: Mutex<Option<String>>,
+            key_content: Mutex<Option<String>>,
+            current_etag: Mutex<String>,
+            patch_vault_calls: AtomicU32,
+            delete_key_calls: AtomicU32,
+        }
+
+        let state = Arc::new(MockEtagServer {
+            vault_content: Mutex::new(None),
+            key_content: Mutex::new(None),
+            current_etag: Mutex::new("\"etag-v1\"".to_string()),
+            patch_vault_calls: AtomicU32::new(0),
+            delete_key_calls: AtomicU32::new(0),
+        });
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let base_url = rt.block_on({
+            let state = Arc::clone(&state);
+            async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let addr = listener.local_addr().expect("addr");
+                tokio::spawn(async move {
+                    loop {
+                        let Ok((mut sock, _)) = listener.accept().await else {
+                            break;
+                        };
+                        let st = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 65_536];
+                            let n = sock.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let first_line = req.lines().next().unwrap_or("");
+                            let parts: Vec<&str> = first_line.split_whitespace().collect();
+                            let method = parts.first().copied().unwrap_or("");
+                            let path = parts.get(1).copied().unwrap_or("");
+                            let body_str = req.split("\r\n\r\n").nth(1).unwrap_or("");
+
+                            let (status, headers, resp_body) = match (method, path) {
+                                ("GET", "/user") => (
+                                    "200 OK",
+                                    "X-OAuth-Scopes: gist\r\n".to_string(),
+                                    serde_json::json!({
+                                        "login": "octocat",
+                                        "name": "The Octocat",
+                                        "avatar_url": null
+                                    })
+                                    .to_string(),
+                                ),
+                                ("GET", p) if p.starts_with("/gists?") => {
+                                    let mut items = Vec::new();
+                                    if st.vault_content.lock().expect("lock").is_some() {
+                                        items.push(serde_json::json!({
+                                            "id": "gist_vault_etag",
+                                            "html_url": "https://gist.github.com/octocat/gist_vault_etag",
+                                            "files": { crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME: {} }
+                                        }));
+                                    }
+                                    if st.key_content.lock().expect("lock").is_some() {
+                                        items.push(serde_json::json!({
+                                            "id": "gist_key_etag",
+                                            "html_url": "https://gist.github.com/octocat/gist_key_etag",
+                                            "files": { crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME: {} }
+                                        }));
+                                    }
+                                    (
+                                        "200 OK",
+                                        String::new(),
+                                        serde_json::Value::Array(items).to_string(),
+                                    )
+                                }
+                                ("GET", "/gists/gist_vault_etag") => {
+                                    if let Some(c) = st.vault_content.lock().expect("lock").clone() {
+                                        let etag = st.current_etag.lock().expect("lock").clone();
+                                        (
+                                            "200 OK",
+                                            format!("ETag: {etag}\r\n"),
+                                            serde_json::json!({
+                                                "id": "gist_vault_etag",
+                                                "html_url": "https://gist.github.com/octocat/gist_vault_etag",
+                                                "files": {
+                                                    crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME: {
+                                                        "content": c,
+                                                        "truncated": false
+                                                    }
+                                                }
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        ("404 Not Found", String::new(), "{}".into())
+                                    }
+                                }
+                                ("GET", "/gists/gist_key_etag") => {
+                                    if let Some(c) = st.key_content.lock().expect("lock").clone() {
+                                        (
+                                            "200 OK",
+                                            String::new(),
+                                            serde_json::json!({
+                                                "id": "gist_key_etag",
+                                                "html_url": "https://gist.github.com/octocat/gist_key_etag",
+                                                "files": {
+                                                    crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME: {
+                                                        "content": c,
+                                                        "truncated": false
+                                                    }
+                                                }
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        ("404 Not Found", String::new(), "{}".into())
+                                    }
+                                }
+                                ("POST", "/gists") | ("PATCH", "/gists/gist_key_etag") => {
+                                    let parsed: serde_json::Value =
+                                        serde_json::from_str(body_str).unwrap_or_default();
+                                    if let Some(c) = parsed["files"]
+                                        [crate::cloud_sync::CLOUD_VAULT_KEY_GIST_FILENAME]["content"]
+                                        .as_str()
+                                    {
+                                        *st.key_content.lock().expect("lock") = Some(c.to_string());
+                                        (
+                                            "200 OK",
+                                            String::new(),
+                                            serde_json::json!({
+                                                "id": "gist_key_etag",
+                                                "html_url": "https://gist.github.com/octocat/gist_key_etag"
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        let c = parsed["files"]
+                                            [crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME]["content"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        *st.vault_content.lock().expect("lock") = Some(c);
+                                        let etag = st.current_etag.lock().expect("lock").clone();
+                                        (
+                                            "200 OK",
+                                            format!("ETag: {etag}\r\n"),
+                                            serde_json::json!({
+                                                "id": "gist_vault_etag",
+                                                "html_url": "https://gist.github.com/octocat/gist_vault_etag"
+                                            })
+                                            .to_string(),
+                                        )
+                                    }
+                                }
+                                ("PATCH", "/gists/gist_vault_etag") => {
+                                    st.patch_vault_calls.fetch_add(1, Ordering::SeqCst);
+                                    let parsed: serde_json::Value =
+                                        serde_json::from_str(body_str).unwrap_or_default();
+                                    let c = parsed["files"]
+                                        [crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME]["content"]
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .to_string();
+                                    *st.vault_content.lock().expect("lock") = Some(c);
+                                    *st.current_etag.lock().expect("lock") =
+                                        "\"etag-v3\"".to_string();
+                                    (
+                                        "200 OK",
+                                        "ETag: \"etag-v3\"\r\n".to_string(),
+                                        serde_json::json!({
+                                            "id": "gist_vault_etag",
+                                            "html_url": "https://gist.github.com/octocat/gist_vault_etag"
+                                        })
+                                        .to_string(),
+                                    )
+                                }
+                                ("DELETE", "/gists/gist_key_etag") => {
+                                    st.delete_key_calls.fetch_add(1, Ordering::SeqCst);
+                                    *st.key_content.lock().expect("lock") = None;
+                                    ("204 No Content", String::new(), String::new())
+                                }
+                                _ => ("404 Not Found", String::new(), "{}".into()),
+                            };
+                            let raw = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                                resp_body.len()
+                            );
+                            let _ = sock.write_all(raw.as_bytes()).await;
+                        });
+                    }
+                });
+                format!("http://{addr}")
+            }
+        });
+
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("core");
+        core.set_cloud_sync_github_bases_for_test(&base_url, &base_url);
+        core.cloud_sync_login_with_token("gho_etag_tok")
+            .expect("login");
+        assert_eq!(
+            load_sync_config_from_store(&core.store)
+                .last_etag
+                .as_deref(),
+            Some("\"etag-v1\"")
+        );
+
+        // Simulate another device advancing the remote vault's ETag without this device syncing yet.
+        *state.current_etag.lock().expect("lock") = "\"etag-v2-peer\"".to_string();
+
+        let err = core
+            .cloud_sync_enable_manual_passphrase("fresh-pass-after-sync")
+            .expect_err("stale local ETag must abort Path B before pushing");
+        assert!(
+            err.to_string().contains("Sync Now"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(state.patch_vault_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.delete_key_calls.load(Ordering::SeqCst), 0);
+        assert!(state.key_content.lock().expect("lock").is_some());
+        assert!(!load_sync_config_from_store(&core.store).require_manual_passphrase);
+
+        // Running Sync Now refreshes local ETag to match remote, then enabling manual mode succeeds.
+        core.cloud_sync_now().expect("sync now refreshes etag");
+        assert_eq!(
+            load_sync_config_from_store(&core.store)
+                .last_etag
+                .as_deref(),
+            Some("\"etag-v2-peer\"")
+        );
+        let enabled = core
+            .cloud_sync_enable_manual_passphrase("fresh-pass-after-sync")
+            .expect("enable succeeds after sync");
+        assert!(!enabled.instant_unlock_enabled);
+        assert!(state.key_content.lock().expect("lock").is_none());
+        assert_eq!(state.delete_key_calls.load(Ordering::SeqCst), 1);
     }
 }

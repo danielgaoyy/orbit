@@ -34,22 +34,38 @@ export function HostLspSection({
     )?.connection_state;
     return state === "online_direct" || state === "online_relay";
   });
+  const effectiveCwd = workspaceCwd && workspaceCwd !== "~" ? workspaceCwd : null;
   const entry = useOrbitSelector((s) =>
-    workspaceCwd ? s.lspServersByWorkspace[`${hostId}::${workspaceCwd}`] : null,
+    effectiveCwd ? s.lspServersByWorkspace[`${hostId}::${effectiveCwd}`] : null,
   );
   const [restarting, setRestarting] = useState<string | null>(null);
-  const loading = entry?.status === "loading";
+  const [refreshing, setRefreshing] = useState(false);
+  const loading =
+    online &&
+    Boolean(effectiveCwd) &&
+    (!entry || entry.status === "idle" || entry.status === "loading");
+  const isRefreshing = refreshing || loading;
 
   useEffect(() => {
-    if (online && workspaceCwd)
-      void orbitActions.loadLspServers(hostId, workspaceCwd);
-  }, [online, hostId, workspaceCwd]);
+    if (online && effectiveCwd)
+      void orbitActions.loadLspServers(hostId, effectiveCwd);
+  }, [online, hostId, effectiveCwd]);
+
+  const handleRefresh = async () => {
+    if (!online || !effectiveCwd) return;
+    setRefreshing(true);
+    try {
+      await orbitActions.loadLspServers(hostId, effectiveCwd);
+    } finally {
+      setRefreshing(false);
+    }
+  };
 
   const restart = async (id: string) => {
-    if (!workspaceCwd || restarting) return;
+    if (!effectiveCwd || restarting) return;
     setRestarting(id);
     try {
-      await orbitActions.restartLspServer(hostId, workspaceCwd, id);
+      await orbitActions.restartLspServer(hostId, effectiveCwd, id);
     } catch (error) {
       orbitActions.showToast(
         error instanceof Error ? error.message : t("common.actionFailed"),
@@ -60,21 +76,19 @@ export function HostLspSection({
   };
 
   return (
-    <section data-setting-id="settings.subTabLsp" className="space-y-2">
+    <section data-setting-id="settings.subTabLsp" className="space-y-3">
       <SettingGroupLabel
         action={
           online &&
-          workspaceCwd && (
+          effectiveCwd && (
             <div className="flex items-center gap-2">
               {workspacePicker}
               <IconButton
                 tooltip={t("common.refresh")}
-                disabled={loading}
-                onClick={() =>
-                  void orbitActions.loadLspServers(hostId, workspaceCwd)
-                }
+                disabled={isRefreshing}
+                onClick={() => void handleRefresh()}
               >
-                <RefreshCw className={loading ? "animate-spin" : undefined} />
+                <RefreshCw className={isRefreshing ? "animate-spin" : undefined} />
               </IconButton>
             </div>
           )
@@ -83,12 +97,12 @@ export function HostLspSection({
         {t("devTools.lsp")}
       </SettingGroupLabel>
       <SettingCard>
-        {online && workspaceCwd && entry?.status === "error" && (
+        {online && effectiveCwd && entry?.status === "error" && (
           <p role="alert" className="text-signal-danger px-4 py-3 text-[13px]">
             {entry.error}
           </p>
         )}
-        {online && workspaceCwd && Boolean(entry?.servers.length) ? (
+        {online && effectiveCwd && Boolean(entry?.servers.length) ? (
           entry?.servers.map((server) => (
             <SettingResourceRow
               key={server.id}
@@ -142,7 +156,7 @@ export function HostLspSection({
             <span>
               {!online
                 ? t("devTools.offline")
-                : !workspaceCwd
+                : !effectiveCwd
                   ? t("devTools.needProject")
                   : loading
                     ? t("common.loading")
@@ -151,7 +165,7 @@ export function HostLspSection({
           </div>
         )}
       </SettingCard>
-      {online && workspaceCwd && (
+      {online && effectiveCwd && (
         <p className="text-ink-muted text-[11px]">{t("devTools.lspPaths")}</p>
       )}
     </section>

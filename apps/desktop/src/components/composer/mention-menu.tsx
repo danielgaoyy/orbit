@@ -260,13 +260,13 @@ export function MentionMenu({
                       onSelect(item);
                     }}
                     className={cn(
-                      "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
+                      "flex w-full cursor-pointer items-center justify-between gap-3 overflow-hidden rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
                       active
                         ? "bg-accent text-ink-primary"
                         : "text-ink-secondary hover:bg-accent/60 hover:text-ink-primary",
                     )}
                   >
-                    <div className="flex min-w-0 items-center gap-2">
+                    <div className="flex min-w-0 flex-1 items-center gap-2">
                       <span
                         aria-label={meta.label}
                         className={cn(
@@ -278,18 +278,20 @@ export function MentionMenu({
                       >
                         {meta.glyph}
                       </span>
-                      <span className="text-ink-primary shrink-0 font-mono text-[13px] font-medium">
+                      <span className="text-ink-primary min-w-0 truncate font-mono text-[13px] font-medium">
                         {item.title}
                       </span>
                       {item.container && (
-                        <span className="text-ink-muted shrink-0 font-mono text-[11px]">
+                        <span className="text-ink-muted max-w-[35%] shrink-0 truncate font-mono text-[11px]">
                           {item.container}
                         </span>
                       )}
                     </div>
-                    <span className="text-ink-muted truncate font-mono text-[11px]">
-                      {locLabel}
-                    </span>
+                    {locLabel && (
+                      <span className="text-ink-muted max-w-[42%] shrink-0 truncate font-mono text-[11px]">
+                        {locLabel}
+                      </span>
+                    )}
                   </button>
                 </div>
               );
@@ -309,25 +311,31 @@ export function MentionMenu({
                   aria-selected={active}
                   type="button"
                   data-mention-idx={idx}
+                  title={path}
                   onMouseEnter={() => onHoverIndex(idx)}
                   onMouseDown={(e) => {
                     e.preventDefault();
                     onSelect(item);
                   }}
                   className={cn(
-                    "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
+                    "flex w-full cursor-pointer items-center justify-between gap-3 overflow-hidden rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
                     active
                       ? "bg-accent text-ink-primary"
                       : "text-ink-secondary hover:bg-accent/60 hover:text-ink-primary",
                   )}
                 >
-                  <div className="flex min-w-0 items-center gap-2.5">
+                  <div className="flex min-w-0 flex-1 items-center gap-2.5">
                     <FileIcon className={iconClass} />
-                    <span className="text-ink-primary shrink-0 font-mono text-[13px] font-medium">
+                    <span
+                      className={cn(
+                        "text-ink-primary min-w-0 truncate font-mono text-[13px] font-medium",
+                        dirPath ? "max-w-[65%] shrink-0" : "flex-1",
+                      )}
+                    >
                       {basename}
                     </span>
                     {dirPath && (
-                      <span className="text-ink-muted truncate font-mono text-[11px]">
+                      <span className="text-ink-muted min-w-0 flex-1 truncate font-mono text-[11px]">
                         {dirPath}
                       </span>
                     )}
@@ -350,26 +358,34 @@ export function MentionMenu({
                   aria-selected={active}
                   type="button"
                   data-mention-idx={idx}
+                  title={[item.title, item.subtitle].filter(Boolean).join(" — ")}
                   onMouseEnter={() => onHoverIndex(idx)}
                   onMouseDown={(e) => {
                     e.preventDefault();
                     onSelect(item);
                   }}
                   className={cn(
-                    "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
+                    "flex w-full cursor-pointer items-center justify-between gap-3 overflow-hidden rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
                     active
                       ? "bg-accent text-ink-primary"
                       : "text-ink-secondary hover:bg-accent/60 hover:text-ink-primary",
                   )}
                 >
-                  <div className="flex min-w-0 items-center gap-2.5">
+                  <div className="flex min-w-0 flex-1 items-center gap-2.5">
                     <BookOpen className={iconClass} />
-                    <span className="text-ink-primary shrink-0 font-mono text-[13px] font-medium">
+                    <span
+                      className={cn(
+                        "text-ink-primary min-w-0 truncate font-mono text-[13px] font-medium",
+                        item.subtitle ? "max-w-[55%] shrink-0" : "flex-1",
+                      )}
+                    >
                       {item.title}
                     </span>
-                    <span className="text-ink-muted truncate text-[11px]">
-                      {item.subtitle}
-                    </span>
+                    {item.subtitle && (
+                      <span className="text-ink-muted min-w-0 flex-1 truncate text-[11px]">
+                        {item.subtitle}
+                      </span>
+                    )}
                   </div>
                   <span className="bg-surface-recessed text-ink-muted shrink-0 rounded-[4px] px-1.5 py-0.5 text-[11px] font-medium">
                     {item.git_status || t("composer.mentionBadgeRule")}
@@ -392,26 +408,34 @@ export function MentionMenu({
                   aria-selected={active}
                   type="button"
                   data-mention-idx={idx}
+                  title={[item.title, peerSubtitle].filter(Boolean).join(" — ")}
                   onMouseEnter={() => onHoverIndex(idx)}
                   onMouseDown={(e) => {
                     e.preventDefault();
                     onSelect(item);
                   }}
                   className={cn(
-                    "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
+                    "flex w-full cursor-pointer items-center justify-between gap-3 overflow-hidden rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
                     active
                       ? "bg-accent text-ink-primary"
                       : "text-ink-secondary hover:bg-accent/60 hover:text-ink-primary",
                   )}
                 >
-                  <div className="flex min-w-0 items-center gap-2.5">
+                  <div className="flex min-w-0 flex-1 items-center gap-2.5">
                     <PeerIcon className={iconClass} />
-                    <span className="text-ink-primary shrink-0 font-mono text-[13px] font-medium">
+                    <span
+                      className={cn(
+                        "text-ink-primary min-w-0 truncate font-mono text-[13px] font-medium",
+                        peerSubtitle ? "max-w-[55%] shrink-0" : "flex-1",
+                      )}
+                    >
                       {item.title}
                     </span>
-                    <span className="text-ink-muted truncate text-[11px]">
-                      {peerSubtitle}
-                    </span>
+                    {peerSubtitle && (
+                      <span className="text-ink-muted min-w-0 flex-1 truncate text-[11px]">
+                        {peerSubtitle}
+                      </span>
+                    )}
                   </div>
                   <span className="bg-surface-recessed text-ink-muted shrink-0 rounded-[4px] px-1.5 py-0.5 text-[11px] font-medium">
                     {isBroadcast
@@ -424,6 +448,8 @@ export function MentionMenu({
 
             if (item.kind === "folder" || item.kind === "folder_hint") {
               const FolderIcon = item.kind === "folder" ? Folder : FolderTree;
+              const folderSubtitle =
+                item.kind === "folder_hint" ? t("composer.mentionFolderDesc") : item.subtitle;
               return (
                 <button
                   key={item.key}
@@ -432,28 +458,38 @@ export function MentionMenu({
                   aria-selected={active}
                   type="button"
                   data-mention-idx={idx}
+                  title={[item.title, folderSubtitle].filter(Boolean).join(" — ")}
                   onMouseEnter={() => onHoverIndex(idx)}
                   onMouseDown={(e) => {
                     e.preventDefault();
                     onSelect(item);
                   }}
                   className={cn(
-                    "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
+                    "flex w-full cursor-pointer items-center justify-between gap-3 overflow-hidden rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
                     active
                       ? "bg-accent text-ink-primary"
                       : "text-ink-secondary hover:bg-accent/60 hover:text-ink-primary",
                   )}
                 >
-                  <div className="flex min-w-0 items-center gap-2.5">
+                  <div className="flex min-w-0 flex-1 items-center gap-2.5">
                     <FolderIcon className={iconClass} />
-                    <span className="text-ink-primary truncate font-mono text-[13px] font-medium">
+                    <span
+                      className={cn(
+                        "text-ink-primary font-mono text-[13px] font-medium",
+                        item.kind === "folder_hint"
+                          ? "shrink-0"
+                          : folderSubtitle
+                            ? "min-w-0 max-w-[65%] shrink-0 truncate"
+                            : "min-w-0 flex-1 truncate",
+                      )}
+                    >
                       {item.title}
                     </span>
-                    <span className="text-ink-muted shrink-0 truncate text-[11px]">
-                      {item.kind === "folder_hint"
-                        ? t("composer.mentionFolderDesc")
-                        : item.subtitle}
-                    </span>
+                    {folderSubtitle && (
+                      <span className="text-ink-muted min-w-0 flex-1 truncate text-[11px]">
+                        {folderSubtitle}
+                      </span>
+                    )}
                   </div>
                   <span className="bg-surface-recessed text-ink-muted shrink-0 rounded-[4px] px-1.5 py-0.5 text-[11px] font-medium">
                     {t("composer.mentionBadgeFolder")}
@@ -463,6 +499,7 @@ export function MentionMenu({
             }
 
             if (item.kind === "pr") {
+              const prSubtitle = t("composer.mentionPrDesc");
               return (
                 <button
                   key={item.key}
@@ -471,25 +508,26 @@ export function MentionMenu({
                   aria-selected={active}
                   type="button"
                   data-mention-idx={idx}
+                  title={[item.title, prSubtitle].filter(Boolean).join(" — ")}
                   onMouseEnter={() => onHoverIndex(idx)}
                   onMouseDown={(e) => {
                     e.preventDefault();
                     onSelect(item);
                   }}
                   className={cn(
-                    "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
+                    "flex w-full cursor-pointer items-center justify-between gap-3 overflow-hidden rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
                     active
                       ? "bg-accent text-ink-primary"
                       : "text-ink-secondary hover:bg-accent/60 hover:text-ink-primary",
                   )}
                 >
-                  <div className="flex min-w-0 items-center gap-2.5">
+                  <div className="flex min-w-0 flex-1 items-center gap-2.5">
                     <GitPullRequest className={iconClass} />
-                    <span className="text-ink-primary shrink-0 font-mono text-[13px] font-medium">
+                    <span className="text-ink-primary min-w-0 max-w-[55%] shrink-0 truncate font-mono text-[13px] font-medium">
                       {item.title}
                     </span>
-                    <span className="text-ink-muted truncate text-[11px]">
-                      {t("composer.mentionPrDesc")}
+                    <span className="text-ink-muted min-w-0 flex-1 truncate text-[11px]">
+                      {prSubtitle}
                     </span>
                   </div>
                   <span className="bg-surface-recessed text-ink-muted shrink-0 rounded-[4px] px-1.5 py-0.5 text-[11px] font-medium">
@@ -500,6 +538,8 @@ export function MentionMenu({
             }
 
             if (item.kind === "web" || item.kind === "web_hint") {
+              const webSubtitle =
+                item.kind === "web_hint" ? t("composer.mentionWebDesc") : item.subtitle;
               return (
                 <button
                   key={item.key}
@@ -508,26 +548,38 @@ export function MentionMenu({
                   aria-selected={active}
                   type="button"
                   data-mention-idx={idx}
+                  title={[item.title, webSubtitle].filter(Boolean).join(" — ")}
                   onMouseEnter={() => onHoverIndex(idx)}
                   onMouseDown={(e) => {
                     e.preventDefault();
                     onSelect(item);
                   }}
                   className={cn(
-                    "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
+                    "flex w-full cursor-pointer items-center justify-between gap-3 overflow-hidden rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
                     active
                       ? "bg-accent text-ink-primary"
                       : "text-ink-secondary hover:bg-accent/60 hover:text-ink-primary",
                   )}
                 >
-                  <div className="flex min-w-0 items-center gap-2.5">
+                  <div className="flex min-w-0 flex-1 items-center gap-2.5">
                     <Globe className={iconClass} />
-                    <span className="text-ink-primary truncate font-mono text-[13px] font-medium">
+                    <span
+                      className={cn(
+                        "text-ink-primary font-mono text-[13px] font-medium",
+                        item.kind === "web_hint"
+                          ? "shrink-0"
+                          : webSubtitle
+                            ? "min-w-0 max-w-[60%] shrink-0 truncate"
+                            : "min-w-0 flex-1 truncate",
+                      )}
+                    >
                       {item.title}
                     </span>
-                    <span className="text-ink-muted truncate text-[11px]">
-                      {item.kind === "web_hint" ? t("composer.mentionWebDesc") : item.subtitle}
-                    </span>
+                    {webSubtitle && (
+                      <span className="text-ink-muted min-w-0 flex-1 truncate text-[11px]">
+                        {webSubtitle}
+                      </span>
+                    )}
                   </div>
                   <span className="bg-surface-recessed text-ink-muted shrink-0 rounded-[4px] px-1.5 py-0.5 text-[11px] font-medium">
                     {t("composer.mentionBadgeWeb")}
@@ -559,26 +611,34 @@ export function MentionMenu({
                 aria-selected={active}
                 type="button"
                 data-mention-idx={idx}
+                title={[item.title, builtinSubtitle].filter(Boolean).join(" — ")}
                 onMouseEnter={() => onHoverIndex(idx)}
                 onMouseDown={(e) => {
                   e.preventDefault();
                   onSelect(item);
                 }}
                 className={cn(
-                  "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
+                  "flex w-full cursor-pointer items-center justify-between gap-3 overflow-hidden rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
                   active
                     ? "bg-accent text-ink-primary"
                     : "text-ink-secondary hover:bg-accent/60 hover:text-ink-primary",
                 )}
               >
-                <div className="flex min-w-0 items-center gap-2.5">
+                <div className="flex min-w-0 flex-1 items-center gap-2.5">
                   <SourceIcon className={iconClass} />
-                  <span className="text-ink-primary shrink-0 font-mono text-[13px] font-medium">
+                  <span
+                    className={cn(
+                      "text-ink-primary min-w-0 truncate font-mono text-[13px] font-medium",
+                      builtinSubtitle ? "max-w-[55%] shrink-0" : "flex-1",
+                    )}
+                  >
                     {item.title}
                   </span>
-                  <span className="text-ink-muted truncate text-[11px]">
-                    {builtinSubtitle}
-                  </span>
+                  {builtinSubtitle && (
+                    <span className="text-ink-muted min-w-0 flex-1 truncate text-[11px]">
+                      {builtinSubtitle}
+                    </span>
+                  )}
                 </div>
               </button>
             );

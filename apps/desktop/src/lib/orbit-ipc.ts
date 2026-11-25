@@ -173,6 +173,8 @@ export interface UpsertExternalMcpServerRequest {
   headers: Record<string, string>;
   keep_existing_secrets: boolean;
   enabled: boolean;
+  /** Create-only: the daemon rejects the write if this name already exists in the target scope. */
+  create_only?: boolean;
 }
 
 export type ArtifactKind = "markdown" | "html" | "code" | "svg" | "mermaid" | "mcp_app";
@@ -1215,6 +1217,7 @@ export interface ProviderSubagentDescriptor {
   parent_subagent_id: string | null;
   title: string;
   subtitle: string | null;
+  model?: string | null;
   status: ProviderSubagentStatus;
   created_at: string;
   updated_at: string;
@@ -5244,6 +5247,8 @@ export const orbitIpc = {
       content: string;
       enabled: boolean;
       expectedEtag?: string | null;
+      /** Create-only: the daemon rejects the write if this slug already exists. */
+      createOnly?: boolean;
     },
   ): Promise<ManagedSkillRecord[]> => {
     if (!transport()) return [];
@@ -5257,6 +5262,7 @@ export const orbitIpc = {
       content: params.content,
       enabled: params.enabled,
       expectedEtag: params.expectedEtag ?? null,
+      createOnly: params.createOnly ?? false,
     });
   },
 
@@ -5295,6 +5301,10 @@ export const orbitIpc = {
       cwd?: string | null;
       sourceMarkdownOrPath: string;
       slugOverride?: string | null;
+      /** Version check for an explicit replace of an existing skill. */
+      expectedEtag?: string | null;
+      /** Create-only: the daemon rejects the import if the resolved slug already exists. */
+      createOnly?: boolean;
     },
   ): Promise<ManagedSkillRecord[]> => {
     if (!transport()) return [];
@@ -5304,6 +5314,8 @@ export const orbitIpc = {
       cwd: params.cwd ?? null,
       sourceMarkdownOrPath: params.sourceMarkdownOrPath,
       slugOverride: params.slugOverride ?? null,
+      expectedEtag: params.expectedEtag ?? null,
+      createOnly: params.createOnly ?? false,
     });
   },
 
@@ -6992,6 +7004,14 @@ export const orbitIpc = {
 
   cloudSyncImportDeviceLinkUri: async (uri: string): Promise<CloudSyncResultView> => {
     return invoke<CloudSyncResultView>("cloud_sync_import_device_link_uri", { uri });
+  },
+
+  cloudSyncEnableManualPassphrase: async (
+    passphrase: string,
+  ): Promise<CloudSyncStatusView> => {
+    return invoke<CloudSyncStatusView>("cloud_sync_enable_manual_passphrase", {
+      passphrase,
+    });
   },
 
   cloudSyncSetManualPassphraseMode: async (

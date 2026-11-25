@@ -258,17 +258,18 @@ pub fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
             use std::os::unix::fs::OpenOptionsExt;
             open_opts.mode(0o600);
         }
-        let mut file = open_opts.open(&tmp_path).map_err(|e| {
-            format!(
-                "failed to create temporary file `{}`: {e}",
-                tmp_path.display()
-            )
-        })?;
-        file.write_all(bytes)
-            .map_err(|e| format!("failed to write exported transcript: {e}"))?;
-        file.sync_all()
-            .map_err(|e| format!("failed to flush exported transcript: {e}"))?;
-        drop(file);
+        {
+            let mut file = open_opts.open(&tmp_path).map_err(|e| {
+                format!(
+                    "failed to create temporary file `{}`: {e}",
+                    tmp_path.display()
+                )
+            })?;
+            file.write_all(bytes)
+                .map_err(|e| format!("failed to write exported transcript: {e}"))?;
+            file.sync_all()
+                .map_err(|e| format!("failed to flush exported transcript: {e}"))?;
+        }
         std::fs::rename(&tmp_path, path)
             .map_err(|e| format!("failed to finalize export `{}`: {e}", path.display()))?;
         Ok(())

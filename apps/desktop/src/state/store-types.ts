@@ -724,6 +724,7 @@ export interface OrbitUiState {
   worktreeBranchPrefix: string;
   preferredEditor: ExternalEditorKind | null;
   voiceInputDeviceId: string | null;
+  voiceEnabledByHost: Record<string, boolean>;
   terminalFontSize: number;
   terminalCursorStyle: TerminalCursorStyle;
   terminalScrollback: number;

@@ -85,6 +85,79 @@ export interface SidebarConversationRowProps {
   onFinishRename: () => void;
 }
 
+function areHighlightIndicesEqual(
+  a?: readonly number[],
+  b?: readonly number[],
+): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+function areSidebarConversationRowPropsEqual(
+  prev: SidebarConversationRowProps,
+  next: SidebarConversationRowProps,
+): boolean {
+  if (
+    prev.threadKey !== next.threadKey ||
+    prev.navId !== next.navId ||
+    prev.projectName !== next.projectName ||
+    prev.effectiveTitle !== next.effectiveTitle ||
+    prev.contextLabel !== next.contextLabel ||
+    prev.isWorktree !== next.isWorktree ||
+    prev.isPinned !== next.isPinned ||
+    prev.isUnread !== next.isUnread ||
+    prev.hasRunningSubagents !== next.hasRunningSubagents ||
+    prev.selected !== next.selected ||
+    prev.keyboardFocused !== next.keyboardFocused ||
+    prev.isChild !== next.isChild ||
+    prev.inGroupRail !== next.inGroupRail ||
+    prev.peerHandle !== next.peerHandle ||
+    prev.menuOpen !== next.menuOpen ||
+    prev.isRenaming !== next.isRenaming ||
+    prev.dragProjectId !== next.dragProjectId ||
+    prev.dragScopeKey !== next.dragScopeKey ||
+    prev.dragWorkspaceId !== next.dragWorkspaceId ||
+    prev.isDragging !== next.isDragging ||
+    prev.dropIndicator !== next.dropIndicator ||
+    prev.onRegisterNavRow !== next.onRegisterNavRow ||
+    prev.onRegisterThreadRow !== next.onRegisterThreadRow ||
+    prev.onStartThreadDrag !== next.onStartThreadDrag ||
+    prev.shouldSuppressClick !== next.shouldSuppressClick ||
+    prev.onOpenMenu !== next.onOpenMenu ||
+    prev.onStartRename !== next.onStartRename ||
+    prev.onFinishRename !== next.onFinishRename
+  ) {
+    return false;
+  }
+  if (
+    prev.host !== next.host &&
+    (prev.host.host_id !== next.host.host_id ||
+      prev.host.connection_state !== next.host.connection_state)
+  ) {
+    return false;
+  }
+  if (
+    prev.agent !== next.agent &&
+    (prev.agent.agent_id !== next.agent.agent_id ||
+      prev.agent.status_label !== next.agent.status_label ||
+      prev.agent.is_running !== next.agent.is_running ||
+      prev.agent.is_awaiting_permission !== next.agent.is_awaiting_permission ||
+      prev.agent.has_background_tasks !== next.agent.has_background_tasks ||
+      prev.agent.has_armed_timers !== next.agent.has_armed_timers ||
+      prev.agent.has_running_subagents !== next.agent.has_running_subagents ||
+      prev.agent.updated_at_rfc3339 !== next.agent.updated_at_rfc3339 ||
+      prev.agent.task_summary !== next.agent.task_summary ||
+      prev.agent.worktree_branch !== next.agent.worktree_branch)
+  ) {
+    return false;
+  }
+  return areHighlightIndicesEqual(prev.highlightIndices, next.highlightIndices);
+}
+
 export const SidebarConversationRow = memo(function SidebarConversationRow({
   threadKey,
   navId,
@@ -408,4 +481,4 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
       )}
     </div>
   );
-});
+}, areSidebarConversationRowPropsEqual);

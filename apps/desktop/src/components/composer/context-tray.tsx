@@ -18,6 +18,7 @@ import {
   X,
 } from "lucide-react";
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
+import { ImageLightbox, type ImageLightboxItem } from "@/components/viewers/image-lightbox";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -40,6 +41,7 @@ import {
   orbitActions,
   useOrbitSelector,
 } from "@/state/orbit-store";
+import { cn } from "@/lib/utils";
 
 interface ContextTrayProps {
   contexts: readonly ContextMentionItem[];
@@ -315,9 +317,16 @@ export const ContextTray = memo(function ContextTray({
                 ) : (
                   <MediaIcon className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
                 )}
-                <span className="truncate font-mono font-medium">{basename}</span>
+                <span
+                  className={cn(
+                    "min-w-0 truncate font-mono font-medium",
+                    dirHint && "max-w-[68%] shrink-0",
+                  )}
+                >
+                  {basename}
+                </span>
                 {dirHint && (
-                  <span className="text-ink-muted hidden truncate font-mono text-[11px] sm:inline">
+                  <span className="text-ink-muted hidden min-w-0 flex-1 truncate font-mono text-[11px] sm:inline">
                     {dirHint}
                   </span>
                 )}
@@ -560,9 +569,16 @@ export const ContextTray = memo(function ContextTray({
                 className="orbit-pill-enter border-border-subtle bg-surface-recessed/70 text-ink-primary inline-flex max-w-68 items-center gap-1.5 rounded-md border py-0.5 pr-1 pl-2 text-[12px]"
               >
                 <FileIcon className="text-ink-tertiary size-3.5 shrink-0 stroke-[1.75]" />
-                <span className="truncate font-mono font-medium">{basename}</span>
+                <span
+                  className={cn(
+                    "min-w-0 truncate font-mono font-medium",
+                    dirHint && "max-w-[68%] shrink-0",
+                  )}
+                >
+                  {basename}
+                </span>
                 {dirHint && (
-                  <span className="text-ink-muted hidden truncate font-mono text-[11px] sm:inline">
+                  <span className="text-ink-muted hidden min-w-0 flex-1 truncate font-mono text-[11px] sm:inline">
                     {dirHint}
                   </span>
                 )}
@@ -776,28 +792,59 @@ export const ContextTray = memo(function ContextTray({
         })}
       </div>
 
-      {/* Inline Image Lightbox Dialog for attached composer images */}
-      <Dialog open={previewImage !== null} onOpenChange={(open) => !open && setPreviewImage(null)}>
-        <DialogContent className="flex max-h-[86vh] w-auto max-w-[min(90vw,960px)] flex-col gap-2 overflow-hidden p-3">
-          <DialogHeader className="pr-8">
-            <DialogTitle className="truncate font-mono text-[13px] font-medium">
-              {previewImage?.filename ?? ""}
-            </DialogTitle>
-            <DialogDescription className="sr-only">
-              {previewImage?.filename ?? ""}
-            </DialogDescription>
-          </DialogHeader>
-          {previewImage && (
-            <div className="bg-surface-recessed flex min-h-0 flex-1 items-center justify-center overflow-auto rounded-lg p-2">
-              <img
-                src={previewImage.url}
-                alt={previewImage.filename}
-                className="max-h-[72vh] max-w-full rounded object-contain"
-              />
-            </div>
-          )}
-        </DialogContent>
-      </Dialog>
+      {/* Frameless Claude-style Image Lightbox for attached composer images */}
+      <ImageLightbox
+        open={previewImage !== null}
+        items={
+          previewImage
+            ? (() => {
+                const items: ImageLightboxItem[] = [];
+                for (const img of images) {
+                  const effectiveHostId = img.stagedHostId || selectedHostId || "";
+                  const cached =
+                    !img.previewUrl && img.path && effectiveHostId
+                      ? getCachedPromptImage(effectiveHostId, img.path)
+                      : null;
+                  const url =
+                    img.previewUrl ||
+                    (cached?.status === "ready" ? cached.url : null);
+                  if (url) {
+                    items.push({
+                      url,
+                      label: img.filename,
+                      path: img.path ?? null,
+                      hostId: effectiveHostId || undefined,
+                      cwd: selectedCwd || "~",
+                    });
+                  }
+                }
+                if (items.length === 0) {
+                  items.push({ url: previewImage.url, label: previewImage.filename });
+                }
+                return items;
+              })()
+            : []
+        }
+        initialIndex={
+          previewImage
+            ? Math.max(
+                0,
+                images
+                  .map((img) => {
+                    const effectiveHostId = img.stagedHostId || selectedHostId || "";
+                    const cached =
+                      !img.previewUrl && img.path && effectiveHostId
+                        ? getCachedPromptImage(effectiveHostId, img.path)
+                        : null;
+                    return img.previewUrl || (cached?.status === "ready" ? cached.url : null);
+                  })
+                  .filter((u): u is string => Boolean(u))
+                  .indexOf(previewImage.url),
+              )
+            : 0
+        }
+        onClose={() => setPreviewImage(null)}
+      />
 
       {/* Inline Text Preview Dialog for collapsed pasted snippets & text files */}
       <Dialog open={previewPaste !== null} onOpenChange={(open) => !open && setPreviewPaste(null)}>

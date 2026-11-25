@@ -42,8 +42,17 @@ export function planSourceTurn(
   seq?: number,
 ) {
   if (seq === undefined) return null;
-  let low = 0;
+  // Optimistic uncommitted turns appended on send carry `anchor_seq === 0` and are
+  // ordered strictly after committed `seq > 0` turns in `orbit-client-core`.
+  // Strip trailing optimistic turns before binary-searching committed anchor_seq values.
   let high = turns.length;
+  while (high > 0 && turns[high - 1].anchor_seq === 0) {
+    high -= 1;
+  }
+  if (seq === 0) {
+    return high < turns.length ? 0 : null;
+  }
+  let low = 0;
   while (low < high) {
     const mid = Math.floor((low + high) / 2);
     if (turns[mid].anchor_seq <= seq) low = mid + 1;
@@ -80,8 +89,11 @@ export function describePlan(
   }
   // A plan whose last update occurred strictly before the latest turn started
   // belongs to a previous turn; never spin a live spinner for an abandoned step.
+  // Optimistic uncommitted UserPrompts carry `anchor_seq === 0`, which represents
+  // a brand-new turn strictly newer than any committed `latestSeq > 0` plan event.
   const isFromPreviousTurn =
-    latestTurnAnchorSeq !== null && latestSeq < latestTurnAnchorSeq;
+    latestTurnAnchorSeq !== null &&
+    (latestTurnAnchorSeq === 0 ? latestSeq > 0 : latestSeq < latestTurnAnchorSeq);
   const effectiveRunning = isForegroundRunning && !isFromPreviousTurn;
   const rows = steps.map((step) => presentPlanStep(step, isForegroundRunning, isFromPreviousTurn));
   const skipped = rows.filter((row) => row.state === "skipped").length;
@@ -166,16 +178,21 @@ export function reconcilePlanShelf(
   if (!plan.allSettled && previous.autoCollapsed) open = true;
   const autoCollapsed =
     plan.shouldAutoDismiss || (plan.allSettled && previous.autoCollapsed);
-  const justSettledLive =
-    plan.shouldAutoDismiss && (!previous.autoCollapsed || previous.settledLive);
   // If a newer turn started without updating a previously settled plan, retire it immediately.
   const retiredByNextTurn = plan.allSettled && plan.isFromPreviousTurn;
-  const dismissed =
-    retiredByNextTurn ||
-    (plan.canDismiss &&
-      previous.dismissed &&
-      previous.version === plan.version &&
-      previous.latestSeq === plan.latestSeq);
+  // A settled plan that was already dismissed (auto-dismissed, manually closed, or hidden on
+  // fresh mount) must never resurrect if `isForegroundRunning` flips true before the next
+  // turn's timeline arrives (e.g. `HostChanged` preceding `TimelineChanged` on prompt submit).
+  const keepDismissed =
+    previous.dismissed &&
+    previous.version === plan.version &&
+    previous.latestSeq === plan.latestSeq &&
+    (plan.canDismiss || plan.allSettled);
+  const dismissed = retiredByNextTurn || keepDismissed;
+  // Keep a collapsed, visible settled plan eligible for timed auto-dismiss even across
+  // transient `isForegroundRunning` blips; manual expand (`open: true`) pauses auto-dismiss.
+  const justSettledLive =
+    plan.shouldAutoDismiss && (!previous.autoCollapsed || previous.settledLive || !open);
   const settledLive = !dismissed && justSettledLive;
   const knownTurn = sourceTurn ?? previous.sourceTurn;
 

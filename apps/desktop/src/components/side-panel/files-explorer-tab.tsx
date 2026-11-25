@@ -141,7 +141,6 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
   const gitFiles = useOrbitSelector((s) =>
     cacheKey ? (s.gitReviews[cacheKey]?.status?.files ?? null) : null,
   );
-  const fileEditorDrafts = useOrbitSelector((s) => s.fileEditorDrafts);
 
   const [query, setQuery] = useState("");
   const [expandedDirs, setExpandedDirs] = useState<Record<string, boolean>>({});
@@ -197,15 +196,15 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
 
   const canMutate = Boolean(hostId && cwd && cwd !== "~");
 
-  const confirmDeleteHasUnsavedEdits = useMemo(() => {
+  const confirmDeleteHasUnsavedEdits = useOrbitSelector((s) => {
     if (!confirmDeleteTarget) return false;
     const prefix = `${confirmDeleteTarget.hostId}::${confirmDeleteTarget.cwd}::`;
-    return Object.entries(fileEditorDrafts).some(([k, d]) => {
+    return Object.entries(s.fileEditorDrafts).some(([k, d]) => {
       if (!d.dirty || !k.startsWith(prefix)) return false;
       const rel = k.slice(prefix.length);
       return rel === confirmDeleteTarget.path || rel.startsWith(`${confirmDeleteTarget.path}/`);
     });
-  }, [confirmDeleteTarget, fileEditorDrafts]);
+  });
 
   const startCreate = (mode: "file" | "dir", prefix = "") => {
     setActionError(null);

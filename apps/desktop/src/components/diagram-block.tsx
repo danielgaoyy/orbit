@@ -634,17 +634,17 @@ export const DiagramBlock = memo(
         </div>
 
         {showDiagram && rendered?.svg ? (
-          <ScrollArea orientation="horizontal" viewportClassName="px-5 py-5">
+          <ScrollArea orientation="horizontal" viewportClassName="px-5 py-4">
             <div
               onDoubleClick={() => setLightboxOpen(true)}
               title="Double-click to expand"
               className="flex min-w-full cursor-zoom-in items-center justify-center transition-opacity duration-150 ease-out"
               style={{
-                minHeight: Math.min(Math.max(rendered.height * 0.42, 92), 340),
+                minHeight: Math.min(Math.max(Math.round(rendered.height * 0.4), 76), 280),
               }}
             >
               <div
-                className="[&>svg]:block [&>svg]:h-auto [&>svg]:max-w-full"
+                className="mx-auto flex items-center justify-center [&>svg]:block [&>svg]:h-auto [&>svg]:max-w-full"
                 dangerouslySetInnerHTML={{ __html: rendered.svg }}
               />
             </div>

@@ -27,6 +27,7 @@ import {
 import { useI18n } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import {
+  type AgentCardView,
   type RichBlockView,
   type WorkspaceEventRecord,
   isAgentForegroundRunning,
@@ -322,6 +323,35 @@ export function reconcileBoardDraft(input: BoardDraftSyncInput): {
   };
 }
 
+const EMPTY_BOARD_EVENTS: readonly WorkspaceEventRecord[] = [];
+const EMPTY_BOARD_PEERS: readonly AgentCardView[] = [];
+
+function sameBoardPeers(prev: readonly AgentCardView[], next: readonly AgentCardView[]): boolean {
+  if (prev === next) return true;
+  if (prev.length !== next.length) return false;
+  for (let i = 0; i < prev.length; i += 1) {
+    const a = prev[i];
+    const b = next[i];
+    if (
+      a.agent_id !== b.agent_id ||
+      a.title !== b.title ||
+      a.handle !== b.handle ||
+      a.provider !== b.provider ||
+      a.model !== b.model ||
+      a.status_label !== b.status_label ||
+      a.is_running !== b.is_running ||
+      a.is_awaiting_permission !== b.is_awaiting_permission ||
+      a.has_background_tasks !== b.has_background_tasks ||
+      a.has_armed_timers !== b.has_armed_timers ||
+      a.worktree_branch !== b.worktree_branch ||
+      a.updated_at_rfc3339 !== b.updated_at_rfc3339
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
   tab,
   visible = true,
@@ -333,31 +363,63 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
   const hostId = tab.hostId ?? "";
   const workspaceId = tab.workspaceId ?? "";
   const scopeKey = `${hostId}::${workspaceId}`;
-  const hostDetail = useOrbitSelector((s) => (hostId ? (s.hostDetails[hostId] ?? null) : null));
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
 
-  const workspace = useMemo(
-    () => hostDetail?.workspaces.find((w) => w.workspace_id === workspaceId) ?? null,
-    [hostDetail, workspaceId],
+  const board = useOrbitSelector((s) =>
+    hostId && workspaceId ? (s.hostDetails[hostId]?.workspace_boards?.[workspaceId] ?? null) : null,
   );
-  const board = hostDetail?.workspace_boards?.[workspaceId] ?? null;
+  const rawEvents = useOrbitSelector((s) =>
+    visible && hostId && workspaceId
+      ? (s.hostDetails[hostId]?.workspace_events?.[workspaceId] ?? EMPTY_BOARD_EVENTS)
+      : EMPTY_BOARD_EVENTS,
+  );
+  const workspaceKey = useOrbitSelector((s) => {
+    if (!hostId || !workspaceId) return "";
+    const ws = s.hostDetails[hostId]?.workspaces.find((w) => w.workspace_id === workspaceId);
+    if (!ws) return "";
+    return `${ws.workspace_id}\0${ws.title ?? ""}\0${ws.mission_goal ?? ""}\0${ws.project_root ?? ""}\0${ws.source_cwd ?? ""}\0${ws.cwd ?? ""}`;
+  });
+  const workspace = useMemo(() => {
+    if (!workspaceKey) return null;
+    const [workspace_id, title, mission_goal, project_root, source_cwd, cwd] =
+      workspaceKey.split("\0");
+    return {
+      workspace_id,
+      title,
+      mission_goal: mission_goal || null,
+      project_root: project_root || null,
+      source_cwd: source_cwd || null,
+      cwd,
+    };
+  }, [workspaceKey]);
+
+  const peersCacheRef = useRef<readonly AgentCardView[]>(EMPTY_BOARD_PEERS);
+  const peers = useOrbitSelector((s) => {
+    if (!visible || !hostId || !workspaceId) {
+      peersCacheRef.current = EMPTY_BOARD_PEERS;
+      return EMPTY_BOARD_PEERS;
+    }
+    const agents = s.hostDetails[hostId]?.agents;
+    if (!agents || agents.length === 0) {
+      peersCacheRef.current = EMPTY_BOARD_PEERS;
+      return EMPTY_BOARD_PEERS;
+    }
+    const nextPeers = agents.filter(
+      (a) =>
+        a.workspace_id === workspaceId &&
+        !a.archived_at_rfc3339 &&
+        !a.background &&
+        !a.parent_agent_id,
+    );
+    if (sameBoardPeers(peersCacheRef.current, nextPeers)) {
+      return peersCacheRef.current;
+    }
+    peersCacheRef.current = nextPeers;
+    return nextPeers;
+  });
+
   const serverContent = board?.content ?? "";
-  const events = useMemo(
-    () => [...(hostDetail?.workspace_events?.[workspaceId] ?? [])].reverse(),
-    [hostDetail, workspaceId],
-  );
-  // Exclude child subagents so only top-level workspace conversations appear in the roster
-  const peers = useMemo(
-    () =>
-      (hostDetail?.agents ?? []).filter(
-        (a) =>
-          a.workspace_id === workspaceId &&
-          !a.archived_at_rfc3339 &&
-          !a.background &&
-          !a.parent_agent_id,
-      ),
-    [hostDetail, workspaceId],
-  );
+  const events = useMemo(() => [...rawEvents].reverse(), [rawEvents]);
 
   const [editingBoard, setEditingBoard] = useState(false);
   const [boardDraft, setBoardDraft] = useState(serverContent);

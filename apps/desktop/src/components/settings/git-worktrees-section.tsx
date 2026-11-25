@@ -1,4 +1,5 @@
-import { memo, useMemo } from "react";
+import { memo, useMemo, useState } from "react";
+import { HostLspSection } from "@/components/settings/host-lsp-section";
 import {
   SettingCard,
   SettingGroupLabel,
@@ -8,12 +9,43 @@ import {
   ToggleSwitch,
   type SettingSelectOption,
 } from "@/components/settings/settings-primitives";
+import { useSettingsWorkspaces } from "@/components/settings/settings-workspaces";
 import { useI18n } from "@/lib/i18n";
 import { modSymbol } from "@/lib/keybindings";
 import { isWebRuntime, type ExternalEditorKind } from "@/lib/orbit-ipc";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
-export const GitWorktreesSection = memo(function GitWorktreesSection() {
+const WorkspaceLspPanel = memo(function WorkspaceLspPanel({ hostId }: { hostId: string }) {
+  const { t } = useI18n();
+  const projects = useSettingsWorkspaces(hostId);
+  const [picked, setPicked] = useState("");
+  const project = projects.find((option) => option.value === picked) ?? projects[0];
+  const workspacePicker = project && (
+    <SettingSelect
+      size="sm"
+      ariaLabel={t("devTools.workspace")}
+      value={project.value}
+      options={projects}
+      onChange={setPicked}
+      triggerClassName="max-w-[320px] text-[13px]"
+    />
+  );
+
+  return (
+    <HostLspSection
+      key={project?.value ?? hostId}
+      hostId={hostId}
+      workspaceCwd={project?.value ?? null}
+      workspacePicker={workspacePicker}
+    />
+  );
+});
+
+export const GitWorktreesSection = memo(function GitWorktreesSection({
+  hostId,
+}: {
+  hostId: string | null;
+}) {
   const { locale, t } = useI18n();
   const draftUseWorktree = useOrbitSelector((s) => s.draftUseWorktree);
   const worktreeBranchPrefix = useOrbitSelector((s) => s.worktreeBranchPrefix);
@@ -68,7 +100,7 @@ export const GitWorktreesSection = memo(function GitWorktreesSection() {
         description={t("settings.gitWorktreesDesc")}
       />
 
-      <div className="flex flex-col gap-2">
+      <div className="flex flex-col gap-3">
         <SettingGroupLabel>{t("settings.groupWorktrees")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
@@ -102,7 +134,7 @@ export const GitWorktreesSection = memo(function GitWorktreesSection() {
       </div>
 
       {!isWebRuntime() && (
-        <div className="flex flex-col gap-2">
+        <div className="flex flex-col gap-3">
           <SettingGroupLabel>{t("settings.groupEditor")}</SettingGroupLabel>
           <SettingCard>
             <SettingRow
@@ -122,6 +154,8 @@ export const GitWorktreesSection = memo(function GitWorktreesSection() {
           </SettingCard>
         </div>
       )}
+
+      {hostId && <WorkspaceLspPanel key={hostId} hostId={hostId} />}
     </div>
   );
 });

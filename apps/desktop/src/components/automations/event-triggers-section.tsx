@@ -729,7 +729,10 @@ export const EventTriggersSection = memo(function EventTriggersSection({
                         {sourceBadgeLabel(trigger.source)}
                       </span>
                       {trigger.github_poll && (
-                        <span className="border-border/75 bg-muted/60 text-muted-foreground shrink-0 rounded-md border px-1.5 py-0.5 font-mono text-[10.5px]">
+                        <span
+                          title={`Poll · ${trigger.github_poll.repo}`}
+                          className="border-border/75 bg-muted/60 text-muted-foreground max-w-[220px] shrink-0 truncate rounded-md border px-1.5 py-0.5 font-mono text-[10.5px]"
+                        >
                           Poll · {trigger.github_poll.repo}
                         </span>
                       )}

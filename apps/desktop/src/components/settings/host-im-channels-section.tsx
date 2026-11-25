@@ -50,28 +50,32 @@ const EMPTY_BINDINGS: readonly ImThreadBinding[] = [];
 const PLATFORM_META: Record<
   ImPlatform,
   {
+    labelKey?: MessageKey;
     label: string;
     showAppId: boolean;
-    appIdLabel: string;
-    appIdPlaceholder: string;
-    primaryLabel: string;
-    primaryPlaceholder: string;
-    signingLabel: string;
-    signingPlaceholder: string;
+    appIdLabelKey?: MessageKey;
+    appIdPlaceholderKey?: MessageKey;
+    primaryLabelKey: MessageKey;
+    primaryPlaceholderKey?: MessageKey;
+    primaryPlaceholder?: string;
+    signingLabelKey: MessageKey;
+    signingPlaceholderKey?: MessageKey;
+    signingPlaceholder?: string;
     signingHintKey?: MessageKey;
     chatPlaceholder: string;
     userPlaceholder: string;
   }
 > = {
   lark: {
-    label: "Lark / 飞书",
+    labelKey: "im.larkLabel",
+    label: "Lark / Feishu",
     showAppId: true,
-    appIdLabel: "App ID",
-    appIdPlaceholder: "cli_a1b2c3d4... (or lark:cli_...)",
-    primaryLabel: "App Secret",
-    primaryPlaceholder: "Lark / Feishu App Secret",
-    signingLabel: "Verification Token / Encrypt Key",
-    signingPlaceholder: "Verification Token or Encrypt Key",
+    appIdLabelKey: "im.larkAppIdLabel",
+    appIdPlaceholderKey: "im.larkAppIdPlaceholder",
+    primaryLabelKey: "im.larkAppSecretLabel",
+    primaryPlaceholderKey: "im.larkAppSecretPlaceholder",
+    signingLabelKey: "im.larkSigningLabel",
+    signingPlaceholderKey: "im.larkSigningPlaceholder",
     signingHintKey: "im.larkSigningHint",
     chatPlaceholder: "oc_7c9a...",
     userPlaceholder: "ou_3f8b...",
@@ -79,11 +83,9 @@ const PLATFORM_META: Record<
   telegram: {
     label: "Telegram",
     showAppId: false,
-    appIdLabel: "",
-    appIdPlaceholder: "",
-    primaryLabel: "Bot Token",
+    primaryLabelKey: "im.botTokenLabel",
     primaryPlaceholder: "123456789:AAH...",
-    signingLabel: "Webhook Secret Token",
+    signingLabelKey: "im.telegramSigningLabel",
     signingPlaceholder: "X-Telegram-Bot-Api-Secret-Token",
     signingHintKey: "im.telegramSigningHint",
     chatPlaceholder: "-1001234567890",
@@ -92,12 +94,10 @@ const PLATFORM_META: Record<
   slack: {
     label: "Slack",
     showAppId: false,
-    appIdLabel: "",
-    appIdPlaceholder: "",
-    primaryLabel: "Bot Token",
+    primaryLabelKey: "im.botTokenLabel",
     primaryPlaceholder: "xoxb-...",
-    signingLabel: "Signing Secret",
-    signingPlaceholder: "Slack App Signing Secret",
+    signingLabelKey: "im.slackSigningLabel",
+    signingPlaceholderKey: "im.slackSigningPlaceholder",
     signingHintKey: "im.slackSigningHint",
     chatPlaceholder: "C0123456789",
     userPlaceholder: "U0123456789",
@@ -105,23 +105,22 @@ const PLATFORM_META: Record<
   discord: {
     label: "Discord",
     showAppId: false,
-    appIdLabel: "",
-    appIdPlaceholder: "",
-    primaryLabel: "Bot Token",
-    primaryPlaceholder: "Discord Bot Token",
-    signingLabel: "Webhook Secret",
+    primaryLabelKey: "im.botTokenLabel",
+    primaryPlaceholderKey: "im.discordBotTokenPlaceholder",
+    signingLabelKey: "im.discordSigningLabel",
     signingPlaceholder: "",
     chatPlaceholder: "123456789012345678",
     userPlaceholder: "987654321098765432",
   },
 };
 
-const PLATFORM_OPTIONS: SettingSelectOption<ImPlatform>[] = [
-  { value: "lark", label: "Lark / 飞书" },
-  { value: "telegram", label: "Telegram" },
-  { value: "slack", label: "Slack" },
-  { value: "discord", label: "Discord" },
-];
+function platformLabel(
+  platform: ImPlatform,
+  tr: (key: MessageKey) => string,
+): string {
+  const meta = PLATFORM_META[platform];
+  return meta.labelKey ? tr(meta.labelKey) : meta.label;
+}
 
 type PresetSessionMode = "default" | "accept_edits" | "auto" | "plan" | "full_access";
 
@@ -218,7 +217,7 @@ function IdChipInput({
   return (
     <Field>
       <FieldLabel className="text-ink-primary">{label}</FieldLabel>
-      <div className="flex items-center gap-1.5">
+      <div className="flex items-center gap-2">
         <Input
           type="text"
           aria-label={label}
@@ -247,11 +246,11 @@ function IdChipInput({
         </Button>
       </div>
       {values.length > 0 && (
-        <div className="flex flex-wrap gap-1 pt-0.5">
+        <div className="flex flex-wrap gap-1 pt-1">
           {values.map((id) => (
             <span
               key={id}
-              className="border-border-subtle bg-surface-recessed text-ink-primary inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-[11px]"
+              className="border-border-subtle bg-surface-recessed text-ink-primary inline-flex items-center gap-1 rounded-md border px-2 py-1 font-mono text-[11px]"
             >
               <span>{id}</span>
               <button
@@ -425,7 +424,12 @@ function ChannelForm({
             <SettingSelect
               ariaLabel={t("im.platform")}
               value={form.platform}
-              options={PLATFORM_OPTIONS}
+              options={[
+                { value: "lark", label: platformLabel("lark", t) },
+                { value: "telegram", label: platformLabel("telegram", t) },
+                { value: "slack", label: platformLabel("slack", t) },
+                { value: "discord", label: platformLabel("discord", t) },
+              ]}
               disabled={isEditing || saving}
               triggerClassName="w-full"
               onChange={(platform) => {
@@ -449,7 +453,7 @@ function ChannelForm({
               value={form.name}
               disabled={saving}
               onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
-              placeholder={t("im.channelNamePlaceholder", { platform: meta.label })}
+              placeholder={t("im.channelNamePlaceholder", { platform: platformLabel(form.platform, t) })}
             />
           </Field>
         </div>
@@ -467,7 +471,7 @@ function ChannelForm({
           <FieldDescription className="text-[11px]">{transportHint}</FieldDescription>
         </Field>
 
-        <div className="border-border-subtle bg-surface-recessed rounded-xl border p-3.5">
+        <div className="border-border-subtle bg-surface-recessed rounded-xl border p-4">
           <FieldGroup className="gap-3">
             <div className="flex items-center justify-between gap-2">
               <span className="text-ink-primary text-[13px] font-medium">
@@ -476,7 +480,7 @@ function ChannelForm({
               {isEditing && hasAnySavedSecret && (
                 <label
                   className={cn(
-                    "text-ink-muted flex cursor-pointer items-center gap-1.5 text-[11px] select-none",
+                    "text-ink-muted flex cursor-pointer items-center gap-2 text-[11px] select-none",
                     saving && "pointer-events-none opacity-55",
                   )}
                 >
@@ -496,7 +500,7 @@ function ChannelForm({
             {meta.showAppId && (
               <Field>
                 <FieldLabel htmlFor="im-app-id" className="text-[13px]">
-                  {meta.appIdLabel}
+                  {meta.appIdLabelKey ? t(meta.appIdLabelKey) : ""}
                 </FieldLabel>
                 <Input
                   id="im-app-id"
@@ -504,7 +508,7 @@ function ChannelForm({
                   value={form.appId}
                   disabled={saving}
                   onChange={(e) => setForm((f) => ({ ...f, appId: e.target.value }))}
-                  placeholder={meta.appIdPlaceholder}
+                  placeholder={meta.appIdPlaceholderKey ? t(meta.appIdPlaceholderKey) : ""}
                   className="font-mono text-[13px]"
                 />
               </Field>
@@ -513,7 +517,7 @@ function ChannelForm({
             <Field>
               <div className="flex items-center justify-between">
                 <FieldLabel htmlFor="im-primary-secret" className="text-[13px]">
-                  {meta.primaryLabel}
+                  {t(meta.primaryLabelKey)}
                 </FieldLabel>
                 {isEditing && form.maskedPrimary && !form.clearExistingSecrets && (
                   <span className="text-ink-muted font-mono text-[11px]">
@@ -530,7 +534,9 @@ function ChannelForm({
                 placeholder={
                   isEditing && form.hasExistingPrimary && !form.clearExistingSecrets
                     ? t("im.keepSavedPlaceholder")
-                    : meta.primaryPlaceholder
+                    : meta.primaryPlaceholderKey
+                      ? t(meta.primaryPlaceholderKey)
+                      : (meta.primaryPlaceholder ?? "")
                 }
                 className="font-mono text-[13px]"
               />
@@ -591,7 +597,7 @@ function ChannelForm({
               <Field>
                 <div className="flex items-center justify-between">
                   <FieldLabel htmlFor="im-signing-secret" className="text-[13px]">
-                    {meta.signingLabel}
+                    {t(meta.signingLabelKey)}
                   </FieldLabel>
                   {isEditing && form.maskedSigning && !form.clearExistingSecrets && (
                     <span className="text-ink-muted font-mono text-[11px]">
@@ -608,7 +614,9 @@ function ChannelForm({
                   placeholder={
                     isEditing && form.hasExistingSigning && !form.clearExistingSecrets
                       ? t("im.keepSavedPlaceholder")
-                      : meta.signingPlaceholder
+                      : meta.signingPlaceholderKey
+                        ? t(meta.signingPlaceholderKey)
+                        : (meta.signingPlaceholder ?? "")
                   }
                   className="font-mono text-[13px]"
                 />
@@ -653,7 +661,7 @@ function ChannelForm({
             value={form.defaultWorkspaceCwd}
             disabled={saving}
             onChange={(e) => setForm((f) => ({ ...f, defaultWorkspaceCwd: e.target.value }))}
-            placeholder="/path/to/registered/workspace"
+            placeholder={t("im.defaultWorkspacePlaceholder")}
             className="font-mono text-[13px]"
           />
           {workspaceOptions.length > 0 && (
@@ -685,7 +693,7 @@ function ChannelForm({
               options={[
                 { value: "default", label: t("common.default") },
                 { value: "accept_edits", label: t("composer.modeAcceptEdits") },
-                { value: "auto", label: t("composer.modeAuto") + " (Guardian)" },
+                { value: "auto", label: t("im.modeAutoGuardian") },
                 { value: "plan", label: t("plan.label") },
                 { value: "full_access", label: t("composer.modeFullAccess") },
               ]}
@@ -696,7 +704,7 @@ function ChannelForm({
           </Field>
         </div>
 
-        <div className="border-border-subtle flex items-center justify-between rounded-xl border px-3.5 py-2.5">
+        <div className="border-border-subtle flex items-center justify-between rounded-xl border px-4 py-3">
           <div className="pr-3">
             <div className="text-ink-primary text-[13px] font-medium">
               {t("im.routePersonalRouter")}
@@ -715,7 +723,7 @@ function ChannelForm({
           />
         </div>
 
-        <div className="border-border-subtle flex items-center justify-between rounded-xl border px-3.5 py-2.5">
+        <div className="border-border-subtle flex items-center justify-between rounded-xl border px-4 py-3">
           <div className="pr-3">
             <div className="text-ink-primary text-[13px] font-medium">
               {t("im.forwardApprovals")}
@@ -805,7 +813,7 @@ const ImTestMessageDrawer = memo(function ImTestMessageDrawer({
         <div className="flex flex-col gap-5">
           <div className="text-ink-secondary flex flex-col gap-1 text-[13px]">
             <span>
-              {PLATFORM_META[channel.platform].label} ·{" "}
+              {platformLabel(channel.platform, t)} ·{" "}
               {resolveTransportMode(channel) === "webhook"
                 ? t("im.modeBadgeWebhook")
                 : channel.platform === "telegram"
@@ -883,9 +891,15 @@ export const HostImChannelsSection = memo(function HostImChannelsSection({
   const channels = imState?.channels ?? EMPTY_CHANNELS;
   const bindings = imState?.bindings ?? EMPTY_BINDINGS;
   const baseWebhookUrl = imState?.baseWebhookUrl || "http://127.0.0.1:7788";
-  const loading = imState?.status === "loading" && channels.length === 0;
+  const loading =
+    isOnline &&
+    (!imState || imState.status === "idle" || imState.status === "loading") &&
+    channels.length === 0;
   const saving = Boolean(imState?.saving);
   const error = imState?.error ?? null;
+
+  const [refreshing, setRefreshing] = useState(false);
+  const isRefreshing = refreshing || loading;
 
   const [drawerInitial, setDrawerInitial] = useState<ChannelFormState | null>(null);
   const [formServerError, setFormServerError] = useState<string | null>(null);
@@ -1072,19 +1086,27 @@ export const HostImChannelsSection = memo(function HostImChannelsSection({
   return (
     <div className="flex flex-col gap-6">
       <SettingPageHeader
-        title={t("im.title")}
+        title={t("settings.subTabImChannels")}
         description={t("im.description")}
         action={
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-2">
             <Button
               type="button"
               variant="outline"
               size="icon-sm"
-              disabled={!isOnline || loading}
-              onClick={() => void orbitActions.loadImChannels(hostId)}
+              disabled={!isOnline || isRefreshing}
+              onClick={async () => {
+                if (!isOnline) return;
+                setRefreshing(true);
+                try {
+                  await orbitActions.loadImChannels(hostId);
+                } finally {
+                  setRefreshing(false);
+                }
+              }}
               title={t("im.refreshChannels")}
             >
-              <RefreshCw className={cn(loading && "animate-spin")} />
+              <RefreshCw className={cn(isRefreshing && "animate-spin")} />
             </Button>
             <Button type="button" size="sm" data-setting-id="im.addChannel" disabled={!isOnline} onClick={openCreateDrawer}>
               <Plus data-icon="inline-start" />
@@ -1106,7 +1128,7 @@ export const HostImChannelsSection = memo(function HostImChannelsSection({
         </div>
       )}
 
-      <div data-setting-id="im.configuredChannels" className="flex flex-col gap-2.5">
+      <div data-setting-id="im.configuredChannels" className="flex flex-col gap-3">
         <SettingGroupLabel>
           {t("im.configuredChannels")}
           {channels.length > 0 ? ` (${channels.length})` : ""}
@@ -1132,7 +1154,6 @@ export const HostImChannelsSection = memo(function HostImChannelsSection({
         ) : (
           <SettingCard>
             {channels.map((ch) => {
-              const meta = PLATFORM_META[ch.platform];
               const boundCount = bindingsCountByChannel.get(ch.channel_id) ?? 0;
               const hasAllowlist = Boolean(ch.allowed_chat_ids.length || ch.allowed_user_ids.length);
               const pillLabel = formatStatusPillLabel(ch);
@@ -1145,7 +1166,7 @@ export const HostImChannelsSection = memo(function HostImChannelsSection({
                   title={ch.name}
                   description={
                     <span className="flex flex-wrap items-baseline gap-x-2">
-                      <span>{meta.label} · {formatTransportLabel(ch)}</span>
+                      <span>{platformLabel(ch.platform, t)} · {formatTransportLabel(ch)}</span>
                       {!hasAllowlist && <span className="text-signal-warning">{t("im.allowlistEmpty")}</span>}
                       {boundCount > 0 && <span>{t("im.activeSessions", { count: boundCount })}</span>}
                       {detail && detail !== pillLabel && ch.status === "error" && (

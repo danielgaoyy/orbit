@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import {
   Blocks,
   CornerDownLeft,
@@ -29,14 +29,9 @@ import { orbitActions, sideQuestionScopeKey, useOrbitSelector } from "@/state/or
 import type { DiffFileView, SessionInsightsView } from "@/lib/orbit-ipc";
 import { cn } from "@/lib/utils";
 
-const EMPTY_INSIGHTS: SessionInsightsView = {
-  touched_files: [],
-  background_tasks: [],
-  subagents: [],
-  detected_local_urls: [],
-};
 const EMPTY_DIFFS: readonly DiffFileView[] = [];
 const EMPTY_FILES: string[] = [];
+const EMPTY_TOUCHED_FILES: SessionInsightsView["touched_files"] = [];
 
 const WEB_TLD_URL_RE =
   /^(?:[a-z0-9-]+\.)+(?:com|org|net|io|dev|ai|app|cn|co|edu|gov|me|xyz|gg|tv|so|sh|cloud|site)(?::\d+)?(?:\/.*)?$/i;
@@ -183,7 +178,7 @@ type LaunchpadSearchEntry =
       onSelect: () => void;
     };
 
-export function SidePanelLaunchpad({
+export const SidePanelLaunchpad = memo(function SidePanelLaunchpad({
   selectedHostId,
   isPanelOpen,
   isPanelSettled,
@@ -201,36 +196,73 @@ export function SidePanelLaunchpad({
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const selectedWorkspaceCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const isDraftNewSession = useOrbitSelector((s) => s.isDraftNewSession);
-  const hostDetails = useOrbitSelector((s) => s.hostDetails);
-  const stages = useOrbitSelector((s) => s.stages);
-  const gitReviews = useOrbitSelector((s) => s.gitReviews);
-  const workspaceFilesCache = useOrbitSelector((s) => s.workspaceFilesCache);
-  const terminalTabs = useOrbitSelector((s) => s.terminalTabs);
-  const sideQuestionsByScope = useOrbitSelector((s) => s.sideQuestionsByScope);
   const focusNonce = useOrbitSelector((s) => s.sidePanelLaunchpadFocusNonce);
 
   const stageKey =
     selectedHostId && selectedAgentId && !isDraftNewSession
       ? `${selectedHostId}::${selectedAgentId}`
       : null;
-  const stage = stageKey ? (stages[stageKey] ?? null) : null;
 
-  const hostDetail = selectedHostId ? (hostDetails[selectedHostId] ?? null) : null;
-  const currentAgent = useMemo(() => {
+  const agentCwd = useOrbitSelector((s) => {
     if (isDraftNewSession || !selectedHostId || !selectedAgentId) return null;
-    return (
-      hostDetail?.agents.find((a) => a.agent_id === selectedAgentId) ??
-      stage?.agent ??
-      null
-    );
-  }, [hostDetail, isDraftNewSession, selectedAgentId, selectedHostId, stage?.agent]);
+    const fromHost = s.hostDetails[selectedHostId]?.agents.find(
+      (a) => a.agent_id === selectedAgentId,
+    )?.cwd;
+    if (fromHost) return fromHost;
+    return stageKey ? (s.stages[stageKey]?.agent?.cwd ?? null) : null;
+  });
 
-  const cwd = currentAgent?.cwd || selectedWorkspaceCwd || "~";
-  const insights = stage?.insights ?? EMPTY_INSIGHTS;
+  const agentWorkspaceId = useOrbitSelector((s) => {
+    if (isDraftNewSession || !selectedHostId || !selectedAgentId) return null;
+    const fromHost = s.hostDetails[selectedHostId]?.agents.find(
+      (a) => a.agent_id === selectedAgentId,
+    )?.workspace_id;
+    if (fromHost) return fromHost;
+    return stageKey ? (s.stages[stageKey]?.agent?.workspace_id ?? null) : null;
+  });
 
-  const sessionTurnDiffs = stage?.session_turn_diffs ?? EMPTY_DIFFS;
-  const gitReview =
-    selectedHostId && cwd && cwd !== "~" ? (gitReviews[`${selectedHostId}::${cwd}`] ?? null) : null;
+  const cwd = agentCwd || selectedWorkspaceCwd || "~";
+
+  const primaryLocalUrl = useOrbitSelector((s) =>
+    stageKey ? (s.stages[stageKey]?.insights?.detected_local_urls[0] ?? null) : null,
+  );
+  const touchedFiles = useOrbitSelector((s) =>
+    stageKey ? (s.stages[stageKey]?.insights?.touched_files ?? EMPTY_TOUCHED_FILES) : EMPTY_TOUCHED_FILES,
+  );
+  const sessionTurnDiffs = useOrbitSelector((s) =>
+    stageKey ? (s.stages[stageKey]?.session_turn_diffs ?? EMPTY_DIFFS) : EMPTY_DIFFS,
+  );
+  const gitReview = useOrbitSelector((s) =>
+    selectedHostId && cwd && cwd !== "~" ? (s.gitReviews[`${selectedHostId}::${cwd}`] ?? null) : null,
+  );
+  const workspaceFiles = useOrbitSelector((s) =>
+    selectedHostId && cwd ? (s.workspaceFilesCache[`${selectedHostId}::${cwd}`] ?? EMPTY_FILES) : EMPTY_FILES,
+  );
+  const totalTerminalCount = useOrbitSelector((s) => {
+    if (!selectedHostId) return 0;
+    let count = 0;
+    for (const tab of s.terminalTabs) {
+      if (tab.hostId === selectedHostId) count += 1;
+    }
+    return count;
+  });
+  const sideQuestionCount = useOrbitSelector((s) => {
+    const scope = sideQuestionScopeKey({ selectedHostId, selectedAgentId, isDraftNewSession });
+    return (s.sideQuestionsByScope[scope] ?? EMPTY_FILES).length;
+  });
+  const artifactCount = useOrbitSelector((s) => {
+    if (!selectedHostId) return 0;
+    const all = s.hostDetails[selectedHostId]?.artifacts;
+    if (!all || all.length === 0) return 0;
+    if (agentWorkspaceId) {
+      let wsCount = 0;
+      for (const a of all) {
+        if (a.workspace_id === agentWorkspaceId) wsCount += 1;
+      }
+      if (wsCount > 0) return wsCount;
+    }
+    return all.length;
+  });
 
   const reviewSummary = useMemo(() => {
     if (gitReview?.diff_files && gitReview.diff_files.length > 0) {
@@ -248,28 +280,6 @@ export function SidePanelLaunchpad({
     }
     return { additions: 0, deletions: 0, count: 0 };
   }, [gitReview, sessionTurnDiffs]);
-
-  const totalTerminalCount = useMemo(
-    () => (selectedHostId ? terminalTabs.filter((t) => t.hostId === selectedHostId).length : 0),
-    [selectedHostId, terminalTabs],
-  );
-
-  const sideQuestionCount = useMemo(() => {
-    const scope = sideQuestionScopeKey({ selectedHostId, selectedAgentId, isDraftNewSession });
-    return (sideQuestionsByScope[scope] ?? []).length;
-  }, [isDraftNewSession, selectedAgentId, selectedHostId, sideQuestionsByScope]);
-
-  const artifactCount = useMemo(() => {
-    const all = hostDetail?.artifacts ?? [];
-    if (all.length === 0) return 0;
-    if (currentAgent?.workspace_id) {
-      const wsCount = all.filter((a) => a.workspace_id === currentAgent.workspace_id).length;
-      if (wsCount > 0) return wsCount;
-    }
-    return all.length;
-  }, [hostDetail?.artifacts, currentAgent?.workspace_id]);
-
-  const primaryLocalUrl = insights.detected_local_urls[0] ?? null;
 
   const primaryActions = useMemo<LaunchpadPrimaryAction[]>(
     () => [
@@ -316,7 +326,7 @@ export function SidePanelLaunchpad({
         onSelect: () =>
           orbitActions.openArtifactsTab({
             hostId: selectedHostId ?? undefined,
-            workspaceId: currentAgent?.workspace_id,
+            workspaceId: agentWorkspaceId ?? undefined,
           }),
       },
       {
@@ -381,7 +391,7 @@ export function SidePanelLaunchpad({
     ],
     [
       artifactCount,
-      currentAgent?.workspace_id,
+      agentWorkspaceId,
       primaryLocalUrl,
       reviewSummary,
       selectedHostId,
@@ -395,9 +405,6 @@ export function SidePanelLaunchpad({
   const isSearching = trimmedQuery.length > 0;
   const sideQuestionText = useMemo(() => parseSideQuestionQuery(query), [query]);
   const detectedUrl = useMemo(() => detectLaunchpadUrl(query), [query]);
-
-  const workspaceFiles =
-    selectedHostId && cwd ? (workspaceFilesCache[`${selectedHostId}::${cwd}`] ?? EMPTY_FILES) : EMPTY_FILES;
 
   const matchedFiles = useMemo(() => {
     if (!isSearching) return EMPTY_FILES;
@@ -525,7 +532,7 @@ export function SidePanelLaunchpad({
     }
   };
 
-  const recentFiles = insights.touched_files.slice(0, 5);
+  const recentFiles = touchedFiles.slice(0, 5);
   const { scripts: workspaceScripts } = useWorkspaceScripts(selectedHostId);
   const hasWorkspaceScripts = workspaceScripts.length > 0;
 
@@ -736,7 +743,7 @@ export function SidePanelLaunchpad({
                     <div className="mb-1.5 flex items-center gap-1.5 px-2.5 text-[11.5px] font-medium">
                       <span className="text-muted-foreground/75">{t("sidePanel.recentFiles")}</span>
                       <span className="text-muted-foreground/55 tabular-nums">
-                        {insights.touched_files.length}
+                        {touchedFiles.length}
                       </span>
                     </div>
                     <div className="flex flex-col gap-0.5">
@@ -795,4 +802,4 @@ export function SidePanelLaunchpad({
       </div>
     </ScrollArea>
   );
-}
+});

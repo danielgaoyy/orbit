@@ -27,6 +27,12 @@ export const SIDE_PANEL_MAX_WIDTH_PX = 1400;
 export const STAGE_MIN_WIDTH_PX = 360;
 export const STAGE_COMFORT_WIDTH_PX = 440;
 
+export const OVERVIEW_PANEL_WIDTH_PX = 304;
+export const OVERVIEW_DOCK_RIGHT_INSET_PX = 16;
+export const OVERVIEW_DOCK_RESERVE_PX = OVERVIEW_PANEL_WIDTH_PX + OVERVIEW_DOCK_RIGHT_INSET_PX; // 320px
+export const OVERVIEW_DOCK_MIN_CENTER_PX = 996;
+export const OVERVIEW_DOCK_ENTER_CENTER_PX = 1036;
+
 const MIN_WORK_PAIR_PX = STAGE_MIN_WIDTH_PX + SIDE_PANEL_MIN_WIDTH_PX; // 680px
 
 function clamp(value: number, min: number, max: number): number {

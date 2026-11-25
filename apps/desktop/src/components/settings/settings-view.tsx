@@ -16,9 +16,8 @@ import {
   ChevronDown,
   Cloud,
   Cpu,
-  Database,
   FileText,
-  GitBranch,
+  FolderGit2,
   Keyboard,
   MessageSquare,
   Mic,
@@ -28,23 +27,21 @@ import {
   Server,
   Settings2,
   ShieldCheck,
-  Sparkles,
+  Webhook,
   X,
 } from "lucide-react";
 import { AppearanceSection } from "./appearance-section";
 import { CloudSyncSection } from "./cloud-sync-section";
-import { DataDiagnosticsSection } from "./data-diagnostics-section";
 import { GeneralSection } from "./general-section";
 import { GitWorktreesSection } from "./git-worktrees-section";
 import { HostAgentsSection } from "./host-agents-section";
 import { HostGuardianSection } from "./host-guardian-section";
 import { HostImChannelsSection } from "./host-im-channels-section";
-import { HostPersonalRouterSection } from "./host-personal-router-section";
 import { HostUsageSection } from "./host-usage-section";
 import { HostVoiceSection } from "./host-voice-section";
 import { HostsFleetSection } from "./hosts-fleet-section";
 import { InstructionsMemorySection } from "./instructions-memory-section";
-import { McpToolsSection } from "./mcp-tools-section";
+import { HooksSection, McpSection } from "./mcp-tools-section";
 import { NotificationsSection } from "./notifications-section";
 import {
   LEGACY_SETTING_ANCHORS,
@@ -87,42 +84,42 @@ import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 const icons = {
   general: Settings2,
   appearance: Palette,
-  git_worktrees: GitBranch,
+  workspace: FolderGit2,
   shortcuts: Keyboard,
   notifications: Bell,
   voice: Mic,
-  cloud_sync: Cloud,
   hosts: Server,
+  cloud_sync: Cloud,
   agents: Cpu,
-  personal_router: Sparkles,
-  safety: ShieldCheck,
+  permissions: ShieldCheck,
   usage: BarChart3,
-  instructions_memory: FileText,
-  mcp_tools: Plug,
-  skills_plugins: Blocks,
-  im_channels: MessageSquare,
-  data_diagnostics: Database,
+  context: FileText,
+  mcp: Plug,
+  hooks: Webhook,
+  extensions: Blocks,
+  channels: MessageSquare,
 } satisfies Record<SettingsCoreSectionId, typeof Settings2>;
 
 const widePages = new Set<SettingsCoreSectionId>([
   "hosts",
-  "safety",
+  "permissions",
   "usage",
-  "mcp_tools",
-  "skills_plugins",
-  "im_channels",
-  "data_diagnostics",
+  "mcp",
+  "hooks",
+  "extensions",
+  "channels",
 ]);
 const scopedPages = new Set<SettingsCoreSectionId>([
+  "workspace",
   "agents",
-  "safety",
+  "permissions",
   "usage",
   "voice",
-  "instructions_memory",
-  "mcp_tools",
-  "skills_plugins",
-  "im_channels",
-  "data_diagnostics",
+  "context",
+  "mcp",
+  "hooks",
+  "extensions",
+  "channels",
 ]);
 
 const ScopedHostSwitcher = memo(function ScopedHostSwitcher({
@@ -350,11 +347,11 @@ const SettingsSidebar = memo(function SettingsSidebar({
   );
 
   return (
-    <aside className="border-border-subtle flex w-[240px] max-w-[38vw] shrink-0 flex-col border-r px-[12px] pt-[14px]">
-      <div className="text-ink-primary px-2 pb-2.5 text-[15px] leading-[20px] font-semibold tracking-[-0.015em]">
+    <aside className="border-border-subtle flex w-[240px] max-w-[38vw] shrink-0 flex-col border-r px-[12px] pt-[12px]">
+      <div className="text-ink-primary px-2 pb-2 text-[15px] leading-[20px] font-semibold tracking-[-0.015em]">
         {t("common.settings")}
       </div>
-      <div className="relative mb-2.5 flex items-center">
+      <div className="relative mb-2 flex items-center">
         <Search
           aria-hidden
           className="text-ink-muted pointer-events-none absolute left-2.5 size-[14px]"
@@ -463,11 +460,11 @@ const SettingsPageBody = memo(function SettingsPageBody({
 
   switch (coreSection) {
     case "general":
-      return <GeneralSection />;
+      return <GeneralSection hostId={hostId} />;
     case "appearance":
       return <AppearanceSection />;
-    case "git_worktrees":
-      return <GitWorktreesSection />;
+    case "workspace":
+      return <GitWorktreesSection hostId={hostId} />;
     case "shortcuts":
       return <ShortcutsSection jumpTo={jumpId} />;
     case "notifications":
@@ -483,15 +480,11 @@ const SettingsPageBody = memo(function SettingsPageBody({
           onOverview={handleOverview}
         />
       );
-    case "personal_router":
-      return <HostPersonalRouterSection />;
     case "agents":
       return <HostAgentsSection hostId={hostId} />;
-    case "safety":
+    case "permissions":
       return <HostGuardianSection hostId={hostId} />;
-    case "data_diagnostics":
-      return <DataDiagnosticsSection hostId={hostId} />;
-    case "instructions_memory":
+    case "context":
       return (
         <InstructionsMemorySection
           hostId={hostId}
@@ -517,11 +510,13 @@ const SettingsPageBody = memo(function SettingsPageBody({
       return <HostVoiceSection hostId={hostId} />;
     case "usage":
       return <HostUsageSection hostId={hostId} />;
-    case "mcp_tools":
-      return <McpToolsSection hostId={hostId} />;
-    case "skills_plugins":
+    case "mcp":
+      return <McpSection hostId={hostId} />;
+    case "hooks":
+      return <HooksSection hostId={hostId} />;
+    case "extensions":
       return <SkillsPluginsSection hostId={hostId} />;
-    case "im_channels":
+    case "channels":
       return <HostImChannelsSection hostId={hostId} />;
   }
 });
@@ -584,7 +579,7 @@ export const SettingsView = memo(function SettingsView({ closing = false }: { cl
 
   const { coreSection, subTab, hostId: linkedHostId } = resolveActiveSettingsLocation(section);
   const requestedHost =
-    linkedHostId ?? (coreSection === "instructions_memory" ? instructionsTargetHostId : null);
+    linkedHostId ?? (coreSection === "context" ? instructionsTargetHostId : null);
   const [pickedHostId, setPickedHostId] = useState<string | null>(workspaceHostId);
   useEffect(() => {
     if (requestedHost) setPickedHostId(requestedHost);
@@ -612,7 +607,7 @@ export const SettingsView = memo(function SettingsView({ closing = false }: { cl
   });
 
   const pageLabel = t(SETTINGS_CORE_SECTIONS.find((item) => item.id === coreSection)!.labelKey);
-  const splitEditor = coreSection === "instructions_memory" && subTab !== "rules" && subTab !== "memory";
+  const splitEditor = coreSection === "context" && subTab !== "rules" && subTab !== "memory";
 
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const canvas = useRef<HTMLDivElement>(null);

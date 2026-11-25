@@ -189,4 +189,69 @@ describe("markdown-helpers & MarkdownBlocksView (B3-08)", () => {
     // Long (>12 line) Rust snippet gets collapse/expand toggle with aria-expanded="true"
     assert.match(html, /aria-expanded="true"/);
   });
+
+  it("renders distinct semantic link styles, clean borderless-column tables, short code without line numbers, and SVG checkboxes", async () => {
+    const mod = await server.ssrLoadModule("/src/components/markdown-blocks.tsx");
+    const blocks: RichBlockView[] = [
+      {
+        kind: "heading",
+        level: 2,
+        spans: [{ text: "Summary", bold: false, italic: false, inline_code: false, strikethrough: false, link_url: null }],
+      },
+      {
+        kind: "paragraph",
+        spans: [
+          { text: "Docs", bold: false, italic: false, inline_code: false, strikethrough: false, link_url: "https://example.com" },
+          { text: " and ", bold: false, italic: false, inline_code: false, strikethrough: false, link_url: null },
+          { text: "stage.rs", bold: false, italic: false, inline_code: true, strikethrough: false, link_url: "file:///repo/stage.rs" },
+        ],
+      },
+      {
+        kind: "block_quote",
+        spans: [{ text: "Quoted note", bold: false, italic: false, inline_code: false, strikethrough: false, link_url: null }],
+      },
+      makeListItem("Done task", { ordered: false, checked: true, depth: 0 }),
+      {
+        kind: "code_block",
+        language: "bash",
+        raw_code: "npm test",
+        lines: [{ line_number: 1, tokens: [{ text: "npm test", fg_hex: "#d4d4d4", bold: false, italic: false }] }],
+      },
+      {
+        kind: "table",
+        alignments: ["left", "right"],
+        headers: [
+          { spans: [{ text: "camelCaseCol", bold: false, italic: false, inline_code: false, strikethrough: false, link_url: null }] },
+          { spans: [{ text: "Count", bold: false, italic: false, inline_code: false, strikethrough: false, link_url: null }] },
+        ],
+        rows: [
+          {
+            cells: [
+              { spans: [{ text: "alpha", bold: false, italic: false, inline_code: false, strikethrough: false, link_url: null }] },
+              { spans: [{ text: "42", bold: false, italic: false, inline_code: false, strikethrough: false, link_url: null }] },
+            ],
+          },
+        ],
+      },
+    ];
+    const html = renderToStaticMarkup(createElement(mod.MarkdownBlocksView, { blocks }));
+
+    // Heading drops top margin when first; prose uses softer 88% ink
+    assert.match(html, /first:mt-0/);
+    assert.match(html, /text-foreground\/88/);
+    // Both plain links and inline-code file links use semantic --ink-link color,
+    // while resting inline-code file links stay on neutral code chip fills without blue borders.
+    assert.match(html, /text-ink-link/);
+    assert.match(html, /group-hover\/link:underline/);
+    assert.doesNotMatch(html, /border-signal-info-border/);
+    // Blockquote uses stronger 2.5px border-border-strong
+    assert.match(html, /border-l-\[2\.5px\]/);
+    // Checkbox uses SVG Check icon rather than Unicode ✓/○
+    assert.match(html, /lucide-check/);
+    assert.doesNotMatch(html, />✓<|>○</);
+    // Single-line code block omits line number gutter
+    assert.doesNotMatch(html, /text-ink-faint tabular-nums mr-3\.5 w-6/);
+    // Table omits vertical cell borders, zebra striping, and forced uppercase headers
+    assert.doesNotMatch(html, /uppercase|border-r|even:bg-/);
+  });
 });

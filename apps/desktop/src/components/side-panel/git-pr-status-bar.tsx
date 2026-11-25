@@ -226,11 +226,21 @@ export const GitPrStatusBar = memo(function GitPrStatusBar({
               key={`${check.name}-${idx}`}
               className="hover:bg-accent/60 flex items-center justify-between gap-2 rounded-md px-2 py-1 text-[11.5px] transition-colors"
             >
-              <div className="flex min-w-0 flex-1 items-center gap-1.5">
+              <div
+                title={[check.name, check.workflow].filter(Boolean).join(" — ")}
+                className="flex min-w-0 flex-1 items-center gap-1.5"
+              >
                 <CheckStateIcon state={check.state} />
-                <span className="text-foreground truncate font-medium">{check.name}</span>
+                <span
+                  className={cn(
+                    "text-foreground min-w-0 truncate font-medium",
+                    check.workflow ? "max-w-[65%] shrink-0" : "flex-1",
+                  )}
+                >
+                  {check.name}
+                </span>
                 {check.workflow && (
-                  <span className="text-muted-foreground truncate text-[10.5px]">
+                  <span className="text-muted-foreground min-w-0 flex-1 truncate text-[10.5px]">
                     {check.workflow}
                   </span>
                 )}

@@ -369,7 +369,12 @@ export const ArtifactSandboxFrame = memo(function ArtifactSandboxFrame({
               {resourceUri || (isMcpApp ? "MCP App (SEP-1865)" : "Sandboxed HTML")}
             </span>
           </span>
-          <span className="text-muted-foreground/70 shrink-0">
+          <span
+            title={
+              mcpServerName ? `MCP · ${mcpServerName} · Sandboxed` : "Sandboxed · No network"
+            }
+            className="text-muted-foreground/70 max-w-[45%] shrink-0 truncate"
+          >
             {mcpServerName ? `MCP · ${mcpServerName} · Sandboxed` : "Sandboxed · No network"}
           </span>
         </div>

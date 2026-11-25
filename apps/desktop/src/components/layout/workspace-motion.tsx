@@ -12,7 +12,13 @@ import {
 } from "react";
 
 import { isMacDesktop } from "@/lib/orbit-ipc";
-import { buildWorkspaceShellCssVars, resolveWorkspacePaneWidths } from "@/lib/workspace-layout";
+import {
+  OVERVIEW_DOCK_ENTER_CENTER_PX,
+  OVERVIEW_DOCK_MIN_CENTER_PX,
+  OVERVIEW_DOCK_RESERVE_PX,
+  buildWorkspaceShellCssVars,
+  resolveWorkspacePaneWidths,
+} from "@/lib/workspace-layout";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
 export type ShellMotionPhase = "idle" | "prep" | "playing";
@@ -23,7 +29,6 @@ const OVERVIEW_OPACITY_OUT = "opacity 175ms var(--ease-exit)";
 const STAGE_MAX_WIDTH_PX = 740;
 const STAGE_MIN_LOCK_WIDTH_PX = 240;
 const STAGE_H_PADDING_PX = 48;
-const OVERVIEW_DOCK_RESERVE_PX = 304;
 
 function clampNumber(value: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, value));
@@ -251,7 +256,9 @@ function evalBreakpoints(params: {
     sidePanelPrefWidth: params.sidePanelWidth,
   });
   const centerW = panes.centerWidthPx;
-  const canDockOverview = params.prevCanDock ? centerW >= 980 : centerW >= 1020;
+  const canDockOverview = params.prevCanDock
+    ? centerW >= OVERVIEW_DOCK_MIN_CENTER_PX
+    : centerW >= OVERVIEW_DOCK_ENTER_CENTER_PX;
   const D =
     params.hasActiveSession && canDockOverview && params.overviewDesktopOpenPref
       ? OVERVIEW_DOCK_RESERVE_PX

@@ -112,6 +112,7 @@ export class OrbitHarmonyCore {
   cloudSyncNowJson(): Promise<string>;
   cloudSyncExportDeviceLinkUri(): string;
   cloudSyncImportDeviceLinkUriJson(uri: string): Promise<string>;
+  cloudSyncEnableManualPassphraseJson(passphrase: string): Promise<string>;
   cloudSyncSetManualPassphraseModeJson(requireManual: boolean): Promise<string>;
   cloudSyncLogoutJson(clearLocalHosts: boolean): string;
   cloudSyncGetPreferencesJson(): string;

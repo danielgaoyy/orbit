@@ -50,8 +50,8 @@ const SCOPE_LABELS: Record<InstructionScope, MessageKey> = {
   local_override: "context.scopeOverride",
 };
 
-const PROVIDER_LABELS: Record<string, string> = {
-  universal: "Universal",
+const PROVIDER_LABELS: Record<string, string | MessageKey> = {
+  universal: "context.providerUniversal",
   orbit: "Orbit",
   claude_code: "Claude Code",
   codex: "Codex",
@@ -59,6 +59,12 @@ const PROVIDER_LABELS: Record<string, string> = {
   cursor_agent: "Cursor",
   copilot: "Copilot",
 };
+
+function formatProviderLabel(hint: string, tr: (key: MessageKey) => string): string | null {
+  const entry = PROVIDER_LABELS[hint];
+  if (!entry) return null;
+  return entry === "context.providerUniversal" ? tr(entry) : entry;
+}
 
 function estimateTokensClient(text: string): number {
   if (!text) return 0;
@@ -81,11 +87,14 @@ function estimateTokensClient(text: string): number {
   return Math.max(1, Math.ceil((cjk * 5 + other) / 4));
 }
 
-function formatTokensCompact(tokens: number): string {
+function formatTokensCompact(
+  tokens: number,
+  tr: (key: MessageKey, params?: Record<string, string | number>) => string,
+): string {
   if (tokens >= 1000) {
-    return `${(tokens / 1000).toFixed(1)}k tok`;
+    return tr("context.tokensCompactK", { count: (tokens / 1000).toFixed(1) });
   }
-  return `${tokens} tok`;
+  return tr("context.tokensCompact", { count: tokens });
 }
 
 function starterTemplateForFilename(filename: string): string {
@@ -179,7 +188,7 @@ export const InstructionsSection = memo(function InstructionsSection({
   const mod = modSymbol();
 
   const [snapshot, setSnapshot] = useState<InstructionFilesSnapshotView | null>(null);
-  const [listLoading, setListLoading] = useState(false);
+  const [listLoading, setListLoading] = useState(() => Boolean(activeHostId && activeCwd));
   const [listError, setListError] = useState<string | null>(null);
 
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
@@ -613,8 +622,8 @@ export const InstructionsSection = memo(function InstructionsSection({
           </p>
         </div>
       ) : listError ? (
-        <div className="flex items-start gap-2.5 rounded-xl border border-signal-danger-border bg-signal-danger-bg px-3.5 py-3 text-[13px] text-signal-danger">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+        <div className="flex items-start gap-2 rounded-xl border border-signal-danger-border bg-signal-danger-bg px-4 py-3 text-[13px] text-signal-danger">
+          <AlertTriangle className="mt-1 h-4 w-4 shrink-0" />
           <div className="min-w-0 flex-1 break-words">{listError}</div>
         </div>
       ) : (
@@ -653,15 +662,15 @@ export const InstructionsSection = memo(function InstructionsSection({
                           });
                         }}
                         className={cn(
-                          "group flex w-full cursor-pointer flex-col gap-1 rounded-lg px-2.5 py-2 text-left transition-colors",
+                          "group flex w-full cursor-pointer flex-col gap-1 rounded-lg px-3 py-2 text-left transition-colors",
                           isSelected
                             ? "bg-surface-raised text-ink-primary"
                             : "text-ink-secondary hover:bg-surface-raised",
                           !entry.exists && !isSelected && "opacity-65 hover:opacity-95",
                         )}
                       >
-                        <div className="flex items-center justify-between gap-1.5">
-                          <div className="flex min-w-0 items-center gap-1.5">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex min-w-0 items-center gap-2">
                             <span className="text-ink-muted w-3.5 shrink-0 font-mono text-[11px] tabular-nums">
                               {entry.precedence_order}
                             </span>
@@ -676,7 +685,7 @@ export const InstructionsSection = memo(function InstructionsSection({
                             )}
                           </div>
                           <span
-                            className="border-border-subtle bg-surface-recessed text-ink-muted shrink-0 rounded border px-1.5 py-px text-[11px] font-medium"
+                            className="border-border-subtle bg-surface-recessed text-ink-muted shrink-0 rounded border px-2 py-px text-[11px] font-medium"
                           >
                             {t(SCOPE_LABELS[entry.scope])}
                           </span>
@@ -687,7 +696,7 @@ export const InstructionsSection = memo(function InstructionsSection({
                             {entry.relative_path}
                           </span>
                           <span className="text-ink-muted shrink-0 font-mono text-[11px] tabular-nums">
-                            {entry.exists ? formatTokensCompact(entry.approx_tokens) : t("context.newFile")}
+                            {entry.exists ? formatTokensCompact(entry.approx_tokens, t) : t("context.newFile")}
                           </span>
                         </div>
 
@@ -707,8 +716,8 @@ export const InstructionsSection = memo(function InstructionsSection({
             </ScrollArea>
 
             {snapshot && (
-              <div className="border-border-subtle text-ink-muted border-t px-3 py-1.5 text-[11px] tabular-nums">
-                {t("context.activeFiles", { count: snapshot.files.filter((file) => file.exists).length })} · ~{formatTokensCompact(snapshot.total_tokens)}
+              <div className="border-border-subtle text-ink-muted border-t px-3 py-2 text-[11px] tabular-nums">
+                {t("context.activeFiles", { count: snapshot.files.filter((file) => file.exists).length })} · ~{formatTokensCompact(snapshot.total_tokens, t)}
               </div>
             )}
             {/* Quick Create Buttons for Missing Canonical Layers */}
@@ -722,7 +731,7 @@ export const InstructionsSection = memo(function InstructionsSection({
                       key={`create-${target.id}`}
                       type="button"
                       onClick={() => handleQuickCreate(target)}
-                      className="text-ink-muted hover:bg-surface-recessed hover:text-ink-primary flex w-full cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-left text-[11px] transition-colors"
+                      className="text-ink-muted hover:bg-surface-recessed hover:text-ink-primary flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1 text-left text-[11px] transition-colors"
                     >
                       <Plus className="h-3 w-3 shrink-0 opacity-75" />
                       <span className="truncate font-mono">{t("context.createFile", { file: createLabel })}</span>
@@ -738,20 +747,20 @@ export const InstructionsSection = memo(function InstructionsSection({
             {selectedEntry ? (
               <>
                 {/* Editor Top Toolbar */}
-                <div className="border-border-subtle flex items-center justify-between gap-2 border-b px-3.5 py-2">
+                <div className="border-border-subtle flex items-center justify-between gap-2 border-b px-4 py-2">
                   <div className="flex min-w-0 items-center gap-2">
                     <span className="text-ink-primary truncate font-mono text-[13px] font-medium">
                       {selectedEntry.relative_path}
                     </span>
                     <span
-                      className="border-border-subtle bg-surface-recessed text-ink-muted shrink-0 rounded border px-1.5 py-px text-[11px] font-medium"
+                      className="border-border-subtle bg-surface-recessed text-ink-muted shrink-0 rounded border px-2 py-px text-[11px] font-medium"
                     >
                       {t(SCOPE_LABELS[selectedEntry.scope])}
                     </span>
                     {selectedEntry.provider_hint &&
-                      PROVIDER_LABELS[selectedEntry.provider_hint] && (
+                      formatProviderLabel(selectedEntry.provider_hint, t) && (
                         <span className="text-ink-muted hidden text-[11px] sm:inline">
-                          {PROVIDER_LABELS[selectedEntry.provider_hint]}
+                          {formatProviderLabel(selectedEntry.provider_hint, t)}
                         </span>
                       )}
                     {dirty && (
@@ -768,7 +777,7 @@ export const InstructionsSection = memo(function InstructionsSection({
                     )}
                   </div>
 
-                  <div className="flex shrink-0 items-center gap-1.5">
+                  <div className="flex shrink-0 items-center gap-2">
                     {dirty && (
                       <button
                         type="button"
@@ -788,7 +797,7 @@ export const InstructionsSection = memo(function InstructionsSection({
                       size="xs"
                       disabled={saving || !fileReady || etagConflict || (!dirty && loadedExists)}
                       onClick={() => void handleSave(false)}
-                      className="gap-1.5 text-[13px]"
+                      className="gap-2 text-[13px]"
                     >
                       {saving ? (
                         <Loader2 className="h-3 w-3 animate-spin" />
@@ -803,7 +812,7 @@ export const InstructionsSection = memo(function InstructionsSection({
 
                 {/* Resolved @import Strip */}
                 {(selectedEntry.imports?.length ?? 0) > 0 && (
-                  <div className="border-border-subtle bg-surface-recessed flex flex-wrap items-center gap-1.5 border-b px-3.5 py-1.5">
+                  <div className="border-border-subtle bg-surface-recessed flex flex-wrap items-center gap-2 border-b px-4 py-2">
                     <span className="text-ink-muted inline-flex items-center gap-1 text-[11px]">
                       <Link2 className="h-3 w-3" />
                       {t("context.imports")}
@@ -811,7 +820,7 @@ export const InstructionsSection = memo(function InstructionsSection({
                     {(selectedEntry.imports ?? []).map((imp) => (
                       <span
                         key={imp}
-                        className="border-border-subtle bg-surface-base text-ink-secondary rounded border px-1.5 py-0.5 font-mono text-[11px]"
+                        className="border-border-subtle bg-surface-base text-ink-secondary rounded border px-2 py-1 font-mono text-[11px]"
                       >
                         @{imp}
                       </span>
@@ -821,16 +830,16 @@ export const InstructionsSection = memo(function InstructionsSection({
 
                 {/* Optimistic Concurrency Etag Conflict Banner */}
                 {etagConflict && (
-                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-signal-warning-border bg-signal-warning-bg px-3.5 py-2 text-[13px] text-signal-warning">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-signal-warning-border bg-signal-warning-bg px-4 py-2 text-[13px] text-signal-warning">
                     <div className="flex items-center gap-2">
                       <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
                       <span>{t("sidePanel.editorConflictTitle")}</span>
                     </div>
-                    <div className="flex items-center gap-1.5">
+                    <div className="flex items-center gap-2">
                       <button
                         type="button"
                         onClick={handleReloadFromDisk}
-                        className="bg-surface-base hover:bg-surface-base cursor-pointer rounded-md border border-signal-warning-border px-2 py-0.5 text-[11px] font-medium transition-colors"
+                        className="bg-surface-base hover:bg-surface-base cursor-pointer rounded-md border border-signal-warning-border px-2 py-1 text-[11px] font-medium transition-colors"
                       >
                         {t("sidePanel.editorConflictReload")}
                       </button>
@@ -838,7 +847,7 @@ export const InstructionsSection = memo(function InstructionsSection({
                         type="button"
                         disabled={saving}
                         onClick={() => void handleSave(true)}
-                        className="cursor-pointer rounded-md border border-signal-warning-border bg-signal-warning-bg px-2 py-0.5 text-[13px] font-medium text-signal-warning transition-colors hover:bg-surface-raised disabled:opacity-50"
+                        className="cursor-pointer rounded-md border border-signal-warning-border bg-signal-warning-bg px-2 py-1 text-[13px] font-medium text-signal-warning transition-colors hover:bg-surface-raised disabled:opacity-50"
                       >
                         {t("sidePanel.editorConflictOverwrite")}
                       </button>
@@ -848,7 +857,7 @@ export const InstructionsSection = memo(function InstructionsSection({
 
                 {/* Generic Save / Read Error Banner */}
                 {saveError && (
-                  <div className="flex items-center justify-between gap-2 border-b border-signal-danger-border bg-signal-danger-bg px-3.5 py-2 text-[13px] text-signal-danger">
+                  <div className="flex items-center justify-between gap-2 border-b border-signal-danger-border bg-signal-danger-bg px-4 py-2 text-[13px] text-signal-danger">
                     <span className="truncate">{saveError}</span>
                     <button
                       type="button"
@@ -893,22 +902,22 @@ export const InstructionsSection = memo(function InstructionsSection({
                       }}
                       aria-label={selectedEntry.filename}
                       placeholder={t("context.editorPlaceholder", { file: selectedEntry.filename })}
-                      className="selectable-text text-ink-primary placeholder:text-ink-muted h-full w-full resize-none bg-transparent p-3.5 font-mono text-[13px] leading-[1.6] outline-none"
+                      className="selectable-text text-ink-primary placeholder:text-ink-muted h-full w-full resize-none bg-transparent p-4 font-mono text-[13px] leading-[1.6] outline-none"
                     />
                   )}
                 </div>
 
                 {/* Editor Footer Status */}
-                <div className="border-border-subtle bg-surface-recessed text-ink-muted flex items-center justify-between gap-2 border-t px-3.5 py-1.5 font-mono text-[11px] tabular-nums">
+                <div className="border-border-subtle bg-surface-recessed text-ink-muted flex items-center justify-between gap-2 border-t px-4 py-2 font-mono text-[11px] tabular-nums">
                   <span className="truncate opacity-75">{selectedEntry.path}</span>
-                  <div className="flex shrink-0 items-center gap-2.5">
+                  <div className="flex shrink-0 items-center gap-2">
                     <span>{loadedLineEnding.toUpperCase()}</span>
                     <span className="opacity-40">·</span>
                     <span>{t("common.linesCount", { count: liveLineCount })}</span>
                     <span className="opacity-40">·</span>
                     <span>{(liveByteSize / 1024).toFixed(1)} KB</span>
                     <span className="opacity-40">·</span>
-                    <span>~{formatTokensCompact(liveDraftTokens)}</span>
+                    <span>~{formatTokensCompact(liveDraftTokens, t)}</span>
                   </div>
                 </div>
               </>

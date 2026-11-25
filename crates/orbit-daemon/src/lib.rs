@@ -6534,6 +6534,7 @@ async fn handle_wire_rpc(
             headers,
             keep_existing_secrets,
             enabled,
+            create_only,
         } => {
             let home = runtime.home_dir.clone();
             let store = Arc::clone(&runtime.store);
@@ -6576,6 +6577,7 @@ async fn handle_wire_rpc(
                     headers,
                     keep_existing_secrets,
                     enabled,
+                    create_only,
                 };
                 let reply = match tokio::task::spawn_blocking(move || {
                     crate::mcp_servers::upsert_external_mcp_server(&home, input, &cache_snapshot)
@@ -8944,6 +8946,7 @@ async fn handle_wire_rpc(
             content,
             enabled,
             expected_etag,
+            create_only,
         } => {
             let authorized_cwd = match authorize_optional_skills_cwd(&runtime.store, cwd).await {
                 Ok(c) => c,
@@ -8959,7 +8962,10 @@ async fn handle_wire_rpc(
                 description,
                 content,
                 enabled,
-                expected_etag,
+                precondition: crate::skills_manager::SkillWritePrecondition::from_wire(
+                    create_only,
+                    expected_etag,
+                ),
             };
             match tokio::task::spawn_blocking(move || {
                 crate::skills_manager::upsert_managed_skill(&orbit_home, &user_home, params)
@@ -9031,6 +9037,8 @@ async fn handle_wire_rpc(
             cwd,
             source_markdown_or_path,
             slug_override,
+            expected_etag,
+            create_only,
         } => {
             let authorized_cwd = match authorize_optional_skills_cwd(&runtime.store, cwd).await {
                 Ok(c) => c,
@@ -9046,6 +9054,10 @@ async fn handle_wire_rpc(
                     authorized_cwd.as_deref(),
                     &source_markdown_or_path,
                     slug_override.as_deref(),
+                    crate::skills_manager::SkillWritePrecondition::from_wire(
+                        create_only,
+                        expected_etag,
+                    ),
                 )
             })
             .await

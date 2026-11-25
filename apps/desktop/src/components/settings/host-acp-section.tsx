@@ -19,9 +19,10 @@ import {
   SettingResourceRow,
 } from "@/components/settings/settings-primitives";
 import { Button } from "@/components/ui/button";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/dialog-tabs";
+import { IconButton } from "@/components/ui/icon-button";
 import { Field, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
+import { Segmented } from "@/components/ui/segmented";
 import { Textarea } from "@/components/ui/textarea";
 import {
   type AcpAgentAvailability,
@@ -206,7 +207,7 @@ function CustomAcpAgentDrawer({
           <div className="grid grid-cols-2 gap-3">
             <Field>
               <FieldLabel htmlFor="acp-id" className="text-[11px]">
-                ID
+                {t("settings.acpId")}
               </FieldLabel>
               <Input
                 id="acp-id"
@@ -229,7 +230,7 @@ function CustomAcpAgentDrawer({
                 autoFocus={Boolean(editing)}
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                placeholder="My Coder"
+                placeholder={t("settings.acpNamePlaceholder")}
               />
             </Field>
           </div>
@@ -340,10 +341,13 @@ export function HostAcpSection({ hostId }: { hostId: string }) {
 
   const acpAgents = hostDetail?.acp_agents ?? EMPTY_ACP_AGENTS;
 
-  const [filter, setFilter] = useState<AcpFilter>("all");
+  const [filter, setFilter] = useState<AcpFilter>(() =>
+    acpAgents.some((a) => a.installed) ? "installed" : "all",
+  );
   const [query, setQuery] = useState("");
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [initialLoading, setInitialLoading] = useState(() => acpAgents.length === 0);
   const [refreshing, setRefreshing] = useState(false);
   const [probingIds, setProbingIds] = useState<Record<string, boolean>>({});
   const [probeResults, setProbeResults] = useState<Record<string, AcpProbeResult>>({});
@@ -362,11 +366,25 @@ export function HostAcpSection({ hostId }: { hostId: string }) {
 
   useEffect(() => {
     mountedRef.current = true;
+    let cancelled = false;
+    if (activeHostRef.current !== hostId) {
+      setInitialLoading(true);
+      setDidInitFilter(false);
+      setFilter("all");
+    }
     activeHostRef.current = hostId;
-    void orbitIpc.refreshAcpAgents(hostId).catch((error) => {
-      if (mountedRef.current) orbitActions.showToast(String(error));
-    });
+    void orbitIpc
+      .refreshAcpAgents(hostId)
+      .catch((error) => {
+        if (!cancelled && mountedRef.current) orbitActions.showToast(String(error));
+      })
+      .finally(() => {
+        if (!cancelled && mountedRef.current && activeHostRef.current === hostId) {
+          setInitialLoading(false);
+        }
+      });
     return () => {
+      cancelled = true;
       mountedRef.current = false;
       if (copyTimerRef.current !== null) {
         window.clearTimeout(copyTimerRef.current);
@@ -382,7 +400,7 @@ export function HostAcpSection({ hostId }: { hostId: string }) {
   );
 
   // Default to "Installed" when at least one ACP agent is installed on initial load
-  const [didInitFilter, setDidInitFilter] = useState(false);
+  const [didInitFilter, setDidInitFilter] = useState(() => acpAgents.length > 0);
   useEffect(() => {
     if (!didInitFilter && acpAgents.length > 0) {
       setDidInitFilter(true);
@@ -517,21 +535,20 @@ export function HostAcpSection({ hostId }: { hostId: string }) {
   const selected = acpAgents.find((agent) => agent.spec.id === expandedId);
   const probe = expandedId ? probeResults[expandedId] : null;
   const deleting = acpAgents.find((agent) => agent.spec.id === confirmDeleteId);
+  const showInitialLoading = initialLoading && acpAgents.length === 0;
   return (
     <SettingGroup
       title={t("settings.subTabAcpRegistry")}
       settingId="settings.subTabAcpRegistry"
       action={
-        <div className="flex gap-2">
-          <Button
-            aria-label={t("common.refresh")}
-            size="icon-sm"
-            variant="ghost"
+        <div className="flex items-center gap-2">
+          <IconButton
+            tooltip={t("common.refresh")}
             disabled={refreshing}
             onClick={() => void handleRefreshRegistry()}
           >
             <RefreshCw className={cn(refreshing && "animate-spin")} />
-          </Button>
+          </IconButton>
           <Button
             size="sm"
             variant="outline"
@@ -544,24 +561,16 @@ export function HostAcpSection({ hostId }: { hostId: string }) {
       }
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <Tabs
+        <Segmented<AcpFilter>
           value={filter}
-          onValueChange={(value) => {
-            if (value === "all" || value === "custom" || value === "installed") setFilter(value);
-          }}
-        >
-          <TabsList aria-label={t("settings.subTabAcpRegistry")}>
-            <TabsTrigger value="installed">
-              {t("settings.agentInstalled")} · {installedCount}
-            </TabsTrigger>
-            <TabsTrigger value="all">
-              {t("settings.acpAll")} · {acpAgents.length}
-            </TabsTrigger>
-            <TabsTrigger value="custom">
-              {t("settings.acpCustom")} · {customCount}
-            </TabsTrigger>
-          </TabsList>
-        </Tabs>
+          onValueChange={setFilter}
+          ariaLabel={t("settings.subTabAcpRegistry")}
+          options={[
+            { value: "installed", label: `${t("settings.agentInstalled")} · ${installedCount}` },
+            { value: "all", label: `${t("settings.acpAll")} · ${acpAgents.length}` },
+            { value: "custom", label: `${t("settings.acpCustom")} · ${customCount}` },
+          ]}
+        />
         <div className="relative w-[180px]">
           <Search className="pointer-events-none absolute top-1/2 left-2.5 size-[13px] -translate-y-1/2 text-ink-muted" />
           <Input
@@ -575,9 +584,14 @@ export function HostAcpSection({ hostId }: { hostId: string }) {
         </div>
       </div>
       <SettingCard>
-        {!filteredAgents.length && (
+        {showInitialLoading ? (
+          <div className="text-ink-muted flex items-center gap-2 px-4 py-4 text-[13px]">
+            <Loader2 className="size-3.5 animate-spin" />
+            <span>{t("common.loading")}</span>
+          </div>
+        ) : !filteredAgents.length ? (
           <p className="px-4 py-3 text-[13px] text-ink-secondary">{t("settings.acpEmpty")}</p>
-        )}
+        ) : null}
         {filteredAgents.map(({ spec, installed }) => (
           <SettingResourceRow
             key={spec.id}

@@ -6,7 +6,12 @@ import { test } from "node:test";
 import { createElement, type ReactElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
-import { computeDisclosureRevealDelta, computeStageScrollState, type ViewportAnchorHoldFn } from "./stage-helpers.ts";
+import {
+  computeDisclosureRevealDelta,
+  computeStageScrollState,
+  shouldFollowBottomOnDisclosureExpand,
+  type ViewportAnchorHoldFn,
+} from "./stage-helpers.ts";
 
 const pinned = { previousTop: 100, currentTop: 92, distanceFromBottom: 8, stickToBottom: true };
 
@@ -81,6 +86,80 @@ test("a 1500px disclosure reveals only the missing preview and keeps its header 
   assert.equal(computeDisclosureRevealDelta({
     ...tall, scrollerRect: { top: 0, bottom: 400, height: 400 }, triggerRect: { top: 370, bottom: 398 },
   }), 138);
+});
+
+test("self-expanding user prompt bubbles measure revealed text below the collapsed preview edge", () => {
+  // Bubble expanded from 144px to 760px starting at y=300 inside an 800px scroller (100..900):
+  // 456px of expanded content is already visible below y=444 -> must not nudge or jitter.
+  assert.equal(computeDisclosureRevealDelta({
+    intent: "expand",
+    beforeContainerHeight: 144,
+    scrollerRect: { top: 100, bottom: 900, height: 800 },
+    triggerRect: { top: 300, bottom: 1060 },
+    containerRect: { bottom: 1060, height: 760 },
+    triggerIsContainer: true,
+  }), 0);
+
+  // Bubble expanded right at the bottom edge (top=740, collapsed bottom=884 inside 100..900):
+  // only 16px visible below collapsed edge -> smoothly reveals up to targetReveal (240 - 16 = 224px).
+  assert.equal(computeDisclosureRevealDelta({
+    intent: "expand",
+    beforeContainerHeight: 144,
+    scrollerRect: { top: 100, bottom: 900, height: 800 },
+    triggerRect: { top: 740, bottom: 1500 },
+    containerRect: { bottom: 1500, height: 760 },
+    triggerIsContainer: true,
+  }), 224);
+});
+
+test("expanding the trailing latest disclosure while at the bottom keeps following the bottom", () => {
+  assert.equal(
+    shouldFollowBottomOnDisclosureExpand({
+      followBottom: true,
+      intent: "expand",
+      wasPinnedBottom: true,
+      beforeGap: 0,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldFollowBottomOnDisclosureExpand({
+      followBottom: true,
+      intent: "expand",
+      wasPinnedBottom: false,
+      beforeGap: 12,
+    }),
+    true,
+  );
+  // Scrolled up into history -> do not yank to bottom
+  assert.equal(
+    shouldFollowBottomOnDisclosureExpand({
+      followBottom: true,
+      intent: "expand",
+      wasPinnedBottom: false,
+      beforeGap: 180,
+    }),
+    false,
+  );
+  // Non-trailing (historical) disclosures or collapses never force bottom follow
+  assert.equal(
+    shouldFollowBottomOnDisclosureExpand({
+      followBottom: false,
+      intent: "expand",
+      wasPinnedBottom: true,
+      beforeGap: 0,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldFollowBottomOnDisclosureExpand({
+      followBottom: true,
+      intent: "collapse",
+      wasPinnedBottom: true,
+      beforeGap: 0,
+    }),
+    false,
+  );
 });
 
 test("the side viewport renders peer disclosures with separate actions and full-height open content", async (t) => {

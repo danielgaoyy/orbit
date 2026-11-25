@@ -161,6 +161,7 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   worktreeBranchPrefix: "preferences",
   preferredEditor: "preferences",
   voiceInputDeviceId: "preferences",
+  voiceEnabledByHost: "preferences",
   terminalFontSize: "preferences",
   terminalCursorStyle: "preferences",
   terminalScrollback: "preferences",
@@ -252,51 +253,75 @@ export function computeChangedTopicMask(prev: OrbitUiState, next: OrbitUiState):
   return dirtyMask;
 }
 
+const trackingProxyCache = new WeakMap<OrbitUiState, OrbitUiState>();
+const activeMaskStack: number[] = [];
+
+const TRACKING_PROXY_HANDLER: ProxyHandler<OrbitUiState> = {
+  get(target, prop, receiver) {
+    const depth = activeMaskStack.length;
+    if (depth > 0 && typeof prop === "string") {
+      const bit = STATE_KEY_TOPIC_BIT_MAP.get(prop);
+      if (bit !== undefined) {
+        activeMaskStack[depth - 1] |= bit;
+      } else if (prop in target) {
+        activeMaskStack[depth - 1] = ALL_TOPICS_MASK;
+      }
+    }
+    return Reflect.get(target, prop, receiver);
+  },
+  has(target, prop) {
+    const depth = activeMaskStack.length;
+    if (depth > 0 && typeof prop === "string") {
+      const bit = STATE_KEY_TOPIC_BIT_MAP.get(prop);
+      activeMaskStack[depth - 1] |= bit !== undefined ? bit : ALL_TOPICS_MASK;
+    }
+    return Reflect.has(target, prop);
+  },
+  ownKeys(target) {
+    const depth = activeMaskStack.length;
+    if (depth > 0) {
+      activeMaskStack[depth - 1] = ALL_TOPICS_MASK;
+    }
+    return Reflect.ownKeys(target);
+  },
+  getOwnPropertyDescriptor(target, prop) {
+    const depth = activeMaskStack.length;
+    if (depth > 0 && typeof prop === "string") {
+      const bit = STATE_KEY_TOPIC_BIT_MAP.get(prop);
+      if (bit !== undefined) {
+        activeMaskStack[depth - 1] |= bit;
+      }
+    }
+    return Reflect.getOwnPropertyDescriptor(target, prop);
+  },
+};
+
 /**
- * Evaluates a selector against a thin top-level property-tracking Proxy around `state`
+ * Evaluates a selector against a cached thin top-level property-tracking Proxy around `state`
  * to automatically infer the exact topic bitmask read by the selector.
- * Nested values are returned unwrapped so reference equality (`Object.is`) is 100% preserved.
+ * Nested values are returned unwrapped so reference equality (`Object.is`) is 100% preserved,
+ * and an active-mask stack keeps nested/re-entrant selector evaluations isolated.
  */
 export function evaluateSelectorWithTopicTracking<T>(
   state: OrbitUiState,
   selector: (s: OrbitUiState) => T,
 ): { value: T; mask: number } {
-  let mask = 0;
-  const proxy = new Proxy(state, {
-    get(target, prop, receiver) {
-      if (typeof prop === "string") {
-        const bit = STATE_KEY_TOPIC_BIT_MAP.get(prop);
-        if (bit !== undefined) {
-          mask |= bit;
-        } else if (prop in target) {
-          mask = ALL_TOPICS_MASK;
-        }
-      }
-      return Reflect.get(target, prop, receiver);
-    },
-    has(target, prop) {
-      if (typeof prop === "string") {
-        const bit = STATE_KEY_TOPIC_BIT_MAP.get(prop);
-        mask |= bit !== undefined ? bit : ALL_TOPICS_MASK;
-      }
-      return Reflect.has(target, prop);
-    },
-    ownKeys(target) {
-      mask = ALL_TOPICS_MASK;
-      return Reflect.ownKeys(target);
-    },
-    getOwnPropertyDescriptor(target, prop) {
-      if (typeof prop === "string") {
-        const bit = STATE_KEY_TOPIC_BIT_MAP.get(prop);
-        if (bit !== undefined) {
-          mask |= bit;
-        }
-      }
-      return Reflect.getOwnPropertyDescriptor(target, prop);
-    },
-  });
+  let proxy = trackingProxyCache.get(state);
+  if (!proxy) {
+    proxy = new Proxy(state, TRACKING_PROXY_HANDLER);
+    trackingProxyCache.set(state, proxy);
+  }
 
-  let value = selector(proxy);
+  activeMaskStack.push(0);
+  let value: T;
+  let mask: number;
+  try {
+    value = selector(proxy);
+    mask = activeMaskStack[activeMaskStack.length - 1];
+  } finally {
+    activeMaskStack.pop();
+  }
+
   if ((value as unknown) === proxy) {
     value = state as unknown as T;
     mask = ALL_TOPICS_MASK;

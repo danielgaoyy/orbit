@@ -80,19 +80,23 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
       if (!hostId) return null;
       const seq = (guardianReqSeqByHost.get(hostId) ?? 0) + 1;
       guardianReqSeqByHost.set(hostId, seq);
-      setState((s) => ({
-        ...s,
-        guardianByHost: {
-          ...s.guardianByHost,
-          [hostId]: {
-            status: "loading",
-            config: s.guardianByHost[hostId]?.config ?? null,
-            recentAudits: s.guardianByHost[hostId]?.recentAudits ?? [],
-            saving: s.guardianByHost[hostId]?.saving ?? false,
-            error: null,
+      setState((s) => {
+        const prev = s.guardianByHost[hostId];
+        if (prev?.status === "ready") return s;
+        return {
+          ...s,
+          guardianByHost: {
+            ...s.guardianByHost,
+            [hostId]: {
+              status: "loading",
+              config: prev?.config ?? null,
+              recentAudits: prev?.recentAudits ?? [],
+              saving: prev?.saving ?? false,
+              error: null,
+            },
           },
-        },
-      }));
+        };
+      });
       try {
         const snap = await orbitIpc.getGuardianConfig(hostId);
         if (guardianReqSeqByHost.get(hostId) !== seq) return null;
@@ -195,18 +199,22 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
       if (!hostId) return null;
       const seq = (permissionRulesReqSeqByHost.get(hostId) ?? 0) + 1;
       permissionRulesReqSeqByHost.set(hostId, seq);
-      setState((s) => ({
-        ...s,
-        permissionRulesByHost: {
-          ...s.permissionRulesByHost,
-          [hostId]: {
-            status: "loading",
-            rules: s.permissionRulesByHost[hostId]?.rules ?? [],
-            saving: s.permissionRulesByHost[hostId]?.saving ?? false,
-            error: null,
+      setState((s) => {
+        const prev = s.permissionRulesByHost[hostId];
+        if (prev?.status === "ready") return s;
+        return {
+          ...s,
+          permissionRulesByHost: {
+            ...s.permissionRulesByHost,
+            [hostId]: {
+              status: "loading",
+              rules: prev?.rules ?? [],
+              saving: prev?.saving ?? false,
+              error: null,
+            },
           },
-        },
-      }));
+        };
+      });
       try {
         const rules = await orbitIpc.listPermissionRules(hostId, projectCwd ?? null);
         if (permissionRulesReqSeqByHost.get(hostId) !== seq) return null;
@@ -353,20 +361,24 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
       if (!hostId) return null;
       const seq = (imChannelsReqSeqByHost.get(hostId) ?? 0) + 1;
       imChannelsReqSeqByHost.set(hostId, seq);
-      setState((s) => ({
-        ...s,
-        imChannelsByHost: {
-          ...s.imChannelsByHost,
-          [hostId]: {
-            status: "loading",
-            channels: s.imChannelsByHost[hostId]?.channels ?? [],
-            bindings: s.imChannelsByHost[hostId]?.bindings ?? [],
-            baseWebhookUrl: s.imChannelsByHost[hostId]?.baseWebhookUrl ?? "",
-            saving: s.imChannelsByHost[hostId]?.saving ?? false,
-            error: null,
+      setState((s) => {
+        const prev = s.imChannelsByHost[hostId];
+        if (prev?.status === "ready") return s;
+        return {
+          ...s,
+          imChannelsByHost: {
+            ...s.imChannelsByHost,
+            [hostId]: {
+              status: "loading",
+              channels: prev?.channels ?? [],
+              bindings: prev?.bindings ?? [],
+              baseWebhookUrl: prev?.baseWebhookUrl ?? "",
+              saving: prev?.saving ?? false,
+              error: null,
+            },
           },
-        },
-      }));
+        };
+      });
       try {
         const snap = await orbitIpc.listImChannels(hostId);
         if (imChannelsReqSeqByHost.get(hostId) !== seq) return null;
@@ -751,19 +763,23 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
       const scopeKey = `${hostId}::${cwd}`;
       const seq = (lspServersSeqByKey.get(scopeKey) ?? 0) + 1;
       lspServersSeqByKey.set(scopeKey, seq);
-      setState((s) => ({
-        ...s,
-        lspServersByWorkspace: upsertLruRecord(
-          s.lspServersByWorkspace,
-          scopeKey,
-          {
-            status: "loading",
-            servers: s.lspServersByWorkspace[scopeKey]?.servers ?? [],
-            error: null,
-          },
-          MAX_LSP_SERVERS_CACHE_ENTRIES,
-        ),
-      }));
+      setState((s) => {
+        const prev = s.lspServersByWorkspace[scopeKey];
+        if (prev?.status === "ready") return s;
+        return {
+          ...s,
+          lspServersByWorkspace: upsertLruRecord(
+            s.lspServersByWorkspace,
+            scopeKey,
+            {
+              status: "loading",
+              servers: prev?.servers ?? [],
+              error: null,
+            },
+            MAX_LSP_SERVERS_CACHE_ENTRIES,
+          ),
+        };
+      });
       try {
         const servers = await orbitIpc.listLspServers(hostId, cwd);
         if (lspServersSeqByKey.get(scopeKey) !== seq) return [];
@@ -963,6 +979,7 @@ export function createAutomationsSlice(ctx: OrbitStoreContext) {
       lifecycleHooksSeqByKey.set(scopeKey, seq);
       setState((s) => {
         const prev = s.lifecycleHooksByScope[scopeKey];
+        if (prev?.status === "ready") return s;
         return {
           ...s,
           lifecycleHooksByScope: upsertLruRecord(

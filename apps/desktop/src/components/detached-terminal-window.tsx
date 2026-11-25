@@ -103,14 +103,19 @@ export function DetachedTerminalWindow({
           <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" />
           <span
             data-tauri-drag-region
-            className="text-foreground truncate font-mono text-[12px] font-medium"
+            title={title}
+            className={cn(
+              "text-foreground min-w-0 truncate font-mono text-[12px] font-medium",
+              cwd && "max-w-[55%] shrink-0",
+            )}
           >
             {title}
           </span>
           {cwd && (
             <span
               data-tauri-drag-region
-              className="text-muted-foreground truncate font-mono text-[11px]"
+              title={cwd}
+              className="text-muted-foreground min-w-0 truncate font-mono text-[11px]"
             >
               · {shortDir(cwd)}
             </span>

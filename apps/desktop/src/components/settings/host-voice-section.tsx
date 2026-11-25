@@ -181,16 +181,22 @@ export const HostVoiceSection = memo(function HostVoiceSection({ hostId }: { hos
   }, [refreshMicrophones]);
 
   const loadConfig = useCallback(async () => {
+    const startSeq = patchSeqRef.current;
     setLoading(true);
     setError(null);
     try {
       const next = await orbitIpc.getVoiceConfig(hostId);
+      if (patchSeqRef.current !== startSeq) return;
       latestConfigRef.current = next.config;
       setState(next);
+      orbitActions.setHostVoiceEnabled(hostId, next.config.enabled);
     } catch (err) {
+      if (patchSeqRef.current !== startSeq) return;
       setError(parseVoiceRpcError(err).message);
     } finally {
-      setLoading(false);
+      if (patchSeqRef.current === startSeq) {
+        setLoading(false);
+      }
     }
   }, [hostId]);
 
@@ -213,6 +219,9 @@ export const HostVoiceSection = memo(function HostVoiceSection({ hostId }: { hos
       const seq = ++patchSeqRef.current;
       setError(null);
       setState((cur) => (cur ? { ...cur, config: nextConfig } : cur));
+      if (patch.enabled !== undefined) {
+        orbitActions.setHostVoiceEnabled(hostId, nextConfig.enabled);
+      }
 
       writeChainRef.current = writeChainRef.current.then(async () => {
         try {
@@ -220,12 +229,14 @@ export const HostVoiceSection = memo(function HostVoiceSection({ hostId }: { hos
           if (patchSeqRef.current === seq) {
             latestConfigRef.current = updated.config;
             setState(updated);
+            orbitActions.setHostVoiceEnabled(hostId, updated.config.enabled);
           }
         } catch (err) {
           const msg = parseVoiceRpcError(err).message;
           if (patchSeqRef.current === seq) {
             latestConfigRef.current = prevConfig;
             setState((cur) => (cur ? { ...cur, config: prevConfig } : cur));
+            orbitActions.setHostVoiceEnabled(hostId, prevConfig.enabled);
             setError(msg);
           }
           orbitActions.showToast(msg);

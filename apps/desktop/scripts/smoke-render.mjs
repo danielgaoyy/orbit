@@ -106,6 +106,22 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
   };
 
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const voiceConfigsByHost = new Map();
+  const defaultVoiceConfig = () => ({
+    enabled: false,
+    stt_backend: "local_whisper",
+    tts_backend: "system_native",
+    language: null,
+    vad_threshold: 0.012,
+    preroll_ms: 300,
+    silence_hangover_ms: 750,
+    auto_speak_responses: false,
+    voice_id: null,
+    openai_endpoint_url: null,
+    openai_api_key_env: null,
+    stt_model_id: "whisper-base-q5",
+    tts_model_id: "kokoro-82m-q8",
+  });
 
   window.__TAURI_INTERNALS__ = {
     transformCallback(cb, once = false) {
@@ -174,6 +190,11 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
         case "lsp_apply_workspace_edit":
           return { applied: false, modified_files: [], total_edits: 0 };
         case "get_cloud_sync_status":
+          return null;
+        case "cloud_sync_generate_passphrase":
+          return "orbit-AAAA-BBBB-CCCC-DDDD-EEEE";
+        case "cloud_sync_enable_manual_passphrase":
+        case "cloud_sync_set_manual_passphrase_mode":
           return null;
         case "discover_fleet_router_hosts":
           return [routerHost];
@@ -562,23 +583,14 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
         case "get_voice_config":
         case "update_voice_config":
         case "download_voice_model":
-        case "delete_voice_model":
+        case "delete_voice_model": {
+          const voiceHost = typeof args.hostId === "string" ? args.hostId : mockHost.host_id;
+          if (cmd === "update_voice_config" && args.config) {
+            voiceConfigsByHost.set(voiceHost, { ...defaultVoiceConfig(), ...args.config });
+          }
+          const voiceConfig = voiceConfigsByHost.get(voiceHost) ?? defaultVoiceConfig();
           return {
-            config: args.config ?? {
-              enabled: false,
-              stt_backend: "local_whisper",
-              tts_backend: "system_native",
-              language: null,
-              vad_threshold: 0.012,
-              preroll_ms: 300,
-              silence_hangover_ms: 750,
-              auto_speak_responses: false,
-              voice_id: null,
-              openai_endpoint_url: null,
-              openai_api_key_env: null,
-              stt_model_id: "whisper-base-q5",
-              tts_model_id: "kokoro-82m-q8",
-            },
+            config: voiceConfig,
             models: [],
             capabilities: {
               local_whisper: false,
@@ -588,6 +600,7 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
               system_client_fallback: true,
             },
           };
+        }
         case "transcribe_voice_audio":
         case "parse_voice_transcript":
           return {
@@ -639,7 +652,11 @@ const MOCK_TAURI_MULTI_HOST_INIT_SCRIPT = MOCK_TAURI_INIT_SCRIPT + `(() => {
     if (cmd === "get_voice_config") window.smokeVoiceHost = args.hostId;
     if (cmd === "list_external_mcp_servers") return mcpServers.get(args.hostId) ?? [];
     if (cmd === "upsert_external_mcp_server") {
-      const { host_id, name, scope, transport, enabled } = args.request;
+      const { host_id, name, scope, transport, enabled, create_only } = args.request;
+      const mockScope = scope === "project" ? "project_dot_mcp" : "orbit_user";
+      if (create_only && (mcpServers.get(host_id) ?? []).some((s) => s.name === name && s.scope === mockScope)) {
+        throw new Error("An MCP server named " + name + " already exists in this scope");
+      }
       const servers = [
         ...(mcpServers.get(host_id) ?? []).filter((s) => s.name !== name),
         { id: name, name, transport, enabled, editable: true, env_keys: [], masked_env: {},

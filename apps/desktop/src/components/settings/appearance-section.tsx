@@ -8,25 +8,23 @@ import {
   ToggleSwitch,
   type SettingSelectOption,
 } from "@/components/settings/settings-primitives";
+import { Segmented, type SegmentedOption } from "@/components/ui/segmented";
 import { useI18n } from "@/lib/i18n";
 import { type ThemeMode, orbitActions, useOrbitSelector } from "@/state/orbit-store";
-import { cn } from "@/lib/utils";
 
-function ThemePreviewSwatch({ mode }: { mode: ThemeMode }) {
-  const halves = mode === "system" ? ["light", "dark"] : [mode];
+function ThemeMiniSwatch({ mode }: { mode: ThemeMode }) {
+  const halves = mode === "system" ? (["light", "dark"] as const) : ([mode] as const);
   return (
-    <span aria-hidden className="border-border-subtle flex h-[44px] w-full overflow-hidden rounded-md border">
+    <span
+      aria-hidden
+      className="border-border-default flex size-[14px] shrink-0 overflow-hidden rounded-full border"
+    >
       {halves.map((tone) => (
-        <span key={tone} data-orbit-theme-preview={tone} className="bg-surface-base flex min-w-0 flex-1">
-          <span className="bg-surface-recessed border-border-subtle w-1/3 shrink-0 border-r p-1.5">
-            <span className="bg-ink-muted/45 block h-[3px] w-2/3 rounded-full" />
-            <span className="bg-ink-muted/25 mt-1 block h-[3px] w-full rounded-full" />
-          </span>
-          <span className="flex-1 p-2">
-            <span className="bg-ink-primary/50 block h-[4px] w-1/2 rounded-full" />
-            <span className="bg-ink-muted/30 mt-1.5 block h-[3px] w-3/4 rounded-full" />
-          </span>
-        </span>
+        <span
+          key={tone}
+          data-orbit-theme-preview={tone}
+          className="bg-surface-base block h-full flex-1"
+        />
       ))}
     </span>
   );
@@ -38,11 +36,11 @@ export const AppearanceSection = memo(function AppearanceSection() {
   const diffLayout = useOrbitSelector((s) => s.diffLayout);
   const coalesceExploration = useOrbitSelector((s) => s.coalesceExploration);
 
-  const themeOptions = useMemo<{ id: ThemeMode; label: string }[]>(
+  const themeOptions = useMemo<readonly SegmentedOption<ThemeMode>[]>(
     () => [
-      { id: "system", label: t("settings.themeSystem") },
-      { id: "light", label: t("settings.themeLight") },
-      { id: "dark", label: t("settings.themeDark") },
+      { value: "system", label: t("settings.themeSystem"), icon: <ThemeMiniSwatch mode="system" /> },
+      { value: "light", label: t("settings.themeLight"), icon: <ThemeMiniSwatch mode="light" /> },
+      { value: "dark", label: t("settings.themeDark"), icon: <ThemeMiniSwatch mode="dark" /> },
     ],
     [t],
   );
@@ -64,45 +62,32 @@ export const AppearanceSection = memo(function AppearanceSection() {
   );
 
   return (
-    <div className="space-y-6">
+    <div className="flex flex-col gap-6">
       <SettingSectionHeader
         title={t("settings.appearanceTitle")}
         description={t("settings.appearanceDesc")}
       />
 
       {/* Theme */}
-      <div className="space-y-2">
+      <div className="flex flex-col gap-3">
         <SettingGroupLabel>{t("settings.groupTheme")}</SettingGroupLabel>
-        <SettingCard settingId="settings.groupTheme">
-          <div className="grid grid-cols-3 gap-3 p-4">
-            {themeOptions.map((opt) => {
-              const active = theme === opt.id;
-              return (
-                <button
-                  key={opt.id}
-                  type="button"
-                  aria-pressed={active}
-                  onClick={() => orbitActions.setTheme(opt.id)}
-                  className={cn(
-                    "flex cursor-pointer flex-col items-center gap-2 rounded-[10px] border p-2.5 transition-colors",
-                    active
-                      ? "border-border-strong bg-surface-recessed text-ink-primary"
-                      : "border-border-subtle hover:border-border-default text-ink-muted hover:text-ink-primary",
-                  )}
-                >
-                  <ThemePreviewSwatch mode={opt.id} />
-                  <span className={cn("text-[13px]", active ? "font-medium" : "font-normal")}>
-                    {opt.label}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
+        <SettingCard>
+          <SettingRow
+            settingId="settings.groupTheme"
+            title={t("settings.groupTheme")}
+          >
+            <Segmented<ThemeMode>
+              ariaLabel={t("settings.groupTheme")}
+              value={theme}
+              options={themeOptions}
+              onValueChange={(next) => orbitActions.setTheme(next)}
+            />
+          </SettingRow>
         </SettingCard>
       </div>
 
       {/* Code Review */}
-      <div className="space-y-2">
+      <div className="flex flex-col gap-3">
         <SettingGroupLabel>{t("settings.groupCodeReview")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
@@ -122,7 +107,7 @@ export const AppearanceSection = memo(function AppearanceSection() {
       </div>
 
       {/* Display */}
-      <div className="space-y-2">
+      <div className="flex flex-col gap-3">
         <SettingGroupLabel>{t("settings.groupDisplay")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow

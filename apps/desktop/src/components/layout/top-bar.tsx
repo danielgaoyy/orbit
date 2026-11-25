@@ -1,20 +1,23 @@
 import { memo, useMemo } from "react";
 import {
+  Archive,
   ArrowLeftRight,
-  Code2,
   Copy,
   Download,
   GitBranch,
   GitFork,
   LayoutList,
   MoreHorizontal,
-  Sparkles,
+  Pin,
+  PinOff,
+  Search,
 } from "lucide-react";
 import {
   type HostCardView,
   type HostDetailView,
   type SessionBackgroundTaskView,
   type SessionSubagentEntryView,
+  isAgentBackgroundWaiting,
   isMacDesktop,
 } from "@/lib/orbit-ipc";
 import { useI18n } from "@/lib/i18n";
@@ -22,7 +25,6 @@ import { isAgentInGitRepo } from "@/lib/projects";
 import { useActionShortcutDisplay } from "@/lib/keybindings";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
 import { SubagentCrewMiniDock } from "@/components/stage/subagent-crew-dock";
-import { StandaloneGroupButton } from "@/components/stage/workspace-peer-strip";
 import { IconButton } from "@/components/ui/icon-button";
 import {
   DropdownMenu,
@@ -30,11 +32,16 @@ import {
   DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuSeparator,
+  DropdownMenuShortcut,
   DropdownMenuTrigger,
+  SimpleTooltip,
 } from "@/components/ui/overlays";
 import { Separator } from "@/components/ui/separator";
 import {
+  hasArmedTimersForAgent,
   hasCrossHostChildAgents,
+  hasLocalSubagentRecords,
+  selectActiveGoalForAgent,
   selectSessionRuntimeActivity,
   selectSessionSubagents,
 } from "@/state/selectors/session-selectors";
@@ -51,7 +58,7 @@ const EMPTY_FLEET_HOSTS: readonly HostCardView[] = Object.freeze([]);
  * - Left: Conversation title + quiet worktree branch chip (when applicable).
  * - Right (strict icon budget, zero duplication with Overview):
  *   1. Conditional SubagentCrewMiniDock (ONLY when Overview is hidden or narrow)
- *   2. Conversation actions: Collaborate (`Users`) + More (`MoreHorizontal`)
+ *   2. Conversation actions: More (`MoreHorizontal`)
  *   3. 1px hairline divider
  *   4. View toggle: Overview (`⌘⌥O`) with subtle semantic indicator dot when hidden
  *      (Side Panel toggle stays stationary at top-right of App shell)
@@ -71,21 +78,28 @@ export const TopBar = memo(function TopBar() {
     Boolean(selectedHostId) &&
     Boolean(selectedAgentId);
 
-  const activeWorktreeWorkspace = useOrbitSelector((s) => {
+  const activeWorktreeKey = useOrbitSelector((s) => {
     if (
       s.workspacePanel !== "conversation" ||
       s.isDraftNewSession ||
       !s.selectedHostId ||
       !s.selectedAgentId
     ) {
-      return null;
+      return "";
     }
     const detail = s.hostDetails[s.selectedHostId];
     const ag = detail?.agents.find((a) => a.agent_id === s.selectedAgentId);
-    if (!ag || !detail) return null;
+    if (!ag || !detail) return "";
     const ws = detail.workspaces.find((w) => w.workspace_id === ag.workspace_id);
-    return ws?.is_worktree ? ws : null;
+    if (!ws?.is_worktree) return "";
+    return `${ws.workspace_id}\0${ws.git_branch ?? ""}\0${ws.cwd}`;
   });
+
+  const activeWorktreeWorkspace = useMemo(() => {
+    if (!activeWorktreeKey) return null;
+    const [workspace_id, git_branch, cwd] = activeWorktreeKey.split("\0");
+    return { workspace_id, git_branch: git_branch || null, cwd };
+  }, [activeWorktreeKey]);
 
   const canForkWorktree = useOrbitSelector((s) => {
     if (
@@ -102,30 +116,54 @@ export const TopBar = memo(function TopBar() {
     return isAgentInGitRepo(s.selectedHostId, ag, detail, s.sidebarView);
   });
 
-  const insightSubagents = useOrbitSelector((s) =>
+  const isPinned = useOrbitSelector((s) =>
     hasActiveSession && s.selectedHostId && s.selectedAgentId
+      ? Boolean(
+          s.sidebarView?.pinned_conversations?.some(
+            (c) => c.host_id === s.selectedHostId && c.agent.agent_id === s.selectedAgentId,
+          ),
+        )
+      : false,
+  );
+
+  const needsTopBarActivity = hasActiveSession && !overviewVisible;
+
+  const insightSubagents = useOrbitSelector((s) =>
+    needsTopBarActivity && s.selectedHostId && s.selectedAgentId
       ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`]?.insights?.subagents ??
         EMPTY_INSIGHT_SUBAGENTS)
       : EMPTY_INSIGHT_SUBAGENTS,
   );
-  const currentHostDetail = useOrbitSelector((s) =>
-    hasActiveSession && s.selectedHostId ? (s.hostDetails[s.selectedHostId] ?? null) : null,
-  );
+  const currentHostDetail = useOrbitSelector((s) => {
+    if (!needsTopBarActivity || !s.selectedHostId || !s.selectedAgentId) return null;
+    const detail = s.hostDetails[s.selectedHostId];
+    if (!detail) return null;
+    const ag = detail.agents.find((a) => a.agent_id === s.selectedAgentId);
+    if (
+      hasLocalSubagentRecords(detail, s.selectedHostId, s.selectedAgentId, insightSubagents) ||
+      selectActiveGoalForAgent(detail, s.selectedAgentId) !== null ||
+      hasArmedTimersForAgent(detail, s.selectedAgentId) ||
+      isAgentBackgroundWaiting(ag)
+    ) {
+      return detail;
+    }
+    return null;
+  });
   const crossHostDetails = useOrbitSelector((s) =>
-    hasActiveSession &&
+    needsTopBarActivity &&
     hasCrossHostChildAgents(s.hostDetails, s.selectedHostId, s.selectedAgentId, insightSubagents)
       ? s.hostDetails
       : EMPTY_HOST_DETAILS,
   );
   const crossHostFleetHosts = useOrbitSelector((s) =>
-    hasActiveSession &&
+    needsTopBarActivity &&
     hasCrossHostChildAgents(s.hostDetails, s.selectedHostId, s.selectedAgentId, insightSubagents)
       ? s.fleet.hosts
       : EMPTY_FLEET_HOSTS,
   );
   const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
   const insightBackgroundTasks = useOrbitSelector((s) =>
-    hasActiveSession && s.selectedHostId && s.selectedAgentId
+    needsTopBarActivity && s.selectedHostId && s.selectedAgentId
       ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`]?.insights?.background_tasks ??
         EMPTY_INSIGHT_BG_TASKS)
       : EMPTY_INSIGHT_BG_TASKS,
@@ -157,22 +195,22 @@ export const TopBar = memo(function TopBar() {
 
   const subagentSummary = useMemo(
     () =>
-      hasActiveSession
+      needsTopBarActivity
         ? selectSessionSubagents(selectorState, selectedHostId, selectedAgentId, insightSubagents)
         : null,
-    [hasActiveSession, selectorState, selectedHostId, selectedAgentId, insightSubagents],
+    [needsTopBarActivity, selectorState, selectedHostId, selectedAgentId, insightSubagents],
   );
 
   const runtimeActivity = useMemo(
     () =>
-      hasActiveSession
+      needsTopBarActivity
         ? selectSessionRuntimeActivity(selectorState, selectedHostId, selectedAgentId, {
             subagents: subagentSummary ?? undefined,
             backgroundTasks: insightBackgroundTasks,
           })
         : null,
     [
-      hasActiveSession,
+      needsTopBarActivity,
       selectorState,
       selectedHostId,
       selectedAgentId,
@@ -334,18 +372,32 @@ export const TopBar = memo(function TopBar() {
               </>
             )}
 
-            <StandaloneGroupButton />
-
             <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <IconButton
-                  size="md"
-                  aria-label={t("topbar.conversationActions")}
-                >
-                  <MoreHorizontal className="size-[15px] stroke-[1.75]" />
-                </IconButton>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" sideOffset={6} className="min-w-[188px]">
+              <SimpleTooltip label={t("topbar.conversationActions")}>
+                <DropdownMenuTrigger asChild>
+                  <IconButton
+                    size="md"
+                    aria-label={t("topbar.conversationActions")}
+                  >
+                    <MoreHorizontal className="size-[15px] stroke-[1.75]" />
+                  </IconButton>
+                </DropdownMenuTrigger>
+              </SimpleTooltip>
+              <DropdownMenuContent align="end" sideOffset={6} className="min-w-[204px]">
+                <DropdownMenuGroup>
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      window.requestAnimationFrame(() => orbitActions.openStageFind());
+                    }}
+                  >
+                    <span className="flex items-center gap-2 whitespace-nowrap">
+                      <Search className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                      <span>{t("stage.findInConversation")}</span>
+                    </span>
+                    <DropdownMenuShortcut>{isMac ? "⌘F" : "Ctrl+F"}</DropdownMenuShortcut>
+                  </DropdownMenuItem>
+                </DropdownMenuGroup>
+                <DropdownMenuSeparator />
                 <DropdownMenuGroup>
                   <DropdownMenuItem
                     onSelect={() => {
@@ -398,24 +450,6 @@ export const TopBar = memo(function TopBar() {
                 <DropdownMenuSeparator />
                 <DropdownMenuGroup>
                   <DropdownMenuItem
-                    onSelect={() => orbitActions.openExportDialog(selectedHostId, selectedAgentId)}
-                  >
-                    <span className="flex items-center gap-2 whitespace-nowrap">
-                      <Download className="text-ink-muted size-[13.5px] stroke-[1.75]" />
-                      <span>{t("topbar.export")}</span>
-                    </span>
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onSelect={() => {
-                      void orbitActions.openCopyCodeBlocksModal(selectedHostId, selectedAgentId);
-                    }}
-                  >
-                    <span className="flex items-center gap-2 whitespace-nowrap">
-                      <Code2 className="text-ink-muted size-[13.5px] stroke-[1.75]" />
-                      <span>{t("topbar.copyCodeBlock")}</span>
-                    </span>
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
                     onSelect={() => {
                       void orbitActions.copyThread(selectedHostId, selectedAgentId);
                     }}
@@ -425,17 +459,35 @@ export const TopBar = memo(function TopBar() {
                       <span>{t("topbar.copyTranscript")}</span>
                     </span>
                   </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => orbitActions.openExportDialog(selectedHostId, selectedAgentId)}
+                  >
+                    <span className="flex items-center gap-2 whitespace-nowrap">
+                      <Download className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                      <span>{t("topbar.export")}</span>
+                    </span>
+                  </DropdownMenuItem>
                 </DropdownMenuGroup>
                 <DropdownMenuSeparator />
                 <DropdownMenuGroup>
                   <DropdownMenuItem
-                    onSelect={() => {
-                      void orbitActions.summarizeAgent(selectedHostId, selectedAgentId);
-                    }}
+                    onSelect={() => orbitActions.togglePinThread(selectedHostId, selectedAgentId)}
                   >
                     <span className="flex items-center gap-2 whitespace-nowrap">
-                      <Sparkles className="text-ink-muted size-[13.5px] stroke-[1.75]" />
-                      <span>{t("topbar.summarize")}</span>
+                      {isPinned ? (
+                        <PinOff className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                      ) : (
+                        <Pin className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                      )}
+                      <span>{isPinned ? t("sidebar.unpin") : t("sidebar.pin")}</span>
+                    </span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => orbitActions.archiveThread(selectedHostId, selectedAgentId)}
+                  >
+                    <span className="flex items-center gap-2 whitespace-nowrap">
+                      <Archive className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                      <span>{t("common.archive")}</span>
                     </span>
                   </DropdownMenuItem>
                 </DropdownMenuGroup>

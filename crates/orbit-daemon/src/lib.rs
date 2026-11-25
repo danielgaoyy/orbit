@@ -953,7 +953,7 @@ impl DaemonRuntime {
         .await
         {
             self.workspace_watcher
-                .watch_active_workspaces(&active_workspaces);
+                .watch_active_workspaces_async(&active_workspaces);
         }
 
         // 4b. Incrementally backfill legacy daemon `timeline_events` into `timeline_events_fts`
@@ -2769,7 +2769,8 @@ async fn run_client_session_loop(
     initial_msg: Option<WireMessage>,
 ) {
     let mut use_zstd = false;
-    let mut subscribed_agents: HashSet<String> = HashSet::new();
+    let subscribed_agents: Arc<std::sync::Mutex<HashSet<String>>> =
+        Arc::new(std::sync::Mutex::new(HashSet::new()));
     let mut subscribed_provider_subagents: HashSet<(String, String)> = HashSet::new();
     let mut cleanup = SessionCleanupGuard::new();
     let mut bcast_rx = runtime.orchestrator.broadcast_tx.subscribe();
@@ -2785,7 +2786,7 @@ async fn run_client_session_loop(
             session_id,
             msg,
             &mut use_zstd,
-            &mut subscribed_agents,
+            &subscribed_agents,
             &mut subscribed_provider_subagents,
             &mut cleanup.slot_to_terminal,
             &mut cleanup.active_session_tasks,
@@ -2914,7 +2915,7 @@ async fn run_client_session_loop(
                                     session_id,
                                     other,
                                     &mut use_zstd,
-                                    &mut subscribed_agents,
+                                    &subscribed_agents,
                                     &mut subscribed_provider_subagents,
                                     &mut cleanup.slot_to_terminal,
                                     &mut cleanup.active_session_tasks,
@@ -2955,11 +2956,18 @@ async fn run_client_session_loop(
                         Some(WireMessage::AgentUpdated { agent })
                     }
                     DaemonBroadcast::AgentDeleted(agent_id) => {
-                        subscribed_agents.remove(&agent_id);
+                        subscribed_agents
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&agent_id);
                         Some(WireMessage::AgentDeleted { agent_id })
                     }
                     DaemonBroadcast::TimelineLive(event) => {
-                        if subscribed_agents.contains(&event.agent_id) {
+                        if subscribed_agents
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .contains(&event.agent_id)
+                        {
                             Some(WireMessage::TimelineLive { event })
                         } else {
                             None
@@ -3014,7 +3022,10 @@ async fn run_client_session_loop(
                         outcome,
                     } => {
                         if origin_session_id != session_id
-                            && subscribed_agents.contains(&outcome.agent.agent_id)
+                            && subscribed_agents
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .contains(&outcome.agent.agent_id)
                         {
                             Some(WireMessage::AgentRewound {
                                 request_id: None,
@@ -3620,7 +3631,7 @@ async fn handle_wire_rpc(
     session_id: Uuid,
     req: WireMessage,
     use_zstd: &mut bool,
-    subscribed_agents: &mut HashSet<String>,
+    subscribed_agents: &Arc<std::sync::Mutex<HashSet<String>>>,
     subscribed_provider_subagents: &mut HashSet<(String, String)>,
     slot_to_terminal: &mut HashMap<u8, (String, tokio::task::AbortHandle)>,
     active_session_tasks: &mut Vec<tokio::task::AbortHandle>,
@@ -5320,7 +5331,10 @@ async fn handle_wire_rpc(
                         if let Ok(agent) =
                             serde_json::from_str::<orbit_protocol::AgentSummary>(&json)
                         {
-                            subscribed_agents.insert(agent.agent_id.clone());
+                            subscribed_agents
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .insert(agent.agent_id.clone());
                             return Some(WireMessage::AgentCreated { request_id, agent });
                         }
                     }
@@ -5345,76 +5359,88 @@ async fn handle_wire_rpc(
                 }
             }
 
+            let rt = Arc::clone(runtime);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let subs = Arc::clone(subscribed_agents);
             let parent_id_for_watch = parent_agent_id.clone();
             let parent_host_for_watch = parent_host_id.clone();
-            match runtime
-                .orchestrator
-                .create_and_start_agent(CreateAgentSpec {
-                    cwd,
-                    extra_dirs,
-                    title,
-                    provider,
-                    model,
-                    effort,
-                    fast_mode,
-                    mode,
-                    initial_prompt,
-                    initial_display_prompt,
-                    initial_badges,
-                    worktree,
-                    workspace_id,
-                    parent_agent_id,
-                    parent_host_id,
-                    profile_id,
-                    background,
-                    auto_archive,
-                    base_ref,
-                    worktree_mode,
-                    branch,
-                    pr_number: None,
-                    handle,
-                    auto_cluster,
-                    acp_agent_id,
-                })
-                .await
-            {
-                Ok(agent) => {
-                    subscribed_agents.insert(agent.agent_id.clone());
-                    // Register durable local finish subscription if caller is a local parent agent
-                    if notify_on_finish == Some(true)
-                        && let Some(caller_id) = parent_id_for_watch
-                    {
-                        let is_local_parent = parent_host_for_watch
-                            .as_deref()
-                            .is_none_or(|h| h == runtime.host_info.host_id);
-                        if is_local_parent
-                            && runtime.store.get_agent(&caller_id).ok().flatten().is_some()
+            tokio::spawn(async move {
+                let reply = match rt
+                    .orchestrator
+                    .create_and_start_agent(CreateAgentSpec {
+                        cwd,
+                        extra_dirs,
+                        title,
+                        provider,
+                        model,
+                        effort,
+                        fast_mode,
+                        mode,
+                        initial_prompt,
+                        initial_display_prompt,
+                        initial_badges,
+                        worktree,
+                        workspace_id,
+                        parent_agent_id,
+                        parent_host_id,
+                        profile_id,
+                        background,
+                        auto_archive,
+                        base_ref,
+                        worktree_mode,
+                        branch,
+                        pr_number: None,
+                        handle,
+                        auto_cluster,
+                        acp_agent_id,
+                    })
+                    .await
+                {
+                    Ok(agent) => {
+                        // Subscribe before sending `AgentCreated` so no subsequent `TimelineLive`
+                        // frames for the newly created agent are filtered out on this session.
+                        subs.lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(agent.agent_id.clone());
+                        // Register durable local finish subscription if caller is a local parent agent
+                        if notify_on_finish == Some(true)
+                            && let Some(caller_id) = parent_id_for_watch
                         {
-                            let _ = runtime
-                                .finish_subs
-                                .register(caller_id, agent.agent_id.clone(), None, true)
-                                .await;
+                            let is_local_parent = parent_host_for_watch
+                                .as_deref()
+                                .is_none_or(|h| h == rt.host_info.host_id);
+                            if is_local_parent
+                                && rt.store.get_agent(&caller_id).ok().flatten().is_some()
+                            {
+                                let _ = rt
+                                    .finish_subs
+                                    .register(caller_id, agent.agent_id.clone(), None, true)
+                                    .await;
+                            }
                         }
+                        if let Some(ref k) = reserved_key
+                            && let Ok(raw) = serde_json::to_string(&agent)
+                        {
+                            let _ = rt.store.commit_receipt("agent_create", k, &raw);
+                        }
+                        WireMessage::AgentCreated { request_id, agent }
                     }
-                    if let Some(ref k) = reserved_key
-                        && let Ok(raw) = serde_json::to_string(&agent)
-                    {
-                        let _ = runtime.store.commit_receipt("agent_create", k, &raw);
+                    Err(e) => {
+                        if let Some(ref k) = reserved_key {
+                            let _ = rt.store.delete_pending_receipt("agent_create", k);
+                        }
+                        let err_code = if e.to_string().contains("not_a_git_repo") {
+                            "not_a_git_repo"
+                        } else {
+                            "create_agent_failed"
+                        };
+                        rpc_err(request_id, err_code, e)
                     }
-                    Some(WireMessage::AgentCreated { request_id, agent })
-                }
-                Err(e) => {
-                    if let Some(ref k) = reserved_key {
-                        let _ = runtime.store.delete_pending_receipt("agent_create", k);
-                    }
-                    let err_code = if e.to_string().contains("not_a_git_repo") {
-                        "not_a_git_repo"
-                    } else {
-                        "create_agent_failed"
-                    };
-                    Some(rpc_err(request_id, err_code, e))
-                }
-            }
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
         }
         WireMessage::ForkAgent {
             request_id,
@@ -5435,7 +5461,10 @@ async fn handle_wire_rpc(
             .await
         {
             Ok(outcome) => {
-                subscribed_agents.insert(outcome.agent.agent_id.clone());
+                subscribed_agents
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(outcome.agent.agent_id.clone());
                 Some(WireMessage::AgentForked {
                     request_id,
                     agent: outcome.agent,
@@ -5462,7 +5491,10 @@ async fn handle_wire_rpc(
             caller_agent_id,
             notify_on_finish,
         } => {
-            subscribed_agents.insert(agent_id.clone());
+            subscribed_agents
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(agent_id.clone());
             if let Some(caller_id) = caller_agent_id {
                 let caller_title = runtime
                     .store
@@ -5569,7 +5601,10 @@ async fn handle_wire_rpc(
             badges,
             queue_id,
         } => {
-            subscribed_agents.insert(agent_id.clone());
+            subscribed_agents
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(agent_id.clone());
             match runtime
                 .orchestrator
                 .enqueue_user_prompt(&agent_id, prompt, display_prompt, badges, queue_id)
@@ -5598,7 +5633,10 @@ async fn handle_wire_rpc(
             agent_id,
             queue_id,
         } => {
-            subscribed_agents.insert(agent_id.clone());
+            subscribed_agents
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(agent_id.clone());
             match runtime
                 .orchestrator
                 .flush_queued_user_prompt_now(&agent_id, &queue_id)
@@ -5698,7 +5736,10 @@ async fn handle_wire_rpc(
             request_id,
             agent_id,
         } => {
-            subscribed_agents.remove(&agent_id);
+            subscribed_agents
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&agent_id);
             runtime.finish_subs.cancel_for_caller(&agent_id).await;
             match runtime.orchestrator.archive_agent(&agent_id).await {
                 Ok(()) => Some(WireMessage::Ack { request_id }),
@@ -5716,7 +5757,10 @@ async fn handle_wire_rpc(
             request_id,
             agent_id,
         } => {
-            subscribed_agents.remove(&agent_id);
+            subscribed_agents
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&agent_id);
             runtime.finish_subs.cancel_for_caller(&agent_id).await;
             match runtime.orchestrator.delete_agent(&agent_id).await {
                 Ok(()) => Some(WireMessage::Ack { request_id }),
@@ -6087,7 +6131,10 @@ async fn handle_wire_rpc(
                     orbit_protocol::MAX_WIRE_TIMELINE_PAGE_BYTES,
                 ) {
                     Ok((events, has_older)) => {
-                        subscribed_agents.insert(agent_id.clone());
+                        subscribed_agents
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(agent_id.clone());
                         Some(WireMessage::TimelineCatchup {
                             request_id,
                             outline_prompts: runtime
@@ -6113,7 +6160,10 @@ async fn handle_wire_rpc(
                         // Only enable live broadcast streaming after the final catchup page is fetched so
                         // TimelineLive frames cannot race ahead of paginated catchup history.
                         if !has_more {
-                            subscribed_agents.insert(agent_id.clone());
+                            subscribed_agents
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .insert(agent_id.clone());
                         }
                         Some(WireMessage::TimelineCatchup {
                             request_id,

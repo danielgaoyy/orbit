@@ -286,7 +286,7 @@ async fn rpc(rt: &Arc<crate::DaemonRuntime>, request: WireMessage) -> Result<Val
         Uuid::new_v4(),
         request,
         &mut false,
-        &mut Default::default(),
+        &Default::default(),
         &mut Default::default(),
         &mut Default::default(),
         &mut vec![],

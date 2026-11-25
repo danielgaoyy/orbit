@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,14 @@ pub const MAX_WATCH_BATCH_AGE: Duration = Duration::from_millis(1500);
 /// Hard cap on distinct canonical workspace root directories watched simultaneously.
 pub const MAX_WATCHED_ROOTS: usize = 64;
 
+/// Hard cap on per-directory OS watches registered under a single workspace root on platforms
+/// (like Linux inotify) that allocate one OS watch per subdirectory.
+pub const MAX_WATCHED_DIRS_PER_ROOT: usize = 4096;
+
+/// Cooldown after a workspace root fails OS watch registration (e.g. `ENOSPC` / `EMFILE`)
+/// so subsequent sessions targeting the same root do not repeatedly re-scan disk.
+pub const WATCH_FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
+
 /// Maximum relative paths included in a single coalesced `WorkspaceFilesChanged` event.
 pub const MAX_COALESCED_PATHS_PER_EVENT: usize = 64;
 
@@ -40,6 +49,9 @@ pub const MAX_REVALIDATION_PATHS_PER_EVENT: usize = 4096;
 
 /// Bounded event queue between the OS watcher callback thread and the Tokio debouncer task.
 const RAW_EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// Bounded command queue for serialized background workspace watch registrations.
+const WATCH_REGISTER_CHANNEL_CAPACITY: usize = 256;
 
 /// Noisy directories ignored anywhere inside a watched workspace tree.
 const IGNORED_DIR_COMPONENTS: &[&str] = &[
@@ -203,6 +215,61 @@ fn is_interesting_event_kind(kind: &EventKind) -> bool {
     !matches!(kind, EventKind::Access(_))
 }
 
+#[cfg(any(test, not(any(target_os = "macos", target_os = "windows"))))]
+fn should_skip_dir_on_watch(rel_components: &[String]) -> bool {
+    if rel_components.is_empty() {
+        return false;
+    }
+    if rel_components[0].eq_ignore_ascii_case(".git") {
+        if rel_components.len() == 1 {
+            return false;
+        }
+        let sub = rel_components[1].to_ascii_lowercase();
+        return !matches!(
+            sub.as_str(),
+            "refs" | "worktrees" | "rebase-merge" | "rebase-apply"
+        );
+    }
+    for seg in rel_components {
+        let lower = seg.to_ascii_lowercase();
+        if lower == ".git"
+            || IGNORED_DIR_COMPONENTS.iter().any(|ign| *ign == lower)
+            || matches!(
+                lower.as_str(),
+                "venv"
+                    | "virtualenv"
+                    | ".tox"
+                    | ".ruff_cache"
+                    | ".gradle"
+                    | ".idea"
+                    | ".vscode-server"
+            )
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn collect_rel_components(root: &Path, path: &Path) -> Option<Vec<String>> {
+    let rel = path.strip_prefix(root).ok()?;
+    let mut comps = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(os) => {
+                let s = os.to_string_lossy();
+                if !s.is_empty() {
+                    comps.push(s.into_owned());
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(comps)
+}
+
 struct WatcherRegistryState {
     raw_tx: mpsc::Sender<Event>,
     /// Dedicated OS watcher per canonical workspace root so failed registration or unwatch
@@ -212,6 +279,52 @@ struct WatcherRegistryState {
     workspace_to_root: HashMap<String, (PathBuf, String)>,
     /// `canonical_root -> set of workspace_ids`
     root_to_workspaces: HashMap<PathBuf, HashSet<String>>,
+    /// Number of OS directory watches registered for each root (used for Linux per-root budget).
+    root_watched_dir_counts: HashMap<PathBuf, usize>,
+    /// Roots that hit `MAX_WATCHED_DIRS_PER_ROOT` during initial or dynamic registration.
+    root_truncated: HashSet<PathBuf>,
+    /// Negative cache for roots that recently failed OS watch registration (e.g. `ENOSPC`).
+    failed_roots: HashMap<PathBuf, Instant>,
+    /// Monotonic generation token per `workspace_id` for cancelling stale async registrations.
+    workspace_watch_gen: HashMap<String, u64>,
+    next_gen: AtomicU64,
+}
+
+impl WatcherRegistryState {
+    fn new(raw_tx: mpsc::Sender<Event>) -> Self {
+        Self {
+            raw_tx,
+            root_watchers: HashMap::new(),
+            workspace_to_root: HashMap::new(),
+            root_to_workspaces: HashMap::new(),
+            root_watched_dir_counts: HashMap::new(),
+            root_truncated: HashSet::new(),
+            failed_roots: HashMap::new(),
+            workspace_watch_gen: HashMap::new(),
+            next_gen: AtomicU64::new(1),
+        }
+    }
+
+    fn alloc_watch_gen(&mut self, workspace_id: &str) -> u64 {
+        let watch_gen = self.next_gen.fetch_add(1, Ordering::Relaxed);
+        self.workspace_watch_gen
+            .insert(workspace_id.to_string(), watch_gen);
+        watch_gen
+    }
+
+    fn clear_watch_gen_if_matches(&mut self, workspace_id: &str, expected_gen: Option<u64>) {
+        if let Some(exp) = expected_gen
+            && self.workspace_watch_gen.get(workspace_id) == Some(&exp)
+        {
+            self.workspace_watch_gen.remove(workspace_id);
+        }
+    }
+}
+
+struct WatchRegisterCommand {
+    workspace_id: String,
+    cwd: PathBuf,
+    expected_gen: u64,
 }
 
 #[derive(Default)]
@@ -229,12 +342,15 @@ type WatchCallback = Arc<dyn Fn(WorkspaceWatchBatch) + Send + Sync>;
 /// Thread-safe, debounced, bounded OS-native file watcher managing all active Orbit workspaces.
 pub struct WorkspaceWatcherManager {
     state: Arc<Mutex<WatcherRegistryState>>,
+    watch_cmd_tx: mpsc::Sender<WatchRegisterCommand>,
     debouncer_abort: tokio::task::AbortHandle,
+    worker_abort: tokio::task::AbortHandle,
 }
 
 impl Drop for WorkspaceWatcherManager {
     fn drop(&mut self) {
         self.debouncer_abort.abort();
+        self.worker_abort.abort();
     }
 }
 
@@ -264,12 +380,9 @@ impl WorkspaceWatcherManager {
         F: Fn(WorkspaceWatchBatch) + Send + Sync + 'static,
     {
         let (raw_tx, raw_rx) = mpsc::channel::<Event>(RAW_EVENT_CHANNEL_CAPACITY);
-        let state = Arc::new(Mutex::new(WatcherRegistryState {
-            raw_tx,
-            root_watchers: HashMap::new(),
-            workspace_to_root: HashMap::new(),
-            root_to_workspaces: HashMap::new(),
-        }));
+        let (watch_cmd_tx, watch_cmd_rx) =
+            mpsc::channel::<WatchRegisterCommand>(WATCH_REGISTER_CHANNEL_CAPACITY);
+        let state = Arc::new(Mutex::new(WatcherRegistryState::new(raw_tx)));
         let cb: WatchCallback = Arc::new(on_change);
         let eff_debounce = debounce.max(Duration::from_millis(20));
         let eff_max_age = max_batch_age.max(eff_debounce);
@@ -280,119 +393,72 @@ impl WorkspaceWatcherManager {
             eff_max_age,
             cb,
         ));
+        let worker_handle = tokio::spawn(run_watch_worker_loop(Arc::clone(&state), watch_cmd_rx));
 
         Arc::new(Self {
             state,
+            watch_cmd_tx,
             debouncer_abort: debouncer_handle.abort_handle(),
+            worker_abort: worker_handle.abort_handle(),
         })
     }
 
-    /// Start watching a workspace root directory.
+    /// Enqueue workspace watch registration without blocking the caller.
+    pub fn watch_workspace_async(&self, workspace_id: &str, cwd: &Path) {
+        let ws_id = workspace_id.trim();
+        if ws_id.is_empty() {
+            return;
+        }
+        let expected_gen = {
+            let Ok(mut guard) = self.state.lock() else {
+                return;
+            };
+            guard.alloc_watch_gen(ws_id)
+        };
+        if let Err(err) = self.watch_cmd_tx.try_send(WatchRegisterCommand {
+            workspace_id: ws_id.to_string(),
+            cwd: cwd.to_path_buf(),
+            expected_gen,
+        }) {
+            debug!(
+                workspace_id = %ws_id,
+                cwd = %cwd.display(),
+                error = %err,
+                "Skipped async workspace watch registration: queue unavailable"
+            );
+            if let Ok(mut guard) = self.state.lock() {
+                guard.clear_watch_gen_if_matches(ws_id, Some(expected_gen));
+            }
+        }
+    }
+
+    /// Start watching a workspace root directory synchronously.
     ///
     /// Fails gracefully (logs a warning, returns `false`) if the directory does not exist,
-    /// `MAX_WATCHED_ROOTS` is reached, or the OS watcher hits inotify/FSEvents watch limits.
+    /// `MAX_WATCHED_ROOTS` is reached, the root is in failure cooldown, or the OS watcher hits
+    /// inotify/FSEvents watch limits.
     pub fn watch_workspace(&self, workspace_id: &str, cwd: &Path) -> bool {
         let ws_id = workspace_id.trim();
         if ws_id.is_empty() {
             return false;
         }
-        let Ok(canonical_root) = crate::platform::canonicalize_clean(cwd) else {
-            debug!(
-                workspace_id = %ws_id,
-                cwd = %cwd.display(),
-                "Skipping workspace watch: directory unavailable"
-            );
-            return false;
-        };
-        if !canonical_root.is_dir() {
-            return false;
-        }
-        let display_cwd = cwd.to_string_lossy().to_string();
-
-        let Ok(mut guard) = self.state.lock() else {
-            return false;
-        };
-
-        // If this workspace was previously mapped to a different root, clean up the old mapping first.
-        if let Some((prev_root, prev_cwd)) = guard.workspace_to_root.get(ws_id).cloned() {
-            if prev_root == canonical_root {
-                if prev_cwd != display_cwd {
-                    guard
-                        .workspace_to_root
-                        .insert(ws_id.to_string(), (canonical_root, display_cwd));
-                }
-                return true;
-            }
-            remove_workspace_from_root_locked(&mut guard, ws_id, &prev_root);
-        }
-
-        let already_watching_root = guard.root_to_workspaces.contains_key(&canonical_root);
-        if !already_watching_root {
-            if guard.root_to_workspaces.len() >= MAX_WATCHED_ROOTS {
-                warn!(
-                    workspace_id = %ws_id,
-                    root = %canonical_root.display(),
-                    cap = MAX_WATCHED_ROOTS,
-                    "Reached maximum watched workspace root limit; skipping watch"
-                );
+        let expected_gen = {
+            let Ok(mut guard) = self.state.lock() else {
                 return false;
-            }
-            let raw_tx = guard.raw_tx.clone();
-            let config = Config::default().with_follow_symlinks(false);
-            let mut root_watcher = match RecommendedWatcher::new(
-                move |res: notify::Result<Event>| match res {
-                    Ok(ev) => {
-                        if is_interesting_event_kind(&ev.kind) && !ev.paths.is_empty() {
-                            let _ = raw_tx.try_send(ev);
-                        }
-                    }
-                    Err(err) => {
-                        warn!(error = %err, "OS workspace file watcher reported error");
-                    }
-                },
-                config,
-            ) {
-                Ok(w) => w,
-                Err(err) => {
-                    warn!(
-                        workspace_id = %ws_id,
-                        root = %canonical_root.display(),
-                        error = %err,
-                        "Failed to create OS workspace file watcher; continuing without live FS events"
-                    );
-                    return false;
-                }
             };
-            if let Err(err) = root_watcher.watch(&canonical_root, RecursiveMode::Recursive) {
-                // Dropping `root_watcher` here immediately releases any partial OS watches
-                // registered before hitting ENOSPC / EMFILE.
-                drop(root_watcher);
-                warn!(
-                    workspace_id = %ws_id,
-                    root = %canonical_root.display(),
-                    error = %err,
-                    "OS file watcher failed to watch workspace (possible inotify/FSEvents limit)"
-                );
-                return false;
-            }
-            guard
-                .root_watchers
-                .insert(canonical_root.clone(), root_watcher);
-        }
-
-        guard
-            .workspace_to_root
-            .insert(ws_id.to_string(), (canonical_root.clone(), display_cwd));
-        guard
-            .root_to_workspaces
-            .entry(canonical_root)
-            .or_default()
-            .insert(ws_id.to_string());
-        true
+            guard.alloc_watch_gen(ws_id)
+        };
+        watch_workspace_inner(
+            &self.state,
+            ws_id,
+            cwd,
+            Some(expected_gen),
+            MAX_WATCHED_DIRS_PER_ROOT,
+        )
     }
 
     /// Stop watching `workspace_id`, releasing the underlying OS watch when no other active
-    /// workspace references the same canonical directory.
+    /// workspace references the same canonical directory and cancelling any pending async watch.
     pub fn unwatch_workspace(&self, workspace_id: &str) {
         let ws_id = workspace_id.trim();
         if ws_id.is_empty() {
@@ -401,8 +467,16 @@ impl WorkspaceWatcherManager {
         let Ok(mut guard) = self.state.lock() else {
             return;
         };
+        guard.workspace_watch_gen.remove(ws_id);
         if let Some((root, _)) = guard.workspace_to_root.remove(ws_id) {
             remove_workspace_from_root_locked(&mut guard, ws_id, &root);
+        }
+    }
+
+    /// Enqueue watch registration for all active (non-archived) workspaces without blocking startup.
+    pub fn watch_active_workspaces_async(&self, workspaces: &[(String, PathBuf)]) {
+        for (ws_id, cwd) in workspaces {
+            self.watch_workspace_async(ws_id, cwd);
         }
     }
 
@@ -428,6 +502,448 @@ impl WorkspaceWatcherManager {
             .map(|g| g.workspace_to_root.len())
             .unwrap_or(0)
     }
+
+    /// Return the count of registered OS directory watches for `cwd`.
+    pub fn watched_dir_count(&self, cwd: &Path) -> usize {
+        let Ok(canonical_root) = crate::platform::canonicalize_clean(cwd) else {
+            return 0;
+        };
+        self.state
+            .lock()
+            .map(|g| {
+                g.root_watched_dir_counts
+                    .get(&canonical_root)
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    }
+
+    /// Return whether `cwd` hit `MAX_WATCHED_DIRS_PER_ROOT` during watch registration.
+    pub fn is_root_truncated(&self, cwd: &Path) -> bool {
+        let Ok(canonical_root) = crate::platform::canonicalize_clean(cwd) else {
+            return false;
+        };
+        self.state
+            .lock()
+            .map(|g| g.root_truncated.contains(&canonical_root))
+            .unwrap_or(false)
+    }
+}
+
+async fn run_watch_worker_loop(
+    state: Arc<Mutex<WatcherRegistryState>>,
+    mut cmd_rx: mpsc::Receiver<WatchRegisterCommand>,
+) {
+    while let Some(cmd) = cmd_rx.recv().await {
+        let state_bg = Arc::clone(&state);
+        let _ = tokio::task::spawn_blocking(move || {
+            watch_workspace_inner(
+                &state_bg,
+                &cmd.workspace_id,
+                &cmd.cwd,
+                Some(cmd.expected_gen),
+                MAX_WATCHED_DIRS_PER_ROOT,
+            );
+        })
+        .await;
+    }
+}
+
+fn watch_workspace_inner(
+    state: &Arc<Mutex<WatcherRegistryState>>,
+    workspace_id: &str,
+    cwd: &Path,
+    expected_gen: Option<u64>,
+    max_dirs_per_root: usize,
+) -> bool {
+    let ws_id = workspace_id.trim();
+    if ws_id.is_empty() {
+        return false;
+    }
+    let Ok(canonical_root) = crate::platform::canonicalize_clean(cwd) else {
+        debug!(
+            workspace_id = %ws_id,
+            cwd = %cwd.display(),
+            "Skipping workspace watch: directory unavailable"
+        );
+        if let Ok(mut guard) = state.lock() {
+            guard.clear_watch_gen_if_matches(ws_id, expected_gen);
+        }
+        return false;
+    };
+    if !canonical_root.is_dir() {
+        if let Ok(mut guard) = state.lock() {
+            guard.clear_watch_gen_if_matches(ws_id, expected_gen);
+        }
+        return false;
+    }
+    let display_cwd = cwd.to_string_lossy().to_string();
+
+    let raw_tx = {
+        let Ok(mut guard) = state.lock() else {
+            return false;
+        };
+        if let Some(exp) = expected_gen
+            && guard.workspace_watch_gen.get(ws_id) != Some(&exp)
+        {
+            return false;
+        }
+
+        // If this workspace was previously mapped to a different root, clean up the old mapping first.
+        if let Some((prev_root, prev_cwd)) = guard.workspace_to_root.get(ws_id).cloned() {
+            if prev_root == canonical_root {
+                if prev_cwd != display_cwd {
+                    guard
+                        .workspace_to_root
+                        .insert(ws_id.to_string(), (canonical_root, display_cwd));
+                }
+                guard.clear_watch_gen_if_matches(ws_id, expected_gen);
+                return true;
+            }
+            remove_workspace_from_root_locked(&mut guard, ws_id, &prev_root);
+        }
+
+        if guard.root_to_workspaces.contains_key(&canonical_root) {
+            guard
+                .workspace_to_root
+                .insert(ws_id.to_string(), (canonical_root.clone(), display_cwd));
+            guard
+                .root_to_workspaces
+                .entry(canonical_root)
+                .or_default()
+                .insert(ws_id.to_string());
+            guard.clear_watch_gen_if_matches(ws_id, expected_gen);
+            return true;
+        }
+
+        let now = Instant::now();
+        guard.failed_roots.retain(|_, until| now < *until);
+        if guard.failed_roots.contains_key(&canonical_root) {
+            guard.clear_watch_gen_if_matches(ws_id, expected_gen);
+            return false;
+        }
+
+        if guard.root_to_workspaces.len() >= MAX_WATCHED_ROOTS {
+            warn!(
+                workspace_id = %ws_id,
+                root = %canonical_root.display(),
+                cap = MAX_WATCHED_ROOTS,
+                "Reached maximum watched workspace root limit; skipping watch"
+            );
+            guard.clear_watch_gen_if_matches(ws_id, expected_gen);
+            return false;
+        }
+
+        guard.raw_tx.clone()
+    };
+
+    let config = Config::default().with_follow_symlinks(false);
+    let mut root_watcher = match RecommendedWatcher::new(
+        move |res: notify::Result<Event>| match res {
+            Ok(ev) => {
+                if is_interesting_event_kind(&ev.kind) && !ev.paths.is_empty() {
+                    let _ = raw_tx.try_send(ev);
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "OS workspace file watcher reported error");
+            }
+        },
+        config,
+    ) {
+        Ok(w) => w,
+        Err(err) => {
+            warn!(
+                workspace_id = %ws_id,
+                root = %canonical_root.display(),
+                error = %err,
+                "Failed to create OS workspace file watcher; continuing without live FS events"
+            );
+            if let Ok(mut guard) = state.lock() {
+                guard
+                    .failed_roots
+                    .insert(canonical_root, Instant::now() + WATCH_FAILURE_COOLDOWN);
+                guard.clear_watch_gen_if_matches(ws_id, expected_gen);
+            }
+            return false;
+        }
+    };
+
+    let (watched_dirs, truncated) =
+        match register_os_watches(&mut root_watcher, &canonical_root, ws_id, max_dirs_per_root) {
+            Ok(stats) => stats,
+            Err(err) => {
+                // Dropping `root_watcher` here immediately releases any partial OS watches
+                // registered before hitting ENOSPC / EMFILE.
+                drop(root_watcher);
+                warn!(
+                    workspace_id = %ws_id,
+                    root = %canonical_root.display(),
+                    error = %err,
+                    "OS file watcher failed to watch workspace (possible inotify/FSEvents limit)"
+                );
+                if let Ok(mut guard) = state.lock() {
+                    guard
+                        .failed_roots
+                        .insert(canonical_root, Instant::now() + WATCH_FAILURE_COOLDOWN);
+                    guard.clear_watch_gen_if_matches(ws_id, expected_gen);
+                }
+                return false;
+            }
+        };
+
+    let Ok(mut guard) = state.lock() else {
+        drop(root_watcher);
+        return false;
+    };
+    if let Some(exp) = expected_gen
+        && guard.workspace_watch_gen.get(ws_id) != Some(&exp)
+    {
+        drop(root_watcher);
+        return false;
+    }
+    guard.clear_watch_gen_if_matches(ws_id, expected_gen);
+
+    if guard.root_to_workspaces.contains_key(&canonical_root) {
+        drop(root_watcher);
+        guard
+            .workspace_to_root
+            .insert(ws_id.to_string(), (canonical_root.clone(), display_cwd));
+        guard
+            .root_to_workspaces
+            .entry(canonical_root)
+            .or_default()
+            .insert(ws_id.to_string());
+        return true;
+    }
+    if guard.root_to_workspaces.len() >= MAX_WATCHED_ROOTS {
+        drop(root_watcher);
+        return false;
+    }
+
+    guard
+        .root_watchers
+        .insert(canonical_root.clone(), root_watcher);
+    guard
+        .root_watched_dir_counts
+        .insert(canonical_root.clone(), watched_dirs);
+    if truncated {
+        guard.root_truncated.insert(canonical_root.clone());
+    } else {
+        guard.root_truncated.remove(&canonical_root);
+    }
+    guard
+        .workspace_to_root
+        .insert(ws_id.to_string(), (canonical_root.clone(), display_cwd));
+    guard
+        .root_to_workspaces
+        .entry(canonical_root)
+        .or_default()
+        .insert(ws_id.to_string());
+    true
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn register_os_watches(
+    root_watcher: &mut RecommendedWatcher,
+    canonical_root: &Path,
+    _ws_id: &str,
+    _max_dirs_per_root: usize,
+) -> notify::Result<(usize, bool)> {
+    root_watcher.watch(canonical_root, RecursiveMode::Recursive)?;
+    Ok((1, false))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn register_os_watches(
+    root_watcher: &mut RecommendedWatcher,
+    canonical_root: &Path,
+    ws_id: &str,
+    max_dirs_per_root: usize,
+) -> notify::Result<(usize, bool)> {
+    register_pruned_bfs_watches(root_watcher, canonical_root, ws_id, max_dirs_per_root)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn register_pruned_bfs_watches(
+    root_watcher: &mut RecommendedWatcher,
+    canonical_root: &Path,
+    ws_id: &str,
+    max_dirs_per_root: usize,
+) -> notify::Result<(usize, bool)> {
+    use std::collections::VecDeque;
+
+    let cap = max_dirs_per_root.max(1);
+    let mut queue: VecDeque<(PathBuf, Vec<String>)> = VecDeque::new();
+    queue.push_back((canonical_root.to_path_buf(), Vec::new()));
+
+    let mut watched_dirs = 0usize;
+    let mut truncated = false;
+
+    while let Some((dir, rel_comps)) = queue.pop_front() {
+        if watched_dirs >= cap {
+            truncated = true;
+            break;
+        }
+        if let Err(err) = root_watcher.watch(&dir, RecursiveMode::NonRecursive) {
+            if dir == canonical_root {
+                return Err(err);
+            }
+            if is_watch_limit_or_resource_error(&err) {
+                return Err(err);
+            }
+            debug!(
+                workspace_id = %ws_id,
+                dir = %dir.display(),
+                error = %err,
+                "Skipping unreadable subdirectory while registering workspace watch"
+            );
+            continue;
+        }
+        watched_dirs += 1;
+
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if !ft.is_dir() || ft.is_symlink() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.is_empty() {
+                continue;
+            }
+            let mut child_rel = rel_comps.clone();
+            child_rel.push(name_str.into_owned());
+            if should_skip_dir_on_watch(&child_rel) {
+                continue;
+            }
+            queue.push_back((entry.path(), child_rel));
+        }
+    }
+
+    if truncated {
+        warn!(
+            workspace_id = %ws_id,
+            root = %canonical_root.display(),
+            watched_dirs = watched_dirs,
+            cap = cap,
+            "Workspace exceeded per-root directory watch cap; shallow directories are watched and deeper subtrees use on-demand refresh"
+        );
+    }
+
+    Ok((watched_dirs, truncated))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn is_watch_limit_or_resource_error(err: &notify::Error) -> bool {
+    match &err.kind {
+        notify::ErrorKind::MaxFilesWatch => true,
+        notify::ErrorKind::Io(io_err) => matches!(io_err.raw_os_error(), Some(28 | 24 | 12)),
+        _ => false,
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn attach_dynamic_subdir_watches(
+    state: &Arc<Mutex<WatcherRegistryState>>,
+    root: &Path,
+    dir_path: &Path,
+) -> Vec<PathBuf> {
+    use std::collections::VecDeque;
+
+    let Ok(meta) = std::fs::symlink_metadata(dir_path) else {
+        return Vec::new();
+    };
+    if !meta.file_type().is_dir() {
+        return Vec::new();
+    }
+    let Some(rel_comps) = collect_rel_components(root, dir_path) else {
+        return Vec::new();
+    };
+    if should_skip_dir_on_watch(&rel_comps) {
+        return Vec::new();
+    }
+
+    const MAX_DYNAMIC_DIRS_PER_EVENT: usize = 64;
+    let mut discovered_files = Vec::new();
+    let Ok(mut guard) = state.lock() else {
+        return discovered_files;
+    };
+    if guard.root_truncated.contains(root) {
+        return discovered_files;
+    }
+    let mut watched_count = guard
+        .root_watched_dir_counts
+        .get(root)
+        .copied()
+        .unwrap_or(0);
+    if watched_count >= MAX_WATCHED_DIRS_PER_ROOT {
+        guard.root_truncated.insert(root.to_path_buf());
+        return discovered_files;
+    }
+    let Some(watcher) = guard.root_watchers.get_mut(root) else {
+        return discovered_files;
+    };
+
+    let mut queue: VecDeque<(PathBuf, Vec<String>)> = VecDeque::new();
+    queue.push_back((dir_path.to_path_buf(), rel_comps));
+    let mut added_here = 0usize;
+
+    while let Some((dir, comps)) = queue.pop_front() {
+        if watched_count >= MAX_WATCHED_DIRS_PER_ROOT || added_here >= MAX_DYNAMIC_DIRS_PER_EVENT {
+            if watched_count >= MAX_WATCHED_DIRS_PER_ROOT {
+                guard.root_truncated.insert(root.to_path_buf());
+            }
+            break;
+        }
+        if watcher.watch(&dir, RecursiveMode::NonRecursive).is_err() {
+            guard.root_truncated.insert(root.to_path_buf());
+            break;
+        }
+        watched_count += 1;
+        added_here += 1;
+
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            let child_path = entry.path();
+            if ft.is_file() {
+                discovered_files.push(child_path);
+                continue;
+            }
+            if !ft.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.is_empty() {
+                continue;
+            }
+            let mut child_rel = comps.clone();
+            child_rel.push(name_str.into_owned());
+            if !should_skip_dir_on_watch(&child_rel) {
+                queue.push_back((child_path, child_rel));
+            }
+        }
+    }
+
+    guard
+        .root_watched_dir_counts
+        .insert(root.to_path_buf(), watched_count);
+    discovered_files
 }
 
 fn remove_workspace_from_root_locked(guard: &mut WatcherRegistryState, ws_id: &str, root: &Path) {
@@ -441,6 +957,8 @@ fn remove_workspace_from_root_locked(guard: &mut WatcherRegistryState, ws_id: &s
         guard.root_to_workspaces.remove(root);
         // Dropping the dedicated per-root watcher cleanly releases all OS watches for `root`.
         guard.root_watchers.remove(root);
+        guard.root_watched_dir_counts.remove(root);
+        guard.root_truncated.remove(root);
     }
 }
 
@@ -510,6 +1028,34 @@ async fn run_debouncer_loop(
     }
 }
 
+fn record_classified_path(
+    pending: &mut HashMap<PathBuf, PendingRootBatch>,
+    root: &Path,
+    path: &Path,
+    now: Instant,
+) {
+    let Some(classified) = classify_watched_path(root, path) else {
+        return;
+    };
+    let entry = pending.entry(root.to_path_buf()).or_default();
+    if entry.first_event_at.is_none() {
+        entry.first_event_at = Some(now);
+    }
+    if entry.changed_paths.len() < MAX_COALESCED_PATHS_PER_EVENT {
+        entry.changed_paths.insert(classified.rel_path.clone());
+    }
+    if entry.revalidation_paths.len() < MAX_REVALIDATION_PATHS_PER_EVENT {
+        entry.revalidation_paths.insert(classified.rel_path);
+    }
+    if classified.is_git_state {
+        entry.git_changed = true;
+    }
+    if classified.is_skills_or_rules {
+        entry.skills_or_rules_changed = true;
+    }
+    entry.last_event_at = Some(now);
+}
+
 fn ingest_raw_event(
     state: &Arc<Mutex<WatcherRegistryState>>,
     pending: &mut HashMap<PathBuf, PendingRootBatch>,
@@ -525,6 +1071,12 @@ fn ingest_raw_event(
         return;
     }
 
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let is_dir_create = matches!(
+        ev.kind,
+        EventKind::Create(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
+    );
+
     let now = Instant::now();
     for raw_path in ev.paths {
         let clean_path = crate::platform::strip_windows_verbatim_prefix(&raw_path);
@@ -532,26 +1084,13 @@ fn ingest_raw_event(
             if !clean_path.starts_with(root) {
                 continue;
             }
-            let Some(classified) = classify_watched_path(root, &clean_path) else {
-                continue;
-            };
-            let entry = pending.entry(root.clone()).or_default();
-            if entry.first_event_at.is_none() {
-                entry.first_event_at = Some(now);
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            if is_dir_create {
+                for discovered in attach_dynamic_subdir_watches(state, root, &clean_path) {
+                    record_classified_path(pending, root, &discovered, now);
+                }
             }
-            if entry.changed_paths.len() < MAX_COALESCED_PATHS_PER_EVENT {
-                entry.changed_paths.insert(classified.rel_path.clone());
-            }
-            if entry.revalidation_paths.len() < MAX_REVALIDATION_PATHS_PER_EVENT {
-                entry.revalidation_paths.insert(classified.rel_path);
-            }
-            if classified.is_git_state {
-                entry.git_changed = true;
-            }
-            if classified.is_skills_or_rules {
-                entry.skills_or_rules_changed = true;
-            }
-            entry.last_event_at = Some(now);
+            record_classified_path(pending, root, &clean_path, now);
         }
     }
 }
@@ -666,12 +1205,11 @@ mod tests {
             tags: vec![],
         };
         engine.save(cwd, draft, None).await?;
-        let state = Arc::new(Mutex::new(WatcherRegistryState {
-            raw_tx: mpsc::channel(1).0,
-            root_watchers: HashMap::new(),
-            workspace_to_root: HashMap::from([("ws".into(), (root.clone(), cwd.into()))]),
-            root_to_workspaces: HashMap::from([(root.clone(), HashSet::from(["ws".into()]))]),
-        }));
+        let mut test_state = WatcherRegistryState::new(mpsc::channel(1).0);
+        test_state.workspace_to_root = HashMap::from([("ws".into(), (root.clone(), cwd.into()))]);
+        test_state.root_to_workspaces =
+            HashMap::from([(root.clone(), HashSet::from(["ws".into()]))]);
+        let state = Arc::new(Mutex::new(test_state));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let callback: WatchCallback = Arc::new(move |batch| {
             let _ = tx.send(batch);
@@ -915,5 +1453,105 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root_a);
         let _ = std::fs::remove_dir_all(&root_b);
+    }
+
+    #[test]
+    fn should_skip_dir_on_watch_prunes_noisy_dirs_and_preserves_git_state() {
+        assert!(!should_skip_dir_on_watch(&[]));
+        assert!(!should_skip_dir_on_watch(&[".git".into()]));
+        assert!(!should_skip_dir_on_watch(&[".git".into(), "refs".into()]));
+        assert!(!should_skip_dir_on_watch(&[
+            ".git".into(),
+            "refs".into(),
+            "heads".into()
+        ]));
+        assert!(!should_skip_dir_on_watch(&[
+            ".git".into(),
+            "worktrees".into()
+        ]));
+        assert!(should_skip_dir_on_watch(&[".git".into(), "objects".into()]));
+        assert!(should_skip_dir_on_watch(&[".git".into(), "logs".into()]));
+        assert!(should_skip_dir_on_watch(&["node_modules".into()]));
+        assert!(should_skip_dir_on_watch(&["apps".into(), ".venv".into()]));
+        assert!(should_skip_dir_on_watch(&["subrepo".into(), ".git".into()]));
+        assert!(!should_skip_dir_on_watch(&["src".into(), "daemon".into()]));
+    }
+
+    #[tokio::test]
+    async fn per_root_dir_cap_cooldown_and_async_unwatch_race_work_cleanly() {
+        let dir = temp_watch_dir("cap_and_async");
+        std::fs::create_dir_all(dir.join("src")).expect("mkdir src");
+        std::fs::create_dir_all(dir.join(".git/objects/00")).expect("mkdir git objects");
+        std::fs::create_dir_all(dir.join(".git/refs/heads")).expect("mkdir git refs");
+        std::fs::create_dir_all(dir.join("node_modules/pkg/sub")).expect("mkdir node_modules");
+        for i in 0..10 {
+            std::fs::create_dir_all(dir.join(format!("dir_{i}/nested"))).expect("mkdir sub");
+        }
+
+        let mgr = WorkspaceWatcherManager::with_debounce(Duration::from_millis(50), |_| {});
+
+        // 1. Direct `watch_workspace_inner` with a tight dir cap stops promptly & marks truncated
+        //    on platforms using per-directory BFS watches (Linux), and succeeds on macOS/Windows.
+        let gen1 = {
+            let mut guard = mgr.state.lock().expect("state");
+            guard.alloc_watch_gen("ws_cap_1")
+        };
+        assert!(watch_workspace_inner(
+            &mgr.state,
+            "ws_cap_1",
+            &dir,
+            Some(gen1),
+            4
+        ));
+        assert_eq!(mgr.watched_root_count(), 1);
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            assert!(mgr.watched_dir_count(&dir) <= 4);
+            assert!(mgr.is_root_truncated(&dir));
+        }
+
+        // Second workspace on same root joins in O(1) without duplicating root watchers
+        assert!(mgr.watch_workspace("ws_cap_2", &dir));
+        assert_eq!(mgr.watched_root_count(), 1);
+        assert_eq!(mgr.watched_workspace_count(), 2);
+
+        mgr.unwatch_workspace("ws_cap_1");
+        mgr.unwatch_workspace("ws_cap_2");
+        assert_eq!(mgr.watched_root_count(), 0);
+
+        // 2. Cooldown negative cache prevents immediate re-scan of recently failed roots
+        let canon = crate::platform::canonicalize_clean(&dir).unwrap_or_else(|_| dir.clone());
+        {
+            let mut guard = mgr.state.lock().expect("state");
+            guard
+                .failed_roots
+                .insert(canon.clone(), Instant::now() + WATCH_FAILURE_COOLDOWN);
+        }
+        assert!(!mgr.watch_workspace("ws_cooldown", &dir));
+        assert_eq!(mgr.watched_root_count(), 0);
+        {
+            let mut guard = mgr.state.lock().expect("state");
+            guard.failed_roots.remove(&canon);
+        }
+
+        // 3. `watch_workspace_async` returns immediately and `unwatch_workspace` cancels cleanly
+        mgr.watch_workspace_async("ws_async_cancel", &dir);
+        mgr.unwatch_workspace("ws_async_cancel");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(mgr.watched_workspace_count(), 0);
+        assert_eq!(mgr.watched_root_count(), 0);
+
+        // 4. `watch_workspace_async` succeeds in background
+        mgr.watch_workspace_async("ws_async_ok", &dir);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline && mgr.watched_workspace_count() == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(mgr.watched_workspace_count(), 1);
+        assert_eq!(mgr.watched_root_count(), 1);
+        mgr.unwatch_workspace("ws_async_ok");
+        assert_eq!(mgr.watched_root_count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

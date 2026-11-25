@@ -298,6 +298,9 @@ pub struct AgentOrchestrator {
     /// Agents whose next idle transition was caused by explicit interrupt or flush-now,
     /// suppressing automatic queue drain for that transition.
     suppress_auto_drain: RwLock<std::collections::HashSet<String>>,
+    /// Agents created with an initial prompt that has not yet been dispatched to a driver,
+    /// allowing `interrupt_agent` during startup/prompt enrichment to cancel before `SendPrompt`.
+    pending_initial_prompt_agents: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Agents that already persisted provider-reported `DriverEvent::TurnUsage` for the active turn,
     /// avoiding double-counting when the turn settles to `Idle`.
     turn_usage_recorded: RwLock<std::collections::HashSet<String>>,
@@ -430,6 +433,7 @@ impl AgentOrchestrator {
             repo_handoff_locks: RwLock::new(HashMap::new()),
             conflict_cooldowns: RwLock::new(HashMap::new()),
             suppress_auto_drain: RwLock::new(std::collections::HashSet::new()),
+            pending_initial_prompt_agents: std::sync::Mutex::new(std::collections::HashSet::new()),
             turn_usage_recorded: RwLock::new(std::collections::HashSet::new()),
             last_compaction: Default::default(),
             last_call_prompt_occupancy: RwLock::new(HashMap::new()),
@@ -716,6 +720,10 @@ impl AgentOrchestrator {
         }
         kill_existing_shim(&self.legacy_shim_socket_path("agent", agent_id)).await;
         self.clear_pending_requests(agent_id).await;
+        self.pending_initial_prompt_agents
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(agent_id);
         self.keep_awake.mark_agent_idle(agent_id);
         next_gen
     }
@@ -1156,7 +1164,7 @@ impl AgentOrchestrator {
             .broadcast_tx
             .send(DaemonBroadcast::WorkspaceUpdated(ws.clone()));
         if let Some(watcher) = self.workspace_watcher.read().await.clone() {
-            watcher.watch_workspace(&ws.workspace_id, Path::new(&ws.cwd));
+            watcher.watch_workspace_async(&ws.workspace_id, Path::new(&ws.cwd));
         }
 
         let deferred = if has_setup {
@@ -1706,7 +1714,7 @@ impl AgentOrchestrator {
             .broadcast_tx
             .send(DaemonBroadcast::WorkspaceUpdated(ws.clone()));
         if let Some(watcher) = self.workspace_watcher.read().await.clone() {
-            watcher.watch_workspace(&ws.workspace_id, Path::new(&ws.cwd));
+            watcher.watch_workspace_async(&ws.workspace_id, Path::new(&ws.cwd));
         }
         Ok(ws)
     }
@@ -2431,6 +2439,12 @@ impl AgentOrchestrator {
         let mgr = Arc::clone(self);
         let summary_bg = summary.clone();
         let ag_id_bg = agent_id.clone();
+        if initial_turn.is_some() {
+            self.pending_initial_prompt_agents
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(ag_id_bg.clone());
+        }
         tokio::spawn(async move {
             if let Some((ref turn_id, prompt_seq)) = initial_turn
                 && mgr.current_generation(&ag_id_bg).await == launch_gen
@@ -2447,6 +2461,10 @@ impl AgentOrchestrator {
                     .await;
             }
             if mgr.current_generation(&ag_id_bg).await != launch_gen {
+                mgr.pending_initial_prompt_agents
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&ag_id_bg);
                 return;
             }
             match mgr
@@ -2464,6 +2482,10 @@ impl AgentOrchestrator {
             {
                 Ok(cmd_tx) => {
                     if mgr.current_generation(&ag_id_bg).await != launch_gen {
+                        mgr.pending_initial_prompt_agents
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&ag_id_bg);
                         let _ = cmd_tx.send(DriverCommand::Shutdown).await;
                         return;
                     }
@@ -2487,6 +2509,15 @@ impl AgentOrchestrator {
                         let wire = mgr
                             .augment_prompt_with_workspace_context(&ag_id_bg, with_rules)
                             .await;
+                        let should_dispatch = mgr.current_generation(&ag_id_bg).await == launch_gen
+                            && mgr
+                                .pending_initial_prompt_agents
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .remove(&ag_id_bg);
+                        if !should_dispatch {
+                            return;
+                        }
                         let _ = cmd_tx
                             .send(DriverCommand::SendPrompt {
                                 turn_id,
@@ -2499,6 +2530,10 @@ impl AgentOrchestrator {
                     }
                 }
                 Err(e) => {
+                    mgr.pending_initial_prompt_agents
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&ag_id_bg);
                     if mgr.current_generation(&ag_id_bg).await != launch_gen {
                         return;
                     }
@@ -3970,6 +4005,11 @@ impl AgentOrchestrator {
                 .await
                 .insert(agent_id.to_string());
         }
+        let had_pending_initial = self
+            .pending_initial_prompt_agents
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(agent_id);
         if let Some(tx) = self.live_agent_tx(agent_id).await {
             let cmd = if preserve_queue {
                 DriverCommand::InterruptAndDrainQueue
@@ -3977,10 +4017,73 @@ impl AgentOrchestrator {
                 DriverCommand::Interrupt
             };
             let _ = tx.send(cmd).await;
+            if had_pending_initial {
+                self.settle_initializing_agent_idle(agent_id).await;
+            }
+        } else {
+            let aid = agent_id.to_string();
+            if let Ok(Some(persisted)) = self.try_store(move |s| s.get_agent(&aid)).await
+                && matches!(
+                    persisted.status,
+                    AgentStatus::Initializing
+                        | AgentStatus::Running { .. }
+                        | AgentStatus::AwaitingPermission { .. }
+                        | AgentStatus::AutonomousWakeup { .. }
+                )
+            {
+                // Fence off any in-flight `create_and_start_agent` startup task so it shuts down
+                // instead of dispatching the initial prompt or emitting an error status later.
+                self.bump_generation(agent_id).await;
+                if let Some(entry) = self.live_agents.write().await.remove(agent_id) {
+                    let _ = entry.cmd_tx.send(DriverCommand::Shutdown).await;
+                    entry.ingest_abort.abort();
+                }
+                self.settle_initializing_agent_idle(agent_id).await;
+            }
         }
         self.cancel_pending_permissions_and_questions(agent_id)
             .await;
         Ok(())
+    }
+
+    async fn settle_initializing_agent_idle(&self, agent_id: &str) {
+        self.keep_awake.mark_agent_idle(agent_id);
+        let aid_settle = agent_id.to_string();
+        if let Ok(Some((ev, updated_opt))) = self
+            .try_store(move |s| -> anyhow::Result<_> {
+                let Some(persisted) = s.get_agent(&aid_settle)? else {
+                    return Ok(None);
+                };
+                if !matches!(
+                    persisted.status,
+                    AgentStatus::Initializing
+                        | AgentStatus::Running { .. }
+                        | AgentStatus::AwaitingPermission { .. }
+                        | AgentStatus::AutonomousWakeup { .. }
+                ) {
+                    return Ok(None);
+                }
+                let epoch = u32::try_from(persisted.timeline_epoch.max(1)).unwrap_or(u32::MAX);
+                let ev = s.append_timeline_event(
+                    &aid_settle,
+                    epoch,
+                    None,
+                    TimelinePayload::StatusChanged {
+                        status: AgentStatus::Idle,
+                    },
+                )?;
+                let updated = s.get_agent(&aid_settle)?;
+                Ok(Some((ev, updated)))
+            })
+            .await
+        {
+            let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+            if let Some(updated) = updated_opt {
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::AgentUpdated(updated));
+            }
+        }
     }
 
     pub async fn set_session_mode(&self, agent_id: &str, mode: SessionMode) -> anyhow::Result<()> {
@@ -5529,6 +5632,10 @@ impl AgentOrchestrator {
         self.roster_states.write().await.remove(agent_id);
         self.injected_rule_hashes.write().await.remove(agent_id);
         self.suppress_auto_drain.write().await.remove(agent_id);
+        self.pending_initial_prompt_agents
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(agent_id);
         let _ = self
             .broadcast_tx
             .send(DaemonBroadcast::AgentDeleted(agent_id.to_string()));
@@ -7416,16 +7523,25 @@ impl AgentOrchestrator {
             done_notify_bg.notify_waiters();
         });
 
-        self.live_agents.write().await.insert(
-            summary.agent_id.clone(),
-            LiveAgentEntry {
-                generation: expected_gen,
-                cmd_tx: cmd_tx.clone(),
-                done_notify,
-                ingest_abort: ingest_task.abort_handle(),
-                shim_seq_tracker,
-            },
-        );
+        {
+            let mut live_guard = self.live_agents.write().await;
+            if self.current_generation(&summary.agent_id).await != expected_gen {
+                drop(live_guard);
+                ingest_task.abort();
+                let _ = cmd_tx.send(DriverCommand::Shutdown).await;
+                anyhow::bail!("agent session was reset during startup");
+            }
+            live_guard.insert(
+                summary.agent_id.clone(),
+                LiveAgentEntry {
+                    generation: expected_gen,
+                    cmd_tx: cmd_tx.clone(),
+                    done_notify,
+                    ingest_abort: ingest_task.abort_handle(),
+                    shim_seq_tracker,
+                },
+            );
+        }
 
         Ok(cmd_tx)
     }
@@ -14757,6 +14873,137 @@ diff --git a/config/prod.env b/config/prod.env\n\
             ghost_rx.try_recv().is_err(),
             "missing agent scope on ingress must fail-closed and never auto-allow"
         );
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[tokio::test]
+    async fn interrupt_initializing_agent_bumps_generation_and_settles_to_idle() {
+        let home_dir =
+            std::env::temp_dir().join(format!("orbit-init-cancel-{}", Uuid::new_v4().simple()));
+        let ws_dir = home_dir.join("repo");
+        std::fs::create_dir_all(&ws_dir).expect("create repo dir");
+
+        let store = Arc::new(OrbitStore::open_in_memory().expect("open db"));
+        let orch = AgentOrchestrator::new(
+            home_dir.clone(),
+            "host_init_cancel".into(),
+            "tok".into(),
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(OrchestrationConfig::default())),
+            Arc::clone(&store),
+            WorkspaceScriptRegistry::new(),
+            Arc::new(KeepAwakeManager::new(false)),
+            Arc::new(RwLock::new(None)),
+            crate::hooks::HooksEngine::new(home_dir.clone()),
+        )
+        .await;
+
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_init".into(),
+                title: "Init Cancel Repo".into(),
+                cwd: ws_dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_init".into(),
+                    workspace_id: "ws_init".into(),
+                    cwd: ws_dir.to_string_lossy().to_string(),
+                    title: "Init Agent".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: None,
+                    effort: None,
+                    fast_mode: false,
+                    mode: SessionMode::FullAccess,
+                    status: AgentStatus::Initializing,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                    acp_agent_id: None,
+                },
+                None,
+            )
+            .expect("upsert agent");
+
+        let launch_gen = orch.bump_generation("ag_init").await;
+        orch.keep_awake
+            .notify_agent_status("ag_init", &AgentStatus::Initializing);
+        let mut bcast_rx = orch.broadcast_tx.subscribe();
+
+        orch.interrupt_agent("ag_init")
+            .await
+            .expect("interrupt initializing agent");
+
+        assert!(
+            orch.current_generation("ag_init").await > launch_gen,
+            "interrupting Initializing agent must bump generation to fence off stale startup"
+        );
+        let settled = store.get_agent("ag_init").expect("get").expect("present");
+        assert_eq!(settled.status, AgentStatus::Idle);
+
+        let mut saw_status_tl = false;
+        let mut saw_agent_upd = false;
+        while let Ok(msg) = bcast_rx.try_recv() {
+            match msg {
+                DaemonBroadcast::TimelineLive(ev)
+                    if ev.agent_id == "ag_init"
+                        && matches!(
+                            ev.payload,
+                            TimelinePayload::StatusChanged {
+                                status: AgentStatus::Idle
+                            }
+                        ) =>
+                {
+                    saw_status_tl = true;
+                }
+                DaemonBroadcast::AgentUpdated(ag)
+                    if ag.agent_id == "ag_init" && ag.status == AgentStatus::Idle =>
+                {
+                    saw_agent_upd = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_status_tl, "expected StatusChanged(Idle) broadcast");
+        assert!(saw_agent_upd, "expected AgentUpdated(Idle) broadcast");
 
         let _ = std::fs::remove_dir_all(&home_dir);
     }

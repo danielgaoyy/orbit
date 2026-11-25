@@ -9,6 +9,7 @@
 //! 8. Multi-agent non-interrupting subagent/peer delivery, thinking-stall progress telemetry, queue-preserving interrupt, and human preemption ordering
 //! 9. Antigravity interrupt/steer rollback handoff, empty-queue InterruptAndDrainQueue, multi-command shell isolation, native subagent live foreground polling + cancel + restart seq preservation, stderr notices, session_info_update title, and preempted-turn usage ledger
 //! 10. Non-blocking pruned workspace watcher + async CreateAgent + optimistic/Initializing cancel settlement
+//! 11. Antigravity open-RPC background timer/task wait settles reply into `Waiting for 1 timer` and wakes cleanly on timer completion without false stall
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -857,8 +858,144 @@ while True:
         })
 
     wait_file = kv.get("WAIT_FILE")
+    open_rpc_wake_file = kv.get("OPEN_RPC_WAKE_FILE")
     think_loop = kv.get("THINK_LOOP") == "1"
     cancelled = False
+    if open_rpc_wake_file:
+        open_rpc_done_file = kv.get("OPEN_RPC_DONE_FILE")
+        s0, s1, s2 = STEP_SEQ, STEP_SEQ + 1, STEP_SEQ + 2
+        STEP_SEQ += 3
+        timer_tid = f"{SESSION_ID}/task-{s1}"
+        emit({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": SESSION_ID,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": f"call_sched_{s0}",
+                    "title": "Schedule",
+                    "status": "completed",
+                    "rawInput": {"DurationSeconds": 1800, "Prompt": "check status"},
+                },
+            },
+        })
+        append_transcript(SESSION_ID, [
+            {
+                "step_index": s0,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "content": "",
+                "tool_calls": [{
+                    "id": f"tp_sched_{s0}",
+                    "name": "schedule",
+                    "args": {"DurationSeconds": 1800, "Prompt": "check status"},
+                }],
+            },
+            {
+                "step_index": s1,
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": f"Tool is running as a background task with task id: {timer_tid}\nTask Description: One-shot timer (30m)",
+            },
+        ])
+        emit({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": SESSION_ID,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "INITIAL_TIMER_ARMED"},
+                },
+            },
+        })
+        append_transcript(SESSION_ID, [
+            {
+                "step_index": s2,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "content": "INITIAL_TIMER_ARMED",
+            },
+        ])
+        while not os.path.exists(open_rpc_wake_file):
+            nxt = read_line(0.025)
+            if nxt == "":
+                sys.exit(0)
+            if nxt is None:
+                continue
+            try:
+                nmsg = json.loads(nxt)
+            except Exception:
+                continue
+            nmethod = nmsg.get("method")
+            nrid = nmsg.get("id")
+            if nmethod == "session/cancel":
+                log_trace({"method": "session/cancel"})
+                if nrid is not None:
+                    emit({"jsonrpc": "2.0", "id": nrid, "result": {}})
+                emit({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "cancelled"}})
+                cancelled = True
+                break
+            elif nrid is not None and nmethod is not None:
+                emit({"jsonrpc": "2.0", "id": nrid, "result": {}})
+        if cancelled:
+            continue
+        s3, s4 = STEP_SEQ, STEP_SEQ + 1
+        STEP_SEQ += 2
+        append_transcript(SESSION_ID, [
+            {
+                "step_index": s3,
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "content": f"[Message] Task id \"{timer_tid}\" finished.\nsender={timer_tid}\nTimer fired.",
+            },
+        ])
+        emit({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": SESSION_ID,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "WAKEUP_TIMER_DONE"},
+                },
+            },
+        })
+        append_transcript(SESSION_ID, [
+            {
+                "step_index": s4,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "content": "WAKEUP_TIMER_DONE",
+            },
+        ])
+        if open_rpc_done_file:
+            while not os.path.exists(open_rpc_done_file):
+                nxt = read_line(0.025)
+                if nxt == "":
+                    sys.exit(0)
+                if nxt is None:
+                    continue
+                try:
+                    nmsg = json.loads(nxt)
+                except Exception:
+                    continue
+                nmethod = nmsg.get("method")
+                nrid = nmsg.get("id")
+                if nmethod == "session/cancel":
+                    log_trace({"method": "session/cancel"})
+                    if nrid is not None:
+                        emit({"jsonrpc": "2.0", "id": nrid, "result": {}})
+                    emit({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "cancelled"}})
+                    cancelled = True
+                    break
+                elif nrid is not None and nmethod is not None:
+                    emit({"jsonrpc": "2.0", "id": nrid, "result": {}})
+            if cancelled:
+                continue
+        emit({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+        continue
     if wait_file:
         next_think_at = time.monotonic() + 0.15
         think_step = 0
@@ -3849,6 +3986,173 @@ async fn pitfall_10_nonblocking_workspace_watcher_and_initializing_cancel() {
         })
         .await,
         "daemon and client must both settle cancelled optimistic/initializing session to Idle"
+    );
+
+    drop_core(core).await;
+    drop(rt);
+}
+
+// ============================================================================
+// PITFALL 11: Antigravity Open-RPC Background Wait Settles & Wakes Without Stall
+// ============================================================================
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pitfall_11_antigravity_open_rpc_background_wait_settles_and_wakes_without_stall() {
+    install_mock_script(
+        &MOCK_ANTIGRAVITY_PATH,
+        ProviderKind::Antigravity,
+        "mock_agy_reg.py",
+        MOCK_ANTIGRAVITY_SCRIPT,
+    );
+    let agy_data_dir = base_tmp_dir()
+        .join(format!("orb_reg_mocks_{}", std::process::id()))
+        .join("agy_data");
+    std::fs::create_dir_all(&agy_data_dir).expect("mkdir agy_data");
+    orbit_providers::antigravity::set_agy_data_dir_override(Some(agy_data_dir));
+
+    let home = new_temp_dir("p11_h");
+    let work = new_temp_dir("p11_w");
+    let wake_file = work.join("p11_wake.flag");
+
+    let (addr, rt) = spawn_embedded_daemon(home.to_path_buf(), None)
+        .await
+        .expect("spawn daemon");
+    let uri = rt
+        .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("offer")
+        .to_qr_uri()
+        .expect("uri");
+    let (core, host_id) = open_and_connect_core(home.join("c11.db"), uri).await;
+
+    core.create_agent(
+        &host_id,
+        &work.to_string_lossy(),
+        ProviderKind::Antigravity,
+        SessionMode::FullAccess,
+        &format!("OPEN_RPC_WAKE_FILE={}", wake_file.display()),
+        None,
+    );
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            async move {
+                c.host_detail(&hid).is_some_and(|d| {
+                    d.agents.iter().any(|a| {
+                        !a.agent_id.starts_with("opt_") && a.provider == ProviderKind::Antigravity
+                    })
+                })
+            }
+        })
+        .await,
+        "Antigravity agent must be created"
+    );
+    let agent_id = core
+        .host_detail(&host_id)
+        .expect("host detail")
+        .agents
+        .into_iter()
+        .find(|a| !a.agent_id.starts_with("opt_") && a.provider == ProviderKind::Antigravity)
+        .expect("agent card")
+        .agent_id;
+    core.open_agent_timeline(&host_id, &agent_id);
+
+    // Phase 1: While `session/prompt` stays open, Orbit must finalize the initial reply and
+    // transition into `Waiting for 1 timer` (`!is_running && has_background_tasks`).
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = agent_id.clone();
+            async move {
+                let card_waiting = c
+                    .host_detail(&hid)
+                    .and_then(|d| d.agents.into_iter().find(|a| a.agent_id == aid))
+                    .is_some_and(|a| {
+                        !a.is_running
+                            && a.has_background_tasks
+                            && a.status_label == "Waiting for 1 timer"
+                    });
+                let st = c.agent_stage(&hid, &aid);
+                let reply_settled = st.turns.iter().any(|t| {
+                    t.live_segments.iter().any(|seg| {
+                        matches!(
+                            seg,
+                            TurnLiveSegmentView::AssistantMessage {
+                                item: TimelineItemView::AssistantMessage {
+                                    text,
+                                    streaming: false,
+                                    ..
+                                },
+                                ..
+                            } if text.contains("INITIAL_TIMER_ARMED")
+                        )
+                    })
+                });
+                card_waiting && reply_settled
+            }
+        })
+        .await,
+        "open-RPC turn with settled reply + running timer must transition to Waiting for 1 timer with streaming: false"
+    );
+
+    // Phase 2: Fire the timer while the original `session/prompt` RPC is still open.
+    std::fs::write(&wake_file, "wake\n").expect("write wake flag");
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = agent_id.clone();
+            async move {
+                let idle_clean = c
+                    .host_detail(&hid)
+                    .and_then(|d| d.agents.into_iter().find(|a| a.agent_id == aid))
+                    .is_some_and(|a| {
+                        !a.is_running && !a.has_background_tasks && a.status_label == "Idle"
+                    });
+                idle_clean && stage_settled_with_text(&c, &hid, &aid, "WAKEUP_TIMER_DONE")
+            }
+        })
+        .await,
+        "timer wakeup over open RPC must stream WAKEUP_TIMER_DONE and settle cleanly to Idle"
+    );
+
+    let st_final = core.agent_stage(&host_id, &agent_id);
+    let reply_ids: Vec<(String, String)> = st_final
+        .turns
+        .iter()
+        .flat_map(|t| t.live_segments.iter())
+        .filter_map(|seg| match seg {
+            TurnLiveSegmentView::AssistantMessage {
+                item:
+                    TimelineItemView::AssistantMessage {
+                        item_id,
+                        text,
+                        streaming,
+                        ..
+                    },
+                ..
+            } => {
+                assert!(
+                    !*streaming,
+                    "all finalized segments must have streaming: false"
+                );
+                Some((item_id.clone(), text.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let initial_entry = reply_ids
+        .iter()
+        .find(|(_, txt)| txt.contains("INITIAL_TIMER_ARMED"))
+        .expect("initial settled reply present");
+    let wakeup_entry = reply_ids
+        .iter()
+        .find(|(_, txt)| txt.contains("WAKEUP_TIMER_DONE"))
+        .expect("wakeup reply present");
+    assert_ne!(
+        initial_entry.0, wakeup_entry.0,
+        "wakeup reply must preserve INITIAL_TIMER_ARMED as a distinct segment"
     );
 
     drop_core(core).await;

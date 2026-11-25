@@ -311,7 +311,11 @@ export const TurnStageSection = memo(function TurnStageSection({
   const isWaitingOnlyOnBackgroundTasks =
     hasLiveBackgroundTasks &&
     ((lastRawSeg?.kind === "wakeup" && isWaitingWakeupLabel(lastRawSeg.label)) ||
-      (Boolean(agentStatusLabel && /background task/i.test(agentStatusLabel)) &&
+      (Boolean(
+        agentStatusLabel &&
+          (isWaitingWakeupLabel(agentStatusLabel) ||
+            /background task|\btimers?\b/i.test(agentStatusLabel)),
+      ) &&
         (lastRawSeg === null ||
           (lastRawSeg.kind === "assistant_message" &&
             lastRawSeg.item.item_type === "assistant_message" &&
@@ -755,7 +759,9 @@ export const TurnStageSection = memo(function TurnStageSection({
                         ? agentStatusLabel.trim()
                         : `${agentStatusLabel.trim()}…`
                       : t("stage.thinkingPending");
-              const isTrailingBackgroundWait = /background task/i.test(trailingLabel);
+              const isTrailingBackgroundWait =
+                isWaitingWakeupLabel(trailingLabel) ||
+                /background task|\btimers?\b/i.test(trailingLabel);
               return (
                 <TurnActivityDisclosure
                   items={EMPTY_TIMELINE_ITEMS}

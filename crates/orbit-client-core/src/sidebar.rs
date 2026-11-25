@@ -1132,7 +1132,10 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
 
             for conv in &group.conversations {
                 let ws_id = conv.agent.workspace_id.as_str();
-                if ws_by_id.get(ws_id).is_some_and(|w| w.is_curated) {
+                if ws_by_id
+                    .get(ws_id)
+                    .is_some_and(|w| w.is_curated && w.archived_at.is_none())
+                {
                     curated_ws_buckets
                         .entry(ws_id.to_string())
                         .or_default()
@@ -2536,5 +2539,76 @@ mod tests {
         assert!(none.projects.is_empty());
         assert!(none.needs_attention.is_empty());
         assert!(none.pinned_conversations.is_empty());
+    }
+
+    #[test]
+    fn archived_curated_workspace_never_resurfaces_with_unarchived_thread() {
+        let now = chrono::Utc::now();
+        let workspaces = vec![WorkspaceSummary {
+            workspace_id: "ws_archived_curated".into(),
+            title: "Archived Group".into(),
+            mission_goal: None,
+            cwd: "/work/app".into(),
+            project_root: Some("/work/app".into()),
+            git_branch: None,
+            is_worktree: false,
+            updated_at: now,
+            source_cwd: None,
+            base_ref: None,
+            parent_workspace_id: None,
+            archived_at: Some(now),
+            background: false,
+            setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+            board_revision: 0,
+            title_locked: false,
+            auto_clustered: false,
+            is_curated: true,
+        }];
+        let mut stray_agent = sample_agent(
+            "ag_stray",
+            "/work/app",
+            "2026-11-25T10:00:00Z",
+            false,
+            false,
+            false,
+            false,
+        );
+        stray_agent.workspace_id = "ws_archived_curated".into();
+
+        let empty_git_repos = HashMap::new();
+        let empty_conflicts = HashSet::new();
+        let view = build_fleet_sidebar(FleetSidebarParams {
+            revision: 1,
+            hosts: vec![SidebarHostInput {
+                host_id: "h1",
+                host_name: "spark",
+                workspaces: &workspaces,
+                discovered_projects: &[],
+                agents: vec![(stray_agent, 0)],
+                active_git_branch: None,
+                git_repos_by_cwd: &empty_git_repos,
+                workspace_conflict_ids: &empty_conflicts,
+            }],
+            pinned_projects: &[],
+            project_order: &[],
+            sort: SidebarProjectSort::Recent,
+            filter: SidebarThreadFilter::All,
+            query: "",
+            active_host_id: None,
+            active_agent_id: None,
+            active_cwd: None,
+        });
+
+        assert_eq!(view.projects.len(), 1);
+        let proj = &view.projects[0];
+        assert!(
+            proj.workspaces.is_empty(),
+            "archived curated workspace must not appear in project.workspaces"
+        );
+        assert_eq!(proj.unclassified_conversations.len(), 1);
+        assert_eq!(
+            proj.unclassified_conversations[0].agent.agent_id,
+            "ag_stray"
+        );
     }
 }

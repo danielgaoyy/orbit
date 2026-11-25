@@ -926,7 +926,7 @@ async fn run_acp_actor(
             model: current_model.clone(),
         })
         .await;
-    if !is_reattached {
+    if !is_reattached || cfg.persisted_initializing {
         let _ = evt_tx
             .send(DriverEvent::StatusChanged(AgentStatus::Idle))
             .await;
@@ -2901,6 +2901,7 @@ done
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: Some("mock-generic".into()),
             acp_spec: Some(spec.clone()),
         };
@@ -3180,6 +3181,7 @@ done
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: Some("custom".into()),
             acp_spec: None,
         };
@@ -3407,6 +3409,7 @@ done
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: Some("edge-acp".into()),
             acp_spec: Some(spec.clone()),
         };
@@ -3772,6 +3775,7 @@ done
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: Some("deliv-acp".into()),
             acp_spec: Some(spec.clone()),
         };

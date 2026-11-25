@@ -1348,7 +1348,7 @@ async fn run_agy_actor(
             model: current_base_model.clone(),
         })
         .await;
-    if !is_reattached {
+    if !is_reattached || cfg.persisted_initializing {
         let _ = evt_tx
             .send(DriverEvent::StatusChanged(AgentStatus::Idle))
             .await;
@@ -12817,6 +12817,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             ),
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -13001,6 +13002,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -13079,6 +13081,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -13326,6 +13329,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -13545,6 +13549,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -14235,6 +14240,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -14695,6 +14701,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -15425,6 +15432,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -15841,6 +15849,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -16245,6 +16254,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -16500,6 +16510,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -16922,6 +16933,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -17255,6 +17267,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -17468,6 +17481,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -17875,6 +17889,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -18060,6 +18075,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -18197,6 +18213,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -18834,6 +18851,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            persisted_initializing: false,
             acp_agent_id: None,
             acp_spec: None,
         };
@@ -19085,5 +19103,144 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             }
             other => panic!("unexpected event for orphan bg task: {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_agy_actor_reattach_persisted_initializing_emits_idle() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+
+        use orbit_shim::ShimListener;
+
+        let short_id = uuid::Uuid::new_v4().simple().to_string();
+        let tmp_data = std::env::temp_dir().join(format!("o_agy_reattach_init_{short_id}"));
+        std::fs::create_dir_all(&tmp_data).expect("mkdir tmp data");
+        let sock_path = std::env::temp_dir().join(format!("o_agy_ri_{short_id}.sock"));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
+        let sess_srv = format!("reattach_init_{short_id}");
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = tokio::io::BufReader::new(rh).lines();
+            let mut seq = 1u64;
+            while let Ok(Some(raw_line)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) =
+                    serde_json::from_str::<ShimFrame>(&raw_line)
+                else {
+                    continue;
+                };
+                let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                let resp = match method {
+                    "initialize" => Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": { "protocolVersion": 1 }
+                    })),
+                    "session/new" => Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": { "sessionId": sess_srv }
+                    })),
+                    _ => None,
+                };
+                if let Some(v) = resp {
+                    let frame = ShimFrame::StdoutLine {
+                        seq: Some(seq),
+                        line: v.to_string(),
+                    };
+                    seq += 1;
+                    let mut enc = serde_json::to_string(&frame).expect("enc");
+                    enc.push('\n');
+                    let _ = wh.write_all(enc.as_bytes()).await;
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let mut extra_env = HashMap::new();
+        extra_env.insert(
+            "ANTIGRAVITY_EXECUTABLE_DATA_DIR".into(),
+            tmp_data.to_string_lossy().to_string(),
+        );
+        let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
+            agent_id: "ag_reattach_init".into(),
+            provider: ProviderKind::Antigravity,
+            orbit_exe: PathBuf::from("/bin/true"),
+            executable: PathBuf::from("/bin/true"),
+            shim_socket: sock_path.clone(),
+            runtime_dir: std::env::temp_dir(),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::FullAccess,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env,
+            reattach_existing_shim: true,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+            persisted_initializing: true,
+            acp_agent_id: None,
+            acp_spec: None,
+        };
+
+        let actor = tokio::spawn(run_agy_actor(cfg, shim, true, cmd_rx, evt_tx));
+        let mut saw_session_init = false;
+        let mut saw_idle = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !saw_idle && tokio::time::Instant::now() < deadline {
+            if let Ok(Some(ev)) =
+                tokio::time::timeout(Duration::from_millis(500), evt_rx.recv()).await
+            {
+                match ev {
+                    DriverEvent::SessionInitialized {
+                        persistence_ref, ..
+                    } => {
+                        assert!(!persistence_ref.is_empty());
+                        saw_session_init = true;
+                    }
+                    DriverEvent::StatusChanged(AgentStatus::Idle) => {
+                        saw_idle = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_session_init, "reattach must emit SessionInitialized");
+        assert!(
+            saw_idle,
+            "reattaching a persisted Initializing session must emit StatusChanged(Idle)"
+        );
+
+        let _ = cmd_tx.send(DriverCommand::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        server.abort();
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_dir_all(&tmp_data);
     }
 }

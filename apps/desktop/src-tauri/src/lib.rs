@@ -1329,20 +1329,28 @@ fn rename_workspace(
 }
 
 #[tauri::command]
-fn archive_workspace(state: State<'_, DesktopAppState>, host_id: String, workspace_id: String) {
-    state.core.archive_workspace(&host_id, &workspace_id);
+async fn archive_workspace(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    workspace_id: String,
+) -> Result<(), String> {
+    state
+        .core
+        .archive_workspace_confirmed(&host_id, &workspace_id, false)
+        .await
 }
 
 #[tauri::command]
-fn archive_workspace_v2(
+async fn archive_workspace_v2(
     state: State<'_, DesktopAppState>,
     host_id: String,
     workspace_id: String,
     keep_agents_unclassified: bool,
-) {
+) -> Result<(), String> {
     state
         .core
-        .archive_workspace_v2(&host_id, &workspace_id, keep_agents_unclassified);
+        .archive_workspace_confirmed(&host_id, &workspace_id, keep_agents_unclassified)
+        .await
 }
 
 #[tauri::command]

@@ -572,4 +572,26 @@ describe("Wave 1A P0 UX Safety", () => {
     assert.equal(describePlan(pausedSteps, false, 1)?.canDismiss, true);
     assert.equal(describePlan(failedSteps, false, 1)?.canDismiss, true);
   });
+
+  it("surfaces archiveWorkspace failures instead of reporting false success", async (t) => {
+    const { orbitActions, getOrbitState } = await server.ssrLoadModule(
+      "/src/state/orbit-store.ts",
+    );
+    const { orbitIpc } = await server.ssrLoadModule("/src/lib/orbit-ipc.ts");
+
+    t.mock.method(orbitIpc, "archiveWorkspace", async () => {
+      throw new Error("RPC timed out after 30s");
+    });
+
+    await assert.rejects(
+      () => orbitActions.archiveWorkspace("local", "ws_stuck", false, { rethrow: true }),
+      /RPC timed out after 30s/,
+    );
+    assert.match(String(getOrbitState().toastNotice), /Failed to update group:.*RPC timed out/);
+    assert.doesNotMatch(String(getOrbitState().toastNotice), /Archived group and conversations/);
+
+    // Non-rethrow (e.g., Ungroup) swallows rejection cleanly while still surfacing failure toast.
+    await orbitActions.archiveWorkspace("local", "ws_stuck", true);
+    assert.match(String(getOrbitState().toastNotice), /Failed to update group:.*RPC timed out/);
+  });
 });

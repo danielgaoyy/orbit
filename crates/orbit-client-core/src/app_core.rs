@@ -10927,6 +10927,32 @@ impl OrbitAppCore {
         );
     }
 
+    pub async fn archive_workspace_confirmed(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+        keep_agents_unclassified: bool,
+    ) -> Result<(), String> {
+        let request_id = Uuid::new_v4();
+        match self
+            .correlated_host_rpc(
+                host_id,
+                request_id,
+                WireMessage::ArchiveWorkspace {
+                    request_id,
+                    workspace_id: workspace_id.to_string(),
+                    keep_agents_unclassified,
+                },
+                Duration::from_secs(30),
+                move |m| matches!(m, WireMessage::Ack { request_id: rid } if *rid == request_id),
+            )
+            .await?
+        {
+            WireMessage::Ack { .. } => Ok(()),
+            _ => Err("unexpected daemon reply for archive_workspace".into()),
+        }
+    }
+
     pub fn unarchive_workspace(self: &Arc<Self>, host_id: &str, workspace_id: &str) {
         self.dispatch_wire_queued(
             host_id,

@@ -46,8 +46,8 @@ android {
         applicationId = "dev.orbit.android"
         minSdk = 29
         targetSdk = 36
-        versionCode = 11005
-        versionName = "0.11.5"
+        versionCode = 11006
+        versionName = "0.11.6"
 
         ndk {
             abiFilters += configuredAbis

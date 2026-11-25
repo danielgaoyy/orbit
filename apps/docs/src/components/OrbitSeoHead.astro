@@ -1,0 +1,185 @@
+---
+import Default from "@astrojs/starlight/components/Head.astro";
+import { ORBIT_VERSION } from "../data/landing-copy";
+
+const route = Astro.locals.starlightRoute;
+const entry = route.entry;
+const isZh = route.locale === "zh-cn" || route.lang === "zh-CN";
+const id = route.id || "";
+const siteOrigin = (Astro.site?.toString() || "https://danielgaoyy.github.io/orbit/").replace(/\/+$/, "");
+const base = import.meta.env.BASE_URL.replace(/\/+$/, "");
+
+// Derive canonical URL & x-default (English) URL
+const pathname = Astro.url.pathname.endsWith("/") ? Astro.url.pathname : `${Astro.url.pathname}/`;
+const withoutBase = base && pathname.startsWith(base) ? pathname.slice(base.length) : pathname;
+const normPath = withoutBase.startsWith("/") ? withoutBase : `/${withoutBase}`;
+const is404 = normPath.startsWith("/404");
+const enSlug = is404
+  ? "/"
+  : normPath.startsWith("/zh-cn/")
+    ? normPath.slice("/zh-cn".length)
+    : normPath === "/zh-cn"
+      ? "/"
+      : normPath;
+
+const originRoot = new URL(siteOrigin).origin;
+const canonicalUrl = `${originRoot}${base}${is404 ? "/" : normPath}`;
+const xDefaultUrl = `${originRoot}${base}${enSlug}`;
+const ogImageUrl = `${originRoot}${base}/images/orbit-desktop-dark.png`;
+
+const title = entry.data.title;
+const description =
+  entry.data.description ||
+  (isZh
+    ? "纯 Rust 多主机 AI 编码代理控制平面，一个常驻 Personal Agent 跨机调度 Claude Code、Codex 与 34+ ACP 代理。"
+    : "Pure-Rust multi-host control plane for Claude Code, Codex, and 34+ coding agents with zero-knowledge Noise E2EE.");
+
+const ogImageAlt = isZh
+  ? "Orbit 桌面端多主机 AI 编码代理工作台深色界面预览"
+  : "Orbit Desktop multi-host AI coding agent control plane dark workspace preview";
+
+const isHome = enSlug === "/" && !is404;
+const isDownload = enSlug === "/download/";
+const isDocsArticle = !isHome && !isDownload && !is404;
+
+let sectionName = "";
+if (id.includes("getting-started/")) {
+  sectionName = isZh ? "快速开始" : "Getting Started";
+} else if (id.includes("guides/")) {
+  sectionName = isZh ? "核心能力指南" : "Core Capabilities";
+} else if (id.includes("reference/")) {
+  sectionName = isZh ? "架构与参考" : "Reference";
+}
+
+const homeUrl = `${originRoot}${base}${isZh ? "/zh-cn/" : "/"}`;
+const docsRootUrl = `${originRoot}${base}${isZh ? "/zh-cn/getting-started/quickstart/" : "/getting-started/quickstart/"}`;
+const versionNumber = ORBIT_VERSION.replace(/^v/, "");
+
+const jsonLdGraph: Record<string, unknown>[] = [];
+
+if (isHome || isDownload) {
+  jsonLdGraph.push({
+    "@type": "SoftwareApplication",
+    name: "Orbit",
+    applicationCategory: "DeveloperApplication",
+    applicationSubCategory: "Multi-Host AI Coding Agent Control Plane",
+    operatingSystem: "macOS, Windows, Linux, iOS, Android, HarmonyOS, Web",
+    softwareVersion: versionNumber,
+    license: "https://opensource.org/licenses/MIT",
+    isAccessibleForFree: true,
+    url: homeUrl,
+    downloadUrl: `${originRoot}${base}${isZh ? "/zh-cn/download/" : "/download/"}`,
+    codeRepository: "https://github.com/danielgaoyy/orbit",
+    image: ogImageUrl,
+    description,
+    offers: {
+      "@type": "Offer",
+      price: "0",
+      priceCurrency: "USD",
+    },
+    featureList: [
+      "Persistent Personal Agent multi-host orchestration",
+      "Detached setsid shim isolation surviving daemon hot upgrades",
+      "Noise_NKpsk0 end-to-end encryption and <6MB self-hosted blind relay",
+      "Zero-public-IP Slack Socket Mode, Discord Gateway, and Feishu/Lark approvals",
+      "OS kernel sandbox (macOS Seatbelt / Linux bubblewrap) and Ed25519 audit chain",
+      "Native Desktop, iOS, Android, HarmonyOS NEXT, and Web WASM PWA clients",
+    ],
+  });
+}
+
+if (isHome) {
+  jsonLdGraph.push({
+    "@type": "WebSite",
+    name: "Orbit",
+    url: homeUrl,
+    inLanguage: isZh ? "zh-CN" : "en",
+    description,
+    publisher: {
+      "@type": "Organization",
+      name: "Orbit Contributors",
+      url: "https://github.com/danielgaoyy/orbit",
+    },
+  });
+}
+
+if (isDownload) {
+  jsonLdGraph.push({
+    "@type": "BreadcrumbList",
+    itemListElement: [
+      { "@type": "ListItem", position: 1, name: "Orbit", item: homeUrl },
+      { "@type": "ListItem", position: 2, name: title, item: canonicalUrl },
+    ],
+  });
+}
+
+if (isDocsArticle) {
+  jsonLdGraph.push({
+    "@type": "TechArticle",
+    headline: title,
+    description,
+    inLanguage: isZh ? "zh-CN" : "en",
+    url: canonicalUrl,
+    mainEntityOfPage: canonicalUrl,
+    image: ogImageUrl,
+    author: {
+      "@type": "Organization",
+      name: "Orbit Contributors",
+      url: "https://github.com/danielgaoyy/orbit",
+    },
+    publisher: {
+      "@type": "Organization",
+      name: "Orbit Contributors",
+      url: "https://github.com/danielgaoyy/orbit",
+    },
+    about: {
+      "@type": "SoftwareApplication",
+      name: "Orbit",
+      softwareVersion: versionNumber,
+    },
+  });
+  jsonLdGraph.push({
+    "@type": "BreadcrumbList",
+    itemListElement: [
+      { "@type": "ListItem", position: 1, name: "Orbit", item: homeUrl },
+      ...(sectionName
+        ? [{ "@type": "ListItem", position: 2, name: sectionName, item: docsRootUrl }]
+        : []),
+      {
+        "@type": "ListItem",
+        position: sectionName ? 3 : 2,
+        name: title,
+        item: canonicalUrl,
+      },
+    ],
+  });
+}
+
+const structuredData =
+  jsonLdGraph.length > 0
+    ? JSON.stringify({
+        "@context": "https://schema.org",
+        "@graph": jsonLdGraph,
+      })
+    : "";
+---
+
+<Default {...Astro.props}><slot /></Default>
+
+{!is404 ? (
+  <>
+    <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1" />
+    <link rel="alternate" hreflang="x-default" href={xDefaultUrl} />
+    <meta property="og:locale:alternate" content={isZh ? "en" : "zh_CN"} />
+    <meta property="og:image:width" content="2880" />
+    <meta property="og:image:height" content="1800" />
+    <meta property="og:image:alt" content={ogImageAlt} />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImageUrl} />
+    <meta name="twitter:image:alt" content={ogImageAlt} />
+    {structuredData && <script type="application/ld+json" set:html={structuredData} />}
+  </>
+) : (
+  <meta name="robots" content="noindex, follow" />
+)}

@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+Disallow: /orbit/desktop-demo/
+
+Sitemap: https://danielgaoyy.github.io/orbit/sitemap-index.xml

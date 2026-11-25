@@ -31,9 +31,9 @@ orbit use-relay relay.example.com:7878
 
 ### 零知识密码学保障
 
-- **端到端 Noise 双向加密**：穿透中继的客户端到守护进程流量采用 `Noise_NKpsk0_25519_ChaChaPoly_SHA256`（域隔离序言 `orbit-relay-e2ee/2`），32 字节 PSK 派生自宿主的 `pairing_secret`，并严格校验 X25519 贡献性（拒绝低阶曲线点）。
-- **控制信道防顶号（PoP）**：守护进程通过 1-RTT `Noise_NK` Proof-of-Possession（`orbit-relay-pop/1`）鉴权控制通道，并以 HMAC-SHA256 挂载数据隧道，杜绝伪造注册。
-- **可选 `fleet_token` 准入**：在 WebSocket 升级前执行恒定时间 Bearer Token 校验（`--fleet-token-stdin`，以 `0600` 持久化并在日志与 UI 中自动脱敏）。
+- **端到端 Noise 双向加密**：穿透中继的客户端到守护进程流量采用 `Noise_NKpsk0_25519_ChaChaPoly_SHA256`（域隔离序言 `orbit-relay-e2ee/2`），32 字节 PSK 派生自宿主 `pairing_secret`，并严格拒绝低阶 X25519 曲线点以防御弱密钥攻击。
+- **控制通道所有权证明（PoP）**：守护进程通过 1-RTT `Noise_NK` 所有权证明（`orbit-relay-pop/1`）完成控制通道鉴权，并以 HMAC-SHA256 挂载数据隧道，杜绝伪造注册。
+- **可选 `fleet_token` 准入**：在 WebSocket 升级前执行常量时间（constant-time）Bearer Token 校验（`--fleet-token-stdin`，以 `0600` 持久化并在日志与 UI 中自动脱敏）。
 - **盲转发**：中继仅透传经过 Zstd 压缩的不透明密文帧，永远无法解密你的提示词、代码 Diff、终端流或凭据。
 
 ## Peer-Bridge 多跳 E2EE 隧道
@@ -41,7 +41,7 @@ orbit use-relay relay.example.com:7878
 对于身处企业隔离内网、既无法直连也无法直出 Relay 的构建机或实验室 GPU，Orbit 提供 **Peer-Bridge 多跳穿透**：
 
 - 可达的跳板机 Daemon 暴露受 `Origin` 校验与并发信号量限流的 `/ws/e2ee` 端点。
-- 作为中继桥（`PeerBridgeOpen` / `PeerBridgeData`）时，中间节点**仅**拨号其 `connected_hosts` 表中明确登记的白名单目标，彻底阻断 SSRF。
+- 作为中继桥（`PeerBridgeOpen` / `PeerBridgeData`）时，中间节点**仅**允许转发至 `connected_hosts` 表中明确登记的白名单目标主机，彻底阻断 SSRF。
 - 客户端直接与最内层的目标 Daemon 完成 `Noise_NKpsk0` 双向握手；中间跳板机只转发密文字节流，不持有目标主机的 `pairing_secret` 或任何明文。
 
 ## 零知识 GitHub Gist 云同步与移动端非局域网重连
@@ -50,7 +50,7 @@ orbit use-relay relay.example.com:7878
 
 ```bash
 orbit login --mesh    # GitHub Device Flow 登录 + 设置本地 Sync Passphrase
-orbit sync --mesh     # 拉取合并加密 Vault，并自动打通本机 connected_hosts Mesh
+orbit sync --mesh     # 拉取合并加密 Vault，并自动建立本机 connected_hosts 互联拓扑
 ```
 
 - **纯本地端到端加密**：客户端在上传私有 GitHub Secret Gist 之前，先使用 **Argon2id + AES-256-GCM**（`orbit-cloud-vault/v1`）加密完整 Vault。

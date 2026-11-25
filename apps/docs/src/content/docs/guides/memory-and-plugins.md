@@ -22,7 +22,7 @@ Each file contains structured YAML frontmatter (`id`, `category`, `status`, `con
 ### Hybrid offline retrieval (FTS5 + RRF)
 
 - **Zero cloud requirement**: Orbit indexes memories locally in SQLite combining **FTS5 BM25 lexical ranking** and a built-in **256-dimension feature-hash cosine similarity** (covering English words, code identifiers, and CJK character n-grams), fused with **Reciprocal Rank Fusion (`k = 60`)**.
-- **Automatic deduplication & staleness tracking**: New memories exceeding `0.92` cosine similarity merge cleanly with existing records. A debounced `notify` file watcher tracks edits, renames, and deletions—automatically flagging any confirmed memory as `needs_revalidation` (and writing that status back to Markdown) whenever one of its `bound_paths` source files changes.
+- **Automatic deduplication & staleness tracking**: New memories exceeding `0.92` cosine similarity merge cleanly with existing records. A debounced `notify` file watcher tracks edits, renames, and deletions, automatically marking any confirmed memory as `needs_revalidation` (and writing that status back to Markdown) whenever one of its `bound_paths` source files changes.
 - **Confirmed-only injection**: AI-created entries start as `hypothesis` and are injected into a provider's first turn (`<orbit_project_memory>` within a strict character/token budget) only after explicit confirmation.
 - **Legacy continuity**: Existing `~/.hermes/memories/*.md` entries are automatically imported as read-only hypotheses scoped by `workspace_root`.
 
@@ -45,7 +45,7 @@ Requests enforce a strict 3-second timeout and fall back cleanly to built-in loc
 
 ### The `orbit_memory` Core Tool
 
-Every provider running on an Orbit host—whether Claude Code, Codex, Antigravity, Pi, or any of the 34+ ACP agents—shares the exact same `orbit_memory` Core Pack tool with four actions:
+Every provider running on an Orbit host — whether Claude Code, Codex, Antigravity, Pi, or any of the 34+ ACP agents — shares the exact same `orbit_memory` Core Pack tool with four actions:
 
 - `recall` (supports `include_unconfirmed: true` to inspect pending hypotheses)
 - `remember` (creates a new scoped `hypothesis` record)
@@ -58,7 +58,7 @@ Paired clients also manage project memories directly over `ListProjectMemories`,
 
 Traditional IDE extensions execute arbitrary native code with full access to your user account. Orbit runs plugins inside an embedded pure-Rust **`wasmi` WebAssembly sandbox**:
 
-- **Zero native privilege**: Plugins execute deterministically inside memory- and fuel-bounded WASM instances—never spawning arbitrary subprocesses or reading outside declared workspace capabilities.
+- **Zero native privilege**: Plugins execute deterministically inside memory- and fuel-bounded WASM instances, never spawning arbitrary subprocesses or reading outside declared workspace capabilities.
 - **Cross-provider `orbit_plugin` tool surface**: Plugins register typed tools and lifecycle extensions exposed consistently to every connected agent provider.
 - **Declarative Cross-Platform UI**: Instead of shipping separate React, SwiftUI, Compose, and ArkTS bundles, plugins emit declarative UI trees (metrics, tables, action buttons, forms) that render natively across Desktop, Web WASM, iOS, Android, and HarmonyOS.
 - **SEP-1865 MCP Apps Bridge**: Orbit also supports MCP servers exposing interactive `ui://` resources (`ReadMcpResource`) and server-bound tool calls (`CallArtifactMcpTool`) directly inside the desktop Artifacts tab.

@@ -83,7 +83,8 @@ const C = {
   op: ["#89DDFF", "#0369A1"],
 };
 
-function buildShowcaseFixture(theme) {
+export function buildShowcaseFixture(theme, opts = {}) {
+  const interactiveDemo = Boolean(opts.interactiveDemo);
   const now = Date.now();
   const isoAgo = (sec) => new Date(now - sec * 1000).toISOString();
 
@@ -99,14 +100,14 @@ function buildShowcaseFixture(theme) {
     custom_direct_endpoint: null,
     via_ssh_tunnel: false,
     last_ping_ms: 1,
-    daemon_version: "0.10.4",
+    daemon_version: "0.11.0",
     os_arch: "darwin/aarch64",
     daemon_pubkey_b64: "mK8v2xQ4pL9rN7tW1yZ3bC5dE6fG8hJ0kM2nP4qR6sU=",
     direct_endpoints: ["127.0.0.1:6868"],
     relay_url: "wss://relay.orbit.internal:7878",
     connection_state: "online_direct",
     last_error: null,
-    available_providers: ["claude_code", "codex", "antigravity", "opencode", "gemini_cli"],
+    available_providers: ["claude_code", "codex", "antigravity", "gemini_cli"],
     workspace_count: 2,
     agent_count: 4,
     pending_approval_count: 0,
@@ -125,14 +126,14 @@ function buildShowcaseFixture(theme) {
     custom_direct_endpoint: null,
     via_ssh_tunnel: false,
     last_ping_ms: 14,
-    daemon_version: "0.10.4",
+    daemon_version: "0.11.0",
     os_arch: "linux/x86_64",
     daemon_pubkey_b64: "bN4pQ8rS2tU6vW0xY4zA8bC2dE6fG0hI4jK8lM2nO6p=",
     direct_endpoints: ["10.42.0.18:6868"],
     relay_url: "wss://relay.orbit.internal:7878",
     connection_state: "online_relay",
     last_error: null,
-    available_providers: ["codex", "claude_code", "opencode"],
+    available_providers: ["claude_code", "codex", "antigravity", "gemini_cli"],
     workspace_count: 2,
     agent_count: 3,
     pending_approval_count: 1,
@@ -151,14 +152,14 @@ function buildShowcaseFixture(theme) {
     custom_direct_endpoint: null,
     via_ssh_tunnel: true,
     last_ping_ms: 28,
-    daemon_version: "0.10.4",
+    daemon_version: "0.11.0",
     os_arch: "linux/x86_64",
     daemon_pubkey_b64: "qR8sT2uV6wX0yZ4aB8cD2eF6gH0iJ4kL8mN2oP6qR0s=",
     direct_endpoints: [],
     relay_url: "ssh+relay://h100-cloud:7878",
     connection_state: "online_relay",
     last_error: null,
-    available_providers: ["antigravity", "gemini_cli", "claude_code"],
+    available_providers: ["claude_code", "codex", "antigravity", "gemini_cli"],
     workspace_count: 1,
     agent_count: 2,
     pending_approval_count: 0,
@@ -192,14 +193,200 @@ function buildShowcaseFixture(theme) {
     archived_at: null,
   };
 
+  const makeThinkingOptions = (efforts, defaultEffort) => {
+    const meta = {
+      off: ["Off", "Thinking disabled"],
+      low: ["Low", "Fast & concise"],
+      medium: ["Medium", "Balanced speed & depth"],
+      high: ["High", "Greater reasoning depth"],
+      xhigh: ["Extra High", "Extra deep reasoning"],
+      max: ["Max", "Maximum reasoning budget"],
+    };
+    return efforts.map((effort) => ({
+      effort,
+      label: meta[effort][0],
+      description: meta[effort][1],
+      is_default: effort === defaultEffort,
+    }));
+  };
+
+  const providerCatalogs = [
+    {
+      provider: "claude_code",
+      configured_default_model: "claude-opus-5-5",
+      configured_default_effort: "high",
+      models: [
+        {
+          id: "claude-fable-5-2",
+          label: "Fable 5.2",
+          description: "Most powerful model for complex architecture & deep reasoning",
+          is_default: false,
+          default_effort: "high",
+          thinking_options: makeThinkingOptions(["low", "medium", "high", "xhigh", "max"], "high"),
+          supports_fast_mode: false,
+        },
+        {
+          id: "claude-opus-5-5",
+          label: "Opus 5.5",
+          description: "Latest flagship release for complex coding & audits",
+          is_default: true,
+          default_effort: "high",
+          thinking_options: makeThinkingOptions(["low", "medium", "high", "xhigh", "max"], "high"),
+          supports_fast_mode: true,
+        },
+        {
+          id: "claude-sonnet-5-5",
+          label: "Sonnet 5.5",
+          description: "Best for everyday tasks & rapid iteration",
+          is_default: false,
+          default_effort: "medium",
+          thinking_options: makeThinkingOptions(["low", "medium", "high", "xhigh", "max"], "medium"),
+          supports_fast_mode: false,
+        },
+        {
+          id: "claude-haiku-5-5",
+          label: "Haiku 5.5",
+          description: "Fastest for quick answers & lightweight checks",
+          is_default: false,
+          default_effort: "medium",
+          thinking_options: makeThinkingOptions(["off", "low", "medium", "high"], "medium"),
+          supports_fast_mode: false,
+        },
+      ],
+    },
+    {
+      provider: "codex",
+      configured_default_model: "gpt-6.2-astra",
+      configured_default_effort: "high",
+      models: [
+        {
+          id: "gpt-6.2-astra",
+          label: "GPT 6.2 Astra",
+          description: "Most capable model for complex coding and professional work",
+          is_default: true,
+          default_effort: "high",
+          thinking_options: makeThinkingOptions(["low", "medium", "high", "xhigh"], "high"),
+          supports_fast_mode: true,
+        },
+        {
+          id: "gpt-6.2-sol",
+          label: "GPT 6.2 Sol",
+          description: "Fast, go-to model for coding and everyday work",
+          is_default: false,
+          default_effort: "medium",
+          thinking_options: makeThinkingOptions(["low", "medium", "high", "xhigh"], "medium"),
+          supports_fast_mode: true,
+        },
+        {
+          id: "gpt-6.1-terra",
+          label: "GPT 6.1 Terra",
+          description: "Efficient model for visual understanding and computer use",
+          is_default: false,
+          default_effort: "medium",
+          thinking_options: makeThinkingOptions(["low", "medium", "high", "xhigh"], "medium"),
+          supports_fast_mode: true,
+        },
+        {
+          id: "gpt-6-luna",
+          label: "GPT 6 Luna",
+          description: "Fast and affordable model for easier tasks",
+          is_default: false,
+          default_effort: "medium",
+          thinking_options: makeThinkingOptions(["low", "medium", "high"], "medium"),
+          supports_fast_mode: true,
+        },
+      ],
+    },
+    {
+      provider: "antigravity",
+      configured_default_model: "gemini-4-neon",
+      configured_default_effort: "high",
+      models: [
+        {
+          id: "gemini-4-neon",
+          label: "Gemini 4 Neon",
+          description: "Frontier reasoning & multi-host agent orchestration",
+          is_default: true,
+          default_effort: "high",
+          thinking_options: makeThinkingOptions(["low", "medium", "high", "xhigh"], "high"),
+          supports_fast_mode: false,
+        },
+        {
+          id: "gemini-4-carbon",
+          label: "Gemini 4 Carbon",
+          description: "Flagship reasoning & multi-file software engineering",
+          is_default: false,
+          default_effort: "medium",
+          thinking_options: makeThinkingOptions(["low", "medium", "high"], "medium"),
+          supports_fast_mode: false,
+        },
+        {
+          id: "gemini-4-hydrogen",
+          label: "Gemini 4 Hydrogen",
+          description: "Extended deep reasoning with Extra High budget",
+          is_default: false,
+          default_effort: "high",
+          thinking_options: makeThinkingOptions(["low", "medium", "high", "xhigh"], "high"),
+          supports_fast_mode: false,
+        },
+      ],
+    },
+    {
+      provider: "gemini_cli",
+      configured_default_model: "gemini-4-neon",
+      configured_default_effort: "high",
+      models: [
+        {
+          id: "gemini-4-neon",
+          label: "Gemini 4 Neon",
+          description: "Frontier reasoning & multi-host agent orchestration",
+          is_default: true,
+          default_effort: "high",
+          thinking_options: makeThinkingOptions(["low", "medium", "high", "xhigh"], "high"),
+          supports_fast_mode: false,
+        },
+        {
+          id: "gemini-4-carbon",
+          label: "Gemini 4 Carbon",
+          description: "Flagship reasoning & multi-file software engineering",
+          is_default: false,
+          default_effort: "medium",
+          thinking_options: makeThinkingOptions(["low", "medium", "high"], "medium"),
+          supports_fast_mode: false,
+        },
+        {
+          id: "gemini-4-hydrogen",
+          label: "Gemini 4 Hydrogen",
+          description: "Extended deep reasoning with Extra High budget",
+          is_default: false,
+          default_effort: "high",
+          thinking_options: makeThinkingOptions(["low", "medium", "high", "xhigh"], "high"),
+          supports_fast_mode: false,
+        },
+      ],
+    },
+  ];
+
+  const modelsByProvider = Object.fromEntries(
+    providerCatalogs.map((cat) => [
+      cat.provider,
+      cat.models.map((m) => ({
+        id: m.id,
+        label: m.label,
+        description: m.description,
+        is_default: m.is_default,
+      })),
+    ]),
+  );
+
   const agentPersonal = {
     agent_id: "ag_personal_chief",
     workspace_id: "ws_orbit_main",
     cwd: "/Users/jess/workspace/orbit",
     title: "Personal Agent · Fleet Release Coordinator",
-    provider: "claude_code",
-    provider_label: "Claude Code",
-    model: "claude-opus-4-6",
+    provider: "antigravity",
+    provider_label: "Antigravity",
+    model: "gemini-4-neon",
     effort: "high",
     mode: "accept_edits",
     status_label: "Running",
@@ -211,13 +398,13 @@ function buildShowcaseFixture(theme) {
     parent_agent_id: null,
     labels: {
       "orbit.agent_role": "personal_router",
-      "orbit.im_channel": "feishu_longconn",
+      "orbit.im_channel": "slack_socket",
     },
     latest_seq: 42,
     read_seq: 42,
     handle: "chief-of-staff",
     worktree_branch: "feat/e2ee-rotation",
-    task_summary: "Coordinating v0.10.5 across 3 fleet hosts",
+    task_summary: "Coordinating v0.11.0 across 3 fleet hosts",
     created_at_rfc3339: isoAgo(1800),
     updated_at_rfc3339: isoAgo(12),
     is_pinned: true,
@@ -232,8 +419,8 @@ function buildShowcaseFixture(theme) {
     title: "Security Auditor · Noise_NKpsk0",
     provider: "claude_code",
     provider_label: "Claude Code",
-    model: "claude-sonnet-4-6",
-    effort: "medium",
+    model: "claude-opus-5-5",
+    effort: "high",
     mode: "plan",
     status_label: "Idle",
     is_running: false,
@@ -257,7 +444,7 @@ function buildShowcaseFixture(theme) {
     title: "Cargo E2E Runner · linux-build-01",
     provider: "codex",
     provider_label: "Codex",
-    model: "gpt-5.4",
+    model: "gpt-6.2-sol",
     effort: "high",
     mode: "accept_edits",
     status_label: "Running",
@@ -283,7 +470,7 @@ function buildShowcaseFixture(theme) {
     title: "WASM & Patrol Audit · gpu-h100-cloud",
     provider: "antigravity",
     provider_label: "Antigravity",
-    model: "gemini-2.5-pro",
+    model: "gemini-4-carbon",
     effort: "medium",
     mode: "accept_edits",
     status_label: "Idle",
@@ -308,8 +495,8 @@ function buildShowcaseFixture(theme) {
     title: "Rotate Relay Pubkey & Deploy",
     provider: "codex",
     provider_label: "Codex",
-    model: "gpt-5.4",
-    effort: "medium",
+    model: "gpt-6.2-astra",
+    effort: "high",
     mode: "accept_edits",
     status_label: "Awaiting Approval",
     is_running: false,
@@ -333,8 +520,8 @@ function buildShowcaseFixture(theme) {
     title: "PR #68 CI & Patrol Monitor",
     provider: "claude_code",
     provider_label: "Claude Code",
-    model: "claude-sonnet-4-6",
-    effort: "low",
+    model: "claude-sonnet-5-5",
+    effort: "medium",
     mode: "plan",
     status_label: "Idle",
     is_running: false,
@@ -355,9 +542,9 @@ function buildShowcaseFixture(theme) {
     workspace_id: "ws_orbit_main",
     cwd: "/Users/jess/workspace/orbit",
     title: "Cross-Provider FTS5 + RRF Tuning",
-    provider: "antigravity",
-    provider_label: "Antigravity",
-    model: "gemini-2.5-pro",
+    provider: "claude_code",
+    provider_label: "Claude Code",
+    model: "claude-fable-5-2",
     effort: "high",
     mode: "accept_edits",
     status_label: "Idle",
@@ -381,8 +568,8 @@ function buildShowcaseFixture(theme) {
     title: "Offline Whisper VAD & WASM Audio",
     provider: "gemini_cli",
     provider_label: "Gemini CLI",
-    model: "gemini-2.5-pro",
-    effort: "medium",
+    model: "gemini-4-hydrogen",
+    effort: "high",
     mode: "accept_edits",
     status_label: "Idle",
     is_running: false,
@@ -733,7 +920,7 @@ function buildShowcaseFixture(theme) {
           {
             cells: [
               { spans: [span("Mac Studio", { bold: true })] },
-              { spans: [span("Claude Code · Opus 4.6")] },
+              { spans: [span("Claude Code · Opus 5.5")] },
               { spans: [span("Local · 1ms", { code: true })] },
               { spans: [span("Verified (+14 −3)")] },
             ],
@@ -741,7 +928,7 @@ function buildShowcaseFixture(theme) {
           {
             cells: [
               { spans: [span("linux-build-01", { bold: true })] },
-              { spans: [span("Codex · GPT-5.4 (worktree)")] },
+              { spans: [span("Codex · GPT 6.2 Sol (worktree)")] },
               { spans: [span("Noise E2EE · 14ms", { code: true })] },
               { spans: [span("184/184 tests · running E2E")] },
             ],
@@ -749,7 +936,7 @@ function buildShowcaseFixture(theme) {
           {
             cells: [
               { spans: [span("gpu-h100-cloud", { bold: true })] },
-              { spans: [span("Antigravity · Gemini 2.5")] },
+              { spans: [span("Antigravity · Gemini 4 Carbon")] },
               { spans: [span("SSH+Relay · 28ms", { code: true })] },
               { spans: [span("Patrol clean · 0 findings")] },
             ],
@@ -779,7 +966,7 @@ function buildShowcaseFixture(theme) {
           span("Needs your approval (Tier-3): ", { bold: true }),
           span("Production relay pubkey rotation on "),
           span("linux-build-01", { code: true }),
-          span(" — also mirrored to your Feishu interactive card."),
+          span(" — also mirrored to your Slack interactive card."),
         ],
       },
     ],
@@ -825,6 +1012,10 @@ function buildShowcaseFixture(theme) {
     has_running_step: true,
   };
 
+  const turn1PromptText = interactiveDemo
+    ? "Ship v0.11.0 across the fleet: Codex builds & runs Cargo E2E on linux-build-01, Claude Code audits Noise_NKpsk0 on Mac Studio, and Antigravity verifies WASM on gpu-h100. Ping me on Slack only for high-risk actions."
+    : "Coordinate the v0.11.0 security release across the fleet: run Codex on linux-build-01 to implement and execute cargo E2E, hand off to Claude Code on Mac Studio for Noise_NKpsk0 crypto review, and verify the WASM client on gpu-h100-cloud. Only ping me on Slack for Tier-3 approvals.";
+
   const turn1 = {
     key: "turn-0",
     turn_index: 0,
@@ -833,7 +1024,7 @@ function buildShowcaseFixture(theme) {
       item_type: "user_prompt",
       seq: 20,
       message_id: "u_prompt_1",
-      text: "Coordinate the v0.10.5 security release across the fleet: audit Noise_NKpsk0 rotation on Mac Studio, run cargo E2E in an isolated worktree on linux-build-01, and verify the WASM client on gpu-h100-cloud. Only ping me on Feishu for Tier-3 approvals.",
+      text: turn1PromptText,
       badges: [
         { kind: "slash", label: "/orbit", path: null },
         { kind: "file", label: "noise.rs", path: "crates/orbit-crypto/src/noise.rs" },
@@ -842,9 +1033,7 @@ function buildShowcaseFixture(theme) {
         {
           kind: "paragraph",
           spans: [
-            span(
-              "Coordinate the v0.10.5 security release across the fleet: audit Noise_NKpsk0 rotation on Mac Studio, run cargo E2E in an isolated worktree on linux-build-01, and verify the WASM client on gpu-h100-cloud. Only ping me on Feishu for Tier-3 approvals.",
-            ),
+            span(turn1PromptText),
           ],
         },
       ],
@@ -888,7 +1077,7 @@ function buildShowcaseFixture(theme) {
 
   const insights = {
     outline_prompts: [
-      { seq: 20, preview: "Coordinate the v0.10.5 security release across the fleet" },
+      { seq: 20, preview: "Coordinate the v0.11.0 security release across the fleet" },
     ],
     plan_steps: [
       {
@@ -912,7 +1101,7 @@ function buildShowcaseFixture(theme) {
       },
       {
         id: "plan_4",
-        title: "Approve Tier-3 relay key rotation & tag v0.10.5",
+        title: "Approve Tier-3 relay key rotation & tag v0.11.0",
         status: "pending",
         updated_seq: 36,
       },
@@ -1106,7 +1295,8 @@ function buildShowcaseFixture(theme) {
       host: hostMac,
       discovered_projects: [],
       directory_listing: null,
-      models_by_provider: {},
+      models_by_provider: modelsByProvider,
+      provider_catalogs: providerCatalogs,
       workspaces: [wsOrbitMain],
       agents: [agentPersonal, subSecurityMac, agentMacMemory],
       last_created_agent_id: null,
@@ -1126,7 +1316,8 @@ function buildShowcaseFixture(theme) {
       host: hostLinux,
       discovered_projects: [],
       directory_listing: null,
-      models_by_provider: {},
+      models_by_provider: modelsByProvider,
+      provider_catalogs: providerCatalogs,
       workspaces: [wsLinuxWorktree],
       agents: [subBuildLinux, agentNeedsApproval, agentTimerWatcher],
       last_created_agent_id: null,
@@ -1146,7 +1337,8 @@ function buildShowcaseFixture(theme) {
       host: hostGpu,
       discovered_projects: [],
       directory_listing: null,
-      models_by_provider: {},
+      models_by_provider: modelsByProvider,
+      provider_catalogs: providerCatalogs,
       workspaces: [wsGpuBench],
       agents: [subWasmGpu, agentGpuVoice],
       last_created_agent_id: null,
@@ -1163,22 +1355,214 @@ function buildShowcaseFixture(theme) {
     },
   };
 
+  // Additional interactive conversation threads for sidebar switching in live web embed
+  const makeSimpleTurn = (key, seq, promptText, replyParagraphs) => {
+    const replyItem = {
+      item_type: "assistant_message",
+      seq: seq + 2,
+      item_id: `msg_${key}`,
+      text: replyParagraphs[0],
+      streaming: false,
+      timestamp_ms: now - 60_000,
+      blocks: replyParagraphs.map((txt) => ({ kind: "paragraph", spans: [span(txt)] })),
+    };
+    return {
+      key,
+      turn_index: 0,
+      anchor_seq: seq,
+      user_prompt: {
+        item_type: "user_prompt",
+        seq,
+        message_id: `u_${key}`,
+        text: promptText,
+        badges: [],
+        blocks: [{ kind: "paragraph", spans: [span(promptText)] }],
+        timestamp_ms: now - 180_000,
+      },
+      agent_message: null,
+      is_compaction_command: false,
+      folded_steps: [],
+      work_counts: {
+        edited_file_count: 0,
+        created_file_count: 0,
+        command_count: 1,
+        read_file_count: 2,
+        search_count: 1,
+        subagent_count: 0,
+        mcp_server_count: 0,
+        other_tool_count: 0,
+        thought_count: 1,
+        narration_count: 0,
+        action_steps: 2,
+        total_steps: 2,
+        failed_count: 0,
+        denied_count: 0,
+        unrecovered_failure_count: 0,
+        additions: 0,
+        deletions: 0,
+      },
+      work_summary_label: "Inspected 2 files · ran 1 command",
+      work_summary_live_label: null,
+      work_summary_live_detail: null,
+      work_summary_includes_failure: false,
+      thought_duration_ms: 900,
+      work_duration_ms: 3200,
+      turn_duration_ms: 4100,
+      terminal_reply: replyItem,
+      last_assistant_reply: { ...replyItem, blocks: [] },
+      notices: [],
+      compactions: [],
+      live_segments: [{ kind: "assistant_message", key: `seg_${key}`, item: replyItem }],
+      turn_diffs: [],
+      has_error: false,
+      has_unrecovered_error: false,
+      has_active_item: false,
+      started_at_ms: now - 180_000,
+      completed_at_ms: now - 60_000,
+      latest_activity_ms: now - 60_000,
+      latest_visible_progress_ms: now - 60_000,
+    };
+  };
+
+  const pendingRelayPerm = {
+    agent_id: "ag_linux_deploy",
+    agent_title: "Rotate Relay Pubkey & Deploy",
+    request_id: "perm_relay_rekey_v011",
+    title: "Tier-3 Approval: Rotate production Noise_NKpsk0 relay pubkey & tag v0.11.0",
+    detail: {
+      kind: "command",
+      command: "orbit relay rekey --host linux-build-01 && git push origin v0.11.0",
+      cwd: "/srv/builds/orbit-wt-e2ee",
+    },
+    allowed_decisions: ["allow_once", "deny"],
+    guardian_assessment: {
+      risk: "high",
+      decision: "require_human",
+      reason: "Production relay key rotation and annotated tag push require explicit human Tier-3 confirmation.",
+      source: "policy_rule",
+    },
+    plan_approval: null,
+    human_only: true,
+    created_at: isoAgo(120),
+  };
+
+  const stageByAgent = {
+    ag_personal_chief: {
+      host_id: "host_mac_studio",
+      agent: agentPersonal,
+      turns: [turn1],
+      pending_permissions: [],
+      insights,
+      session_turn_diffs: diffFiles,
+    },
+    ag_linux_deploy: {
+      host_id: "host_linux_build",
+      agent: agentNeedsApproval,
+      turns: [
+        makeSimpleTurn(
+          "turn-deploy",
+          10,
+          "Rotate the Noise_NKpsk0 blind-relay pubkey on linux-build-01 after Claude Code's crypto audit passes, and push v0.11.0.",
+          [
+            "Codex finished the isolated worktree build (1,061 tests passed) and Claude Code signed off on the Curve25519 contributory check.",
+            "Pushing annotated tag v0.11.0 and rotating the live relay pubkey triggered Guardian Tier-3 policy — confirm below or tap Approve in Slack.",
+          ],
+        ),
+      ],
+      pending_permissions: [pendingRelayPerm],
+      insights: { ...insights, plan_steps: [], subagents: [], background_tasks: [] },
+      session_turn_diffs: diffFiles,
+    },
+    ag_mac_memory: {
+      host_id: "host_mac_studio",
+      agent: agentMacMemory,
+      turns: [
+        makeSimpleTurn(
+          "turn-mem",
+          18,
+          "Tune FTS5 + Reciprocal Rank Fusion weights across .orbit/memory/*.md so Claude Code, Codex, and Antigravity share the exact same recall order.",
+          [
+            "Benchmarked RRF k=60 across 48 project memory notes in .orbit/memory/. Top-3 recall improved from 81% to 96% with zero idle token overhead.",
+            "Shared notes (ci/windows-locks.md and arch/shim-isolation.md) are now automatically surfaced whenever any engine touches SQLite WAL tests or shim lifecycles.",
+          ],
+        ),
+      ],
+      pending_permissions: [],
+      insights: { ...insights, plan_steps: [], subagents: [], background_tasks: [] },
+      session_turn_diffs: [],
+    },
+    ag_linux_ci_watch: {
+      host_id: "host_linux_build",
+      agent: agentTimerWatcher,
+      turns: [
+        makeSimpleTurn(
+          "turn-patrol",
+          7,
+          "Watch PR #68 CI checks with a zero-burn conditional timer and run Two-Stage Orbit Patrol on the immutable Git blob.",
+          [
+            "Stage 1 Static Scan completed in 18ms across 42 changed files (0 leaked secrets, 0 unsafe blocks).",
+            "Stage 2 Adversarial Audit verified all Noise_NKpsk0 rekeying paths and armed a conditional wakeup timer (0 idle tokens while waiting for CI).",
+          ],
+        ),
+      ],
+      pending_permissions: [],
+      insights: { ...insights, plan_steps: [], subagents: [] },
+      session_turn_diffs: diffFiles,
+    },
+    ag_gpu_voice: {
+      host_id: "host_gpu_cloud",
+      agent: agentGpuVoice,
+      turns: [
+        makeSimpleTurn(
+          "turn-voice",
+          12,
+          "Verify offline Whisper VAD latency and zero-knowledge Noise_NKpsk0 handshake in the Web WASM PWA.",
+          [
+            "Local Whisper base-q5 transcribed 12s voice commands in 140ms on-host with zero cloud audio upload.",
+            "Browser orbit-client-wasm completed mutual Noise_NKpsk0 handshake against the <6MB blind relay with 0 bytes of plaintext visible on the wire.",
+          ],
+        ),
+      ],
+      pending_permissions: [],
+      insights: { ...insights, plan_steps: [], subagents: [], background_tasks: [] },
+      session_turn_diffs: [],
+    },
+  };
+
   const prefs = {
     locale: "en",
     theme,
     sidebarOpen: true,
-    sidebarWidth: 256,
-    sidePanelWidth: 468,
-    overviewDesktopOpenPref: false,
+    sidebarWidth: 252,
+    sidePanelWidth: 440,
+    overviewDesktopOpenPref: interactiveDemo,
     diffLayout: "unified",
+    draftProvider: "antigravity",
+    draftEffort: "high",
+    draftModels: {
+      antigravity: "gemini-4-neon",
+      gemini_cli: "gemini-4-neon",
+      claude_code: "claude-opus-5-5",
+      codex: "gpt-6.2-astra",
+    },
   };
 
   return `(() => {
+    const interactiveDemo = ${JSON.stringify(interactiveDemo)};
+    let demoLocale = "en";
+    try {
+      const qs = new URLSearchParams(window.location.search);
+      if (qs.get("lang") === "zh" || qs.get("lang") === "zh-CN") demoLocale = "zh";
+    } catch {}
+
+    const prefs = ${JSON.stringify(prefs)};
+    prefs.locale = demoLocale;
+
     try {
       window.localStorage.clear();
       window.sessionStorage.clear();
-      window.localStorage.setItem("orbit.desktop.prefs.v3", ${JSON.stringify(JSON.stringify(prefs))});
-      window.localStorage.setItem("orbit.desktop.locale.v1", "en");
+      window.localStorage.setItem("orbit.desktop.prefs.v3", JSON.stringify(prefs));
+      window.localStorage.setItem("orbit.desktop.locale.v1", demoLocale);
       window.localStorage.setItem("orbit.desktop.onboarding.completed.v1", "true");
       window.localStorage.setItem("orbit.desktop.thread_prefs_migrated.v1", "1");
     } catch {}
@@ -1193,21 +1577,72 @@ function buildShowcaseFixture(theme) {
         document.documentElement.classList.remove("dark");
         document.documentElement.style.colorScheme = "light";
       }
+      if (interactiveDemo && !document.getElementById("orbit-showcase-traffic-lights") && document.body) {
+        const dots = document.createElement("div");
+        dots.id = "orbit-showcase-traffic-lights";
+        dots.style.cssText =
+          "position:fixed;top:14px;left:16px;z-index:60;display:flex;gap:8px;align-items:center;pointer-events:none;";
+        for (const [bg, ring] of [
+          ["#FF5F57", "rgba(0,0,0,0.14)"],
+          ["#FEBC2E", "rgba(0,0,0,0.14)"],
+          ["#28C840", "rgba(0,0,0,0.14)"],
+        ]) {
+          const dot = document.createElement("span");
+          dot.style.cssText =
+            "width:12px;height:12px;border-radius:9999px;background:" + bg + ";box-shadow:inset 0 0 0 0.5px " + ring + ";";
+          dots.appendChild(dot);
+        }
+        document.body.appendChild(dots);
+      }
     };
     if (document.documentElement) syncTheme();
     document.addEventListener("DOMContentLoaded", syncTheme, { once: true });
 
     const hostDetails = ${JSON.stringify(hostDetails)};
+    const providerCatalogs = ${JSON.stringify(providerCatalogs)};
     const fleetHosts = ${JSON.stringify([hostMac, hostLinux, hostGpu])};
     const sidebarView = ${JSON.stringify(sidebarView)};
-    const mainAgent = ${JSON.stringify(agentPersonal)};
-    const mainTurns = ${JSON.stringify([turn1])};
-    const mainInsights = ${JSON.stringify(insights)};
+    const stageByAgent = ${JSON.stringify(stageByAgent)};
     const gitReview = ${JSON.stringify(gitReview)};
-    const diffFiles = ${JSON.stringify(diffFiles)};
 
+    let revisionCounter = 5;
     let nextCallbackId = 1;
     const callbacks = new Map();
+    let coreEventCb = null;
+    let coreEventSeq = 0;
+
+    const emitCoreEvent = (ev) => {
+      if (!coreEventCb) return;
+      const index = coreEventSeq++;
+      try {
+        coreEventCb({ index, message: ev });
+      } catch {}
+    };
+
+    const getStageRecord = (agentId) => stageByAgent[agentId] ?? stageByAgent.ag_personal_chief;
+
+    const findAgentHostId = (agentId, fallbackHostId) => {
+      for (const [hid, detail] of Object.entries(hostDetails)) {
+        if (detail.agents.some((a) => a.agent_id === agentId)) return hid;
+      }
+      return fallbackHostId ?? "host_mac_studio";
+    };
+
+    const mutateDemoAgent = (hostId, agentId, patch) => {
+      const targetHostId = findAgentHostId(agentId, hostId);
+      const detail = hostDetails[targetHostId];
+      if (detail) {
+        const ag = detail.agents.find((a) => a.agent_id === agentId);
+        if (ag) Object.assign(ag, patch);
+        detail.revision = ++revisionCounter;
+      }
+      const rec = stageByAgent[agentId];
+      if (rec?.agent) {
+        Object.assign(rec.agent, patch);
+      }
+      emitCoreEvent({ kind: "host_changed", host_id: targetHostId });
+      emitCoreEvent({ kind: "timeline_changed", host_id: targetHostId, agent_id: agentId });
+    };
 
     window.__TAURI_INTERNALS__ = {
       transformCallback(cb, once = false) {
@@ -1223,12 +1658,23 @@ function buildShowcaseFixture(theme) {
       },
       async invoke(cmd, args = {}) {
         switch (cmd) {
-          case "subscribe_core_events":
+          case "subscribe_core_events": {
+            const ch = args?.onEvent;
+            const cbId =
+              typeof ch === "object" && ch && typeof ch.id === "number"
+                ? ch.id
+                : typeof ch === "string" && ch.startsWith("__CHANNEL__:")
+                  ? Number(ch.slice("__CHANNEL__:".length))
+                  : null;
+            if (cbId != null && callbacks.has(cbId)) {
+              coreEventCb = callbacks.get(cbId).cb;
+            }
             return null;
+          }
           case "get_bridge_info":
-            return { protocol_version: 2, core_version: "0.10.4", capabilities: [] };
+            return { protocol_version: 2, core_version: "0.11.0", capabilities: [] };
           case "get_app_version":
-            return "0.10.4";
+            return "0.11.0";
           case "get_local_machine_info":
             return {
               hostname: "mac-studio.local",
@@ -1237,50 +1683,67 @@ function buildShowcaseFixture(theme) {
             };
           case "get_fleet_overview":
             return {
-              revision: 3,
-              total_pending_approvals: 1,
+              revision: revisionCounter,
+              total_pending_approvals: stageByAgent.ag_linux_deploy.pending_permissions.length,
               hosts: fleetHosts,
               projects: [],
             };
           case "get_host_detail":
             return hostDetails[args.hostId] ?? hostDetails.host_mac_studio;
           case "get_fleet_sidebar":
-            return sidebarView;
-          case "get_agent_stage":
+            return { ...sidebarView, revision: revisionCounter };
+          case "get_agent_stage": {
+            const rec = getStageRecord(args.agentId);
             return {
-              revision: 5,
-              host_id: args.hostId ?? "host_mac_studio",
-              agent: mainAgent,
-              turns: mainTurns,
-              pending_permissions: [],
+              revision: revisionCounter,
+              host_id: args.hostId ?? rec.host_id,
+              agent: rec.agent,
+              turns: rec.turns,
+              pending_permissions: rec.pending_permissions,
               pending_questions: [],
               pending_plan_approval: null,
-              session_turn_diffs: diffFiles,
-              insights: mainInsights,
-              latest_seq: 42,
+              session_turn_diffs: rec.session_turn_diffs,
+              insights: rec.insights,
+              latest_seq: rec.agent.latest_seq,
             };
-          case "get_agent_stage_delta":
+          }
+          case "get_agent_stage_delta": {
+            const rec = getStageRecord(args.agentId);
             return {
-              revision: 5,
-              host_id: args.hostId ?? "host_mac_studio",
-              agent: mainAgent,
+              revision: revisionCounter,
+              host_id: args.hostId ?? rec.host_id,
+              agent: rec.agent,
               replace_from_turn_index: 0,
               window_start_turn_index: 0,
-              changed_turns: mainTurns,
-              total_turn_count: mainTurns.length,
+              changed_turns: rec.turns,
+              total_turn_count: rec.turns.length,
               has_older_turns: false,
               has_older_history: false,
-              oldest_loaded_seq: 20,
-              pending_permissions: [],
+              oldest_loaded_seq: 1,
+              pending_permissions: rec.pending_permissions,
               pending_questions: [],
               pending_plan_approval: null,
-              session_turn_diffs: diffFiles,
-              insights: mainInsights,
-              latest_seq: 42,
+              session_turn_diffs: rec.session_turn_diffs,
+              insights: rec.insights,
+              latest_seq: rec.agent.latest_seq,
               reset: true,
-              aux_revision: 5,
+              aux_revision: revisionCounter,
               aux_unchanged: false,
             };
+          }
+          case "respond_permission":
+          case "resolve_permission": {
+            const rec = getStageRecord(args.agentId || "ag_linux_deploy");
+            rec.pending_permissions = [];
+            rec.agent.is_awaiting_permission = false;
+            rec.agent.status_label = "Idle";
+            sidebarView.needs_attention = [];
+            revisionCounter += 1;
+            return null;
+          }
+          case "send_prompt":
+          case "enqueue_prompt":
+            return interactiveDemo ? "demo_preview_readonly" : null;
           case "get_git_review":
             return gitReview;
           case "git_pr_status":
@@ -1302,18 +1765,56 @@ function buildShowcaseFixture(theme) {
               review_comments: [],
               unresolved_comment_count: 0,
             };
-          case "get_context_occupancy":
+          case "set_agent_config": {
+            if (args.agentId) {
+              const patch = {};
+              if (args.model !== undefined) patch.model = args.model;
+              if (args.effort !== undefined) patch.effort = args.effort;
+              mutateDemoAgent(args.hostId, args.agentId, patch);
+            }
+            return null;
+          }
+          case "set_agent_model": {
+            if (args.agentId) {
+              mutateDemoAgent(args.hostId, args.agentId, { model: args.model ?? null });
+            }
+            return null;
+          }
+          case "update_agent": {
+            if (args.agentId) {
+              const patch = {};
+              if (args.model !== undefined) patch.model = args.model;
+              if (args.effort !== undefined) patch.effort = args.effort;
+              if (args.fastMode !== undefined) patch.fast_mode = Boolean(args.fastMode);
+              if (args.mode !== undefined) patch.mode = args.mode;
+              mutateDemoAgent(args.hostId, args.agentId, patch);
+            }
+            return null;
+          }
+          case "get_context_occupancy": {
+            const rec = getStageRecord(args.agentId);
+            const activeModel = rec.agent?.model ?? "gemini-4-neon";
+            const isGemini = activeModel.startsWith("gemini-");
+            const windowTokens = isGemini ? 1000000 : activeModel.startsWith("gpt-") ? 272000 : 200000;
             return {
               agent_id: args.agentId ?? "ag_personal_chief",
-              model: "claude-opus-4-6",
-              context_window_tokens: 200000,
-              used_tokens: 46200,
-              occupancy_pct: 23.1,
-              segments: [],
+              model: activeModel,
+              context_window_tokens: windowTokens,
+              total_used_tokens: 46200,
+              occupancy_percent: Number(((46200 / windowTokens) * 100).toFixed(1)),
+              segments: [
+                { category: "system_tools", label: "System & Tools", tokens: 12400, percent: Number(((12400 / windowTokens) * 100).toFixed(1)) },
+                { category: "history", label: "Conversation", tokens: 21800, percent: Number(((21800 / windowTokens) * 100).toFixed(1)) },
+                { category: "tool_outputs", label: "Tool Outputs", tokens: 12000, percent: Number(((12000 / windowTokens) * 100).toFixed(1)) },
+              ],
             };
+          }
+          case "get_fallback_provider_catalogs":
+            return providerCatalogs;
+          case "refresh_provider_models":
+            return null;
           case "list_external_editors":
           case "list_ssh_hosts":
-          case "get_fallback_provider_catalogs":
           case "get_slash_commands":
           case "list_managed_skills":
           case "list_provider_subagents":
@@ -1935,7 +2436,9 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error("[capture-showcase] ERROR:", err);
-  process.exit(1);
-});
+if (path.resolve(process.argv[1] || "") === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    console.error("[capture-showcase] ERROR:", err);
+    process.exit(1);
+  });
+}

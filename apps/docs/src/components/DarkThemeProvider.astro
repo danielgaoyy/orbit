@@ -1,0 +1,12 @@
+{/* Enforce dark-only flagship palette before first paint (zero FOUC) */}
+<script is:inline>
+  window.StarlightThemeProvider = (() => {
+    document.documentElement.dataset.theme = "dark";
+    try {
+      localStorage.setItem("starlight-theme", "dark");
+    } catch {}
+    return {
+      updatePickers() {},
+    };
+  })();
+</script>

@@ -3,7 +3,7 @@ title: Quickstart
 description: Install the single static Orbit binary, bring up your first daemon, pair your devices, and activate your Personal Agent in five minutes.
 ---
 
-Orbit ships as a **single static Rust binary** (`orbit`) with zero Node.js or Python runtime dependencies. Every role—`daemon`, `shim`, `relay`, `pair`, `doctor`, and full multi-host orchestration CLI—is compiled into one executable.
+Orbit ships as a **single static Rust binary** (`orbit`) with zero Node.js or Python runtime dependencies. Every role (`daemon`, `shim`, `relay`, `pair`, `doctor`, and the multi-host orchestration CLI) compiles into one portable executable.
 
 ## 1. Install the `orbit` binary
 
@@ -59,13 +59,13 @@ orbit login --mesh
 
 ## 5. Activate your Personal Agent
 
-Instead of manually babysitting separate threads across machines:
+Instead of manually juggling separate threads across machines:
 
 1. Open **Settings → App → Personal Agent** in Orbit Desktop.
 2. Elect any always-on host in your fleet (such as a home Mac Studio or cloud Devbox) as your global **Personal Router** (`chief-of-staff`).
-3. Choose your preferred brain provider (`Claude Code`, `Codex`, `Antigravity`, or an ACP agent) and optionally connect **Feishu**, **Slack Socket Mode**, or **Discord Gateway v10** with zero public webhooks.
+3. Choose your preferred coordinator provider (`Claude Code`, `Codex`, `Antigravity`, or any ACP agent) and optionally connect **Slack Socket Mode**, **Discord Gateway v10**, or **Feishu / Lark** with zero public webhooks.
 
-Your Personal Agent now maintains a live delta view of every online machine, dispatches work across hosts into isolated Git worktrees, and alerts you only when a **Tier-3 human decision** is required.
+Your Personal Agent maintains a live incremental view of every online machine, dispatches work across hosts into isolated Git worktrees, and pings you only when an irreversible **Tier-3 human decision** (such as a production push, deploy, or secret rotation) is required.
 
 ## Next steps
 

@@ -6,6 +6,7 @@ import { defineConfig } from "vite";
 const host = process.env.TAURI_DEV_HOST;
 
 export default defineConfig({
+  base: process.env.ORBIT_DESKTOP_BASE || "/",
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {

@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - "apps/docs/**"
+      - "apps/desktop/**"
       - ".github/workflows/docs-pages.yml"
   workflow_dispatch:
 
@@ -28,10 +29,17 @@ jobs:
         with:
           node-version: "22"
           cache: "npm"
-          cache-dependency-path: apps/docs/package-lock.json
+          cache-dependency-path: |
+            apps/desktop/package-lock.json
+            apps/docs/package-lock.json
       - name: Configure GitHub Pages
         id: pages
         uses: actions/configure-pages@v5
+      - name: Build Embedded Desktop Web Demo Bundle
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          node scripts/build-docs-demo.mjs
       - name: Install & Build Bilingual Docs Site
         working-directory: apps/docs
         env:

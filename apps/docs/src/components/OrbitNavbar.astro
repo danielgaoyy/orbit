@@ -1,0 +1,147 @@
+---
+import { getLandingCopy, type LandingLang } from "../data/landing-copy";
+import OrbitCommunityIcon from "./OrbitCommunityIcon.astro";
+
+interface Props {
+  lang: LandingLang;
+  active?: "home" | "download";
+  pageSlug?: string;
+}
+
+const { lang, active = "home", pageSlug = "" } = Astro.props;
+const isZh = lang === "zh-CN";
+const base = import.meta.env.BASE_URL.replace(/\/+$/, "");
+const prefix = isZh ? `${base}/zh-cn` : base;
+const copy = getLandingCopy(lang, base, prefix);
+
+const cleanSlug = pageSlug.replace(/^\/+/, "");
+const enRoute = `${base}/${cleanSlug}`;
+const zhRoute = `${base}/zh-cn/${cleanSlug}`;
+const allReleasesUrl = "https://github.com/danielgaoyy/orbit/releases";
+const repoUrl = "https://github.com/danielgaoyy/orbit";
+---
+
+<nav class="orbit-nav" aria-label="Primary" data-orbit-nav>
+  <div class="orbit-nav-inner">
+    <a class="orbit-brand" href={`${prefix}/`}>
+      <svg class="orbit-brand-mark" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+        <circle cx="14" cy="14" r="10.5" stroke="currentColor" stroke-width="1.5" stroke-opacity="0.35" />
+        <ellipse
+          cx="14"
+          cy="14"
+          rx="11.5"
+          ry="4.8"
+          transform="rotate(-24 14 14)"
+          stroke="currentColor"
+          stroke-width="1.6"
+        />
+        <circle cx="14" cy="14" r="3.2" fill="currentColor" />
+        <circle cx="23.2" cy="9.8" r="2.1" fill="var(--orbit-accent-cyan)" />
+      </svg>
+      <span>Orbit</span>
+    </a>
+
+    <div class="orbit-nav-right">
+      <div class="orbit-nav-links">
+        <a href={`${prefix}/getting-started/quickstart/`}>{copy.nav.docs}</a>
+        <a href={allReleasesUrl} target="_blank" rel="noopener noreferrer">{copy.nav.changelog}</a>
+
+        <div class="orbit-nav-menu" data-nav-menu="community">
+          <button
+            type="button"
+            class="orbit-menu-trigger"
+            data-menu-trigger
+            aria-expanded="false"
+            aria-controls="orbit-community-pop"
+          >
+            <span>{copy.nav.community}</span>
+            <svg class="orbit-menu-chev" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+              <path d="M3 4.5 6 7.5 9 4.5" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
+          <div class="orbit-menu-pop orbit-community-pop" id="orbit-community-pop" data-menu-pop hidden>
+            {copy.nav.communityItems.map((item) => (
+              <a
+                class="orbit-menu-opt"
+                href={item.href}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <span class="orbit-menu-opt-ico" aria-hidden="true">
+                  <OrbitCommunityIcon id={item.id} />
+                </span>
+                <span>{item.label}</span>
+              </a>
+            ))}
+          </div>
+        </div>
+
+        <a
+          href={`${prefix}/download/`}
+          aria-current={active === "download" ? "page" : undefined}
+        >
+          {copy.nav.download}
+        </a>
+      </div>
+
+      <div class="orbit-nav-utils">
+        <div class="orbit-nav-menu" data-nav-menu="lang">
+          <button
+            type="button"
+            class="orbit-menu-trigger"
+            data-menu-trigger
+            aria-expanded="false"
+            aria-controls="orbit-lang-pop"
+            aria-label="Switch language"
+          >
+            <svg class="orbit-lang-ico" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+              <path
+                d="M3.5 5.2h7.6M7.3 3.4v1.8m2.3 0c-.5 2.8-2.2 5.4-5.2 7.2m1.2-4.6c.9 1.6 2.3 3.2 4 4.3M11.4 16.5l2.7-7.2 2.7 7.2m-4.5-2.2h3.6"
+                stroke="currentColor"
+                stroke-width="1.45"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+            <span>{copy.nav.langCurrentCode}</span>
+            <svg class="orbit-menu-chev" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+              <path d="M3 4.5 6 7.5 9 4.5" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
+          <div class="orbit-menu-pop" id="orbit-lang-pop" data-menu-pop hidden>
+            <a class={`orbit-menu-opt ${!isZh ? "is-active" : ""}`} href={enRoute}>
+              <span>English</span>
+              {!isZh && <span class="orbit-menu-chk" aria-hidden="true">✓</span>}
+            </a>
+            <a class={`orbit-menu-opt ${isZh ? "is-active" : ""}`} href={zhRoute}>
+              <span>简体中文</span>
+              {isZh && <span class="orbit-menu-chk" aria-hidden="true">✓</span>}
+            </a>
+          </div>
+        </div>
+
+        <a
+          class="orbit-gh-inline"
+          href={repoUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          aria-label="Star Orbit on GitHub"
+        >
+          <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+            <path
+              fill-rule="evenodd"
+              clip-rule="evenodd"
+              d="M10 1.8a8.2 8.2 0 0 0-2.6 16c.4.1.6-.2.6-.4v-1.4c-2.3.5-2.8-1-2.8-1-.4-.9-.9-1.2-.9-1.2-.8-.5.1-.5.1-.5.8.1 1.3.8 1.3.8.7 1.3 1.9.9 2.4.7.1-.5.3-.9.5-1.1-1.8-.2-3.7-.9-3.7-4 0-.9.3-1.6.8-2.2-.1-.2-.4-1 .1-2.2 0 0 .7-.2 2.3.8a7.8 7.8 0 0 1 4.1 0c1.6-1 2.3-.8 2.3-.8.4 1.2.2 2 .1 2.2.5.6.8 1.3.8 2.2 0 3.1-1.9 3.8-3.7 4 .3.2.5.7.5 1.5v2.2c0 .2.2.5.6.4a8.2 8.2 0 0 0-2.6-16Z"
+            />
+          </svg>
+          <span class="orbit-star-count" data-gh-stars>{copy.nav.starFallback}</span>
+        </a>
+      </div>
+    </div>
+  </div>
+</nav>
+
+<script>
+  import { initOrbitNavbar } from "../scripts/nav-controls";
+  initOrbitNavbar("[data-orbit-nav]");
+</script>

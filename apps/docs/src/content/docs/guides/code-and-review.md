@@ -11,7 +11,7 @@ Open any local or remote workspace file in the right Side Panel (`⌘P` / `Ctrl+
 
 - **Instant Rust-assisted preview**: Uses Rust 250-line prefix syntax highlighting, promise-deduplicated hover/pointerdown intent prefetch, and a stale-while-revalidate file cache so remote files feel instantaneous.
 - **First-class Language Server Protocol (LSP)**: Query workspace symbols, hover types, jump to definition, inspect references, view inline diagnostics, trigger code actions, and execute safe cross-file renames over the remote host's language servers (`lsp_hover`, `lsp_goto_definition`, `lsp_references`, `lsp_rename`, `lsp_apply_workspace_edit`).
-- **FIM (Fill-in-the-Middle) Ghost Text**: Low-latency inline edit predictions appear directly inside CodeMirror 6 as calm translucent ghost text, respecting Orbit's *Orbital Quiet Precision* restraint—accept with `Tab`, dismiss with `Esc`, with zero popup clutter.
+- **FIM (Fill-in-the-Middle) Ghost Text**: Low-latency inline edit predictions appear directly inside CodeMirror 6 as calm translucent ghost text — accept with `Tab` or dismiss with `Esc`, with zero popup clutter.
 
 ## Interactive Conversation & File Rewind
 

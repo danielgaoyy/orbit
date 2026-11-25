@@ -1,0 +1,479 @@
+---
+import OrbitNavbar from "./OrbitNavbar.astro";
+import OrbitFooter from "./OrbitFooter.astro";
+import { ORBIT_VERSION, type LandingLang } from "../data/landing-copy";
+
+interface Props {
+  lang: LandingLang;
+}
+
+const { lang } = Astro.props;
+const isZh = lang === "zh-CN";
+const base = import.meta.env.BASE_URL.replace(/\/+$/, "");
+const prefix = isZh ? `${base}/zh-cn` : base;
+
+const releaseBase = "https://github.com/danielgaoyy/orbit/releases/latest/download";
+const latestReleaseUrl = "https://github.com/danielgaoyy/orbit/releases/latest";
+const allReleasesUrl = "https://github.com/danielgaoyy/orbit/releases";
+const checksumsUrl = `${releaseBase}/SHA256SUMS.txt`;
+
+const macDmg = `${releaseBase}/Orbit-macOS-AppleSilicon.dmg`;
+const winExe = `${releaseBase}/Orbit-Windows-x64-setup.exe`;
+const winMsi = `${releaseBase}/Orbit-Windows-x64.msi`;
+const linuxDebX64 = `${releaseBase}/Orbit-Linux-x64.deb`;
+const linuxDebArm64 = `${releaseBase}/Orbit-Linux-arm64.deb`;
+
+const cliMacArm64 = `${releaseBase}/orbit-cli-macos-arm64`;
+const cliLinuxX64 = `${releaseBase}/orbit-cli-linux-x64`;
+const cliLinuxArm64 = `${releaseBase}/orbit-cli-linux-arm64`;
+const cliWinX64 = `${releaseBase}/orbit-windows-x86_64.exe`;
+
+const iosIpa = `${releaseBase}/Orbit-iOS-sideload.ipa`;
+const harmonyHap = `${releaseBase}/Orbit-HarmonyOS.hap`;
+
+const cliTabs = [
+  {
+    id: "install",
+    label: isZh ? "一键安装 (macOS / Linux)" : "Quick Install (macOS / Linux)",
+    cmd: "curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh",
+    hint: isZh
+      ? "安装脚本自动识别架构并校验下载产物的 SHA-256，单静态二进制零 Node / Python 依赖。"
+      : "Auto-detects architecture and verifies SHA-256 of downloaded artifacts. Single static binary — zero Node or Python runtime.",
+  },
+  {
+    id: "pair",
+    label: isZh ? "启动并配对" : "Start & Pair",
+    cmd: "orbit daemon up && orbit pair",
+    hint: isZh
+      ? "默认仅绑定本机回环 127.0.0.1:6868，生成二维码供手机或桌面端秒连。"
+      : "Binds loopback 127.0.0.1:6868 by default and prints a Noise E2EE pairing QR for mobile & desktop.",
+  },
+  {
+    id: "web",
+    label: isZh ? "开启 Web WASM PWA" : "Serve Web WASM PWA",
+    cmd: "orbit daemon up --serve-web",
+    hint: isZh
+      ? "零安装浏览器客户端，Noise_NKpsk0 握手全程在浏览器 WASM 内完成。"
+      : "Zero-install browser PWA with mutual Noise_NKpsk0 E2EE running entirely inside WebAssembly.",
+  },
+];
+
+const copy = isZh
+  ? {
+      badgeTag: ORBIT_VERSION,
+      badgeText: "查看最新 Release Notes",
+      title: "下载 Orbit",
+      subtitle: "覆盖桌面与移动端的原生客户端，以及零外部依赖的单静态 Rust 宿主二进制。",
+      dlNeutral: "下载 Orbit",
+      dlMac: "下载 macOS 版 (Apple Silicon)",
+      dlWin: "下载 Windows 版 (x64)",
+      dlLinux: "下载 Linux 版 (.deb x64)",
+      dlMobile: "跳转移动端下载",
+      allReleases: "查看全部版本",
+      recommended: "当前设备推荐",
+      desktopTitle: "桌面端应用",
+      desktopSub: "基于 Tauri v2 与共享 Rust 引擎构建，120Hz 原生渲染，内置多主机编排、分屏终端、CodeMirror 6 与 Orbit Patrol。",
+      macNote: "macOS 13+ · Apple Silicon (arm64)",
+      macAlt: "首次启动若遇 Gatekeeper 提示，请查看 Release 说明执行 xattr 放行。",
+      winNote: "Windows 10 / 11 · x64",
+      winAlt: "同时提供企业静默部署 .msi 安装包。",
+      linuxNote: "Debian / Ubuntu · x64 & arm64",
+      linuxAlt: "同时支持 ARM64 Debian 包与纯静态 musl CLI。",
+      cliTitle: "宿主 CLI 与 Daemon（单静态 Rust 二进制）",
+      cliSub: "在任何 Mac Studio、Linux 构建机或裸 GPU 服务器上三秒就绪，集成 daemon、setsid shim、blind relay 与 doctor。",
+      copyIdle: "复制",
+      copyDone: "已复制",
+      copyFallback: "按 ⌘C 复制",
+      directBins: "直接下载静态二进制：",
+      mobileTitle: "移动端与零知识 Web 客户端",
+      mobileSub: "一套纯 Rust ViewModel 驱动全端，支持灵动岛、折叠屏自适应、离线语音与 Noise E2EE 直连 / 盲中继。",
+      iosDesc: "SwiftUI 原生 · 灵动岛 Live Activity · APNs 推送 · Keychain 硬件主密钥。",
+      iosCta: "下载 iOS IPA",
+      androidDesc: "Jetpack Compose · 折叠屏双栏自适应 · FCM · Android Keystore 加密。",
+      androidCta: "前往 Releases 获取 APK",
+      harmonyDesc: "ArkTS V2 · 折叠屏悬停态 · HUKS 硬件主密钥 · 完整原生 N-API 绑定。",
+      harmonyCta: "下载 HarmonyOS HAP",
+      webDesc: "orbit-client-wasm · 浏览器内零知识端到端加密 · 无需安装即开即用。",
+      webCta: "查看 Web PWA 指南",
+      verifyTitle: "校验与快速上手",
+      verifySha: "下载 SHA256SUMS.txt 校验文件",
+      verifyQuickstart: "阅读 5 分钟上手文档",
+      verifySecurity: "了解零知识安全架构",
+    }
+  : {
+      badgeTag: ORBIT_VERSION,
+      badgeText: "View latest release notes",
+      title: "Download Orbit",
+      subtitle: "Native apps for every screen, plus one zero-dependency static Rust binary for your hosts.",
+      dlNeutral: "Download Orbit",
+      dlMac: "Download for macOS (Apple Silicon)",
+      dlWin: "Download for Windows (x64)",
+      dlLinux: "Download for Linux (.deb x64)",
+      dlMobile: "Jump to Mobile Clients",
+      allReleases: "All Releases on GitHub",
+      recommended: "Recommended",
+      desktopTitle: "Desktop Apps",
+      desktopSub: "Built with Tauri v2 and the shared Rust core. 120Hz native chrome with fleet orchestration, split PTY, CodeMirror 6, and Orbit Patrol.",
+      macNote: "macOS 13+ · Apple Silicon (arm64)",
+      macAlt: "First launch ad-hoc note & xattr command included in release notes.",
+      winNote: "Windows 10 / 11 · x64",
+      winAlt: "Both interactive NSIS setup and enterprise .msi installer included.",
+      linuxNote: "Debian / Ubuntu · x64 & arm64",
+      linuxAlt: "Native .deb packages plus zero-glibc musl static CLI for any distro.",
+      cliTitle: "Host CLI & Daemon (Single Static Binary)",
+      cliSub: "Drop onto any Mac Studio, Linux build server, or bare GPU box in 3 seconds — bundles daemon, setsid shim, blind relay, and doctor.",
+      copyIdle: "Copy",
+      copyDone: "Copied",
+      copyFallback: "Press ⌘C",
+      directBins: "Direct static binaries:",
+      mobileTitle: "Mobile & Zero-Knowledge Web",
+      mobileSub: "One pure-Rust ViewModel powers every surface — Dynamic Island, foldables, offline Whisper voice, and Noise E2EE failover.",
+      iosDesc: "Native SwiftUI · Dynamic Island Live Activity · APNs push · Keychain master key.",
+      iosCta: "Download iOS IPA",
+      androidDesc: "Jetpack Compose · Foldable split-screen · FCM push · Android Keystore.",
+      androidCta: "Get APK on Releases",
+      harmonyDesc: "Native ArkTS V2 · Foldable posture support · HUKS master key · native N-API core.",
+      harmonyCta: "Download HarmonyOS HAP",
+      webDesc: "orbit-client-wasm · In-browser Noise_NKpsk0 E2EE · Zero install via --serve-web.",
+      webCta: "Read Web PWA Guide",
+      verifyTitle: "Verify & Get Started",
+      verifySha: "Download SHA256SUMS.txt",
+      verifyQuickstart: "5-Minute Quickstart",
+      verifySecurity: "Zero-Knowledge Security Model",
+    };
+---
+
+<div class="orbit-landing orbit-download-page" data-orbit-download>
+  <OrbitNavbar lang={lang} active="download" pageSlug="download/" />
+
+  <section class="orbit-dl-hero">
+    <div class="orbit-hero-glow" aria-hidden="true"></div>
+    <div class="orbit-wrap orbit-hero-inner">
+      <div class="orbit-hero-head">
+        <a class="orbit-pill" href={latestReleaseUrl} target="_blank" rel="noopener noreferrer">
+          <span class="orbit-pill-tag">{copy.badgeTag}</span>
+          <span>{copy.badgeText}</span>
+          <span aria-hidden="true">↗</span>
+        </a>
+
+        <h1 class="orbit-hero-title">{copy.title}</h1>
+        <p class="orbit-hero-sub">{copy.subtitle}</p>
+
+        <div class="orbit-hero-actions">
+          <a
+            class="orbit-btn orbit-btn-primary"
+            href="#desktop-downloads"
+            data-os-download
+            data-href-mac={macDmg}
+            data-href-win={winExe}
+            data-href-linux={linuxDebX64}
+            data-href-mobile="#mobile-downloads"
+            data-label-mac={copy.dlMac}
+            data-label-win={copy.dlWin}
+            data-label-linux={copy.dlLinux}
+            data-label-mobile={copy.dlMobile}
+          >
+            <svg class="orbit-btn-icon" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+              <path d="M9 2.5v8.8m0 0-3.2-3.2M9 11.3l3.2-3.2M3.5 14.5h11" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <span data-os-label>{copy.dlNeutral}</span>
+          </a>
+
+          <a class="orbit-btn orbit-btn-secondary" href={allReleasesUrl} target="_blank" rel="noopener noreferrer">
+            <span>{copy.allReleases}</span>
+            <span aria-hidden="true">↗</span>
+          </a>
+        </div>
+
+        <div class="orbit-dl-meta-line">
+          <span>MIT / Apache-2.0</span>
+          <span aria-hidden="true">·</span>
+          <a href={checksumsUrl} target="_blank" rel="noopener noreferrer">
+            <span>SHA256SUMS.txt</span>
+            <span aria-hidden="true">↗</span>
+          </a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 1. DESKTOP APPS (macOS / Windows / Linux) -->
+  <section class="orbit-section orbit-dl-section" id="desktop-downloads">
+    <div class="orbit-wrap">
+      <div class="orbit-dl-head">
+        <h2 class="orbit-dl-h2">{copy.desktopTitle}</h2>
+        <p class="orbit-dl-sub">{copy.desktopSub}</p>
+      </div>
+
+      <div class="orbit-dl-grid-3">
+        <article class="orbit-dl-card" data-os-card="mac">
+          <div class="orbit-dl-card-top">
+            <div class="orbit-dl-os-title">
+              <svg class="orbit-dl-os-ico" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                <path d="M13.6 10.6c0-1.9 1.6-2.9 1.7-3-.9-1.4-2.4-1.6-2.9-1.6-1.2-.1-2.4.7-3 .7-.6 0-1.6-.7-2.6-.7-1.3 0-2.6.8-3.3 2-1.4 2.4-.4 6 1 8 .7 1 1.5 2.1 2.5 2 1 0 1.4-.6 2.6-.6 1.2 0 1.5.6 2.6.6 1.1 0 1.8-1 2.4-2 .8-1.1 1.1-2.2 1.1-2.3 0 0-2.1-.8-2.1-3.1ZM11.7 4.7c.6-.7 1-1.6.9-2.6-.8 0-1.8.6-2.4 1.3-.5.6-1 1.6-.8 2.5.9.1 1.8-.5 2.3-1.2Z" />
+              </svg>
+              <h3>macOS</h3>
+            </div>
+            <span class="orbit-dl-rec" data-os-badge hidden>{copy.recommended}</span>
+          </div>
+          <p class="orbit-dl-spec">{copy.macNote}</p>
+          <div class="orbit-dl-card-actions">
+            <a class="orbit-btn orbit-btn-secondary orbit-btn-sm" href={macDmg}>
+              <span>Apple Silicon (.dmg)</span>
+            </a>
+            <a class="orbit-dl-link" href={cliMacArm64}>
+              <span>orbit-cli-macos-arm64</span>
+              <span aria-hidden="true">↓</span>
+            </a>
+          </div>
+          <p class="orbit-dl-footnote">{copy.macAlt}</p>
+        </article>
+
+        <article class="orbit-dl-card" data-os-card="win">
+          <div class="orbit-dl-card-top">
+            <div class="orbit-dl-os-title">
+              <svg class="orbit-dl-os-ico" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                <path d="M2.5 4.3 9.2 3.4v6.2H2.5V4.3Zm7.6-1 7.4-1v7.3h-7.4V3.3ZM2.5 10.5h6.7v6.2l-6.7-.9v-5.3Zm7.6 0h7.4v7.2l-7.4-1v-6.2Z" />
+              </svg>
+              <h3>Windows</h3>
+            </div>
+            <span class="orbit-dl-rec" data-os-badge hidden>{copy.recommended}</span>
+          </div>
+          <p class="orbit-dl-spec">{copy.winNote}</p>
+          <div class="orbit-dl-card-actions">
+            <a class="orbit-btn orbit-btn-secondary orbit-btn-sm" href={winExe}>
+              <span>Setup Installer (.exe)</span>
+            </a>
+            <a class="orbit-dl-link" href={winMsi}>
+              <span>Enterprise (.msi)</span>
+              <span aria-hidden="true">↓</span>
+            </a>
+          </div>
+          <p class="orbit-dl-footnote">{copy.winAlt}</p>
+        </article>
+
+        <article class="orbit-dl-card" data-os-card="linux">
+          <div class="orbit-dl-card-top">
+            <div class="orbit-dl-os-title">
+              <svg class="orbit-dl-os-ico" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                <rect x="2.8" y="3.5" width="14.4" height="13" rx="2.4" stroke="currentColor" stroke-width="1.5" />
+                <path d="M6.2 8.2 8.8 10.4 6.2 12.6M10.4 12.6h3.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+              <h3>Linux</h3>
+            </div>
+            <span class="orbit-dl-rec" data-os-badge hidden>{copy.recommended}</span>
+          </div>
+          <p class="orbit-dl-spec">{copy.linuxNote}</p>
+          <div class="orbit-dl-card-actions">
+            <a class="orbit-btn orbit-btn-secondary orbit-btn-sm" href={linuxDebX64}>
+              <span>Ubuntu / Debian x64 (.deb)</span>
+            </a>
+            <a class="orbit-dl-link" href={linuxDebArm64}>
+              <span>ARM64 (.deb)</span>
+              <span aria-hidden="true">↓</span>
+            </a>
+          </div>
+          <p class="orbit-dl-footnote">{copy.linuxAlt}</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- 2. HOST CLI & DAEMON -->
+  <section class="orbit-section orbit-dl-section" id="cli-downloads">
+    <div class="orbit-wrap">
+      <div class="orbit-dl-head">
+        <h2 class="orbit-dl-h2">{copy.cliTitle}</h2>
+        <p class="orbit-dl-sub">{copy.cliSub}</p>
+      </div>
+
+      <div class="orbit-dl-cli-box" data-cli-tabs>
+        <div class="orbit-dl-cli-top">
+          <div class="orbit-seg-bar orbit-dl-seg" role="group" aria-label="CLI install commands">
+            {cliTabs.map((t, idx) => (
+              <button
+                type="button"
+                class="orbit-seg-btn"
+                data-cli-tab={t.id}
+                data-cli-cmd={t.cmd}
+                data-cli-hint={t.hint}
+                aria-pressed={idx === 0 ? "true" : "false"}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div class="orbit-dl-cmd-row">
+          <span class="orbit-cli-prompt" aria-hidden="true">$</span>
+          <code data-cli-code>{cliTabs[0].cmd}</code>
+          <button
+            type="button"
+            class="orbit-copy-btn"
+            data-dl-copy
+            aria-live="polite"
+            data-label-idle={copy.copyIdle}
+            data-label-done={copy.copyDone}
+            data-label-fallback={copy.copyFallback}
+          >
+            {copy.copyIdle}
+          </button>
+        </div>
+
+        <p class="orbit-dl-cli-hint" data-cli-hint-out>{cliTabs[0].hint}</p>
+
+        <div class="orbit-dl-bin-bar">
+          <span>{copy.directBins}</span>
+          <a href={cliLinuxX64}>linux-x64 (musl)</a>
+          <a href={cliLinuxArm64}>linux-arm64 (musl)</a>
+          <a href={cliMacArm64}>macos-arm64</a>
+          <a href={cliWinX64}>windows-x64.exe</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3. MOBILE & ZERO-KNOWLEDGE WEB CLIENTS -->
+  <section class="orbit-section orbit-dl-section" id="mobile-downloads">
+    <div class="orbit-wrap">
+      <div class="orbit-dl-head">
+        <h2 class="orbit-dl-h2">{copy.mobileTitle}</h2>
+        <p class="orbit-dl-sub">{copy.mobileSub}</p>
+      </div>
+
+      <div class="orbit-dl-grid-4">
+        <article class="orbit-dl-mini-card">
+          <div class="orbit-dl-mini-tag">SwiftUI · Live Activity</div>
+          <h3>iOS</h3>
+          <p>{copy.iosDesc}</p>
+          <a class="orbit-dl-link" href={iosIpa}>
+            <span>{copy.iosCta}</span>
+            <span aria-hidden="true">↓</span>
+          </a>
+        </article>
+
+        <article class="orbit-dl-mini-card">
+          <div class="orbit-dl-mini-tag">Compose · Foldables</div>
+          <h3>Android</h3>
+          <p>{copy.androidDesc}</p>
+          <a class="orbit-dl-link" href={latestReleaseUrl} target="_blank" rel="noopener noreferrer">
+            <span>{copy.androidCta}</span>
+            <span aria-hidden="true">↗</span>
+          </a>
+        </article>
+
+        <article class="orbit-dl-mini-card">
+          <div class="orbit-dl-mini-tag">ArkTS V2 · Foldables</div>
+          <h3>HarmonyOS NEXT</h3>
+          <p>{copy.harmonyDesc}</p>
+          <a class="orbit-dl-link" href={harmonyHap}>
+            <span>{copy.harmonyCta}</span>
+            <span aria-hidden="true">↓</span>
+          </a>
+        </article>
+
+        <article class="orbit-dl-mini-card">
+          <div class="orbit-dl-mini-tag">Rust WASM · PWA</div>
+          <h3>Web WASM PWA</h3>
+          <p>{copy.webDesc}</p>
+          <a class="orbit-dl-link" href={`${prefix}/guides/clients-and-voice/`}>
+            <span>{copy.webCta}</span>
+            <span aria-hidden="true">→</span>
+          </a>
+        </article>
+      </div>
+
+      <div class="orbit-dl-verify-strip">
+        <strong>{copy.verifyTitle}</strong>
+        <div class="orbit-dl-verify-links">
+          <a href={checksumsUrl} target="_blank" rel="noopener noreferrer">
+            <span>{copy.verifySha}</span>
+            <span aria-hidden="true">↗</span>
+          </a>
+          <a href={`${prefix}/getting-started/quickstart/`}>
+            <span>{copy.verifyQuickstart}</span>
+            <span aria-hidden="true">→</span>
+          </a>
+          <a href={`${prefix}/guides/security-sandbox/`}>
+            <span>{copy.verifySecurity}</span>
+            <span aria-hidden="true">→</span>
+          </a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <OrbitFooter lang={lang} />
+</div>
+
+<script>
+  import { detectClientPlatform, hydrateOsDownloadButtons } from "../scripts/os-detect";
+
+  (() => {
+    const root = document.querySelector<HTMLElement>("[data-orbit-download]");
+    if (!root) return;
+
+    const platform = detectClientPlatform();
+    hydrateOsDownloadButtons(root, platform);
+
+    const desktopOs = platform === "mobile" ? "" : platform;
+    root.querySelectorAll<HTMLElement>("[data-os-card]").forEach((card) => {
+      const match = Boolean(desktopOs && card.dataset.osCard === desktopOs);
+      card.classList.toggle("is-recommended", match);
+      const badge = card.querySelector<HTMLElement>("[data-os-badge]");
+      if (badge) badge.hidden = !match;
+      const btn = card.querySelector<HTMLElement>(".orbit-btn");
+      if (btn) {
+        btn.classList.toggle("orbit-btn-primary", match);
+        btn.classList.toggle("orbit-btn-secondary", !match);
+      }
+    });
+
+    const cliRoot = root.querySelector<HTMLElement>("[data-cli-tabs]");
+    if (cliRoot) {
+      const tabs = cliRoot.querySelectorAll<HTMLButtonElement>("[data-cli-tab]");
+      const codeEl = cliRoot.querySelector<HTMLElement>("[data-cli-code]");
+      const hintEl = cliRoot.querySelector<HTMLElement>("[data-cli-hint-out]");
+      const copyBtn = cliRoot.querySelector<HTMLButtonElement>("[data-dl-copy]");
+
+      tabs.forEach((tab) => {
+        tab.addEventListener("click", () => {
+          tabs.forEach((t) => t.setAttribute("aria-pressed", t === tab ? "true" : "false"));
+          if (codeEl && tab.dataset.cliCmd) codeEl.textContent = tab.dataset.cliCmd;
+          if (hintEl && tab.dataset.cliHint) hintEl.textContent = tab.dataset.cliHint;
+        });
+      });
+
+      const flashLabel = (btn: HTMLButtonElement, text: string) => {
+        btn.textContent = text;
+        window.setTimeout(() => {
+          btn.textContent = btn.dataset.labelIdle || "Copy";
+        }, 1600);
+      };
+
+      copyBtn?.addEventListener("click", async () => {
+        const text = codeEl?.textContent?.trim() || "";
+        if (!text) return;
+        try {
+          await navigator.clipboard.writeText(text);
+          flashLabel(copyBtn, copyBtn.dataset.labelDone || "Copied");
+        } catch {
+          try {
+            const ta = document.createElement("textarea");
+            ta.value = text;
+            ta.style.position = "fixed";
+            ta.style.opacity = "0";
+            document.body.appendChild(ta);
+            ta.select();
+            const ok = document.execCommand("copy");
+            document.body.removeChild(ta);
+            flashLabel(copyBtn, ok ? copyBtn.dataset.labelDone || "Copied" : copyBtn.dataset.labelFallback || "Press ⌘C");
+          } catch {
+            flashLabel(copyBtn, copyBtn.dataset.labelFallback || "Press ⌘C");
+          }
+        }
+      });
+    }
+  })();
+</script>

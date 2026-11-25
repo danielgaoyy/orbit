@@ -37,26 +37,26 @@ All commands live inside the single static `orbit` binary (`crates/orbit-cli`).
 ```text
 orbit/
 ├── crates/
-│   ├── orbit-protocol/        # Wire protocol, state enums, Zstd frame compression
-│   ├── orbit-crypto/          # Noise_NKpsk0_25519_ChaChaPoly_SHA256 E2EE & pairing
-│   ├── orbit-store/           # Embedded SQLite WAL (daemon, client replica, FTS5 memory, audit chain)
-│   ├── orbit-shim/            # Detached setsid process shell (Unix Socket + portable-pty + egress proxy)
-│   ├── orbit-providers/       # Native (Claude, Codex, Antigravity, Pi) + 34+ ACP registry drivers
-│   ├── orbit-daemon/          # Host daemon (Personal Router, IM longconn, Sandbox, Guardian, LSP, Git)
+│   ├── orbit-protocol/        # Wire protocol, state enums, Zstd framing
+│   ├── orbit-crypto/          # Noise_NKpsk0 E2EE & pairing credentials
+│   ├── orbit-store/           # SQLite WAL, FTS5 memory, audit chain
+│   ├── orbit-shim/            # Detached setsid shell, PTY, egress proxy
+│   ├── orbit-providers/       # Native CLIs + 34+ ACP registry drivers
+│   ├── orbit-daemon/          # Router, IM runner, Sandbox, LSP, Git
 │   ├── orbit-relay/           # < 6 MB zero-knowledge blind E2EE relay
-│   ├── orbit-relay-transport/ # Shared Relay & ssh+relay tunnel transport
-│   ├── orbit-client-core/     # Shared MVU ViewModel, connection pool, Markdown/Highlight/Diff/VT100/Diagram
-│   ├── orbit-ffi-uniffi/      # UniFFI v0.32 bindings (iOS SwiftUI & Android Jetpack Compose)
-│   ├── orbit-uniffi-bindgen/  # Standalone UniFFI CLI binding generator
-│   ├── orbit-ffi-ohos/        # ohos-rs N-API bindings (HarmonyOS 7+ ArkUI V2)
+│   ├── orbit-relay-transport/ # Shared Relay & ssh+relay tunnel client
+│   ├── orbit-client-core/     # Shared MVU core, pools, Diff, VT100
+│   ├── orbit-ffi-uniffi/      # UniFFI v0.32 bindings (iOS & Android)
+│   ├── orbit-uniffi-bindgen/  # Standalone UniFFI binding generator
+│   ├── orbit-ffi-ohos/        # ohos-rs N-API bindings (HarmonyOS 7+)
 │   └── orbit-cli/             # Single static multi-role binary
 └── apps/
-    ├── desktop/               # Tauri v2 + React 19 + Base UI + CodeMirror 6 + xterm.js WebGL
-    ├── web/ (WASM PWA)        # Browser & installable PWA powered by orbit-client-core WASM
+    ├── desktop/               # Tauri v2, React 19, CodeMirror 6, xterm
+    ├── web/ (WASM PWA)        # Browser PWA powered by Rust WASM core
     ├── ios/                   # Swift + SwiftUI + Live Activity
     ├── android/               # Kotlin 2.1 + Jetpack Compose Material 3
     ├── harmony/               # Stage Model + ArkTS + ArkUI V2
-    └── docs/                  # Astro Starlight bilingual showcase & documentation site
+    └── docs/                  # Astro Starlight bilingual docs site
 ```
 
 ## Process Isolation Invariant (`orbit shim`)

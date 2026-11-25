@@ -22,6 +22,7 @@ apps/desktop/src-tauri/gen/
 apps/docs/node_modules/
 apps/docs/dist/
 apps/docs/.astro/
+apps/docs/public/desktop-demo/
 
 # iOS Native (XcodeGen + XCFramework artifacts)
 apps/ios/build/

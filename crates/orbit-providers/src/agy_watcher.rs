@@ -182,6 +182,7 @@ impl ManagerState {
             let mut applied_effective = old_effective.clone();
             let mut watch_race_retry = false;
             let mut mutated_os_watches = false;
+            let mut added_effective_dir = false;
 
             // Add new watches before dropping old ones so parent->child upgrades have no blind gap.
             for dir in candidate_effective.difference(&old_effective) {
@@ -212,6 +213,7 @@ impl ManagerState {
                 if ok {
                     dir_handles.insert(handle_id);
                     applied_effective.insert(dir.clone());
+                    added_effective_dir = true;
                 } else if need_os_watch {
                     self.watched_dir_handles.remove(dir);
                 }
@@ -251,6 +253,15 @@ impl ManagerState {
                         },
                     );
                 }
+            }
+
+            // `subscribe()` and `set_targets()` enqueue asynchronously onto `orbit-agy-watcher`.
+            // Send one coalesced wakeup once a new effective directory watch is active so any
+            // file write that landed during the async registration window (before `inotify` /
+            // `FSEvents` / `ReadDirectoryChangesW` attached) is caught immediately instead of
+            // waiting for the 5-second safety-net poll.
+            if added_effective_dir {
+                let _ = tx.try_send(());
             }
 
             #[cfg(target_os = "macos")]
@@ -729,8 +740,11 @@ mod tests {
             vec![normalize_watch_path(&leaf)]
         );
 
-        // Drain any initial dir-creation event before testing a fresh append.
-        let _ = tokio::time::timeout(Duration::from_millis(120), handle.recv()).await;
+        // Drain initial registration/dir-creation events until quiescent before testing a fresh append.
+        while tokio::time::timeout(Duration::from_millis(120), handle.recv())
+            .await
+            .is_ok()
+        {}
 
         {
             let mut file = std::fs::OpenOptions::new()
@@ -775,8 +789,12 @@ mod tests {
             "missing desired leaf should watch deepest existing ancestor"
         );
 
-        // Drain initial settling events if any.
-        let _ = tokio::time::timeout(Duration::from_millis(100), handle.recv()).await;
+        // Drain initial settling events (both synthetic registration wakeup and any macOS FSEvents
+        // latency from sibling directory creation above) until quiescent.
+        while tokio::time::timeout(Duration::from_millis(120), handle.recv())
+            .await
+            .is_ok()
+        {}
 
         // Writing inside a sibling session's leaf should not wake this ancestor-watched handle.
         std::fs::write(sibling_leaf.join("transcript_full.jsonl"), "ignored\n")
@@ -810,8 +828,12 @@ mod tests {
             "old ancestor watch should be dropped after upgrade"
         );
 
-        // Drain any stale directory-upgrade notification before testing direct leaf append.
-        let _ = tokio::time::timeout(Duration::from_millis(100), handle.recv()).await;
+        // Drain any stale directory-upgrade notification (including synthetic watch-registration
+        // wakeup) until quiescent before testing direct leaf append.
+        while tokio::time::timeout(Duration::from_millis(100), handle.recv())
+            .await
+            .is_ok()
+        {}
 
         // Subsequent append directly inside the newly watched leaf wakes immediately.
         {
@@ -928,5 +950,33 @@ mod tests {
             0,
             "all OS watches must clean up cleanly after concurrent stress test"
         );
+    }
+
+    #[tokio::test]
+    async fn agy_watcher_wakes_when_write_races_async_subscribe() {
+        let dir = TempTestDir::new("orbit_agy_watch_race");
+        let leaf = dir.path().join("brain/sess-race/.system_generated/logs");
+        std::fs::create_dir_all(&leaf).expect("mkdir");
+        let file_path = leaf.join("transcript_full.jsonl");
+        std::fs::write(&file_path, "{\"step\":0}\n").expect("seed");
+
+        let watcher = AgyBrainWatcher::new_internal();
+        assert!(watcher.is_healthy());
+
+        // Write immediately after `subscribe()` returns without waiting for the async
+        // `orbit-agy-watcher` thread to finish registering the OS watch.
+        let mut handle = watcher.subscribe(vec![leaf]);
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&file_path)
+                .expect("open append");
+            writeln!(f, "{{\"step\":1}}").expect("append");
+            f.sync_all().expect("sync");
+        }
+
+        tokio::time::timeout(Duration::from_millis(500), handle.recv())
+            .await
+            .expect("write racing async subscribe must wake immediately via post-register nudge");
     }
 }

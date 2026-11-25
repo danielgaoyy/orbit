@@ -69,6 +69,6 @@ orbit login --mesh
 
 ## 下一步阅读
 
-- [Personal Agent 与全局调度](/zh-cn/guides/personal-agent/) — 深入了解跨主机上下文聚合、Worktree 协作与 IM 长连接。
-- [多主机舰队与零知识中继](/zh-cn/guides/multi-host-fleet/) — 掌握 Happy-Eyeballs 竞速路由、Peer-Bridge 与云同步。
-- [安全边界、内核沙箱与审计链](/zh-cn/guides/security-sandbox/) — 配置 OS 内核沙箱、出站代理白名单与防篡改审计。
+- [Personal Agent 与全局调度](../../guides/personal-agent/) — 深入了解跨主机上下文聚合、Worktree 协作与 IM 长连接。
+- [多主机舰队与零知识中继](../../guides/multi-host-fleet/) — 掌握 Happy-Eyeballs 竞速路由、Peer-Bridge 与云同步。
+- [安全边界、内核沙箱与审计链](../../guides/security-sandbox/) — 配置 OS 内核沙箱、出站代理白名单与防篡改审计。

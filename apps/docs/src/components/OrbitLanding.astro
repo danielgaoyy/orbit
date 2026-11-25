@@ -5,11 +5,12 @@ interface Props {
 
 const { lang } = Astro.props;
 const isZh = lang === "zh-CN";
-const prefix = isZh ? "/zh-cn" : "";
+const base = import.meta.env.BASE_URL.replace(/\/+$/, "");
+const prefix = isZh ? `${base}/zh-cn` : base;
 
 const copy = isZh
   ? {
-      badge: "v0.10 · 纯 Rust 单静态二进制 · 零知识端到端加密",
+      badge: "v0.11 · 纯 Rust 单静态二进制 · 零知识端到端加密",
       heroLine1: "一个 Personal Agent，",
       heroLine2: "调度你全部机器上的 AI 编码舰队。",
       heroSub:
@@ -205,7 +206,7 @@ const copy = isZh
       ],
     }
   : {
-      badge: "v0.10 · Single Static Rust Binary · Zero-Knowledge E2EE",
+      badge: "v0.11 · Single Static Rust Binary · Zero-Knowledge E2EE",
       heroLine1: "One Personal Agent.",
       heroLine2: "Every machine in your fleet.",
       heroSub:
@@ -808,7 +809,7 @@ orbit pair`;
         </div>
         <div class="orbit-frame-viewport">
           <img
-            src="/images/orbit-desktop-dark.png"
+            src={`${base}/images/orbit-desktop-dark.png`}
             alt="Orbit Desktop in Obsidian Graphite dark theme showing multi-host fleet sidebar, Personal Agent orchestrating 3 subagents, Plan shelf, and syntax-highlighted Git Review Diff"
             class="orbit-frame-img"
             data-preview-img="dark"
@@ -818,7 +819,7 @@ orbit pair`;
             loading="eager"
           />
           <img
-            src="/images/orbit-desktop-light.png"
+            src={`${base}/images/orbit-desktop-light.png`}
             alt="Orbit Desktop in Alabaster Paper light theme showing multi-host fleet sidebar, Personal Agent orchestrating 3 subagents, Plan shelf, and syntax-highlighted Git Review Diff"
             class="orbit-frame-img"
             data-preview-img="light"

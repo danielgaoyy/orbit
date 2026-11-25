@@ -69,6 +69,6 @@ Your Personal Agent now maintains a live delta view of every online machine, dis
 
 ## Next steps
 
-- [Personal Agent & IM Dispatch](/guides/personal-agent/) — Configure cross-host orchestration and zero-webhook IM cards.
-- [Multi-Host Fleet & E2EE Relay](/guides/multi-host-fleet/) — Deep-dive on Happy-Eyeballs routing, Peer-Bridge, and Cloud Sync.
-- [Security, Sandbox & Audit Chain](/guides/security-sandbox/) — Harden OS kernel sandboxes, egress allowlists, and signed audit logs.
+- [Personal Agent & IM Dispatch](../../guides/personal-agent/) — Configure cross-host orchestration and zero-webhook IM cards.
+- [Multi-Host Fleet & E2EE Relay](../../guides/multi-host-fleet/) — Deep-dive on Happy-Eyeballs routing, Peer-Bridge, and Cloud Sync.
+- [Security, Sandbox & Audit Chain](../../guides/security-sandbox/) — Harden OS kernel sandboxes, egress allowlists, and signed audit logs.

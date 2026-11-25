@@ -138,9 +138,11 @@ function CustomAcpAgentDrawer({
   const [installHint, setInstallHint] = useState(editing?.install_hint ?? "");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const canSubmit = Boolean(id.trim()) && Boolean(command.trim());
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (saving) return;
     const cleanId = id.trim();
     const cleanName = name.trim() || cleanId;
     const cleanCmd = command.trim();
@@ -318,7 +320,7 @@ function CustomAcpAgentDrawer({
             >
               {t("common.cancel")}
             </Button>
-            <Button type="submit" size="sm" disabled={saving}>
+            <Button type="submit" size="sm" disabled={saving || !canSubmit}>
               {saving && <Loader2 className="h-[12.5px] w-[12.5px] animate-spin" />}
               <span>{t(editing ? "common.save" : "settings.acpAdd")}</span>
             </Button>

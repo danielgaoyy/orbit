@@ -297,9 +297,13 @@ function HookEditorDrawer({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const busy = saving || deleting;
+  const canSubmit =
+    Boolean(name.trim()) &&
+    (actionKind === "command" ? Boolean(command.trim()) : Boolean(webhookUrl.trim()));
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (busy) return;
     const cleanName = name.trim();
     if (!cleanName) {
       setError(t("devTools.requireName"));
@@ -664,7 +668,7 @@ function HookEditorDrawer({
             >
               {t("common.cancel")}
             </Button>
-            <Button type="submit" size="sm" disabled={busy}>
+            <Button type="submit" size="sm" disabled={busy || !canSubmit}>
               {saving && <Loader2 className="h-[12px] w-[12px] animate-spin" />}
               {editing ? t("common.save") : t("hooks.addHook")}
             </Button>

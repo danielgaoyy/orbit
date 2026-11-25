@@ -359,6 +359,7 @@ function ChannelForm({
     form.transportMode === "webhook" && form.platform !== "discord";
   const hasAnySavedSecret =
     form.hasExistingPrimary || form.hasExistingSigning || form.hasExistingAppToken;
+  const canSubmit = Boolean(form.name.trim()) && Boolean(form.defaultWorkspaceCwd.trim());
 
   const handleSave = async () => {
     setLocalError(null);
@@ -414,7 +415,7 @@ function ChannelForm({
       className="flex flex-col gap-4"
       onSubmit={(event) => {
         event.preventDefault();
-        if (!saving) void handleSave();
+        if (!saving && canSubmit) void handleSave();
       }}
     >
       <FieldGroup className="gap-4">
@@ -742,7 +743,7 @@ function ChannelForm({
         <Button type="button" variant="outline" size="sm" disabled={saving} onClick={onClose}>
           {t("common.cancel")}
         </Button>
-        <Button type="submit" size="sm" disabled={saving}>
+        <Button type="submit" size="sm" disabled={saving || !canSubmit}>
           {saving && <Loader2 className="size-[12.5px] animate-spin" />}
           {isEditing ? t("im.saveChanges") : t("im.createChannel")}
         </Button>

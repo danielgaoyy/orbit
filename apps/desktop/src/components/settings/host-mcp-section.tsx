@@ -285,9 +285,13 @@ function McpServerDrawer({
   const [enabled, setEnabled] = useState(() => seed?.enabled ?? true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const canSubmit =
+    Boolean(name.trim()) &&
+    (transportKind === "stdio" ? Boolean(command.trim()) : Boolean(url.trim()));
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (saving) return;
     const cleanName = name.trim();
     if (!/^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$/.test(cleanName)) {
       setError(t("devTools.nameInvalid"));
@@ -546,7 +550,7 @@ function McpServerDrawer({
             >
               {t("common.cancel")}
             </Button>
-            <Button type="submit" size="sm" disabled={saving}>
+            <Button type="submit" size="sm" disabled={saving || !canSubmit}>
               {saving && <Loader2 className="h-[13px] w-[13px] animate-spin" />}
               <span>
                 {isEdit

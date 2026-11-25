@@ -173,6 +173,13 @@ function RuleEditorModal({
   }, [busy, isDirty, onClose]);
 
   const approxTokens = useMemo(() => estimateTokensClient(body), [body]);
+  const parsedGlobs = useMemo(
+    () => (triggerMode === "glob_auto_attach" ? parseGlobsInput(globsText) : []),
+    [triggerMode, globsText],
+  );
+  const canSubmit =
+    (Boolean(editing) || Boolean(name.trim())) &&
+    (triggerMode !== "glob_auto_attach" || parsedGlobs.length > 0);
   const activeHint = TRIGGER_GROUPS.find((g) => g.mode === triggerMode)?.hint;
 
   const scopeOptions = useMemo(
@@ -186,6 +193,7 @@ function RuleEditorModal({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (busy) return;
     const cleanName = name.trim();
     if (!editing && !RULE_PATH_REGEX.test(cleanName)) {
       setError(
@@ -193,7 +201,6 @@ function RuleEditorModal({
       );
       return;
     }
-    const parsedGlobs = triggerMode === "glob_auto_attach" ? parseGlobsInput(globsText) : [];
     if (triggerMode === "glob_auto_attach" && parsedGlobs.length === 0) {
       setError(t("context.ruleGlobError"));
       return;
@@ -466,7 +473,7 @@ function RuleEditorModal({
               <Button type="button" variant="outline" size="sm" disabled={busy} onClick={requestClose}>
                 {t("common.cancel")}
               </Button>
-              <Button type="submit" size="sm" disabled={busy}>
+              <Button type="submit" size="sm" disabled={busy || !canSubmit}>
                 {saving && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
                 {t("permissionRules.saveRule")}
               </Button>

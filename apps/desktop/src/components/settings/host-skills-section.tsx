@@ -132,6 +132,9 @@ const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
   const isCreate = mode === "create";
   const busy = creating || importing;
   const writeScope = isCreate ? newScope : importScope;
+  const canSubmit =
+    (writeScope !== "project" || Boolean(activeCwd)) &&
+    (isCreate ? Boolean(newSlug.trim()) : Boolean(importSource.trim()));
 
   const scopeOptions = useMemo(
     () => [
@@ -242,7 +245,9 @@ const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
         className="flex flex-col gap-4"
         onSubmit={(e) => {
           e.preventDefault();
-          if (!busy && online) void (isCreate ? handleCreateSkill() : handleImportSkill());
+          if (!busy && online && canSubmit) {
+            void (isCreate ? handleCreateSkill() : handleImportSkill());
+          }
         }}
       >
         <FieldGroup>
@@ -345,7 +350,12 @@ const SkillCreateImportDrawer = memo(function SkillCreateImportDrawer({
             </>
           )}
         </FieldGroup>
-        <Button type="submit" size="sm" disabled={!online || busy} className="self-end">
+        <Button
+          type="submit"
+          size="sm"
+          disabled={!online || busy || !canSubmit}
+          className="self-end"
+        >
           {busy && <OrbitSpinner size={13} />}
           {t(isCreate ? "managedSkills.create" : "managedSkills.import")}
         </Button>

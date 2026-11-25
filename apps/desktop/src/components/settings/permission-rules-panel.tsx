@@ -287,6 +287,9 @@ export function PermissionRulesPanel({
   };
 
   const isLoading = rulesSnap.status === "loading" && rulesSnap.rules.length === 0;
+  const canSaveRule =
+    Boolean(draft.pattern.trim()) &&
+    (draft.scopeKind !== "project" || Boolean(draft.projectCwd.trim()));
 
   return (
     <div className="flex flex-col gap-2">
@@ -539,7 +542,7 @@ export function PermissionRulesPanel({
                 <Button
                   type="button"
                   size="sm"
-                  disabled={rulesSnap.saving || !draft.pattern.trim()}
+                  disabled={rulesSnap.saving || !canSaveRule}
                   onClick={() => void handleSaveRule()}
                 >
                   {rulesSnap.saving && <OrbitSpinner size={12} />}

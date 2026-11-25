@@ -300,7 +300,6 @@ const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: st
   const config = entry?.config ?? null;
   const audits = entry?.recentAudits ?? EMPTY_AUDITS;
   const isLoading = entry?.status === "loading" && !config;
-  const isSaving = entry?.saving ?? false;
 
   const persistedModel = config?.llm_model ?? "";
   const [modelDraft, setModelDraft] = useState(persistedModel);
@@ -388,7 +387,7 @@ const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: st
           isOnline ? (
             <button
               type="button"
-              disabled={entry?.status === "loading" || isSaving}
+              disabled={entry?.status === "loading"}
               onClick={() => {
                 void orbitActions.loadGuardianConfig(hostId);
                 void orbitActions.loadPermissionRules(hostId);
@@ -449,7 +448,6 @@ const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: st
                 >
                   <ToggleSwitch
                     checked={config.enabled}
-                    disabled={isSaving}
                     ariaLabel={t("guardian.enableTitle")}
                     onChange={(enabled) => commitConfig({ enabled })}
                   />
@@ -463,7 +461,7 @@ const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: st
                   <SettingSelect
                     value={effectiveMaxRisk}
                     options={maxRiskOptions}
-                    disabled={isSaving || !config.enabled}
+                    disabled={!config.enabled}
                     onChange={(val) => commitConfig({ auto_approve_max_risk: val })}
                     triggerClassName="w-[176px]"
                     menuClassName="w-[260px]"
@@ -477,7 +475,7 @@ const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: st
                 >
                   <ToggleSwitch
                     checked={config.allow_read_only_tools}
-                    disabled={isSaving || !config.enabled}
+                    disabled={!config.enabled}
                     ariaLabel={t("guardian.readOnlyTitle")}
                     onChange={(allow_read_only_tools) => commitConfig({ allow_read_only_tools })}
                   />
@@ -490,7 +488,7 @@ const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: st
                 >
                   <ToggleSwitch
                     checked={config.allow_workspace_tests}
-                    disabled={isSaving || !config.enabled}
+                    disabled={!config.enabled}
                     ariaLabel={t("guardian.workspaceTestsTitle")}
                     onChange={(allow_workspace_tests) => commitConfig({ allow_workspace_tests })}
                   />
@@ -503,7 +501,7 @@ const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: st
                 >
                   <ToggleSwitch
                     checked={config.use_ai_classifier_for_medium}
-                    disabled={isSaving || !config.enabled}
+                    disabled={!config.enabled}
                     ariaLabel={t("guardian.tier2Title")}
                     onChange={(use_ai_classifier_for_medium) =>
                       commitConfig({ use_ai_classifier_for_medium })
@@ -524,7 +522,7 @@ const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: st
                       </div>
                       <ToggleSwitch
                         checked={llmTier2Enabled}
-                        disabled={isSaving || !config.enabled}
+                        disabled={!config.enabled}
                         ariaLabel={t("guardian.llmTier2Title")}
                         onChange={(enabled) => commitConfig({ llm_tier2_enabled: enabled })}
                       />
@@ -539,7 +537,7 @@ const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: st
                           <SettingSelect
                             value={effectiveLlmProvider}
                             options={llmProviderOptions}
-                            disabled={isSaving || !config.enabled}
+                            disabled={!config.enabled}
                             onChange={(val) =>
                               commitConfig({
                                 llm_provider: val === "auto" ? null : (val as ProviderKind),
@@ -557,7 +555,7 @@ const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: st
                           <Input
                             type="text"
                             value={modelDraft}
-                            disabled={isSaving || !config.enabled}
+                            disabled={!config.enabled}
                             onChange={(e) => setModelDraft(e.target.value)}
                             onBlur={commitModelDraft}
                             onKeyDown={(e) => {
@@ -578,7 +576,7 @@ const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: st
                           <SettingSelect
                             value={String(llmTimeoutMs)}
                             options={llmTimeoutOptions}
-                            disabled={isSaving || !config.enabled}
+                            disabled={!config.enabled}
                             onChange={(val) => {
                               const parsed = Number.parseInt(val, 10);
                               if (Number.isFinite(parsed)) {
@@ -607,7 +605,7 @@ const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: st
                   addLabel={t("guardian.addRule")}
                   removeAriaLabel={(item) => t("guardian.removeRule", { item })}
                   items={config.trusted_command_prefixes}
-                  disabled={isSaving || !config.enabled}
+                  disabled={!config.enabled}
                   onChange={(trusted_command_prefixes) => commitConfig({ trusted_command_prefixes })}
                 />
                 <PatternListEditor
@@ -617,7 +615,7 @@ const GuardianPolicies = memo(function GuardianPolicies({ hostId }: { hostId: st
                   addLabel={t("guardian.addRule")}
                   removeAriaLabel={(item) => t("guardian.removeRule", { item })}
                   items={config.blocked_command_patterns}
-                  disabled={isSaving}
+                  disabled={false}
                   onChange={(blocked_command_patterns) => commitConfig({ blocked_command_patterns })}
                 />
               </div>

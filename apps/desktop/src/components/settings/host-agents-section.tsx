@@ -1,4 +1,4 @@
-import { memo, useMemo, useState } from "react";
+import { memo, useMemo, useRef, useState } from "react";
 import { Plus, RefreshCw, Trash2 } from "lucide-react";
 import { HostAcpSection } from "./host-acp-section";
 import {
@@ -288,13 +288,15 @@ const HostAgentControls = memo(function HostAgentControls({ hostId }: { hostId: 
   const providerCatalogs = useOrbitSelector((s) => s.hostDetails[hostId]?.provider_catalogs);
   const [showAll, setShowAll] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [saving, setSaving] = useState(false);
+  const [pendingConfig, setPendingConfig] = useState<OrchestrationConfig | null>(null);
+  const updateSeqRef = useRef(0);
   const [editor, setEditor] = useState<AgentProfile | "new" | null>(null);
   const [deleting, setDeleting] = useState<AgentProfile | null>(null);
   const installed = useMemo(
     () => PROVIDER_LIST.filter((provider) => available.includes(provider.id)),
     [available],
   );
+  const effectiveConfig = pendingConfig ?? config;
 
   async function refresh() {
     setRefreshing(true);
@@ -307,17 +309,29 @@ const HostAgentControls = memo(function HostAgentControls({ hostId }: { hostId: 
     }
   }
   async function update(patch: Partial<OrchestrationConfig>) {
-    if (!config || saving) return;
-    setSaving(true);
+    if (!effectiveConfig) return;
+    const nextConfig: OrchestrationConfig = { ...effectiveConfig, ...patch };
+    const seq = ++updateSeqRef.current;
+    setPendingConfig(nextConfig);
     try {
-      await orbitIpc.updateOrchestrationConfig(hostId, { ...config, ...patch });
+      await orbitIpc.updateOrchestrationConfig(hostId, nextConfig);
     } catch (error) {
       orbitActions.showToast(String(error));
     } finally {
-      setSaving(false);
+      if (updateSeqRef.current === seq) {
+        setPendingConfig(null);
+      }
     }
   }
-  const runtimeDisabled = !config || saving;
+  const idleTimeoutSecs = effectiveConfig?.idle_timeout_secs ?? 1800;
+  const idleTimeoutOptions = useMemo(
+    () =>
+      [...new Set([600, 1200, 1800, 3600, idleTimeoutSecs])]
+        .sort((a, b) => a - b)
+        .map((value) => ({ value, label: t("settings.agentMinutes", { count: value / 60 }) })),
+    [idleTimeoutSecs, t],
+  );
+  const runtimeDisabled = !effectiveConfig;
   return (
     <div className="flex flex-col gap-6">
       <SettingGroup
@@ -369,7 +383,7 @@ const HostAgentControls = memo(function HostAgentControls({ hostId }: { hostId: 
             <ToggleSwitch
               ariaLabel={t("settings.agentMcpInjector")}
               disabled={runtimeDisabled}
-              checked={config?.mcp_inject_enabled ?? true}
+              checked={effectiveConfig?.mcp_inject_enabled ?? true}
               onChange={(mcp_inject_enabled) => void update({ mcp_inject_enabled })}
             />
           </SettingRow>
@@ -385,7 +399,7 @@ const HostAgentControls = memo(function HostAgentControls({ hostId }: { hostId: 
             <ToggleSwitch
               ariaLabel={t("settings.agentKeepAwake")}
               disabled={runtimeDisabled}
-              checked={config?.keep_awake_while_running ?? true}
+              checked={effectiveConfig?.keep_awake_while_running ?? true}
               onChange={(keep_awake_while_running) => void update({ keep_awake_while_running })}
             />
           </SettingRow>
@@ -397,17 +411,15 @@ const HostAgentControls = memo(function HostAgentControls({ hostId }: { hostId: 
             <div className="flex items-center gap-2">
               <SettingSelect
                 size="sm"
-                value={config?.idle_timeout_secs ?? 1800}
-                disabled={runtimeDisabled || !config?.idle_cleanup_enabled}
+                value={idleTimeoutSecs}
+                disabled={runtimeDisabled || !effectiveConfig?.idle_cleanup_enabled}
                 ariaLabel={t("settings.agentIdleCleanup")}
-                options={[...new Set([600, 1200, 1800, 3600, config?.idle_timeout_secs ?? 1800])]
-                  .sort((a, b) => a - b)
-                  .map((value) => ({ value, label: t("settings.agentMinutes", { count: value / 60 }) }))}
+                options={idleTimeoutOptions}
                 onChange={(idle_timeout_secs) => void update({ idle_timeout_secs })}
               />
               <ToggleSwitch
                 disabled={runtimeDisabled}
-                checked={config?.idle_cleanup_enabled ?? true}
+                checked={effectiveConfig?.idle_cleanup_enabled ?? true}
                 ariaLabel={t("settings.agentIdleCleanup")}
                 onChange={(idle_cleanup_enabled) => void update({ idle_cleanup_enabled })}
               />
@@ -421,7 +433,7 @@ const HostAgentControls = memo(function HostAgentControls({ hostId }: { hostId: 
             <ToggleSwitch
               ariaLabel={t("settings.agentAutoResume")}
               disabled={runtimeDisabled}
-              checked={config?.resume_on_startup ?? false}
+              checked={effectiveConfig?.resume_on_startup ?? false}
               onChange={(resume_on_startup) => void update({ resume_on_startup })}
             />
           </SettingRow>

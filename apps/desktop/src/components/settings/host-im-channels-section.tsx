@@ -1079,7 +1079,7 @@ export const HostImChannelsSection = memo(function HostImChannelsSection({
             >
               <RefreshCw className={cn(loading && "animate-spin")} />
             </Button>
-            <Button type="button" size="sm" data-setting-id="im.addChannel" disabled={!isOnline || saving} onClick={openCreateDrawer}>
+            <Button type="button" size="sm" data-setting-id="im.addChannel" disabled={!isOnline} onClick={openCreateDrawer}>
               <Plus data-icon="inline-start" />
               {t("im.addChannel")}
             </Button>
@@ -1152,13 +1152,13 @@ export const HostImChannelsSection = memo(function HostImChannelsSection({
                       {pillLabel}
                     </Badge>
                   }
-                  onClick={isOnline && !saving ? () => openEditDrawer(ch) : undefined}
+                  onClick={isOnline ? () => openEditDrawer(ch) : undefined}
                   action={
                     <div className="flex items-center gap-2">
                       <IconButton
                         size="sm"
                         tooltip={t("im.test")}
-                        disabled={!isOnline || saving}
+                        disabled={!isOnline}
                         onClick={() => setTestingId(ch.channel_id)}
                       >
                         <Send />
@@ -1167,14 +1167,14 @@ export const HostImChannelsSection = memo(function HostImChannelsSection({
                         size="sm"
                         tone="danger"
                         tooltip={t("common.delete")}
-                        disabled={!isOnline || saving}
+                        disabled={!isOnline}
                         onClick={() => setConfirmDeleteId(ch.channel_id)}
                       >
                         <Trash2 />
                       </IconButton>
                       <ToggleSwitch
                         checked={ch.enabled}
-                        disabled={!isOnline || saving}
+                        disabled={!isOnline}
                         ariaLabel={ch.name}
                         onChange={(next) => handleToggleEnabled(ch, next)}
                       />

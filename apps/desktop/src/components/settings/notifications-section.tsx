@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Bell, Check, RefreshCw, Send, Shield, Smartphone, Trash2, Volume2 } from "lucide-react";
 import {
   SettingCard,
@@ -157,11 +157,13 @@ export const NotificationsSection = memo(function NotificationsSection() {
     }
   };
 
-  // Optimistic override only while an update RPC is in flight (avoids 4x mirror useEffect loops).
+  // Optimistic override only while an update RPC is in flight (avoids 4x mirror useEffect loops
+  // and keeps sibling mobile push controls crisp without flash-disabling during fast RPC saves).
   const [pendingPrefs, setPendingPrefs] = useState<{
     hostId: string;
     prefs: PushPreferences;
   } | null>(null);
+  const mobileSaveSeqRef = useRef(0);
   const [pendingRemoveDevice, setPendingRemoveDevice] = useState<{
     hostId: string;
     hostName: string;
@@ -191,6 +193,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
     if (!activeHostId || pushEntry?.status !== "ready") return;
     const hostIdAtStart = activeHostId;
     const nextPrefs = updater(draftPrefs);
+    const seq = ++mobileSaveSeqRef.current;
     setPendingPrefs({ hostId: hostIdAtStart, prefs: nextPrefs });
     try {
       await orbitActions.updatePushPreferences(hostIdAtStart, {
@@ -199,7 +202,9 @@ export const NotificationsSection = memo(function NotificationsSection() {
         keep_existing_gateway_token: true,
       });
     } finally {
-      setPendingPrefs((cur) => (cur?.hostId === hostIdAtStart ? null : cur));
+      if (mobileSaveSeqRef.current === seq) {
+        setPendingPrefs((cur) => (cur?.hostId === hostIdAtStart ? null : cur));
+      }
     }
   };
 
@@ -420,7 +425,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
             <ToggleSwitch
               ariaLabel={t("settings.pushEnabled")}
               checked={draftPrefs.enabled}
-              disabled={!isPushReady || pushEntry?.saving}
+              disabled={!isPushReady}
               onChange={(v) => void persistMobilePrefs((p) => ({ ...p, enabled: v }))}
             />
           </SettingRow>
@@ -440,7 +445,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
               <ToggleSwitch
                 ariaLabel={t("settings.pushMessagePreview")}
                 checked={draftPrefs.include_message_preview}
-                disabled={!isPushReady || pushEntry?.saving}
+                disabled={!isPushReady}
                 onChange={(v) => void persistMobilePrefs((p) => ({ ...p, include_message_preview: v }))}
               />
             </div>
@@ -459,7 +464,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
                     ariaLabel={t("settings.notifyQuietStart")}
                     value={draftPrefs.quiet_start_hour}
                     options={HOUR_OPTIONS}
-                    disabled={!isPushReady || pushEntry?.saving}
+                    disabled={!isPushReady}
                     triggerClassName="min-w-[82px]"
                     menuClassName="min-w-[104px]"
                     onChange={(hour) =>
@@ -472,7 +477,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
                     ariaLabel={t("settings.notifyQuietEnd")}
                     value={draftPrefs.quiet_end_hour}
                     options={HOUR_OPTIONS}
-                    disabled={!isPushReady || pushEntry?.saving}
+                    disabled={!isPushReady}
                     triggerClassName="min-w-[82px]"
                     menuClassName="min-w-[104px]"
                     onChange={(hour) =>
@@ -484,7 +489,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
               <ToggleSwitch
                 ariaLabel={t("settings.pushQuietHours")}
                 checked={draftPrefs.quiet_hours_enabled}
-                disabled={!isPushReady || pushEntry?.saving}
+                disabled={!isPushReady}
                 onChange={(v) => void persistMobilePrefs((p) => ({ ...p, quiet_hours_enabled: v }))}
               />
             </div>

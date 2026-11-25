@@ -592,7 +592,6 @@ export function HostMcpSection({
   const [localProbes, setLocalProbes] = useState<
     Record<string, McpProbeResult>
   >({});
-  const [togglingIds, setTogglingIds] = useState<Record<string, boolean>>({});
   const [removing, setRemoving] = useState<ExternalMcpServerRecord | null>(
     null,
   );
@@ -606,12 +605,16 @@ export function HostMcpSection({
   const activeHostRef = useRef(hostId);
   const fetchSeqRef = useRef(0);
   const probeSeqRef = useRef<Record<string, number>>({});
+  const toggleSeqRef = useRef(0);
+  const toggleChainRef = useRef<Promise<void>>(Promise.resolve());
 
-  const refreshServers = useCallback(async () => {
+  const refreshServers = useCallback(async (options?: { silent?: boolean }) => {
     if (!mountedRef.current || !online) return;
     const reqHost = hostId;
     const seq = ++fetchSeqRef.current;
-    setLoading(true);
+    if (!options?.silent) {
+      setLoading(true);
+    }
     setLoadError(null);
     try {
       const snapshot = await orbitActions.refreshExternalMcpServers(
@@ -637,6 +640,7 @@ export function HostMcpSection({
       setLoadError(err instanceof Error ? err.message : String(err));
     } finally {
       if (
+        !options?.silent &&
         mountedRef.current &&
         activeHostRef.current === reqHost &&
         fetchSeqRef.current === seq
@@ -719,35 +723,45 @@ export function HostMcpSection({
     }
   };
 
-  const handleToggle = async (
+  const handleToggle = (
     server: ExternalMcpServerRecord,
     nextEnabled: boolean,
   ) => {
     const reqHost = hostId;
-    setTogglingIds((prev) => ({ ...prev, [server.id]: true }));
-    try {
-      await orbitActions.toggleExternalMcpServer(
-        reqHost,
-        server.id,
-        nextEnabled,
-        workspaceCwd,
-      );
-      await refreshServers();
-    } catch (err) {
-      if (mountedRef.current && activeHostRef.current === reqHost) {
-        orbitActions.showToast(
-          err instanceof Error ? err.message : t("common.actionFailed"),
+    const seq = ++toggleSeqRef.current;
+    setServers((prev) =>
+      prev.map((item) =>
+        item.id === server.id ? { ...item, enabled: nextEnabled } : item,
+      ),
+    );
+    toggleChainRef.current = toggleChainRef.current.then(async () => {
+      try {
+        await orbitActions.toggleExternalMcpServer(
+          reqHost,
+          server.id,
+          nextEnabled,
+          workspaceCwd,
         );
+        if (
+          mountedRef.current &&
+          activeHostRef.current === reqHost &&
+          toggleSeqRef.current === seq
+        ) {
+          await refreshServers({ silent: true });
+        }
+      } catch (err) {
+        if (mountedRef.current && activeHostRef.current === reqHost) {
+          setServers((prev) =>
+            prev.map((item) =>
+              item.id === server.id ? { ...item, enabled: !nextEnabled } : item,
+            ),
+          );
+          orbitActions.showToast(
+            err instanceof Error ? err.message : t("common.actionFailed"),
+          );
+        }
       }
-    } finally {
-      if (mountedRef.current && activeHostRef.current === reqHost) {
-        setTogglingIds((prev) => {
-          const next = { ...prev };
-          delete next[server.id];
-          return next;
-        });
-      }
-    }
+    });
   };
 
   const handleDelete = async () => {
@@ -821,7 +835,6 @@ export function HostMcpSection({
             const expanded = expandedId === server.id;
             const probe = localProbes[server.id] ?? server.last_probe ?? null;
             const isProbing = Boolean(probingIds[server.id]);
-            const isToggling = Boolean(togglingIds[server.id]);
             const isHttp = server.transport.kind === "streamable_http";
             const summaryLine =
               server.transport.kind === "stdio"
@@ -876,12 +889,12 @@ export function HostMcpSection({
                           </IconButton>
                           <ToggleSwitch
                             checked={server.enabled}
-                            disabled={isToggling}
+                            disabled={!online}
                             ariaLabel={t("devTools.toggle", {
                               name: server.name,
                             })}
                             onChange={(enabled) =>
-                              void handleToggle(server, enabled)
+                              handleToggle(server, enabled)
                             }
                           />
                         </>

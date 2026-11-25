@@ -69,8 +69,10 @@ export const HostVoiceSection = memo(function HostVoiceSection({ hostId }: { hos
 
   const [state, setState] = useState<VoiceConfigState | null>(null);
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const latestConfigRef = useRef<VoiceConfig | null>(null);
+  const patchSeqRef = useRef(0);
+  const writeChainRef = useRef<Promise<void>>(Promise.resolve());
 
   const [webAudioInputs, setWebAudioInputs] = useState<AudioInputDeviceInfo[]>([]);
   const [systemAudioInputs, setSystemAudioInputs] = useState<SystemAudioInputDevice[]>([]);
@@ -183,6 +185,7 @@ export const HostVoiceSection = memo(function HostVoiceSection({ hostId }: { hos
     setError(null);
     try {
       const next = await orbitIpc.getVoiceConfig(hostId);
+      latestConfigRef.current = next.config;
       setState(next);
     } catch (err) {
       setError(parseVoiceRpcError(err).message);
@@ -192,28 +195,44 @@ export const HostVoiceSection = memo(function HostVoiceSection({ hostId }: { hos
   }, [hostId]);
 
   useEffect(() => {
+    latestConfigRef.current = null;
+    patchSeqRef.current += 1;
     if (isOnline) void loadConfig();
     else setLoading(false);
   }, [loadConfig, isOnline]);
 
+  // Apply changes optimistically and serialize RPC writes so rapid toggles never
+  // race or flash-disable sibling controls (like the Recognition language select).
   const patchConfig = useCallback(
-    async (patch: Partial<VoiceConfig>) => {
-      if (!state) return;
-      const nextConfig: VoiceConfig = { ...state.config, ...patch };
-      setSaving(true);
+    (patch: Partial<VoiceConfig>) => {
+      const base = latestConfigRef.current;
+      if (!base) return;
+      const prevConfig = base;
+      const nextConfig: VoiceConfig = { ...base, ...patch };
+      latestConfigRef.current = nextConfig;
+      const seq = ++patchSeqRef.current;
       setError(null);
-      try {
-        const updated = await orbitIpc.updateVoiceConfig(hostId, nextConfig);
-        setState(updated);
-      } catch (err) {
-        const msg = parseVoiceRpcError(err).message;
-        setError(msg);
-        orbitActions.showToast(msg);
-      } finally {
-        setSaving(false);
-      }
+      setState((cur) => (cur ? { ...cur, config: nextConfig } : cur));
+
+      writeChainRef.current = writeChainRef.current.then(async () => {
+        try {
+          const updated = await orbitIpc.updateVoiceConfig(hostId, nextConfig);
+          if (patchSeqRef.current === seq) {
+            latestConfigRef.current = updated.config;
+            setState(updated);
+          }
+        } catch (err) {
+          const msg = parseVoiceRpcError(err).message;
+          if (patchSeqRef.current === seq) {
+            latestConfigRef.current = prevConfig;
+            setState((cur) => (cur ? { ...cur, config: prevConfig } : cur));
+            setError(msg);
+          }
+          orbitActions.showToast(msg);
+        }
+      });
     },
-    [hostId, state],
+    [hostId],
   );
 
   const mergedMicrophones = useMemo(
@@ -253,7 +272,6 @@ export const HostVoiceSection = memo(function HostVoiceSection({ hostId }: { hos
     [t],
   );
 
-  const busy = saving || loading;
   const cfg = state?.config;
   const languageValue = cfg?.language ?? "auto";
   const selectedMicValue = voiceInputDeviceId ?? SYSTEM_DEFAULT_MIC;
@@ -310,7 +328,7 @@ export const HostVoiceSection = memo(function HostVoiceSection({ hostId }: { hos
           <Button
             variant="outline"
             size="sm"
-            disabled={busy || !isOnline}
+            disabled={loading || !isOnline}
             onClick={() => {
               lastAutoProbedSignatureRef.current = null;
               void refreshMicrophones({ probe: true });
@@ -347,9 +365,9 @@ export const HostVoiceSection = memo(function HostVoiceSection({ hostId }: { hos
               >
                 <ToggleSwitch
                   checked={cfg.enabled}
-                  disabled={busy || !isOnline}
+                  disabled={!isOnline}
                   ariaLabel={t("voice.enableTitle")}
-                  onChange={(enabled) => void patchConfig({ enabled })}
+                  onChange={(enabled) => patchConfig({ enabled })}
                 />
               </SettingRow>
 
@@ -363,9 +381,9 @@ export const HostVoiceSection = memo(function HostVoiceSection({ hostId }: { hos
                 <SettingSelect<string>
                   ariaLabel={t("voice.languageTitle")}
                   value={languageValue}
-                  disabled={busy || !isOnline}
+                  disabled={!isOnline}
                   onChange={(val) =>
-                    void patchConfig({ language: val === "auto" ? null : val })
+                    patchConfig({ language: val === "auto" ? null : val })
                   }
                   options={languageOptions}
                 />
@@ -378,10 +396,10 @@ export const HostVoiceSection = memo(function HostVoiceSection({ hostId }: { hos
               >
                 <ToggleSwitch
                   checked={cfg.auto_speak_responses}
-                  disabled={busy || !isOnline}
+                  disabled={!isOnline}
                   ariaLabel={t("voice.autoSpeakTitle")}
                   onChange={(auto_speak_responses) =>
-                    void patchConfig({ auto_speak_responses })
+                    patchConfig({ auto_speak_responses })
                   }
                 />
               </SettingRow>

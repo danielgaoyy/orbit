@@ -152,7 +152,6 @@ export const HostPluginsSection = memo(function HostPluginsSection({
   const [installOpen, setInstallOpen] = useState(false);
   const [detailOpen, setDetailOpen] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [togglingId, setTogglingId] = useState<string | null>(null);
   const [uninstallTarget, setUninstallTarget] = useState<InstalledPluginView | null>(null);
   const [previewPluginIds, setPreviewPluginIds] = useState<Record<string, boolean>>({});
   const [opOutputByKey, setOpOutputByKey] = useState<Record<string, string>>({});
@@ -191,20 +190,21 @@ export const HostPluginsSection = memo(function HostPluginsSection({
   const handleToggleEnabled = useCallback(
     async (plugin: InstalledPluginView, nextEnabled: boolean) => {
       const id = plugin.manifest.id;
-      setTogglingId(id);
+      const prevEnabled = plugin.enabled;
       setError(null);
+      setPlugins((prev) =>
+        prev.map((p) => (p.manifest.id === id ? { ...p, enabled: nextEnabled } : p)),
+      );
       try {
         await orbitIpc.setPluginEnabled(hostId, id, nextEnabled);
-        setPlugins((prev) =>
-          prev.map((p) => (p.manifest.id === id ? { ...p, enabled: nextEnabled } : p)),
-        );
         notifyPluginsChanged(hostId);
       } catch (err) {
+        setPlugins((prev) =>
+          prev.map((p) => (p.manifest.id === id ? { ...p, enabled: prevEnabled } : p)),
+        );
         const msg = err instanceof Error ? err.message : String(err);
         setError(msg);
         orbitActions.showToast(msg);
-      } finally {
-        setTogglingId(null);
       }
     },
     [hostId],
@@ -310,7 +310,7 @@ export const HostPluginsSection = memo(function HostPluginsSection({
               action={
                 <ToggleSwitch
                   checked={plugin.enabled}
-                  disabled={!isOnline || togglingId !== null}
+                  disabled={!isOnline}
                   ariaLabel={plugin.manifest.name}
                   onChange={(enabled) => void handleToggleEnabled(plugin, enabled)}
                 />

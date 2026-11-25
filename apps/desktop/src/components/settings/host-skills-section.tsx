@@ -419,10 +419,11 @@ function ManagedSkills({
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [discardEdits, setDiscardEdits] = useState(false);
   const [forking, setForking] = useState(false);
-  const [togglingId, setTogglingId] = useState<string | null>(null);
 
   const readSeqRef = useRef(0);
   const listSeqRef = useRef(0);
+  const toggleSeqRef = useRef(0);
+  const toggleChainRef = useRef<Promise<void>>(Promise.resolve());
   const hasLoadedScopedRef = useRef(false);
   const selectedSkillIdRef = useRef<string | null>(null);
   selectedSkillIdRef.current = selectedSkillId;
@@ -456,6 +457,7 @@ function ManagedSkills({
       const fresh = await orbitIpc.listManagedSkills(hostId, activeCwd);
       if (listSeqRef.current === seq) {
         hasLoadedScopedRef.current = true;
+        toggleSeqRef.current += 1;
         setSkills(fresh);
       }
     } catch (err) {
@@ -585,18 +587,36 @@ function ManagedSkills({
     loadedEtag,
   ]);
 
-  const handleToggleEnabled = async (skill: ManagedSkillRecord, nextEnabled: boolean) => {
-    setTogglingId(skill.id);
-    try {
-      const updated = await orbitIpc.toggleManagedSkill(hostId, skill.id, nextEnabled, activeCwd);
-      hasLoadedScopedRef.current = true;
-      setSkills(updated);
-    } catch (err) {
-      orbitActions.showToast(String(err));
-    } finally {
-      setTogglingId(null);
-    }
-  };
+  const handleToggleEnabled = useCallback(
+    (skill: ManagedSkillRecord, nextEnabled: boolean) => {
+      const seq = ++toggleSeqRef.current;
+      setSkills((prev) =>
+        prev.map((item) => (item.id === skill.id ? { ...item, enabled: nextEnabled } : item)),
+      );
+      toggleChainRef.current = toggleChainRef.current.then(async () => {
+        try {
+          const updated = await orbitIpc.toggleManagedSkill(
+            hostId,
+            skill.id,
+            nextEnabled,
+            activeCwd,
+          );
+          if (toggleSeqRef.current === seq) {
+            hasLoadedScopedRef.current = true;
+            setSkills(updated);
+          }
+        } catch (err) {
+          setSkills((prev) =>
+            prev.map((item) =>
+              item.id === skill.id ? { ...item, enabled: !nextEnabled } : item,
+            ),
+          );
+          orbitActions.showToast(String(err));
+        }
+      });
+    },
+    [hostId, activeCwd],
+  );
 
   const handleDeleteSkill = async (skill: ManagedSkillRecord) => {
     const updated = await orbitIpc.deleteManagedSkill(hostId, skill.id, activeCwd);
@@ -716,8 +736,8 @@ function ManagedSkills({
               <ToggleSwitch
                 checked={skill.enabled}
                 ariaLabel={skill.name}
-                disabled={!online || togglingId !== null}
-                onChange={(next) => void handleToggleEnabled(skill, next)}
+                disabled={!online}
+                onChange={(next) => handleToggleEnabled(skill, next)}
               />
             </>
           );
@@ -811,8 +831,8 @@ function ManagedSkills({
                   <ToggleSwitch
                     checked={skill.enabled}
                     ariaLabel={skill.name}
-                    disabled={togglingId !== null || !online}
-                    onChange={(next) => void handleToggleEnabled(skill, next)}
+                    disabled={!online}
+                    onChange={(next) => handleToggleEnabled(skill, next)}
                   />
                 }
               />

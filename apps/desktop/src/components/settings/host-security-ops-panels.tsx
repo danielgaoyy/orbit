@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Check,
@@ -64,7 +64,7 @@ function triggerTextDownload(filename: string, content: string, mimeType: string
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-export function HostSandboxAndAuditPanel({
+export const HostSandboxAndAuditPanel = memo(function HostSandboxAndAuditPanel({
   hostId,
   isOnline,
 }: {
@@ -74,7 +74,9 @@ export function HostSandboxAndAuditPanel({
   const { t } = useI18n();
   const [policy, setPolicy] = useState<SandboxPolicy | null>(null);
   const [sandboxLoaded, setSandboxLoaded] = useState(false);
-  const [savingSandbox, setSavingSandbox] = useState(false);
+  const latestPolicyRef = useRef<SandboxPolicy | null>(null);
+  const sandboxSeqRef = useRef(0);
+  const sandboxChainRef = useRef<Promise<void>>(Promise.resolve());
 
   const [auditStatus, setAuditStatus] = useState<AuditChainVerification | null>(null);
   const [verifyingAudit, setVerifyingAudit] = useState(false);
@@ -82,13 +84,15 @@ export function HostSandboxAndAuditPanel({
 
   const loadSandboxAndAudit = useCallback(async () => {
     if (!isOnline) return;
+    const loadSeq = ++sandboxSeqRef.current;
     setVerifyingAudit(true);
     try {
       const [sandboxRes, auditRes] = await Promise.allSettled([
         orbitIpc.getSandboxConfig(hostId),
         orbitIpc.getAuditChainStatus(hostId),
       ]);
-      if (sandboxRes.status === "fulfilled") {
+      if (sandboxRes.status === "fulfilled" && sandboxSeqRef.current === loadSeq) {
+        latestPolicyRef.current = sandboxRes.value;
         setPolicy(sandboxRes.value);
         setSandboxLoaded(true);
       }
@@ -106,20 +110,44 @@ export function HostSandboxAndAuditPanel({
 
   const effectivePolicy = policy ?? DEFAULT_SANDBOX_POLICY;
 
+  // Apply sandbox toggles optimistically with serialized RPC writes so changing
+  // one control never flash-disables sibling controls during the local round-trip.
   const commitSandbox = useCallback(
-    async (nextPolicy: SandboxPolicy) => {
-      setSavingSandbox(true);
-      try {
-        const updated = await orbitIpc.updateSandboxConfig(hostId, nextPolicy);
-        setPolicy(updated ?? nextPolicy);
-        orbitActions.showToast(t("securityOps.sandboxSavedToast"));
-      } catch (err) {
-        orbitActions.showToast(err instanceof Error ? err.message : String(err));
-      } finally {
-        setSavingSandbox(false);
-      }
+    (patch: Partial<SandboxPolicy>) => {
+      const prevPolicy = latestPolicyRef.current ?? DEFAULT_SANDBOX_POLICY;
+      const nextPolicy: SandboxPolicy = { ...prevPolicy, ...patch };
+      latestPolicyRef.current = nextPolicy;
+      const seq = ++sandboxSeqRef.current;
+      setPolicy(nextPolicy);
+
+      sandboxChainRef.current = sandboxChainRef.current.then(async () => {
+        try {
+          const updated = await orbitIpc.updateSandboxConfig(hostId, nextPolicy);
+          if (sandboxSeqRef.current === seq) {
+            const resolved = updated ?? nextPolicy;
+            latestPolicyRef.current = resolved;
+            setPolicy(resolved);
+          }
+          orbitActions.showToast(t("securityOps.sandboxSavedToast"));
+        } catch (err) {
+          if (sandboxSeqRef.current === seq) {
+            latestPolicyRef.current = prevPolicy;
+            setPolicy(prevPolicy);
+          }
+          orbitActions.showToast(err instanceof Error ? err.message : String(err));
+        }
+      });
     },
     [hostId, t],
+  );
+
+  const sandboxModeOptions = useMemo(
+    () => [
+      { value: "off" as const, label: t("securityOps.sandboxOff") },
+      { value: "workspace_write" as const, label: t("securityOps.sandboxWorkspaceWrite") },
+      { value: "strict_read_only" as const, label: t("securityOps.sandboxStrictReadOnly") },
+    ],
+    [t],
   );
 
   const handleVerifyAudit = useCallback(async () => {
@@ -175,13 +203,9 @@ export function HostSandboxAndAuditPanel({
           >
             <SettingSelect<SandboxMode>
               value={effectivePolicy.mode}
-              disabled={!isOnline || !sandboxLoaded || savingSandbox}
-              onChange={(mode) => void commitSandbox({ ...effectivePolicy, mode })}
-              options={[
-                { value: "off", label: t("securityOps.sandboxOff") },
-                { value: "workspace_write", label: t("securityOps.sandboxWorkspaceWrite") },
-                { value: "strict_read_only", label: t("securityOps.sandboxStrictReadOnly") },
-              ]}
+              disabled={!isOnline || !sandboxLoaded}
+              onChange={(mode) => commitSandbox({ mode })}
+              options={sandboxModeOptions}
             />
           </SettingRow>
 
@@ -193,11 +217,9 @@ export function HostSandboxAndAuditPanel({
             >
               <ToggleSwitch
                 checked={effectivePolicy.allow_network}
-                disabled={!isOnline || !sandboxLoaded || savingSandbox}
+                disabled={!isOnline || !sandboxLoaded}
                 ariaLabel={t("securityOps.sandboxNetworkTitle")}
-                onChange={(allow_network) =>
-                  void commitSandbox({ ...effectivePolicy, allow_network })
-                }
+                onChange={(allow_network) => commitSandbox({ allow_network })}
               />
             </SettingRow>
           )}
@@ -297,9 +319,9 @@ export function HostSandboxAndAuditPanel({
       </div>
     </>
   );
-}
+});
 
-export function HostDiagnosticsAndMigrationPanel({
+export const HostDiagnosticsAndMigrationPanel = memo(function HostDiagnosticsAndMigrationPanel({
   hostId,
   isOnline,
 }: {
@@ -589,4 +611,4 @@ export function HostDiagnosticsAndMigrationPanel({
       </div>
     </>
   );
-}
+});

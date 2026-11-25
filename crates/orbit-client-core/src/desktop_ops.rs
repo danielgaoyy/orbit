@@ -290,6 +290,30 @@ pub fn read_local_daemon_pairing_secret() -> Option<String> {
     read_local_daemon_pairing_secret_in(&orbit_dir)
 }
 
+/// Read and normalize the local daemon's persisted `relay_url` from `<orbit_dir>/config.json`.
+pub fn read_local_daemon_relay_url_in(orbit_dir: &Path) -> Option<String> {
+    let raw = fs::read_to_string(orbit_dir.join("config.json")).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let relay = val.get("relay_url")?.as_str()?;
+    normalize_relay_input(Some(relay))
+}
+
+/// Read and normalize the local daemon's persisted `relay_url` on Desktop (or Xcode iOS Simulator).
+pub fn read_local_daemon_relay_url() -> Option<String> {
+    let is_desktop = cfg!(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "windows"
+    ));
+    let is_ios_simulator =
+        cfg!(target_os = "ios") && std::env::var_os("SIMULATOR_HOST_HOME").is_some();
+    if !is_desktop && !is_ios_simulator {
+        return None;
+    }
+    let orbit_dir = resolve_orbit_home_dir()?;
+    read_local_daemon_relay_url_in(&orbit_dir)
+}
+
 fn read_local_daemon_port(orbit_dir: &Path) -> u16 {
     if let Ok(raw) = fs::read_to_string(orbit_dir.join("daemon.addr"))
         && let Ok(addr) = raw.trim().parse::<std::net::SocketAddr>()
@@ -380,15 +404,7 @@ pub fn discover_local_daemon_pairing_uri() -> Option<String> {
     let host_id = kp.host_id().ok()?;
     let hostname = detect_system_hostname();
     let port = read_local_daemon_port(&orbit_dir);
-    let relay_url = fs::read_to_string(orbit_dir.join("config.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| {
-            v.get("relay_url")
-                .and_then(|r| r.as_str())
-                .map(ToOwned::to_owned)
-        })
-        .and_then(|r| normalize_relay_input(Some(&r)));
+    let relay_url = read_local_daemon_relay_url_in(&orbit_dir);
     let offer = orbit_crypto::PairingOffer {
         host_id,
         hostname,

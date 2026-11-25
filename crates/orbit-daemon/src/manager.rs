@@ -3519,21 +3519,21 @@ impl AgentOrchestrator {
         let Some(item) = item_opt else {
             return Ok(());
         };
-        let store_busy = updated_opt.as_ref().is_some_and(|ag| {
-            ag.status.is_foreground_busy()
-                || matches!(ag.status, AgentStatus::AwaitingPermission { .. })
-        });
+        let awaiting_permission = updated_opt
+            .as_ref()
+            .is_some_and(|ag| matches!(ag.status, AgentStatus::AwaitingPermission { .. }))
+            || self.has_pending_permissions(agent_id).await;
         if let Some(updated) = updated_opt {
             let _ = self
                 .broadcast_tx
                 .send(DaemonBroadcast::AgentUpdated(updated));
         }
-        let should_interrupt = store_busy || self.has_pending_permissions(agent_id).await;
-        // Never send a separate `DriverCommand::Interrupt` before `send_prompt_with_options`:
-        // doing so lets `session/cancel` settle while prompt pre-processing is still awaiting git
-        // snapshots, letting stale queued prompts or trailing turn finalization race ahead of the
-        // new `UserPrompt`. Instead, pass `ActiveTurnBehavior::Interrupt` directly on `SendPrompt`
-        // so the driver atomically cancels the active turn and dispatches this replacement prompt.
+        // Only force-interrupt when the active turn is blocked on an unanswered permission/question
+        // gate. For a normally running turn, dispatch `ActiveTurnBehavior::Steer` so providers with
+        // native non-destructive steering (Antigravity concurrent `session/prompt`, Codex
+        // `turn/steer`, Claude stdin `user`, Pi `steer`) inject the user's steer message WITHOUT
+        // sending a destructive cancel that kills running subagents or background tasks/daemons!
+        let should_interrupt = awaiting_permission;
         if should_interrupt {
             self.suppress_auto_drain
                 .write()
@@ -12106,21 +12106,80 @@ mod fast_mode_orchestrator_tests {
             .await
             .expect("flush queued prompt");
 
-        // Must receive ONLY a single `SendPrompt { behavior: ActiveTurnBehavior::Interrupt }`
-        // with NO preceding separate `DriverCommand::Interrupt`!
+        // Running turn WITHOUT pending permissions must dispatch a single non-destructive
+        // `SendPrompt { behavior: ActiveTurnBehavior::Steer }` (never `Interrupt` or extra
+        // `DriverCommand::Interrupt`, so running subagents and background daemons survive).
         let first_cmd = cmd_rx.try_recv().expect("driver command sent");
         match first_cmd {
             DriverCommand::SendPrompt {
                 prompt, behavior, ..
             } => {
-                assert_eq!(behavior, ActiveTurnBehavior::Interrupt);
+                assert_eq!(behavior, ActiveTurnBehavior::Steer);
                 assert!(prompt.contains("Run this now"));
             }
-            other => panic!("expected direct SendPrompt(Interrupt), got {other:?}"),
+            other => panic!("expected direct SendPrompt(Steer), got {other:?}"),
         }
         assert!(
             cmd_rx.try_recv().is_err(),
             "must not emit extra DriverCommand::Interrupt before SendPrompt"
+        );
+
+        // When blocked on a pending permission gate, `flush_queued_user_prompt_now` MUST cancel
+        // the permission gate and dispatch a single `SendPrompt { behavior: Interrupt }`.
+        orch.pending_permissions.write().await.insert(
+            ("ag_fq".to_string(), "perm_block_1".to_string()),
+            PendingPermissionSummary {
+                agent_id: "ag_fq".into(),
+                agent_title: "Flush Queue Agent".into(),
+                workspace_id: "ws_fq".into(),
+                request_id: "perm_block_1".into(),
+                title: "Approve".into(),
+                detail: ToolCallDetail::Generic {
+                    tool_name: "shell".into(),
+                    arguments_json: "{}".into(),
+                },
+                allowed_decisions: vec!["allow".into(), "deny".into()],
+                guardian_assessment: None,
+                plan_approval: None,
+                human_only: false,
+                created_at: now,
+            },
+        );
+        let saved_perm = store
+            .enqueue_agent_prompt(
+                "ag_fq",
+                "q_now_perm",
+                "Unblock perm now",
+                "Unblock perm now",
+                &[],
+            )
+            .expect("enqueue perm");
+        orch.flush_queued_user_prompt_now("ag_fq", &saved_perm.queue_id)
+            .await
+            .expect("flush queued prompt with pending perm");
+        assert!(
+            !orch.has_pending_permissions("ag_fq").await,
+            "flush with pending permission must cancel blocking permission gate"
+        );
+        let perm_cmds: Vec<DriverCommand> = std::iter::from_fn(|| cmd_rx.try_recv().ok()).collect();
+        let send_cmd = perm_cmds
+            .iter()
+            .find(|c| matches!(c, DriverCommand::SendPrompt { .. }))
+            .expect("SendPrompt dispatched");
+        match send_cmd {
+            DriverCommand::SendPrompt {
+                prompt, behavior, ..
+            } => {
+                assert_eq!(*behavior, ActiveTurnBehavior::Interrupt);
+                assert!(prompt.contains("Unblock perm now"));
+            }
+            other => panic!("expected SendPrompt(Interrupt), got {other:?}"),
+        }
+        assert!(
+            !perm_cmds
+                .iter()
+                .any(|c| matches!(c, DriverCommand::Interrupt)),
+            "must not emit separate DriverCommand::Interrupt before SendPrompt"
         );
 
         // Preflight guard: if a `PrePromptSubmit` hook blocks `flush_queued_user_prompt_now`,

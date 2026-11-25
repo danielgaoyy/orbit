@@ -297,7 +297,7 @@ export const en = {
   "composer.mentions": "Mentions",
   "composer.actions": "Actions",
   "composer.stopGeneration": "Stop generation",
-  "composer.sendNowTooltip": "Steer now (interrupts current turn)",
+  "composer.sendNowTooltip": "Steer active turn now",
   "composer.steerAction": "Steer",
   "composer.editQueuedAria": "Edit queued message",
   "composer.removeQueuedAria": "Remove queued message",

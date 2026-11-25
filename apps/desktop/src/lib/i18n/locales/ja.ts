@@ -298,7 +298,7 @@ export const ja: MessageDictionary = {
   "composer.mentions": "メンション",
   "composer.actions": "アクション",
   "composer.stopGeneration": "生成を停止",
-  "composer.sendNowTooltip": "今すぐ指示（現在のターンを中断）",
+  "composer.sendNowTooltip": "現在のターンを今すぐステア",
   "composer.steerAction": "ステア",
   "composer.editQueuedAria": "キュー内のメッセージを編集",
   "composer.removeQueuedAria": "キュー内のメッセージを削除",

@@ -1318,6 +1318,7 @@ async fn run_acp_actor(
     let mut tool_cache: HashMap<String, ToolCallDetail> = HashMap::new();
     let mut pending_perms: HashMap<String, PendingAcpPerm> = HashMap::new();
     let mut pending_plan_mode_switches: HashMap<String, PendingAcpPlanModeSwitch> = HashMap::new();
+    let mut pending_human_steers: VecDeque<QueuedDriverPrompt> = VecDeque::new();
     let mut pending_prompts: VecDeque<QueuedDriverPrompt> = VecDeque::new();
     let mut pending_interrupt_replacement: Option<QueuedDriverPrompt> = None;
     let mut active_turn_message_ids: Vec<String> = Vec::new();
@@ -1349,31 +1350,8 @@ async fn run_acp_actor(
                     } => {
                         user_interrupted = false;
                         if active_prompt_rpc_key.is_some() || active_turn_id.is_some() {
-                            // ACP providers lack native non-destructive mid-turn steering;
-                            // degrade agent-originated `Steer` to `Queue`.
-                            let effective_behavior = if origin == PromptOrigin::Agent
-                                && matches!(behavior, ActiveTurnBehavior::Steer)
-                            {
-                                ActiveTurnBehavior::Queue
-                            } else {
-                                behavior
-                            };
                             let blocking_tid = active_turn_id.clone();
-                            if matches!(effective_behavior, ActiveTurnBehavior::Queue) {
-                                emit_prompt_delivery(
-                                    &evt_tx,
-                                    &turn_id,
-                                    &message_ids,
-                                    AgentMessageDeliveryStatus::Queued,
-                                    blocking_tid,
-                                )
-                                .await;
-                                pending_prompts.push_back(QueuedDriverPrompt {
-                                    turn_id,
-                                    prompt,
-                                    message_ids,
-                                });
-                            } else if matches!(effective_behavior, ActiveTurnBehavior::Interrupt) {
+                            if matches!(behavior, ActiveTurnBehavior::Interrupt) {
                                 user_interrupted = true;
                                 seg_state.finalize_all_messages(&evt_tx).await;
                                 for (_, p) in pending_perms.drain() {
@@ -1400,76 +1378,10 @@ async fn run_acp_actor(
                                 if shim.write_stdin_line(cancel).await.is_err() {
                                     emit_dropped_queued_prompts(
                                         &evt_tx,
-                                        pending_interrupt_replacement.take(),
-                                        &mut pending_prompts,
-                                    )
-                                    .await;
-                                    emit_prompt_delivery(
-                                        &evt_tx,
-                                        &turn_id,
-                                        &message_ids,
-                                        AgentMessageDeliveryStatus::Dropped,
                                         None,
+                                        &mut pending_human_steers,
                                     )
                                     .await;
-                                    finalize_and_emit_unexpected_exit(&mut seg_state, &evt_tx)
-                                        .await;
-                                    break;
-                                }
-                                if let Some(prev_rep) = pending_interrupt_replacement.take() {
-                                    emit_prompt_delivery(
-                                        &evt_tx,
-                                        &prev_rep.turn_id,
-                                        &prev_rep.message_ids,
-                                        AgentMessageDeliveryStatus::Dropped,
-                                        None,
-                                    )
-                                    .await;
-                                }
-                                emit_prompt_delivery(
-                                    &evt_tx,
-                                    &turn_id,
-                                    &message_ids,
-                                    AgentMessageDeliveryStatus::Queued,
-                                    blocking_tid,
-                                )
-                                .await;
-                                pending_interrupt_replacement = Some(QueuedDriverPrompt {
-                                    turn_id,
-                                    prompt,
-                                    message_ids,
-                                });
-                            } else if !pending_perms.is_empty() {
-                                emit_prompt_delivery(
-                                    &evt_tx,
-                                    &turn_id,
-                                    &message_ids,
-                                    AgentMessageDeliveryStatus::Dropped,
-                                    None,
-                                )
-                                .await;
-                                let _ = evt_tx
-                                    .send(DriverEvent::Notice {
-                                        level: "warning".into(),
-                                        message: "Waiting for your permission response above. Please approve, deny, or stop the current turn first.".into(),
-                                    })
-                                    .await;
-                            } else {
-                                // `ActiveTurnBehavior::Steer` for human prompts on ACP providers without native mid-RPC steer:
-                                // cancel active turn cleanly while preserving accepted FIFO `pending_prompts`.
-                                user_interrupted = true;
-                                seg_state.finalize_all_messages(&evt_tx).await;
-                                cancelling_active_turn = true;
-                                cancel_deadline = Some(
-                                    tokio::time::Instant::now() + Duration::from_secs(10),
-                                );
-                                let cancel = json!({
-                                    "jsonrpc": "2.0",
-                                    "method": "session/cancel",
-                                    "params": { "sessionId": session_id }
-                                })
-                                .to_string();
-                                if shim.write_stdin_line(cancel).await.is_err() {
                                     emit_dropped_queued_prompts(
                                         &evt_tx,
                                         pending_interrupt_replacement.take(),
@@ -1511,6 +1423,32 @@ async fn run_acp_actor(
                                     prompt,
                                     message_ids,
                                 });
+                            } else {
+                                // ACP providers lack native non-destructive mid-turn steer, and
+                                // `session/cancel` is a destructive force-cancellation that can
+                                // kill running tools/subagents/background tasks. Degrade `Steer`
+                                // safely to non-destructive queueing (human steers drain ahead of
+                                // queued agent notifications once the active turn settles).
+                                emit_prompt_delivery(
+                                    &evt_tx,
+                                    &turn_id,
+                                    &message_ids,
+                                    AgentMessageDeliveryStatus::Queued,
+                                    blocking_tid,
+                                )
+                                .await;
+                                let queued = QueuedDriverPrompt {
+                                    turn_id,
+                                    prompt,
+                                    message_ids,
+                                };
+                                if origin == PromptOrigin::Human
+                                    && matches!(behavior, ActiveTurnBehavior::Steer)
+                                {
+                                    pending_human_steers.push_back(queued);
+                                } else {
+                                    pending_prompts.push_back(queued);
+                                }
                             }
                             continue;
                         }
@@ -1568,6 +1506,8 @@ async fn run_acp_actor(
                     }
                     DriverCommand::Interrupt => {
                         user_interrupted = true;
+                        emit_dropped_queued_prompts(&evt_tx, None, &mut pending_human_steers)
+                            .await;
                         let dropped_rep = pending_interrupt_replacement.take();
                         emit_dropped_queued_prompts(&evt_tx, dropped_rep, &mut pending_prompts)
                             .await;
@@ -1630,6 +1570,12 @@ async fn run_acp_actor(
                             if shim.write_stdin_line(cancel).await.is_err() {
                                 emit_dropped_queued_prompts(
                                     &evt_tx,
+                                    None,
+                                    &mut pending_human_steers,
+                                )
+                                .await;
+                                emit_dropped_queued_prompts(
+                                    &evt_tx,
                                     pending_interrupt_replacement.take(),
                                     &mut pending_prompts,
                                 )
@@ -1639,6 +1585,7 @@ async fn run_acp_actor(
                             }
                         } else if let Some(next_q) = pending_interrupt_replacement
                             .take()
+                            .or_else(|| pending_human_steers.pop_front())
                             .or_else(|| pending_prompts.pop_front())
                         {
                             let effective_prompt = if inject_handoff_on_next_prompt {
@@ -1927,6 +1874,7 @@ async fn run_acp_actor(
 
             maybe_frame = shim.rx.recv() => {
                 let Some(frame) = maybe_frame else {
+                    emit_dropped_queued_prompts(&evt_tx, None, &mut pending_human_steers).await;
                     emit_dropped_queued_prompts(
                         &evt_tx,
                         pending_interrupt_replacement.take(),
@@ -2128,6 +2076,12 @@ async fn run_acp_actor(
                                                     .await;
                                                     emit_dropped_queued_prompts(
                                                         &evt_tx,
+                                                        None,
+                                                        &mut pending_human_steers,
+                                                    )
+                                                    .await;
+                                                    emit_dropped_queued_prompts(
+                                                        &evt_tx,
                                                         pending_interrupt_replacement.take(),
                                                         &mut pending_prompts,
                                                     )
@@ -2159,6 +2113,7 @@ async fn run_acp_actor(
 
                                     if let Some(next_q) = pending_interrupt_replacement
                                         .take()
+                                        .or_else(|| pending_human_steers.pop_front())
                                         .or_else(|| pending_prompts.pop_front())
                                     {
                                         user_interrupted = false;
@@ -2188,6 +2143,12 @@ async fn run_acp_actor(
                                                 &dropped,
                                                 AgentMessageDeliveryStatus::Dropped,
                                                 None,
+                                            )
+                                            .await;
+                                            emit_dropped_queued_prompts(
+                                                &evt_tx,
+                                                None,
+                                                &mut pending_human_steers,
                                             )
                                             .await;
                                             emit_dropped_queued_prompts(
@@ -2299,6 +2260,8 @@ async fn run_acp_actor(
                         }
                     }
                     ShimFrame::Exited { code } => {
+                        emit_dropped_queued_prompts(&evt_tx, None, &mut pending_human_steers)
+                            .await;
                         emit_dropped_queued_prompts(
                             &evt_tx,
                             pending_interrupt_replacement.take(),
@@ -2367,6 +2330,7 @@ async fn run_acp_actor(
                     .await;
                 if let Some(next_q) = pending_interrupt_replacement
                     .take()
+                    .or_else(|| pending_human_steers.pop_front())
                     .or_else(|| pending_prompts.pop_front())
                 {
                     user_interrupted = false;
@@ -2397,6 +2361,8 @@ async fn run_acp_actor(
                             None,
                         )
                         .await;
+                        emit_dropped_queued_prompts(&evt_tx, None, &mut pending_human_steers)
+                            .await;
                         emit_dropped_queued_prompts(
                             &evt_tx,
                             pending_interrupt_replacement.take(),
@@ -3860,6 +3826,7 @@ done
         let prompts_bg = Arc::clone(&received_prompts);
         let cancel_count = Arc::new(AtomicU64::new(0));
         let cancel_bg = Arc::clone(&cancel_count);
+        let (release_slow_tx, mut release_slow_rx) = mpsc::channel::<()>(2);
 
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.expect("accept");
@@ -3879,97 +3846,9 @@ done
             }
 
             let mut inflight_prompt_id: Option<Value> = None;
-            while let Ok(Some(raw_line)) = lines.next_line().await {
-                let Ok(ShimFrame::WriteStdin { line }) =
-                    serde_json::from_str::<ShimFrame>(&raw_line)
-                else {
-                    continue;
-                };
-                let Ok(req) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
-                match method {
-                    "initialize" => {
-                        send_stdout(
-                            &mut wh,
-                            &mut seq,
-                            json!({
-                                "jsonrpc": "2.0",
-                                "id": req["id"],
-                                "result": { "protocolVersion": 1 }
-                            }),
-                        )
-                        .await;
-                    }
-                    "session/new" => {
-                        send_stdout(
-                            &mut wh,
-                            &mut seq,
-                            json!({
-                                "jsonrpc": "2.0",
-                                "id": req["id"],
-                                "result": { "sessionId": "sess-acpp-deliv" }
-                            }),
-                        )
-                        .await;
-                    }
-                    "session/prompt" => {
-                        let text = req
-                            .pointer("/params/prompt/0/text")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        prompts_bg.lock().await.push(text.clone());
-                        if text.starts_with("SLOW_") {
-                            send_stdout(
-                                &mut wh,
-                                &mut seq,
-                                json!({
-                                    "jsonrpc": "2.0",
-                                    "method": "session/update",
-                                    "params": {
-                                        "sessionId": "sess-acpp-deliv",
-                                        "update": {
-                                            "sessionUpdate": "agent_thought_chunk",
-                                            "content": { "type": "text", "text": "pondering" }
-                                        }
-                                    }
-                                }),
-                            )
-                            .await;
-                            inflight_prompt_id = Some(req["id"].clone());
-                        } else {
-                            send_stdout(
-                                &mut wh,
-                                &mut seq,
-                                json!({
-                                    "jsonrpc": "2.0",
-                                    "method": "session/update",
-                                    "params": {
-                                        "sessionId": "sess-acpp-deliv",
-                                        "update": {
-                                            "sessionUpdate": "agent_message_chunk",
-                                            "content": { "type": "text", "text": format!("ok:{text}") }
-                                        }
-                                    }
-                                }),
-                            )
-                            .await;
-                            send_stdout(
-                                &mut wh,
-                                &mut seq,
-                                json!({
-                                    "jsonrpc": "2.0",
-                                    "id": req["id"],
-                                    "result": { "stopReason": "end_turn" }
-                                }),
-                            )
-                            .await;
-                        }
-                    }
-                    "session/cancel" => {
-                        cancel_bg.fetch_add(1, Ordering::SeqCst);
+            loop {
+                tokio::select! {
+                    _ = release_slow_rx.recv() => {
                         if let Some(pid) = inflight_prompt_id.take() {
                             send_stdout(
                                 &mut wh,
@@ -3977,24 +3856,131 @@ done
                                 json!({
                                     "jsonrpc": "2.0",
                                     "id": pid,
-                                    "result": { "stopReason": "cancelled" }
+                                    "result": { "stopReason": "end_turn" }
                                 }),
                             )
                             .await;
                         }
                     }
-                    _ => {
-                        if let Some(id) = req.get("id") {
-                            send_stdout(
-                                &mut wh,
-                                &mut seq,
-                                json!({
-                                    "jsonrpc": "2.0",
-                                    "id": id,
-                                    "result": {}
-                                }),
-                            )
-                            .await;
+                    maybe_line = lines.next_line() => {
+                        let Ok(Some(raw_line)) = maybe_line else { break; };
+                        let Ok(ShimFrame::WriteStdin { line }) =
+                            serde_json::from_str::<ShimFrame>(&raw_line)
+                        else {
+                            continue;
+                        };
+                        let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                            continue;
+                        };
+                        let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                        match method {
+                            "initialize" => {
+                                send_stdout(
+                                    &mut wh,
+                                    &mut seq,
+                                    json!({
+                                        "jsonrpc": "2.0",
+                                        "id": req["id"],
+                                        "result": { "protocolVersion": 1 }
+                                    }),
+                                )
+                                .await;
+                            }
+                            "session/new" => {
+                                send_stdout(
+                                    &mut wh,
+                                    &mut seq,
+                                    json!({
+                                        "jsonrpc": "2.0",
+                                        "id": req["id"],
+                                        "result": { "sessionId": "sess-acpp-deliv" }
+                                    }),
+                                )
+                                .await;
+                            }
+                            "session/prompt" => {
+                                let text = req
+                                    .pointer("/params/prompt/0/text")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                prompts_bg.lock().await.push(text.clone());
+                                if text.starts_with("SLOW_") {
+                                    send_stdout(
+                                        &mut wh,
+                                        &mut seq,
+                                        json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "session/update",
+                                            "params": {
+                                                "sessionId": "sess-acpp-deliv",
+                                                "update": {
+                                                    "sessionUpdate": "agent_thought_chunk",
+                                                    "content": { "type": "text", "text": "pondering" }
+                                                }
+                                            }
+                                        }),
+                                    )
+                                    .await;
+                                    inflight_prompt_id = Some(req["id"].clone());
+                                } else {
+                                    send_stdout(
+                                        &mut wh,
+                                        &mut seq,
+                                        json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "session/update",
+                                            "params": {
+                                                "sessionId": "sess-acpp-deliv",
+                                                "update": {
+                                                    "sessionUpdate": "agent_message_chunk",
+                                                    "content": { "type": "text", "text": format!("ok:{text}") }
+                                                }
+                                            }
+                                        }),
+                                    )
+                                    .await;
+                                    send_stdout(
+                                        &mut wh,
+                                        &mut seq,
+                                        json!({
+                                            "jsonrpc": "2.0",
+                                            "id": req["id"],
+                                            "result": { "stopReason": "end_turn" }
+                                        }),
+                                    )
+                                    .await;
+                                }
+                            }
+                            "session/cancel" => {
+                                cancel_bg.fetch_add(1, Ordering::SeqCst);
+                                if let Some(pid) = inflight_prompt_id.take() {
+                                    send_stdout(
+                                        &mut wh,
+                                        &mut seq,
+                                        json!({
+                                            "jsonrpc": "2.0",
+                                            "id": pid,
+                                            "result": { "stopReason": "cancelled" }
+                                        }),
+                                    )
+                                    .await;
+                                }
+                            }
+                            _ => {
+                                if let Some(id) = req.get("id") {
+                                    send_stdout(
+                                        &mut wh,
+                                        &mut seq,
+                                        json!({
+                                            "jsonrpc": "2.0",
+                                            "id": id,
+                                            "result": {}
+                                        }),
+                                    )
+                                    .await;
+                                }
+                            }
                         }
                     }
                 }
@@ -4063,6 +4049,8 @@ done
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
 
+        // Human Steer on ACP providers MUST degrade safely to non-destructive priority queueing
+        // (zero session/cancel!), draining ahead of queued agent notifications once SLOW_1 settles.
         cmd_tx
             .send(DriverCommand::SendPrompt {
                 turn_id: "t_hu".into(),
@@ -4073,6 +4061,13 @@ done
             })
             .await
             .expect("human steer");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            cancel_count.load(Ordering::SeqCst),
+            0,
+            "Human Steer on ACP provider MUST NOT send destructive session/cancel"
+        );
+        release_slow_tx.send(()).await.expect("release SLOW_1");
         let mut ag_events = Vec::new();
         loop {
             let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
@@ -4093,7 +4088,7 @@ done
                 _ => {}
             }
         }
-        assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
         assert_eq!(
             ag_events,
             vec![
@@ -4173,10 +4168,64 @@ done
                 _ => {}
             }
         }
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
+
+        // Explicit ActiveTurnBehavior::Interrupt still emits session/cancel and preempts immediately.
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t3".into(),
+                prompt: "SLOW_3".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
+            })
+            .await
+            .expect("t3");
+        loop {
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                    .await
+                    .expect("think 3")
+                    .expect("ev"),
+                DriverEvent::ThinkingText { .. }
+            ) {
+                break;
+            }
+        }
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_int".into(),
+                prompt: "HUMAN_INTERRUPT".into(),
+                behavior: ActiveTurnBehavior::Interrupt,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
+            })
+            .await
+            .expect("human interrupt");
+        loop {
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                    .await
+                    .expect("interrupt idle")
+                    .expect("ev"),
+                DriverEvent::StatusChanged(AgentStatus::Idle)
+            ) {
+                break;
+            }
+        }
         assert_eq!(cancel_count.load(Ordering::SeqCst), 2);
         assert_eq!(
             *received_prompts.lock().await,
-            vec!["SLOW_1", "HUMAN_1", "AGENT_1", "SLOW_2", "Q1", "Q2"]
+            vec![
+                "SLOW_1",
+                "HUMAN_1",
+                "AGENT_1",
+                "SLOW_2",
+                "Q1",
+                "Q2",
+                "SLOW_3",
+                "HUMAN_INTERRUPT",
+            ]
         );
 
         drop(cmd_tx);

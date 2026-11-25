@@ -24,12 +24,16 @@ pub enum AttentionState {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActiveTurnBehavior {
-    /// Steer the running turn in-place when supported by the provider runtime.
+    /// Steer the running turn non-destructively without cancelling running subagents or background tasks.
     ///
-    /// For human prompts on ACP runtimes without native mid-turn steering, this cancels the
-    /// active turn and replaces it immediately while preserving FIFO queued messages.
-    /// For agent-originated messages/notifications, runtimes without native non-destructive
-    /// steering degrade `Steer` to `Queue` so active parent turns are never aborted.
+    /// - Runtimes with native mid-turn injection (Antigravity concurrent `session/prompt`, Codex
+    ///   `turn/steer`, Claude stdin `user` frame, Pi `steer` RPC) inject human steers directly into
+    ///   the active turn with zero force cancellation.
+    /// - Generic ACP runtimes without native mid-turn steering degrade human `Steer` to a
+    ///   non-destructive priority queue drained ahead of queued agent notifications once the active
+    ///   turn settles naturally.
+    /// - Agent-originated messages/notifications on ACP/Antigravity degrade `Steer` to FIFO `Queue`
+    ///   so active parent turns are never disturbed.
     #[default]
     Steer,
     /// Queue strictly in FIFO order until the current turn transitions to `Idle`.

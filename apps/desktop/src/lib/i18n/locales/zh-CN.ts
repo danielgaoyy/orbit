@@ -290,7 +290,7 @@ export const zhCN: MessageDictionary = {
   "composer.mentions": "引用",
   "composer.actions": "指令",
   "composer.stopGeneration": "停止生成",
-  "composer.sendNowTooltip": "立即引导（中断当前轮次）",
+  "composer.sendNowTooltip": "立即引导当前轮次",
   "composer.steerAction": "引导",
   "composer.editQueuedAria": "编辑排队消息",
   "composer.removeQueuedAria": "移除排队消息",

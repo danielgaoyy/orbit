@@ -2478,12 +2478,14 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         },
       }));
       const activeAgent = getState().hostDetails[hostId]?.agents.find((a) => a.agent_id === agentId);
-      if (isAgentForegroundRunning(activeAgent) || activeAgent?.is_awaiting_permission) {
+      const awaitingPermission = Boolean(activeAgent?.is_awaiting_permission);
+      if (awaitingPermission) {
         await orbitIpc.interruptAgent(hostId, agentId);
       }
       await orbitIpc.sendPrompt(hostId, agentId, target.wirePrompt, {
         displayPrompt: target.displayText,
         badges: target.badges,
+        activeTurnBehavior: awaitingPermission ? "interrupt" : "steer",
       });
     },
 

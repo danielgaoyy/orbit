@@ -69,16 +69,24 @@ export const ConversationComposer = memo(function ConversationComposer({
     if (!el) return;
     let lastW = el.clientWidth;
     setComposerWidthPx(lastW);
+    let rafId: number | null = null;
     const ro = new ResizeObserver((entries) => {
       const nextW = Math.round(entries[0]?.contentRect.width ?? 0);
       if (nextW > 0 && nextW !== lastW) {
         lastW = nextW;
-        setComposerWidthPx(nextW);
-        setWidthTick((n) => n + 1);
+        if (rafId !== null) window.cancelAnimationFrame(rafId);
+        rafId = window.requestAnimationFrame(() => {
+          rafId = null;
+          setComposerWidthPx(nextW);
+          setWidthTick((n) => n + 1);
+        });
       }
     });
     ro.observe(el);
-    return () => ro.disconnect();
+    return () => {
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
+      ro.disconnect();
+    };
   }, []);
 
   useLayoutEffect(() => {
@@ -101,7 +109,10 @@ export const ConversationComposer = memo(function ConversationComposer({
   const showStop = isBusy && Boolean(onInterrupt) && value.trim().length === 0;
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (ime.shouldIgnoreKeyDown(e)) return;
+    if (ime.shouldIgnoreKeyDown(e)) {
+      if (e.key === "Enter") e.preventDefault();
+      return;
+    }
 
     const isModEnter = e.key === "Enter" && (e.metaKey || e.ctrlKey);
     const isPlainEnter = e.key === "Enter" && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey;
@@ -221,6 +232,21 @@ export const ConversationComposer = memo(function ConversationComposer({
           </div>
           <div className="flex shrink-0 items-center gap-1.5">
             {resolvedRightControls}
+            {isBusy && Boolean(onInterrupt) && !showStop && (
+              <SimpleTooltip label={t("composer.stopGeneration")} shortcut="Esc Esc" side="top">
+                <button
+                  type="button"
+                  onClick={onInterrupt}
+                  aria-label={t("composer.stopGeneration")}
+                  className={cn(
+                    "orbit-press bg-surface-recessed hover:bg-accent inline-flex shrink-0 cursor-pointer items-center justify-center rounded-full",
+                    variant === "compact" ? "size-[30px]" : "size-8.5",
+                  )}
+                >
+                  <span className="bg-signal-danger size-[11px] rounded-[2.5px]" />
+                </button>
+              </SimpleTooltip>
+            )}
             {showStop ? (
               <SimpleTooltip label={t("composer.stopGeneration")} shortcut="Esc Esc" side="top">
                 <button

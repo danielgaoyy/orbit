@@ -113,12 +113,21 @@ function DailyUsageBarChart({
 
   useEffect(() => {
     const chart = chartRef.current;
-    if (!chart) return;
+    if (!chart || typeof ResizeObserver === "undefined") return;
+    let rafId = 0;
     const observer = new ResizeObserver(([entry]) => {
-      if (entry.contentRect.width > 0) setWidth(Math.max(100, Math.round(entry.contentRect.width)));
+      const next = entry?.contentRect.width ?? 0;
+      if (next <= 0 || rafId) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0;
+        setWidth(Math.max(100, Math.round(chart.getBoundingClientRect().width || next)));
+      });
     });
     observer.observe(chart);
-    return () => observer.disconnect();
+    return () => {
+      if (rafId) window.cancelAnimationFrame(rafId);
+      observer.disconnect();
+    };
   }, [hasDaily]);
 
   const values = useMemo(

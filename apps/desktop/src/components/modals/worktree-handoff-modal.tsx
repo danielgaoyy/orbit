@@ -102,6 +102,12 @@ function WorktreeHandoffModalBody({
 }) {
   const { hostId, workspaceId, direction } = target;
   const targetWorkspaceId = target.targetWorkspaceId ?? null;
+  const activeAgentInWs = useOrbitSelector((s) => {
+    if (!s.selectedAgentId || s.selectedHostId !== hostId) return null;
+    const ag = s.hostDetails[hostId]?.agents.find((a) => a.agent_id === s.selectedAgentId);
+    return ag && ag.workspace_id === workspaceId ? ag.agent_id : null;
+  });
+  const sourceAgentId = target.sourceAgentId ?? activeAgentInWs;
   const identity = targetIdentityKey(target);
 
   const sourceWorkspace = useOrbitSelector(
@@ -148,6 +154,7 @@ function WorktreeHandoffModalBody({
       .previewWorktreeHandoff({
         host_id: hostId,
         workspace_id: workspaceId,
+        source_agent_id: sourceAgentId,
         direction,
         target_workspace_id: targetWorkspaceId,
         include_committed: direction === "worktree_to_local" ? includeCommitted : false,
@@ -210,6 +217,7 @@ function WorktreeHandoffModalBody({
       const outcome = await orbitIpc.executeWorktreeHandoff({
         host_id: hostId,
         workspace_id: workspaceId,
+        source_agent_id: sourceAgentId,
         direction,
         mode,
         target_workspace_id: targetWorkspaceId,
@@ -517,7 +525,7 @@ function WorktreeHandoffModalBody({
             </div>
           </div>
           {canOfferThreeWay && (
-            <label className="flex cursor-pointer items-center justify-between gap-2 border-t border-amber-500/20 pt-2">
+            <div className="flex items-center justify-between gap-2 border-t border-amber-500/20 pt-2">
               <span className="text-[12px] font-medium">
                 Apply with 3-way conflict markers
               </span>
@@ -527,7 +535,7 @@ function WorktreeHandoffModalBody({
                 disabled={executing}
                 ariaLabel="Apply with 3-way conflict markers"
               />
-            </label>
+            </div>
           )}
         </div>
       )}

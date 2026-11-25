@@ -23,14 +23,15 @@ pub struct OrbitMcpLaunchSpec {
     pub stdio_args: Vec<String>,
 }
 
-/// Persisted still-`Running` background task tool call from SQLite `timeline_events`,
+/// Persisted still-`Running` tool call from SQLite `timeline_events`,
 /// passed into drivers on reattach/resume so historical finished tasks are reconciled cleanly
-/// and genuinely still-running tasks retain their canonical `call_id` mapping across restarts.
+/// and genuinely still-running foreground/background tools retain their canonical metadata &
+/// `call_id` mapping across daemon restarts.
 #[derive(Debug, Clone)]
 pub struct PersistedBackgroundTask {
     pub call_id: String,
     pub detail: ToolCallDetail,
-    pub info: BackgroundTaskInfo,
+    pub info: Option<BackgroundTaskInfo>,
 }
 
 #[derive(Clone)]

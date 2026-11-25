@@ -1093,6 +1093,7 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
     getScrollElement: () => scrollRef.current,
     estimateSize: (index) => estimateRowHeight(flatRows[index]),
     overscan: 16,
+    useAnimationFrameWithResizeObserver: true,
     getItemKey: (index) => flatRows[index]?.key ?? index,
   });
 

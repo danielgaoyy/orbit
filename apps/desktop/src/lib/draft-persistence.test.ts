@@ -10,6 +10,7 @@ import {
   buildSerializedDraftPayload,
   createDraftPersistenceController,
   hasNonEmptyScopeDraft,
+  mergeMissingDraftSlices,
   parseAndValidatePersistedDrafts,
   truncateUtf8,
   utf8ByteLength,
@@ -1037,5 +1038,45 @@ describe("draft-persistence", () => {
       hydratedHeavy.inlineMentions["host-1::heavy"]?.some((m) => m.token === "@src/a.ts"),
       "lightweight inline mention should survive budget trimming",
     );
+  });
+
+  it("invokes onPersistPayload mirror hook on flush/clear and merges SQLite fallback without overwriting active edits", () => {
+    const storage = new MemoryStorage();
+    const nowMs = 1_750_000_000_000;
+    const mirroredPayloads: Array<string | null> = [];
+    const slices = emptySlices();
+
+    const controller = createDraftPersistenceController(() => slices, {
+      storage,
+      debounceMs: 0,
+      now: () => nowMs,
+      onPersistPayload: (json) => mirroredPayloads.push(json),
+    });
+
+    slices.composerDrafts["host-1::ag_1"] = "unsent SQLite draft";
+    slices.composerDrafts["host-1::ag_2"] = "old SQLite draft";
+    controller.markDirty(["host-1::ag_1", "host-1::ag_2"]);
+    controller.flushNow(true);
+    assert.equal(mirroredPayloads.length, 1);
+    assert.ok(typeof mirroredPayloads[0] === "string" && mirroredPayloads[0].includes("unsent SQLite draft"));
+
+    // Clearing all scopes emits null so SQLite deletes stale drafts too
+    delete slices.composerDrafts["host-1::ag_1"];
+    delete slices.composerDrafts["host-1::ag_2"];
+    controller.removeScopes(["host-1::ag_1", "host-1::ag_2"], true);
+    assert.equal(mirroredPayloads[mirroredPayloads.length - 1], null);
+
+    // Cold-start fallback recovery only populates scopes empty in current memory
+    const fallbackHydrated = parseAndValidatePersistedDrafts(mirroredPayloads[0], { nowMs });
+    const liveSlices: DraftStateSlices = {
+      ...emptySlices(),
+      composerDrafts: { "host-1::ag_2": "newer user input in memory" },
+    };
+    const merged = mergeMissingDraftSlices(liveSlices, fallbackHydrated);
+    assert.ok(merged !== null);
+    assert.deepEqual(merged.recoveredScopes, ["host-1::ag_1"]);
+    assert.equal(merged.composerDrafts?.["host-1::ag_1"], "unsent SQLite draft");
+    assert.equal(merged.composerDrafts?.["host-1::ag_2"], "newer user input in memory");
+    controller.dispose();
   });
 });

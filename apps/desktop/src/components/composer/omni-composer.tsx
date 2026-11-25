@@ -570,12 +570,22 @@ export const OmniComposer = memo(function OmniComposer({
   useLayoutEffect(() => {
     const overlay = tokenOverlayRef.current;
     if (!overlay) return;
+    let rafId: number | null = null;
     const measure = () =>
       setTokenIndentPx(Math.max(0, overlay.getBoundingClientRect().width - TOKEN_PAD_X + TOKEN_GAP));
     measure();
-    const observer = new ResizeObserver(measure);
+    const observer = new ResizeObserver(() => {
+      if (rafId !== null) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = null;
+        measure();
+      });
+    });
     observer.observe(overlay);
-    return () => observer.disconnect();
+    return () => {
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
+      observer.disconnect();
+    };
   }, [slashDirective, selectedHostId]);
 
   const activeMode: SessionMode = normalizePermissionMode(
@@ -598,13 +608,21 @@ export const OmniComposer = memo(function OmniComposer({
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
+    let rafId: number | null = null;
     const ro = new ResizeObserver(([entry]) => {
       const width = entry.borderBoxSize[0]?.inlineSize ?? entry.contentRect.width;
-      setComposerWidthPx(width);
-      setIsCompactBar(width < 440);
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
+      rafId = window.requestAnimationFrame(() => {
+        rafId = null;
+        setComposerWidthPx(width);
+        setIsCompactBar(width < 440);
+      });
     });
     ro.observe(el, { box: "border-box" });
-    return () => ro.disconnect();
+    return () => {
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
+      ro.disconnect();
+    };
   }, [selectedHostId]);
 
   // Measure full wrapped textarea height from the off-flow `<div>` mirror BEFORE paint (`useLayoutEffect`).
@@ -1382,7 +1400,10 @@ export const OmniComposer = memo(function OmniComposer({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (ime.shouldIgnoreKeyDown(e)) return;
+    if (ime.shouldIgnoreKeyDown(e)) {
+      if (e.key === "Enter") e.preventDefault();
+      return;
+    }
 
     if (
       isTauriRuntime() &&
@@ -1444,7 +1465,6 @@ export const OmniComposer = memo(function OmniComposer({
       !e.ctrlKey &&
       !e.altKey &&
       !slashTrigger &&
-      !mentionTrigger &&
       inlineMentions.length > 0 &&
       textareaRef.current
     ) {
@@ -1477,7 +1497,6 @@ export const OmniComposer = memo(function OmniComposer({
       !e.ctrlKey &&
       !e.altKey &&
       !slashTrigger &&
-      !mentionTrigger &&
       inlineMentions.length > 0 &&
       textareaRef.current
     ) {
@@ -2314,6 +2333,7 @@ export const OmniComposer = memo(function OmniComposer({
             <ComposerBottomBar
               hasPayload={hasPayload}
               submitBusy={submitBusy}
+              isTurnBusy={isTurnBusy}
               showStopButton={showStopButton}
               voiceRecording={voiceRecording}
               voiceTranscribing={voiceTranscribing}
@@ -2342,6 +2362,7 @@ export const OmniComposer = memo(function OmniComposer({
 interface ComposerBottomBarProps {
   hasPayload: boolean;
   submitBusy: boolean;
+  isTurnBusy: boolean;
   showStopButton: boolean;
   voiceRecording: boolean;
   voiceTranscribing: boolean;
@@ -2362,7 +2383,7 @@ interface ComposerBottomBarProps {
 }
 
 const ComposerBottomBar = memo(function ComposerBottomBar({
-  hasPayload, submitBusy, showStopButton, voiceRecording, voiceTranscribing,
+  hasPayload, submitBusy, isTurnBusy, showStopButton, voiceRecording, voiceTranscribing,
   submitTooltipLabel, submitShortcut,
   activeMode, effectiveProvider, isCompactBar, selectedHostId, selectedAgentId,
   onAttach, onMention, onSlash, onSelectMode, onSubmit, onStartVoice, onStopVoice,
@@ -2454,6 +2475,23 @@ const ComposerBottomBar = memo(function ComposerBottomBar({
           provider={effectiveProvider}
           iconOnly={isCompactBar}
         />
+
+        {isTurnBusy && !showStopButton && !voiceRecording && Boolean(selectedAgentId) && (
+          <SimpleTooltip label={t("composer.stopGeneration")} shortcut="Esc Esc" side="top">
+            <button
+              type="button"
+              aria-label={t("composer.stopGeneration")}
+              onClick={() => {
+                if (selectedAgentId) {
+                  void orbitIpc.interruptAgent(selectedHostId, selectedAgentId);
+                }
+              }}
+              className="orbit-press bg-surface-recessed hover:bg-accent inline-flex size-8.5 shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors duration-150 ease-[var(--ease-out-expo)]"
+            >
+              <span aria-hidden="true" className="bg-signal-danger size-[11px] rounded-[2.5px]" />
+            </button>
+          </SimpleTooltip>
+        )}
 
         <SimpleTooltip
           label={actionLabel}

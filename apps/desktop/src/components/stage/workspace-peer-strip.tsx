@@ -939,7 +939,21 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
         </div>
 
         {/* Pinned Add Collaborator Button (never clipped by scrolling peer tabs) */}
-        <Popover open={spawnOpen} onOpenChange={setSpawnOpen}>
+        <Popover
+          open={spawnOpen}
+          onOpenChange={(nextOpen, eventDetails) => {
+            if (!nextOpen && eventDetails?.reason === "outside-press") {
+              const target = eventDetails.event?.target;
+              if (
+                target instanceof Element &&
+                target.closest('[data-slot="select-content"], [data-slot="select-item"], [role="listbox"]')
+              ) {
+                return;
+              }
+            }
+            setSpawnOpen(nextOpen);
+          }}
+        >
           <SimpleTooltip label={t("peerStrip.addCollaborator")}>
             <PopoverTrigger asChild>
               <button

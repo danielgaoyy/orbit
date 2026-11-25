@@ -682,6 +682,28 @@ fn prepend_handoff_context(ctx: Option<String>, prompt: &str) -> String {
     format!("{ctx}\n\n{prompt}")
 }
 
+fn format_agy_clean_turns_handoff(turns: &[(String, String)]) -> Option<String> {
+    if turns.is_empty() {
+        return None;
+    }
+    let mut sections = vec![
+        "[Prior Conversation Context in this Workspace]".to_string(),
+        "Continue smoothly from these completed turns (any aborted turn was discarded):"
+            .to_string(),
+    ];
+    for (u, a) in turns.iter().rev().take(8).rev() {
+        let u_trim = u.trim();
+        let a_trim = a.trim();
+        if !u_trim.is_empty() {
+            sections.push(format!("User: {}", truncate_preview(u_trim, 1200)));
+        }
+        if !a_trim.is_empty() {
+            sections.push(format!("Assistant: {}", truncate_preview(a_trim, 1200)));
+        }
+    }
+    Some(sections.join("\n\n"))
+}
+
 fn prepend_interrupted_reply_handoff(handoff: Option<String>, prompt: &str) -> String {
     let Some(ctx) = handoff.filter(|c| !c.trim().is_empty()) else {
         return prompt.to_string();
@@ -1468,8 +1490,15 @@ async fn run_agy_actor(
     let now_utc = Utc::now();
     let mut stale_settlements: Vec<(String, ToolCallStatus)> = Vec::new();
     for persisted in &cfg.persisted_running_bg_tasks {
-        let tid_opt = persisted
-            .info
+        let Some(ref bg_info) = persisted.info else {
+            if is_reattached {
+                tool_cache.insert(persisted.call_id.clone(), persisted.detail.clone());
+            } else {
+                stale_settlements.push((persisted.call_id.clone(), ToolCallStatus::Failed));
+            }
+            continue;
+        };
+        let tid_opt = bg_info
             .task_id
             .as_deref()
             .map(str::trim)
@@ -1498,14 +1527,14 @@ async fn run_agy_actor(
                 wakeup_tools.register_synthetic_bg_task(
                     &persisted.call_id,
                     persisted.detail.clone(),
-                    persisted.info.clone(),
+                    bg_info.clone(),
                 );
                 tool_cache.insert(persisted.call_id.clone(), persisted.detail.clone());
                 bg_tracker.record_started_with_expiry(
                     tid,
                     Some(persisted.call_id.clone()),
-                    persisted.info.log_path.clone(),
-                    Some(persisted.info.clone()),
+                    bg_info.log_path.clone(),
+                    Some(bg_info.clone()),
                     hist.expires_at,
                 );
             }
@@ -1583,6 +1612,9 @@ async fn run_agy_actor(
     let mut cancel_deadline: Option<tokio::time::Instant> = None;
     let mut pending_cancelled_partial_reply: Option<String> = None;
     let mut pending_interrupted_reply_handoff: Option<String> = None;
+    let mut committed_turns: Vec<(String, String)> = Vec::new();
+    let mut current_turn_user_prompt: Option<String> = None;
+    let mut reset_session_on_cancel = false;
     let mut last_stderr_notice: HashMap<&'static str, Instant> = HashMap::new();
     let mut pending_self_heal: Option<PendingSelfHeal> = None;
     let mut consecutive_self_heals: u32 = 0;
@@ -2178,7 +2210,9 @@ async fn run_agy_actor(
                         last_acp_update_at = None;
                         cancelling_active_turn = false;
                         turn_was_cancelled = false;
+                        reset_session_on_cancel = false;
                         cancel_deadline = None;
+                        let raw_prompt_for_history = prompt.clone();
                         if autonomous_turn_id.take().is_some() {
                             autonomous_wakeup_source = None;
                             let bg_deltas = transcript_monitor.sync_silent_with_bg_tasks();
@@ -2205,6 +2239,7 @@ async fn run_agy_actor(
                             pending_interrupted_reply_handoff.take(),
                             &with_handoff,
                         );
+                        current_turn_user_prompt = Some(raw_prompt_for_history);
                         active_turn_message_ids = message_ids.clone();
                         last_dispatched_prompt = Some(QueuedDriverPrompt {
                             turn_id: turn_id.clone(),
@@ -2289,6 +2324,7 @@ async fn run_agy_actor(
                             .await;
                         replay_filter.clear_all();
                         wakeup_tools.clear_replay_generation();
+                        reset_session_on_cancel = false;
                         if !foreground_bg_wait
                             && let Some(partial) = snapshot_active_partial_reply(&seg_state)
                         {
@@ -2365,6 +2401,7 @@ async fn run_agy_actor(
                             .await;
                         replay_filter.clear_all();
                         wakeup_tools.clear_replay_generation();
+                        reset_session_on_cancel = false;
                         if !foreground_bg_wait
                             && let Some(partial) = snapshot_active_partial_reply(&seg_state)
                         {
@@ -3210,6 +3247,73 @@ async fn run_agy_actor(
                                     // capturing any newly spawned/completed background task IDs.
                                     let (bg_deltas, committed_texts) =
                                         transcript_monitor.sync_silent_for_turn_end();
+                                    let finished_user_prompt = current_turn_user_prompt.take();
+                                    let should_reset_session = std::mem::take(&mut reset_session_on_cancel);
+                                    if !was_cancelled && val.get("error").is_none() {
+                                        if let Some(u_txt) = finished_user_prompt {
+                                            let a_txt = committed_texts
+                                                .last()
+                                                .cloned()
+                                                .or_else(|| seg_state.latest_msg_text.clone())
+                                                .unwrap_or_default();
+                                            committed_turns.push((u_txt, a_txt));
+                                            if committed_turns.len() > 8 {
+                                                committed_turns.remove(0);
+                                            }
+                                        }
+                                    } else if was_cancelled
+                                        && should_reset_session
+                                        && pending_cancelled_partial_reply.is_none()
+                                        && committed_texts.is_empty()
+                                    {
+                                        // Early thinking cancel produced no assistant output: open a
+                                        // clean ACP session seeded strictly with completed turns so
+                                        // the cancelled prompt cannot contaminate the next turn.
+                                        if let Ok(fresh) = open_agy_session(
+                                            &cfg,
+                                            &mut shim,
+                                            &mut next_rpc_id,
+                                            &mut pending_rpcs,
+                                            AgySessionOpenMode::New,
+                                            current_base_model.as_deref(),
+                                            active_effort,
+                                            &mode,
+                                        )
+                                        .await
+                                        {
+                                            let prev_session_id = session_id.clone();
+                                            session_id = fresh.session_id;
+                                            available_model_ids = fresh.available_model_ids;
+                                            canonical_base_ids = fresh.canonical_base_ids;
+                                            current_base_model = fresh.current_base_model;
+                                            active_effort = fresh.effective_effort;
+                                            transcript_monitor =
+                                                AgyTranscriptMonitor::from_brain_dir_with_session(
+                                                    agy_data_dir.join("brain").join(&session_id),
+                                                    &session_id,
+                                                );
+                                            transcript_monitor.sync_silent();
+                                            replay_filter.clear_all();
+                                            wakeup_tools.clear_replay_generation();
+                                            brain_watch.set_targets(collect_agy_watch_targets(
+                                                &transcript_monitor,
+                                                &subagent_monitors,
+                                            ));
+                                            let _ = evt_tx
+                                                .send(DriverEvent::SessionInitialized {
+                                                    persistence_ref: session_id.clone(),
+                                                    model: current_base_model.clone(),
+                                                })
+                                                .await;
+                                            if session_id != prev_session_id
+                                                && let Some(clean_ctx) =
+                                                    format_agy_clean_turns_handoff(&committed_turns)
+                                            {
+                                                pending_handoff_context = Some(clean_ctx);
+                                                inject_handoff_on_next_prompt = true;
+                                            }
+                                        }
+                                    }
                                     if was_cancelled
                                         && let Some(partial) = pending_cancelled_partial_reply.take()
                                         && transcript_monitor.active_path().is_some()
@@ -3308,9 +3412,20 @@ async fn run_agy_actor(
                                         .or_else(|| pending_human_steers.pop_front())
                                         .or_else(|| pending_prompts.pop_front())
                                     {
+                                        reset_session_on_cancel = false;
+                                        current_turn_user_prompt = Some(next_q.prompt.clone());
+                                        let with_handoff = if inject_handoff_on_next_prompt {
+                                            inject_handoff_on_next_prompt = false;
+                                            prepend_handoff_context(
+                                                pending_handoff_context.take(),
+                                                &next_q.prompt,
+                                            )
+                                        } else {
+                                            next_q.prompt.clone()
+                                        };
                                         let next_prompt = prepend_interrupted_reply_handoff(
                                             pending_interrupted_reply_handoff.take(),
-                                            &next_q.prompt,
+                                            &with_handoff,
                                         );
                                         active_turn_message_ids = next_q.message_ids.clone();
                                         last_dispatched_prompt = Some(QueuedDriverPrompt {
@@ -3864,12 +3979,63 @@ async fn run_agy_actor(
                 wakeup_tools.clear_replay_generation();
                 finalize_agy_stream_segments(&mut seg_state, &evt_tx).await;
                 let (bg_deltas, committed_texts) = transcript_monitor.sync_silent_for_turn_end();
-                if let Some(partial) = pending_cancelled_partial_reply.take()
+                current_turn_user_prompt = None;
+                let timed_out_partial = pending_cancelled_partial_reply.take();
+                let should_reset_on_timeout = std::mem::take(&mut reset_session_on_cancel)
+                    || timed_out_partial.is_none();
+                if let Some(partial) = timed_out_partial
                     && transcript_monitor.active_path().is_some()
                     && !planner_texts_committed_reply(&committed_texts, &partial)
                 {
                     pending_interrupted_reply_handoff =
                         Some(format_interrupted_reply_handoff(&partial));
+                } else if should_reset_on_timeout {
+                    // Cancel deadline expired while Turn 1 may still be running inside `agy acp`:
+                    // open a fresh `session/new` so late `session/update` frames from the aborted
+                    // trajectory never bleed into Turn 2.
+                    if let Ok(fresh) = open_agy_session(
+                        &cfg,
+                        &mut shim,
+                        &mut next_rpc_id,
+                        &mut pending_rpcs,
+                        AgySessionOpenMode::New,
+                        current_base_model.as_deref(),
+                        active_effort,
+                        &mode,
+                    )
+                    .await
+                    {
+                        let prev_session_id = session_id.clone();
+                        session_id = fresh.session_id;
+                        available_model_ids = fresh.available_model_ids;
+                        canonical_base_ids = fresh.canonical_base_ids;
+                        current_base_model = fresh.current_base_model;
+                        active_effort = fresh.effective_effort;
+                        transcript_monitor = AgyTranscriptMonitor::from_brain_dir_with_session(
+                            agy_data_dir.join("brain").join(&session_id),
+                            &session_id,
+                        );
+                        transcript_monitor.sync_silent();
+                        replay_filter.clear_all();
+                        wakeup_tools.clear_replay_generation();
+                        brain_watch.set_targets(collect_agy_watch_targets(
+                            &transcript_monitor,
+                            &subagent_monitors,
+                        ));
+                        let _ = evt_tx
+                            .send(DriverEvent::SessionInitialized {
+                                persistence_ref: session_id.clone(),
+                                model: current_base_model.clone(),
+                            })
+                            .await;
+                        if session_id != prev_session_id
+                            && let Some(clean_ctx) =
+                                format_agy_clean_turns_handoff(&committed_turns)
+                        {
+                            pending_handoff_context = Some(clean_ctx);
+                            inject_handoff_on_next_prompt = true;
+                        }
+                    }
                 }
                 apply_foreground_bg_deltas_with_mode(
                     &cfg.agent_id,

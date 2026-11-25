@@ -871,10 +871,44 @@ fn pad_graphviz_viewbox(svg: &str, pad: f32) -> String {
     out
 }
 
+fn polish_raw_svg_contrast(svg: &str, theme_mode: DiagramTheme) -> String {
+    if !matches!(theme_mode, DiagramTheme::Dark) {
+        return svg.to_string();
+    }
+    rewrite_svg_open_tags(svg, |tag| {
+        let is_text = starts_with_ascii_ci(tag, "<text") || starts_with_ascii_ci(tag, "<tspan");
+        let is_shape = starts_with_ascii_ci(tag, "<rect")
+            || starts_with_ascii_ci(tag, "<circle")
+            || starts_with_ascii_ci(tag, "<ellipse")
+            || starts_with_ascii_ci(tag, "<polygon")
+            || starts_with_ascii_ci(tag, "<polyline")
+            || starts_with_ascii_ci(tag, "<path")
+            || starts_with_ascii_ci(tag, "<line");
+        let mut next = tag
+            .replace("stroke=\"#000000\"", "stroke=\"#E4E4E7\"")
+            .replace("stroke=\"#000\"", "stroke=\"#E4E4E7\"")
+            .replace("stroke=\"black\"", "stroke=\"#E4E4E7\"")
+            .replace("fill=\"#000000\"", "fill=\"#F4F4F5\"")
+            .replace("fill=\"#000\"", "fill=\"#F4F4F5\"")
+            .replace("fill=\"black\"", "fill=\"#F4F4F5\"");
+        if is_text && !next.contains("fill=") {
+            if let Some(end) = next.rfind('>') {
+                next.insert_str(end, " fill=\"#F4F4F5\"");
+            }
+        } else if is_shape && next.contains("stroke=") {
+            next = next
+                .replace("stroke=\"#111111\"", "stroke=\"#CBD5E1\"")
+                .replace("stroke=\"#18181b\"", "stroke=\"#CBD5E1\"");
+        }
+        next
+    })
+}
+
 fn render_raw_svg(source: &str, theme_mode: DiagramTheme) -> RenderDiagramView {
     match sanitize_svg(source) {
         Ok((sanitized, width, height)) => {
-            let namespaced = namespace_svg_ids(&sanitized, DiagramKind::Svg, theme_mode, source);
+            let contrasted = polish_raw_svg_contrast(&sanitized, theme_mode);
+            let namespaced = namespace_svg_ids(&contrasted, DiagramKind::Svg, theme_mode, source);
             RenderDiagramView {
                 kind: DiagramKind::Svg,
                 theme: theme_mode,

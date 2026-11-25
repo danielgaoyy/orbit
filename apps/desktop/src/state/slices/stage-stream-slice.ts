@@ -485,12 +485,27 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         }
         loadingEarlierStageKeys.add(tlKey);
         try {
+          const prevOldest = stage.oldest_loaded_seq ?? 0;
+          const prevTurnCount = stage.turns.length;
           const started = await orbitIpc.loadOlderAgentTimeline(hostId, agentId, 300);
           if (!started) {
             return 0;
           }
-          await ctx.actions.pullStageDelta(hostId, agentId);
-          return 1;
+          for (let attempt = 0; attempt < 25; attempt += 1) {
+            await ctx.actions.pullStageDelta(hostId, agentId);
+            const refreshed = getState().stages[tlKey];
+            if (!refreshed) return 0;
+            const addedTurns = Math.max(0, refreshed.turns.length - prevTurnCount);
+            if (
+              addedTurns > 0 ||
+              (refreshed.oldest_loaded_seq ?? prevOldest) < prevOldest ||
+              !refreshed.has_older_history
+            ) {
+              return Math.max(addedTurns, (refreshed.oldest_loaded_seq ?? prevOldest) < prevOldest ? 1 : 0);
+            }
+            await new Promise((r) => window.setTimeout(r, 40));
+          }
+          return 0;
         } catch {
           return 0;
         } finally {

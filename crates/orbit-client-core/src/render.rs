@@ -295,7 +295,8 @@ pub fn detect_language_for_path(path: &str) -> &'static str {
         "fish" => "sh",
         "css" => "css",
         "scss" | "sass" => "scss",
-        "html" | "htm" | "xml" | "svg" => "html",
+        "svg" => "svg",
+        "html" | "htm" | "xml" => "html",
         "sql" => "sql",
         "graphql" | "gql" => "graphql",
         "lua" => "lua",
@@ -857,20 +858,32 @@ fn flush_active_list_item_prefix(
 
 /// Parse streaming or completed Markdown into platform-agnostic native render blocks.
 pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockView> {
+    parse_markdown_blocks_with_math(markdown, streaming, true)
+}
+
+/// Parse Markdown into native render blocks with explicit control over `$...$` / `$$...$$` math.
+pub fn parse_markdown_blocks_with_math(
+    markdown: &str,
+    streaming: bool,
+    enable_math: bool,
+) -> Vec<RichBlockView> {
     let (normalized, had_unclosed_fence) = if streaming {
         heal_streaming_fences(markdown)
     } else {
         (markdown.to_string(), false)
     };
-    let preprocessed = crate::math::preprocess_markdown_math(&normalized);
+    let preprocessed = if enable_math {
+        crate::math::preprocess_markdown_math(&normalized)
+    } else {
+        normalized
+    };
 
     let mut options = Options::empty();
-    options.insert(
-        Options::ENABLE_TABLES
-            | Options::ENABLE_STRIKETHROUGH
-            | Options::ENABLE_TASKLISTS
-            | Options::ENABLE_MATH,
-    );
+    options
+        .insert(Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS);
+    if enable_math {
+        options.insert(Options::ENABLE_MATH);
+    }
     let parser = Parser::new_ext(&preprocessed, options).into_offset_iter();
 
     let mut blocks = Vec::new();

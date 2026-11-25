@@ -851,6 +851,45 @@ impl OrbitStore {
         Ok(())
     }
 
+    pub fn get_composer_draft(&self, draft_key: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT draft_json FROM composer_drafts WHERE draft_key = ?1",
+                params![draft_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw)
+    }
+
+    pub fn set_composer_draft(
+        &self,
+        draft_key: &str,
+        draft_json: &str,
+        updated_at_ms: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "INSERT INTO composer_drafts (draft_key, draft_json, updated_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(draft_key) DO UPDATE SET
+                draft_json = excluded.draft_json,
+                updated_at_ms = excluded.updated_at_ms",
+            params![draft_key, draft_json, updated_at_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_composer_draft(&self, draft_key: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "DELETE FROM composer_drafts WHERE draft_key = ?1",
+            params![draft_key],
+        )?;
+        Ok(())
+    }
+
     // --- Mission Workspace Shared Blackboard & Activity Events ---
 
     pub fn get_workspace_board(

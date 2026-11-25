@@ -189,14 +189,28 @@ pub async fn check_local_health(port: u16) -> bool {
     matches!(client.get(url).send().await, Ok(r) if r.status().is_success())
 }
 
-/// Verify whether `127.0.0.1:{port}` is free, owned by `expected_host_id` (`Mine`), or held by another user/process (`OccupiedByOther`).
-pub async fn probe_daemon_port(port: u16, expected_host_id: &str) -> PortOwnership {
+pub(crate) fn connectable_ip_for_bind(ip: std::net::IpAddr) -> std::net::IpAddr {
+    if ip.is_unspecified() {
+        if ip.is_ipv6() {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        } else {
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)
+        }
+    } else {
+        ip
+    }
+}
+
+/// Verify whether `{ip}:{port}` is free, owned by `expected_host_id` (`Mine`), or held by another process (`OccupiedByOther`).
+pub async fn probe_daemon_addr(addr: SocketAddr, expected_host_id: &str) -> PortOwnership {
+    let probe_ip = connectable_ip_for_bind(addr.ip());
     if let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_millis(350))
         .redirect(reqwest::redirect::Policy::none())
         .build()
     {
-        let url = format!("http://127.0.0.1:{port}/healthz");
+        let probe_sock = SocketAddr::new(probe_ip, addr.port());
+        let url = format!("http://{probe_sock}/healthz");
         if let Ok(resp) = client.get(url).send().await {
             if resp.status().is_success()
                 && let Ok(body) = resp.text().await
@@ -212,13 +226,28 @@ pub async fn probe_daemon_port(port: u16, expected_host_id: &str) -> PortOwnersh
         }
     }
 
-    if TcpListener::bind(("0.0.0.0", port)).is_ok()
-        && TcpListener::bind(("127.0.0.1", port)).is_ok()
-    {
+    if addr.ip().is_unspecified() {
+        if TcpListener::bind(("0.0.0.0", addr.port())).is_ok()
+            && TcpListener::bind(("127.0.0.1", addr.port())).is_ok()
+        {
+            PortOwnership::Free
+        } else {
+            PortOwnership::OccupiedByOther
+        }
+    } else if TcpListener::bind(addr).is_ok() {
         PortOwnership::Free
     } else {
         PortOwnership::OccupiedByOther
     }
+}
+
+/// Verify whether `127.0.0.1:{port}` is free, owned by `expected_host_id` (`Mine`), or held by another user/process (`OccupiedByOther`).
+pub async fn probe_daemon_port(port: u16, expected_host_id: &str) -> PortOwnership {
+    probe_daemon_addr(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        expected_host_id,
+    )
+    .await
 }
 
 /// Automatically select an isolated, conflict-free port for `expected_host_id` on multi-user shared servers.
@@ -229,7 +258,7 @@ pub async fn resolve_isolated_daemon_listen(
     preferred: SocketAddr,
     expected_host_id: &str,
 ) -> anyhow::Result<SocketAddr> {
-    match probe_daemon_port(preferred.port(), expected_host_id).await {
+    match probe_daemon_addr(preferred, expected_host_id).await {
         PortOwnership::Mine | PortOwnership::Free => return Ok(preferred),
         PortOwnership::OccupiedByOther => {}
     }
@@ -239,15 +268,13 @@ pub async fn resolve_isolated_daemon_listen(
         if candidate == preferred.port() {
             continue;
         }
+        let candidate_addr = SocketAddr::new(preferred.ip(), candidate);
+        let probe_sock = SocketAddr::new(connectable_ip_for_bind(preferred.ip()), candidate);
         // Fast TCP check before HTTP probe so scanning 130 ports takes < 3ms!
-        if std::net::TcpStream::connect_timeout(
-            &SocketAddr::from(([127, 0, 0, 1], candidate)),
-            Duration::from_millis(15),
-        )
-        .is_ok()
-            && probe_daemon_port(candidate, expected_host_id).await == PortOwnership::Mine
+        if std::net::TcpStream::connect_timeout(&probe_sock, Duration::from_millis(15)).is_ok()
+            && probe_daemon_addr(candidate_addr, expected_host_id).await == PortOwnership::Mine
         {
-            return Ok(SocketAddr::new(preferred.ip(), candidate));
+            return Ok(candidate_addr);
         }
     }
 
@@ -256,9 +283,7 @@ pub async fn resolve_isolated_daemon_listen(
         if candidate == preferred.port() {
             continue;
         }
-        if TcpListener::bind((preferred.ip(), candidate)).is_ok()
-            && TcpListener::bind(("127.0.0.1", candidate)).is_ok()
-        {
+        if TcpListener::bind((preferred.ip(), candidate)).is_ok() {
             return Ok(SocketAddr::new(preferred.ip(), candidate));
         }
     }
@@ -266,38 +291,56 @@ pub async fn resolve_isolated_daemon_listen(
     anyhow::bail!("no free isolated daemon port available in 6868..=6999")
 }
 
-/// Find the live port currently serving `expected_host_id`, falling back to `fallback_port`.
-pub async fn find_live_daemon_port_for_host(expected_host_id: &str, fallback_port: u16) -> u16 {
-    if probe_daemon_port(fallback_port, expected_host_id).await == PortOwnership::Mine {
-        return fallback_port;
+/// Find the live bind address currently serving `expected_host_id`, falling back to `fallback_addr`.
+pub async fn find_live_daemon_addr_for_host(
+    expected_host_id: &str,
+    fallback_addr: SocketAddr,
+) -> SocketAddr {
+    if probe_daemon_addr(fallback_addr, expected_host_id).await == PortOwnership::Mine {
+        return fallback_addr;
+    }
+    let loopback_fallback = SocketAddr::from((Ipv4Addr::LOCALHOST, fallback_addr.port()));
+    if fallback_addr.ip() != Ipv4Addr::LOCALHOST
+        && probe_daemon_addr(loopback_fallback, expected_host_id).await == PortOwnership::Mine
+    {
+        return loopback_fallback;
     }
     for candidate in 6868u16..=6999 {
-        if candidate == fallback_port {
+        if candidate == fallback_addr.port() {
             continue;
         }
-        if std::net::TcpStream::connect_timeout(
-            &SocketAddr::from(([127, 0, 0, 1], candidate)),
-            Duration::from_millis(15),
-        )
-        .is_ok()
-            && probe_daemon_port(candidate, expected_host_id).await == PortOwnership::Mine
+        let candidate_addr = SocketAddr::new(fallback_addr.ip(), candidate);
+        let probe_sock = SocketAddr::new(connectable_ip_for_bind(fallback_addr.ip()), candidate);
+        if std::net::TcpStream::connect_timeout(&probe_sock, Duration::from_millis(15)).is_ok()
+            && probe_daemon_addr(candidate_addr, expected_host_id).await == PortOwnership::Mine
         {
-            return candidate;
+            return candidate_addr;
         }
     }
-    fallback_port
+    fallback_addr
 }
 
-pub async fn wait_until_healthy_for_host(
-    port: u16,
+/// Find the live port currently serving `expected_host_id`, falling back to `fallback_port`.
+pub async fn find_live_daemon_port_for_host(expected_host_id: &str, fallback_port: u16) -> u16 {
+    find_live_daemon_addr_for_host(
+        expected_host_id,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, fallback_port)),
+    )
+    .await
+    .port()
+}
+
+pub async fn wait_until_healthy_for_host_addr(
+    addr: SocketAddr,
     expected_host_id: Option<&str>,
     timeout: Duration,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
+    let probe_ip = connectable_ip_for_bind(addr.ip());
     while tokio::time::Instant::now() < deadline {
         let ok = match expected_host_id {
-            Some(hid) => probe_daemon_port(port, hid).await == PortOwnership::Mine,
-            None => check_local_health(port).await,
+            Some(hid) => probe_daemon_addr(addr, hid).await == PortOwnership::Mine,
+            None => check_local_health_ip(probe_ip, addr.port()).await,
         };
         if ok {
             return true;
@@ -305,9 +348,21 @@ pub async fn wait_until_healthy_for_host(
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
     match expected_host_id {
-        Some(hid) => probe_daemon_port(port, hid).await == PortOwnership::Mine,
-        None => check_local_health(port).await,
+        Some(hid) => probe_daemon_addr(addr, hid).await == PortOwnership::Mine,
+        None => check_local_health_ip(probe_ip, addr.port()).await,
     }
+}
+
+async fn check_local_health_ip(ip: std::net::IpAddr, port: u16) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_millis(400))
+        .build()
+    else {
+        return false;
+    };
+    let sock = SocketAddr::new(ip, port);
+    let url = format!("http://{sock}/healthz");
+    matches!(client.get(url).send().await, Ok(r) if r.status().is_success())
 }
 
 fn resolve_user_home() -> Option<PathBuf> {
@@ -368,10 +423,25 @@ pub async fn install_supervised(
         }
     };
 
-    if !wait_until_healthy_for_host(expected_port, expected_host_id, Duration::from_secs(4)).await {
+    let probe_target = if matches!(role, ServiceRole::Daemon) {
+        orbit_daemon::read_live_daemon_addr(home_dir)
+            .or_else(|| orbit_daemon::DaemonPersistedConfig::load(home_dir).listen_addr)
+            .map(|a| SocketAddr::new(a.ip(), expected_port))
+            .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, expected_port)))
+    } else {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, expected_port))
+    };
+
+    if !wait_until_healthy_for_host_addr(probe_target, expected_host_id, Duration::from_secs(4))
+        .await
+    {
         anyhow::bail!(
-            "{} did not pass identity health check on 127.0.0.1:{expected_port} (check logs in {})",
+            "{} did not pass identity health check on {} (check logs in {})",
             role.unit_name(),
+            SocketAddr::new(
+                connectable_ip_for_bind(probe_target.ip()),
+                probe_target.port()
+            ),
             role.log_file(home_dir).display()
         );
     }
@@ -689,10 +759,13 @@ fn start_detached_pid_service(
     let err_file = out_file.try_clone()?;
 
     let mut cmd = Command::new(exe);
-    cmd.arg("--home")
-        .arg(home_dir)
-        .arg(role.subcommand_arg())
-        .env("RUST_LOG", "info")
+    cmd.arg("--home").arg(home_dir).arg(role.subcommand_arg());
+    if matches!(role, ServiceRole::Daemon)
+        && let Some(listen_addr) = orbit_daemon::DaemonPersistedConfig::load(home_dir).listen_addr
+    {
+        cmd.arg("--listen").arg(listen_addr.to_string());
+    }
+    cmd.env("RUST_LOG", "info")
         .env("PATH", path_env)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
@@ -720,14 +793,40 @@ fn stop_pid_file_process(pid_file: &Path) {
         let pid = raw.trim();
         if let Ok(pid_num) = pid.parse::<u32>()
             && pid_num > 1
+            && pid_num != std::process::id()
         {
             #[cfg(unix)]
             {
+                let pid_str = pid_num.to_string();
                 let _ = Command::new("kill")
-                    .args(["-s", "TERM", "--", &pid_num.to_string()])
+                    .args(["-s", "TERM", "--", &pid_str])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
+                // Wait up to 3s for graceful exit so `$ORBIT_HOME/daemon.lock` and listen
+                // sockets are released before the replacement daemon spawns.
+                let mut alive = true;
+                for _ in 0..30 {
+                    let is_alive = Command::new("kill")
+                        .args(["-0", "--", &pid_str])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .is_ok_and(|s| s.success());
+                    if !is_alive {
+                        alive = false;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                if alive {
+                    let _ = Command::new("kill")
+                        .args(["-s", "KILL", "--", &pid_str])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
             #[cfg(windows)]
             {

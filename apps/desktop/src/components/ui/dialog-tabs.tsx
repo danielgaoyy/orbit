@@ -4,8 +4,35 @@ import { Tabs as BaseTabs } from "@base-ui/react/tabs";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-function Dialog(props: React.ComponentProps<typeof BaseDialog.Root>) {
-  return <BaseDialog.Root {...props} />;
+function Dialog({
+  open,
+  ...props
+}: React.ComponentProps<typeof BaseDialog.Root>) {
+  const [rendered, setRendered] = React.useState(Boolean(open));
+  const [instanceKey, setInstanceKey] = React.useState(0);
+  const prevOpenRef = React.useRef(open);
+
+  React.useEffect(() => {
+    if (open === undefined) return;
+    if (open) {
+      if (!prevOpenRef.current) {
+        setInstanceKey((k) => k + 1);
+      }
+      setRendered(true);
+      prevOpenRef.current = true;
+      return;
+    }
+    prevOpenRef.current = false;
+    const timer = window.setTimeout(() => {
+      setRendered(false);
+    }, 220);
+    return () => window.clearTimeout(timer);
+  }, [open]);
+
+  if (open !== undefined && !open && !rendered) {
+    return null;
+  }
+  return <BaseDialog.Root key={open !== undefined ? instanceKey : undefined} open={open} {...props} />;
 }
 
 type DialogTriggerProps = Omit<React.ComponentProps<typeof BaseDialog.Trigger>, "render"> & {

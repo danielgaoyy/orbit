@@ -617,10 +617,6 @@ export const SettingsView = memo(function SettingsView({ closing = false }: { cl
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const canvas = useRef<HTMLDivElement>(null);
   const [dialogHost, setDialogHost] = useState<HTMLDivElement | null>(null);
-  const setDialogRef = useCallback((node: HTMLDivElement | null) => {
-    dialogRef.current = node;
-    setDialogHost(node);
-  }, []);
   const [jump, setJump] = useState<{ section: typeof section; id: string } | null>(null);
 
   const hostIdRef = useRef(hostId);
@@ -681,7 +677,7 @@ export const SettingsView = memo(function SettingsView({ closing = false }: { cl
         className="settings-backdrop fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-5 select-none dark:bg-black/55"
       >
         <div
-          ref={setDialogRef}
+          ref={dialogRef}
           role="dialog"
           aria-modal="true"
           aria-label={t("common.settings")}
@@ -739,6 +735,10 @@ export const SettingsView = memo(function SettingsView({ closing = false }: { cl
               </div>
             </div>
           </main>
+          <div
+            ref={setDialogHost}
+            className="pointer-events-none absolute inset-0 z-50 overflow-hidden"
+          />
         </div>
       </div>
     </SettingsDrawerPortalContext.Provider>

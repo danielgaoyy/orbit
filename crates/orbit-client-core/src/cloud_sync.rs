@@ -81,13 +81,22 @@ pub fn encode_device_link_uri(
 
 pub fn decode_device_link_uri(raw: &str) -> Result<CloudSyncDeviceLinkPayload, CloudSyncError> {
     let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(CloudSyncError::InvalidVault(
+            "Paste a Device Link URI starting with orbit://sync-login?...".into(),
+        ));
+    }
     let rest = trimmed
         .strip_prefix(CLOUD_SYNC_DEVICE_LINK_PREFIX)
         .ok_or_else(|| {
-            CloudSyncError::InvalidVault("Invalid Orbit device link URI prefix".into())
+            CloudSyncError::InvalidVault(
+                "Invalid device link: expected an orbit://sync-login URI generated from an already signed-in device (not a host pairing code)".into(),
+            )
         })?;
     let query = rest.strip_prefix('?').ok_or_else(|| {
-        CloudSyncError::InvalidVault("Missing query in Orbit device link URI".into())
+        CloudSyncError::InvalidVault(
+            "Incomplete device link URI (missing ?p=... query parameter)".into(),
+        )
     })?;
     let mut payload_b64: Option<&str> = None;
     for pair in query.split('&') {
@@ -99,16 +108,23 @@ pub fn decode_device_link_uri(raw: &str) -> Result<CloudSyncDeviceLinkPayload, C
         }
     }
     let b64 = payload_b64.ok_or_else(|| {
-        CloudSyncError::InvalidVault("Missing p parameter in device link URI".into())
+        CloudSyncError::InvalidVault("Incomplete device link URI (missing p payload)".into())
     })?;
     let decoded = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, b64)
         .or_else(|_| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64))
-        .map_err(|e| CloudSyncError::InvalidVault(format!("invalid base64 in device link: {e}")))?;
-    let payload: CloudSyncDeviceLinkPayload = serde_json::from_slice(&decoded)
-        .map_err(|e| CloudSyncError::InvalidVault(format!("malformed device link payload: {e}")))?;
+        .map_err(|_| {
+            CloudSyncError::InvalidVault(
+                "Corrupted device link payload (truncated or invalid encoding)".into(),
+            )
+        })?;
+    let payload: CloudSyncDeviceLinkPayload = serde_json::from_slice(&decoded).map_err(|_| {
+        CloudSyncError::InvalidVault(
+            "Unrecognized device link payload format; generate a fresh Device Link URI".into(),
+        )
+    })?;
     if payload.v != 1 || payload.github_access_token.trim().is_empty() {
         return Err(CloudSyncError::InvalidVault(
-            "Unsupported or incomplete Orbit device link payload".into(),
+            "Unsupported or expired device link version; generate a new Device Link URI".into(),
         ));
     }
     Ok(payload)

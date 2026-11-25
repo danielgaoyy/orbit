@@ -299,6 +299,62 @@ pub struct PairingOffer {
     pub pairing_secret: String,
 }
 
+/// Normalize a direct WebSocket endpoint (`host:port` -> `ws://host:port/ws`, `[v6]:port` -> `ws://[v6]:port/ws`),
+/// ensuring a `ws://` / `wss://` scheme and `/ws` path when omitted.
+pub fn normalize_ws_endpoint(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let has_ws_scheme = trimmed.len() >= 5
+        && (trimmed[..5].eq_ignore_ascii_case("ws://")
+            || (trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("wss://")));
+    let with_scheme = if has_ws_scheme || trimmed.contains("://") {
+        trimmed.to_string()
+    } else if let Some(rest) = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("HTTP://"))
+    {
+        format!("ws://{rest}")
+    } else if let Some(rest) = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("HTTPS://"))
+    {
+        format!("wss://{rest}")
+    } else {
+        format!("ws://{trimmed}")
+    };
+
+    if with_scheme.ends_with("/ws") || with_scheme.ends_with("/ws/e2ee") {
+        with_scheme
+    } else {
+        let after_scheme = with_scheme
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(&with_scheme);
+        if after_scheme.contains('/') {
+            with_scheme
+        } else {
+            format!("{with_scheme}/ws")
+        }
+    }
+}
+
+/// Normalize a peer direct endpoint to its Noise_NK `/ws/e2ee` WebSocket URL.
+pub fn normalize_e2ee_ws_endpoint(raw: &str) -> String {
+    let normalized = normalize_ws_endpoint(raw);
+    if normalized.is_empty() {
+        return normalized;
+    }
+    if let Some(prefix) = normalized.strip_suffix("/ws") {
+        format!("{prefix}/ws/e2ee")
+    } else if normalized.ends_with("/ws/e2ee") {
+        normalized
+    } else {
+        format!("{normalized}/ws/e2ee")
+    }
+}
+
 impl PairingOffer {
     pub fn to_qr_uri(&self) -> Result<String, CryptoError> {
         let json = serde_json::to_vec(self)?;
@@ -308,7 +364,14 @@ impl PairingOffer {
     pub fn from_qr_uri(uri: &str) -> Result<Self, CryptoError> {
         let encoded = uri.strip_prefix("orbit://pair/").unwrap_or(uri);
         let raw = URL_SAFE_NO_PAD.decode(encoded.trim())?;
-        Ok(serde_json::from_slice(&raw)?)
+        let mut offer: Self = serde_json::from_slice(&raw)?;
+        for ep in &mut offer.direct_endpoints {
+            let norm = normalize_ws_endpoint(ep);
+            if !norm.is_empty() {
+                *ep = norm;
+            }
+        }
+        Ok(offer)
     }
 }
 

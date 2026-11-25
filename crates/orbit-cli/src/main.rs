@@ -48,9 +48,10 @@ use crate::orchestration_cli::{
     cmd_workspace, resolve_server_url,
 };
 use crate::service::{
-    PortOwnership, RelayProbeOutcome, ServiceRole, check_local_health, default_daemon_listen,
-    detect_public_ipv4, find_live_daemon_port_for_host, install_and_start_service,
-    normalize_relay_url, preflight_probe_relay, probe_daemon_port, resolve_isolated_daemon_listen,
+    PortOwnership, RelayProbeOutcome, ServiceRole, check_local_health, connectable_ip_for_bind,
+    default_daemon_listen, detect_public_ipv4, find_live_daemon_addr_for_host,
+    find_live_daemon_port_for_host, install_and_start_service, normalize_relay_url,
+    preflight_probe_relay, probe_daemon_addr, probe_daemon_port, resolve_isolated_daemon_listen,
     self_upgrade_cli, stop_service,
 };
 use crate::ssh_config::{discover_ssh_hosts, provision_relay_via_ssh};
@@ -641,6 +642,13 @@ enum Commands {
         #[arg(long)]
         socket: PathBuf,
     },
+
+    /// Internal Claude Code `PreToolUse` hook evaluator forwarding tool calls to the local Daemon.
+    #[command(hide = true)]
+    InternalPreToolUse {
+        #[arg(long)]
+        agent_id: String,
+    },
 }
 
 fn resolve_home(override_home: Option<PathBuf>) -> PathBuf {
@@ -774,7 +782,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     let explicit_server = cli.server.clone();
     let server = resolve_server_url(&home_dir, cli.server);
 
-    let initialize_logging = !matches!(cli.command, Commands::Mcp { .. });
+    let initialize_logging = !matches!(
+        cli.command,
+        Commands::Mcp { .. } | Commands::InternalPreToolUse { .. }
+    );
     #[cfg(target_os = "linux")]
     let initialize_logging =
         initialize_logging && !matches!(cli.command, Commands::SandboxBridge { .. });
@@ -924,18 +935,21 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
             let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
             let persisted = DaemonPersistedConfig::load(&home_dir);
-            let fallback_port = persisted
-                .listen_addr
-                .unwrap_or_else(default_daemon_listen)
-                .port();
-            let active_port =
-                find_live_daemon_port_for_host(&runtime.host_info.host_id, fallback_port).await;
-            let daemon_live = probe_daemon_port(active_port, &runtime.host_info.host_id).await
+            let live_addr = orbit_daemon::read_live_daemon_addr(&home_dir);
+            let fallback_addr = live_addr
+                .or(persisted.listen_addr)
+                .unwrap_or_else(default_daemon_listen);
+            let active_addr =
+                find_live_daemon_addr_for_host(&runtime.host_info.host_id, fallback_addr).await;
+            let active_port = active_addr.port();
+            let daemon_live = probe_daemon_addr(active_addr, &runtime.host_info.host_id).await
                 == PortOwnership::Mine;
 
             if let Some(path) = bundle {
                 let bundle = if daemon_live {
-                    let addr = format!("ws://127.0.0.1:{active_port}/ws");
+                    let sock =
+                        SocketAddr::new(connectable_ip_for_bind(active_addr.ip()), active_port);
+                    let addr = format!("ws://{sock}/ws");
                     let client = connect_cli_server(&home_dir, &addr, false).await?;
                     let id = Uuid::new_v4();
                     match client.request(WireMessage::ExportDiagnosticBundle{request_id:id},Duration::from_secs(60),|w|matches!(w,WireMessage::DiagnosticBundleReady{request_id,..} if *request_id==id)).await?{
@@ -973,7 +987,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 },
                 active_port
             );
-            match &persisted.relay_url {
+            let effective_relay = persisted
+                .relay_url
+                .or_else(|| orbit_daemon::read_live_daemon_relay(&home_dir));
+            match &effective_relay {
                 Some(r) => println!("Relay Route  : {} (Noise NK E2EE)", redact_relay_url(r)),
                 None => println!(
                     "Relay Route  : (not configured — LAN/Tailscale only; run `orbit use-relay <HOST:PORT>`)"
@@ -1238,7 +1255,8 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             relay,
             rotate_secret,
         } => {
-            print_pairing_summary(&home_dir, port, endpoints, relay, rotate_secret).await?;
+            print_pairing_summary(&home_dir, port, endpoints, relay, rotate_secret, json_mode)
+                .await?;
         }
 
         Commands::Login {
@@ -1333,12 +1351,22 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     drop(runtime);
 
                     let mut persisted = DaemonPersistedConfig::load(&home_dir);
+                    let live_addr = orbit_daemon::read_live_daemon_addr(&home_dir);
                     let preferred = if let Some(l) = sub_listen.or(listen) {
                         l
                     } else if let Some(p) = port {
-                        SocketAddr::from(([127, 0, 0, 1], p))
+                        SocketAddr::new(
+                            live_addr
+                                .map(|a| a.ip())
+                                .or_else(|| persisted.listen_addr.map(|a| a.ip()))
+                                .unwrap_or_else(|| default_daemon_listen().ip()),
+                            p,
+                        )
                     } else {
-                        persisted.listen_addr.unwrap_or_else(default_daemon_listen)
+                        persisted
+                            .listen_addr
+                            .or(live_addr)
+                            .unwrap_or_else(default_daemon_listen)
                     };
                     let addr = resolve_isolated_daemon_listen(preferred, &expected_host_id).await?;
                     persisted.listen_addr = Some(addr);
@@ -1409,11 +1437,12 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     let persisted = DaemonPersistedConfig::load(&home_dir);
                     let base_addr = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
                     let live_addr = orbit_daemon::read_live_daemon_addr(&home_dir);
-                    let preferred_port = live_addr.map(|a| a.port()).unwrap_or(base_addr.port());
-                    let live_port =
-                        find_live_daemon_port_for_host(&runtime.host_info.host_id, preferred_port)
+                    let fallback_addr = live_addr.unwrap_or(base_addr);
+                    let active_addr =
+                        find_live_daemon_addr_for_host(&runtime.host_info.host_id, fallback_addr)
                             .await;
-                    let healthy = probe_daemon_port(live_port, &runtime.host_info.host_id).await
+                    let live_port = active_addr.port();
+                    let healthy = probe_daemon_addr(active_addr, &runtime.host_info.host_id).await
                         == PortOwnership::Mine;
                     let effective_ip = if healthy
                         && let Some(la) = live_addr
@@ -1423,6 +1452,9 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     } else {
                         base_addr.ip()
                     };
+                    let effective_relay = persisted
+                        .relay_url
+                        .or_else(|| orbit_daemon::read_live_daemon_relay(&home_dir));
                     println!(
                         "Orbit Daemon : {}",
                         if healthy { "RUNNING" } else { "STOPPED" }
@@ -1433,8 +1465,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     );
                     println!(
                         "Relay URL    : {}",
-                        persisted
-                            .relay_url
+                        effective_relay
                             .as_deref()
                             .map(redact_relay_url)
                             .unwrap_or_else(|| "(not configured)".to_string())
@@ -2188,8 +2219,80 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
             res?;
         }
+        Commands::InternalPreToolUse { agent_id } => {
+            run_internal_pre_tool_use(&home_dir, &agent_id).await?;
+        }
     }
 
+    Ok(())
+}
+
+async fn run_internal_pre_tool_use(
+    home_dir: &std::path::Path,
+    agent_id: &str,
+) -> anyhow::Result<()> {
+    let mut stdin_buf = String::new();
+    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin_buf);
+    let trimmed = stdin_buf.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Ok(());
+    };
+    let port = orbit_daemon::read_live_daemon_port(home_dir);
+    if port == 0 {
+        return Ok(());
+    }
+    let token = std::fs::read_to_string(home_dir.join("mcp-token"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let Some(token) = token else {
+        return Ok(());
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .no_proxy()
+        .build()
+    else {
+        return Ok(());
+    };
+    let url = format!("http://127.0.0.1:{port}/internal/pre-tool-use");
+    let body = serde_json::json!({
+        "agent_id": agent_id,
+        "tool_name": payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or(""),
+        "tool_input": payload.get("tool_input").cloned().unwrap_or_else(|| serde_json::json!({})),
+        "tool_use_id": payload.get("tool_use_id").and_then(|v| v.as_str()),
+    });
+    let Ok(resp) = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+    else {
+        return Ok(());
+    };
+    if !resp.status().is_success() {
+        return Ok(());
+    }
+    if let Ok(val) = resp.json::<serde_json::Value>().await
+        && val.get("decision").and_then(|v| v.as_str()) == Some("deny")
+    {
+        let reason = val
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Blocked by Orbit policy or PreToolUse hook");
+        let out = serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason
+            }
+        });
+        println!("{out}");
+    }
     Ok(())
 }
 
@@ -2449,10 +2552,8 @@ pub(crate) fn advertised_direct_endpoints(bind_ip: std::net::IpAddr, port: u16) 
     }
 }
 
-/// Extract the TCP port if `raw_url` is a plain `ws://` URL targeting a local loopback host
-/// (`127.0.0.0/8`, `localhost`, or `[::1]`). Rejects remote hosts, TLS URLs, userinfo (`@`), and
-/// parser-differential characters so local daemon credentials are never sent to remote targets.
-fn parse_loopback_ws_port(raw_url: &str) -> Option<u16> {
+/// Extract `(host, port)` from a plain `ws://` URL (`127.0.0.1`, `localhost`, `[::1]`, or explicit IP).
+fn parse_direct_ws_host_port(raw_url: &str) -> Option<(String, u16)> {
     let trimmed = raw_url.trim();
     if trimmed.len() < 5 || !trimmed[..5].eq_ignore_ascii_case("ws://") {
         return None;
@@ -2464,16 +2565,12 @@ fn parse_loopback_ws_port(raw_url: &str) -> Option<u16> {
     }
     if let Some(bracketed) = authority.strip_prefix('[') {
         let (host, after) = bracketed.split_once(']')?;
-        let ip: std::net::Ipv6Addr = host.parse().ok()?;
-        if !ip.is_loopback() {
-            return None;
-        }
+        let _: std::net::Ipv6Addr = host.parse().ok()?;
         if after.is_empty() {
-            return Some(80);
+            return Some((host.to_string(), 80));
         }
-        let port_str = after.strip_prefix(':')?;
-        let port: u16 = port_str.parse().ok()?;
-        return (port > 0).then_some(port);
+        let port: u16 = after.strip_prefix(':')?.parse().ok()?;
+        return (port > 0).then_some((host.to_string(), port));
     }
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => {
@@ -2488,11 +2585,22 @@ fn parse_loopback_ws_port(raw_url: &str) -> Option<u16> {
         }
         None => (authority, 80),
     };
-    let is_loopback = host.eq_ignore_ascii_case("localhost")
+    Some((host.to_string(), port))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
         || host
-            .parse::<std::net::Ipv4Addr>()
-            .is_ok_and(|ip| ip.is_loopback());
-    is_loopback.then_some(port)
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Extract the TCP port if `raw_url` is a plain `ws://` URL targeting a local loopback host
+/// (`127.0.0.0/8`, `localhost`, or `[::1]`). Rejects remote hosts, TLS URLs, userinfo (`@`), and
+/// parser-differential characters so local daemon credentials are never sent to remote targets.
+fn parse_loopback_ws_port(raw_url: &str) -> Option<u16> {
+    let (host, port) = parse_direct_ws_host_port(raw_url)?;
+    is_loopback_host(&host).then_some(port)
 }
 
 async fn resolve_cli_direct_secret(
@@ -2503,7 +2611,17 @@ async fn resolve_cli_direct_secret(
     if let Some(secret) = explicit_secret.map(str::trim).filter(|s| !s.is_empty()) {
         return Ok((secret.to_string(), None));
     }
-    let Some(port) = parse_loopback_ws_port(server_url) else {
+    let live_addr = orbit_daemon::read_live_daemon_addr(home_dir);
+    let probe_addr = if let Some(port) = parse_loopback_ws_port(server_url) {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    } else if let Some((host, port)) = parse_direct_ws_host_port(server_url)
+        && let Ok(ip) = host.parse::<std::net::IpAddr>()
+        && let Some(la) = live_addr
+        && la.port() == port
+        && (la.ip() == ip || la.ip().is_unspecified())
+    {
+        SocketAddr::new(ip, port)
+    } else {
         anyhow::bail!(
             "refusing to send local daemon pairing secret to remote server `{server_url}`; pass `--server orbit://pair/...` or set `ORBIT_PAIRING_SECRET` for this remote target"
         );
@@ -2514,9 +2632,9 @@ async fn resolve_cli_direct_secret(
             home_dir.join("host-keypair.json").display()
         );
     };
-    if probe_daemon_port(port, &local_host_id).await != PortOwnership::Mine {
+    if probe_daemon_addr(probe_addr, &local_host_id).await != PortOwnership::Mine {
         anyhow::bail!(
-            "refusing to send local daemon pairing secret to `{server_url}`: 127.0.0.1:{port} is not owned by local daemon `{local_host_id}` (pass `--server orbit://pair/...` or set `ORBIT_PAIRING_SECRET`)"
+            "refusing to send local daemon pairing secret to `{server_url}`: {probe_addr} is not owned by local daemon `{local_host_id}` (pass `--server orbit://pair/...` or set `ORBIT_PAIRING_SECRET`)"
         );
     }
     let secret = orbit_daemon::read_pairing_secret(home_dir).ok_or_else(|| {
@@ -2574,58 +2692,88 @@ async fn print_pairing_summary(
     explicit_endpoints: Vec<String>,
     explicit_relay: Option<String>,
     rotate_secret: bool,
+    json_mode: bool,
 ) -> anyhow::Result<()> {
     let runtime = DaemonRuntime::bootstrap(home_dir).await?;
     if rotate_secret {
         let _ = runtime.rotate_pairing_secret()?;
-        eprintln!(
-            "[✓] Rotated host pairing secret at {} (active immediately for new connections).",
-            home_dir
-                .join(orbit_daemon::PAIRING_SECRET_FILENAME)
-                .display()
-        );
+        if !json_mode {
+            eprintln!(
+                "[✓] Rotated host pairing secret at {} (active immediately for new connections).",
+                home_dir
+                    .join(orbit_daemon::PAIRING_SECRET_FILENAME)
+                    .display()
+            );
+        }
     }
     let persisted = DaemonPersistedConfig::load(home_dir);
     let configured_listen = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
     let live_addr = orbit_daemon::read_live_daemon_addr(home_dir);
-    let preferred_port = live_addr
-        .map(|a| a.port())
-        .unwrap_or_else(|| configured_listen.port());
-    let port = match port_override {
-        Some(p) => p,
-        None => find_live_daemon_port_for_host(&runtime.host_info.host_id, preferred_port).await,
+    let fallback_addr = match port_override {
+        Some(p) => SocketAddr::new(
+            live_addr
+                .map(|a| a.ip())
+                .unwrap_or_else(|| configured_listen.ip()),
+            p,
+        ),
+        None => live_addr.unwrap_or(configured_listen),
     };
+    let active_addr = if port_override.is_some() {
+        fallback_addr
+    } else {
+        find_live_daemon_addr_for_host(&runtime.host_info.host_id, fallback_addr).await
+    };
+    let port = active_addr.port();
     let bind_ip = if let Some(la) = live_addr
         && la.port() == port
-        && probe_daemon_port(port, &runtime.host_info.host_id).await == PortOwnership::Mine
+        && probe_daemon_addr(la, &runtime.host_info.host_id).await == PortOwnership::Mine
     {
         la.ip()
     } else {
-        configured_listen.ip()
+        active_addr.ip()
     };
-    let endpoints = if explicit_endpoints.is_empty() {
+    let endpoints: Vec<String> = if explicit_endpoints.is_empty() {
         advertised_direct_endpoints(bind_ip, port)
     } else {
         explicit_endpoints
+            .into_iter()
+            .map(|ep| orbit_crypto::normalize_ws_endpoint(&ep))
+            .filter(|ep| !ep.is_empty())
+            .collect()
     };
     let relay = match explicit_relay {
         Some(r) => Some(normalize_relay_url(&r)?),
-        None => persisted.relay_url,
+        None => persisted
+            .relay_url
+            .or_else(|| orbit_daemon::read_live_daemon_relay(home_dir)),
     };
 
     let offer = runtime.build_pairing_offer(endpoints.clone(), relay.clone())?;
-    let relay_summary = relay
-        .as_deref()
-        .map(redact_relay_url)
-        .unwrap_or_else(|| "none (LAN only — run `orbit use-relay <HOST:PORT>` for remote)".into());
-    eprintln!(
-        "Host `{}` ({}) | Direct: {} | Relay: {}",
-        runtime.host_info.hostname,
-        runtime.host_info.host_id,
-        endpoints.join(", "),
-        relay_summary
-    );
-    println!("{}", offer.to_qr_uri()?);
+    let pairing_uri = offer.to_qr_uri()?;
+    if json_mode {
+        let payload = serde_json::json!({
+            "host_id": runtime.host_info.host_id,
+            "hostname": runtime.host_info.hostname,
+            "daemon_pubkey_b64": offer.daemon_pubkey_b64,
+            "direct_endpoints": endpoints,
+            "relay_url": relay.as_deref().map(redact_relay_url),
+            "pairing_uri": pairing_uri,
+            "secret_rotated": rotate_secret,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        let relay_summary = relay.as_deref().map(redact_relay_url).unwrap_or_else(|| {
+            "none (LAN only — run `orbit use-relay <HOST:PORT>` for remote)".into()
+        });
+        eprintln!(
+            "Host `{}` ({}) | Direct: {} | Relay: {}",
+            runtime.host_info.hostname,
+            runtime.host_info.host_id,
+            endpoints.join(", "),
+            relay_summary
+        );
+        println!("{pairing_uri}");
+    }
     Ok(())
 }
 

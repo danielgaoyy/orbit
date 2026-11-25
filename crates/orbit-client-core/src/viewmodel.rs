@@ -850,7 +850,9 @@ pub(crate) fn render_timeline_event_view(
             }
             let blocks = markdown_cache
                 .entry(key)
-                .or_insert_with(|| parse_markdown_blocks(text, false))
+                .or_insert_with(|| {
+                    crate::render::parse_markdown_blocks_with_math(text, false, false)
+                })
                 .clone();
             Some(TimelineItemView::UserPrompt {
                 seq: ev.seq,
@@ -1015,7 +1017,9 @@ pub(crate) fn render_timeline_event_view(
             }
             let blocks = markdown_cache
                 .entry(key)
-                .or_insert_with(|| parse_markdown_blocks(text, false))
+                .or_insert_with(|| {
+                    crate::render::parse_markdown_blocks_with_math(text, false, false)
+                })
                 .clone();
             let folded = delivery_updates.get(message_id);
             let resolved_status = match (delivery_status, folded.and_then(|f| f.delivery_status)) {

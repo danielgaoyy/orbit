@@ -1,5 +1,10 @@
 import type { ComposerInlineDirective } from "@/lib/slash-commands";
 import {
+  DRAFTS_STORAGE_KEY,
+  mergeMissingDraftSlices,
+  parseAndValidatePersistedDrafts,
+} from "@/lib/draft-persistence";
+import {
   t,
 } from "@/lib/i18n";
 import {
@@ -156,7 +161,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
 
       // 2. Non-blocking secondary metadata bootstrap (never blocks or aborts fleet hydration)
       void (async () => {
-        const [editors, sshList, version, fallbackCatalogs, slashCommands, cloudSyncStatus] =
+        const [editors, sshList, version, fallbackCatalogs, slashCommands, cloudSyncStatus, sqliteDraftJson] =
           await Promise.all([
             orbitIpc.listExternalEditors().catch(() => []),
             orbitIpc.listSshHosts().catch(() => []),
@@ -164,7 +169,30 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
             orbitIpc.getFallbackProviderCatalogs().catch(() => []),
             orbitIpc.getSlashCommands("desktop").catch(() => []),
             orbitIpc.getCloudSyncStatus().catch(() => null),
+            orbitIpc.getComposerDraft(DRAFTS_STORAGE_KEY).catch(() => null),
           ]);
+        if (sqliteDraftJson) {
+          const parsedSqliteDrafts = parseAndValidatePersistedDrafts(sqliteDraftJson, {
+            excludeScopes: getState().archivedThreads,
+          });
+          const mergedDrafts = mergeMissingDraftSlices(getState(), parsedSqliteDrafts);
+          if (mergedDrafts) {
+            ctx.draftPersistence.restoreUpdatedAtByScope(mergedDrafts.updatedAtByScope);
+            setState((s) => ({
+              ...s,
+              ...(mergedDrafts.composerDrafts ? { composerDrafts: mergedDrafts.composerDrafts } : {}),
+              ...(mergedDrafts.pastedAttachments ? { pastedAttachments: mergedDrafts.pastedAttachments } : {}),
+              ...(mergedDrafts.diffQuotes ? { diffQuotes: mergedDrafts.diffQuotes } : {}),
+              ...(mergedDrafts.contextItems ? { contextItems: mergedDrafts.contextItems } : {}),
+              ...(mergedDrafts.inlineMentions ? { inlineMentions: mergedDrafts.inlineMentions } : {}),
+              ...(mergedDrafts.slashDirectives ? { slashDirectives: mergedDrafts.slashDirectives } : {}),
+              ...(mergedDrafts.sideQuestionDrafts ? { sideQuestionDrafts: mergedDrafts.sideQuestionDrafts } : {}),
+            }));
+            ctx.draftPersistence.markDirty(mergedDrafts.recoveredScopes);
+            ctx.emitComposerDraftChange();
+            ctx.emitDraftPresenceChange();
+          }
+        }
         seedFallbackProviderCatalogs(fallbackCatalogs);
         setState((s) => ({
           ...s,
@@ -645,7 +673,36 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
             nextGitReposCache[`${hostId}::${cwdKey}`] = insp;
           }
         }
-        let nextAgentId = s.selectedAgentId;
+        const replacedMap = detail.replaced_optimistic_agents ?? {};
+        const resolveReplacedAgentId = (id: string | null): string | null => {
+          if (!id) return null;
+          let cur = id;
+          for (let i = 0; i < 4 && replacedMap[cur]; i += 1) {
+            cur = replacedMap[cur];
+          }
+          return cur;
+        };
+        const remapScopedRecord = <T>(rec: Record<string, T>): Record<string, T> => {
+          let changed = false;
+          const nextRec = { ...rec };
+          for (const [optId, realId] of Object.entries(replacedMap)) {
+            const oldKey = `${hostId}::${optId}`;
+            const newKey = `${hostId}::${realId}`;
+            if (oldKey in nextRec) {
+              if (!(newKey in nextRec)) {
+                nextRec[newKey] = nextRec[oldKey];
+              }
+              delete nextRec[oldKey];
+              changed = true;
+            }
+          }
+          return changed ? nextRec : rec;
+        };
+
+        let nextAgentId = s.selectedHostId === hostId ? resolveReplacedAgentId(s.selectedAgentId) : s.selectedAgentId;
+        if (s.selectedHostId === hostId && s.selectedAgentId && nextAgentId && nextAgentId !== s.selectedAgentId) {
+          sharedDisclosureStateStore.migrateAgent(s.selectedAgentId, nextAgentId);
+        }
         let nextDraft = s.isDraftNewSession;
         let nextCwd = s.selectedWorkspaceCwd;
 
@@ -741,6 +798,14 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
           [[hostId, detail]],
           activeScopeKey,
         );
+        const remappedStages = remapScopedRecord(s.stages);
+        const remappedComposerDrafts = remapScopedRecord(s.composerDrafts);
+        const remappedSlashDirectives = remapScopedRecord(s.slashDirectives);
+        const remappedInlineMentions = remapScopedRecord(s.inlineMentions);
+        const remappedContextItems = remapScopedRecord(s.contextItems);
+        const remappedPastedAttachments = remapScopedRecord(s.pastedAttachments);
+        const remappedDiffQuotes = remapScopedRecord(s.diffQuotes);
+        const remappedSideQuestionDrafts = remapScopedRecord(s.sideQuestionDrafts);
 
         return {
           ...s,
@@ -759,16 +824,32 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
           draftProvider: nextDraftProvider,
           terminalTabs: nextTabs,
           activeTerminalTabKey: nextActiveTab,
-          ...(remotelyArchivedDraftKeys.size > 0
-            ? {
-                composerDrafts: omitRecordKeys(s.composerDrafts, remotelyArchivedDraftKeys),
-                slashDirectives: omitRecordKeys(s.slashDirectives, remotelyArchivedDraftKeys),
-                inlineMentions: omitRecordKeys(s.inlineMentions, remotelyArchivedDraftKeys),
-                pastedAttachments: omitRecordKeys(s.pastedAttachments, remotelyArchivedDraftKeys),
-                diffQuotes: omitRecordKeys(s.diffQuotes, remotelyArchivedDraftKeys),
-                sideQuestionDrafts: omitRecordKeys(s.sideQuestionDrafts, remotelyArchivedDraftKeys),
-              }
-            : {}),
+          stages: remappedStages,
+          composerDrafts:
+            remotelyArchivedDraftKeys.size > 0
+              ? omitRecordKeys(remappedComposerDrafts, remotelyArchivedDraftKeys)
+              : remappedComposerDrafts,
+          slashDirectives:
+            remotelyArchivedDraftKeys.size > 0
+              ? omitRecordKeys(remappedSlashDirectives, remotelyArchivedDraftKeys)
+              : remappedSlashDirectives,
+          inlineMentions:
+            remotelyArchivedDraftKeys.size > 0
+              ? omitRecordKeys(remappedInlineMentions, remotelyArchivedDraftKeys)
+              : remappedInlineMentions,
+          contextItems: remappedContextItems,
+          pastedAttachments:
+            remotelyArchivedDraftKeys.size > 0
+              ? omitRecordKeys(remappedPastedAttachments, remotelyArchivedDraftKeys)
+              : remappedPastedAttachments,
+          diffQuotes:
+            remotelyArchivedDraftKeys.size > 0
+              ? omitRecordKeys(remappedDiffQuotes, remotelyArchivedDraftKeys)
+              : remappedDiffQuotes,
+          sideQuestionDrafts:
+            remotelyArchivedDraftKeys.size > 0
+              ? omitRecordKeys(remappedSideQuestionDrafts, remotelyArchivedDraftKeys)
+              : remappedSideQuestionDrafts,
         };
       });
 

@@ -181,7 +181,7 @@ export const TerminalTab = memo(function TerminalTab({
     >
       {/* Compact PTY Session Sub-Bar — seamless with Workbench chrome */}
       <div className="border-border-subtle bg-surface-base flex h-[36px] shrink-0 items-center justify-between gap-1.5 border-b px-2.5">
-        <div className="flex min-w-0 items-center gap-1 overflow-x-auto">
+        <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
           {hostTabs.map((tab) => {
             const focused = tab.key === activeHostTab?.key;
             const visibleInSplit = Boolean(activeSplit && activeSplit.paneKeys.includes(tab.key));
@@ -191,7 +191,7 @@ export const TerminalTab = memo(function TerminalTab({
                 key={tab.key}
                 onClick={() => orbitActions.setActiveTerminalTab(tab.key)}
                 className={cn(
-                  "group inline-flex h-[24px] cursor-pointer items-center gap-1.5 rounded-[7px] border px-2 text-[11px] transition-colors",
+                  "group inline-flex h-[24px] shrink-0 cursor-pointer items-center gap-1.5 rounded-[7px] border px-2 text-[11px] whitespace-nowrap transition-colors",
                   focused
                     ? "border-border-default bg-surface-raised text-ink-primary font-medium"
                     : visibleInSplit
@@ -240,7 +240,7 @@ export const TerminalTab = memo(function TerminalTab({
               type="button"
               aria-label={t("terminal.newShell")}
               onClick={() => orbitActions.spawnNewTerminalTab(selectedHostId, selectedCwd || "~")}
-              className="text-muted-foreground hover:bg-accent hover:text-foreground inline-flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-lg transition-colors"
+              className="text-muted-foreground hover:bg-accent hover:text-foreground inline-flex h-[26px] w-[26px] shrink-0 cursor-pointer items-center justify-center rounded-lg transition-colors"
             >
               <Plus className="h-[14px] w-[14px]" />
             </button>
@@ -251,7 +251,7 @@ export const TerminalTab = memo(function TerminalTab({
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
-                  className="text-muted-foreground hover:bg-accent hover:text-foreground inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] transition-colors"
+                  className="text-muted-foreground hover:bg-accent hover:text-foreground inline-flex h-[24px] shrink-0 cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] whitespace-nowrap transition-colors"
                 >
                   <span>Attach ({detachedTerminals.length})</span>
                   <ChevronDown className="h-[11.5px] w-[11.5px]" />

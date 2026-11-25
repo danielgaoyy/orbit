@@ -248,18 +248,26 @@ export const ConversationViewport = memo(function ConversationViewport({
     if (!el || typeof ResizeObserver === "undefined") return;
     let prevCh = el.clientHeight;
     lastClientHeightRef.current = prevCh;
+    let rafId: number | null = null;
     const ro = new ResizeObserver(() => {
-      const ch = el.clientHeight;
-      const shrankBy = prevCh - ch;
-      prevCh = ch;
-      if (shrankBy > 0.5 && stickToBottomRef.current && !holdActiveRef.current) {
-        el.scrollTop += shrankBy;
-        lastScrollTopRef.current = el.scrollTop;
-      }
-      handleScroll();
+      if (rafId !== null) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = null;
+        const ch = el.clientHeight;
+        const shrankBy = prevCh - ch;
+        prevCh = ch;
+        if (shrankBy > 0.5 && stickToBottomRef.current && !holdActiveRef.current) {
+          el.scrollTop += shrankBy;
+          lastScrollTopRef.current = el.scrollTop;
+        }
+        handleScroll();
+      });
     });
     ro.observe(el);
-    return () => ro.disconnect();
+    return () => {
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
+      ro.disconnect();
+    };
   }, [viewportRef, stickToBottomRef, handleScroll, resetKey]);
 
   const scrollToLatest = useCallback((smooth = false) => {
@@ -370,9 +378,19 @@ export const ConversationUserBubble = memo(function ConversationUserBubble({
     };
     measure();
     if (typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(measure);
+    let rafId = 0;
+    const ro = new ResizeObserver(() => {
+      if (rafId) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0;
+        measure();
+      });
+    });
     ro.observe(el);
-    return () => ro.disconnect();
+    return () => {
+      if (rafId) window.cancelAnimationFrame(rafId);
+      ro.disconnect();
+    };
   }, [text]);
 
   useEffect(() => {

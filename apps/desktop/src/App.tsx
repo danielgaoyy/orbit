@@ -571,7 +571,7 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
 
         {/* 2. Center Narrative Stage (pure CSS variables when idle; coordinated motion on panel toggle) */}
         <div
-          className="flex min-h-0 min-w-0 flex-1 flex-col overflow-clip [contain:layout_style]"
+          className="flex min-h-0 min-w-0 flex-1 flex-col overflow-clip"
           style={{
             paddingLeft: leftLayoutReserveCss,
             paddingRight: rightLayoutReserveCss,

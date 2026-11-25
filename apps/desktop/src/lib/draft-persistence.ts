@@ -253,6 +253,7 @@ export interface DraftPersistenceOptions extends Omit<DraftBudgetOptions, "nowMs
   now?: () => number;
   windowTarget?: WindowEventTargetLike | null;
   documentTarget?: DocumentEventTargetLike | null;
+  onPersistPayload?: (payloadJson: string | null) => void;
 }
 
 export interface DraftPersistenceController {
@@ -1531,6 +1532,7 @@ export function createDraftPersistenceController(
       nowMs,
     });
     writePayloadWithQuotaFallback(storage, storageKey, serialized);
+    options?.onPersistPayload?.(serialized.json);
 
     // Only delete timestamps for scopes that are genuinely empty in memory;
     // preserve timestamps for still-in-memory LRU-evicted scopes to prevent LRU inversion.
@@ -1598,6 +1600,7 @@ export function createDraftPersistenceController(
           nowMs: now(),
         });
         writePayloadWithQuotaFallback(storage, storageKey, cleaned);
+        options?.onPersistPayload?.(cleaned.json);
       }
 
       return hydrated;
@@ -1673,5 +1676,91 @@ export function createDraftPersistenceController(
         documentTarget.removeEventListener("visibilitychange", onVisibilityChange);
       }
     },
+  };
+}
+
+export interface MergedDraftRecoveryResult {
+  composerDrafts?: Record<string, string>;
+  pastedAttachments?: Record<string, PersistedPastedAttachment[]>;
+  diffQuotes?: Record<string, PersistedDiffQuote[]>;
+  contextItems?: Record<string, PersistedContextItem[]>;
+  inlineMentions?: Record<string, PersistedInlineMention[]>;
+  slashDirectives?: Record<string, ComposerInlineDirective | null>;
+  sideQuestionDrafts?: Record<string, string>;
+  updatedAtByScope: Record<string, number>;
+  recoveredScopes: string[];
+}
+
+/**
+ * Recover persisted drafts for scopes that are empty in current memory (e.g. cold-start
+ * rehydration from Rust SQLite when localStorage lost or evicted recent edits), without
+ * overwriting any active user edits already in memory.
+ */
+export function mergeMissingDraftSlices(
+  current: DraftStateSlices,
+  fallback: HydratedDraftSlices,
+): MergedDraftRecoveryResult | null {
+  const recoveredScopes: string[] = [];
+  const updatedAtByScope: Record<string, number> = {};
+  let composerDrafts: Record<string, string> | undefined;
+  let pastedAttachments: Record<string, PersistedPastedAttachment[]> | undefined;
+  let diffQuotes: Record<string, PersistedDiffQuote[]> | undefined;
+  let contextItems: Record<string, PersistedContextItem[]> | undefined;
+  let inlineMentions: Record<string, PersistedInlineMention[]> | undefined;
+  let slashDirectives: Record<string, ComposerInlineDirective | null> | undefined;
+  let sideQuestionDrafts: Record<string, string> | undefined;
+
+  for (const [scopeKey, ts] of Object.entries(fallback.updatedAtByScope)) {
+    if (!isValidScopeKey(scopeKey) || hasNonEmptyScopeDraft(current, scopeKey)) {
+      continue;
+    }
+    recoveredScopes.push(scopeKey);
+    updatedAtByScope[scopeKey] = ts;
+
+    if (scopeKey in fallback.composerDrafts) {
+      composerDrafts ??= { ...current.composerDrafts };
+      composerDrafts[scopeKey] = fallback.composerDrafts[scopeKey];
+    }
+    if (scopeKey in fallback.pastedAttachments) {
+      pastedAttachments ??= { ...current.pastedAttachments };
+      pastedAttachments[scopeKey] = fallback.pastedAttachments[scopeKey];
+    }
+    if (scopeKey in fallback.diffQuotes) {
+      diffQuotes ??= { ...current.diffQuotes };
+      diffQuotes[scopeKey] = fallback.diffQuotes[scopeKey];
+    }
+    if (scopeKey in fallback.contextItems) {
+      contextItems ??= {
+        ...((current.contextItems ?? {}) as Record<string, PersistedContextItem[]>),
+      };
+      contextItems[scopeKey] = fallback.contextItems[scopeKey];
+    }
+    if (scopeKey in fallback.inlineMentions) {
+      inlineMentions ??= {
+        ...((current.inlineMentions ?? {}) as Record<string, PersistedInlineMention[]>),
+      };
+      inlineMentions[scopeKey] = fallback.inlineMentions[scopeKey];
+    }
+    if (scopeKey in fallback.slashDirectives) {
+      slashDirectives ??= { ...current.slashDirectives };
+      slashDirectives[scopeKey] = fallback.slashDirectives[scopeKey];
+    }
+    if (scopeKey in fallback.sideQuestionDrafts) {
+      sideQuestionDrafts ??= { ...current.sideQuestionDrafts };
+      sideQuestionDrafts[scopeKey] = fallback.sideQuestionDrafts[scopeKey];
+    }
+  }
+
+  if (recoveredScopes.length === 0) return null;
+  return {
+    ...(composerDrafts ? { composerDrafts } : {}),
+    ...(pastedAttachments ? { pastedAttachments } : {}),
+    ...(diffQuotes ? { diffQuotes } : {}),
+    ...(contextItems ? { contextItems } : {}),
+    ...(inlineMentions ? { inlineMentions } : {}),
+    ...(slashDirectives ? { slashDirectives } : {}),
+    ...(sideQuestionDrafts ? { sideQuestionDrafts } : {}),
+    updatedAtByScope,
+    recoveredScopes,
   };
 }

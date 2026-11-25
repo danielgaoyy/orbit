@@ -1292,6 +1292,7 @@ export interface WorktreeHandoffOutcome {
 export interface PreviewWorktreeHandoffRequest {
   host_id: string;
   workspace_id: string;
+  source_agent_id?: string | null;
   direction: WorktreeHandoffDirection;
   target_workspace_id?: string | null;
   include_committed: boolean;
@@ -1300,6 +1301,7 @@ export interface PreviewWorktreeHandoffRequest {
 export interface ExecuteWorktreeHandoffRequest {
   host_id: string;
   workspace_id: string;
+  source_agent_id?: string | null;
   direction: WorktreeHandoffDirection;
   mode: WorktreeHandoffMode;
   target_workspace_id?: string | null;
@@ -4836,6 +4838,33 @@ export const orbitIpc = {
       throw new Error("Worktree handoff requires the Orbit desktop runtime");
     }
     return invoke<WorktreeHandoffOutcome>("execute_worktree_handoff", { req });
+  },
+
+  getComposerDraft: async (draftKey: string): Promise<string | null> => {
+    if (!transport()) return null;
+    try {
+      return await invoke<string | null>("get_composer_draft", { draftKey });
+    } catch {
+      return null;
+    }
+  },
+
+  setComposerDraft: async (draftKey: string, draftJson: string): Promise<void> => {
+    if (!transport()) return;
+    try {
+      await invoke<void>("set_composer_draft", { draftKey, draftJson });
+    } catch {
+      // Fall back cleanly to localStorage draft cache.
+    }
+  },
+
+  deleteComposerDraft: async (draftKey: string): Promise<void> => {
+    if (!transport()) return;
+    try {
+      await invoke<void>("delete_composer_draft", { draftKey });
+    } catch {
+      // Ignore SQLite cleanup failure when falling back to localStorage.
+    }
   },
 
   listWorkspaceScripts: async (hostId: string, workspaceId: string): Promise<void> => {

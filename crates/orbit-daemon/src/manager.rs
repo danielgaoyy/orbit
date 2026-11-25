@@ -119,6 +119,7 @@ struct DeferredWorktreeSetup {
 pub enum DaemonBroadcast {
     AgentUpdated(AgentSummary),
     AgentDeleted(String),
+    PendingPermissionsChanged(Vec<PendingPermissionSummary>),
     TimelineLive(TimelineEvent),
     WorkspaceUpdated(WorkspaceSummary),
     WorkspaceFilesChanged {
@@ -254,6 +255,52 @@ impl Drop for EvaluatingPermissionGuard {
     }
 }
 
+async fn resolve_git_main_checkout_root(path: &Path) -> Option<PathBuf> {
+    let out = tokio::process::Command::new("git")
+        .args([
+            "-C",
+            &path.to_string_lossy(),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let common_raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if common_raw.is_empty() {
+        return None;
+    }
+    let common_path = PathBuf::from(&common_raw);
+    if common_path.file_name().and_then(|n| n.to_str()) == Some(".git") {
+        return common_path.parent().map(Path::to_path_buf);
+    }
+    None
+}
+
+fn strip_internal_thinking_tags(raw: &str) -> String {
+    let mut out = raw.to_string();
+    for (open_tag, close_tag) in [("<thinking>", "</thinking>"), ("<thought>", "</thought>")] {
+        loop {
+            let lower = out.to_ascii_lowercase();
+            let Some(start) = lower.find(open_tag) else {
+                break;
+            };
+            if let Some(rel_end) = lower[start + open_tag.len()..].find(close_tag) {
+                let end = start + open_tag.len() + rel_end + close_tag.len();
+                out.replace_range(start..end, "");
+            } else {
+                out.truncate(start);
+                break;
+            }
+        }
+    }
+    out.trim().to_string()
+}
+
 pub struct AgentOrchestrator {
     pub(crate) memory: crate::memory::MemoryEngine,
     home_dir: PathBuf,
@@ -287,6 +334,11 @@ pub struct AgentOrchestrator {
     /// Recently dispatched `PostToolUse` `(agent_id, call_id)` pairs so repeated terminal
     /// tool-call snapshots do not double-fire hooks.
     post_tool_hook_dispatched: RwLock<std::collections::HashSet<(String, String)>>,
+    /// Recently evaluated `(agent_id, primary_tool, target_summary)` from Claude internal `PreToolUse`
+    /// hook so an immediate follow-up `can_use_tool` does not double-fire `PreToolUse` hooks.
+    pre_tool_hook_evaluated: RwLock<HashMap<(String, String, String), std::time::Instant>>,
+    /// Saved pre-`Plan` `SessionMode` per `agent_id` so approving a plan restores e.g. `AcceptEdits`.
+    pre_plan_modes: RwLock<HashMap<String, SessionMode>>,
     /// Incremental `<orbit-workspace>` roster tracking state per `agent_id`.
     roster_states: RwLock<HashMap<String, WorkspaceRosterState>>,
     /// Per-agent injected `<WORKSPACE_RULES>` hashes `(agent_id -> (rule_id -> content_hash))`.
@@ -428,6 +480,8 @@ impl AgentOrchestrator {
             )),
             guardian_auto_resolved_requests: RwLock::new(std::collections::HashSet::new()),
             post_tool_hook_dispatched: RwLock::new(std::collections::HashSet::new()),
+            pre_tool_hook_evaluated: RwLock::new(HashMap::new()),
+            pre_plan_modes: RwLock::new(HashMap::new()),
             roster_states: RwLock::new(HashMap::new()),
             injected_rule_hashes: RwLock::new(HashMap::new()),
             repo_handoff_locks: RwLock::new(HashMap::new()),
@@ -1007,7 +1061,11 @@ impl AgentOrchestrator {
                 .await;
             if should_close_status {
                 self.keep_awake.mark_agent_idle(&ag.agent_id);
-                if was_running && cfg.resume_on_startup && !ag.background {
+                if was_running
+                    && cfg.resume_on_startup
+                    && !ag.background
+                    && !protected_agents.contains(&ag.agent_id)
+                {
                     let mgr = Arc::clone(self);
                     let ag_id = ag.agent_id.clone();
                     let resume_prompt = cfg.resume_prompt.clone();
@@ -1133,11 +1191,19 @@ impl AgentOrchestrator {
                 .setup
                 .is_some();
 
+        let main_checkout_root = if is_worktree {
+            resolve_git_main_checkout_root(&src_path)
+                .await
+                .unwrap_or_else(|| src_path.clone())
+        } else {
+            src_path.clone()
+        };
+
         let title_locked = spec.title.as_deref().is_some_and(|t| !t.trim().is_empty());
         let project_root = spec
             .project_root
             .filter(|s| !s.trim().is_empty())
-            .or_else(|| Some(src_path.to_string_lossy().to_string()));
+            .or_else(|| Some(main_checkout_root.to_string_lossy().to_string()));
         let ws = WorkspaceSummary {
             workspace_id: format!("ws_{}", Uuid::new_v4().simple()),
             title: spec.title.unwrap_or(default_title),
@@ -1146,7 +1212,7 @@ impl AgentOrchestrator {
             is_worktree,
             updated_at: Utc::now(),
             source_cwd: if is_worktree {
-                Some(src_path.to_string_lossy().to_string())
+                Some(main_checkout_root.to_string_lossy().to_string())
             } else {
                 None
             },
@@ -2099,9 +2165,12 @@ impl AgentOrchestrator {
                 )
                 .await?;
                 let wt_str = wt_path.to_string_lossy().to_string();
+                let normalized_wt_source = resolve_git_main_checkout_root(&src_for_wt)
+                    .await
+                    .unwrap_or(src_for_wt);
                 agent_labels.insert(
                     "orbit.worktree_source_cwd".into(),
-                    src_for_wt.to_string_lossy().to_string(),
+                    normalized_wt_source.to_string_lossy().to_string(),
                 );
                 if let Some(br) = created_br {
                     agent_labels.insert("orbit.worktree_branch".into(), br);
@@ -3882,6 +3951,21 @@ impl AgentOrchestrator {
 
         let aid_persist = agent_id.to_string();
         let tid_persist = turn_id.clone();
+        let msg_id_check = msg_id.clone();
+        let duplicate_prompt = self
+            .try_store(move |s| s.has_user_prompt_message_id(&aid_persist, &msg_id_check))
+            .await
+            .unwrap_or(false);
+        if duplicate_prompt {
+            tracing::debug!(
+                agent_id,
+                message_id = %msg_id,
+                "Skipping duplicate UserPrompt persistence/dispatch (already recorded)"
+            );
+            return Ok(());
+        }
+
+        let aid_persist = agent_id.to_string();
         let (ev, read_ag_opt) = self
             .try_store(move |s| -> anyhow::Result<_> {
                 let ev = s.append_timeline_event(
@@ -3928,25 +4012,30 @@ impl AgentOrchestrator {
     }
 
     fn build_handoff_context_from_store(store: &OrbitStore, agent_id: &str) -> Option<String> {
-        let events = store.fetch_recent_timeline(agent_id, 200).ok()?;
-        let mut turns = Vec::new();
+        let (events, _) = store.fetch_timeline_since(agent_id, 0, 2000).ok()?;
+        let mut turns: Vec<(bool, String, String)> = Vec::new();
         for ev in events {
             match ev.payload {
                 TimelinePayload::UserPrompt { text, badges, .. } => {
-                    if !text.trim().is_empty() {
-                        turns.push(format!("User: {text}"));
+                    let body = if !text.trim().is_empty() {
+                        text
                     } else if !badges.is_empty() {
                         let summary: Vec<&str> = badges.iter().map(|b| b.label.as_str()).collect();
-                        turns.push(format!("User: {}", summary.join(" ")));
-                    }
+                        summary.join(" ")
+                    } else {
+                        continue;
+                    };
+                    turns.push((true, "User: ".to_string(), body));
                 }
                 TimelinePayload::AssistantMessage {
                     text,
                     streaming: false,
                     ..
                 } => {
-                    let clipped: String = text.chars().take(1200).collect();
-                    turns.push(format!("Assistant: {clipped}"));
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        turns.push((false, "Assistant: ".to_string(), trimmed.to_string()));
+                    }
                 }
                 _ => {}
             }
@@ -3954,10 +4043,66 @@ impl AgentOrchestrator {
         if turns.is_empty() {
             return None;
         }
-        let start = turns.len().saturating_sub(12);
+        const MAX_HANDOFF_CHARS: usize = 65_536;
+        let recent_assistant_keep = turns.len().saturating_sub(12);
+        let formatted: Vec<String> = turns
+            .iter()
+            .enumerate()
+            .map(|(idx, (is_user, prefix, body))| {
+                if *is_user {
+                    format!("{prefix}{body}")
+                } else {
+                    let cap = if idx >= recent_assistant_keep {
+                        1200
+                    } else {
+                        240
+                    };
+                    let clipped: String = body.chars().take(cap).collect();
+                    format!("{prefix}{clipped}")
+                }
+            })
+            .collect();
+        let mut joined = formatted.join("\n\n");
+        if joined.chars().count() > MAX_HANDOFF_CHARS {
+            // Re-pack preserving EVERY UserPrompt turn verbatim first, clipping older assistants tighter.
+            let compact: Vec<String> = turns
+                .iter()
+                .enumerate()
+                .map(|(idx, (is_user, prefix, body))| {
+                    if *is_user {
+                        let max_user = MAX_HANDOFF_CHARS / 2;
+                        let clipped: String = body.chars().take(max_user).collect();
+                        format!("{prefix}{clipped}")
+                    } else {
+                        let cap = if idx >= recent_assistant_keep {
+                            600
+                        } else {
+                            80
+                        };
+                        let clipped: String = body.chars().take(cap).collect();
+                        format!("{prefix}{clipped}")
+                    }
+                })
+                .collect();
+            joined = compact.join("\n\n");
+            if joined.chars().count() > MAX_HANDOFF_CHARS {
+                // Keep all user prompts + tail assistant turns within budget.
+                let mut user_only: Vec<String> = turns
+                    .iter()
+                    .filter(|(is_user, _, _)| *is_user)
+                    .map(|(_, prefix, body)| {
+                        let clipped: String = body.chars().take(2000).collect();
+                        format!("{prefix}{clipped}")
+                    })
+                    .collect();
+                for entry in formatted.iter().rev().take(6) {
+                    user_only.push(entry.clone());
+                }
+                joined = user_only.join("\n\n");
+            }
+        }
         Some(format!(
-            "[Prior Conversation Context in this Workspace]\n{}",
-            turns[start..].join("\n\n")
+            "[Prior Conversation Context in this Workspace]\n{joined}"
         ))
     }
 
@@ -4149,8 +4294,25 @@ impl AgentOrchestrator {
     pub async fn set_session_mode(&self, agent_id: &str, mode: SessionMode) -> anyhow::Result<()> {
         let aid = agent_id.to_string();
         let mode_db = mode.clone();
-        self.try_store(move |s| s.update_agent_mode(&aid, &mode_db))
+        let prev_mode = self
+            .try_store(move |s| -> anyhow::Result<Option<SessionMode>> {
+                let prev = s.get_agent(&aid)?.map(|a| a.mode);
+                s.update_agent_mode(&aid, &mode_db)?;
+                Ok(prev)
+            })
             .await?;
+        if matches!(mode, SessionMode::Plan) {
+            if let Some(prev) = prev_mode
+                && !matches!(prev, SessionMode::Plan)
+            {
+                self.pre_plan_modes
+                    .write()
+                    .await
+                    .insert(agent_id.to_string(), prev);
+            }
+        } else {
+            self.pre_plan_modes.write().await.remove(agent_id);
+        }
         if let Some(tx) = self.live_agent_tx(agent_id).await {
             let _ = tx.send(DriverCommand::SetMode { mode }).await;
         }
@@ -4353,6 +4515,18 @@ impl AgentOrchestrator {
             )
         })
         .await?;
+        if let Some(ref next_mode) = mode {
+            if matches!(next_mode, SessionMode::Plan) {
+                if !matches!(existing.mode, SessionMode::Plan) {
+                    self.pre_plan_modes
+                        .write()
+                        .await
+                        .insert(agent_id.to_string(), existing.mode.clone());
+                }
+            } else {
+                self.pre_plan_modes.write().await.remove(agent_id);
+            }
+        }
         if let Some(tx) = self.live_agent_tx(agent_id).await {
             if let Some(md) = mode {
                 let _ = tx.send(DriverCommand::SetMode { mode: md }).await;
@@ -4490,15 +4664,23 @@ impl AgentOrchestrator {
     }
 
     async fn clear_pending_requests(&self, agent_id: &str) {
-        self.pending_permissions
-            .write()
-            .await
-            .retain(|(aid, _), _| aid != agent_id);
+        let removed_perms = {
+            let mut perms = self.pending_permissions.write().await;
+            let before = perms.len();
+            perms.retain(|(aid, _), _| aid != agent_id);
+            perms.len() != before
+        };
         self.guardian_auto_resolved_requests
             .write()
             .await
             .retain(|(aid, _)| aid != agent_id);
         self.pending_questions.write().await.remove(agent_id);
+        if removed_perms {
+            let snapshot = self.list_pending_permissions(None).await;
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::PendingPermissionsChanged(snapshot));
+        }
     }
 
     pub async fn resolve_permission(
@@ -4599,6 +4781,21 @@ impl AgentOrchestrator {
                         "permission request `{request_id}` does not permit `allow_always`"
                     );
                 }
+                if peeked
+                    .as_ref()
+                    .and_then(|p| p.guardian_assessment.as_ref())
+                    .is_some_and(|a| {
+                        matches!(
+                            a.risk_level,
+                            orbit_protocol::GuardianRiskLevel::High
+                                | orbit_protocol::GuardianRiskLevel::Critical
+                        )
+                    })
+                {
+                    anyhow::bail!(
+                        "High/Critical risk actions cannot mint Always-Allow rules; choose one-time `allow` or `deny`"
+                    );
+                }
                 CanonicalDecision::AllowAlways
             }
             "deny" | "reject" | "reject_once" | "decline" => CanonicalDecision::Deny,
@@ -4627,10 +4824,9 @@ impl AgentOrchestrator {
                 anyhow::bail!("plan approval gate `{request_id}` does not support `allow_always`");
             }
             let (action, target_mode) = match canonical {
-                CanonicalDecision::Allow => (
-                    orbit_protocol::PlanApprovalAction::ApproveAndBuild,
-                    Some(SessionMode::Default),
-                ),
+                CanonicalDecision::Allow => {
+                    (orbit_protocol::PlanApprovalAction::ApproveAndBuild, None)
+                }
                 CanonicalDecision::Deny => (orbit_protocol::PlanApprovalAction::Dismiss, None),
                 CanonicalDecision::AllowAlways => unreachable!(),
             };
@@ -5238,6 +5434,175 @@ impl AgentOrchestrator {
         })
     }
 
+    pub async fn evaluate_claude_pre_tool_use(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+        _tool_use_id: Option<&str>,
+    ) -> Option<String> {
+        let aid = agent_id.to_string();
+        let ag = self
+            .try_store(move |s| s.get_agent(&aid))
+            .await
+            .ok()
+            .flatten()?;
+        let detail = orbit_providers::claude::map_claude_tool_detail(tool_name, tool_input, None);
+        let title = format!("Claude wants to use {tool_name}");
+        let (primary_tool, hook_targets) = crate::hooks::tool_detail_hook_targets(&detail, &title);
+        let (_, target_summary) = crate::guardian::summarize_tool_request(&detail, &title);
+        let hook_cwd = PathBuf::from(&ag.cwd);
+        let pre_payload = serde_json::json!({
+            "event": "pre_tool_use",
+            "agent_id": agent_id,
+            "workspace_id": &ag.workspace_id,
+            "cwd": &ag.cwd,
+            "provider": ag.provider.slug(),
+            "title": &title,
+            "tool_name": &primary_tool,
+            "tool_detail": &detail,
+            "tool_input": crate::hooks::tool_detail_input_value(&detail),
+            "target_summary": &target_summary,
+            "is_plan_approval": false,
+        });
+        let pre_outcome = self
+            .hooks
+            .dispatch_event_with_targets(
+                orbit_protocol::HookEventKind::PreToolUse,
+                Some(hook_cwd.as_path()),
+                &hook_targets,
+                pre_payload,
+            )
+            .await;
+        let unsupported_input_rewrite = pre_outcome.decision != orbit_protocol::HookDecision::Block
+            && pre_outcome.updated_input.is_some();
+        if pre_outcome.decision == orbit_protocol::HookDecision::Block || unsupported_input_rewrite
+        {
+            let hook_name = pre_outcome
+                .blocking_hook_name
+                .as_deref()
+                .or_else(|| pre_outcome.records.last().map(|r| r.hook_name.as_str()))
+                .unwrap_or("lifecycle hook");
+            let reason = if unsupported_input_rewrite {
+                "PreToolUse updated_input is not supported for this provider tool (fail-closed)"
+            } else {
+                pre_outcome
+                    .reason
+                    .as_deref()
+                    .unwrap_or("blocked by PreToolUse hook")
+            };
+            let notice = TimelinePayload::Notice {
+                level: "warning".into(),
+                message: format!(
+                    "PreToolUse hook `{hook_name}` blocked `{primary_tool}` ({target_summary}): {reason}"
+                ),
+            };
+            if let Ok((saved_ev, mutated)) = self
+                .store
+                .append_timeline_event_deduped(agent_id, 1, None, notice)
+                && mutated
+            {
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::TimelineLive(saved_ev));
+            }
+            return Some(format!("PreToolUse hook `{hook_name}` blocked: {reason}"));
+        }
+
+        // Remember recent allowed PreToolUse so an immediate follow-up `can_use_tool` does not double-fire.
+        {
+            let mut guard = self.pre_tool_hook_evaluated.write().await;
+            if guard.len() > 256 {
+                guard.clear();
+            }
+            guard.insert(
+                (
+                    agent_id.to_string(),
+                    primary_tool.clone(),
+                    target_summary.clone(),
+                ),
+                std::time::Instant::now(),
+            );
+        }
+
+        // Evaluate Orbit PermissionRules Deny rules even on Claude built-in auto-allowed tools (e.g. `echo`, `ls`).
+        let rules = match self.store.list_permission_rules(Some(&ag.cwd)) {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    error = %err,
+                    "Permission rules store unavailable during internal PreToolUse check"
+                );
+                return Some("Permission rules store unavailable (fail-closed)".to_string());
+            }
+        };
+        if let Some(matched) = crate::permission_rules::evaluate_permission_rules(
+            &rules,
+            &crate::permission_rules::PermissionRuleEvalContext {
+                project_cwd: &ag.cwd,
+                provider: ag.provider,
+                title: &title,
+                detail: &detail,
+                has_plan_approval: false,
+            },
+        ) && matches!(
+            matched.rule.decision,
+            orbit_protocol::PermissionRuleDecision::Deny
+        ) {
+            let matched_at = Utc::now();
+            let _ = self
+                .store
+                .record_permission_rule_match(&matched.rule.id, matched_at);
+            let decided_at_ms = u64::try_from(matched_at.timestamp_millis()).unwrap_or(0);
+            self.guardian
+                .record_audit_entry(orbit_protocol::GuardianAuditEntry {
+                    id: format!("pr_{}", &Uuid::new_v4().simple().to_string()[..12]),
+                    agent_id: agent_id.to_string(),
+                    request_id: format!("pre_{}", &Uuid::new_v4().simple().to_string()[..12]),
+                    tool_name: primary_tool,
+                    target_summary: target_summary.clone(),
+                    assessment: orbit_protocol::GuardianAssessment {
+                        risk_level: orbit_protocol::GuardianRiskLevel::High,
+                        decision: orbit_protocol::GuardianDecision::AutoDeny,
+                        confidence: 1.0,
+                        classifier_tier: "deterministic".into(),
+                        reason: matched.reason.clone(),
+                        signals: vec![
+                            "permission_rule".into(),
+                            matched.rule.scope_kind.as_str().into(),
+                            matched.rule.source.as_str().into(),
+                        ],
+                        latency_ms: 0,
+                    },
+                    decided_at_ms,
+                })
+                .await;
+            let notice = TimelinePayload::Notice {
+                level: "warning".into(),
+                message: format!(
+                    "Permission rule denied (`{}`): {target_summary}",
+                    matched.rule.pattern
+                ),
+            };
+            if let Ok((saved_ev, mutated)) = self
+                .store
+                .append_timeline_event_deduped(agent_id, 1, None, notice)
+                && mutated
+            {
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::TimelineLive(saved_ev));
+            }
+            return Some(format!(
+                "Blocked by Orbit permission rule `{}` ({})",
+                matched.rule.pattern, matched.reason
+            ));
+        }
+
+        None
+    }
+
     pub async fn resolve_plan_approval(
         self: &Arc<Self>,
         agent_id: &str,
@@ -5302,7 +5667,19 @@ impl AgentOrchestrator {
             }
         };
 
-        let effective_target_mode = target_mode.unwrap_or(SessionMode::Default);
+        let saved_pre_plan =
+            if matches!(action, orbit_protocol::PlanApprovalAction::ApproveAndBuild) {
+                self.pre_plan_modes
+                    .write()
+                    .await
+                    .remove(agent_id)
+                    .filter(|m| !matches!(m, SessionMode::Plan))
+            } else {
+                None
+            };
+        let effective_target_mode = target_mode
+            .or(saved_pre_plan)
+            .unwrap_or(SessionMode::Default);
         let effective_edited = edited_plan_markdown
             .filter(|edited| orbit_protocol::is_plan_edited(&plan.plan_markdown, Some(edited)));
 
@@ -6221,9 +6598,15 @@ impl AgentOrchestrator {
                     "requested",
                     &serde_json::Value::Null,
                 )?;
+                let epoch = s
+                    .get_agent(&aid)
+                    .ok()
+                    .flatten()
+                    .map(|a| u32::try_from(a.timeline_epoch.max(1)).unwrap_or(u32::MAX))
+                    .unwrap_or(1);
                 Ok(s.append_timeline_event(
                     &aid,
-                    1,
+                    epoch,
                     None,
                     TimelinePayload::Notice {
                         level: "compaction".into(),
@@ -7330,7 +7713,7 @@ impl AgentOrchestrator {
                     .as_deref()
                     .and_then(|pid| s.get_profile(pid).ok().flatten());
                 let persisted_running_bg_tasks: Vec<PersistedBackgroundTask> = s
-                    .list_running_background_tool_calls(&aid_boot)
+                    .list_open_running_tool_calls(&aid_boot)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|(call_id, detail, info)| PersistedBackgroundTask {
@@ -7432,6 +7815,33 @@ impl AgentOrchestrator {
                 "ORBIT_SERVER".into(),
                 format!("ws://127.0.0.1:{daemon_port}/ws"),
             );
+        }
+        if matches!(summary.provider, ProviderKind::ClaudeCode) && daemon_port > 0 {
+            extra_env.insert("ORBIT_PRE_TOOL_HOOK".into(), "1".into());
+        } else if matches!(summary.provider, ProviderKind::Codex) {
+            let cwd_path = PathBuf::from(&summary.cwd);
+            let has_deny_rule = self
+                .store
+                .list_permission_rules(Some(&summary.cwd))
+                .ok()
+                .is_some_and(|rules| {
+                    rules
+                        .iter()
+                        .any(|r| matches!(r.decision, orbit_protocol::PermissionRuleDecision::Deny))
+                });
+            let has_pre_hook = self
+                .hooks
+                .list_snapshot(Some(&cwd_path))
+                .await
+                .ok()
+                .is_some_and(|snap| {
+                    snap.hooks
+                        .iter()
+                        .any(|h| h.enabled && h.event == orbit_protocol::HookEventKind::PreToolUse)
+                });
+            if has_deny_rule || has_pre_hook {
+                extra_env.insert("ORBIT_STRICT_TOOL_GATING".into(), "1".into());
+            }
         }
 
         let persisted_bg_wait = matches!(
@@ -8220,7 +8630,10 @@ impl AgentOrchestrator {
                                 crate::hooks::extract_paths_from_unified_diff(
                                     path,
                                     unified_diff.as_deref(),
-                                ),
+                                )
+                                .into_iter()
+                                .filter(|p| !orbit_protocol::looks_like_plan_file_path(p))
+                                .collect(),
                             ),
                             ToolCallDetail::Generic { arguments_json, .. } => (
                                 None,
@@ -8269,17 +8682,22 @@ impl AgentOrchestrator {
                 if status == ToolCallStatus::Completed {
                     match &detail {
                         ToolCallDetail::FileEdit { path, unified_diff } => {
-                            let edited_paths = crate::hooks::extract_paths_from_unified_diff(
-                                path,
-                                unified_diff.as_deref(),
-                            );
+                            let edited_paths: Vec<String> =
+                                crate::hooks::extract_paths_from_unified_diff(
+                                    path,
+                                    unified_diff.as_deref(),
+                                )
+                                .into_iter()
+                                .filter(|p| !orbit_protocol::looks_like_plan_file_path(p))
+                                .collect();
                             for edited_path in &edited_paths {
                                 self.record_file_edit_and_check_conflict(agent_id, edited_path)
                                     .await;
                             }
                             let aid_edit = agent_id.to_string();
-                            if let Ok(Some(ag)) =
-                                self.try_store(move |s| s.get_agent(&aid_edit)).await
+                            if !edited_paths.is_empty()
+                                && let Ok(Some(ag)) =
+                                    self.try_store(move |s| s.get_agent(&aid_edit)).await
                             {
                                 let target_path = path.clone();
                                 let payload = serde_json::json!({
@@ -8407,6 +8825,16 @@ impl AgentOrchestrator {
                         crate::hooks::tool_detail_hook_targets(&detail, &title);
                     let (_, target_summary) =
                         crate::guardian::summarize_tool_request(&detail, &title);
+                    let recently_checked_by_claude_hook = {
+                        let key = (
+                            agent_id.to_string(),
+                            primary_tool.clone(),
+                            target_summary.clone(),
+                        );
+                        let mut guard = self.pre_tool_hook_evaluated.write().await;
+                        guard.retain(|_, ts| ts.elapsed() < std::time::Duration::from_secs(5));
+                        guard.remove(&key).is_some()
+                    };
                     let hook_cwd = agent_opt.as_ref().map(|ag| PathBuf::from(&ag.cwd));
                     let pre_payload = serde_json::json!({
                         "event": "pre_tool_use",
@@ -8422,15 +8850,18 @@ impl AgentOrchestrator {
                         "target_summary": &target_summary,
                         "is_plan_approval": plan_approval.is_some(),
                     });
-                    let pre_outcome = self
-                        .hooks
-                        .dispatch_event_with_targets(
-                            orbit_protocol::HookEventKind::PreToolUse,
-                            hook_cwd.as_deref(),
-                            &hook_targets,
-                            pre_payload,
-                        )
-                        .await;
+                    let pre_outcome = if recently_checked_by_claude_hook {
+                        crate::hooks::HookDispatchOutcome::default()
+                    } else {
+                        self.hooks
+                            .dispatch_event_with_targets(
+                                orbit_protocol::HookEventKind::PreToolUse,
+                                hook_cwd.as_deref(),
+                                &hook_targets,
+                                pre_payload,
+                            )
+                            .await
+                    };
                     if self.current_generation(agent_id).await != expected_gen {
                         return;
                     }
@@ -8706,7 +9137,10 @@ impl AgentOrchestrator {
                         workspace_cwd: &ag.cwd,
                         agent_provider: Some(ag.provider),
                     };
-                    let assessment = self.guardian.assess_and_record(&eval_req).await;
+                    let assessment = self
+                        .guardian
+                        .assess_and_record_with_options(&eval_req, ag.is_personal_router())
+                        .await;
                     // Re-verify generation and current mode after async classification (TOCTOU guard).
                     if self.current_generation(agent_id).await != expected_gen {
                         return;
@@ -8877,6 +9311,17 @@ impl AgentOrchestrator {
                         .as_ref()
                         .is_some_and(crate::guardian::assessment_requires_human_only);
 
+                let mut allowed_decisions = allowed_decisions;
+                if guardian_assessment.as_ref().is_some_and(|a| {
+                    matches!(
+                        a.risk_level,
+                        orbit_protocol::GuardianRiskLevel::High
+                            | orbit_protocol::GuardianRiskLevel::Critical
+                    )
+                }) {
+                    allowed_decisions.retain(|d| d != "allow_always");
+                }
+
                 if let Some(ref ag) = agent_opt {
                     self.pending_permissions.write().await.insert(
                         (agent_id.to_string(), request_id.clone()),
@@ -8898,10 +9343,12 @@ impl AgentOrchestrator {
                     // inserting the settled entry into `pending_permissions`.
                     eval_guard.disarm();
 
-                    // Notify active Personal Router for Tier-2 Medium pre-review (Tier-3 High/Critical,
-                    // plan approvals, and fail-closed/human-only verdicts stay strictly human-only!)
-                    // and mirror event to optional external Hermes webhook.
+                    // Notify active Personal Router for Tier-2 Medium pre-review ONLY for workers
+                    // spawned by this Router (`ag.parent_agent_id == Some(router_id)`). Tier-3
+                    // High/Critical, plan approvals, and unrelated human/workspace sessions stay
+                    // strictly human-only!
                     if !ag.is_personal_router()
+                        && ag.parent_agent_id.is_some()
                         && let Some(router) = self.personal_router().await
                     {
                         let risk_level = guardian_assessment
@@ -8933,6 +9380,7 @@ impl AgentOrchestrator {
                                     | orbit_protocol::GuardianRiskLevel::Medium
                             )
                             && let Some(router_id) = router.active_router_agent_id().await
+                            && ag.parent_agent_id.as_deref() == Some(router_id.as_str())
                             && router_id != agent_id
                             && let Some(delivery) = self.message_delivery().await
                         {
@@ -9265,17 +9713,22 @@ impl AgentOrchestrator {
                                     for ev in events.iter().rev() {
                                         if let TimelinePayload::AssistantMessage { text, .. } =
                                             &ev.payload
-                                            && !text.trim().is_empty()
                                         {
-                                            return crate::hooks::truncate_hook_preview(text, 300);
+                                            let cleaned = strip_internal_thinking_tags(text);
+                                            if !cleaned.trim().is_empty() {
+                                                return crate::hooks::truncate_hook_preview(
+                                                    &cleaned, 300,
+                                                );
+                                            }
                                         }
                                     }
                                 }
                                 task_summary_fallback
                                     .as_deref()
-                                    .map(str::trim)
+                                    .map(strip_internal_thinking_tags)
+                                    .map(|s| s.trim().to_string())
                                     .filter(|s| !s.is_empty())
-                                    .map(|s| crate::hooks::truncate_hook_preview(s, 300))
+                                    .map(|s| crate::hooks::truncate_hook_preview(&s, 300))
                                     .unwrap_or_else(|| "Turn completed".to_string())
                             })
                             .await
@@ -9867,6 +10320,12 @@ impl AgentOrchestrator {
         if let Some(live) = self.live_terminals.write().await.remove(terminal_id) {
             let _ = live.shim_tx.send(PtyAction::Kill).await;
         }
+        // Fallback: ensure any detached PTY shim/shell not present in `live_terminals`
+        // (e.g. mid-reconnect or post-restart) is still reaped cleanly.
+        if let Ok(sock) = self.shim_socket_path("p", terminal_id) {
+            kill_existing_shim(&sock).await;
+        }
+        kill_existing_shim(&self.legacy_shim_socket_path("pty", terminal_id)).await;
         for mut stopped in self.scripts.unregister_by_terminal_id(terminal_id).await {
             stopped.info.status = WorkspaceScriptStatus::Stopped;
             stopped.info.terminal_id = None;

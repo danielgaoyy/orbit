@@ -102,7 +102,11 @@ fn build_codex_turn_start_params(
     service_tier_explicitly_controlled: bool,
     input_items: Value,
 ) -> Value {
-    let (pol, sandbox_policy) = codex_turn_policies(mode, &cfg.extra_dirs);
+    let strict_tool_gating = cfg
+        .extra_env
+        .get("ORBIT_STRICT_TOOL_GATING")
+        .is_some_and(|v| v == "1");
+    let (pol, sandbox_policy) = codex_turn_policies(mode, &cfg.extra_dirs, strict_tool_gating);
     let mut params = json!({
         "threadId": thread_id,
         "input": input_items,
@@ -271,13 +275,18 @@ async fn run_codex_actor(
     let mut inject_handoff_on_next_prompt = false;
     let mut pending_handoff_context = cfg.fallback_handoff_context.clone();
 
+    let strict_tool_gating = cfg
+        .extra_env
+        .get("ORBIT_STRICT_TOOL_GATING")
+        .is_some_and(|v| v == "1");
+
     let (thread_id, mut resolved_model) = if is_reattached
         && let Some(ref tid) = cfg.resume_session_id
     {
         (tid.clone(), cfg.model.clone())
     } else {
         // Start or resume thread (injecting Orbit MCP server into `config.mcp_servers`)
-        let (approval_policy, start_sandbox) = codex_thread_mode_strings(&mode);
+        let (approval_policy, start_sandbox) = codex_thread_mode_strings(&mode, strict_tool_gating);
         let thread_req_id = next_id;
         next_id += 1;
 
@@ -1627,21 +1636,49 @@ async fn wait_codex_id_response(
     }
 }
 
-fn codex_thread_mode_strings(mode: &SessionMode) -> (&'static str, &'static str) {
+fn codex_thread_mode_strings(
+    mode: &SessionMode,
+    strict_tool_gating: bool,
+) -> (&'static str, &'static str) {
     match mode {
         SessionMode::FullAccess => ("never", "danger-full-access"),
         SessionMode::Plan => ("on-request", "read-only"),
-        // Auto (Guardian) keeps approval policy `on-request` so Orbit's daemon classifies requests.
-        SessionMode::Auto => ("on-request", "workspace-write"),
-        _ => ("on-request", "workspace-write"),
+        // Auto (Guardian) keeps approval policy `on-request` (or `untrusted` when Orbit Deny
+        // rules / PreToolUse hooks must intercept built-in safe shell commands) so Orbit's
+        // daemon classifies requests.
+        SessionMode::Auto => (
+            if strict_tool_gating {
+                "untrusted"
+            } else {
+                "on-request"
+            },
+            "workspace-write",
+        ),
+        _ => (
+            if strict_tool_gating {
+                "untrusted"
+            } else {
+                "on-request"
+            },
+            "workspace-write",
+        ),
     }
 }
 
-fn codex_turn_policies(mode: &SessionMode, extra_dirs: &[PathBuf]) -> (&'static str, Value) {
+fn codex_turn_policies(
+    mode: &SessionMode,
+    extra_dirs: &[PathBuf],
+    strict_tool_gating: bool,
+) -> (&'static str, Value) {
     let writable_roots: Vec<String> = extra_dirs
         .iter()
         .map(|p| p.to_string_lossy().to_string())
         .collect();
+    let policy_str = if strict_tool_gating {
+        "untrusted"
+    } else {
+        "on-request"
+    };
     match mode {
         SessionMode::FullAccess => ("never", json!({ "type": "dangerFullAccess" })),
         SessionMode::Plan => ("on-request", json!({ "type": "readOnly" })),
@@ -1649,7 +1686,7 @@ fn codex_turn_policies(mode: &SessionMode, extra_dirs: &[PathBuf]) -> (&'static 
         | SessionMode::Default
         | SessionMode::AcceptEdits
         | SessionMode::Custom(_) => (
-            "on-request",
+            policy_str,
             json!({
                 "type": "workspaceWrite",
                 "networkAccess": false,

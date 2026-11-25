@@ -419,13 +419,16 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let now = Utc::now().to_rfc3339();
         let closed_json = serde_json::to_string(&AgentStatus::Closed)?;
-        let current_status: Option<String> = conn
+        let row_meta: Option<(String, String, Option<String>)> = conn
             .query_row(
-                "SELECT status_json FROM agents WHERE agent_id = ?1",
+                "SELECT status_json, attention_state, labels_json FROM agents WHERE agent_id = ?1",
                 params![agent_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
+        let (current_status, current_attention, labels_raw) = row_meta
+            .map(|(s, a, l)| (Some(s), a, l))
+            .unwrap_or_else(|| (None, "none".to_string(), None));
         let normalized_status = match current_status
             .as_deref()
             .and_then(|s| serde_json::from_str::<AgentStatus>(s).ok())
@@ -438,11 +441,21 @@ impl OrbitStore {
             ) => closed_json,
             _ => current_status.unwrap_or(closed_json),
         };
+        let mut labels: HashMap<String, String> = labels_raw
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        if current_attention != "none" && !current_attention.trim().is_empty() {
+            labels.insert("orbit.pre_archive_attention".to_string(), current_attention);
+        } else {
+            labels.remove("orbit.pre_archive_attention");
+        }
+        let next_labels_json = serde_json::to_string(&labels)?;
         conn.execute(
             "UPDATE agents
-             SET archived_at = ?1, status_json = ?2, attention_state = 'none', updated_at = ?1
-             WHERE agent_id = ?3",
-            params![now, normalized_status, agent_id],
+             SET archived_at = ?1, status_json = ?2, attention_state = 'none', labels_json = ?3, updated_at = ?1
+             WHERE agent_id = ?4",
+            params![now, normalized_status, next_labels_json, agent_id],
         )?;
         let _ = conn.execute(
             "DELETE FROM agent_queued_prompts WHERE agent_id = ?1",
@@ -453,9 +466,26 @@ impl OrbitStore {
 
     pub fn unarchive_agent(&self, agent_id: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let row_meta: Option<Option<String>> = conn
+            .query_row(
+                "SELECT labels_json FROM agents WHERE agent_id = ?1",
+                params![agent_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mut labels: HashMap<String, String> = row_meta
+            .flatten()
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let restored_attention = labels
+            .remove("orbit.pre_archive_attention")
+            .filter(|a| !a.trim().is_empty())
+            .unwrap_or_else(|| "none".to_string());
+        let next_labels_json = serde_json::to_string(&labels)?;
         conn.execute(
-            "UPDATE agents SET archived_at = NULL, updated_at = ?1 WHERE agent_id = ?2",
-            params![Utc::now().to_rfc3339(), agent_id],
+            "UPDATE agents SET archived_at = NULL, attention_state = ?1, labels_json = ?2, updated_at = ?3 WHERE agent_id = ?4",
+            params![restored_attention, next_labels_json, Utc::now().to_rfc3339(), agent_id],
         )?;
         Ok(())
     }

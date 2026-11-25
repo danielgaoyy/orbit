@@ -184,8 +184,46 @@ impl GuardianManager {
 
     /// Evaluate a permission request using the current host policy and record the audit entry.
     pub async fn assess_and_record(&self, req: &GuardianEvalRequest<'_>) -> GuardianAssessment {
+        self.assess_and_record_with_options(req, false).await
+    }
+
+    /// Evaluate a permission request with optional Personal Router caller privileges.
+    pub async fn assess_and_record_with_options(
+        &self,
+        req: &GuardianEvalRequest<'_>,
+        is_personal_router: bool,
+    ) -> GuardianAssessment {
         let config = self.config.read().await.clone();
-        let assessment = self.assess_with_config(req, &config).await;
+        let assessment = if is_personal_router
+            && matches!(
+                &req.detail,
+                ToolCallDetail::Generic { tool_name, .. }
+                    if matches!(
+                        tool_name.trim().to_ascii_lowercase().as_str(),
+                        "mcp__orbit__orbit_control"
+                            | "mcp__orbit__send_message"
+                            | "mcp__orbit__create_agent"
+                            | "mcp__orbit__spawn_workspace_peer"
+                            | "orbit/orbit_control"
+                            | "orbit/send_message"
+                            | "orbit/create_agent"
+                            | "orbit/spawn_workspace_peer"
+                    )
+            )
+            && !config.enabled.then_some(()).is_none()
+        {
+            GuardianAssessment {
+                risk_level: GuardianRiskLevel::Low,
+                decision: GuardianDecision::AutoAllow,
+                confidence: 0.96,
+                classifier_tier: "deterministic_tier1".into(),
+                reason: "Personal Router fleet orchestration control tool".into(),
+                signals: vec!["personal_router_control".into()],
+                latency_ms: 0,
+            }
+        } else {
+            self.assess_with_config(req, &config).await
+        };
         let (tool_name, target_summary) = summarize_tool_request(req.detail, req.title);
         let decided_at_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0);
         let entry = GuardianAuditEntry {
@@ -884,6 +922,34 @@ fn classify_generic_tool(
 ) -> Tier1Result {
     let lower_tool = tool_name.trim().to_ascii_lowercase();
     let parsed: Option<serde_json::Value> = serde_json::from_str(arguments_json).ok();
+
+    // Safe read-only & workspace coordination Orbit MCP tools are Low risk and AutoAllow cleanly.
+    if matches!(
+        lower_tool.as_str(),
+        "mcp__orbit__workspace_board"
+            | "mcp__orbit__workspace_peers"
+            | "mcp__orbit__list_hosts"
+            | "mcp__orbit__list_projects"
+            | "mcp__orbit__inspect_project_context"
+            | "mcp__orbit__orbit_memory"
+            | "mcp__orbit__orbit_plugin"
+            | "orbit/workspace_board"
+            | "orbit/workspace_peers"
+            | "orbit/list_hosts"
+            | "orbit/list_projects"
+            | "orbit/inspect_project_context"
+            | "orbit/orbit_memory"
+            | "orbit/orbit_plugin"
+    ) && !contains_sensitive_secret_reference(arguments_json)
+    {
+        return Tier1Result::final_decision(
+            GuardianRiskLevel::Low,
+            GuardianDecision::AutoAllow,
+            0.98,
+            format!("Orbit read-only/coordination MCP tool `{tool_name}`"),
+            vec!["orbit_mcp_readonly".into()],
+        );
+    }
 
     // Shell-equivalent generic tools go through the full deterministic shell classifier.
     if matches!(

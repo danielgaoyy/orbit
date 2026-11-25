@@ -1082,6 +1082,9 @@ pub fn compose_prompt(
                     format!("/compact {clean_user_text}")
                 }
             }
+            ProviderKind::Codex | ProviderKind::Pi if clean_user_text.is_empty() => {
+                "/compact".to_string()
+            }
             _ => {
                 let instr = build_workflow_instruction(SlashDirective::Compact);
                 if clean_user_text.is_empty() {
@@ -2227,7 +2230,7 @@ mod tests {
         let compact_codex = compose_prompt(
             &ComposePromptRequest {
                 provider: ProviderKind::Codex,
-                raw_text: "/compact focus on auth".into(),
+                raw_text: "/compact".into(),
                 explicit_directive: None,
                 host_id: None,
                 cwd: None,
@@ -2239,8 +2242,25 @@ mod tests {
             None,
         );
         assert!(compact_codex.is_compact);
+        assert_eq!(compact_codex.wire_prompt, "/compact");
+
+        let compact_acp = compose_prompt(
+            &ComposePromptRequest {
+                provider: ProviderKind::Acp,
+                raw_text: "/compact focus on auth".into(),
+                explicit_directive: None,
+                host_id: None,
+                cwd: None,
+                contexts: Vec::new(),
+                quotes: Vec::new(),
+                pastes: Vec::new(),
+            },
+            None,
+            None,
+        );
+        assert!(compact_acp.is_compact);
         assert!(
-            compact_codex
+            compact_acp
                 .wire_prompt
                 .contains("<WORKFLOW_INSTRUCTION command=\"/compact\">")
         );

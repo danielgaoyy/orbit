@@ -458,7 +458,8 @@ impl PersonalRouterManager {
         &self,
         target_host_id: Option<&str>,
     ) -> Vec<FleetProjectEntry> {
-        let include_all = matches!(target_host_id, Some("all") | Some("*"));
+        let include_all =
+            target_host_id.is_none() || matches!(target_host_id, Some("all") | Some("*"));
         let mut out = Vec::new();
 
         // Local projects
@@ -1348,22 +1349,22 @@ fn compute_recommendation_score(
     let mut reasons = Vec::new();
     if has_active_router {
         score = score.saturating_add(30);
-        reasons.push("已有运行中的分工师会话");
+        reasons.push("Active Personal Router session");
     }
     if hermes_installed {
         score = score.saturating_add(35);
-        reasons.push("已检测到 Hermes");
+        reasons.push("Hermes detected");
     }
     if hermes_has_memory {
         score = score.saturating_add(15);
-        reasons.push("含已有长期记忆");
+        reasons.push("Long-term memory present");
     }
     if !hermes_installed && has_fallback_providers {
         score = score.saturating_add(15);
-        reasons.push("可用内置 Coding Harness 驱动");
+        reasons.push("Built-in Coding Harness driver available");
     }
     let reason = if reasons.is_empty() {
-        "在线主机".to_string()
+        "Online host".to_string()
     } else {
         reasons.join(" · ")
     };
@@ -1522,13 +1523,13 @@ fn build_router_create_spec(
     let router_soul = build_router_system_instructions(cfg);
     let init_prompt = format!(
         "[Orbit Personal Router Initialization]\n{router_soul}\n\n\
-         You are now online as the user's Orbit Personal Router (分工师). \
+         You are now online as the user's Orbit Personal Router. \
          Acknowledge briefly in 1-2 sentences that you are ready to route and coordinate tasks."
     );
     CreateAgentSpec {
         cwd,
         extra_dirs: Vec::new(),
-        title: Some("Personal Router · 分工师".to_string()),
+        title: Some("Personal Router".to_string()),
         provider,
         model: cfg.model.clone(),
         effort: cfg.effort,
@@ -1536,7 +1537,7 @@ fn build_router_create_spec(
         mode: SessionMode::Auto,
         initial_prompt: init_prompt,
         initial_display_prompt: Some(
-            "Personal Router · 分工师已就绪，正在等待你的指令。".to_string(),
+            "Personal Router is ready and awaiting your instructions.".to_string(),
         ),
         initial_badges: Vec::new(),
         worktree: false,

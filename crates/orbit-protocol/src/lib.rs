@@ -2936,6 +2936,8 @@ pub enum WireMessage {
     PreviewWorktreeHandoff {
         request_id: Uuid,
         workspace_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_agent_id: Option<String>,
         direction: WorktreeHandoffDirection,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_workspace_id: Option<String>,
@@ -2949,6 +2951,8 @@ pub enum WireMessage {
     ExecuteWorktreeHandoff {
         request_id: Uuid,
         workspace_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_agent_id: Option<String>,
         direction: WorktreeHandoffDirection,
         mode: WorktreeHandoffMode,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5493,6 +5497,7 @@ mod tests {
             WireMessage::PreviewWorktreeHandoff {
                 request_id: req_id,
                 workspace_id: "ws_wt".into(),
+                source_agent_id: None,
                 direction: WorktreeHandoffDirection::WorktreeToLocal,
                 target_workspace_id: None,
                 include_committed: true,
@@ -5525,6 +5530,7 @@ mod tests {
             WireMessage::ExecuteWorktreeHandoff {
                 request_id: req_id,
                 workspace_id: "ws_local".into(),
+                source_agent_id: None,
                 direction: WorktreeHandoffDirection::LocalToWorktree,
                 mode: WorktreeHandoffMode::Move,
                 target_workspace_id: None,

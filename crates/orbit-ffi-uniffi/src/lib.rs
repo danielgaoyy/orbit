@@ -4804,6 +4804,7 @@ impl From<FfiPreviewWorktreeHandoffRequest> for PreviewWorktreeHandoffRequest {
         Self {
             host_id: v.host_id,
             workspace_id: v.workspace_id,
+            source_agent_id: None,
             direction: v.direction.into(),
             target_workspace_id: v.target_workspace_id,
             include_committed: v.include_committed,
@@ -4828,6 +4829,7 @@ impl From<FfiExecuteWorktreeHandoffRequest> for ExecuteWorktreeHandoffRequest {
         Self {
             host_id: v.host_id,
             workspace_id: v.workspace_id,
+            source_agent_id: None,
             direction: v.direction.into(),
             mode: v.mode.into(),
             target_workspace_id: v.target_workspace_id,

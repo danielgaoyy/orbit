@@ -110,7 +110,11 @@ const EarlierCluster = memo(function EarlierCluster({
         openOnHover
         delay={0}
         closeDelay={160}
-        aria-label={t("stage.earlierPromptCount", { count: earlier.length })}
+        aria-label={
+          earlier.length === 1
+            ? t("stage.earlierPromptCountOne")
+            : t("stage.earlierPromptCount", { count: earlier.length })
+        }
         aria-busy={jumpingToSeq !== null || undefined}
         className={cn(
           "group/cluster mb-1 flex h-[22px] w-full shrink-0 cursor-pointer flex-col items-start justify-center gap-[2.5px] rounded-sm pl-[1.5px] focus-visible:outline-1 focus-visible:outline-ink-secondary",

@@ -129,6 +129,13 @@ export const StageFindBar = memo(function StageFindBar({
       aria-label={t("stage.findInConversation")}
       data-orbit-stage-find="true"
       data-orbit-find-ignore="true"
+      onKeyDown={(e) => {
+        if (e.key === "Escape" && !ime.shouldIgnoreKeyDown(e)) {
+          e.preventDefault();
+          e.stopPropagation();
+          onClose();
+        }
+      }}
       style={{
         right: `${16 + overviewReservePx}px`,
         transition: overviewReserveTransition,

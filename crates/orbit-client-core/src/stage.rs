@@ -1958,6 +1958,11 @@ fn finalize_turn(
                     has_error = true;
                 }
                 for df in diff_files {
+                    if matches!(status, ToolCallStatus::Failed | ToolCallStatus::Denied)
+                        || orbit_protocol::looks_like_plan_file_path(&df.path)
+                    {
+                        continue;
+                    }
                     let norm_path = strip_workspace_prefix(&df.path, cwd);
                     let key_path = if norm_path.is_empty() {
                         df.path.clone()
@@ -1979,8 +1984,10 @@ fn finalize_turn(
                         );
                     }
                 }
-                if let ToolCallDetail::FileEdit { path, .. } = detail
+                if !matches!(status, ToolCallStatus::Failed | ToolCallStatus::Denied)
+                    && let ToolCallDetail::FileEdit { path, .. } = detail
                     && !path.is_empty()
+                    && !orbit_protocol::looks_like_plan_file_path(path)
                 {
                     let norm_path = strip_workspace_prefix(path, cwd);
                     let key_path = if norm_path.is_empty() {
@@ -4113,7 +4120,10 @@ pub fn derive_session_insights(
                     }
                     ToolCallDetail::FileEdit { path, .. } => {
                         let raw_path = path.trim();
-                        if !raw_path.is_empty() {
+                        if !matches!(status, ToolCallStatus::Failed | ToolCallStatus::Denied)
+                            && !raw_path.is_empty()
+                            && !orbit_protocol::looks_like_plan_file_path(raw_path)
+                        {
                             let display_path = strip_workspace_prefix(raw_path, cwd);
                             let is_create = is_file_create_detail(summary_title, detail);
                             let add: u32 = diff_files.iter().map(|f| f.additions).sum();

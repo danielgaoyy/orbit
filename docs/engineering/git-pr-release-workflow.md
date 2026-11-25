@@ -48,11 +48,12 @@
 
 ### 阶段 A：通过 PR 完成版本号升级与 Lockfile 刷新
 1. 基于最新 `origin/main` 拉出发布分支 `chore/release-vX.Y.Z`。
-2. **统一同步以下全部 13 个文件**（`versionName`/`MARKETING_VERSION` 升至 `X.Y.Z`，Android/Harmony/iOS 整数版本号 `versionCode`/`CURRENT_PROJECT_VERSION` 按 `MAJOR * 10000 + MINOR * 100 + PATCH` 递增，例如 `0.9.8` -> `9008`）：
+2. **统一同步以下全部 15 个文件**（`versionName`/`MARKETING_VERSION` 升至 `X.Y.Z`，Android/Harmony/iOS 整数版本号 `versionCode`/`CURRENT_PROJECT_VERSION` 按 `MAJOR * 1_000_000 + MINOR * 1000 + PATCH` 递增，例如 `0.9.8` -> `9008`、`0.10.4` -> `10004`、`0.11.0` -> `11000`）：
    - `Cargo.toml`（`[workspace.package].version`）
    - `Cargo.lock`（通过 `cargo check --workspace` 刷新）
    - `apps/desktop/package.json`（`version`）
    - `apps/desktop/package-lock.json`（通过 `cd apps/desktop && npm install --package-lock-only` 刷新）
+   - `apps/docs/package.json` 与 `apps/docs/package-lock.json`（`version`，通过 `cd apps/docs && npm install --package-lock-only` 刷新）
    - `apps/desktop/src-tauri/Cargo.toml`（`[package].version`）
    - `apps/desktop/src-tauri/Cargo.lock`（通过 `cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml` 刷新）
    - `apps/desktop/src-tauri/tauri.conf.json`（`version`）

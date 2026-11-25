@@ -385,10 +385,68 @@ fn build_claude_fast_mode_control_request(request_id: &str, enabled: bool) -> Va
     })
 }
 
+fn build_claude_effort_control_request(request_id: &str, effort: ReasoningEffort) -> Value {
+    let eff_slug = match effort {
+        ReasoningEffort::Off => {
+            return json!({
+                "request_id": request_id,
+                "type": "control_request",
+                "request": {
+                    "subtype": "set_max_thinking_tokens",
+                    "max_thinking_tokens": 0
+                }
+            });
+        }
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Xhigh => "xhigh",
+        ReasoningEffort::Max | ReasoningEffort::Ultra => "max",
+    };
+    json!({
+        "request_id": request_id,
+        "type": "control_request",
+        "request": {
+            "subtype": "apply_flag_settings",
+            "settings": {
+                "effortLevel": eff_slug
+            }
+        }
+    })
+}
+
+fn extract_claude_fast_mode_disabled_notice(
+    cfg: &SessionLaunchConfig,
+    init_val: &Value,
+) -> Option<String> {
+    if !cfg.fast_mode {
+        return None;
+    }
+    let state = init_val
+        .pointer("/response/response/fast_mode_state")
+        .and_then(|v| v.as_str())?;
+    if !state.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    let reason = init_val
+        .pointer("/response/response/fast_mode_disabled_reason")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    Some(match reason {
+        Some(r) => format!(
+            "Fast mode is currently disabled by Claude Code ({r}); running at standard speed."
+        ),
+        None => {
+            "Fast mode is currently disabled by Claude Code; running at standard speed.".to_string()
+        }
+    })
+}
+
 async fn spawn_claude_shim_and_init(
     cfg: &SessionLaunchConfig,
     start_mode: ClaudeSessionStartMode<'_>,
-) -> Result<orbit_shim::ShimClient, String> {
+) -> Result<(orbit_shim::ShimClient, Option<String>), String> {
     let mcp_guard = match cfg.mcp_spec {
         Some(ref mcp) => Some(write_claude_mcp_config_file(
             &cfg.runtime_dir,
@@ -409,16 +467,25 @@ async fn spawn_claude_shim_and_init(
     env.insert("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS".into(), "1".into());
     env.insert("NO_COLOR".into(), "1".into());
     if let Some(eff) = cfg.effort {
-        let eff_str = match eff {
-            ReasoningEffort::Off => None,
-            ReasoningEffort::Low => Some("low"),
-            ReasoningEffort::Medium => Some("medium"),
-            ReasoningEffort::High => Some("high"),
-            ReasoningEffort::Xhigh => Some("xhigh"),
-            ReasoningEffort::Max | ReasoningEffort::Ultra => Some("max"),
-        };
-        if let Some(s) = eff_str {
-            env.insert("CLAUDE_CODE_EFFORT_LEVEL".into(), s.into());
+        match eff {
+            ReasoningEffort::Off => {
+                env.insert("MAX_THINKING_TOKENS".into(), "0".into());
+            }
+            ReasoningEffort::Low => {
+                env.insert("CLAUDE_CODE_EFFORT_LEVEL".into(), "low".into());
+            }
+            ReasoningEffort::Medium => {
+                env.insert("CLAUDE_CODE_EFFORT_LEVEL".into(), "medium".into());
+            }
+            ReasoningEffort::High => {
+                env.insert("CLAUDE_CODE_EFFORT_LEVEL".into(), "high".into());
+            }
+            ReasoningEffort::Xhigh => {
+                env.insert("CLAUDE_CODE_EFFORT_LEVEL".into(), "xhigh".into());
+            }
+            ReasoningEffort::Max | ReasoningEffort::Ultra => {
+                env.insert("CLAUDE_CODE_EFFORT_LEVEL".into(), "max".into());
+            }
         }
     }
     crate::shell_snapshot::merge_cached_shell_env_into_map(&mut env);
@@ -465,11 +532,15 @@ async fn spawn_claude_shim_and_init(
         return Err(format!("failed to write claude initialize: {e}"));
     }
 
-    if let Err(e) = wait_claude_init_response(&mut fresh, &cfg.shim_seq_tracker).await {
-        let _ = fresh.kill().await;
-        return Err(e);
-    }
-    Ok(fresh)
+    let init_val = match wait_claude_init_response(&mut fresh, &cfg.shim_seq_tracker).await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = fresh.kill().await;
+            return Err(e);
+        }
+    };
+    let fast_notice = extract_claude_fast_mode_disabled_notice(cfg, &init_val);
+    Ok((fresh, fast_notice))
 }
 
 pub async fn spawn_claude_session(
@@ -490,19 +561,19 @@ pub async fn spawn_claude_session(
     let mut inject_handoff_on_next_prompt = false;
     let mut fork_fallback_notice: Option<String> = None;
 
-    let (shim, is_reattached) = if let Some(existing) = reattached {
+    let (shim, is_reattached, startup_fast_notice) = if let Some(existing) = reattached {
         if let Some(ack_seq) = existing.attach_ack_seq() {
             cfg.shim_seq_tracker.fetch_max(ack_seq, Ordering::Relaxed);
         }
-        (existing, true)
+        (existing, true, None)
     } else if let Some(ref fork_sid) = cfg.fork_from_session_id {
         match spawn_claude_shim_and_init(&cfg, ClaudeSessionStartMode::ForkFrom(fork_sid)).await {
-            Ok(fresh) => {
+            Ok((fresh, fast_notice)) => {
                 forked_natively = true;
                 // Do not leak a fabricated random session_id before Claude's `system/init`
                 // confirms the newly allocated forked session ID.
                 preassigned_session_id.clear();
-                (fresh, false)
+                (fresh, false, fast_notice)
             }
             Err(first_err) if cfg.native_fork_only => {
                 return Err(format!(
@@ -511,7 +582,7 @@ pub async fn spawn_claude_session(
             }
             Err(first_err) => {
                 let short_sid: String = fork_sid.chars().take(8).collect();
-                let fresh = spawn_claude_shim_and_init(
+                let (fresh, fast_notice) = spawn_claude_shim_and_init(
                     &cfg,
                     ClaudeSessionStartMode::Fresh(&preassigned_session_id),
                 )
@@ -523,16 +594,16 @@ pub async fn spawn_claude_session(
                 fork_fallback_notice = Some(format!(
                     "Native Claude session fork ({short_sid}…) fell back to a fresh session with conversation context restored."
                 ));
-                (fresh, false)
+                (fresh, false, fast_notice)
             }
         }
     } else if let Some(ref resume_id) = cfg.resume_session_id {
         match spawn_claude_shim_and_init(&cfg, ClaudeSessionStartMode::Resume(resume_id)).await {
-            Ok(fresh) => (fresh, false),
+            Ok((fresh, fast_notice)) => (fresh, false, fast_notice),
             Err(first_err) if cfg.fallback_handoff_context.is_some() => {
                 let short_sid: String = resume_id.chars().take(8).collect();
                 let fresh_id = Uuid::new_v4().to_string();
-                let fresh = spawn_claude_shim_and_init(
+                let (fresh, fast_notice) = spawn_claude_shim_and_init(
                     &cfg,
                     ClaudeSessionStartMode::Fresh(&fresh_id),
                 )
@@ -545,12 +616,12 @@ pub async fn spawn_claude_session(
                 fork_fallback_notice = Some(format!(
                     "Previous Claude session ({short_sid}…) could not be resumed; started a fresh session with recent conversation context restored."
                 ));
-                (fresh, false)
+                (fresh, false, fast_notice)
             }
             Err(e) => return Err(e),
         }
     } else {
-        let fresh = spawn_claude_shim_and_init(
+        let (fresh, fast_notice) = spawn_claude_shim_and_init(
             &cfg,
             ClaudeSessionStartMode::Fresh(&preassigned_session_id),
         )
@@ -558,7 +629,7 @@ pub async fn spawn_claude_session(
         if cfg.fallback_handoff_context.is_some() {
             inject_handoff_on_next_prompt = true;
         }
-        (fresh, false)
+        (fresh, false, fast_notice)
     };
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<DriverCommand>(64);
@@ -572,6 +643,7 @@ pub async fn spawn_claude_session(
         forked_natively,
         inject_handoff_on_next_prompt,
         fork_fallback_notice,
+        startup_fast_notice,
         cmd_rx,
         evt_tx,
     ));
@@ -803,10 +875,12 @@ async fn run_claude_actor(
     mut forked_natively: bool,
     mut inject_handoff_on_next_prompt: bool,
     fork_fallback_notice: Option<String>,
+    startup_fast_notice: Option<String>,
     mut cmd_rx: mpsc::Receiver<DriverCommand>,
     evt_tx: mpsc::Sender<DriverEvent>,
 ) {
     let mut emitted_session_init = false;
+    let mut emitted_model_known = cfg.model.as_deref().is_some_and(|s| !s.trim().is_empty());
     if !forked_natively {
         let _ = evt_tx
             .send(DriverEvent::SessionInitialized {
@@ -817,6 +891,14 @@ async fn run_claude_actor(
         emitted_session_init = true;
     }
     if let Some(notice) = fork_fallback_notice {
+        let _ = evt_tx
+            .send(DriverEvent::Notice {
+                level: "info".into(),
+                message: notice,
+            })
+            .await;
+    }
+    if let Some(notice) = startup_fast_notice {
         let _ = evt_tx
             .send(DriverEvent::Notice {
                 level: "info".into(),
@@ -1157,6 +1239,7 @@ async fn run_claude_actor(
                         fast_mode,
                     } => {
                         if let Some(m) = model {
+                            emitted_model_known = true;
                             let rid = format!("ctrl_{ctrl_seq}");
                             ctrl_seq += 1;
                             let req = json!({
@@ -1170,24 +1253,9 @@ async fn run_claude_actor(
                             let _ = shim.write_stdin_line(req.to_string()).await;
                         }
                         if let Some(eff) = effort {
-                            let max_tokens = match eff {
-                                ReasoningEffort::Off => 0,
-                                ReasoningEffort::Low => 4_000,
-                                ReasoningEffort::Medium => 10_000,
-                                ReasoningEffort::High => 16_000,
-                                ReasoningEffort::Xhigh => 24_000,
-                                ReasoningEffort::Max | ReasoningEffort::Ultra => 31_999,
-                            };
                             let rid = format!("ctrl_{ctrl_seq}");
                             ctrl_seq += 1;
-                            let req = json!({
-                                "request_id": rid,
-                                "type": "control_request",
-                                "request": {
-                                    "subtype": "set_max_thinking_tokens",
-                                    "max_thinking_tokens": max_tokens
-                                }
-                            });
+                            let req = build_claude_effort_control_request(&rid, eff);
                             let _ = shim.write_stdin_line(req.to_string()).await;
                         }
                         if let Some(enabled) = fast_mode
@@ -1411,7 +1479,7 @@ async fn run_claude_actor(
                                                 )
                                                 .await
                                                 {
-                                                    Ok(fresh_shim) => {
+                                                    Ok((fresh_shim, fast_notice)) => {
                                                         shim = fresh_shim;
                                                         forked_natively = false;
                                                         session_id = fresh_id;
@@ -1423,6 +1491,14 @@ async fn run_claude_actor(
                                                                 model: cfg.model.clone(),
                                                             })
                                                             .await;
+                                                        if let Some(notice) = fast_notice {
+                                                            let _ = evt_tx
+                                                                .send(DriverEvent::Notice {
+                                                                    level: "info".into(),
+                                                                    message: notice,
+                                                                })
+                                                                .await;
+                                                        }
                                                         let _ = evt_tx
                                                             .send(DriverEvent::Notice {
                                                                 level: "info".into(),
@@ -1494,20 +1570,33 @@ async fn run_claude_actor(
                                                         break;
                                                     }
                                                 }
-                                            } else if !emitted_session_init || sid != session_id {
-                                                session_id = sid.to_string();
-                                                emitted_session_init = true;
-                                                pending_fork_first_prompt = None;
+                                            } else if !emitted_session_init
+                                                || sid != session_id
+                                                || !emitted_model_known
+                                            {
                                                 let model = val
                                                     .get("model")
                                                     .and_then(|v| v.as_str())
+                                                    .map(str::trim)
+                                                    .filter(|s| !s.is_empty())
                                                     .map(ToOwned::to_owned);
-                                                let _ = evt_tx
-                                                    .send(DriverEvent::SessionInitialized {
-                                                        persistence_ref: session_id.clone(),
-                                                        model,
-                                                    })
-                                                    .await;
+                                                if !emitted_session_init
+                                                    || sid != session_id
+                                                    || model.is_some()
+                                                {
+                                                    session_id = sid.to_string();
+                                                    emitted_session_init = true;
+                                                    pending_fork_first_prompt = None;
+                                                    if model.is_some() {
+                                                        emitted_model_known = true;
+                                                    }
+                                                    let _ = evt_tx
+                                                        .send(DriverEvent::SessionInitialized {
+                                                            persistence_ref: session_id.clone(),
+                                                            model,
+                                                        })
+                                                        .await;
+                                                }
                                             }
                                         }
                                     }
@@ -2263,7 +2352,7 @@ fn extract_claude_model_context_window(val: &Value, dominant_model: Option<&str>
 async fn wait_claude_init_response(
     shim: &mut orbit_shim::ShimClient,
     shim_seq_tracker: &std::sync::atomic::AtomicU64,
-) -> Result<(), String> {
+) -> Result<Value, String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -2293,7 +2382,7 @@ async fn wait_claude_init_response(
                                     .unwrap_or("Claude Code initialize rejected");
                                 return Err(err_msg.to_string());
                             }
-                            return Ok(());
+                            return Ok(val);
                         }
                     }
                     ShimFrame::Exited { code } => {
@@ -2825,15 +2914,6 @@ struct ClaudeManifestRow {
     supports_fast_mode: bool,
 }
 
-const EFFORTS_XHIGH_WITH_OFF: &[ReasoningEffort] = &[
-    ReasoningEffort::Off,
-    ReasoningEffort::Low,
-    ReasoningEffort::Medium,
-    ReasoningEffort::High,
-    ReasoningEffort::Xhigh,
-    ReasoningEffort::Max,
-];
-
 const EFFORTS_XHIGH: &[ReasoningEffort] = &[
     ReasoningEffort::Low,
     ReasoningEffort::Medium,
@@ -2842,8 +2922,7 @@ const EFFORTS_XHIGH: &[ReasoningEffort] = &[
     ReasoningEffort::Max,
 ];
 
-const EFFORTS_STANDARD_WITH_OFF: &[ReasoningEffort] = &[
-    ReasoningEffort::Off,
+const EFFORTS_STANDARD: &[ReasoningEffort] = &[
     ReasoningEffort::Low,
     ReasoningEffort::Medium,
     ReasoningEffort::High,
@@ -2888,7 +2967,7 @@ const CLAUDE_MANIFEST: &[ClaudeManifestRow] = &[
         min_version: Some((2, 1, 293)),
         default_priority: 0,
         default_effort: Some(ReasoningEffort::Medium),
-        efforts: EFFORTS_XHIGH_WITH_OFF,
+        efforts: EFFORTS_XHIGH,
         supports_fast_mode: false,
     },
     ClaudeManifestRow {
@@ -2898,7 +2977,7 @@ const CLAUDE_MANIFEST: &[ClaudeManifestRow] = &[
         min_version: Some((2, 1, 219)),
         default_priority: 2,
         default_effort: Some(ReasoningEffort::High),
-        efforts: EFFORTS_XHIGH_WITH_OFF,
+        efforts: EFFORTS_XHIGH,
         supports_fast_mode: true,
     },
     ClaudeManifestRow {
@@ -2918,7 +2997,7 @@ const CLAUDE_MANIFEST: &[ClaudeManifestRow] = &[
         min_version: None,
         default_priority: 0,
         default_effort: Some(ReasoningEffort::High),
-        efforts: EFFORTS_XHIGH_WITH_OFF,
+        efforts: EFFORTS_XHIGH,
         supports_fast_mode: false,
     },
     ClaudeManifestRow {
@@ -2928,7 +3007,7 @@ const CLAUDE_MANIFEST: &[ClaudeManifestRow] = &[
         min_version: None,
         default_priority: 1,
         default_effort: Some(ReasoningEffort::High),
-        efforts: EFFORTS_XHIGH_WITH_OFF,
+        efforts: EFFORTS_XHIGH,
         supports_fast_mode: true,
     },
     ClaudeManifestRow {
@@ -2938,7 +3017,7 @@ const CLAUDE_MANIFEST: &[ClaudeManifestRow] = &[
         min_version: None,
         default_priority: 0,
         default_effort: Some(ReasoningEffort::High),
-        efforts: EFFORTS_STANDARD_WITH_OFF,
+        efforts: EFFORTS_STANDARD,
         supports_fast_mode: true,
     },
     ClaudeManifestRow {
@@ -2948,7 +3027,7 @@ const CLAUDE_MANIFEST: &[ClaudeManifestRow] = &[
         min_version: None,
         default_priority: 0,
         default_effort: Some(ReasoningEffort::High),
-        efforts: EFFORTS_STANDARD_WITH_OFF,
+        efforts: EFFORTS_STANDARD,
         supports_fast_mode: false,
     },
     ClaudeManifestRow {
@@ -3025,6 +3104,279 @@ fn build_claude_catalog_for_version(version: Option<(u32, u32, u32)>) -> Provide
     }
 }
 
+fn format_claude_fallback_label(id: &str) -> String {
+    let trimmed = id.trim();
+    if let Some(row) = CLAUDE_MANIFEST
+        .iter()
+        .find(|r| r.id.eq_ignore_ascii_case(trimmed))
+    {
+        return row.label.to_string();
+    }
+    let without_prefix = trimmed
+        .strip_prefix("claude-")
+        .or_else(|| trimmed.strip_prefix("CLAUDE-"))
+        .unwrap_or(trimmed);
+    without_prefix
+        .split('-')
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) if first.is_ascii_alphabetic() => {
+                    format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
+                }
+                _ => w.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_claude_entry_to_spec(
+    entry: &Value,
+    id: &str,
+    is_default: bool,
+    force_prettify_label: bool,
+) -> ProviderModelSpec {
+    let manifest_row = CLAUDE_MANIFEST
+        .iter()
+        .find(|r| r.id.eq_ignore_ascii_case(id));
+
+    let raw_display = entry
+        .get("displayName")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let label = if force_prettify_label {
+        format_claude_fallback_label(id)
+    } else if let Some(disp) = raw_display {
+        if disp.eq_ignore_ascii_case("default")
+            || disp.to_ascii_lowercase().starts_with("default (")
+        {
+            format_claude_fallback_label(id)
+        } else if !disp.bytes().any(|b| b.is_ascii_digit())
+            && let Some(row) = manifest_row
+        {
+            row.label.to_string()
+        } else {
+            disp.to_string()
+        }
+    } else {
+        format_claude_fallback_label(id)
+    };
+
+    let description = entry
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+
+    let supports_effort = entry
+        .get("supportsEffort")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let mut supported_efforts: Vec<ReasoningEffort> = Vec::new();
+    if supports_effort
+        && let Some(levels) = entry
+            .get("supportedEffortLevels")
+            .and_then(|v| v.as_array())
+    {
+        for lvl in levels {
+            if let Some(slug) = lvl.as_str()
+                && let Some(eff) = ReasoningEffort::from_slug(slug)
+                && eff != ReasoningEffort::Off
+                && !supported_efforts.contains(&eff)
+            {
+                supported_efforts.push(eff);
+            }
+        }
+    }
+
+    let default_effort = if supported_efforts.is_empty() {
+        None
+    } else if let Some(row_def) = manifest_row.and_then(|r| r.default_effort)
+        && supported_efforts.contains(&row_def)
+    {
+        Some(row_def)
+    } else if supported_efforts.contains(&ReasoningEffort::Medium) {
+        Some(ReasoningEffort::Medium)
+    } else if supported_efforts.contains(&ReasoningEffort::High) {
+        Some(ReasoningEffort::High)
+    } else {
+        supported_efforts.first().copied()
+    };
+
+    let thinking_options = supported_efforts
+        .into_iter()
+        .map(|eff| ThinkingOptionSpec {
+            effort: eff,
+            label: eff.display_label().to_string(),
+            description: None,
+            is_default: Some(eff) == default_effort,
+        })
+        .collect();
+
+    let supports_fast_mode = entry
+        .get("supportsFastMode")
+        .or_else(|| entry.get("supports_fast_mode"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    ProviderModelSpec {
+        id: id.to_string(),
+        label,
+        description,
+        is_default,
+        default_effort,
+        thinking_options,
+        supports_fast_mode,
+    }
+}
+
+pub(crate) fn parse_claude_initialize_models(init_val: &Value) -> Option<ProviderModelCatalog> {
+    let entries = init_val
+        .pointer("/response/response/models")
+        .or_else(|| init_val.pointer("/response/models"))
+        .or_else(|| init_val.get("models"))
+        .and_then(|v| v.as_array())?;
+
+    let default_entry = entries.iter().find(|item| {
+        item.get("value")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("default"))
+    });
+    let default_model_id = default_entry
+        .and_then(|item| item.get("resolvedModel").and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+
+    let mut models = Vec::new();
+    let mut seen_ids = HashSet::new();
+
+    for entry in entries {
+        let val_slug = entry
+            .get("value")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if val_slug.eq_ignore_ascii_case("default") {
+            continue;
+        }
+        let Some(id) = entry
+            .get("resolvedModel")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| (!val_slug.is_empty()).then_some(val_slug))
+        else {
+            continue;
+        };
+        let lower_id = id.to_ascii_lowercase();
+        if !seen_ids.insert(lower_id) {
+            continue;
+        }
+        let is_default = default_model_id
+            .as_deref()
+            .is_some_and(|def| def.eq_ignore_ascii_case(id));
+        models.push(parse_claude_entry_to_spec(entry, id, is_default, false));
+    }
+
+    if let Some(def_id) = default_model_id.as_deref()
+        && !seen_ids.contains(&def_id.to_ascii_lowercase())
+        && let Some(def_entry) = default_entry
+    {
+        models.insert(0, parse_claude_entry_to_spec(def_entry, def_id, true, true));
+    }
+
+    if models.is_empty() {
+        return None;
+    }
+
+    if !models.iter().any(|m| m.is_default)
+        && let Some(first) = models.first_mut()
+    {
+        first.is_default = true;
+    }
+
+    let active_default = models
+        .iter()
+        .find(|m| m.is_default)
+        .or_else(|| models.first());
+    let configured_default_model =
+        default_model_id.or_else(|| active_default.map(|m| m.id.clone()));
+    let configured_default_effort = active_default
+        .and_then(|m| m.default_effort)
+        .or(Some(ReasoningEffort::Medium));
+
+    Some(ProviderModelCatalog {
+        provider: ProviderKind::ClaudeCode,
+        models,
+        configured_default_model,
+        configured_default_effort,
+    })
+}
+
+async fn probe_claude_initialize_models(executable: &Path) -> Option<ProviderModelCatalog> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let rpc_res = tokio::time::timeout(Duration::from_secs(4), async {
+        let mut cmd = tokio::process::Command::new(executable);
+        cmd.args([
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--input-format",
+            "stream-json",
+            "--permission-prompt-tool",
+            "stdio",
+            "--no-session-persistence",
+        ])
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+        crate::shell_snapshot::apply_cached_shell_env(&mut cmd);
+        let mut child = cmd.spawn().ok()?;
+
+        let mut stdin = child.stdin.take()?;
+        let stdout = child.stdout.take()?;
+        let mut lines = BufReader::new(stdout).lines();
+
+        let init_req = json!({
+            "request_id": "probe_init",
+            "type": "control_request",
+            "request": { "subtype": "initialize" }
+        });
+        stdin
+            .write_all(format!("{init_req}\n").as_bytes())
+            .await
+            .ok()?;
+        stdin.flush().await.ok()?;
+
+        let mut init_val: Option<Value> = None;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(v) = serde_json::from_str::<Value>(&line)
+                && v.get("type").and_then(|t| t.as_str()) == Some("control_response")
+                && v.pointer("/response/request_id").and_then(|r| r.as_str()) == Some("probe_init")
+            {
+                init_val = Some(v);
+                break;
+            }
+        }
+        let _ = child.kill().await;
+        init_val
+    })
+    .await
+    .ok()
+    .flatten()?;
+
+    parse_claude_initialize_models(&rpc_res)
+}
+
 pub fn fallback_claude_models() -> ProviderModelCatalog {
     build_claude_catalog_for_version(None)
 }
@@ -3033,6 +3385,9 @@ pub async fn probe_claude_models(executable: Option<&Path>) -> ProviderModelCata
     let Some(exe) = executable else {
         return fallback_claude_models();
     };
+    if let Some(live) = probe_claude_initialize_models(exe).await {
+        return live;
+    }
     let ver = tokio::time::timeout(Duration::from_secs(2), async {
         let mut cmd = tokio::process::Command::new(exe);
         cmd.arg("--version")
@@ -3240,6 +3595,7 @@ mod tests {
             false,
             true,
             false,
+            None,
             None,
             cmd_rx,
             evt_tx,
@@ -3474,6 +3830,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             None,
             cmd_rx,
             evt_tx,
@@ -3971,6 +4328,7 @@ mod tests {
             false,
             false,
             None,
+            None,
             cmd_rx,
             evt_tx,
         ));
@@ -4190,6 +4548,7 @@ mod tests {
             false,
             false,
             None,
+            None,
             cmd_rx,
             evt_tx,
         ));
@@ -4386,5 +4745,289 @@ mod tests {
         }
         assert_eq!(classify_claude_background_task_type("local_agent"), None);
         assert_eq!(classify_claude_background_task_type("local_workflow"), None);
+    }
+
+    #[test]
+    fn parse_claude_initialize_models_deduplicates_default_and_maps_efforts_and_fast_mode() {
+        let init_val = json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "probe_init",
+                "response": {
+                    "models": [
+                        {
+                            "value": "default",
+                            "resolvedModel": "claude-opus-5-5",
+                            "displayName": "Default (recommended)",
+                            "description": "Use the default model",
+                            "supportsEffort": true,
+                            "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
+                            "supportsFastMode": true
+                        },
+                        {
+                            "value": "opus",
+                            "resolvedModel": "claude-opus-5-5",
+                            "displayName": "Opus 5.5",
+                            "description": "Custom Opus model (claude-opus-5-5)",
+                            "supportsEffort": true,
+                            "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
+                            "supportsFastMode": true
+                        },
+                        {
+                            "value": "fable",
+                            "resolvedModel": "claude-fable-5-1",
+                            "displayName": "Fable",
+                            "description": "Fable 5.1 · Most capable",
+                            "supportsEffort": true,
+                            "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"]
+                        },
+                        {
+                            "value": "sonnet",
+                            "resolvedModel": "claude-sonnet-4-6",
+                            "displayName": "Sonnet 4.6",
+                            "description": "Custom Sonnet model",
+                            "supportsEffort": true,
+                            "supportedEffortLevels": ["off", "low", "medium", "high", "max"]
+                        },
+                        {
+                            "value": "haiku",
+                            "resolvedModel": "claude-haiku-4-5",
+                            "displayName": "Haiku 4.5",
+                            "description": "Custom Haiku model"
+                        }
+                    ]
+                }
+            }
+        });
+
+        let cat = parse_claude_initialize_models(&init_val).expect("parsed catalog");
+        assert_eq!(cat.provider, ProviderKind::ClaudeCode);
+        assert_eq!(
+            cat.configured_default_model.as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(cat.models.len(), 4);
+        assert!(cat.models[0].is_default);
+        assert_eq!(cat.models[0].id, "claude-opus-5-5");
+        assert!(cat.models[0].supports_fast_mode);
+
+        let fable = cat
+            .models
+            .iter()
+            .find(|m| m.id == "claude-fable-5-1")
+            .expect("fable");
+        assert_eq!(fable.label, "Fable 5.1");
+        assert!(!fable.supports_fast_mode);
+
+        let sonnet = cat
+            .models
+            .iter()
+            .find(|m| m.id == "claude-sonnet-4-6")
+            .expect("sonnet");
+        assert!(
+            !sonnet
+                .thinking_options
+                .iter()
+                .any(|o| o.effort == ReasoningEffort::Off),
+            "unsupported Off effort must be filtered out"
+        );
+
+        let haiku = cat
+            .models
+            .iter()
+            .find(|m| m.id == "claude-haiku-4-5")
+            .expect("haiku");
+        assert!(haiku.thinking_options.is_empty());
+        assert_eq!(haiku.default_effort, None);
+    }
+
+    #[test]
+    fn build_claude_effort_control_request_uses_apply_flag_settings_for_levels_and_zero_tokens_for_off()
+     {
+        let high = build_claude_effort_control_request("ctrl_1", ReasoningEffort::High);
+        assert_eq!(high["request"]["subtype"], json!("apply_flag_settings"));
+        assert_eq!(high["request"]["settings"]["effortLevel"], json!("high"));
+
+        let off = build_claude_effort_control_request("ctrl_2", ReasoningEffort::Off);
+        assert_eq!(off["request"]["subtype"], json!("set_max_thinking_tokens"));
+        assert_eq!(off["request"]["max_thinking_tokens"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn claude_system_init_backfills_default_model_and_live_set_effort_sends_effort_level() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_claude_model_effort_{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
+        let observed_reqs: Arc<tokio::sync::Mutex<Vec<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let observed_bg = Arc::clone(&observed_reqs);
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+
+            let mut ack =
+                serde_json::to_string(&ShimFrame::AttachAck { latest_seq: 0 }).expect("ack");
+            ack.push('\n');
+            let _ = wh.write_all(ack.as_bytes()).await;
+            let _ = wh.flush().await;
+
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw)
+                else {
+                    continue;
+                };
+                let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let typ = req.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if typ == "control_request" {
+                    observed_bg.lock().await.push(req.clone());
+                    let rid = req.get("request_id").and_then(|v| v.as_str()).unwrap_or("");
+                    send_stdout(
+                        &mut wh,
+                        &mut seq,
+                        json!({
+                            "type": "control_response",
+                            "response": { "subtype": "success", "request_id": rid }
+                        }),
+                    )
+                    .await;
+                } else if typ == "user" {
+                    send_stdout(
+                        &mut wh,
+                        &mut seq,
+                        json!({
+                            "type": "system",
+                            "subtype": "init",
+                            "session_id": "sess_claude_default_1",
+                            "model": "claude-opus-5-5"
+                        }),
+                    )
+                    .await;
+                    send_stdout(
+                        &mut wh,
+                        &mut seq,
+                        json!({
+                            "type": "result",
+                            "subtype": "success",
+                            "is_error": false
+                        }),
+                    )
+                    .await;
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect mock");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let mut cfg = sample_cfg(false);
+        cfg.shim_socket = sock_path.clone();
+        cfg.model = None;
+        cfg.effort = None;
+
+        let actor = tokio::spawn(run_claude_actor(
+            cfg,
+            "sess_claude_default_1".into(),
+            shim,
+            false,
+            false,
+            false,
+            None,
+            None,
+            cmd_rx,
+            evt_tx,
+        ));
+
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "turn_cl_1".into(),
+                prompt: "hi".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
+            })
+            .await
+            .expect("send prompt");
+
+        let mut backfilled_model: Option<String> = None;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("turn timeout")
+                .expect("ev");
+            match ev {
+                DriverEvent::SessionInitialized { model, .. } if model.is_some() => {
+                    backfilled_model = model;
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(backfilled_model.as_deref(), Some("claude-opus-5-5"));
+
+        cmd_tx
+            .send(DriverCommand::SetConfig {
+                model: None,
+                effort: Some(ReasoningEffort::High),
+                fast_mode: None,
+            })
+            .await
+            .expect("send SetConfig effort");
+        // Wait briefly for the driver loop to write the control_request
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let reqs = observed_reqs.lock().await;
+        assert!(
+            reqs.iter().any(|r| {
+                r.pointer("/request/subtype").and_then(|v| v.as_str())
+                    == Some("apply_flag_settings")
+                    && r.pointer("/request/settings/effortLevel")
+                        .and_then(|v| v.as_str())
+                        == Some("high")
+            }),
+            "expected apply_flag_settings with effortLevel=high, got: {reqs:?}"
+        );
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = std::fs::remove_file(&sock_path);
     }
 }

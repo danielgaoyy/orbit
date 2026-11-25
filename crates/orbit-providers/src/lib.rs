@@ -23,7 +23,10 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
-use orbit_protocol::{ModelOption, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot};
+use orbit_protocol::{
+    ModelOption, ProviderKind, ProviderModelCatalog, ProviderModelSpec, ProviderQuotaSnapshot,
+    ReasoningEffort,
+};
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 
@@ -753,6 +756,110 @@ pub async fn discover_all_provider_models() -> Vec<ProviderModelCatalog> {
     probe_all_provider_models().await
 }
 
+fn resolve_catalog_model_spec<'a>(
+    catalog: &'a ProviderModelCatalog,
+    provider: ProviderKind,
+    trimmed_model: Option<&str>,
+) -> Option<&'a ProviderModelSpec> {
+    if let Some(m) = trimmed_model {
+        if let Some(found) = catalog.models.iter().find(|s| s.id.eq_ignore_ascii_case(m)) {
+            return Some(found);
+        }
+        // Strip Antigravity wire thinking-effort suffix (e.g. `gemini-4-carbon-high`), except fixed suffixes.
+        if provider == ProviderKind::Antigravity && !m.eq_ignore_ascii_case("gpt-oss-120b-medium") {
+            let lower = m.to_ascii_lowercase();
+            for suffix in [
+                "-off", "-low", "-medium", "-high", "-xhigh", "-max", "-ultra",
+            ] {
+                if let Some(base) = lower.strip_suffix(suffix)
+                    && let Some(found) = catalog
+                        .models
+                        .iter()
+                        .find(|s| s.id.eq_ignore_ascii_case(base))
+                {
+                    return Some(found);
+                }
+            }
+        }
+        // Resolve Claude short family aliases (`opus`, `sonnet`, `haiku`, `fable`) against catalog
+        if provider == ProviderKind::ClaudeCode {
+            let lower = m.to_ascii_lowercase();
+            if matches!(lower.as_str(), "opus" | "sonnet" | "haiku" | "fable") {
+                let needle = format!("-{lower}-");
+                let tail = format!("-{lower}");
+                if let Some(found) = catalog.models.iter().find(|s| {
+                    let sid = s.id.to_ascii_lowercase();
+                    sid.contains(&needle) || sid.ends_with(&tail)
+                }) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    } else {
+        // No explicit model: resolve catalog's configured or marked default
+        if let Some(def_id) = catalog.configured_default_model.as_deref()
+            && let Some(found) = catalog
+                .models
+                .iter()
+                .find(|s| s.id.eq_ignore_ascii_case(def_id))
+        {
+            return Some(found);
+        }
+        catalog
+            .models
+            .iter()
+            .find(|s| s.is_default)
+            .or_else(|| catalog.models.first())
+    }
+}
+
+/// Clamp `current_effort` when `(provider, model)` switches to a model with narrower or empty
+/// `thinking_options`. Returns `None` when the existing effort can be preserved untouched, or
+/// `Some(next_effort)` when SQLite / live driver config should update `effort` (including clearing
+/// to `Some(None)` for effortless models such as `gemini-pro-orchestrator-neon`).
+pub async fn clamp_provider_model_effort(
+    provider: ProviderKind,
+    model: Option<&str>,
+    current_effort: Option<ReasoningEffort>,
+    cached_catalogs: Option<&[ProviderModelCatalog]>,
+) -> Option<Option<ReasoningEffort>> {
+    let cur = current_effort?;
+    let trimmed_model = model.map(str::trim).filter(|s| !s.is_empty());
+
+    let fallback_storage;
+    let catalog = if let Some(found) = cached_catalogs.and_then(|cats| {
+        cats.iter()
+            .find(|c| c.provider == provider && !c.models.is_empty())
+    }) {
+        found
+    } else {
+        fallback_storage = fallback_all_provider_models().await;
+        fallback_storage
+            .iter()
+            .find(|c| c.provider == provider && !c.models.is_empty())?
+    };
+
+    let spec = resolve_catalog_model_spec(catalog, provider, trimmed_model)?;
+    if spec.thinking_options.is_empty() {
+        return Some(None);
+    }
+    if spec.thinking_options.iter().any(|opt| opt.effort == cur) {
+        return None;
+    }
+
+    let next = spec
+        .default_effort
+        .filter(|d| spec.thinking_options.iter().any(|opt| opt.effort == *d))
+        .or_else(|| {
+            catalog
+                .configured_default_effort
+                .filter(|d| spec.thinking_options.iter().any(|opt| opt.effort == *d))
+        })
+        .or_else(|| spec.thinking_options.first().map(|opt| opt.effort));
+    Some(next)
+}
+
 /// Determine whether `(provider, model)` supports Fast output mode, preferring live probed
 /// `ProviderModelCatalog` capabilities when cached and falling back to provider heuristics.
 pub fn provider_model_supports_fast_mode(
@@ -765,60 +872,9 @@ pub fn provider_model_supports_fast_mode(
     if let Some(catalog) = cached_catalogs.and_then(|cats| {
         cats.iter()
             .find(|c| c.provider == provider && !c.models.is_empty())
-    }) {
-        if let Some(m) = trimmed_model {
-            if let Some(found) = catalog.models.iter().find(|s| s.id.eq_ignore_ascii_case(m)) {
-                return found.supports_fast_mode;
-            }
-            // Strip Antigravity wire thinking-effort suffix (e.g. `gemini-4-carbon-high`)
-            if provider == ProviderKind::Antigravity {
-                let lower = m.to_ascii_lowercase();
-                for suffix in [
-                    "-off", "-low", "-medium", "-high", "-xhigh", "-max", "-ultra",
-                ] {
-                    if let Some(base) = lower.strip_suffix(suffix)
-                        && let Some(found) = catalog
-                            .models
-                            .iter()
-                            .find(|s| s.id.eq_ignore_ascii_case(base))
-                    {
-                        return found.supports_fast_mode;
-                    }
-                }
-            }
-            // Resolve Claude short family aliases (`opus`, `sonnet`, `haiku`, `fable`) against catalog
-            if provider == ProviderKind::ClaudeCode {
-                let lower = m.to_ascii_lowercase();
-                if matches!(lower.as_str(), "opus" | "sonnet" | "haiku" | "fable") {
-                    let needle = format!("-{lower}-");
-                    let tail = format!("-{lower}");
-                    if let Some(found) = catalog.models.iter().find(|s| {
-                        let sid = s.id.to_ascii_lowercase();
-                        sid.contains(&needle) || sid.ends_with(&tail)
-                    }) {
-                        return found.supports_fast_mode;
-                    }
-                }
-            }
-        } else {
-            // No explicit model: resolve catalog's configured or marked default
-            if let Some(def_id) = catalog.configured_default_model.as_deref()
-                && let Some(found) = catalog
-                    .models
-                    .iter()
-                    .find(|s| s.id.eq_ignore_ascii_case(def_id))
-            {
-                return found.supports_fast_mode;
-            }
-            if let Some(found) = catalog
-                .models
-                .iter()
-                .find(|s| s.is_default)
-                .or_else(|| catalog.models.first())
-            {
-                return found.supports_fast_mode;
-            }
-        }
+    }) && let Some(found) = resolve_catalog_model_spec(catalog, provider, trimmed_model)
+    {
+        return found.supports_fast_mode;
     }
 
     match provider {

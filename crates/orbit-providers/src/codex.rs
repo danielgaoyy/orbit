@@ -70,6 +70,7 @@ fn build_codex_thread_start_params(
 
 fn build_codex_thread_resume_params(
     tid: &str,
+    model: Option<&str>,
     fast_mode: bool,
     inner_config: &serde_json::Map<String, Value>,
 ) -> Value {
@@ -77,6 +78,9 @@ fn build_codex_thread_resume_params(
         "threadId": tid,
         "excludeTurns": true
     });
+    if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
+        params["model"] = Value::String(m.to_string());
+    }
     if fast_mode {
         params["serviceTier"] = Value::String("fast".to_string());
     }
@@ -333,7 +337,12 @@ async fn run_codex_actor(
                 })
             }
             CodexThreadOpenMode::Resume(tid) => {
-                let params = build_codex_thread_resume_params(tid, cfg.fast_mode, &inner_config);
+                let params = build_codex_thread_resume_params(
+                    tid,
+                    cfg.model.as_deref(),
+                    cfg.fast_mode,
+                    &inner_config,
+                );
                 json!({
                     "id": req_id,
                     "method": "thread/resume",
@@ -496,11 +505,20 @@ async fn run_codex_actor(
             )
             .unwrap_or("unknown")
             .to_string();
-        let model = thread_res
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned)
-            .or_else(|| cfg.model.clone());
+        let requested_model = cfg
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        let model = requested_model.or_else(|| {
+            thread_res
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+        });
         (tid, model)
     };
     let mut current_effort = cfg.effort;
@@ -882,8 +900,14 @@ async fn run_codex_actor(
                         effort,
                         fast_mode,
                     } => {
-                        if model.is_some() {
-                            resolved_model = model;
+                        if let Some(m) = model {
+                            if effort.is_none()
+                                && m.to_ascii_lowercase().contains("luna")
+                                && current_effort == Some(ReasoningEffort::Ultra)
+                            {
+                                current_effort = Some(ReasoningEffort::Max);
+                            }
+                            resolved_model = Some(m);
                         }
                         if effort.is_some() {
                             current_effort = effort;
@@ -2688,6 +2712,21 @@ async fn read_codex_config_toml_defaults() -> (Option<String>, Option<ReasoningE
     (cfg_model, cfg_effort)
 }
 
+fn resolve_codex_model_default_effort(
+    effort_entries: &[(ReasoningEffort, Option<String>)],
+    configured_effort: Option<ReasoningEffort>,
+    model_def_effort: Option<ReasoningEffort>,
+) -> Option<ReasoningEffort> {
+    if effort_entries.is_empty() {
+        return configured_effort.or(model_def_effort);
+    }
+    let supports = |target: ReasoningEffort| effort_entries.iter().any(|(e, _)| *e == target);
+    configured_effort
+        .filter(|e| supports(*e))
+        .or_else(|| model_def_effort.filter(|e| supports(*e)))
+        .or_else(|| effort_entries.first().map(|(e, _)| *e))
+}
+
 fn build_codex_thinking_options(
     entries: &[(ReasoningEffort, Option<String>)],
     resolved_default: Option<ReasoningEffort>,
@@ -2707,8 +2746,8 @@ fn build_codex_thinking_options(
             is_default: Some(*eff) == resolved_default,
         });
     }
-    if let Some(def) = resolved_default
-        && !out.iter().any(|x| x.effort == def)
+    if out.is_empty()
+        && let Some(def) = resolved_default
     {
         out.push(ThinkingOptionSpec {
             effort: def,
@@ -2720,6 +2759,24 @@ fn build_codex_thinking_options(
     out
 }
 
+fn codex_tier_entry_supports_fast(entry: &Value) -> bool {
+    if let Some(s) = entry.as_str() {
+        return s.eq_ignore_ascii_case("fast") || s.eq_ignore_ascii_case("priority");
+    }
+    if let Some(obj) = entry.as_object() {
+        let id_fast = obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("fast") || s.eq_ignore_ascii_case("priority"));
+        let name_fast = obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("fast"));
+        return id_fast || name_fast;
+    }
+    false
+}
+
 pub fn codex_model_supports_fast_mode(model_id: &str, item: Option<&Value>) -> bool {
     if let Some(obj) = item {
         if let Some(explicit) = obj
@@ -2729,16 +2786,35 @@ pub fn codex_model_supports_fast_mode(model_id: &str, item: Option<&Value>) -> b
         {
             return explicit;
         }
+        let mut saw_tier_metadata = false;
+        if let Some(speed_tiers) = obj
+            .get("additionalSpeedTiers")
+            .or_else(|| obj.get("additional_speed_tiers"))
+            .and_then(|v| v.as_array())
+        {
+            saw_tier_metadata = true;
+            if speed_tiers
+                .iter()
+                .filter_map(|v| v.as_str())
+                .any(|t| t.eq_ignore_ascii_case("fast"))
+            {
+                return true;
+            }
+        }
         if let Some(tiers) = obj
             .get("supportedServiceTiers")
             .or_else(|| obj.get("supported_service_tiers"))
+            .or_else(|| obj.get("serviceTiers"))
             .or_else(|| obj.get("service_tiers"))
             .and_then(|v| v.as_array())
         {
-            return tiers
-                .iter()
-                .filter_map(|v| v.as_str())
-                .any(|t| t.eq_ignore_ascii_case("fast"));
+            saw_tier_metadata = true;
+            if tiers.iter().any(codex_tier_entry_supports_fast) {
+                return true;
+            }
+        }
+        if saw_tier_metadata {
+            return false;
         }
     }
     let lower = model_id.trim().to_ascii_lowercase();
@@ -2793,7 +2869,6 @@ pub async fn fallback_codex_models() -> ProviderModelCatalog {
                 .or_else(|| item.get("defaultReasoningEffort"))
                 .and_then(|v| v.as_str())
                 .and_then(ReasoningEffort::from_slug);
-            let resolved_eff = cfg_effort.or(model_default_eff);
 
             let mut effort_entries = Vec::new();
             if let Some(levels) = item
@@ -2816,6 +2891,8 @@ pub async fn fallback_codex_models() -> ProviderModelCatalog {
                     }
                 }
             }
+            let resolved_eff =
+                resolve_codex_model_default_effort(&effort_entries, cfg_effort, model_default_eff);
 
             parsed_models.push(ProviderModelSpec {
                 id: id.to_string(),
@@ -2875,6 +2952,11 @@ pub async fn fallback_codex_models() -> ProviderModelCatalog {
             Some("Maximum reasoning with automatic task delegation".to_string()),
         ),
     ];
+    let luna_efforts: Vec<(ReasoningEffort, Option<String>)> = full_efforts
+        .iter()
+        .filter(|(eff, _)| *eff != ReasoningEffort::Ultra)
+        .cloned()
+        .collect();
     let presets = [
         (
             "gpt-6.2-sol",
@@ -2933,7 +3015,14 @@ pub async fn fallback_codex_models() -> ProviderModelCatalog {
     let models = presets
         .into_iter()
         .map(|(id, label, desc, def_eff, is_def)| {
-            let resolved_eff = cfg_effort.unwrap_or(def_eff);
+            let entries = if id.contains("luna") {
+                &luna_efforts
+            } else {
+                &full_efforts
+            };
+            let resolved_eff =
+                resolve_codex_model_default_effort(entries, cfg_effort, Some(def_eff))
+                    .unwrap_or(def_eff);
             ProviderModelSpec {
                 id: id.to_string(),
                 label: label.to_string(),
@@ -2944,7 +3033,7 @@ pub async fn fallback_codex_models() -> ProviderModelCatalog {
                     is_def
                 },
                 default_effort: Some(resolved_eff),
-                thinking_options: build_codex_thinking_options(&full_efforts, Some(resolved_eff)),
+                thinking_options: build_codex_thinking_options(entries, Some(resolved_eff)),
                 supports_fast_mode: codex_model_supports_fast_mode(id, None),
             }
         })
@@ -3109,7 +3198,6 @@ pub async fn probe_codex_models(executable: Option<&Path>) -> ProviderModelCatal
             .get("defaultReasoningEffort")
             .and_then(|v| v.as_str())
             .and_then(ReasoningEffort::from_slug);
-        let resolved_default_effort = configured_effort.or(model_def_effort);
 
         let mut effort_entries = Vec::new();
         if let Some(arr) = item
@@ -3128,6 +3216,11 @@ pub async fn probe_codex_models(executable: Option<&Path>) -> ProviderModelCatal
                 }
             }
         }
+        let resolved_default_effort = resolve_codex_model_default_effort(
+            &effort_entries,
+            configured_effort,
+            model_def_effort,
+        );
 
         models.push(ProviderModelSpec {
             id: id.to_string(),
@@ -3235,9 +3328,12 @@ mod tests {
         assert_eq!(on_thread["serviceTier"], json!("fast"));
         assert!(on_thread.get("service_tier").is_none());
 
-        let resume_off = build_codex_thread_resume_params("thr_old", false, &empty_cfg);
+        let resume_off = build_codex_thread_resume_params("thr_old", None, false, &empty_cfg);
+        assert!(resume_off.get("model").is_none());
         assert!(resume_off.get("serviceTier").is_none());
-        let resume_on = build_codex_thread_resume_params("thr_old", true, &empty_cfg);
+        let resume_on =
+            build_codex_thread_resume_params("thr_old", Some("gpt-6.1-terra"), true, &empty_cfg);
+        assert_eq!(resume_on["model"], json!("gpt-6.1-terra"));
         assert_eq!(resume_on["serviceTier"], json!("fast"));
 
         let cfg = sample_cfg(false);
@@ -3297,6 +3393,18 @@ mod tests {
         assert!(codex_model_supports_fast_mode(
             "custom-model",
             Some(&json!({ "supportedServiceTiers": ["standard", "fast"] }))
+        ));
+        assert!(codex_model_supports_fast_mode(
+            "custom-model",
+            Some(&json!({ "additionalSpeedTiers": ["fast"] }))
+        ));
+        assert!(codex_model_supports_fast_mode(
+            "custom-model",
+            Some(&json!({ "serviceTiers": [{ "id": "priority", "name": "Fast" }] }))
+        ));
+        assert!(!codex_model_supports_fast_mode(
+            "gpt-6.1-terra",
+            Some(&json!({ "additionalSpeedTiers": [], "serviceTiers": [] }))
         ));
         assert!(!codex_model_supports_fast_mode(
             "gpt-5.4",
@@ -4506,5 +4614,199 @@ mod tests {
         assert!(!codex_file_change_single_concrete_path(&placeholder));
         let empty = build_codex_file_change_detail(&[]);
         assert!(!codex_file_change_single_concrete_path(&empty));
+    }
+
+    #[test]
+    fn codex_default_effort_clamps_configured_ultra_on_luna_without_fabricating_option() {
+        let luna_entries = vec![
+            (ReasoningEffort::Low, None),
+            (ReasoningEffort::Medium, None),
+            (ReasoningEffort::High, None),
+            (ReasoningEffort::Xhigh, None),
+            (ReasoningEffort::Max, None),
+        ];
+        let resolved = resolve_codex_model_default_effort(
+            &luna_entries,
+            Some(ReasoningEffort::Ultra),
+            Some(ReasoningEffort::Medium),
+        );
+        assert_eq!(resolved, Some(ReasoningEffort::Medium));
+        let opts = build_codex_thinking_options(&luna_entries, resolved);
+        assert!(
+            !opts.iter().any(|o| o.effort == ReasoningEffort::Ultra),
+            "unsupported Ultra must NOT be fabricated onto luna thinking_options"
+        );
+        assert!(
+            opts.iter()
+                .any(|o| o.effort == ReasoningEffort::Medium && o.is_default)
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_resume_preserves_requested_model_over_stale_thread_model() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_codex_resume_model_{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
+        let observed_resume_params: Arc<tokio::sync::Mutex<Option<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let observed_turn_model: Arc<tokio::sync::Mutex<Option<String>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let resume_bg = Arc::clone(&observed_resume_params);
+        let turn_bg = Arc::clone(&observed_turn_model);
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+
+            let mut ack =
+                serde_json::to_string(&ShimFrame::AttachAck { latest_seq: 0 }).expect("ack");
+            ack.push('\n');
+            let _ = wh.write_all(ack.as_bytes()).await;
+            let _ = wh.flush().await;
+
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw)
+                else {
+                    continue;
+                };
+                let Ok(rpc) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = rpc.get("id").cloned().unwrap_or(Value::Null);
+                let method = rpc.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                match method {
+                    "initialize" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"id": id, "result": {"userAgent": "codex/test"}}),
+                        )
+                        .await;
+                    }
+                    "thread/resume" => {
+                        *resume_bg.lock().await = rpc.get("params").cloned();
+                        // Stale thread returns old model `gpt-6.1-sol` even when `gpt-6.1-terra` was requested.
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "id": id,
+                                "result": {
+                                    "thread": { "id": "thr_stale_1" },
+                                    "model": "gpt-6.1-sol"
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "turn/start" => {
+                        let m = rpc
+                            .pointer("/params/model")
+                            .and_then(|v| v.as_str())
+                            .map(ToOwned::to_owned);
+                        *turn_bg.lock().await = m;
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"id": id, "result": {"turn": {"id": "t_res_1"}}}),
+                        )
+                        .await;
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "method": "turn/completed",
+                                "params": { "turn": { "id": "t_res_1", "status": "completed" } }
+                            }),
+                        )
+                        .await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect mock");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let mut cfg = sample_cfg(false);
+        cfg.shim_socket = sock_path.clone();
+        cfg.resume_session_id = Some("thr_stale_1".into());
+        cfg.model = Some("gpt-6.1-terra".into());
+
+        let actor = tokio::spawn(run_codex_actor(cfg, shim, false, cmd_rx, evt_tx));
+        let mut init_model: Option<String> = None;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot timeout")
+                .expect("ev");
+            match ev {
+                DriverEvent::SessionInitialized { model, .. } => init_model = model,
+                DriverEvent::StatusChanged(AgentStatus::Idle) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(init_model.as_deref(), Some("gpt-6.1-terra"));
+
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "turn_res_1".into(),
+                prompt: "hello".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
+            })
+            .await
+            .expect("send prompt");
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("turn timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        let resume_p = observed_resume_params
+            .lock()
+            .await
+            .clone()
+            .expect("thread/resume params");
+        assert_eq!(resume_p["model"], json!("gpt-6.1-terra"));
+        assert_eq!(
+            observed_turn_model.lock().await.as_deref(),
+            Some("gpt-6.1-terra")
+        );
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = std::fs::remove_file(&sock_path);
     }
 }

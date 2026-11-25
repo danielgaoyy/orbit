@@ -239,6 +239,7 @@ struct OpenedAgySession {
     available_model_ids: HashSet<String>,
     canonical_base_ids: HashSet<String>,
     current_base_model: Option<String>,
+    effective_effort: Option<ReasoningEffort>,
 }
 
 fn is_agy_missing_trajectory_error(msg: &str) -> bool {
@@ -483,7 +484,7 @@ async fn open_agy_session(
         })
         .unwrap_or_default();
 
-    let canonical_base_ids: HashSet<String> = sess_val
+    let mut canonical_base_ids: HashSet<String> = sess_val
         .get("configOptions")
         .and_then(|v| v.as_array())
         .and_then(|arr| {
@@ -506,20 +507,59 @@ async fn open_agy_session(
         .map(ToOwned::to_owned)
         .or_else(|| requested_model.map(ToOwned::to_owned));
 
+    let initial_server_base = sess_val
+        .pointer("/models/currentModelId")
+        .and_then(|v| v.as_str())
+        .map(|m| normalize_agy_base_model_id(m, &canonical_base_ids))
+        .or_else(|| parse_agy_config_option_value(&sess_val, "model"));
+
+    let session_default_effort = parse_agy_config_option_value(&sess_val, "thought_level")
+        .and_then(|s| ReasoningEffort::from_slug(&s))
+        .or_else(|| {
+            raw_initial_model
+                .as_deref()
+                .and_then(|m| strip_trailing_effort_suffix(m).1)
+        });
+
     let mut current_base_model = raw_initial_model
         .as_deref()
         .map(|m| normalize_agy_base_model_id(m, &canonical_base_ids))
+        .or_else(|| parse_agy_config_option_value(&sess_val, "model"))
         .or_else(|| requested_model.map(ToOwned::to_owned));
 
+    let requested_suffix_effort = requested_model
+        .filter(|m| !canonical_base_ids.contains(*m))
+        .and_then(|m| strip_trailing_effort_suffix(m).1);
+    let effective_requested_effort = requested_effort.or(requested_suffix_effort);
+    let requested_base =
+        requested_model.map(|m| normalize_agy_base_model_id(m, &canonical_base_ids));
+
+    let mut effective_effort = if current_base_model
+        .as_deref()
+        .is_some_and(is_agy_effortless_model_id)
+    {
+        None
+    } else {
+        effective_requested_effort.or(session_default_effort)
+    };
+
+    // Only skip `session/set_model` when no explicit effort was requested and the server
+    // already initialized on the exact requested base model (preserving its default effort, e.g. High).
+    let skip_set_model = effective_requested_effort.is_none()
+        && requested_base.is_some()
+        && initial_server_base.as_deref() == requested_base.as_deref();
+
     // Optional `session/set_model` when explicit model or effort was requested
-    if (requested_model.is_some() || requested_effort.is_some())
+    if !skip_set_model
+        && (requested_model.is_some() || effective_requested_effort.is_some())
         && let Some(base_m) = requested_model
             .map(ToOwned::to_owned)
             .or_else(|| current_base_model.clone())
     {
-        let wire_model_id = resolve_agy_wire_model_id(
+        let wire_model_id = resolve_agy_wire_model_id_with_default(
             &base_m,
-            requested_effort,
+            effective_requested_effort,
+            session_default_effort,
             &available_model_ids,
             &canonical_base_ids,
         );
@@ -535,9 +575,53 @@ async fn open_agy_session(
         )
         .await
             && let Ok(v) = wait_rpc_during_boot(shim, pending_rpcs, rx, &cfg.shim_seq_tracker).await
-            && let Some(m) = v.pointer("/models/currentModelId").and_then(|x| x.as_str())
         {
-            current_base_model = Some(normalize_agy_base_model_id(m, &canonical_base_ids));
+            if let Some(m) = v
+                .pointer("/models/currentModelId")
+                .or_else(|| v.get("modelId"))
+                .and_then(|x| x.as_str())
+            {
+                let norm = normalize_agy_base_model_id(m, &canonical_base_ids);
+                let inferred_eff = if !canonical_base_ids.contains(m) {
+                    strip_trailing_effort_suffix(m).1
+                } else {
+                    None
+                };
+                effective_effort = if is_agy_effortless_model_id(&norm)
+                    || (!available_model_ids.is_empty()
+                        && !agy_model_has_effort_variants(&norm, &available_model_ids))
+                {
+                    None
+                } else {
+                    inferred_eff.or(effective_requested_effort)
+                };
+                current_base_model = Some(norm);
+            } else if let Some(opts) = v.get("configOptions").and_then(|x| x.as_array()) {
+                sync_agy_config_options(
+                    opts,
+                    &mut canonical_base_ids,
+                    &mut current_base_model,
+                    &mut effective_effort,
+                );
+            } else {
+                // Standard ACP `session/set_model` returns `{}` on success while streaming
+                // `config_option_update` asynchronously; retain the requested wire model.
+                let norm = normalize_agy_base_model_id(&wire_model_id, &canonical_base_ids);
+                let inferred_eff = if !canonical_base_ids.contains(&wire_model_id) {
+                    strip_trailing_effort_suffix(&wire_model_id).1
+                } else {
+                    None
+                };
+                effective_effort = if is_agy_effortless_model_id(&norm)
+                    || (!available_model_ids.is_empty()
+                        && !agy_model_has_effort_variants(&norm, &available_model_ids))
+                {
+                    None
+                } else {
+                    inferred_eff.or(effective_requested_effort)
+                };
+                current_base_model = Some(norm);
+            }
         }
     }
 
@@ -582,6 +666,7 @@ async fn open_agy_session(
         available_model_ids,
         canonical_base_ids,
         current_base_model,
+        effective_effort,
     })
 }
 
@@ -845,7 +930,7 @@ async fn run_agy_actor(
             opened.session_id,
             opened.available_model_ids,
             opened.canonical_base_ids,
-            cfg.effort,
+            opened.effective_effort.or(cfg.effort),
             opened.current_base_model,
         )
     };
@@ -1570,8 +1655,26 @@ async fn run_agy_actor(
                     } => {
                         let model_or_effort_changed = model.is_some() || effort.is_some();
                         if let Some(m) = model {
-                            current_base_model =
-                                Some(normalize_agy_base_model_id(&m, &canonical_base_ids));
+                            let inferred = if effort.is_none() && !canonical_base_ids.contains(&m) {
+                                strip_trailing_effort_suffix(&m).1
+                            } else {
+                                None
+                            };
+                            if let Some(inf) = inferred {
+                                active_effort = Some(inf);
+                            }
+                            let norm = normalize_agy_base_model_id(&m, &canonical_base_ids);
+                            if effort.is_none()
+                                && (is_agy_effortless_model_id(&norm)
+                                    || (!available_model_ids.is_empty()
+                                        && !agy_model_has_effort_variants(
+                                            &norm,
+                                            &available_model_ids,
+                                        )))
+                            {
+                                active_effort = None;
+                            }
+                            current_base_model = Some(norm);
                         }
                         if effort.is_some() {
                             active_effort = effort;
@@ -1579,26 +1682,17 @@ async fn run_agy_actor(
                         if model_or_effort_changed
                             && let Some(ref base_m) = current_base_model
                         {
-                            let wire_model_id = resolve_agy_wire_model_id(
+                            for (id, payload) in build_agy_model_config_requests(
+                                &session_id,
                                 base_m,
                                 active_effort,
                                 &available_model_ids,
                                 &canonical_base_ids,
-                            );
-                            let id = next_rpc_id;
-                            next_rpc_id += 1;
-                            post_reattach_non_prompt_rpcs.insert(RpcId::Num(id).as_key());
-                            let req = json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "method": "session/set_model",
-                                "params": {
-                                    "sessionId": session_id,
-                                    "modelId": wire_model_id
-                                }
-                            })
-                            .to_string();
-                            let _ = shim.write_stdin_line(req).await;
+                                &mut next_rpc_id,
+                            ) {
+                                post_reattach_non_prompt_rpcs.insert(RpcId::Num(id).as_key());
+                                let _ = shim.write_stdin_line(payload.to_string()).await;
+                            }
                         }
                         if let Some(enabled) = fast_mode
                             && enabled != cfg.fast_mode
@@ -1893,6 +1987,16 @@ async fn run_agy_actor(
                                     continue;
                                 }
                                 if post_reattach_non_prompt_rpcs.remove(&key) {
+                                    if let Some(opts) =
+                                        val.pointer("/result/configOptions").and_then(|v| v.as_array())
+                                    {
+                                        sync_agy_config_options(
+                                            opts,
+                                            &mut canonical_base_ids,
+                                            &mut current_base_model,
+                                            &mut active_effort,
+                                        );
+                                    }
                                     continue;
                                 }
                                 let is_reattached_completion = reattached_turn_in_flight
@@ -1968,6 +2072,7 @@ async fn run_agy_actor(
                                                     available_model_ids = fresh.available_model_ids;
                                                     canonical_base_ids = fresh.canonical_base_ids;
                                                     current_base_model = fresh.current_base_model;
+                                                    active_effort = fresh.effective_effort;
                                                     transcript_monitor =
                                                         AgyTranscriptMonitor::new(&session_id);
                                                     transcript_monitor.sync_silent();
@@ -2252,6 +2357,17 @@ async fn run_agy_actor(
                                     .get("sessionUpdate")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("");
+                                if update_kind == "config_option_update"
+                                    && let Some(opts) =
+                                        update.get("configOptions").and_then(|v| v.as_array())
+                                {
+                                    sync_agy_config_options(
+                                        opts,
+                                        &mut canonical_base_ids,
+                                        &mut current_base_model,
+                                        &mut active_effort,
+                                    );
+                                }
                                 // During transcript-driven post-turn wakeup, still process tool_call /
                                 // tool_call_update so ACP native IDs unify with `wake_tool_*` and
                                 // background-task signal cancellations are detected immediately.
@@ -8425,7 +8541,94 @@ fn truncate_preview(s: &str, max_chars: usize) -> String {
 
 // --- Antigravity ACP Model & Thinking Catalog Probing (`agy acp --stdio` `session/new`) ---
 
+fn parse_agy_config_option_value(val: &Value, config_id: &str) -> Option<String> {
+    val.get("configOptions")
+        .and_then(|v| v.as_array())?
+        .iter()
+        .find(|opt| opt.get("id").and_then(|x| x.as_str()) == Some(config_id))
+        .and_then(|opt| opt.get("currentValue").or_else(|| opt.get("value")))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn is_agy_effortless_model_id(model_id: &str) -> bool {
+    let lower = model_id.trim().to_ascii_lowercase();
+    lower.contains("orchestrator") || lower == "gpt-oss-120b-medium"
+}
+
+fn agy_model_has_effort_variants(base_id: &str, available_ids: &HashSet<String>) -> bool {
+    ["low", "medium", "high", "xhigh", "max"]
+        .iter()
+        .any(|suf| available_ids.contains(&format!("{base_id}-{suf}")))
+}
+
+fn agy_effort_slug(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::Off | ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Xhigh => "xhigh",
+        ReasoningEffort::Max | ReasoningEffort::Ultra => "max",
+    }
+}
+
+fn sync_agy_config_options(
+    config_options: &[Value],
+    canonical_base_ids: &mut HashSet<String>,
+    current_base_model: &mut Option<String>,
+    active_effort: &mut Option<ReasoningEffort>,
+) {
+    let model_opt = config_options
+        .iter()
+        .find(|opt| opt.get("id").and_then(|x| x.as_str()) == Some("model"));
+    if let Some(opts) = model_opt
+        .and_then(|opt| opt.get("options"))
+        .and_then(|v| v.as_array())
+    {
+        let parsed: HashSet<String> = opts
+            .iter()
+            .filter_map(|item| item.get("value").and_then(|s| s.as_str()))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        if !parsed.is_empty() {
+            *canonical_base_ids = parsed;
+        }
+    }
+    if let Some(val) = model_opt
+        .and_then(|opt| opt.get("currentValue").or_else(|| opt.get("value")))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        *current_base_model = Some(val.to_string());
+    }
+
+    let thought_opt = config_options
+        .iter()
+        .find(|opt| opt.get("id").and_then(|x| x.as_str()) == Some("thought_level"));
+    if let Some(thought) = thought_opt {
+        if let Some(eff) = thought
+            .get("currentValue")
+            .or_else(|| thought.get("value"))
+            .and_then(|v| v.as_str())
+            .and_then(ReasoningEffort::from_slug)
+        {
+            *active_effort = Some(eff);
+        }
+    } else if model_opt.is_some() {
+        // When switching to Orchestrator models, `agy acp` omits `thought_level` completely.
+        *active_effort = None;
+    }
+}
+
 fn strip_trailing_effort_suffix(model_id: &str) -> (&str, Option<ReasoningEffort>) {
+    if model_id.trim().eq_ignore_ascii_case("gpt-oss-120b-medium") {
+        return (model_id, None);
+    }
     for (suffix, eff) in [
         ("-xhigh", ReasoningEffort::Xhigh),
         ("-ultra", ReasoningEffort::Ultra),
@@ -8452,9 +8655,10 @@ fn normalize_agy_base_model_id(raw_id: &str, canonical_bases: &HashSet<String>) 
     raw_id.to_string()
 }
 
-fn resolve_agy_wire_model_id(
+fn resolve_agy_wire_model_id_with_default(
     wanted_model: &str,
     effort: Option<ReasoningEffort>,
+    session_default_effort: Option<ReasoningEffort>,
     available_ids: &HashSet<String>,
     canonical_bases: &HashSet<String>,
 ) -> String {
@@ -8481,6 +8685,12 @@ fn resolve_agy_wire_model_id(
     if available_ids.contains(wanted_model) {
         return wanted_model.to_string();
     }
+    if let Some(def_eff) = session_default_effort {
+        let candidate = format!("{base}-{}", agy_effort_slug(def_eff));
+        if available_ids.contains(&candidate) {
+            return candidate;
+        }
+    }
     for fallback_suf in ["medium", "high", "low"] {
         let candidate = format!("{base}-{fallback_suf}");
         if available_ids.contains(&candidate) {
@@ -8488,6 +8698,90 @@ fn resolve_agy_wire_model_id(
         }
     }
     wanted_model.to_string()
+}
+
+fn resolve_agy_wire_model_id(
+    wanted_model: &str,
+    effort: Option<ReasoningEffort>,
+    available_ids: &HashSet<String>,
+    canonical_bases: &HashSet<String>,
+) -> String {
+    resolve_agy_wire_model_id_with_default(
+        wanted_model,
+        effort,
+        None,
+        available_ids,
+        canonical_bases,
+    )
+}
+
+fn build_agy_model_config_requests(
+    session_id: &str,
+    base_m: &str,
+    active_effort: Option<ReasoningEffort>,
+    available_model_ids: &HashSet<String>,
+    canonical_base_ids: &HashSet<String>,
+    next_rpc_id: &mut i64,
+) -> Vec<(i64, Value)> {
+    if !available_model_ids.is_empty() {
+        let wire_model_id = resolve_agy_wire_model_id(
+            base_m,
+            active_effort,
+            available_model_ids,
+            canonical_base_ids,
+        );
+        let id = *next_rpc_id;
+        *next_rpc_id += 1;
+        return vec![(
+            id,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "session/set_model",
+                "params": {
+                    "sessionId": session_id,
+                    "modelId": wire_model_id
+                }
+            }),
+        )];
+    }
+
+    let mut reqs = Vec::with_capacity(2);
+    let model_id_rpc = *next_rpc_id;
+    *next_rpc_id += 1;
+    reqs.push((
+        model_id_rpc,
+        json!({
+            "jsonrpc": "2.0",
+            "id": model_id_rpc,
+            "method": "session/set_config_option",
+            "params": {
+                "sessionId": session_id,
+                "configId": "model",
+                "value": base_m
+            }
+        }),
+    ));
+    if let Some(eff) = active_effort
+        && !is_agy_effortless_model_id(base_m)
+    {
+        let eff_id_rpc = *next_rpc_id;
+        *next_rpc_id += 1;
+        reqs.push((
+            eff_id_rpc,
+            json!({
+                "jsonrpc": "2.0",
+                "id": eff_id_rpc,
+                "method": "session/set_config_option",
+                "params": {
+                    "sessionId": session_id,
+                    "configId": "thought_level",
+                    "value": agy_effort_slug(eff)
+                }
+            }),
+        ));
+    }
+    reqs
 }
 
 struct AgyFallbackRow<'a> {
@@ -8539,10 +8833,18 @@ pub fn fallback_antigravity_models() -> ProviderModelCatalog {
 
     let rows = [
         AgyFallbackRow {
+            id: "gemini-4-neon",
+            label: "Gemini 4 Neon",
+            desc: "Latest flagship reasoning & multi-file software engineering",
+            is_default: true,
+            default_effort: Some(ReasoningEffort::High),
+            efforts: &xhigh_efforts,
+        },
+        AgyFallbackRow {
             id: "gemini-4-carbon",
             label: "Gemini 4 Carbon",
             desc: "Flagship reasoning & multi-file software engineering",
-            is_default: true,
+            is_default: false,
             default_effort: Some(ReasoningEffort::Medium),
             efforts: &std_efforts,
         },
@@ -8561,6 +8863,14 @@ pub fn fallback_antigravity_models() -> ProviderModelCatalog {
             is_default: false,
             default_effort: Some(ReasoningEffort::High),
             efforts: &xhigh_efforts,
+        },
+        AgyFallbackRow {
+            id: "gemini-pro-orchestrator-neon",
+            label: "Orchestrator (Neon)",
+            desc: "Multi-agent coordinator powered by Neon",
+            is_default: false,
+            default_effort: None,
+            efforts: &[],
         },
         AgyFallbackRow {
             id: "gemini-pro-orchestrator",
@@ -8602,6 +8912,14 @@ pub fn fallback_antigravity_models() -> ProviderModelCatalog {
             default_effort: Some(ReasoningEffort::Medium),
             efforts: &std_efforts,
         },
+        AgyFallbackRow {
+            id: "gpt-oss-120b-medium",
+            label: "GPT-OSS 120B (Medium)",
+            desc: "Open-weight reasoning model on Antigravity",
+            is_default: false,
+            default_effort: None,
+            efforts: &[],
+        },
     ];
 
     let models = rows
@@ -8629,8 +8947,8 @@ pub fn fallback_antigravity_models() -> ProviderModelCatalog {
     ProviderModelCatalog {
         provider: ProviderKind::Antigravity,
         models,
-        configured_default_model: Some("gemini-4-carbon".to_string()),
-        configured_default_effort: Some(ReasoningEffort::Medium),
+        configured_default_model: Some("gemini-4-neon".to_string()),
+        configured_default_effort: Some(ReasoningEffort::High),
     }
 }
 
@@ -15935,5 +16253,610 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         assert!(!tools.has_open_non_bg_tools(&active_bg_calls));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_agy_config_options_updates_model_and_clears_effort_on_orchestrator() {
+        let mut canonical = HashSet::new();
+        let mut base_model = Some("gemini-4-neon".to_string());
+        let mut effort = Some(ReasoningEffort::High);
+
+        let carbon_opts = vec![
+            json!({
+                "id": "model",
+                "currentValue": "gemini-4-carbon",
+                "options": [
+                    { "value": "gemini-4-neon" },
+                    { "value": "gemini-4-carbon" },
+                    { "value": "gemini-pro-orchestrator-neon" }
+                ]
+            }),
+            json!({
+                "id": "thought_level",
+                "currentValue": "medium"
+            }),
+        ];
+        sync_agy_config_options(&carbon_opts, &mut canonical, &mut base_model, &mut effort);
+        assert_eq!(base_model.as_deref(), Some("gemini-4-carbon"));
+        assert_eq!(effort, Some(ReasoningEffort::Medium));
+        assert!(canonical.contains("gemini-pro-orchestrator-neon"));
+
+        let orch_opts = vec![json!({
+            "id": "model",
+            "currentValue": "gemini-pro-orchestrator-neon",
+            "options": [
+                { "value": "gemini-4-neon" },
+                { "value": "gemini-pro-orchestrator-neon" }
+            ]
+        })];
+        sync_agy_config_options(&orch_opts, &mut canonical, &mut base_model, &mut effort);
+        assert_eq!(base_model.as_deref(), Some("gemini-pro-orchestrator-neon"));
+        assert_eq!(effort, None);
+    }
+
+    #[tokio::test]
+    async fn agy_session_set_model_empty_response_preserves_orchestrator_model() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_agy_orch_empty_{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
+        let observed_set_models: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let observed_bg = Arc::clone(&observed_set_models);
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+
+            let mut ack =
+                serde_json::to_string(&ShimFrame::AttachAck { latest_seq: 0 }).expect("ack");
+            ack.push('\n');
+            let _ = wh.write_all(ack.as_bytes()).await;
+            let _ = wh.flush().await;
+
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw)
+                else {
+                    continue;
+                };
+                let Ok(rpc) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = rpc.get("id").cloned().unwrap_or(Value::Null);
+                let method = rpc.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                match method {
+                    "initialize" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1}}),
+                        )
+                        .await;
+                    }
+                    "session/new" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "jsonrpc":"2.0",
+                                "id":id,
+                                "result":{
+                                    "sessionId":"sess_orch_1",
+                                    "models":{
+                                        "currentModelId":"gemini-4-neon-high",
+                                        "availableModels":[
+                                            {"modelId":"gemini-4-neon-high"},
+                                            {"modelId":"gemini-4-neon-medium"},
+                                            {"modelId":"gemini-pro-orchestrator-neon"}
+                                        ]
+                                    },
+                                    "configOptions":[
+                                        {
+                                            "id":"model",
+                                            "currentValue":"gemini-4-neon",
+                                            "options":[
+                                                {"value":"gemini-4-neon"},
+                                                {"value":"gemini-pro-orchestrator-neon"}
+                                            ]
+                                        },
+                                        {
+                                            "id":"thought_level",
+                                            "currentValue":"high"
+                                        }
+                                    ]
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "session/set_model" => {
+                        let mid = rpc
+                            .pointer("/params/modelId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        observed_bg.lock().await.push(mid);
+                        // Real `agy acp` returns `{}` and emits config_option_update asynchronously.
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                        )
+                        .await;
+                    }
+                    _ => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect mock");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
+            agent_id: "ag_orch_empty".into(),
+            provider: ProviderKind::Antigravity,
+            executable: PathBuf::from("/bin/true"),
+            orbit_exe: PathBuf::from("/bin/true"),
+            shim_socket: sock_path.clone(),
+            runtime_dir: std::env::temp_dir(),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: Some("gemini-pro-orchestrator-neon".into()),
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::FullAccess,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
+        };
+
+        let actor = tokio::spawn(run_agy_actor(cfg, shim, false, cmd_rx, evt_tx));
+        let mut init_model: Option<String> = None;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot timeout")
+                .expect("ev");
+            match ev {
+                DriverEvent::SessionInitialized { model, .. } => init_model = model,
+                DriverEvent::StatusChanged(AgentStatus::Idle) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            init_model.as_deref(),
+            Some("gemini-pro-orchestrator-neon"),
+            "empty session/set_model result must NOT revert Orchestrator (Neon) to default gemini-4-neon"
+        );
+        assert_eq!(
+            *observed_set_models.lock().await,
+            vec!["gemini-pro-orchestrator-neon".to_string()]
+        );
+
+        let _ = cmd_tx.send(DriverCommand::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[tokio::test]
+    async fn agy_effort_none_does_not_downgrade_default_high_to_medium() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_agy_no_downgrade_{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
+        let observed_set_models: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let observed_bg = Arc::clone(&observed_set_models);
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+
+            let mut ack =
+                serde_json::to_string(&ShimFrame::AttachAck { latest_seq: 0 }).expect("ack");
+            ack.push('\n');
+            let _ = wh.write_all(ack.as_bytes()).await;
+            let _ = wh.flush().await;
+
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw)
+                else {
+                    continue;
+                };
+                let Ok(rpc) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = rpc.get("id").cloned().unwrap_or(Value::Null);
+                let method = rpc.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                match method {
+                    "initialize" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1}}),
+                        )
+                        .await;
+                    }
+                    "session/new" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "jsonrpc":"2.0",
+                                "id":id,
+                                "result":{
+                                    "sessionId":"sess_high_1",
+                                    "models":{
+                                        "currentModelId":"gemini-4-neon-high",
+                                        "availableModels":[
+                                            {"modelId":"gemini-4-neon-high"},
+                                            {"modelId":"gemini-4-neon-medium"}
+                                        ]
+                                    },
+                                    "configOptions":[
+                                        {
+                                            "id":"model",
+                                            "currentValue":"gemini-4-neon",
+                                            "options":[{"value":"gemini-4-neon"}]
+                                        },
+                                        {"id":"thought_level","currentValue":"high"}
+                                    ]
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "session/set_model" => {
+                        let mid = rpc
+                            .pointer("/params/modelId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        observed_bg.lock().await.push(mid);
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                        )
+                        .await;
+                    }
+                    _ => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect mock");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
+            agent_id: "ag_no_downgrade".into(),
+            provider: ProviderKind::Antigravity,
+            executable: PathBuf::from("/bin/true"),
+            orbit_exe: PathBuf::from("/bin/true"),
+            shim_socket: sock_path.clone(),
+            runtime_dir: std::env::temp_dir(),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: Some("gemini-4-neon".into()),
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::FullAccess,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
+        };
+
+        let actor = tokio::spawn(run_agy_actor(cfg, shim, false, cmd_rx, evt_tx));
+        let mut init_model: Option<String> = None;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot timeout")
+                .expect("ev");
+            match ev {
+                DriverEvent::SessionInitialized { model, .. } => init_model = model,
+                DriverEvent::StatusChanged(AgentStatus::Idle) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(init_model.as_deref(), Some("gemini-4-neon"));
+        assert!(
+            observed_set_models.lock().await.is_empty(),
+            "matching base model with effort=None must NOT downgrade default High to Medium: {:?}",
+            *observed_set_models.lock().await
+        );
+
+        let _ = cmd_tx.send(DriverCommand::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[tokio::test]
+    async fn agy_reattached_set_config_uses_set_config_option_for_model_and_effort() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_agy_reattach_cfg_{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
+        let observed_rpcs: Arc<tokio::sync::Mutex<Vec<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let observed_bg = Arc::clone(&observed_rpcs);
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+
+            let mut ack =
+                serde_json::to_string(&ShimFrame::AttachAck { latest_seq: 0 }).expect("ack");
+            ack.push('\n');
+            let _ = wh.write_all(ack.as_bytes()).await;
+            let _ = wh.flush().await;
+
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw)
+                else {
+                    continue;
+                };
+                let Ok(rpc) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                observed_bg.lock().await.push(rpc.clone());
+                let id = rpc.get("id").cloned().unwrap_or(Value::Null);
+                let method = rpc.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                if method == "session/prompt" {
+                    send_stdout(
+                        &mut wh,
+                        &mut seq,
+                        json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}}),
+                    )
+                    .await;
+                } else {
+                    send_stdout(
+                        &mut wh,
+                        &mut seq,
+                        json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                    )
+                    .await;
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect mock");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let cfg = SessionLaunchConfig {
+            sandbox: None,
+            egress_proxy_url: None,
+            agent_id: "ag_reattach_cfg".into(),
+            provider: ProviderKind::Antigravity,
+            executable: PathBuf::from("/bin/true"),
+            orbit_exe: PathBuf::from("/bin/true"),
+            shim_socket: sock_path.clone(),
+            runtime_dir: std::env::temp_dir(),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: Some("gemini-4-neon".into()),
+            effort: Some(ReasoningEffort::Medium),
+            fast_mode: false,
+            mode: SessionMode::FullAccess,
+            resume_session_id: Some("sess_reattached_1".into()),
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: true,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
+        };
+
+        let actor = tokio::spawn(run_agy_actor(cfg, shim, true, cmd_rx, evt_tx));
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("init timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::SessionInitialized { .. }) {
+                break;
+            }
+        }
+
+        cmd_tx
+            .send(DriverCommand::SetConfig {
+                model: Some("gemini-4-carbon".into()),
+                effort: Some(ReasoningEffort::High),
+                fast_mode: None,
+            })
+            .await
+            .expect("send SetConfig carbon+high");
+        cmd_tx
+            .send(DriverCommand::SetConfig {
+                model: Some("gemini-pro-orchestrator-neon".into()),
+                effort: None,
+                fast_mode: None,
+            })
+            .await
+            .expect("send SetConfig orchestrator");
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "turn_reattach_cfg".into(),
+                prompt: "ping".into(),
+                behavior: ActiveTurnBehavior::Steer,
+                origin: PromptOrigin::Human,
+                message_ids: Vec::new(),
+            })
+            .await
+            .expect("send prompt");
+
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("turn timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        let rpcs = observed_rpcs.lock().await;
+        let cfg_calls: Vec<(&str, &str)> = rpcs
+            .iter()
+            .filter(|r| {
+                r.get("method").and_then(|v| v.as_str()) == Some("session/set_config_option")
+            })
+            .map(|r| {
+                (
+                    r.pointer("/params/configId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    r.pointer("/params/value")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(
+            cfg_calls,
+            vec![
+                ("model", "gemini-4-carbon"),
+                ("thought_level", "high"),
+                ("model", "gemini-pro-orchestrator-neon"),
+            ]
+        );
+
+        let _ = cmd_tx.send(DriverCommand::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = std::fs::remove_file(&sock_path);
     }
 }

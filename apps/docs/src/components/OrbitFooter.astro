@@ -1,0 +1,64 @@
+---
+import { getLandingCopy, type LandingLang } from "../data/landing-copy";
+
+interface Props {
+  lang: LandingLang;
+}
+
+const { lang } = Astro.props;
+const isZh = lang === "zh-CN";
+const base = import.meta.env.BASE_URL.replace(/\/+$/, "");
+const prefix = isZh ? `${base}/zh-cn` : base;
+const copy = getLandingCopy(lang, base, prefix);
+---
+
+<footer class="orbit-footer">
+  <div class="orbit-wrap">
+    <div class="orbit-footer-grid">
+      <div class="orbit-footer-brand">
+        <a class="orbit-brand" href={`${prefix}/`}>
+          <svg class="orbit-brand-mark" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+            <circle cx="14" cy="14" r="10.5" stroke="currentColor" stroke-width="1.5" stroke-opacity="0.35" />
+            <ellipse
+              cx="14"
+              cy="14"
+              rx="11.5"
+              ry="4.8"
+              transform="rotate(-24 14 14)"
+              stroke="currentColor"
+              stroke-width="1.6"
+            />
+            <circle cx="14" cy="14" r="3.2" fill="currentColor" />
+            <circle cx="23.2" cy="9.8" r="2.1" fill="var(--orbit-accent-cyan)" />
+          </svg>
+          <span>Orbit</span>
+        </a>
+        <p>{copy.footer.blurb}</p>
+      </div>
+
+      {copy.footer.cols.map((col) => (
+        <div class="orbit-footer-col">
+          <h4>{col.title}</h4>
+          <ul>
+            {col.links.map((lnk) => (
+              <li>
+                <a
+                  href={lnk.href}
+                  target={lnk.external ? "_blank" : undefined}
+                  rel={lnk.external ? "noopener noreferrer" : undefined}
+                >
+                  {lnk.label}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </div>
+
+    <div class="orbit-footer-bottom">
+      <span>{copy.footer.copyright}</span>
+      <span>{copy.footer.rightNote}</span>
+    </div>
+  </div>
+</footer>

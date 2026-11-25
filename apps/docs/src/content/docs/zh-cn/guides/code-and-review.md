@@ -3,15 +3,15 @@ title: 代码编辑、时间回溯与 Orbit Patrol
 description: 使用 CodeMirror 6 + LSP + FIM 幽灵补全直接编辑远端文件，一键回溯会话与文件状态，可视化解决三方 Git 冲突，并运行两阶段 Orbit Patrol PR 审阅。
 ---
 
-把任务交给 AI 代理只是研发闭环的前半程，**高效验证、微调、回溯并安全合入代码**才是决定工程质量的关键。Orbit 将完整的代码编辑与 Git 审阅闭环直接融入对话舞台旁。
+把任务交给 AI 代理只是研发闭环的前半程，**高效验证、微调、回溯并安全合入代码**才是决定工程质量的关键。Orbit 将完整的代码编辑与 Git 审阅闭环直接集成在对话工作区旁。
 
 ## CodeMirror 6 + LSP + FIM 幽灵补全
 
 按下 `⌘P`（`Ctrl+P`）快速打开或点击时间线中任意文件路径，即可在右侧面板浏览与编辑本地或远端工作区代码：
 
-- **零卡顿远端打开体验**：结合 Rust 250 行前缀语法高亮、悬停/按下意图预取（Promise 去重）与 stale-while-revalidate 缓存，翻阅远端代码如本地般丝滑。
+- **零卡顿远端打开体验**：结合 Rust 250 行前缀语法高亮、悬停/点击预取（请求自动去重）与 Stale-While-Revalidate 缓存，翻阅远端代码如本地般流畅。
 - **完整 Language Server Protocol（LSP）支持**：直接连接远端主机的语言服务器，提供工作区符号搜索、类型悬停、跳转定义、引用查找、内联诊断、Code Action 与跨文件安全重命名（`lsp_hover`、`lsp_goto_definition`、`lsp_references`、`lsp_rename`、`lsp_apply_workspace_edit`）。
-- **FIM（Fill-in-the-Middle）幽灵文本预测**：低延迟行内编辑预测以克制的半透明幽灵文本直接呈现在 CodeMirror 6 中——按 `Tab` 接受、`Esc` 忽略，绝不弹出遮挡视线的浮窗。
+- **FIM（Fill-in-the-Middle）行内幽灵补全**：低延迟行内编辑预测以低干扰半透明 Ghost Text 直接呈现在 CodeMirror 6 中——按 `Tab` 接受、`Esc` 忽略，绝不弹出遮挡视线的浮窗。
 
 ## 交互式会话与文件回溯（Rewind）
 
@@ -19,7 +19,7 @@ description: 使用 CodeMirror 6 + LSP + FIM 幽灵补全直接编辑远端文�
 
 - 在时间线任意历史轮次触发 **回溯（`rewind_agent`）**。
 - Orbit 同步将**对话时间线**与**该轮次之后发生变更的工作区文件**一并恢复至检查点（返回 `restored_files` 数量与恢复的提示词草稿），助你迅速换一条更优路径继续推进。
-- 若希望保留当前尝试并同时验证另一套方案，可使用 **分叉至 Worktree（`orbit fork --worktree`）**，在任意 `seq` 节点把对话与代码同步克隆到独立 Git Worktree。
+- 若希望保留当前尝试并同时验证另一套方案，可使用 **派生独立 Worktree（`orbit fork --worktree`）**，在任意 `seq` 节点把对话与代码同步克隆到独立 Git Worktree。
 
 ## 完整 Git 写入闭环与 Worktree 移交
 

@@ -10,7 +10,7 @@ Orbit 在开发者的真实工作站与服务器上编排编码代理、Shell �
 - **全仓强制 `unsafe_code = "deny"`**：Rust Workspace 全局禁用 `unsafe` 代码，生产路径显式传递错误。
 - **默认回环监听 + 反 CSWSH**：`orbit daemon` 默认绑定 `127.0.0.1:6868`，强制校验持久化 `pairing_secret` 与严格 `Origin` 头，阻断本地浏览器跨站 WebSocket 劫持。
 - **零 `argv` 凭据泄露**：配对密钥、MCP Token 与 `fleet_token` 严禁通过进程命令行参数传递，统一经 stdin 管道或 `0600` 权限文件注入。
-- **密钥轮换主动断连**：执行 `orbit pair --rotate-secret` 会立即轮换 `pairing_secret` 并主动踢掉既有 E2EE 会话。
+- **密钥轮换主动断连**：执行 `orbit pair --rotate-secret` 会立即轮换 `pairing_secret` 并主动断开所有既有 E2EE 会话。
 - **供应链与环境变量防护**：`deploy/install.sh`、`orbit upgrade` 与桌面更新强制 HTTPS、GitHub 域名白名单、防降级与 `SHA256SUMS.txt` 校验；自定义 ACP 环境变量自动拦截 `LD_PRELOAD`、`DYLD_*`、`NODE_OPTIONS`、`ORBIT_*` 等注入变量。
 
 ## OS 内核级工具沙箱（`sandbox_policy`）
@@ -35,7 +35,7 @@ Orbit 在开发者的真实工作站与服务器上编排编码代理、Shell �
 - **平台实现**：
   - **macOS**：原生 Seatbelt（`sandbox-exec`）内核策略。
   - **Linux**：基于 `bubblewrap`（`bwrap`）的 User Namespace 与 Network Namespace 隔离。
-  - **Windows**：剥离凭据环境变量并绑定工作区私有临时目录（协作式文件系统与网络约束）。
+  - **Windows**：剥离凭据环境变量并绑定工作区私有临时目录（应用层文件系统与网络约束）。
 - 在任意主机上运行 `orbit doctor` 即可查看当前生效的沙箱后端与内核强制状态。
 
 ## 防 SSRF 会话级出站代理（Egress Proxy）
@@ -44,7 +44,7 @@ Orbit 在开发者的真实工作站与服务器上编排编码代理、Shell �
 
 - 所有出站 HTTP 与 `CONNECT` 请求必须认证至由对应 `orbit shim` 托管的**会话私有代理**（随子进程同生共死）。
 - **`denied_domains` 永远优先于 `allowed_domains`**（支持精确域名与 `*.example.com` 通配符）。
-- **DNS 解析结果钉选防 SSRF**：代理由自身解析 DNS，拦截所有私网、回环、链路本地及非公网 IP，并直接拨号通过校验的目标 IP，彻底根除 DNS Rebinding 攻击。
+- **DNS 解析固定（DNS Pinning）防 SSRF**：代理自行解析 DNS，拦截所有私网、回环、链路本地及非公网 IP，并直接向已校验目标 IP 发起连接，彻底消除 DNS Rebinding 攻击。
 - 在 Linux 隔离网络命名空间内，回环代理监听经私有 Unix Domain Socket 转发。
 
 ## 细粒度权限规则、Guardian 与生命周期钩子
@@ -58,7 +58,7 @@ Orbit 在开发者的真实工作站与服务器上编排编码代理、Shell �
 宿主的所有安全事件（策略变更、沙箱拦截、权限审批、E2EE 密钥轮换）均写入 SQLite 的 `security_audit_chain` 表：
 
 - 每条记录通过 **SHA-256 哈希链**串联前一条摘要，并使用宿主身份派生的域隔离密钥进行 **Ed25519 签名**。
-- 随时校验序列连续性、载荷完整性、签名与高水位标记，或导出留存：
+- 随时校验序列连续性、载荷完整性、签名与序列高水位（high-water mark），或导出留存：
 
 ```bash
 # 校验本机安全审计链与 Ed25519 签名完整性

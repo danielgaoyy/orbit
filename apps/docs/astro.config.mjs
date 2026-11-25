@@ -15,6 +15,10 @@ const basePrefix = docsBase === "/" ? "" : docsBase;
 export default defineConfig({
   site: docsSite,
   base: docsBase,
+  trailingSlash: "always",
+  devToolbar: {
+    enabled: false,
+  },
   integrations: [
     starlight({
       title: {
@@ -22,11 +26,50 @@ export default defineConfig({
         "zh-CN": "Orbit",
       },
       description:
-        "One Personal Agent. Every Machine. Zero-Knowledge Multi-Host Orchestration for AI Coding Agents.",
+        "Pure-Rust multi-host control plane for Claude Code, Codex, and 34+ coding agents with a persistent Personal Agent and zero-knowledge Noise E2EE.",
       logo: {
-        light: "./src/assets/orbit-logo-light.svg",
-        dark: "./src/assets/orbit-logo-dark.svg",
+        src: "./src/assets/orbit-logo-dark.svg",
         replacesTitle: false,
+      },
+      components: {
+        Head: "./src/components/OrbitSeoHead.astro",
+        ThemeProvider: "./src/components/DarkThemeProvider.astro",
+        ThemeSelect: "./src/components/EmptyThemeSelect.astro",
+        Header: "./src/components/OrbitDocsHeader.astro",
+        PageTitle: "./src/components/OrbitDocsTitle.astro",
+      },
+      expressiveCode: {
+        themes: ["github-dark-default"],
+        styleOverrides: {
+          borderRadius: "10px",
+          borderWidth: "1px",
+          borderColor: "rgba(255, 255, 255, 0.1)",
+          codeBackground: "#0d0e12",
+          codeFontFamily:
+            '"JetBrains Mono", "SF Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+          codeFontSize: "14px",
+          codeLineHeight: "1.62",
+          codePaddingBlock: "0.95rem",
+          codePaddingInline: "1.15rem",
+          uiFontSize: "14px",
+          frames: {
+            frameBoxShadowCssValue: "none",
+            editorBackground: "#0d0e12",
+            editorTabBarBackground: "#13141a",
+            editorTabBarBorderBottomColor: "rgba(255, 255, 255, 0.072)",
+            terminalBackground: "#0d0e12",
+            terminalTitlebarBackground: "#13141a",
+            terminalTitlebarBorderBottomColor: "rgba(255, 255, 255, 0.072)",
+            terminalTitlebarDotsForeground: "transparent",
+            terminalTitlebarDotsOpacity: "0",
+            inlineButtonBackground: "#16171c",
+            inlineButtonBorder: "rgba(255, 255, 255, 0.11)",
+            inlineButtonForeground: "#9a9da8",
+            inlineButtonBackgroundHoverOrFocusOpacity: "1",
+            tooltipSuccessBackground: "#162b24",
+            tooltipSuccessForeground: "#34d399",
+          },
+        },
       },
       favicon: "/favicon.svg",
       defaultLocale: "root",
@@ -60,16 +103,7 @@ export default defineConfig({
           tag: "meta",
           attrs: {
             name: "theme-color",
-            content: "#17181E",
-            media: "(prefers-color-scheme: dark)",
-          },
-        },
-        {
-          tag: "meta",
-          attrs: {
-            name: "theme-color",
-            content: "#FCFCFE",
-            media: "(prefers-color-scheme: light)",
+            content: "#09090b",
           },
         },
       ],

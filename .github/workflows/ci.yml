@@ -160,6 +160,7 @@ jobs:
           node --experimental-strip-types --test "src/**/*.test.ts"
           npm run build
           npm run test:smoke
+          node scripts/build-docs-demo.mjs
       - name: Build Bilingual Showcase & Docs Site (Astro Starlight)
         working-directory: apps/docs
         run: |

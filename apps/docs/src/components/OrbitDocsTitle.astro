@@ -1,0 +1,24 @@
+---
+const route = Astro.locals.starlightRoute;
+const entry = route.entry;
+const isZh = route.locale === "zh-cn" || route.lang === "zh-CN";
+const id = route.id || "";
+
+let sectionLabel = "";
+if (id.includes("getting-started/")) {
+  sectionLabel = isZh ? "快速开始" : "Getting Started";
+} else if (id.includes("guides/")) {
+  sectionLabel = isZh ? "核心能力指南" : "Core Capabilities";
+} else if (id.includes("reference/")) {
+  sectionLabel = isZh ? "架构与参考" : "Reference";
+}
+
+const title = entry.data.title;
+const description = entry.data.description;
+---
+
+<div class="orbit-docs-title-block">
+  {sectionLabel && <span class="orbit-docs-eyebrow">{sectionLabel}</span>}
+  <h1 id="_top" class="orbit-docs-h1">{title}</h1>
+  {description && <p class="orbit-docs-lead">{description}</p>}
+</div>

@@ -1,6 +1,6 @@
 ---
 title: Five Native Clients & Offline Voice
-description: One pure-Rust orbit-client-core ViewModel powering Desktop, Web WASM PWA, iOS (+ Live Activity), Android, and HarmonyOS 7+, plus detached raw PTYs and Codex-style offline voice input.
+description: One pure-Rust orbit-client-core ViewModel powering Desktop, Web WASM PWA, iOS (+ Live Activity), Android, and HarmonyOS 7+, plus detached raw PTYs and local offline voice input.
 ---
 
 Orbit refuses to duplicate state machines, protocol parsers, or diff engines across client codebases. **All domain logic lives once in pure Rust (`crates/orbit-client-core` + `crates/orbit-store`)**, while five thin native interfaces focus strictly on platform ergonomics and 120 Hz rendering.
@@ -28,9 +28,9 @@ Orbit treats remote shell access as a first-class sibling to AI agents:
 
 - Managed by `orbit shim` via `portable-pty` and modeled in `orbit-client-core` with a `vt100` screen grid (`terminal_screen_slot`).
 - Desktop streams raw binary frames directly into `@xterm/xterm` WebGL with OSC 133 command markers, search, and floating detached terminal windows.
-- Mobile clients render crisp synchronized terminal buffers and quick-key bars—and because every PTY lives inside a detached `orbit shim`, restarting `orbit daemon` or switching Wi-Fi to 5G never kills your running builds or `tmux` sessions.
+- Mobile clients render crisp synchronized terminal buffers and quick-key bars. Because every PTY runs inside a detached `orbit shim`, restarting `orbit daemon` or switching from Wi-Fi to 5G never interrupts running builds or `tmux` sessions.
 
-## Codex-style Offline Voice input
+## Local Offline Voice Input
 
 Speak naturally to your coding agents or Personal Agent from Desktop or mobile **without streaming microphone audio to a third-party speech cloud**:
 

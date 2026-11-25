@@ -3,7 +3,7 @@ title: Security, Sandbox & Audit Chain
 description: Defense-in-depth engineering security across Noise_NKpsk0 E2EE, macOS Seatbelt and Linux bubblewrap kernel sandboxes, SSRF-pinned egress proxy, permission rules, and Ed25519 signed audit chains.
 ---
 
-Orbit executes AI coding agents, shell PTYs, and Git mutations across developer machines. Security boundaries are enforced as **compile-time and protocol-level invariants**—not optional afterthoughts.
+Orbit executes AI coding agents, shell PTYs, and Git mutations across developer machines. Security boundaries are enforced as **compile-time and protocol-level invariants**, not optional afterthoughts.
 
 ## Cryptographic & process invariants
 
@@ -45,7 +45,7 @@ When sandboxed network access is disabled (the default), agents cannot dial outb
 
 - All outbound HTTP and `CONNECT` traffic authenticates to a **session-local egress proxy** owned by the detached `orbit shim` for the child process lifetime.
 - **Deny rules always take precedence** over `allowed_domains` (supporting exact hosts and `*.example.com` wildcards).
-- **DNS answer pinning against SSRF**: The proxy resolves DNS itself, rejects any private, loopback, link-local, or non-public IP address, and dials the validated IP directly—eliminating DNS rebinding attacks.
+- **DNS answer pinning against SSRF**: The proxy resolves DNS itself, rejects any private, loopback, link-local, or non-public IP address, and connects directly to the validated IP — eliminating DNS rebinding attacks.
 - On Linux inside isolated network namespaces, the loopback listener is bridged strictly through a private Unix domain socket.
 
 ## Permission Rules, Guardian & Lifecycle Hooks

@@ -1,0 +1,44 @@
+# Orbit — Multi-Host AI Coding Agent Control Plane
+
+> Open-source, pure-Rust multi-host control plane for Claude Code, Codex, Antigravity, Gemini CLI, and 34+ ACP coding agents. One persistent Personal Agent orchestrates your Mac, Linux build servers, and cloud GPUs with detached hot-upgrade shims, kernel sandboxes, and zero-knowledge Noise_NKpsk0 end-to-end encryption. Dual-licensed under MIT / Apache-2.0.
+
+## Key Capabilities
+
+- **Single Static Rust Binary (`orbit`)**: Bundles `daemon`, `shim`, `relay`, `pair`, `doctor`, and full orchestration CLI with zero Node.js or Python runtime dependencies.
+- **Persistent Personal Agent**: One global coordinator across all online machines that decomposes tasks, chains specialist agents across isolated Git worktrees, and escalates only irreversible high-risk actions (Tier-3) to Desktop, Mobile, Slack Socket Mode, Discord Gateway, or Feishu/Lark.
+- **Hot-Upgrade Detached Shims (`orbit shim`)**: Stateful AI agents and interactive PTYs run inside `setsid` detached processes over Unix sockets so upgrading or restarting `orbit daemon` never kills live sessions.
+- **Zero-Knowledge Multi-Host Mesh**: Happy-Eyeballs routing across direct LAN, Tailscale/SSH, and a self-hosted `< 6 MB` blind relay using `Noise_NKpsk0_25519_ChaChaPoly_SHA256` (`orbit-relay-e2ee/2`).
+- **Kernel Security & Audit Trail**: macOS Seatbelt and Linux bubblewrap tool sandboxes, DNS-pinned SSRF-safe egress proxy, and SHA-256 + Ed25519 tamper-evident audit chain (`orbit audit verify`).
+- **Five Native Clients + Offline Voice**: Shared pure-Rust `orbit-client-core` ViewModel powering Desktop (macOS/Windows/Linux Tauri v2), iOS (SwiftUI + Dynamic Island Live Activity), Android (Jetpack Compose), HarmonyOS NEXT (ArkTS V2), and Web WASM PWA, plus local Whisper offline voice input.
+
+## Documentation (English)
+
+- [Homepage](https://danielgaoyy.github.io/orbit/): Product overview, interactive desktop preview, architecture comparison, and FAQ.
+- [Download Orbit](https://danielgaoyy.github.io/orbit/download/): Native installers for macOS, Windows, Linux, iOS, Android, HarmonyOS NEXT, Web WASM PWA, and host CLI static binaries.
+- [Quickstart](https://danielgaoyy.github.io/orbit/getting-started/quickstart/): Install the static binary, start the loopback daemon, pair devices, and activate your Personal Agent in 5 minutes.
+- [Personal Agent & IM Dispatch](https://danielgaoyy.github.io/orbit/guides/personal-agent/): Multi-host orchestration, isolated Git worktrees, 3-Tier Guardian approvals, and zero-webhook Slack, Discord, and Feishu/Lark connections.
+- [Multi-Host Fleet & E2EE Relay](https://danielgaoyy.github.io/orbit/guides/multi-host-fleet/): Happy-Eyeballs transport racing, self-hosted `< 6 MB` blind relay, Peer-Bridge multi-hop tunnels, and encrypted GitHub Secret Gist sync.
+- [Security, Sandbox & Audit Chain](https://danielgaoyy.github.io/orbit/guides/security-sandbox/): Workspace `unsafe_code = "deny"`, macOS Seatbelt / Linux bubblewrap isolation, DNS-pinned egress proxy, and Ed25519 audit chain verification.
+- [Cross-Provider Memory & WASM Plugins](https://danielgaoyy.github.io/orbit/guides/memory-and-plugins/): Markdown-first `.orbit/memory/` with SQLite FTS5 + RRF retrieval and capability-scoped `wasmi` WebAssembly plugins.
+- [Five Native Clients & Offline Voice](https://danielgaoyy.github.io/orbit/guides/clients-and-voice/): Pure-Rust `orbit-client-core`, tail-first timeline pagination, detached raw PTY terminals, and local offline Whisper voice input.
+- [Code, Git Rewind & Orbit Patrol](https://danielgaoyy.github.io/orbit/guides/code-and-review/): CodeMirror 6 with remote LSP and FIM ghost text, interactive conversation & file rewind, 3-way conflict resolution, and Two-Stage Orbit Patrol PR reviews.
+- [CLI, Architecture & Telemetry](https://danielgaoyy.github.io/orbit/reference/cli-and-architecture/): Complete `orbit` CLI reference, 13-crate Rust workspace topology, shim isolation invariants, budgets, OpenMetrics, and OTLP logging.
+
+## 文档中心（简体中文）
+
+- [中文首页](https://danielgaoyy.github.io/orbit/zh-cn/)
+- [下载安装](https://danielgaoyy.github.io/orbit/zh-cn/download/)
+- [五分钟上手](https://danielgaoyy.github.io/orbit/zh-cn/getting-started/quickstart/)
+- [Personal Agent 与全局调度](https://danielgaoyy.github.io/orbit/zh-cn/guides/personal-agent/)
+- [多主机舰队与零知识中继](https://danielgaoyy.github.io/orbit/zh-cn/guides/multi-host-fleet/)
+- [安全边界、内核沙箱与审计链](https://danielgaoyy.github.io/orbit/zh-cn/guides/security-sandbox/)
+- [跨引擎记忆与 WASM 插件](https://danielgaoyy.github.io/orbit/zh-cn/guides/memory-and-plugins/)
+- [五端原生客户端与离线语音](https://danielgaoyy.github.io/orbit/zh-cn/guides/clients-and-voice/)
+- [代码编辑、时间回溯与 Orbit Patrol](https://danielgaoyy.github.io/orbit/zh-cn/guides/code-and-review/)
+- [CLI 命令、五端架构与可观测性](https://danielgaoyy.github.io/orbit/zh-cn/reference/cli-and-architecture/)
+
+## Source & Releases
+
+- Repository: https://github.com/danielgaoyy/orbit
+- Releases & SHA256SUMS: https://github.com/danielgaoyy/orbit/releases
+- Security Policy: https://github.com/danielgaoyy/orbit/blob/main/SECURITY.md

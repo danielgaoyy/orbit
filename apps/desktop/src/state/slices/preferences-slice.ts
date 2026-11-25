@@ -25,6 +25,7 @@ import {
 } from "../store-helpers";
 import type { OrbitStoreContext } from "../store-runtime";
 import type {
+  ActiveTurnSendBehavior,
   InstructionsTarget,
   SettingsSection,
   SettingsSectionTarget,
@@ -201,6 +202,13 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
     },
 
 
+    setActiveTurnSendBehavior(behavior: ActiveTurnSendBehavior): void {
+      const normalized: ActiveTurnSendBehavior = behavior === "steer" ? "steer" : "queue";
+      setState((s) => ({ ...s, activeTurnSendBehavior: normalized }), true);
+      void pushCloudPrefPatch({ activeTurnSendBehavior: normalized });
+    },
+
+
     setCustomKeybinding(actionId: ShortcutActionId, chord: string | null): void {
       const def = SHORTCUT_ACTION_MAP[actionId];
       if (!def) return;
@@ -371,6 +379,10 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
             theme: nextTheme ?? s.theme,
             resolvedTheme: nextTheme ? resolveTheme(nextTheme) : s.resolvedTheme,
             enterToSend: typeof prefs.enterToSend === "boolean" ? prefs.enterToSend : s.enterToSend,
+            activeTurnSendBehavior:
+              prefs.activeTurnSendBehavior === "steer" || prefs.activeTurnSendBehavior === "queue"
+                ? prefs.activeTurnSendBehavior
+                : s.activeTurnSendBehavior,
             notifyOnApproval:
               typeof prefs.notifyOnApproval === "boolean"
                 ? prefs.notifyOnApproval
@@ -629,6 +641,7 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
           locale: getState().locale,
           theme: getState().theme,
           enterToSend: getState().enterToSend,
+          activeTurnSendBehavior: getState().activeTurnSendBehavior,
           notifyOnApproval: getState().notifyOnApproval,
           notifyOnTurnComplete: getState().notifyOnTurnComplete,
           notifyOnAgentError: getState().notifyOnAgentError,

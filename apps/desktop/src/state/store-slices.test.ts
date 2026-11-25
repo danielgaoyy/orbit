@@ -47,6 +47,7 @@ function createMinimalTestState(): OrbitUiState {
     resolvedTheme: "light",
     locale: "en",
     enterToSend: true,
+    activeTurnSendBehavior: "queue",
     terminalFontSize: 13,
     activeView: "workspace",
     workspacePanel: "conversation",

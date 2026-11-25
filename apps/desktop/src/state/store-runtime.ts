@@ -19,6 +19,7 @@ import type {
   SlashDirective,
 } from "@/lib/orbit-ipc";
 import type {
+  ActiveTurnSendBehavior,
   ComposerFocusOptions,
   ContextMentionItem,
   HostUpgradeOutcome,
@@ -239,6 +240,7 @@ export interface OrbitCrossSliceActions {
   closeSettings(): void;
   closeOnboardingGuide(markCompleted?: boolean): void;
   setTheme(theme: ThemeMode): void;
+  setActiveTurnSendBehavior(behavior: ActiveTurnSendBehavior): void;
   inspectGitRepos(
     hostId: string,
     path: string,

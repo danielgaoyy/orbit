@@ -5,6 +5,7 @@ import {
   SettingRow,
   SettingSectionHeader,
   SettingSelect,
+  ToggleSwitch,
   type SettingSelectOption,
 } from "@/components/settings/settings-primitives";
 import { useI18n } from "@/lib/i18n";
@@ -35,6 +36,7 @@ export const AppearanceSection = memo(function AppearanceSection() {
   const { t } = useI18n();
   const theme = useOrbitSelector((s) => s.theme);
   const diffLayout = useOrbitSelector((s) => s.diffLayout);
+  const coalesceExploration = useOrbitSelector((s) => s.coalesceExploration);
 
   const themeOptions = useMemo<{ id: ThemeMode; label: string }[]>(
     () => [
@@ -114,6 +116,24 @@ export const AppearanceSection = memo(function AppearanceSection() {
               options={diffLayoutOptions}
               onChange={(layout) => orbitActions.setDiffLayout(layout)}
               menuClassName="w-[216px]"
+            />
+          </SettingRow>
+        </SettingCard>
+      </div>
+
+      {/* Display */}
+      <div className="space-y-2">
+        <SettingGroupLabel>{t("settings.groupDisplay")}</SettingGroupLabel>
+        <SettingCard>
+          <SettingRow
+            settingId="settings.collapseExploration"
+            title={t("settings.collapseExploration")}
+            description={t("settings.collapseExplorationDesc")}
+          >
+            <ToggleSwitch
+              ariaLabel={t("settings.collapseExploration")}
+              checked={coalesceExploration}
+              onChange={(v) => orbitActions.setWorktreePrefs({ coalesceExploration: v })}
             />
           </SettingRow>
         </SettingCard>

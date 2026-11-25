@@ -6,6 +6,7 @@ export const preferenceDefaults = {
   draftUseWorktree: true,
   diffLayout: "unified",
   enterToSend: true,
+  activeTurnSendBehavior: "queue",
   notifyOnApproval: true,
   notifyOnTurnComplete: false,
   notifyOnAgentError: true,

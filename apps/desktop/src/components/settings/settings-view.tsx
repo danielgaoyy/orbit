@@ -18,6 +18,7 @@ import {
   Cpu,
   Database,
   FileText,
+  GitBranch,
   Keyboard,
   MessageSquare,
   Mic,
@@ -34,6 +35,7 @@ import { AppearanceSection } from "./appearance-section";
 import { CloudSyncSection } from "./cloud-sync-section";
 import { DataDiagnosticsSection } from "./data-diagnostics-section";
 import { GeneralSection } from "./general-section";
+import { GitWorktreesSection } from "./git-worktrees-section";
 import { HostAgentsSection } from "./host-agents-section";
 import { HostGuardianSection } from "./host-guardian-section";
 import { HostImChannelsSection } from "./host-im-channels-section";
@@ -85,6 +87,7 @@ import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 const icons = {
   general: Settings2,
   appearance: Palette,
+  git_worktrees: GitBranch,
   shortcuts: Keyboard,
   notifications: Bell,
   voice: Mic,
@@ -462,6 +465,8 @@ const SettingsPageBody = memo(function SettingsPageBody({
       return <GeneralSection />;
     case "appearance":
       return <AppearanceSection />;
+    case "git_worktrees":
+      return <GitWorktreesSection />;
     case "shortcuts":
       return <ShortcutsSection jumpTo={jumpId} />;
     case "notifications":

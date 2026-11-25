@@ -1,14 +1,22 @@
 import { memo, useEffect, useMemo, useRef } from "react";
 import { ArrowRight, Compass } from "lucide-react";
 import {
-  SettingCard, SettingGroupLabel, SettingRow, SettingSectionHeader, SettingSelect,
-  ToggleSwitch, type SettingSelectOption,
+  SettingCard,
+  SettingGroupLabel,
+  SettingRow,
+  SettingSectionHeader,
+  SettingSelect,
+  type SettingSelectOption,
 } from "@/components/settings/settings-primitives";
 import { Button } from "@/components/ui/button";
 import { LOCALES, useI18n } from "@/lib/i18n";
 import { modSymbol } from "@/lib/keybindings";
-import { isWebRuntime, normalizeSemver, type ExternalEditorKind } from "@/lib/orbit-ipc";
-import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { isWebRuntime, normalizeSemver } from "@/lib/orbit-ipc";
+import {
+  type ActiveTurnSendBehavior,
+  orbitActions,
+  useOrbitSelector,
+} from "@/state/orbit-store";
 
 const languageOptions = LOCALES.map((item) => ({
   value: item.id,
@@ -19,28 +27,45 @@ const languageOptions = LOCALES.map((item) => ({
 export const GeneralSection = memo(function GeneralSection() {
   const { locale, t } = useI18n();
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
-  const draftUseWorktree = useOrbitSelector((s) => s.draftUseWorktree);
-  const worktreeBranchPrefix = useOrbitSelector((s) => s.worktreeBranchPrefix);
-  const coalesceExploration = useOrbitSelector((s) => s.coalesceExploration);
-  const externalEditors = useOrbitSelector((s) => s.externalEditors);
-  const preferredEditor = useOrbitSelector((s) => s.preferredEditor);
+  const activeTurnSendBehavior = useOrbitSelector((s) => s.activeTurnSendBehavior);
   const storeAppVersion = useOrbitSelector((s) => s.appVersion);
   const releaseUpdateInfo = useOrbitSelector((s) => s.releaseUpdateInfo);
   const checkingUpdate = useOrbitSelector((s) => s.checkingReleaseUpdate);
   const releaseCheckError = useOrbitSelector((s) => s.releaseCheckError);
   const isBrowserOffline = useOrbitSelector((s) => s.isBrowserOffline);
   const mod = modSymbol();
+  const modEnterLabel = mod === "⌘" ? "⌘ + Enter" : "Ctrl + Enter";
 
-  const prefixOptions = useMemo<SettingSelectOption<string>[]>(
+  const sendShortcutOptions = useMemo<SettingSelectOption<"enter" | "mod_enter">[]>(
     () => [
-      { value: "auto", label: t("composer.modeAuto"), description: t("settings.branchPrefixAutoDesc") },
-      { value: "orbit/", label: "orbit/", mono: true },
-      { value: "feat/", label: "feat/", mono: true },
-      { value: "fix/", label: "fix/", mono: true },
-      { value: "chore/", label: "chore/", mono: true },
+      {
+        value: "enter",
+        label: "Enter",
+        description: t("settings.sendShortcutEnterDesc"),
+      },
+      {
+        value: "mod_enter",
+        label: modEnterLabel,
+        description: t("settings.sendShortcutModEnterDesc"),
+      },
     ],
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [locale],
+    [modEnterLabel, t],
+  );
+
+  const activeTurnSendOptions = useMemo<SettingSelectOption<ActiveTurnSendBehavior>[]>(
+    () => [
+      {
+        value: "queue",
+        label: t("settings.activeTurnSendQueue"),
+        description: t("settings.activeTurnSendQueueDesc"),
+      },
+      {
+        value: "steer",
+        label: t("settings.activeTurnSendSteer"),
+        description: t("settings.activeTurnSendSteerDesc"),
+      },
+    ],
+    [t],
   );
 
   const appVersion = normalizeSemver(storeAppVersion) ?? "0.11.2";
@@ -53,44 +78,16 @@ export const GeneralSection = memo(function GeneralSection() {
     void orbitActions.checkFleetUpdates({ silent: true });
   }, [releaseUpdateInfo, checkingUpdate, isBrowserOffline]);
 
-  // Synced preferences may contain a custom prefix from another client.
-  const branchOptions = useMemo(
-    () =>
-      prefixOptions.some((item) => item.value === worktreeBranchPrefix)
-        ? prefixOptions
-        : [...prefixOptions, { value: worktreeBranchPrefix, label: worktreeBranchPrefix, mono: true }],
-    [prefixOptions, worktreeBranchPrefix],
-  );
-
-  const installedEditors = useMemo(
-    () => externalEditors.filter((ed) => ed.installed),
-    [externalEditors],
-  );
-
-  const effectivePreferred: ExternalEditorKind | null =
-    (preferredEditor && installedEditors.some((ed) => ed.kind === preferredEditor)
-      ? preferredEditor
-      : installedEditors[0]?.kind) ?? null;
-
-  const editorOptions = useMemo<SettingSelectOption<ExternalEditorKind>[]>(
-    () =>
-      installedEditors.map((ed) => ({
-        value: ed.kind,
-        label: ed.label,
-      })),
-    [installedEditors],
-  );
-
   return (
-    <div className="space-y-6">
+    <div className="flex flex-col gap-6">
       <SettingSectionHeader
         title={t("settings.generalTitle")}
         description={t("settings.generalDesc")}
       />
 
-      {/* Interface Language */}
-      <div className="space-y-2">
-        <SettingGroupLabel>{t("settings.groupInterface")}</SettingGroupLabel>
+      {/* General */}
+      <div className="flex flex-col gap-2">
+        <SettingGroupLabel>{t("settings.groupGeneral")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
             settingId="settings.language"
@@ -105,11 +102,28 @@ export const GeneralSection = memo(function GeneralSection() {
               menuClassName="w-[216px]"
             />
           </SettingRow>
+
+          <SettingRow
+            settingId="settings.setupGuide"
+            title={t("settings.setupGuide")}
+            description={t("settings.setupGuideDesc")}
+          >
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => orbitActions.openOnboardingGuide()}
+              className="text-[13px]"
+            >
+              <Compass className="text-ink-muted size-[13px]" />
+              <span>{t("settings.openSetupGuide")}</span>
+            </Button>
+          </SettingRow>
         </SettingCard>
       </div>
 
-      <div className="space-y-2">
-        <SettingGroupLabel>{t("settings.groupComposer")}</SettingGroupLabel>
+      {/* Send */}
+      <div className="flex flex-col gap-2">
+        <SettingGroupLabel>{t("settings.groupSend")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
             settingId="settings.sendWithEnter"
@@ -120,81 +134,35 @@ export const GeneralSection = memo(function GeneralSection() {
                 : t("settings.sendWithEnterOffDesc", { mod })
             }
           >
-            <ToggleSwitch
+            <SettingSelect<"enter" | "mod_enter">
               ariaLabel={t("settings.sendWithEnter")}
-              checked={enterToSend}
-              onChange={(v) => orbitActions.setEnterToSend(v)}
+              value={enterToSend ? "enter" : "mod_enter"}
+              options={sendShortcutOptions}
+              onChange={(val) => orbitActions.setEnterToSend(val === "enter")}
+              menuClassName="w-[216px]"
             />
           </SettingRow>
 
           <SettingRow
-            settingId="settings.collapseExploration"
-            title={t("settings.collapseExploration")}
-            description={t("settings.collapseExplorationDesc")}
+            settingId="settings.activeTurnSendBehavior"
+            title={t("settings.activeTurnSendBehavior")}
+            description={t("settings.activeTurnSendBehaviorDesc")}
           >
-            <ToggleSwitch
-              ariaLabel={t("settings.collapseExploration")}
-              checked={coalesceExploration}
-              onChange={(v) => orbitActions.setWorktreePrefs({ coalesceExploration: v })}
-            />
-          </SettingRow>
-
-          {!isWebRuntime() && (
-            <SettingRow
-              settingId="settings.externalEditor"
-              title={t("settings.externalEditor")}
-              description={t("settings.externalEditorDesc", { mod })}
-            >
-              <SettingSelect
-                ariaLabel={t("settings.externalEditor")}
-                value={effectivePreferred}
-                options={editorOptions}
-                onChange={(kind) => orbitActions.setPreferredEditor(kind)}
-                placeholder={t("settings.noEditorsFound")}
-                disabled={editorOptions.length === 0}
-              />
-            </SettingRow>
-          )}
-        </SettingCard>
-      </div>
-
-      {/* Git & Worktrees */}
-      <div className="space-y-2">
-        <SettingGroupLabel>{t("settings.groupGitWorktrees")}</SettingGroupLabel>
-        <SettingCard>
-          <SettingRow
-            settingId="settings.isolateWorktrees"
-            title={t("settings.isolateWorktrees")}
-            description={t("settings.isolateWorktreesDesc")}
-          >
-            <ToggleSwitch
-              ariaLabel={t("settings.isolateWorktrees")}
-              checked={draftUseWorktree}
-              onChange={(v) => orbitActions.setDraftConfig({ useWorktree: v })}
-            />
-          </SettingRow>
-
-          <SettingRow
-            settingId="settings.branchPrefix"
-            title={t("settings.branchPrefix")}
-            description={t("settings.branchPrefixDesc")}
-            disabled={!draftUseWorktree}
-          >
-            <SettingSelect
-              ariaLabel={t("settings.branchPrefix")}
-              value={worktreeBranchPrefix}
-              options={branchOptions}
-              disabled={!draftUseWorktree}
-              onChange={(pfx) => orbitActions.setWorktreePrefs({ worktreeBranchPrefix: pfx })}
-              menuClassName="w-[200px]"
+            <SettingSelect<ActiveTurnSendBehavior>
+              ariaLabel={t("settings.activeTurnSendBehavior")}
+              value={activeTurnSendBehavior}
+              options={activeTurnSendOptions}
+              onChange={(val) => orbitActions.setActiveTurnSendBehavior(val)}
+              menuClassName="w-[248px]"
             />
           </SettingRow>
         </SettingCard>
       </div>
 
+      {/* App Version */}
       {!isWebRuntime() && (
-        <div className="space-y-2">
-          <SettingGroupLabel>Orbit Desktop</SettingGroupLabel>
+        <div className="flex flex-col gap-2">
+          <SettingGroupLabel>{t("settings.groupAppVersion")}</SettingGroupLabel>
           <SettingCard>
             <SettingRow
               settingId="settings.appVersion"
@@ -218,27 +186,6 @@ export const GeneralSection = memo(function GeneralSection() {
           </SettingCard>
         </div>
       )}
-
-      {/* Getting Started / Onboarding Guide */}
-      <div className="space-y-2">
-        <SettingGroupLabel>{t("settings.groupGettingStarted")}</SettingGroupLabel>
-        <SettingCard>
-          <SettingRow
-            settingId="settings.setupGuide"
-            title={t("settings.setupGuide")}
-            description={t("settings.setupGuideDesc")}
-          >
-            <Button
-              variant="outline" size="sm"
-              onClick={() => orbitActions.openOnboardingGuide()}
-              className="text-[13px]"
-            >
-              <Compass className="text-ink-muted size-[13px]" />
-              <span>{t("settings.openSetupGuide")}</span>
-            </Button>
-          </SettingRow>
-        </SettingCard>
-      </div>
     </div>
   );
 });

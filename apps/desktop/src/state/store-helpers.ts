@@ -151,6 +151,7 @@ export function buildPersistedPrefsPayload(snap: OrbitUiState): PersistedPrefs {
     locale: snap.locale,
     theme: snap.theme,
     enterToSend: snap.enterToSend,
+    activeTurnSendBehavior: snap.activeTurnSendBehavior,
     customKeybindings: snap.customKeybindings,
     notifyOnApproval: snap.notifyOnApproval,
     notifyOnTurnComplete: snap.notifyOnTurnComplete,
@@ -720,6 +721,11 @@ export function createDefaultInitialState(
     theme: initialTheme,
     resolvedTheme: initialResolvedTheme,
     enterToSend: initialPrefs.enterToSend ?? preferenceDefaults.enterToSend,
+    activeTurnSendBehavior:
+      initialPrefs.activeTurnSendBehavior === "steer" ||
+      initialPrefs.activeTurnSendBehavior === "queue"
+        ? initialPrefs.activeTurnSendBehavior
+        : preferenceDefaults.activeTurnSendBehavior,
     notifyOnApproval: initialPrefs.notifyOnApproval ?? preferenceDefaults.notifyOnApproval,
     notifyOnTurnComplete: initialPrefs.notifyOnTurnComplete ?? preferenceDefaults.notifyOnTurnComplete,
     notifyOnAgentError: initialPrefs.notifyOnAgentError ?? preferenceDefaults.notifyOnAgentError,

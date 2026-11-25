@@ -102,6 +102,7 @@ export {
 };
 export type { StoreTopic };
 export type {
+  ActiveTurnSendBehavior,
   ActiveViewMode,
   ArchivedThreadEntry,
   ComposerFocusOptions,

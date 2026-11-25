@@ -95,6 +95,7 @@ import {
   workspaceSymbolToMentionCandidate,
 } from "@/lib/symbol-mentions";
 import {
+  type ActiveTurnSendBehavior,
   type ContextMentionItem,
   type DiffQuoteSnippet,
   type InlineMentionTarget,
@@ -125,27 +126,29 @@ export function resolveComposerEnterAction(
   e: Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "shiftKey" | "altKey">,
   enterToSend: boolean,
   isTurnBusy: boolean,
+  activeTurnSendBehavior: ActiveTurnSendBehavior = "queue",
 ): { submit: boolean; steerImmediately: boolean } {
   if (e.key !== "Enter" || e.altKey) {
     return { submit: false, steerImmediately: false };
   }
   const hasMod = e.metaKey || e.ctrlKey;
+  const steerOnPrimary = isTurnBusy && activeTurnSendBehavior === "steer";
+  const steerOnAlternate = isTurnBusy && activeTurnSendBehavior !== "steer";
   if (enterToSend) {
     if (hasMod && !e.shiftKey) {
-      return { submit: true, steerImmediately: isTurnBusy };
+      return { submit: true, steerImmediately: steerOnAlternate };
     }
     if (!hasMod && !e.shiftKey) {
-      return { submit: true, steerImmediately: false };
+      return { submit: true, steerImmediately: steerOnPrimary };
     }
     return { submit: false, steerImmediately: false };
   }
-  // enterToSend === false: Mod+Enter is the primary Send/Queue shortcut (never force-steer);
-  // Mod+Shift+Enter performs force-steer.
+  // enterToSend === false: Mod+Enter is the primary shortcut; Mod+Shift+Enter triggers the opposite active-turn mode.
   if (hasMod && e.shiftKey) {
-    return { submit: true, steerImmediately: true };
+    return { submit: true, steerImmediately: steerOnAlternate };
   }
   if (hasMod && !e.shiftKey) {
-    return { submit: true, steerImmediately: false };
+    return { submit: true, steerImmediately: steerOnPrimary };
   }
   return { submit: false, steerImmediately: false };
 }
@@ -252,6 +255,7 @@ export const OmniComposer = memo(function OmniComposer({
       : EMPTY_CATALOGS,
   );
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
+  const activeTurnSendBehavior = useOrbitSelector((s) => s.activeTurnSendBehavior);
   const promptHistory = useOrbitSelector((s) => s.promptHistory);
   const slashCommands = useOrbitSelector((s) => s.slashCommands);
   const managedSkills = useOrbitSelector((s) =>
@@ -1483,7 +1487,7 @@ export const OmniComposer = memo(function OmniComposer({
       }
     }
 
-    const enterAction = resolveComposerEnterAction(e, enterToSend, isTurnBusy);
+    const enterAction = resolveComposerEnterAction(e, enterToSend, isTurnBusy, activeTurnSendBehavior);
     if (enterAction.submit) {
       e.preventDefault();
       triggerSubmit(enterAction.steerImmediately);
@@ -1497,7 +1501,11 @@ export const OmniComposer = memo(function OmniComposer({
     textareaRef.current?.setSelectionRange(0, 0);
   }, []);
   const handleSelectModeSilent = useCallback((mode: SessionMode) => handleSelectMode(mode, false), [handleSelectMode]);
-  const handleSubmitClick = useCallback(() => triggerSubmit(false), [triggerSubmit]);
+  const steerOnPrimarySubmit = isTurnBusy && activeTurnSendBehavior === "steer";
+  const handleSubmitClick = useCallback(
+    () => triggerSubmit(steerOnPrimarySubmit),
+    [triggerSubmit, steerOnPrimarySubmit],
+  );
 
   // --- M6 Codex-style Voice Control (zero extra toolbar chrome) ---
   const voiceRecorderRef = useRef<VoiceRecorderSession | null>(null);
@@ -1900,13 +1908,15 @@ export const OmniComposer = memo(function OmniComposer({
   const showStopButton = isTurnBusy && !hasPayload && Boolean(selectedAgentId);
   const waitingForUpload = hasUploadingAttachment && !localSubmission;
   const submitBusy = !localSubmission && (isSubmitting || hasUploadingAttachment);
-  const steerShortcut = enterToSend ? `${mod}↵` : mod === "⌘" ? "⌘⇧↵" : `${mod}Shift+↵`;
+  const alternateSendShortcut = enterToSend ? `${mod}↵` : mod === "⌘" ? "⌘⇧↵" : `${mod}Shift+↵`;
   const submitTooltipLabel = waitingForUpload
     ? t("composer.uploadingAttachments")
     : isSubmitting && !localSubmission
       ? t("composer.sendingPrompt")
       : isTurnBusy && !localSubmission
-        ? t("composer.queueFollowUpHint", { shortcut: steerShortcut })
+        ? activeTurnSendBehavior === "steer"
+          ? t("composer.steerFollowUpHint", { shortcut: alternateSendShortcut })
+          : t("composer.queueFollowUpHint", { shortcut: alternateSendShortcut })
         : t("common.send");
   const submitShortcut = submitBusy ? undefined : enterToSend ? "↵" : `${mod}↵`;
 
@@ -1934,7 +1944,9 @@ export const OmniComposer = memo(function OmniComposer({
         break;
     }
     if (isForegroundRunning) {
-      return t("composer.placeholderRunning", { shortcut: steerShortcut });
+      return activeTurnSendBehavior === "steer"
+        ? t("composer.placeholderRunningSteer", { shortcut: alternateSendShortcut })
+        : t("composer.placeholderRunning", { shortcut: alternateSendShortcut });
     }
     if (!isDraft && hasCurrentAgent) {
       return t("composer.placeholderFollowUp");

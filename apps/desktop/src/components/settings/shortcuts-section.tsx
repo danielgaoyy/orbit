@@ -43,6 +43,7 @@ interface PendingConflictState {
 export const ShortcutsSection = memo(function ShortcutsSection({ jumpTo }: { jumpTo?: string }) {
   const { locale, t } = useI18n();
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
+  const activeTurnSendBehavior = useOrbitSelector((s) => s.activeTurnSendBehavior);
   const customKeybindings = useOrbitSelector((s) => s.customKeybindings);
 
   const [query, setQuery] = useState("");
@@ -130,19 +131,31 @@ export const ShortcutsSection = memo(function ShortcutsSection({ jumpTo }: { jum
     });
 
     // Read-only contextual shortcuts (fixed behavior / range chords)
+    const primarySendKeys = enterToSend ? "Enter" : `${mod}Enter`;
+    const alternateSendKeys = enterToSend ? `${mod}Enter` : `${mod}${shift}Enter`;
     rows.push(
       { group: navGroup, action: t("settings.scSwitchConversation"), keys: `${mod}1 .. ${mod}9` },
       {
         group: composerGroup,
-        action: t("settings.scSendPrompt"),
-        keys: enterToSend ? "Enter" : `${mod}Enter`,
+        action:
+          activeTurnSendBehavior === "steer"
+            ? t("settings.scSendOrSteerPrompt")
+            : t("settings.scSendPrompt"),
+        keys: primarySendKeys,
       },
       {
         group: composerGroup,
         action: t("settings.scNewLine"),
         keys: enterToSend ? `${shift}Enter` : "Enter",
       },
-      { group: composerGroup, action: t("settings.scSteerAgent"), keys: enterToSend ? `${mod}Enter` : `${mod}${shift}Enter` },
+      {
+        group: composerGroup,
+        action:
+          activeTurnSendBehavior === "steer"
+            ? t("settings.scQueueFollowUp")
+            : t("settings.scSteerAgent"),
+        keys: alternateSendKeys,
+      },
       { group: composerGroup, action: t("settings.scStopGeneration"), keys: "Esc Esc" },
       { group: approvalsGroup, action: t("settings.scQuickSelectOption"), keys: "1 .. 9" },
     );
@@ -165,7 +178,7 @@ export const ShortcutsSection = memo(function ShortcutsSection({ jumpTo }: { jum
     }
     return Array.from(map.entries());
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [locale, isMac, mod, shift, query, enterToSend, customKeybindings]);
+  }, [locale, isMac, mod, shift, query, enterToSend, activeTurnSendBehavior, customKeybindings]);
 
   return (
     <div className="flex flex-col gap-5">

@@ -148,6 +148,7 @@ export const STATE_KEY_TOPIC: Readonly<Record<keyof OrbitUiState, StoreTopic>> =
   theme: "preferences",
   resolvedTheme: "preferences",
   enterToSend: "preferences",
+  activeTurnSendBehavior: "preferences",
   notifyOnApproval: "preferences",
   notifyOnTurnComplete: "preferences",
   notifyOnAgentError: "preferences",

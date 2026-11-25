@@ -21,12 +21,12 @@ const t = (key: MessageKey) => en[key];
 const hostId = "ipv6:2001:db8::42";
 
 describe("Settings navigation", () => {
-  it("contains the sixteen sections in sidebar order within their four domains", () => {
+  it("contains the seventeen sections in sidebar order within their four domains", () => {
     const grouped = SETTINGS_NAV_GROUPS.map((group) => [
       group.id, ...SETTINGS_CORE_SECTIONS.filter((s) => s.group === group.id).map((s) => s.id),
     ]);
     assert.deepEqual(grouped, [
-      ["preferences", "general", "appearance", "shortcuts", "notifications", "voice"],
+      ["preferences", "general", "appearance", "git_worktrees", "shortcuts", "notifications", "voice"],
       ["fleet_sync", "cloud_sync", "hosts"],
       ["agents_safety", "agents", "personal_router", "safety", "usage"],
       ["context_extensions", "instructions_memory", "mcp_tools", "skills_plugins", "im_channels", "data_diagnostics"],
@@ -40,6 +40,7 @@ describe("Settings navigation", () => {
   it("opens every legacy target at its page and, where applicable, its original resource", () => {
     const cases: [SettingsSectionTarget, SettingsCoreSectionId, SettingsSubTabId | null][] = [
       ["general", "general", null], ["appearance", "appearance", null],
+      ["git_worktrees", "git_worktrees", null],
       ["shortcuts", "shortcuts", null], ["notifications", "notifications", null],
       ["cloud_sync", "cloud_sync", null], ["archived", "data_diagnostics", "archived"],
       ["personal_router", "personal_router", null], ["router", "personal_router", null],
@@ -111,6 +112,7 @@ describe("Settings search", () => {
   it("matches individual settings, localized labels and keywords across all language choices", () => {
     const cases: [string, string | undefined][] = [
       ["diff layout", "settings.diffLayout"], ["分支前缀", "settings.branchPrefix"],
+      ["排队发送", "settings.activeTurnSendBehavior"],
       ["入力マイク", "voice.microphoneTitle"], ["microphone", "voice.microphoneTitle"],
       ["keep awake", "settings.agentKeepAwake"], ["cloudflare", "settings.advancedRelayTitle"],
       ["CLAUDE.md", "settings.subTabInstructions"], ["飞书", "im.configuredChannels"],
@@ -123,6 +125,8 @@ describe("Settings search", () => {
       }
     }
     assert.equal(searchSettingsEntries("Appearance", { t })[0]?.id, "appearance");
+    assert.equal(searchSettingsEntries("分支前缀", { t })[0]?.target, "git_worktrees");
+    assert.equal(searchSettingsEntries("collapse exploration", { t })[0]?.target, "appearance");
     assert.equal(searchSettingsEntries("项目记忆", { t }).some((hit) => hit.settingId === "memory.title"), true);
   });
 

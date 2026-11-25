@@ -68,7 +68,7 @@ async function settingsDriver(cdp) {
 
   async function open() {
     await key(",", "Comma", 4); // The settings passes emulate macOS.
-    await waitFor("Settings rail", () => document.querySelectorAll("[data-settings-section]").length === 16);
+    await waitFor("Settings rail", () => document.querySelectorAll("[data-settings-section]").length === 17);
   }
 
   async function go(section) {
@@ -131,7 +131,7 @@ export async function exerciseLocalSettings(cdp) {
       return box.top >= shellRect.top && box.bottom <= shellRect.bottom;
     });
   });
-  assert.ok(railFits, "All 16 destinations should fit inside the Settings modal rail at a 14-inch viewport");
+  assert.ok(railFits, "All 17 destinations should fit inside the Settings modal rail at a 14-inch viewport");
   assert.equal(await evaluate(() => document.documentElement.classList.contains("dark")), false);
   const destinations = await evaluate(() =>
     [...document.querySelectorAll("[data-settings-section]")].map((button) => button.dataset.settingsSection));
@@ -247,11 +247,47 @@ export async function exerciseLocalSettings(cdp) {
   };
 
   await go("general");
-  const toggle = '[data-setting-id="settings.sendWithEnter"] [role="switch"]';
-  await click(toggle);
-  await waitFor("changed Send with Enter preference", (selector) =>
-    document.querySelector(selector)?.getAttribute("aria-checked") === "false", toggle);
-  await assertNoResetButtons("General (after toggling Send with Enter)");
+  assert.equal(
+    await evaluate(() => Boolean(
+      document.querySelector('[data-setting-id="settings.language"]') &&
+      document.querySelector('[data-setting-id="settings.setupGuide"]') &&
+      document.querySelector('[data-setting-id="settings.sendWithEnter"]') &&
+      document.querySelector('[data-setting-id="settings.activeTurnSendBehavior"]') &&
+      document.querySelector('[data-setting-id="settings.appVersion"]') &&
+      !document.querySelector('[data-setting-id="settings.isolateWorktrees"]') &&
+      !document.querySelector('[data-setting-id="settings.collapseExploration"]') &&
+      !document.querySelector('[data-setting-id="settings.externalEditor"]'),
+    )),
+    true,
+    "General should contain only Language, Setup guide, Send shortcut, While agent is running, and App version",
+  );
+  const sendTrigger = '[data-setting-id="settings.sendWithEnter"] [data-slot="select-trigger"]';
+  await click(sendTrigger);
+  await click('[data-slot="select-item"]', "⌘ + Enter");
+  await waitFor("changed Send shortcut preference", (selector) =>
+    document.querySelector(selector)?.innerText.includes("⌘ + Enter"), sendTrigger);
+  await assertNoResetButtons("General (after changing Send shortcut)");
+
+  const activeTurnTrigger = '[data-setting-id="settings.activeTurnSendBehavior"] [data-slot="select-trigger"]';
+  await click(activeTurnTrigger);
+  await click('[data-slot="select-item"]', "Steer");
+  await waitFor("changed active-turn send behavior to Steer", (selector) =>
+    document.querySelector(selector)?.innerText.includes("Steer"), activeTurnTrigger);
+  await click(activeTurnTrigger);
+  await click('[data-slot="select-item"]', "Queue");
+  await waitFor("restored active-turn send behavior to Queue", (selector) =>
+    document.querySelector(selector)?.innerText.includes("Queue"), activeTurnTrigger);
+
+  await go("git_worktrees");
+  assert.equal(
+    await evaluate(() => Boolean(
+      document.querySelector('[data-setting-id="settings.isolateWorktrees"]') &&
+      document.querySelector('[data-setting-id="settings.branchPrefix"]') &&
+      document.querySelector('[data-setting-id="settings.externalEditor"]'),
+    )),
+    true,
+    "Git & Worktrees should contain Isolate worktrees, Branch prefix, and External editor",
+  );
 
   await go("shortcuts");
   const cmdPaletteRecorder = '[data-setting-id="settings.scCommandPalette"] button';
@@ -278,19 +314,25 @@ export async function exerciseLocalSettings(cdp) {
   await assertNoResetButtons("Data & Diagnostics");
 
   await go("appearance");
+  assert.equal(
+    await evaluate(() => Boolean(document.querySelector('[data-setting-id="settings.collapseExploration"]'))),
+    true,
+    "Appearance should contain Collapse thinking and tool calls",
+  );
   await key("f", "KeyF", 4);
   const search = 'input[aria-label="Search settings"]';
   await waitFor("keyboard focus in Settings search", (selector) => document.activeElement?.matches(selector), search);
-  await cdp.send("Input.insertText", { text: "Send with Enter" });
-  await waitFor("Send with Enter search result", () =>
-    document.querySelector("#settings-results")?.innerText.includes("Send with Enter"));
+  await cdp.send("Input.insertText", { text: "Send shortcut" });
+  await waitFor("Send shortcut search result", () =>
+    document.querySelector("#settings-results")?.innerText.includes("Send shortcut"));
   await assertNoResetButtons("search results");
   await key("Enter", "Enter");
-  await waitFor("jump to Send with Enter row", () =>
+  await waitFor("jump to Send shortcut row", () =>
     document.querySelector('[data-setting-id="settings.sendWithEnter"][data-settings-highlight="true"]') !== null);
-  await click(toggle);
-  await waitFor("toggled Send with Enter back to true", (selector) =>
-    document.querySelector(selector)?.getAttribute("aria-checked") === "true", toggle);
+  await click(sendTrigger);
+  await click('[data-slot="select-item"]', "Enter");
+  await waitFor("restored default Send shortcut", (selector) =>
+    document.querySelector(selector)?.innerText.trim() === "Enter", sendTrigger);
 
   await key("f", "KeyF", 4);
   await cdp.send("Input.insertText", { text: "diff layout" });

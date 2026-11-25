@@ -8,16 +8,18 @@ type SettingEntry = readonly [target: SettingsPage, label: MessageKey, keywords:
 
 export const SETTING_ENTRIES = [
   ["general", "settings.language", "locale interface language 言語 语言 日本語 中文 english"],
-  ["general", "settings.sendWithEnter", "enter to send composer submit 回车发送 エンターキー 送信"],
-  ["general", "settings.collapseExploration", "coalesce exploration steps collapse 折叠探索 探索ステップ"],
-  ["general", "settings.externalEditor", "external ide vscode cursor zed 外部编辑器 エディタ"],
-  ["general", "settings.isolateWorktrees", "git isolate worktree 隔离 工作树 分離 作業ツリー"],
-  ["general", "settings.branchPrefix", "worktree branch prefix git 分支前缀 ブランチ接頭辞"],
-  ["general", "settings.appVersion", "check for updates app desktop version 版本升级 バージョン更新"],
   ["general", "settings.setupGuide", "onboarding walkthrough first run 入门向导 セットアップ 初期設定"],
+  ["general", "settings.sendWithEnter", "send shortcut enter to send composer submit 发送快捷键 回车发送 送信ショートカット エンターキー"],
+  ["general", "settings.activeTurnSendBehavior", "while agent is running queue steer follow up interrupt 排队发送 引导发送 代理运行时 ステア キュー 実行中"],
+  ["general", "settings.appVersion", "check for updates app desktop version 版本升级 バージョン更新"],
 
   ["appearance", "settings.groupTheme", "system light dark color scheme 主题 暗色 ダーク ライト テーマ"],
   ["appearance", "settings.diffLayout", "git code review diff layout unified split 统一 分栏 差分 並列"],
+  ["appearance", "settings.collapseExploration", "coalesce exploration steps collapse 折叠探索 探索ステップ"],
+
+  ["git_worktrees", "settings.isolateWorktrees", "git isolate worktree 隔离 工作树 分離 作業ツリー"],
+  ["git_worktrees", "settings.branchPrefix", "worktree branch prefix git 分支前缀 ブランチ接頭辞"],
+  ["git_worktrees", "settings.externalEditor", "external ide vscode cursor zed 外部编辑器 エディタ"],
 
   ["shortcuts", "settings.searchShortcutsPlaceholder", "keybindings hotkeys filter 查找快捷键 ショートカット検索"],
   ...SHORTCUT_ACTIONS.map(({ labelKey, defaultChord }): SettingEntry => ["shortcuts", labelKey, defaultChord]),

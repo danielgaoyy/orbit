@@ -392,6 +392,7 @@ export type OverviewSectionId =
 
 export type ReviewScope = "working_tree" | "session_turns";
 export type DiffLayoutMode = "unified" | "split";
+export type ActiveTurnSendBehavior = "queue" | "steer";
 export type ThemeMode = "system" | "light" | "dark";
 export type ResolvedTheme = "light" | "dark";
 export type ActiveViewMode = "workspace" | "settings";
@@ -704,6 +705,7 @@ export interface OrbitUiState {
   theme: ThemeMode;
   resolvedTheme: ResolvedTheme;
   enterToSend: boolean;
+  activeTurnSendBehavior: ActiveTurnSendBehavior;
   notifyOnApproval: boolean;
   notifyOnTurnComplete: boolean;
   notifyOnAgentError: boolean;
@@ -727,6 +729,7 @@ export interface PersistedPrefs {
   locale?: OrbitLocale;
   theme?: ThemeMode;
   enterToSend?: boolean;
+  activeTurnSendBehavior?: ActiveTurnSendBehavior;
   customKeybindings?: Record<string, string>;
   notifyOnApproval?: boolean;
   notifyOnTurnComplete?: boolean;

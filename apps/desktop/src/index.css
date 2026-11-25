@@ -1074,16 +1074,16 @@ html.orbit-linux .animate-spin {
   }
 }
 
-/* Settings modal keeps all 16 flat destinations scannable inside the dialog rail. */
+/* Settings modal keeps all 17 flat destinations scannable inside the dialog rail. */
 .settings-rail-group [data-settings-section] {
-  height: 28px;
+  height: 27px;
 }
 .settings-rail-group + .settings-rail-group {
-  margin-top: clamp(6px, 1.2vh, 12px);
+  margin-top: clamp(6px, 1.1vh, 10px);
 }
 @media (max-height: 820px) {
-  .settings-rail-group [data-settings-section] { height: 26px; }
-  .settings-rail-group + .settings-rail-group { margin-top: 6px; }
+  .settings-rail-group [data-settings-section] { height: 25px; }
+  .settings-rail-group + .settings-rail-group { margin-top: 5px; }
 }
 .settings-view [data-setting-id] { scroll-margin-block: 24px; }
 

@@ -509,7 +509,7 @@ describe("Wave 1A P0 UX Safety", () => {
     assert.equal(getOrbitState().pendingUnsavedFileAction?.action.kind, "reload");
   });
 
-  it("P0-6: enterToSend=false queues on Mod+Enter and force-steers only on Mod+Shift+Enter", async () => {
+  it("P0-6: resolveComposerEnterAction honors enterToSend and activeTurnSendBehavior (queue vs steer)", async () => {
     const { resolveComposerEnterAction } = await server.ssrLoadModule(
       "/src/components/composer/omni-composer.tsx",
     );
@@ -522,7 +522,7 @@ describe("Wave 1A P0 UX Safety", () => {
       ...overrides,
     });
 
-    // enterToSend === false, busy turn
+    // Default / "queue" mode, enterToSend === false, busy turn
     assert.deepEqual(
       resolveComposerEnterAction(key(), false, true),
       { submit: false, steerImmediately: false },
@@ -532,7 +532,7 @@ describe("Wave 1A P0 UX Safety", () => {
       { submit: true, steerImmediately: false },
     );
     assert.deepEqual(
-      resolveComposerEnterAction(key({ ctrlKey: true }), false, true),
+      resolveComposerEnterAction(key({ ctrlKey: true }), false, true, "queue"),
       { submit: true, steerImmediately: false },
     );
     assert.deepEqual(
@@ -540,11 +540,11 @@ describe("Wave 1A P0 UX Safety", () => {
       { submit: true, steerImmediately: true },
     );
     assert.deepEqual(
-      resolveComposerEnterAction(key({ ctrlKey: true, shiftKey: true }), false, true),
+      resolveComposerEnterAction(key({ ctrlKey: true, shiftKey: true }), false, true, "queue"),
       { submit: true, steerImmediately: true },
     );
 
-    // enterToSend === true, busy turn
+    // Default / "queue" mode, enterToSend === true, busy turn
     assert.deepEqual(
       resolveComposerEnterAction(key(), true, true),
       { submit: true, steerImmediately: false },
@@ -556,6 +556,64 @@ describe("Wave 1A P0 UX Safety", () => {
     assert.deepEqual(
       resolveComposerEnterAction(key({ metaKey: true }), true, true),
       { submit: true, steerImmediately: true },
+    );
+
+    // "steer" mode, enterToSend === true, busy turn: primary Enter steers, Mod+Enter queues
+    assert.deepEqual(
+      resolveComposerEnterAction(key(), true, true, "steer"),
+      { submit: true, steerImmediately: true },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ shiftKey: true }), true, true, "steer"),
+      { submit: false, steerImmediately: false },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ metaKey: true }), true, true, "steer"),
+      { submit: true, steerImmediately: false },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ ctrlKey: true }), true, true, "steer"),
+      { submit: true, steerImmediately: false },
+    );
+
+    // "steer" mode, enterToSend === false, busy turn: primary Mod+Enter steers, Mod+Shift+Enter queues
+    assert.deepEqual(
+      resolveComposerEnterAction(key(), false, true, "steer"),
+      { submit: false, steerImmediately: false },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ metaKey: true }), false, true, "steer"),
+      { submit: true, steerImmediately: true },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ ctrlKey: true }), false, true, "steer"),
+      { submit: true, steerImmediately: true },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ metaKey: true, shiftKey: true }), false, true, "steer"),
+      { submit: true, steerImmediately: false },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ ctrlKey: true, shiftKey: true }), false, true, "steer"),
+      { submit: true, steerImmediately: false },
+    );
+
+    // Idle turn (isTurnBusy === false): never steers in either mode
+    assert.deepEqual(
+      resolveComposerEnterAction(key(), true, false, "steer"),
+      { submit: true, steerImmediately: false },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ metaKey: true }), true, false, "queue"),
+      { submit: true, steerImmediately: false },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ metaKey: true }), false, false, "steer"),
+      { submit: true, steerImmediately: false },
+    );
+    assert.deepEqual(
+      resolveComposerEnterAction(key({ metaKey: true, shiftKey: true }), false, false, "queue"),
+      { submit: true, steerImmediately: false },
     );
   });
 

@@ -1016,6 +1016,8 @@ struct HostMemoryState {
     timeline_loading_older: HashSet<String>,
     pending_tail_catchups: HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
+    cancelled_optimistic_req_ids: HashSet<Uuid>,
+    cancelled_optimistic_agents: HashSet<String>,
     agent_req_by_req_id: HashMap<Uuid, String>,
     replaced_optimistic_agents: HashMap<String, String>,
     last_created_agent_id: Option<String>,
@@ -1202,6 +1204,8 @@ impl HostMemoryState {
             timeline_loading_older: HashSet::new(),
             pending_tail_catchups: HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
+            cancelled_optimistic_req_ids: HashSet::new(),
+            cancelled_optimistic_agents: HashSet::new(),
             agent_req_by_req_id: HashMap::new(),
             replaced_optimistic_agents: HashMap::new(),
             last_created_agent_id: None,
@@ -5802,6 +5806,7 @@ impl OrbitAppCore {
             None;
         let mut preview_tunnels_to_close: Vec<(HostSessionHandle, Uuid, &'static str)> = Vec::new();
         let mut migrated_opt_pref: Option<(String, String)> = None;
+        let mut cancel_created_agent: Option<String> = None;
         let mut rewound_seen_reset: Option<(String, u64)> = None;
         let mut adopted_daemon_relay = false;
         let mut adopted_modern_relay: Option<String> = None;
@@ -6003,8 +6008,17 @@ impl OrbitAppCore {
                     notify_fleet = true;
                     notify_host = true;
                 }
-                WireMessage::AgentCreated { request_id, agent } => {
+                WireMessage::AgentCreated {
+                    request_id,
+                    mut agent,
+                } => {
                     let ag_id = agent.agent_id.clone();
+                    let was_cancelled_opt = state.cancelled_optimistic_req_ids.remove(&request_id);
+                    if was_cancelled_opt {
+                        agent.status = AgentStatus::Idle;
+                        state.cancelled_optimistic_agents.insert(ag_id.clone());
+                        cancel_created_agent = Some(ag_id.clone());
+                    }
                     if let Some(opt_id) = state.optimistic_by_req_id.remove(&request_id) {
                         state.agents.remove(&opt_id);
                         state.full_outline_prompts.remove(&opt_id);
@@ -6123,6 +6137,13 @@ impl OrbitAppCore {
                 WireMessage::AgentUpdated { mut agent } => {
                     reconcile_pending_queue_ops(state, &mut agent);
                     let ag_id = agent.agent_id.clone();
+                    if state.cancelled_optimistic_agents.contains(&ag_id) {
+                        if !agent.status.is_foreground_busy() {
+                            state.cancelled_optimistic_agents.remove(&ag_id);
+                        } else {
+                            agent.status = AgentStatus::Idle;
+                        }
+                    }
                     let prev_summary = state.agents.get(&ag_id);
                     let prev_epoch = prev_summary.map(|a| a.timeline_epoch);
                     let prev_pinned = prev_summary.map(|a| a.is_pinned);
@@ -6210,6 +6231,7 @@ impl OrbitAppCore {
                         .get(&agent_id)
                         .and_then(|a| a.parent_agent_id.clone());
                     state.agents.remove(&agent_id);
+                    state.cancelled_optimistic_agents.remove(&agent_id);
                     state.timelines.remove(&agent_id);
                     state.full_outline_prompts.remove(&agent_id);
                     state.pending_epoch_outline_fallback.remove(&agent_id);
@@ -8209,6 +8231,7 @@ impl OrbitAppCore {
                     } else {
                         state.last_error = Some(formatted_err.clone());
                         if let Some(req_id) = request_id {
+                            state.cancelled_optimistic_req_ids.remove(&req_id);
                             if let Some(opt_id) = state.optimistic_by_req_id.remove(&req_id) {
                                 record_agent_rpc_error(
                                     state,
@@ -8368,6 +8391,16 @@ impl OrbitAppCore {
         }
         if let Some((sync_state, is_live_update)) = host_sync_to_apply {
             self.reconcile_host_sync_state(host_id, sync_state, is_live_update);
+        }
+        if let Some(cancel_ag_id) = cancel_created_agent {
+            self.dispatch_wire_or_queue(
+                host_id,
+                WireMessage::InterruptTurn {
+                    request_id: Uuid::new_v4(),
+                    agent_id: cancel_ag_id,
+                    preserve_queue: false,
+                },
+            );
         }
         if let Some((opt_id, real_id)) = migrated_opt_pref {
             let _ = self
@@ -9634,6 +9667,7 @@ impl OrbitAppCore {
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
+            h.cancelled_optimistic_agents.remove(agent_id);
             if let Some(ag) = h.agents.get_mut(agent_id) {
                 ag.status = AgentStatus::Running {
                     turn_id: "pending".into(),
@@ -9877,19 +9911,79 @@ impl OrbitAppCore {
         agent_id: &str,
         preserve_queue: bool,
     ) {
+        let mut resolved_agent_id = agent_id.to_string();
+        if agent_id.starts_with("opt_") {
+            let mut replaced_real_id: Option<String> = None;
+            let mut cancelled_local = false;
+            let mut notify_target = agent_id.to_string();
+            if let Ok(mut guard) = self.hosts.write()
+                && let Some(h) = guard.get_mut(host_id)
+            {
+                if let Some(real_id) = h.replaced_optimistic_agents.get(agent_id).cloned() {
+                    h.cancelled_optimistic_agents.insert(real_id.clone());
+                    if let Some(ag) = h.agents.get_mut(&real_id)
+                        && ag.status.is_foreground_busy()
+                    {
+                        ag.status = AgentStatus::Idle;
+                        ag.updated_at = Utc::now();
+                        cancelled_local = true;
+                    }
+                    h.mark_stage_dirty(&real_id, 0, true);
+                    notify_target = real_id.clone();
+                    replaced_real_id = Some(real_id);
+                } else {
+                    let req_id_opt = agent_id
+                        .strip_prefix("opt_")
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                        .or_else(|| {
+                            h.optimistic_by_req_id
+                                .iter()
+                                .find_map(|(rid, oid)| (oid == agent_id).then_some(*rid))
+                        });
+                    if let Some(req_id) = req_id_opt
+                        && h.optimistic_by_req_id.contains_key(&req_id)
+                    {
+                        h.cancelled_optimistic_req_ids.insert(req_id);
+                    }
+                    if let Some(ag) = h.agents.get_mut(agent_id) {
+                        ag.status = AgentStatus::Idle;
+                        ag.updated_at = Utc::now();
+                        cancelled_local = true;
+                    }
+                    h.mark_stage_dirty(agent_id, 0, true);
+                }
+            }
+            if cancelled_local {
+                self.emit(|revision| CoreNotification::FleetChanged { revision });
+                self.emit(|revision| CoreNotification::HostChanged {
+                    revision,
+                    host_id: host_id.to_string(),
+                });
+                self.emit(|revision| CoreNotification::TimelineChanged {
+                    revision,
+                    host_id: host_id.to_string(),
+                    agent_id: notify_target,
+                });
+            }
+            if let Some(real_id) = replaced_real_id {
+                resolved_agent_id = real_id;
+            } else {
+                return;
+            }
+        }
         let req_id = Uuid::new_v4();
-        if !agent_id.starts_with("opt_")
-            && let Ok(mut guard) = self.hosts.write()
+        if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
             && h.session.is_some()
         {
-            h.agent_req_by_req_id.insert(req_id, agent_id.to_string());
+            h.agent_req_by_req_id
+                .insert(req_id, resolved_agent_id.clone());
         }
         self.dispatch_wire(
             host_id,
             WireMessage::InterruptTurn {
                 request_id: req_id,
-                agent_id: agent_id.to_string(),
+                agent_id: resolved_agent_id,
                 preserve_queue,
             },
         );
@@ -34305,5 +34399,277 @@ mod tests {
             .last_error
             .expect("last_error recorded");
         assert!(err_msg.contains("rate limit") && err_msg.contains("paused"));
+    }
+
+    #[test]
+    fn interrupt_optimistic_agent_settles_locally_and_cancels_on_agent_created() {
+        let core = OrbitAppCore::open_in_memory_with_discovery(false).expect("core");
+        let (handle, mut rx) = crate::HostSessionHandle::new_test_channel();
+        let profile = SavedHostProfile {
+            host_id: "host_opt_cancel".into(),
+            hostname: "opt-cancel-box".into(),
+            custom_name: Some("Opt Cancel Box".into()),
+            ssh_alias: None,
+            route_mode: HostRouteMode::Auto,
+            remote_daemon_port: 6868,
+            custom_direct_endpoint: None,
+            daemon_pubkey_b64: "pk_opt_cancel".into(),
+            direct_endpoints: Vec::new(),
+            relay_url: None,
+            pairing_secret: "sec".into(),
+            pairing_secret_updated_at_ms: 0,
+            state: HostConnectionState::OnlineDirect,
+        };
+        {
+            let mut guard = core.hosts.write().expect("hosts");
+            let mut state = HostMemoryState::new(profile);
+            state.session = Some(handle);
+            guard.insert("host_opt_cancel".into(), state);
+        }
+
+        let opt_id = core.create_agent_with_config(CreateAgentRequest {
+            host_id: "host_opt_cancel",
+            cwd: "/tmp/big_repo",
+            extra_dirs: Vec::new(),
+            provider: ProviderKind::Antigravity,
+            model: Some("gemini-4-neon".into()),
+            effort: None,
+            fast_mode: None,
+            mode: SessionMode::FullAccess,
+            initial_prompt: "你好",
+            initial_display_prompt: None,
+            initial_badges: Vec::new(),
+            worktree_branch: None,
+            workspace_id: None,
+            handle: None,
+            auto_cluster: None,
+            acp_agent_id: None,
+        });
+        assert!(opt_id.starts_with("opt_"));
+        assert!(
+            core.host_detail("host_opt_cancel")
+                .expect("detail")
+                .agents
+                .into_iter()
+                .find(|a| a.agent_id == opt_id)
+                .expect("opt card")
+                .is_running
+        );
+
+        let create_frame = core.runtime.block_on(rx.recv()).expect("create frame");
+        let (create_req_id, create_receipt) = match create_frame {
+            crate::OutboundPayload::ConfirmedWire(
+                WireMessage::CreateAgent { request_id, .. },
+                receipt,
+            ) => (request_id, receipt),
+            other => panic!("expected confirmed CreateAgent frame, got {other:?}"),
+        };
+        create_receipt.send(Ok(())).expect("ack create");
+
+        // Cancel while still in optimistic `opt_*` state
+        core.interrupt_agent("host_opt_cancel", &opt_id);
+
+        // Local UI state must immediately stop spinning (not is_running), and NO `InterruptTurn`
+        // with `opt_*` may be dispatched to the daemon.
+        let card_after_cancel = core
+            .host_detail("host_opt_cancel")
+            .expect("detail")
+            .agents
+            .into_iter()
+            .find(|a| a.agent_id == opt_id)
+            .expect("opt card after cancel");
+        assert!(!card_after_cancel.is_running);
+        assert!(
+            rx.try_recv().is_err(),
+            "cancelling opt_* must not emit InterruptTurn with synthetic opt_* ID"
+        );
+
+        // Now `AgentCreated` arrives from daemon (with status Initializing) -> client keeps it
+        // Idle AND dispatches `InterruptTurn` for the real `ag_*` ID!
+        let now = Utc::now();
+        let real_agent = AgentSummary {
+            agent_id: "ag_real_cancelled".into(),
+            workspace_id: "ws_real".into(),
+            cwd: "/tmp/big_repo".into(),
+            title: "你好".into(),
+            provider: ProviderKind::Antigravity,
+            model: Some("gemini-4-neon".into()),
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::FullAccess,
+            status: AgentStatus::Initializing,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 1,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 1,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: None,
+        };
+        core.handle_inbound_wire(
+            "host_opt_cancel",
+            WireMessage::AgentCreated {
+                request_id: create_req_id,
+                agent: real_agent.clone(),
+            },
+        );
+        // Even if a stale `AgentUpdated(Initializing)` broadcast arrives right after `AgentCreated`,
+        // the cancelled session must NOT regress back to running.
+        core.handle_inbound_wire(
+            "host_opt_cancel",
+            WireMessage::AgentUpdated {
+                agent: real_agent.clone(),
+            },
+        );
+
+        let real_card = core
+            .host_detail("host_opt_cancel")
+            .expect("detail")
+            .agents
+            .into_iter()
+            .find(|a| a.agent_id == "ag_real_cancelled")
+            .expect("real card");
+        assert!(!real_card.is_running);
+
+        // Must observe `InterruptTurn` queued/dispatched for `ag_real_cancelled` (alongside
+        // `SubscribeTimeline` from `open_agent_timeline`).
+        let mut saw_real_interrupt = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && !saw_real_interrupt {
+            match core.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            }) {
+                Ok(Some(crate::OutboundPayload::ConfirmedWire(
+                    WireMessage::InterruptTurn { agent_id, .. },
+                    receipt,
+                ))) => {
+                    receipt.send(Ok(())).expect("ack interrupt");
+                    if agent_id == "ag_real_cancelled" {
+                        saw_real_interrupt = true;
+                    }
+                }
+                Ok(Some(crate::OutboundPayload::Wire(_)))
+                | Ok(Some(crate::OutboundPayload::Terminal(_))) => {}
+                Ok(Some(crate::OutboundPayload::ConfirmedWire(_, receipt))) => {
+                    let _ = receipt.send(Ok(()));
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(
+            saw_real_interrupt,
+            "client must forward InterruptTurn to real agent_id once AgentCreated resolves"
+        );
+
+        // Also verify the race where `AgentCreated` arrives right before the UI calls
+        // `interrupt_agent` using the stale `opt_*` ID stored in `replaced_optimistic_agents`.
+        let opt_id2 = core.create_agent_with_config(CreateAgentRequest {
+            host_id: "host_opt_cancel",
+            cwd: "/tmp/big_repo",
+            extra_dirs: Vec::new(),
+            provider: ProviderKind::Antigravity,
+            model: None,
+            effort: None,
+            fast_mode: None,
+            mode: SessionMode::FullAccess,
+            initial_prompt: "race test",
+            initial_display_prompt: None,
+            initial_badges: Vec::new(),
+            worktree_branch: None,
+            workspace_id: None,
+            handle: None,
+            auto_cluster: None,
+            acp_agent_id: None,
+        });
+        let create_req_id2 = loop {
+            match core.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            }) {
+                Ok(Some(crate::OutboundPayload::ConfirmedWire(
+                    WireMessage::CreateAgent { request_id, .. },
+                    receipt,
+                ))) => {
+                    receipt.send(Ok(())).expect("ack create 2");
+                    break request_id;
+                }
+                Ok(Some(crate::OutboundPayload::ConfirmedWire(_, receipt))) => {
+                    let _ = receipt.send(Ok(()));
+                }
+                Ok(Some(crate::OutboundPayload::Wire(_)))
+                | Ok(Some(crate::OutboundPayload::Terminal(_))) => {}
+                other => panic!("unexpected outbound payload before second CreateAgent: {other:?}"),
+            }
+        };
+        let mut real_agent2 = real_agent;
+        real_agent2.agent_id = "ag_real_replaced".into();
+        real_agent2.status = AgentStatus::Initializing;
+        core.handle_inbound_wire(
+            "host_opt_cancel",
+            WireMessage::AgentCreated {
+                request_id: create_req_id2,
+                agent: real_agent2,
+            },
+        );
+        core.interrupt_agent("host_opt_cancel", &opt_id2);
+        let replaced_card = core
+            .host_detail("host_opt_cancel")
+            .expect("detail")
+            .agents
+            .into_iter()
+            .find(|a| a.agent_id == "ag_real_replaced")
+            .expect("replaced real card");
+        assert!(!replaced_card.is_running);
+
+        let mut saw_replaced_interrupt = false;
+        let deadline2 = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline2 && !saw_replaced_interrupt {
+            match core.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            }) {
+                Ok(Some(crate::OutboundPayload::ConfirmedWire(
+                    WireMessage::InterruptTurn { agent_id, .. },
+                    receipt,
+                ))) => {
+                    receipt.send(Ok(())).expect("ack interrupt 2");
+                    if agent_id == "ag_real_replaced" {
+                        saw_replaced_interrupt = true;
+                    }
+                }
+                Ok(Some(crate::OutboundPayload::Wire(WireMessage::InterruptTurn {
+                    agent_id,
+                    ..
+                }))) => {
+                    if agent_id == "ag_real_replaced" {
+                        saw_replaced_interrupt = true;
+                    }
+                }
+                Ok(Some(crate::OutboundPayload::Wire(_)))
+                | Ok(Some(crate::OutboundPayload::Terminal(_))) => {}
+                Ok(Some(crate::OutboundPayload::ConfirmedWire(_, receipt))) => {
+                    let _ = receipt.send(Ok(()));
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(
+            saw_replaced_interrupt,
+            "interrupting stale opt_* ID after replacement must forward InterruptTurn to real agent_id"
+        );
     }
 }

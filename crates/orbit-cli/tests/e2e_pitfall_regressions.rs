@@ -8,6 +8,7 @@
 //! 7. Archiving an agent kills ONLY that agent's shim/PGID without broadcast-signaling siblings (`--` before `-<pgid>`)
 //! 8. Multi-agent non-interrupting subagent/peer delivery, thinking-stall progress telemetry, queue-preserving interrupt, and human preemption ordering
 //! 9. Antigravity interrupt/steer rollback handoff, empty-queue InterruptAndDrainQueue, multi-command shell isolation, native subagent live foreground polling + cancel + restart seq preservation, stderr notices, session_info_update title, and preempted-turn usage ledger
+//! 10. Non-blocking pruned workspace watcher + async CreateAgent + optimistic/Initializing cancel settlement
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -3698,4 +3699,158 @@ async fn pitfall_09_antigravity_interrupt_steer_bg_isolation_subagent_order_and_
 
     drop_core(core2).await;
     drop(rt2);
+}
+
+// ============================================================================
+// PITFALL 10: Non-blocking Pruned Workspace Watcher & Initializing Cancel
+// ============================================================================
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pitfall_10_nonblocking_workspace_watcher_and_initializing_cancel() {
+    install_mock_script(
+        &MOCK_ANTIGRAVITY_PATH,
+        ProviderKind::Antigravity,
+        "mock_agy_reg.py",
+        MOCK_ANTIGRAVITY_SCRIPT,
+    );
+
+    let home = new_temp_dir("p10_h");
+    let work = new_temp_dir("p10_w");
+
+    // Populate noisy directory subtrees that must be pruned by the watcher and never block
+    // agent creation or WS responsiveness.
+    std::fs::create_dir_all(work.join(".git/objects/aa/bb")).expect("mkdir git objects");
+    std::fs::create_dir_all(work.join(".git/logs/refs/heads")).expect("mkdir git logs");
+    std::fs::create_dir_all(work.join("node_modules/pkg/nested")).expect("mkdir node_modules");
+    std::fs::create_dir_all(work.join(".venv/lib/python3.12/site-packages")).expect("mkdir venv");
+    std::fs::create_dir_all(work.join("target/debug/deps")).expect("mkdir target");
+    for i in 0..40 {
+        std::fs::create_dir_all(work.join(format!("data_shard_{i}/sub"))).expect("mkdir shard");
+    }
+
+    let (addr, rt) = spawn_embedded_daemon(home.to_path_buf(), None)
+        .await
+        .expect("spawn daemon");
+    let uri = rt
+        .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .expect("offer")
+        .to_qr_uri()
+        .expect("uri");
+    let (core, host_id) = open_and_connect_core(home.join("c10.db"), uri).await;
+
+    // 1. Create a session in the large/noisy directory and confirm it replies quickly.
+    core.create_agent(
+        &host_id,
+        &work.to_string_lossy(),
+        ProviderKind::Antigravity,
+        SessionMode::FullAccess,
+        "ECHO=P10_FAST_CREATE",
+        None,
+    );
+    assert!(
+        wait_until(Duration::from_secs(12), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            async move {
+                c.host_detail(&hid).is_some_and(|d| {
+                    d.agents.iter().any(|a| {
+                        !a.agent_id.starts_with("opt_")
+                            && a.provider == ProviderKind::Antigravity
+                            && !a.is_running
+                            && a.latest_seq > 0
+                    })
+                })
+            }
+        })
+        .await,
+        "CreateAgent in noisy workspace must resolve and finish promptly"
+    );
+    let fast_ag = core
+        .host_detail(&host_id)
+        .expect("detail")
+        .agents
+        .into_iter()
+        .find(|a| !a.agent_id.starts_with("opt_"))
+        .expect("fast agent");
+    core.open_agent_timeline(&host_id, &fast_ag.agent_id);
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let aid = fast_ag.agent_id.clone();
+            async move { stage_settled_with_text(&c, &hid, &aid, "REPLY=P10_FAST_CREATE") }
+        })
+        .await,
+        "first agent must receive REPLY=P10_FAST_CREATE"
+    );
+
+    // 2. Create a second session that would block on WAIT_FILE and immediately cancel while it is
+    //    still optimistic (`opt_*`) / `Initializing`.
+    let never_gate = work.join("p10_never_gate.flag");
+    let opt_id = core.create_agent_with_config(orbit_client_core::app_core::CreateAgentRequest {
+        host_id: &host_id,
+        cwd: &work.to_string_lossy(),
+        extra_dirs: Vec::new(),
+        provider: ProviderKind::Antigravity,
+        model: None,
+        effort: None,
+        fast_mode: None,
+        mode: SessionMode::FullAccess,
+        initial_prompt: &format!("WAIT_FILE={} ECHO=SHOULD_CANCEL", never_gate.display()),
+        initial_display_prompt: None,
+        initial_badges: Vec::new(),
+        worktree_branch: None,
+        workspace_id: None,
+        handle: None,
+        auto_cluster: None,
+        acp_agent_id: None,
+    });
+    assert!(opt_id.starts_with("opt_"));
+
+    core.interrupt_agent(&host_id, &opt_id);
+    assert!(
+        core.host_detail(&host_id).is_some_and(|d| {
+            let effective_id = d
+                .replaced_optimistic_agents
+                .get(&opt_id)
+                .map(String::as_str)
+                .unwrap_or(opt_id.as_str());
+            d.agents
+                .iter()
+                .find(|a| a.agent_id == effective_id)
+                .is_some_and(|a| !a.is_running)
+        }),
+        "cancelling opt_* session must immediately exit Working/Running state locally"
+    );
+
+    // Wait until the daemon creates the real agent and settles it cleanly to Idle.
+    assert!(
+        wait_until(Duration::from_secs(12), || {
+            let store = Arc::clone(&rt.store);
+            let c = Arc::clone(&core);
+            let hid = host_id.clone();
+            let first_id = fast_ag.agent_id.clone();
+            async move {
+                let db_agents = store
+                    .list_agents_filtered(None, false, false, None)
+                    .unwrap_or_default();
+                let Some(second_db) = db_agents.into_iter().find(|a| a.agent_id != first_id) else {
+                    return false;
+                };
+                let db_idle = second_db.status == orbit_protocol::AgentStatus::Idle;
+                let ui_idle = c.host_detail(&hid).is_some_and(|d| {
+                    d.agents
+                        .iter()
+                        .find(|a| a.agent_id == second_db.agent_id)
+                        .is_some_and(|a| !a.is_running)
+                });
+                db_idle && ui_idle
+            }
+        })
+        .await,
+        "daemon and client must both settle cancelled optimistic/initializing session to Idle"
+    );
+
+    drop_core(core).await;
+    drop(rt);
 }

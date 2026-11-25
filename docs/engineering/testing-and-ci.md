@@ -56,6 +56,7 @@ In Release ([`release.yml`](../../.github/workflows/release.yml)) 与 TestFlight
 | `pitfall_07_archive_agent_terminates_only_target_shim_pgid_without_signaling_siblings` | Unix | 归档会话终止目标 `orbit shim` / PGID 时仅杀目标进程组，绝不因缺少 `--` 误触发 `kill(-1)` 波及同级会话或无关进程 |
 | `pitfall_08_multi_agent_non_interrupting_delivery_and_stall_recovery` | Unix | Antigravity + Codex + Claude 多代理非打断异步投递（`0 session/cancel` + `Queued -> Dispatched -> Settled` FIFO）、纯思考停滞检测（`latest_visible_progress_ms < latest_activity_ms`）+ 保队列打断继续（`interrupt_agent_and_continue`）及人类抢占重排优先顺序 |
 | `pitfall_09_antigravity_interrupt_steer_bg_isolation_subagent_order_and_stderr` | Unix | Antigravity 会话标题实时同步（`session_info_update`）、多命令 Shell 与后台任务隔离防劫持、打断/Steer 事务回滚上下文交接 + 原位 `bg_task` 收敛 + 抢占轮次用量补记（`usage_ledger`）、空队列 `InterruptAndDrainQueue` 干净回 `Idle`、原生子代理前后台实时轮询 + 中途取消 + 重启回放 `seq` 保序及致命 `stderr` 错误提示上浮 |
+| `pitfall_10_nonblocking_workspace_watcher_and_initializing_cancel` | Unix | 异步剪枝/限流工作区文件监听不阻塞 `CreateAgent` 与同连接 `Ping/Pong`、消除会话循环头阻塞、以及 `opt_*` / `Initializing` 阶段取消链路干净回落到 `Idle` |
 
 > **编写规则**：凡修复涉及消息流转、分端状态同步、Relay 建连或并行协作的生产 Bug，必须在同一 PR 中新增最小复现回归用例。
 

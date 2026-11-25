@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowRight, Cloud, Laptop, Server } from "lucide-react";
+import { Cloud, Laptop, Server } from "lucide-react";
 import {
   SettingCard,
   SettingGroupLabel,
   SettingResourceRow,
 } from "@/components/settings/settings-primitives";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useI18n } from "@/lib/i18n";
@@ -89,8 +90,8 @@ export function AddHostSection({ onPaired }: { onPaired: (id: string) => void })
               if (uri.trim()) void connect("uri", () => orbitIpc.pairHost(uri.trim()));
             }}
           >
-            <p className="text-ink-secondary text-[13px]">{t("settings.fleetUriHint")}</p>
-            <div className="flex gap-2">
+            <p className="text-ink-secondary text-[13px] leading-[1.45]">{t("settings.fleetUriHint")}</p>
+            <div className="flex items-center gap-2">
               <Input
                 type="password"
                 autoComplete="off"
@@ -102,9 +103,9 @@ export function AddHostSection({ onPaired }: { onPaired: (id: string) => void })
                 }}
                 aria-label={t("web.uri")}
                 placeholder="orbit://pair/…"
-                className="min-w-0 flex-1 font-mono"
+                className="h-[30px] min-w-0 flex-1 font-mono text-[13px]"
               />
-              <Button type="submit" disabled={!uri.trim() || pending !== null}>
+              <Button type="submit" size="sm" disabled={!uri.trim() || pending !== null} className="text-[13px]">
                 {t(pending === "uri" ? "web.connecting" : "web.connect")}
               </Button>
             </div>
@@ -129,7 +130,7 @@ export function AddHostSection({ onPaired }: { onPaired: (id: string) => void })
                   description={ssh.display_target}
                   action={
                     paired ? (
-                      t("settings.fleetPairedStatus")
+                      <Badge variant="secondary">{t("settings.fleetPairedStatus")}</Badge>
                     ) : (
                       <Button
                         size="sm"
@@ -138,6 +139,7 @@ export function AddHostSection({ onPaired }: { onPaired: (id: string) => void })
                         onClick={() =>
                           void connect(`ssh:${ssh.alias}`, () => orbitIpc.pairSshHost(ssh.alias))
                         }
+                        className="text-[13px]"
                       >
                         {t(pending === `ssh:${ssh.alias}` ? "web.connecting" : "web.connect")}
                       </Button>
@@ -155,16 +157,7 @@ export function AddHostSection({ onPaired }: { onPaired: (id: string) => void })
             icon={<Cloud />}
             title={t("settings.cloudSyncTitle")}
             description={t("settings.fleetCloudImport")}
-            action={
-              <Button
-                variant="ghost"
-                size="icon"
-                aria-label={t("settings.cloudSyncTitle")}
-                onClick={() => orbitActions.setSettingsSection("cloud_sync")}
-              >
-                <ArrowRight />
-              </Button>
-            }
+            onClick={() => orbitActions.setSettingsSection("cloud_sync")}
           />
         </SettingCard>
       )}

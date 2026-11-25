@@ -2,6 +2,7 @@ import { createContext, memo, useContext, useRef, type ReactNode } from "react";
 import { Dialog } from "@base-ui/react/dialog";
 import { ChevronRight, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Select, type SelectOption, type SelectProps } from "@/components/ui/select";
 import { HostStatusIndicator } from "@/components/ui/status-indicator";
 import { Switch } from "@/components/ui/switch";
@@ -210,6 +211,56 @@ export const SettingRow = memo(function SettingRow({
   );
 });
 
+export const SettingDisclosureCard = memo(function SettingDisclosureCard({
+  title,
+  description,
+  meta,
+  open,
+  defaultOpen = false,
+  onOpenChange,
+  settingId,
+  contentClassName,
+  children,
+}: SettingAnchorProps & {
+  title: ReactNode;
+  description?: ReactNode;
+  meta?: ReactNode;
+  open?: boolean;
+  defaultOpen?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  contentClassName?: string;
+  children: ReactNode;
+}) {
+  return (
+    <Collapsible
+      data-setting-id={settingId}
+      open={open}
+      defaultOpen={defaultOpen}
+      onOpenChange={onOpenChange}
+      className="border-border-subtle bg-surface-raised overflow-hidden rounded-[12px] border"
+    >
+      <CollapsibleTrigger className="group/disclosure hover:bg-surface-recessed/55 focus-visible:bg-surface-recessed/55 focus-visible:ring-ring/40 flex w-full cursor-pointer items-center justify-between gap-3 px-4 py-3 text-left transition-colors outline-none focus-visible:ring-1 focus-visible:ring-inset">
+        <span className="flex min-w-0 flex-1 items-center gap-2.5">
+          <ChevronRight
+            aria-hidden
+            className="text-ink-muted size-[14px] shrink-0 transition-transform duration-150 group-data-[panel-open]/disclosure:rotate-90 motion-reduce:transition-none"
+          />
+          <span className="min-w-0 flex-1">
+            <span className="text-ink-primary block truncate text-[13px] font-medium">{title}</span>
+            {description && (
+              <span className="text-ink-secondary mt-0.5 block truncate text-[11px]">{description}</span>
+            )}
+          </span>
+        </span>
+        {meta && <span className="flex shrink-0 items-center gap-2">{meta}</span>}
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <div className={cn("border-border-subtle border-t", contentClassName)}>{children}</div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+});
+
 interface ResourceRowProps {
   title: ReactNode;
   description?: ReactNode;
@@ -231,14 +282,20 @@ export const SettingResourceRow = memo(function SettingResourceRow({
 }: ResourceRowProps) {
   const body = (
     <>
-      {icon && <span className="text-ink-muted shrink-0">{icon}</span>}
+      {icon && (
+        <span className="text-ink-muted flex size-[18px] shrink-0 items-center justify-center [&_svg]:size-[15px] [&_svg]:stroke-[1.75]">
+          {icon}
+        </span>
+      )}
       <span className="min-w-0 flex-1">
         <span className="text-ink-primary block break-words text-[13px] font-medium">{title}</span>
         {description && (
           <span className="text-ink-muted mt-0.5 block break-words text-[11px]">{description}</span>
         )}
       </span>
-      {status && <span className="text-ink-secondary shrink-0 text-[11px]">{status}</span>}
+      {status && (
+        <span className="text-ink-secondary shrink-0 font-mono text-[11px] tabular-nums">{status}</span>
+      )}
       {onClick && <ChevronRight className="text-ink-faint size-[14px] shrink-0" />}
     </>
   );

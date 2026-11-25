@@ -64,9 +64,11 @@ function RuleRelativeTime({
 export function PermissionRulesPanel({
   hostId,
   isOnline,
+  embedded = false,
 }: {
   hostId: string;
   isOnline: boolean;
+  embedded?: boolean;
 }) {
   const { t } = useI18n();
   const rulesSelector = useMemo(() => createHostPermissionRulesSelector(hostId), [hostId]);
@@ -291,90 +293,74 @@ export function PermissionRulesPanel({
     Boolean(draft.pattern.trim()) &&
     (draft.scopeKind !== "project" || Boolean(draft.projectCwd.trim()));
 
-  return (
-    <div className="flex flex-col gap-2">
-      <SettingGroupLabel
-        action={
-          isOnline ? (
-            <div className="flex items-center gap-1.5">
-              {alwaysAllowCount >= 2 && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="xs"
-                  disabled={rulesSnap.saving}
-                  onClick={() => setConfirmRevokeAllOpen(true)}
-                  className="text-ink-muted hover:text-signal-danger"
-                >
-                  {t("permissionRules.revokeAllAlwaysAllow", { count: alwaysAllowCount })}
-                </Button>
-              )}
-              <Button
-                type="button"
-                variant="outline"
-                size="xs"
-                disabled={rulesSnap.saving}
-                onClick={() => (showAddForm ? setShowAddForm(false) : openAddForm())}
-              >
-                {showAddForm ? (
-                  <X data-icon="inline-start" />
-                ) : (
-                  <Plus data-icon="inline-start" />
-                )}
-                <span>{showAddForm ? t("common.cancel") : t("permissionRules.addRule")}</span>
-              </Button>
-            </div>
-          ) : undefined
-        }
+  const actionButtons = isOnline ? (
+    <div className="flex shrink-0 items-center gap-1.5">
+      {alwaysAllowCount >= 2 && (
+        <Button
+          type="button"
+          variant="ghost"
+          size={embedded ? "sm" : "xs"}
+          disabled={rulesSnap.saving}
+          onClick={() => setConfirmRevokeAllOpen(true)}
+          className="text-ink-muted hover:text-signal-danger text-[13px]"
+        >
+          {t("permissionRules.revokeAllAlwaysAllow", { count: alwaysAllowCount })}
+        </Button>
+      )}
+      <Button
+        type="button"
+        variant="outline"
+        size={embedded ? "sm" : "xs"}
+        disabled={rulesSnap.saving}
+        onClick={() => (showAddForm ? setShowAddForm(false) : openAddForm())}
+        className={embedded ? "text-[13px]" : undefined}
       >
-        <span className="inline-flex items-center gap-1.5">
-          <span>{t("permissionRules.sectionTitle")}</span>
-          {rulesSnap.rules.length > 0 && (
-            <span className="text-ink-faint font-mono tabular-nums">
-              {rulesSnap.rules.length}
-            </span>
-          )}
-        </span>
-      </SettingGroupLabel>
+        {showAddForm ? <X className="size-[13px]" /> : <Plus className="size-[13px]" />}
+        <span>{showAddForm ? t("common.cancel") : t("permissionRules.addRule")}</span>
+      </Button>
+    </div>
+  ) : null;
 
-      <SettingCard>
-        <div className="flex flex-col gap-2.5 px-4 py-3">
-          <div className="text-ink-secondary text-[13px] leading-[1.45]">
-            {t("permissionRules.sectionSubtitle")}
-          </div>
+  const body = (
+    <>
+      <div className="flex flex-col gap-2.5 px-4 py-3.5">
+        <div className="text-ink-secondary text-[13px] leading-[1.45]">
+          {t("permissionRules.sectionSubtitle")}
+        </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="relative min-w-[200px] flex-1">
-              <Search className="text-ink-faint pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2" />
-              <Input
-                type="text"
-                value={query}
-                disabled={!isOnline}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder={t("permissionRules.searchPlaceholder")}
-                className="h-[30px] pl-8 text-[13px]"
-              />
-            </div>
-            <SettingSelect
-              value={filterTab}
-              options={filterOptions}
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="relative min-w-[200px] flex-1">
+            <Search className="text-ink-faint pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2" />
+            <Input
+              type="text"
+              value={query}
               disabled={!isOnline}
-              size="sm"
-              onChange={setFilterTab}
-              triggerClassName="w-[144px]"
-              menuClassName="w-[168px]"
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder={t("permissionRules.searchPlaceholder")}
+              className="h-[30px] pl-8 text-[13px]"
             />
           </div>
-
-          {rulesSnap.error && (
-            <div
-              role="alert"
-              className="border-signal-danger-border bg-signal-danger-bg text-signal-danger rounded-lg border px-3 py-2 text-[13px]"
-            >
-              {rulesSnap.error}
-            </div>
-          )}
+          <SettingSelect
+            value={filterTab}
+            options={filterOptions}
+            disabled={!isOnline}
+            size="sm"
+            onChange={setFilterTab}
+            triggerClassName="w-[144px]"
+            menuClassName="w-[168px]"
+          />
+          {embedded && actionButtons}
         </div>
+
+        {rulesSnap.error && (
+          <div
+            role="alert"
+            className="border-signal-danger-border bg-signal-danger-bg text-signal-danger rounded-lg border px-3 py-2 text-[13px]"
+          >
+            {rulesSnap.error}
+          </div>
+        )}
+      </div>
 
         {showAddForm && (
           <div className="bg-surface-recessed/55 px-4 py-3.5">
@@ -557,127 +543,130 @@ export function PermissionRulesPanel({
           </div>
         )}
 
-        {isLoading ? (
-          <div className="text-ink-muted flex items-center justify-center gap-2 px-4 py-8 text-[13px]">
-            <OrbitSpinner size={14} />
-            <span>{t("permissionRules.loading")}</span>
-          </div>
-        ) : rulesSnap.rules.length === 0 ? (
-          <Empty className="py-7">
-            <EmptyHeader>
-              <EmptyMedia variant="icon">
-                <Shield />
-              </EmptyMedia>
-              <EmptyTitle className="text-[13px]">{t("permissionRules.emptyTitle")}</EmptyTitle>
-              <EmptyDescription>{t("permissionRules.emptyDescription")}</EmptyDescription>
-            </EmptyHeader>
-          </Empty>
-        ) : filteredRules.length === 0 ? (
-          <div className="text-ink-muted px-4 py-6 text-center text-[13px]">
-            {t("permissionRules.noFilterMatches")}
-          </div>
-        ) : (
-          <div className="orbit-native-scroll divide-border-subtle max-h-[340px] divide-y overflow-y-auto overscroll-contain">
-            {filteredRules.map((rule) => {
-              const isDeny = rule.decision === "deny";
-              const providerLabel =
-                formatProviderShortLabel(rule.provider) ?? t("permissionRules.providerAll");
-              const projectName =
-                rule.scope_kind === "project" ? basenameFromPath(rule.project_cwd) : null;
+      {isLoading ? (
+        <div className="text-ink-muted flex items-center justify-center gap-2 px-4 py-8 text-[13px]">
+          <OrbitSpinner size={14} />
+          <span>{t("permissionRules.loading")}</span>
+        </div>
+      ) : rulesSnap.rules.length === 0 ? (
+        <Empty className="py-7">
+          <EmptyHeader>
+            <EmptyMedia variant="icon">
+              <Shield />
+            </EmptyMedia>
+            <EmptyTitle className="text-[13px]">{t("permissionRules.emptyTitle")}</EmptyTitle>
+            <EmptyDescription>{t("permissionRules.emptyDescription")}</EmptyDescription>
+          </EmptyHeader>
+        </Empty>
+      ) : filteredRules.length === 0 ? (
+        <div className="text-ink-muted px-4 py-6 text-center text-[13px]">
+          {t("permissionRules.noFilterMatches")}
+        </div>
+      ) : (
+        <div className="orbit-native-scroll divide-border-subtle max-h-[340px] divide-y overflow-y-auto overscroll-contain">
+          {filteredRules.map((rule) => {
+            const isDeny = rule.decision === "deny";
+            const providerLabel =
+              formatProviderShortLabel(rule.provider) ?? t("permissionRules.providerAll");
+            const projectName =
+              rule.scope_kind === "project" ? basenameFromPath(rule.project_cwd) : null;
 
-              return (
-                <div
-                  key={rule.id}
-                  className="flex items-start justify-between gap-3 px-4 py-3 transition-colors hover:bg-surface-recessed/35"
-                >
-                  <div className="flex min-w-0 flex-1 flex-col gap-1.5">
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <Badge variant={isDeny ? "destructive" : "success"}>
-                        {isDeny ? (
-                          <ShieldBan className="size-3" />
-                        ) : (
-                          <ShieldCheck className="size-3" />
-                        )}
-                        <span>
-                          {isDeny
-                            ? t("permissionRules.decisionDeny")
-                            : t("permissionRules.decisionAllow")}
-                        </span>
-                      </Badge>
-                      <code className="text-ink-primary min-w-0 truncate font-mono text-[13px] font-medium">
-                        {rule.pattern}
-                      </code>
-                    </div>
-
-                    <div className="text-ink-muted flex flex-wrap items-center gap-1.5 text-[11px]">
-                      {rule.scope_kind === "project" ? (
-                        <SimpleTooltip label={rule.project_cwd ?? ""} side="top">
-                          <Badge variant="outline" className="font-mono text-[11px]">
-                            {t("permissionRules.scopeProject")}: {projectName || rule.project_cwd}
-                          </Badge>
-                        </SimpleTooltip>
+            return (
+              <div
+                key={rule.id}
+                className="flex items-start justify-between gap-3 px-4 py-3 transition-colors hover:bg-surface-recessed/35"
+              >
+                <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <Badge variant={isDeny ? "destructive" : "success"}>
+                      {isDeny ? (
+                        <ShieldBan className="size-3" />
                       ) : (
-                        <Badge variant="outline" className="text-[11px]">
-                          {t("permissionRules.scopeHost")}
-                        </Badge>
+                        <ShieldCheck className="size-3" />
                       )}
-
-                      <Badge variant="secondary" className="text-[11px]">
-                        {rule.source === "always_allow_grant"
-                          ? t("permissionRules.sourceAlwaysAllow")
-                          : t("permissionRules.sourceManual")}
-                      </Badge>
-
                       <span>
-                        {toolKindLabel(rule.tool_kind)} · {patternKindLabel(rule.pattern_kind)}
+                        {isDeny
+                          ? t("permissionRules.decisionDeny")
+                          : t("permissionRules.decisionAllow")}
                       </span>
-                      <span aria-hidden="true">·</span>
-                      <span>{providerLabel}</span>
-                      <span aria-hidden="true">·</span>
-                      <span className="font-mono tabular-nums">
-                        {formatMatchCount(rule.match_count)}
-                      </span>
-                      {rule.last_matched_at ? (
-                        <>
-                          <span aria-hidden="true">·</span>
-                          <RuleRelativeTime
-                            isoTimestamp={rule.last_matched_at}
-                            prefixKey="permissionRules.lastMatched"
-                          />
-                        </>
-                      ) : (
-                        <>
-                          <span aria-hidden="true">·</span>
-                          <RuleRelativeTime isoTimestamp={rule.created_at} />
-                        </>
-                      )}
-                    </div>
+                    </Badge>
+                    <code className="text-ink-primary min-w-0 truncate font-mono text-[13px] font-medium">
+                      {rule.pattern}
+                    </code>
+                  </div>
 
-                    {rule.note && (
-                      <div className="text-ink-tertiary truncate text-[11px]">{rule.note}</div>
+                  <div className="text-ink-muted flex flex-wrap items-center gap-1.5 text-[11px]">
+                    {rule.scope_kind === "project" ? (
+                      <SimpleTooltip label={rule.project_cwd ?? ""} side="top">
+                        <Badge variant="outline" className="font-mono text-[11px]">
+                          {t("permissionRules.scopeProject")}: {projectName || rule.project_cwd}
+                        </Badge>
+                      </SimpleTooltip>
+                    ) : (
+                      <Badge variant="outline" className="text-[11px]">
+                        {t("permissionRules.scopeHost")}
+                      </Badge>
+                    )}
+
+                    <Badge variant="secondary" className="text-[11px]">
+                      {rule.source === "always_allow_grant"
+                        ? t("permissionRules.sourceAlwaysAllow")
+                        : t("permissionRules.sourceManual")}
+                    </Badge>
+
+                    <span>
+                      {toolKindLabel(rule.tool_kind)} · {patternKindLabel(rule.pattern_kind)}
+                    </span>
+                    <span aria-hidden="true">·</span>
+                    <span>{providerLabel}</span>
+                    <span aria-hidden="true">·</span>
+                    <span className="font-mono tabular-nums">
+                      {formatMatchCount(rule.match_count)}
+                    </span>
+                    {rule.last_matched_at ? (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <RuleRelativeTime
+                          isoTimestamp={rule.last_matched_at}
+                          prefixKey="permissionRules.lastMatched"
+                        />
+                      </>
+                    ) : (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <RuleRelativeTime isoTimestamp={rule.created_at} />
+                      </>
                     )}
                   </div>
 
-                  <SimpleTooltip label={t("permissionRules.revokeAction")} side="top">
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      disabled={rulesSnap.saving}
-                      aria-label={`${t("permissionRules.revokeAction")} ${rule.pattern}`}
-                      onClick={() => setRevokeTarget(rule)}
-                      className="text-ink-muted hover:bg-signal-danger-bg hover:text-signal-danger shrink-0"
-                    >
-                      <Trash2 className="size-3.5" />
-                    </Button>
-                  </SimpleTooltip>
+                  {rule.note && (
+                    <div className="text-ink-tertiary truncate text-[11px]">{rule.note}</div>
+                  )}
                 </div>
-              );
-            })}
-          </div>
-        )}
-      </SettingCard>
 
+                <SimpleTooltip label={t("permissionRules.revokeAction")} side="top">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    disabled={rulesSnap.saving}
+                    aria-label={`${t("permissionRules.revokeAction")} ${rule.pattern}`}
+                    onClick={() => setRevokeTarget(rule)}
+                    className="text-ink-muted hover:bg-signal-danger-bg hover:text-signal-danger shrink-0"
+                  >
+                    <Trash2 className="size-3.5" />
+                  </Button>
+                </SimpleTooltip>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </>
+  );
+
+  const dialogs = (
+    <>
       <ConfirmDialog
         open={revokeTarget !== null}
         onOpenChange={(open) => {
@@ -713,6 +702,33 @@ export function PermissionRulesPanel({
         tone="danger"
         onConfirm={handleConfirmRevokeAllAlwaysAllow}
       />
+    </>
+  );
+
+  if (embedded) {
+    return (
+      <>
+        <div className="divide-border-subtle divide-y">{body}</div>
+        {dialogs}
+      </>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      <SettingGroupLabel action={actionButtons ?? undefined}>
+        <span className="inline-flex items-center gap-1.5">
+          <span>{t("permissionRules.sectionTitle")}</span>
+          {rulesSnap.rules.length > 0 && (
+            <span className="text-ink-faint font-mono tabular-nums">
+              {rulesSnap.rules.length}
+            </span>
+          )}
+        </span>
+      </SettingGroupLabel>
+
+      <SettingCard>{body}</SettingCard>
+      {dialogs}
     </div>
   );
 }

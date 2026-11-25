@@ -43,23 +43,18 @@ export const HostsFleetSection = memo(function HostsFleetSection({
   }
   const visibleHost = detail ?? (localOnly ? hosts[0] : null);
   return (
-    <div className="flex flex-col gap-[24px]">
+    <div className="flex flex-col gap-6">
       <SettingPageHeader
         title={detail ? detail.display_name : t("settings.nav4Hosts")}
         breadcrumb={
           detail ? (
-            <nav
-              className="flex items-center gap-2 text-[11px]"
-              aria-label={t("settings.connectionTitle")}
+            <button
+              type="button"
+              onClick={onOverview}
+              className="text-ink-muted hover:text-ink-primary cursor-pointer text-[13px] font-medium transition-colors"
             >
-              <Button variant="link" className="h-auto p-0 text-[11px]" onClick={onOverview}>
-                {t("settings.nav4Hosts")}
-              </Button>
-              <span aria-hidden="true">/</span>
-              <span aria-current="page" className="truncate">
-                {detail.display_name}
-              </span>
-            </nav>
+              {t("settings.nav4Hosts")}
+            </button>
           ) : undefined
         }
         description={t(detail ? "settings.connectionDesc" : "settings.fleetDescription")}
@@ -70,9 +65,10 @@ export const HostsFleetSection = memo(function HostsFleetSection({
               variant="outline"
               size="sm"
               onClick={() => orbitActions.setSettingsSection("add_host")}
+              className="text-[13px]"
             >
-              <Plus data-icon="inline-start" />
-              {t(localOnly ? "settings.fleetConnectRemote" : "settings.fleetConnectHost")}
+              <Plus className="size-[13px]" />
+              <span>{t(localOnly ? "settings.fleetConnectRemote" : "settings.fleetConnectHost")}</span>
             </Button>
           )
         }

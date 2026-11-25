@@ -16,12 +16,13 @@ import { ConnectedHostMesh } from "@/components/settings/connected-host-mesh";
 import {
   HostStatusIndicator,
   SettingCard,
-  SettingGroupLabel,
+  SettingDisclosureCard,
+  SettingGroup,
   SettingRow,
   hostConnectionLabel,
 } from "@/components/settings/settings-primitives";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Input } from "@/components/ui/input";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
@@ -217,18 +218,15 @@ export const HostConnectionSection = memo(function HostConnectionSection({
   };
 
   return (
-    <div className="flex flex-col gap-[20px]">
-      {/* Status & Actions */}
-      <div className="space-y-2">
-        <SettingGroupLabel>
-          {inlinePairing ? host.display_name : t("settings.groupStatus")}
-        </SettingGroupLabel>
+    <div className="flex flex-col gap-6">
+      {/* Status, Service & Mobile Pairing */}
+      <SettingGroup title={inlinePairing ? host.display_name : t("settings.groupStatus")}>
         <SettingCard>
           <SettingRow
             title={
               <span className="inline-flex items-center gap-2">
                 <HostStatusIndicator state={host.connection_state} />
-                {hostConnectionLabel(host.connection_state)}
+                <span>{hostConnectionLabel(host.connection_state)}</span>
               </span>
             }
             description={
@@ -250,31 +248,11 @@ export const HostConnectionSection = memo(function HostConnectionSection({
                   .catch((err) => orbitActions.showToast(String(err)));
                 orbitActions.showToast(t("settings.reconnectingHost", { host: host.display_name }));
               }}
-              className="px-2.5"
+              className="text-[13px]"
             >
               <RefreshCw className="size-[13px]" />
               <span>{t("banner.reconnect")}</span>
             </Button>
-          </SettingRow>
-
-          <SettingRow
-            settingId="settings.mobilePairing"
-            title={t("settings.mobilePairing")}
-            description={t("settings.pairingQrDesc", { host: host.display_name })}
-          >
-            {inlinePairing ? (
-              <PairingQrCard
-                compact
-                hostId={hostId}
-                hostName={host.display_name}
-                className="max-w-[224px]"
-              />
-            ) : (
-              <Button variant="outline" size="sm" onClick={() => setPairingQrOpen(true)}>
-                <QrCode data-icon="inline-start" />
-                {t("settings.showQr")}
-              </Button>
-            )}
           </SettingRow>
 
           <SettingRow
@@ -293,115 +271,135 @@ export const HostConnectionSection = memo(function HostConnectionSection({
                   : t("settings.hostServiceDesc")
             }
           >
-            <div className="flex items-center gap-1.5">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={upgrading || isFleetBusy}
+              onClick={() => void handleUpgradeDaemon()}
+              className="text-[13px]"
+            >
+              {upgrading ? (
+                <OrbitSpinner size={13} />
+              ) : isDaemonOutdated ? (
+                <ArrowUpCircle className="size-[13px]" />
+              ) : (
+                <RefreshCw className="size-[13px]" />
+              )}
+              <span>
+                {upgrading
+                  ? t("common.updating")
+                  : isDaemonOutdated
+                    ? t("common.update")
+                    : isLocal
+                      ? t("settings.restart")
+                      : t("common.update")}
+              </span>
+            </Button>
+          </SettingRow>
+
+          {inlinePairing ? (
+            <div data-setting-id="settings.mobilePairing">
+              <PairingQrCard
+                layout="inline"
+                hostId={hostId}
+                hostName={host.display_name}
+                title={t("settings.mobilePairing")}
+                description={t("settings.pairingQrDesc", { host: host.display_name })}
+              />
+            </div>
+          ) : (
+            <SettingRow
+              settingId="settings.mobilePairing"
+              title={t("settings.mobilePairing")}
+              description={t("settings.pairingQrDesc", { host: host.display_name })}
+            >
               <Button
-                type="button"
                 variant="outline"
                 size="sm"
-                disabled={upgrading || isFleetBusy}
-                onClick={() => void handleUpgradeDaemon()}
-                className="px-2.5"
+                onClick={() => setPairingQrOpen(true)}
+                className="text-[13px]"
               >
-                {upgrading ? (
-                  <OrbitSpinner size={13} className="size-[13px]" />
-                ) : isDaemonOutdated ? (
-                  <ArrowUpCircle className="size-[13.5px]" />
-                ) : (
-                  <RefreshCw className="size-[13px]" />
-                )}
-                <span>
-                  {upgrading
-                    ? t("common.updating")
-                    : isDaemonOutdated
-                      ? t("common.update")
-                      : isLocal
-                        ? t("settings.restart")
-                        : t("common.update")}
-                </span>
+                <QrCode className="size-[13px]" />
+                <span>{t("settings.showQr")}</span>
               </Button>
-            </div>
-          </SettingRow>
+            </SettingRow>
+          )}
         </SettingCard>
-      </div>
+      </SettingGroup>
 
       <ConnectedHostMesh hostId={hostId} />
 
-      {/* Identity */}
-      <details className="group border-border-subtle rounded-xl border bg-surface-raised">
-        <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-[13px] font-medium">
-          <ChevronRight className="size-[13px] text-ink-muted transition-transform group-open:rotate-90" />
-          {t("settings.fleetHostIdentity")}
-        </summary>
-
-        <div className="space-y-2.5 px-4 py-3.5 text-[13px]">
-          <div className="flex items-center justify-between gap-4">
+      {/* Identity & Advanced Network Disclosures */}
+      <div className="flex flex-col gap-3">
+        <SettingDisclosureCard
+          title={t("settings.fleetHostIdentity")}
+          meta={
+            <Badge variant="secondary" className="max-w-[180px] truncate font-mono tabular-nums">
+              {host.host_id}
+            </Badge>
+          }
+          contentClassName="divide-border-subtle divide-y"
+        >
+          <div className="flex items-center justify-between gap-4 px-4 py-2.5 text-[13px]">
             <span className="text-ink-muted shrink-0">Host ID</span>
             <button
               type="button"
               onClick={() => void copyValue("id", host.host_id)}
-              className="selectable-text text-ink-primary/90 hover:text-ink-primary inline-flex min-w-0 cursor-pointer items-center gap-1.5 font-mono text-[13px]"
+              className="selectable-text text-ink-primary hover:bg-surface-recessed inline-flex min-w-0 cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 font-mono text-[13px] transition-colors"
             >
               <span className="truncate">{host.host_id}</span>
               {copiedField === "id" ? (
-                <Check className="text-signal-success size-[12.5px] shrink-0" />
+                <Check className="text-signal-success size-[13px] shrink-0" />
               ) : (
-                <Copy className="text-ink-muted size-[12.5px] shrink-0 opacity-70" />
+                <Copy className="text-ink-muted size-[13px] shrink-0 opacity-70" />
               )}
             </button>
           </div>
 
-          <div className="flex items-center justify-between gap-4">
+          <div className="flex items-center justify-between gap-4 px-4 py-2.5 text-[13px]">
             <span className="text-ink-muted shrink-0">{t("settings.fleetPublicKey")}</span>
             <button
               type="button"
               onClick={() => void copyValue("pubkey", host.daemon_pubkey_b64)}
-              className="selectable-text text-ink-primary/90 hover:text-ink-primary inline-flex min-w-0 cursor-pointer items-center gap-1.5 font-mono text-[13px]"
+              className="selectable-text text-ink-primary hover:bg-surface-recessed inline-flex min-w-0 cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 font-mono text-[13px] transition-colors"
             >
               <span className="truncate">{host.daemon_pubkey_b64.slice(0, 26)}…</span>
               {copiedField === "pubkey" ? (
-                <Check className="text-signal-success size-[12.5px] shrink-0" />
+                <Check className="text-signal-success size-[13px] shrink-0" />
               ) : (
-                <Copy className="text-ink-muted size-[12.5px] shrink-0 opacity-70" />
+                <Copy className="text-ink-muted size-[13px] shrink-0 opacity-70" />
               )}
             </button>
           </div>
 
-          <div className="flex items-center justify-between gap-4">
+          <div className="flex items-center justify-between gap-4 px-4 py-2.5 text-[13px]">
             <span className="text-ink-muted shrink-0">{t("settings.fleetEndpoints")}</span>
-            <span className="selectable-text text-ink-primary/85 truncate font-mono text-[13px]">
+            <span className="selectable-text text-ink-secondary truncate px-2 py-1 font-mono text-[13px]">
               {host.direct_endpoints.join(", ") || "—"}
             </span>
           </div>
-        </div>
-      </details>
+        </SettingDisclosureCard>
 
-      {/* Advanced Network & Custom Relay (Collapsed by default; auto-managed across Fleet) */}
-      <Collapsible
-        data-setting-id="settings.advancedRelayTitle"
-        open={relayExpanded}
-        onOpenChange={setRelayExpanded}
-        className="border-border-subtle bg-surface-raised/60 rounded-[13px] border px-4 py-3"
-      >
-        <CollapsibleTrigger className="group/relay flex w-full cursor-pointer items-center justify-between gap-2 text-left outline-none">
-          <span className="flex min-w-0 items-center gap-2">
-            <ChevronRight className="text-ink-muted size-3.5 shrink-0 transition-transform duration-150 group-data-[panel-open]/relay:rotate-90" />
-            <span className="text-ink-primary text-[13px] font-medium">
-              {t("settings.advancedRelayTitle")}
-            </span>
-          </span>
-          <span className="bg-surface-recessed text-ink-muted max-w-[220px] shrink-0 truncate rounded-md px-2 py-0.5 font-mono text-[11px]">
-            {host.relay_url
-              ? redactRelayForDisplay(host.relay_url)
-              : t("settings.advancedRelayAutoBadge")}
-          </span>
-        </CollapsibleTrigger>
-
-        <CollapsibleContent className="space-y-3 pt-3 transition-opacity">
-          <p className="text-ink-muted text-[13px] leading-relaxed">
+        <SettingDisclosureCard
+          settingId="settings.advancedRelayTitle"
+          open={relayExpanded}
+          onOpenChange={setRelayExpanded}
+          title={t("settings.advancedRelayTitle")}
+          meta={
+            <Badge variant="secondary" className="max-w-[220px] truncate font-mono">
+              {host.relay_url
+                ? redactRelayForDisplay(host.relay_url)
+                : t("settings.advancedRelayAutoBadge")}
+            </Badge>
+          }
+          contentClassName="flex flex-col gap-3 px-4 py-3.5"
+        >
+          <p className="text-ink-secondary text-[13px] leading-[1.45]">
             {t("settings.advancedRelayDesc")}
           </p>
 
-          <div className="flex flex-wrap gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <Input
               type="text"
               value={relayInput}
@@ -412,13 +410,14 @@ export const HostConnectionSection = memo(function HostConnectionSection({
                 if (e.key === "Enter" && relayDirty) handleRequestSaveRelay();
               }}
               placeholder="wss://relay.example.com"
-              className="h-[34px] min-w-[200px] flex-1 px-3 font-mono"
+              className="h-[30px] min-w-[200px] flex-1 px-2.5 font-mono text-[13px]"
             />
             <Button
               type="button"
+              size="sm"
               disabled={!relayDirty}
               onClick={handleRequestSaveRelay}
-              className="h-[34px] px-3.5"
+              className="text-[13px]"
             >
               {t("settings.fleetSave")}
             </Button>
@@ -426,11 +425,12 @@ export const HostConnectionSection = memo(function HostConnectionSection({
               <Button
                 type="button"
                 variant="outline"
+                size="sm"
                 disabled={sharingRelay}
                 onClick={() => openRelayConfirm({ kind: "share_all", relayUrl: relayInput.trim() })}
-                className="h-[34px] gap-1.5 px-3 text-[13px]"
+                className="text-[13px]"
               >
-                {sharingRelay && <OrbitSpinner size={13.5} className="size-[13.5px]" />}
+                {sharingRelay && <OrbitSpinner size={13} />}
                 <span>{t("settings.fleetShareRelay")}</span>
               </Button>
             )}
@@ -438,8 +438,9 @@ export const HostConnectionSection = memo(function HostConnectionSection({
               <Button
                 type="button"
                 variant="outline"
+                size="sm"
                 onClick={() => openRelayConfirm({ kind: "clear" })}
-                className="h-[34px] px-3"
+                className="text-[13px]"
               >
                 {t("settings.fleetClear")}
               </Button>
@@ -447,23 +448,23 @@ export const HostConnectionSection = memo(function HostConnectionSection({
           </div>
 
           {sshHosts.length > 0 && (
-            <div className="pt-0.5">
+            <div className="flex flex-col gap-2 pt-0.5">
               <button
                 type="button"
                 onClick={() => setShowSshDeploy((v) => !v)}
-                className="text-ink-muted hover:text-ink-primary inline-flex cursor-pointer items-center gap-1 text-[13px] font-medium transition-colors"
+                className="text-ink-secondary hover:text-ink-primary inline-flex w-fit cursor-pointer items-center gap-1.5 text-[13px] font-medium transition-colors"
               >
                 {showSshDeploy ? (
-                  <ChevronDown className="h-[13.5px] w-[13.5px]" />
+                  <ChevronDown className="size-[13px]" />
                 ) : (
-                  <ChevronRight className="h-[13.5px] w-[13.5px]" />
+                  <ChevronRight className="size-[13px]" />
                 )}
                 <span>{t("settings.fleetDeploySsh")}</span>
               </button>
 
               {showSshDeploy && (
-                <div className="space-y-2.5 pt-2">
-                  <div className="orbit-native-scroll border-border-subtle divide-border-subtle max-h-48 divide-y overflow-y-auto overscroll-contain rounded-[10px] border">
+                <div className="flex flex-col gap-2.5 pt-0.5">
+                  <div className="orbit-native-scroll border-border-subtle bg-surface-recessed/40 divide-border-subtle max-h-48 divide-y overflow-y-auto overscroll-contain rounded-[10px] border">
                     {sshHosts.map((s) => (
                       <div
                         key={s.alias}
@@ -492,9 +493,9 @@ export const HostConnectionSection = memo(function HostConnectionSection({
                             className="shrink-0 gap-1.5 text-[11px]"
                           >
                             {deployingSsh === s.alias ? (
-                              <OrbitSpinner size={12} className="size-3" />
+                              <OrbitSpinner size={12} />
                             ) : (
-                              <Cloud className="size-3" />
+                              <Cloud className="size-[12px]" />
                             )}
                             <span>{t("settings.deployCloudflareShort")}</span>
                           </Button>
@@ -507,9 +508,9 @@ export const HostConnectionSection = memo(function HostConnectionSection({
                             className="shrink-0 gap-1.5 text-[11px]"
                           >
                             {deployingSsh === s.alias ? (
-                              <OrbitSpinner size={12} className="size-3" />
+                              <OrbitSpinner size={12} />
                             ) : (
-                              <Radio className="size-3" />
+                              <Radio className="size-[12px]" />
                             )}
                             <span>{t("settings.fleetDeploy")}</span>
                           </Button>
@@ -518,16 +519,16 @@ export const HostConnectionSection = memo(function HostConnectionSection({
                     ))}
                   </div>
 
-                  <div className="space-y-2">
+                  <div className="flex flex-col gap-2">
                     <button
                       type="button"
                       onClick={() => setShowCfCustom((v) => !v)}
-                      className="text-ink-muted hover:text-ink-primary inline-flex cursor-pointer items-center gap-1 text-[11px] font-medium transition-colors"
+                      className="text-ink-muted hover:text-ink-primary inline-flex w-fit cursor-pointer items-center gap-1 text-[11px] font-medium transition-colors"
                     >
                       {showCfCustom ? (
-                        <ChevronDown className="size-3" />
+                        <ChevronDown className="size-[12px]" />
                       ) : (
-                        <ChevronRight className="size-3" />
+                        <ChevronRight className="size-[12px]" />
                       )}
                       <span>{t("settings.deployCfCustomToggle")}</span>
                     </button>
@@ -540,7 +541,7 @@ export const HostConnectionSection = memo(function HostConnectionSection({
                           onChange={(e) => setCfHostname(e.target.value)}
                           {...ime.compositionProps}
                           placeholder={t("settings.deployCfHostnamePlaceholder")}
-                          className="h-[32px] px-2.5 font-mono text-[13px]"
+                          className="h-[30px] px-2.5 font-mono text-[13px]"
                         />
                         <Input
                           type="password"
@@ -548,7 +549,7 @@ export const HostConnectionSection = memo(function HostConnectionSection({
                           onChange={(e) => setCfTunnelToken(e.target.value)}
                           {...ime.compositionProps}
                           placeholder={t("settings.deployCfTokenPlaceholder")}
-                          className="h-[32px] px-2.5 font-mono text-[13px]"
+                          className="h-[30px] px-2.5 font-mono text-[13px]"
                         />
                       </div>
                     )}
@@ -559,13 +560,15 @@ export const HostConnectionSection = memo(function HostConnectionSection({
           )}
 
           {relayStatusMsg && (
-            <div className="selectable-text text-ink-primary/90 text-[13px]">{relayStatusMsg}</div>
+            <div className="selectable-text border-border-subtle bg-surface-recessed/50 text-ink-secondary rounded-lg border px-3 py-2 text-[13px]">
+              {relayStatusMsg}
+            </div>
           )}
-        </CollapsibleContent>
-      </Collapsible>
+        </SettingDisclosureCard>
+      </div>
 
       {/* Danger Zone: Remove host */}
-      <SettingCard>
+      <SettingCard className="border-signal-danger-border/55">
         <SettingRow
           settingId="settings.fleetRemoveHost"
           title={t("settings.fleetRemoveHost")}
@@ -576,7 +579,7 @@ export const HostConnectionSection = memo(function HostConnectionSection({
             variant="outline"
             size="sm"
             onClick={() => setConfirmRemoveOpen(true)}
-            className="border-signal-danger-border text-signal-danger hover:bg-signal-danger-bg hover:text-signal-danger"
+            className="border-signal-danger-border text-signal-danger hover:bg-signal-danger-bg hover:text-signal-danger text-[13px]"
           >
             <Trash2 className="size-[13px]" />
             <span>{t("settings.fleetRemoveHost")}</span>

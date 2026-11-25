@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import {
   SettingCard,
+  SettingGroup,
   SettingGroupLabel,
   SettingRow,
   SettingSelect,
@@ -64,7 +65,7 @@ function triggerTextDownload(filename: string, content: string, mimeType: string
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-export const HostSandboxAndAuditPanel = memo(function HostSandboxAndAuditPanel({
+export const HostSandboxSection = memo(function HostSandboxSection({
   hostId,
   isOnline,
 }: {
@@ -78,35 +79,20 @@ export const HostSandboxAndAuditPanel = memo(function HostSandboxAndAuditPanel({
   const sandboxSeqRef = useRef(0);
   const sandboxChainRef = useRef<Promise<void>>(Promise.resolve());
 
-  const [auditStatus, setAuditStatus] = useState<AuditChainVerification | null>(null);
-  const [verifyingAudit, setVerifyingAudit] = useState(false);
-  const [exportingAudit, setExportingAudit] = useState(false);
-
-  const loadSandboxAndAudit = useCallback(async () => {
+  useEffect(() => {
     if (!isOnline) return;
     const loadSeq = ++sandboxSeqRef.current;
-    setVerifyingAudit(true);
-    try {
-      const [sandboxRes, auditRes] = await Promise.allSettled([
-        orbitIpc.getSandboxConfig(hostId),
-        orbitIpc.getAuditChainStatus(hostId),
-      ]);
-      if (sandboxRes.status === "fulfilled" && sandboxSeqRef.current === loadSeq) {
-        latestPolicyRef.current = sandboxRes.value;
-        setPolicy(sandboxRes.value);
-        setSandboxLoaded(true);
-      }
-      if (auditRes.status === "fulfilled") {
-        setAuditStatus(auditRes.value);
-      }
-    } finally {
-      setVerifyingAudit(false);
-    }
+    void orbitIpc
+      .getSandboxConfig(hostId)
+      .then((res) => {
+        if (sandboxSeqRef.current === loadSeq) {
+          latestPolicyRef.current = res;
+          setPolicy(res);
+          setSandboxLoaded(true);
+        }
+      })
+      .catch(() => undefined);
   }, [hostId, isOnline]);
-
-  useEffect(() => {
-    void loadSandboxAndAudit();
-  }, [loadSandboxAndAudit]);
 
   const effectivePolicy = policy ?? DEFAULT_SANDBOX_POLICY;
 
@@ -150,6 +136,95 @@ export const HostSandboxAndAuditPanel = memo(function HostSandboxAndAuditPanel({
     [t],
   );
 
+  const activeModeLabel =
+    effectivePolicy.mode === "off"
+      ? t("securityOps.sandboxOff")
+      : effectivePolicy.mode === "strict_read_only"
+        ? t("securityOps.sandboxStrictReadOnly")
+        : t("securityOps.sandboxWorkspaceWrite");
+
+  return (
+    <SettingGroup
+      title={t("securityOps.sandboxGroup")}
+      action={
+        sandboxLoaded ? (
+          <Badge variant={effectivePolicy.mode === "off" ? "secondary" : "success"}>
+            {activeModeLabel}
+          </Badge>
+        ) : undefined
+      }
+    >
+      <SettingCard>
+        <SettingRow
+          settingId="securityOps.sandboxModeTitle"
+          title={t("securityOps.sandboxModeTitle")}
+          description={t("securityOps.sandboxModeDesc")}
+        >
+          <SettingSelect<SandboxMode>
+            value={effectivePolicy.mode}
+            disabled={!isOnline || !sandboxLoaded}
+            onChange={(mode) => commitSandbox({ mode })}
+            options={sandboxModeOptions}
+            triggerClassName="w-[180px]"
+          />
+        </SettingRow>
+
+        {effectivePolicy.mode !== "off" && (
+          <SettingRow
+            settingId="securityOps.sandboxNetworkTitle"
+            title={t("securityOps.sandboxNetworkTitle")}
+            description={t("securityOps.sandboxNetworkDesc")}
+          >
+            <ToggleSwitch
+              checked={effectivePolicy.allow_network}
+              disabled={!isOnline || !sandboxLoaded}
+              ariaLabel={t("securityOps.sandboxNetworkTitle")}
+              onChange={(allow_network) => commitSandbox({ allow_network })}
+            />
+          </SettingRow>
+        )}
+
+        {sandboxLoaded && effectivePolicy.mode !== "off" && (
+          <div className="bg-surface-recessed/45 text-ink-muted flex items-center gap-2 px-4 py-2.5 text-[11px]">
+            <Lock className="size-[13px] shrink-0 opacity-80" />
+            <span>{t("securityOps.sandboxCredentialsProtected")}</span>
+          </div>
+        )}
+      </SettingCard>
+    </SettingGroup>
+  );
+});
+
+export const HostAuditChainSection = memo(function HostAuditChainSection({
+  hostId,
+  isOnline,
+}: {
+  hostId: string;
+  isOnline: boolean;
+}) {
+  const { t } = useI18n();
+  const [auditStatus, setAuditStatus] = useState<AuditChainVerification | null>(null);
+  const [verifyingAudit, setVerifyingAudit] = useState(false);
+  const [exportingAudit, setExportingAudit] = useState(false);
+
+  useEffect(() => {
+    if (!isOnline) return;
+    let active = true;
+    setVerifyingAudit(true);
+    void orbitIpc
+      .getAuditChainStatus(hostId)
+      .then((res) => {
+        if (active) setAuditStatus(res);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (active) setVerifyingAudit(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [hostId, isOnline]);
+
   const handleVerifyAudit = useCallback(async () => {
     setVerifyingAudit(true);
     try {
@@ -191,133 +266,94 @@ export const HostSandboxAndAuditPanel = memo(function HostSandboxAndAuditPanel({
   const isAuditHealthy = auditStatus !== null && auditStatus.broken_seq === null;
 
   return (
-    <>
-      {/* OS Sandbox Policy */}
-      <div className="flex flex-col gap-2">
-        <SettingGroupLabel>{t("securityOps.sandboxGroup")}</SettingGroupLabel>
-        <SettingCard>
-          <SettingRow
-            settingId="securityOps.sandboxModeTitle"
-            title={t("securityOps.sandboxModeTitle")}
-            description={t("securityOps.sandboxModeDesc")}
-          >
-            <SettingSelect<SandboxMode>
-              value={effectivePolicy.mode}
-              disabled={!isOnline || !sandboxLoaded}
-              onChange={(mode) => commitSandbox({ mode })}
-              options={sandboxModeOptions}
-            />
-          </SettingRow>
-
-          {effectivePolicy.mode !== "off" && (
-            <SettingRow
-              settingId="securityOps.sandboxNetworkTitle"
-              title={t("securityOps.sandboxNetworkTitle")}
-              description={t("securityOps.sandboxNetworkDesc")}
-            >
-              <ToggleSwitch
-                checked={effectivePolicy.allow_network}
-                disabled={!isOnline || !sandboxLoaded}
-                ariaLabel={t("securityOps.sandboxNetworkTitle")}
-                onChange={(allow_network) => commitSandbox({ allow_network })}
-              />
-            </SettingRow>
-          )}
-
-          {sandboxLoaded && effectivePolicy.mode !== "off" && (
-            <div className="text-ink-muted flex items-center gap-2 px-4 py-2.5 text-[11px]">
-              <Lock className="size-3.5 shrink-0 opacity-75" />
-              <span>{t("securityOps.sandboxCredentialsProtected")}</span>
-            </div>
-          )}
-        </SettingCard>
-      </div>
-
-      {/* Tamper-Evident Audit Chain */}
-      <div className="flex flex-col gap-2">
-        <SettingGroupLabel>{t("securityOps.auditChainGroup")}</SettingGroupLabel>
-        <SettingCard>
-          <div data-setting-id="securityOps.auditChainTitle" className="flex flex-col gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
-            <div className="min-w-0 space-y-1.5">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-ink-primary text-[13px] font-medium">
-                  {t("securityOps.auditChainTitle")}
-                </span>
-                {auditStatus ? (
-                  isAuditHealthy ? (
-                    <Badge
-                      variant="outline"
-                      className="border-signal-success/35 bg-signal-success/10 text-signal-success gap-1 text-[11px]"
-                    >
-                      <CheckCircle2 className="size-3" />
-                      {t("securityOps.auditChainVerified")}
-                    </Badge>
-                  ) : (
-                    <Badge
-                      variant="outline"
-                      className="border-signal-danger/40 bg-signal-danger/10 text-signal-danger gap-1 text-[11px]"
-                    >
-                      <AlertTriangle className="size-3" />
-                      {t("securityOps.auditChainBroken", { seq: auditStatus.broken_seq ?? 0 })}
-                    </Badge>
-                  )
-                ) : (
-                  <Badge variant="outline" className="text-ink-muted text-[11px]">
-                    {t("securityOps.auditChainPending")}
+    <SettingGroup title={t("securityOps.auditChainGroup")}>
+      <SettingCard>
+        <div
+          data-setting-id="securityOps.auditChainTitle"
+          className="flex flex-col gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between"
+        >
+          <div className="min-w-0 space-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-ink-primary text-[13px] font-medium">
+                {t("securityOps.auditChainTitle")}
+              </span>
+              {auditStatus ? (
+                isAuditHealthy ? (
+                  <Badge variant="success">
+                    <CheckCircle2 className="size-[12px]" />
+                    <span>{t("securityOps.auditChainVerified")}</span>
                   </Badge>
-                )}
-              </div>
-
-              {auditStatus && (
-                <div className="text-ink-secondary flex flex-wrap items-center gap-3 font-mono text-[11px] tabular-nums">
-                  <span>
-                    {t("securityOps.auditEntriesCount", { count: auditStatus.verified_entries })}
-                  </span>
-                  <span className="text-ink-faint">·</span>
-                  <span className="inline-flex items-center gap-1">
-                    <ShieldCheck className="text-signal-success size-3" />
-                    {t("securityOps.auditCheckpointsCount", {
-                      count: auditStatus.signed_checkpoints,
-                    })}
-                  </span>
-                </div>
+                ) : (
+                  <Badge variant="destructive">
+                    <AlertTriangle className="size-[12px]" />
+                    <span>{t("securityOps.auditChainBroken", { seq: auditStatus.broken_seq ?? 0 })}</span>
+                  </Badge>
+                )
+              ) : (
+                <Badge variant="secondary">{t("securityOps.auditChainPending")}</Badge>
               )}
             </div>
 
-            <div className="flex shrink-0 items-center gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={!isOnline || verifyingAudit}
-                onClick={() => void handleVerifyAudit()}
-              >
-                {verifyingAudit ? (
-                  <OrbitSpinner size={12} />
-                ) : (
-                  <RefreshCw data-icon="inline-start" />
-                )}
-                {t("securityOps.auditVerifyButton")}
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={!isOnline || exportingAudit}
-                onClick={() => void handleExportAudit()}
-              >
-                {exportingAudit ? (
-                  <OrbitSpinner size={12} />
-                ) : (
-                  <FileDown data-icon="inline-start" />
-                )}
-                {t("securityOps.auditExportButton")}
-              </Button>
-            </div>
+            {auditStatus && (
+              <div className="text-ink-secondary flex flex-wrap items-center gap-2.5 font-mono text-[11px] tabular-nums">
+                <span>
+                  {t("securityOps.auditEntriesCount", { count: auditStatus.verified_entries })}
+                </span>
+                <span aria-hidden className="text-ink-faint">
+                  ·
+                </span>
+                <span className="inline-flex items-center gap-1">
+                  <ShieldCheck className="text-signal-success size-[12px]" />
+                  {t("securityOps.auditCheckpointsCount", {
+                    count: auditStatus.signed_checkpoints,
+                  })}
+                </span>
+              </div>
+            )}
           </div>
-        </SettingCard>
-      </div>
-    </>
+
+          <div className="flex shrink-0 items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={!isOnline || verifyingAudit}
+              onClick={() => void handleVerifyAudit()}
+              className="text-[13px]"
+            >
+              {verifyingAudit ? <OrbitSpinner size={13} /> : <RefreshCw className="size-[13px]" />}
+              <span>{t("securityOps.auditVerifyButton")}</span>
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={!isOnline || exportingAudit}
+              onClick={() => void handleExportAudit()}
+              className="text-[13px]"
+            >
+              {exportingAudit ? <OrbitSpinner size={13} /> : <FileDown className="size-[13px]" />}
+              <span>{t("securityOps.auditExportButton")}</span>
+            </Button>
+          </div>
+        </div>
+      </SettingCard>
+    </SettingGroup>
+  );
+});
+
+export const HostSandboxAndAuditPanel = memo(function HostSandboxAndAuditPanel({
+  hostId,
+  isOnline,
+}: {
+  hostId: string;
+  isOnline: boolean;
+}) {
+  return (
+    <div className="flex flex-col gap-5">
+      <HostSandboxSection hostId={hostId} isOnline={isOnline} />
+      <HostAuditChainSection hostId={hostId} isOnline={isOnline} />
+    </div>
   );
 });
 

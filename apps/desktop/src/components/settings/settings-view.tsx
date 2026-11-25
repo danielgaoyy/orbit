@@ -106,6 +106,7 @@ const icons = {
 
 const widePages = new Set<SettingsCoreSectionId>([
   "hosts",
+  "safety",
   "usage",
   "mcp_tools",
   "skills_plugins",

@@ -3,11 +3,14 @@ import { ArrowUpCircle, Laptop, RefreshCw } from "lucide-react";
 import {
   HostStatusIndicator,
   SettingCard,
+  SettingGroup,
   SettingResourceRow,
   SettingRow,
   settingsHostTransport,
 } from "@/components/settings/settings-primitives";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { Progress } from "@/components/ui/progress";
 import { useI18n } from "@/lib/i18n";
 import { type HostCardView, compareSemver, normalizeSemver } from "@/lib/orbit-ipc";
@@ -79,136 +82,158 @@ export function FleetUpgrades({
       : t("settings.updatesDefaultDesc", { count: hosts.length });
 
   return (
-    <SettingCard>
-      <SettingRow
-        settingId="settings.checkForUpdates"
-        title={t("settings.groupUpdatesFleet")}
-        description={status || latestDescription}
-      >
-        <div className="flex flex-wrap items-center gap-2">
-          {fleetUpdate.phase === "paused_with_failures" ? (
-            <>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={offline}
-                onClick={() => void orbitActions.retryFailedFleetHosts()}
-              >
-                {t("settings.retryFailedHosts")}
-              </Button>
-              {fleetUpdate.pendingDesktopUpdate && release && (
+    <SettingGroup title={t("settings.groupUpdatesFleet")}>
+      <SettingCard>
+        <SettingRow
+          settingId="settings.checkForUpdates"
+          title={t("settings.groupUpdatesFleet")}
+          description={status || latestDescription}
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            {fleetUpdate.phase === "paused_with_failures" ? (
+              <>
                 <Button
+                  variant="outline"
                   size="sm"
                   disabled={offline}
-                  onClick={() => void orbitActions.installDesktopAppUpdate(release)}
+                  onClick={() => void orbitActions.retryFailedFleetHosts()}
+                  className="text-[13px]"
                 >
-                  {t("settings.continueDesktopUpdate")}
+                  {t("settings.retryFailedHosts")}
                 </Button>
-              )}
-            </>
-          ) : (
-            <>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={busy || offline}
-                onClick={() => void orbitActions.checkFleetUpdates()}
-              >
-                <RefreshCw data-icon="inline-start" />
-                {t(checking ? "settings.checking" : "settings.checkForUpdates")}
-              </Button>
-              <Button
-                variant={resync ? "outline" : "default"}
-                size="sm"
-                disabled={busy || offline}
-                title={resync ? t("settings.resyncAllTitle") : undefined}
-                onClick={() => void orbitActions.upgradeAllConnectedHosts({ force: resync })}
-              >
-                <ArrowUpCircle data-icon="inline-start" />
-                {busy
-                  ? t("common.updating")
-                  : resync
-                    ? t("settings.resyncAll")
-                    : pending
-                      ? t("settings.updateAllCount", { count: pending })
-                      : t("settings.updateAll")}
-              </Button>
-            </>
-          )}
-        </div>
-      </SettingRow>
-      <SettingResourceRow
-        icon={<Laptop />}
-        title="Orbit Desktop"
-        description={t("settings.localClient")}
-        status={
-          appVersion ? `v${normalizeSemver(appVersion) ?? appVersion}` : t("common.unknownVersion")
-        }
-        action={
-          fleetUpdate.phase === "upgrading_desktop" && fleetUpdate.desktopProgress !== null ? (
-            <div className="flex items-center gap-2 font-mono text-[11px]">
-              <Progress
-                className="w-[64px]"
-                value={fleetUpdate.desktopProgress * 100}
-                aria-label={t("settings.installing")}
-              />
-              {Math.round(fleetUpdate.desktopProgress * 100)}%
-            </div>
-          ) : release?.has_newer_version && target ? (
-            `→ v${target}`
-          ) : undefined
-        }
-      />
-      {showHostRows &&
-        hosts.map((host) => {
-          const update = hostUpdates[host.host_id];
-          const version = normalizeSemver(host.daemon_version);
-          const reachable = hostCanUpgrade(host);
-          const transport = settingsHostTransport(host);
-          const upgradeHost = () =>
-            void orbitActions.upgradeHostDaemon(host.host_id, {
-              force: true,
-              targetVersion: target,
-            });
-          return (
-            <SettingResourceRow
-              key={host.host_id}
-              icon={<HostStatusIndicator state={host.connection_state} />}
-              title={host.display_name}
-              description={
-                update?.status === "failed" && update.error
-                  ? `${transport} · ${update.error}`
-                  : transport
-              }
-              onClick={() => onSelectHost(host.host_id)}
-              status={version ? `v${version}` : t("common.unknownVersion")}
-              action={
-                update?.status === "upgrading" ? (
-                  t("common.updating")
-                ) : !reachable ? (
-                  t("settings.offlineSkipped")
-                ) : (
+                {fleetUpdate.pendingDesktopUpdate && release && (
                   <Button
-                    type="button"
-                    variant="ghost"
                     size="sm"
-                    disabled={busy || offline}
-                    aria-label={t("settings.forceRestartHost", { host: host.display_name })}
-                    onClick={upgradeHost}
+                    disabled={offline}
+                    onClick={() => void orbitActions.installDesktopAppUpdate(release)}
+                    className="text-[13px]"
                   >
-                    {update?.status === "failed" ? (
-                      t("common.retry")
-                    ) : needsUpgrade(host) && target ? (
-                      `→ v${target}`
-                    ) : (
-                      <RefreshCw data-icon="inline-start" />
-                    )}
+                    {t("settings.continueDesktopUpdate")}
                   </Button>
-                )
-              }
-            />
-          );
-        })}
-    </SettingCard>
+                )}
+              </>
+            ) : (
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={busy || offline}
+                  onClick={() => void orbitActions.checkFleetUpdates()}
+                  className="text-[13px]"
+                >
+                  {checking ? (
+                    <OrbitSpinner size={13} />
+                  ) : (
+                    <RefreshCw className="size-[13px]" />
+                  )}
+                  <span>{t(checking ? "settings.checking" : "settings.checkForUpdates")}</span>
+                </Button>
+                <Button
+                  variant={resync ? "outline" : "default"}
+                  size="sm"
+                  disabled={busy || offline}
+                  title={resync ? t("settings.resyncAllTitle") : undefined}
+                  onClick={() => void orbitActions.upgradeAllConnectedHosts({ force: resync })}
+                  className="text-[13px]"
+                >
+                  {busy && !checking ? (
+                    <OrbitSpinner size={13} />
+                  ) : (
+                    <ArrowUpCircle className="size-[13px]" />
+                  )}
+                  <span>
+                    {busy
+                      ? t("common.updating")
+                      : resync
+                        ? t("settings.resyncAll")
+                        : pending
+                          ? t("settings.updateAllCount", { count: pending })
+                          : t("settings.updateAll")}
+                  </span>
+                </Button>
+              </>
+            )}
+          </div>
+        </SettingRow>
+        <SettingResourceRow
+          icon={<Laptop />}
+          title="Orbit Desktop"
+          description={t("settings.localClient")}
+          status={
+            appVersion ? `v${normalizeSemver(appVersion) ?? appVersion}` : t("common.unknownVersion")
+          }
+          action={
+            fleetUpdate.phase === "upgrading_desktop" && fleetUpdate.desktopProgress !== null ? (
+              <div className="flex items-center gap-2 font-mono text-[11px] tabular-nums">
+                <Progress
+                  className="w-[64px]"
+                  value={fleetUpdate.desktopProgress * 100}
+                  aria-label={t("settings.installing")}
+                />
+                <span>{Math.round(fleetUpdate.desktopProgress * 100)}%</span>
+              </div>
+            ) : release?.has_newer_version && target ? (
+              <Badge variant="default" className="font-mono tabular-nums">
+                → v{target}
+              </Badge>
+            ) : undefined
+          }
+        />
+        {showHostRows &&
+          hosts.map((host) => {
+            const update = hostUpdates[host.host_id];
+            const version = normalizeSemver(host.daemon_version);
+            const reachable = hostCanUpgrade(host);
+            const transport = settingsHostTransport(host);
+            const upgradeHost = () =>
+              void orbitActions.upgradeHostDaemon(host.host_id, {
+                force: true,
+                targetVersion: target,
+              });
+            return (
+              <SettingResourceRow
+                key={host.host_id}
+                icon={<HostStatusIndicator state={host.connection_state} />}
+                title={host.display_name}
+                description={
+                  update?.status === "failed" && update.error
+                    ? `${transport} · ${update.error}`
+                    : transport
+                }
+                onClick={() => onSelectHost(host.host_id)}
+                status={version ? `v${version}` : t("common.unknownVersion")}
+                action={
+                  update?.status === "upgrading" ? (
+                    <Badge variant="secondary" className="gap-1.5">
+                      <OrbitSpinner size={11} />
+                      <span>{t("common.updating")}</span>
+                    </Badge>
+                  ) : !reachable ? (
+                    <Badge variant="secondary">{t("settings.offlineSkipped")}</Badge>
+                  ) : (
+                    <Button
+                      type="button"
+                      variant={needsUpgrade(host) || update?.status === "failed" ? "outline" : "ghost"}
+                      size={needsUpgrade(host) || update?.status === "failed" ? "xs" : "icon-sm"}
+                      disabled={busy || offline}
+                      aria-label={t("settings.forceRestartHost", { host: host.display_name })}
+                      onClick={upgradeHost}
+                      className={needsUpgrade(host) ? "font-mono text-[11px] tabular-nums" : undefined}
+                    >
+                      {update?.status === "failed" ? (
+                        t("common.retry")
+                      ) : needsUpgrade(host) && target ? (
+                        `→ v${target}`
+                      ) : (
+                        <RefreshCw className="size-[13px]" />
+                      )}
+                    </Button>
+                  )
+                }
+              />
+            );
+          })}
+      </SettingCard>
+    </SettingGroup>
   );
 }

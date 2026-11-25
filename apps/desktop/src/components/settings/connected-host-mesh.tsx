@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Link2, Server, Trash2 } from "lucide-react";
 import { SettingCard, SettingGroup, SettingResourceRow, ToggleSwitch } from "./settings-primitives";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Input } from "@/components/ui/input";
@@ -35,13 +36,14 @@ export function ConnectedHostMesh({ hostId }: { hostId: string }) {
       action={
         otherHosts && (
           <Button
-            size="sm"
+            size="xs"
             variant="outline"
             disabled={busy}
             onClick={() => void update(() => orbitIpc.syncFleetConnectedHosts(hostId))}
+            className="text-[11px]"
           >
-            <Link2 />
-            {t("settings.meshSync")}
+            <Link2 className="size-[12px]" />
+            <span>{t("settings.meshSync")}</span>
           </Button>
         )
       }
@@ -58,7 +60,11 @@ export function ConnectedHostMesh({ hostId }: { hostId: string }) {
                 .filter(Boolean)
                 .join(" · ")
             }
-            status={t(meshStatusLabels[peer.status])}
+            status={
+              <Badge variant={meshStatusVariants[peer.status]}>
+                {t(meshStatusLabels[peer.status])}
+              </Badge>
+            }
             action={
               <div className="flex items-center gap-2">
                 <ToggleSwitch
@@ -76,15 +82,16 @@ export function ConnectedHostMesh({ hostId }: { hostId: string }) {
                   size="icon-sm"
                   aria-label={t("settings.meshRemove", { name: peer.label })}
                   onClick={() => setRemove(peer)}
+                  className="text-ink-muted hover:bg-signal-danger-bg hover:text-signal-danger"
                 >
-                  <Trash2 />
+                  <Trash2 className="size-[13px]" />
                 </Button>
               </div>
             }
           />
         ))}
         <form
-          className="flex flex-wrap items-center gap-2 p-3"
+          className="bg-surface-recessed/35 flex flex-wrap items-center gap-2 px-4 py-3"
           onSubmit={(event) => {
             event.preventDefault();
             if (!uri.trim()) return;
@@ -100,7 +107,7 @@ export function ConnectedHostMesh({ hostId }: { hostId: string }) {
             placeholder={t("settings.meshLabel")}
             value={label}
             onChange={(event) => setLabel(event.target.value)}
-            className="w-[140px]"
+            className="h-[30px] w-[148px] text-[13px]"
           />
           <Input
             aria-label={t("settings.meshUri")}
@@ -109,9 +116,9 @@ export function ConnectedHostMesh({ hostId }: { hostId: string }) {
             autoComplete="off"
             value={uri}
             onChange={(event) => setUri(event.target.value)}
-            className="min-w-[140px] flex-1 font-mono"
+            className="h-[30px] min-w-[160px] flex-1 font-mono text-[13px]"
           />
-          <Button size="sm" type="submit" disabled={busy || !uri.trim()}>
+          <Button size="sm" type="submit" disabled={busy || !uri.trim()} className="text-[13px]">
             {t("settings.meshAdd")}
           </Button>
         </form>
@@ -139,4 +146,12 @@ const meshStatusLabels = {
   connecting: "settings.statusConnecting",
   error: "settings.meshError",
   disabled: "settings.meshDisabled",
+} as const;
+
+const meshStatusVariants = {
+  online: "success",
+  offline: "secondary",
+  connecting: "warning",
+  error: "destructive",
+  disabled: "secondary",
 } as const;

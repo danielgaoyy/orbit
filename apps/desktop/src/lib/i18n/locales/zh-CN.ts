@@ -1660,7 +1660,7 @@ export const zhCN: MessageDictionary = {
   "stage.openInPanel": "在侧栏打开",
   "stage.undoToHere": "撤销到此处",
   "stage.forkFromHere": "从此处分支",
-  "stage.forkMenu": "创建分支…",
+  "stage.forkMenu": "创建分支",
   "stage.editedPath": "已编辑 {path}",
   "stage.filesChanged": "已更改 {count} 个文件",
   "stage.forkedFrom": "分支来源：{title}",
@@ -2263,12 +2263,7 @@ export const zhCN: MessageDictionary = {
   "settings.shortcutsConflictNotice": "{keys} 已分配给「{action}」。",
   "settings.shortcutsSwap": "互换",
 
-  // 历史回合折叠与文件级回滚预览
-  "stage.collapseTurn": "折叠此回合",
-  "stage.expandTurnTooltip": "点击展开此回合",
-  "stage.collapsedTurnTools": "{count} 次工具调用",
-  "stage.collapseEarlierTurns": "折叠前 {count} 个回合",
-  "stage.expandAllTurns": "展开 {count} 个已折叠回合",
+  // 文件级回滚预览
   "stage.rewindPreviewLoading": "正在计算文件还原预览…",
   "stage.rewindConflictWarning": "自检查点以来有 {count} 个文件在会话外被修改，还原将覆盖这些外部改动。",
   "stage.rewindSelectedCount": "已选 {selected} / {total}",

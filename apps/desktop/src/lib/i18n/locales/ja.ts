@@ -1684,7 +1684,7 @@ export const ja: MessageDictionary = {
   "stage.openInPanel": "サイドパネルで開く",
   "stage.undoToHere": "ここまで元に戻す",
   "stage.forkFromHere": "ここからフォーク",
-  "stage.forkMenu": "フォーク…",
+  "stage.forkMenu": "フォーク",
   "stage.editedPath": "{path} を編集",
   "stage.filesChanged": "{count} 個のファイルを変更",
   "stage.forkedFrom": "{title} からフォーク",
@@ -2290,12 +2290,7 @@ export const ja: MessageDictionary = {
   "settings.shortcutsConflictNotice": "{keys} はすでに「{action}」に割り当てられています。",
   "settings.shortcutsSwap": "入れ替える",
 
-  // ターン折りたたみ & ファイル単位の巻き戻しプレビュー
-  "stage.collapseTurn": "ターンを折りたたむ",
-  "stage.expandTurnTooltip": "クリックしてターンを展開",
-  "stage.collapsedTurnTools": "{count} 件のツール",
-  "stage.collapseEarlierTurns": "以前の {count} ターンを折りたたむ",
-  "stage.expandAllTurns": "折りたたまれた {count} 件を展開",
+  // ファイル単位の巻き戻しプレビュー
   "stage.rewindPreviewLoading": "ファイル復元プレビューを計算中…",
   "stage.rewindConflictWarning": "チェックポイント以降に外部で変更されたファイルが {count} 件あります。復元すると外部の変更が上書きされます。",
   "stage.rewindSelectedCount": "{selected} / {total} 選択中",

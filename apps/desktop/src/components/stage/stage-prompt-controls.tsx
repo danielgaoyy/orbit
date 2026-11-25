@@ -13,7 +13,6 @@ import {
   AlertTriangle,
   Check,
   ChevronRight,
-  ChevronsDownUp,
   Copy,
   Crosshair,
   FileCode2,
@@ -555,38 +554,6 @@ export const UndoActionButton = memo(function UndoActionButton({
   );
 });
 
-/** Quiet turn-collapse icon button matching `CopyActionButton` / `UndoActionButton`. */
-export const CollapseTurnActionButton = memo(function CollapseTurnActionButton({
-  label,
-  onClick,
-  className,
-}: {
-  label: string;
-  onClick: () => void;
-  className?: string;
-}) {
-  return (
-    <HoverPillTooltip
-      label={label}
-      delay={240}
-      renderTrigger={(handlers) => (
-        <button
-          type="button"
-          aria-label={label}
-          onClick={onClick}
-          {...handlers}
-          className={cn(
-            "text-muted-foreground hover:text-foreground hover:bg-accent/65 orbit-press relative inline-flex size-[22px] cursor-pointer items-center justify-center rounded-md",
-            className,
-          )}
-        >
-          <ChevronsDownUp className="size-[13px] stroke-[1.8]" />
-        </button>
-      )}
-    />
-  );
-});
-
 /**
  * Restrained Fork icon button matching `CopyActionButton` / `UndoActionButton` (`13px` icon in `22×22px` hit target).
  * Directly forks in place for non-git directories; opens a tiny 2-option popover when worktree branching is available.
@@ -717,7 +684,6 @@ export const UserPromptBubble = memo(function UserPromptBubble({
   holdViewport,
   animateEntrance = false,
   onRequestRewind,
-  onCollapseTurn,
   onPreviewImage,
 }: {
   item: Extract<TimelineItemView, { item_type: "user_prompt" }>;
@@ -727,7 +693,6 @@ export const UserPromptBubble = memo(function UserPromptBubble({
   holdViewport: ViewportAnchorHoldFn;
   animateEntrance?: boolean;
   onRequestRewind?: (seq: number, promptText: string, badges: readonly PromptBadge[]) => void;
-  onCollapseTurn?: () => void;
   onPreviewImage: (img: PromptImagePreviewTarget) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -1020,9 +985,6 @@ export const UserPromptBubble = memo(function UserPromptBubble({
           <RelativeTimestampPill timestampMs={promptTimestampMs} />
         )}
         <StageCopyButton text={copyPayload} />
-        {onCollapseTurn && (
-          <CollapseTurnActionButton label={t("stage.collapseTurn")} onClick={onCollapseTurn} />
-        )}
         {onRequestRewind && item.seq > 0 && (
           <UndoActionButton label={t("stage.undoToHere")} onClick={handleRewindClick} />
         )}
@@ -1498,7 +1460,6 @@ export const TurnFooter = memo(function TurnFooter({
   isLastTurn,
   canForkWorktree = false,
   onRequestFork,
-  onCollapseTurn,
 }: {
   completedAtMs: number | null;
   replyText: string | null;
@@ -1507,9 +1468,7 @@ export const TurnFooter = memo(function TurnFooter({
   isLastTurn?: boolean;
   canForkWorktree?: boolean;
   onRequestFork?: (upToSeq: number | null, worktree: boolean) => void;
-  onCollapseTurn?: () => void;
 }) {
-  const { t } = useI18n();
   const handleFork = useCallback(
     (worktree: boolean) => {
       onRequestFork?.(isLastTurn ? null : forkUpToSeq, worktree);
@@ -1535,14 +1494,6 @@ export const TurnFooter = memo(function TurnFooter({
           align="start"
           onFork={handleFork}
           className={replyText ? undefined : "-ml-1"}
-        />
-      )}
-
-      {onCollapseTurn && (
-        <CollapseTurnActionButton
-          label={t("stage.collapseTurn")}
-          onClick={onCollapseTurn}
-          className={!replyText && !(showFork && onRequestFork) ? "-ml-1" : undefined}
         />
       )}
 

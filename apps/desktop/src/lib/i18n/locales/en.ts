@@ -1684,7 +1684,7 @@ export const en = {
   "stage.openInPanel": "Open in Side Panel",
   "stage.undoToHere": "Undo to this point",
   "stage.forkFromHere": "Fork from here",
-  "stage.forkMenu": "Fork…",
+  "stage.forkMenu": "Fork",
   "stage.editedPath": "Edited {path}",
   "stage.filesChanged": "{count} files changed",
   "stage.forkedFrom": "Forked from {title}",
@@ -2292,12 +2292,7 @@ export const en = {
   "settings.shortcutsConflictNotice": "{keys} is already assigned to \"{action}\".",
   "settings.shortcutsSwap": "Swap",
 
-  // Stage Turn Collapse & Interactive File-Level Rewind
-  "stage.collapseTurn": "Collapse turn",
-  "stage.expandTurnTooltip": "Click to expand turn",
-  "stage.collapsedTurnTools": "{count} tools",
-  "stage.collapseEarlierTurns": "Collapse {count} earlier turns",
-  "stage.expandAllTurns": "Expand {count} collapsed",
+  // Interactive File-Level Rewind
   "stage.rewindPreviewLoading": "Computing file restore preview…",
   "stage.rewindConflictWarning": "{count} file(s) changed outside this session since the checkpoint. Restoring them will overwrite external edits.",
   "stage.rewindSelectedCount": "{selected} / {total} selected",

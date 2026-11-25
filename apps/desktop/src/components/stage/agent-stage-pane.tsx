@@ -376,7 +376,6 @@ export const AgentStagePane = memo(function AgentStagePane({
                 hasActiveGoal={hasActiveGoal}
                 isForegroundRunning={isRunning}
                 onClick={handleWaveClick}
-                actionHint={t("sidebar.remoteOpenAction")}
                 className="mt-3 mb-1"
               />
             </div>

@@ -709,7 +709,6 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
                 hasActiveGoal={false}
                 isForegroundRunning={isLatestTurnActive}
                 onClick={handleNestedWaveClick}
-                actionHint={t("sidebar.remoteOpenAction")}
                 className="mt-3 mb-1"
               />
             </div>

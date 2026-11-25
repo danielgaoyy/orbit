@@ -299,6 +299,7 @@ describe("composer directive submission", () => {
     assert.doesNotMatch(bubbleSrc, /bg-signal-info-bg|border-signal-info-border/);
 
     assert.match(queueSrc, /<InlineDirectiveToken/);
+    assert.doesNotMatch(queueSrc, /ring-border-strong|ring-1/);
   });
 });
 

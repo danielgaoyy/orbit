@@ -1,5 +1,4 @@
 import { memo, useCallback, useMemo } from "react";
-import { ChevronRight } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
 import type { ResolvedSubagentItem } from "@/lib/subagents";
 import { cn } from "@/lib/utils";
@@ -13,7 +12,6 @@ import {
   orbitActions,
   useOrbitSelector,
 } from "@/state/orbit-store";
-import { openSubagent } from "./subagent-crew-dock";
 import {
   type ActiveSubagentSummary,
   type StageActivityBackgroundTaskSummary,
@@ -38,14 +36,13 @@ export {
 
 export interface StageActivityWaveProps extends StageLiveActivityInput {
   onClick?: () => void;
-  actionHint?: string;
   /** Marks the control as an Overview toggle trigger so clicking does not dismiss an open narrow popover first. */
   overviewTrigger?: boolean;
   className?: string;
 }
 
 /**
- * Calm bottom concentric ripple-wave activity row summarizing live background dependencies
+ * Minimal bottom concentric ripple-wave activity line summarizing live background dependencies
  * (awaiting/running subagents, running background tasks, armed timers, or active goals)
  * without duplicating Overview HUD avatars or active turn spinners.
  */
@@ -57,11 +54,10 @@ export const StageActivityWave = memo(function StageActivityWave({
   hasActiveGoal,
   isForegroundRunning = false,
   onClick,
-  actionHint,
   overviewTrigger = false,
   className,
 }: StageActivityWaveProps) {
-  const { t, locale } = useI18n();
+  const { locale } = useI18n();
 
   const summary = useMemo(
     () =>
@@ -91,9 +87,9 @@ export const StageActivityWave = memo(function StageActivityWave({
 
   const isWarning = summary.tone === "warning";
   const rowClasses = cn(
-    "group/wave -mx-[7px] flex min-h-[28px] w-[calc(100%+14px)] min-w-0 items-center gap-2 rounded-[8px] px-[7px] py-1 text-left text-[13px] leading-[18px] tabular-nums select-none",
+    "group/wave inline-flex max-w-full min-h-[24px] min-w-0 items-center gap-2 py-0.5 text-left text-[13px] leading-[18px] tabular-nums select-none",
     onClick &&
-      "orbit-press cursor-pointer outline-none transition-colors hover:bg-accent/55 focus-visible:ring-2 focus-visible:ring-ring/50",
+      "cursor-pointer outline-none focus-visible:underline decoration-ink-muted underline-offset-4",
   );
 
   const innerContent = (
@@ -104,7 +100,9 @@ export const StageActivityWave = memo(function StageActivityWave({
         aria-hidden="true"
         className={cn(
           "relative inline-flex size-[18px] shrink-0 items-center justify-center",
-          isWarning ? "text-signal-warning" : "text-ink-secondary",
+          isWarning
+            ? "text-signal-warning"
+            : cn("text-ink-secondary", onClick && "transition-colors group-hover/wave:text-ink-primary"),
         )}
       >
         <span className="orbit-activity-ripple-ring pointer-events-none absolute size-[7px] rounded-full border border-current" />
@@ -135,7 +133,12 @@ export const StageActivityWave = memo(function StageActivityWave({
         </span>
 
         {summary.secondaryHint && (
-          <span className="min-w-0 shrink truncate text-ink-tertiary">
+          <span
+            className={cn(
+              "min-w-0 shrink truncate text-ink-tertiary",
+              onClick && "transition-colors group-hover/wave:text-ink-secondary",
+            )}
+          >
             <span aria-hidden="true" className="text-ink-muted">
               ·{" "}
             </span>
@@ -143,16 +146,6 @@ export const StageActivityWave = memo(function StageActivityWave({
           </span>
         )}
       </span>
-
-      {onClick && (
-        <span
-          aria-hidden="true"
-          className="ml-auto inline-flex shrink-0 items-center gap-0.5 text-[11px] text-ink-tertiary opacity-0 transition-opacity duration-[150ms] group-hover/wave:opacity-100 group-focus-visible/wave:opacity-100"
-        >
-          <span>{actionHint ?? t("overview.title")}</span>
-          <ChevronRight className="size-3 stroke-[1.8]" />
-        </span>
-      )}
     </>
   );
 
@@ -187,9 +180,9 @@ export const StageActivityWave = memo(function StageActivityWave({
 });
 
 /**
- * Connected main-stage wrapper that isolates timer/goal store subscriptions from `StreamStage`,
- * routes clicks cleanly to Overview HUD (opening/expanding the active section) or the sole
- * active subagent tab, and preserves the active-turn bottom cushion when idle.
+ * Connected main-stage wrapper that isolates timer/goal/overview subscriptions from `StreamStage`,
+ * makes the activity line interactive ONLY when the Overview preview card is hidden,
+ * and preserves the active-turn bottom cushion when idle.
  */
 export const StreamStageActivityWave = memo(function StreamStageActivityWave({
   hostId,
@@ -218,6 +211,9 @@ export const StreamStageActivityWave = memo(function StreamStageActivityWave({
       ? selectActiveGoalForAgent(s.hostDetails[hostId], agentId)
       : null,
   );
+  const isOverviewVisible = useOrbitSelector((s) =>
+    s.stageCanDockOverview ? s.overviewDesktopOpenPref : s.overviewPopoverOpen,
+  );
   const hasActiveGoal = Boolean(activeGoal && activeGoal.status !== "paused");
   const hasLiveActivityWave =
     liveSubagentActivity.runningCount > 0 ||
@@ -227,43 +223,27 @@ export const StreamStageActivityWave = memo(function StreamStageActivityWave({
 
   const handleClick = useCallback(() => {
     const state = getOrbitState();
+    const isOverviewOpen = state.stageCanDockOverview
+      ? state.overviewDesktopOpenPref
+      : state.overviewPopoverOpen;
+    if (isOverviewOpen) return;
+
     const targetSection: OverviewSectionId =
       liveSubagentActivity.awaitingCount > 0 || liveSubagentActivity.runningCount > 0
         ? "subagents"
         : runningBackgroundTasks.length > 0
           ? "tasks"
           : "goals";
-    const isOverviewOpen = state.stageCanDockOverview
-      ? state.overviewDesktopOpenPref
-      : state.overviewPopoverOpen;
     const isSectionCollapsed = Boolean(state.overviewCollapsedSections[targetSection]);
 
-    if (!isOverviewOpen) {
-      orbitActions.toggleOverviewPanel(true);
-      if (isSectionCollapsed) {
-        orbitActions.toggleOverviewSection(targetSection);
-      }
-      return;
-    }
-
+    orbitActions.toggleOverviewPanel(true);
     if (isSectionCollapsed) {
       orbitActions.toggleOverviewSection(targetSection);
-      return;
-    }
-
-    if (
-      targetSection === "subagents" &&
-      liveSubagentActivity.soleActive &&
-      runningBackgroundTasks.length === 0
-    ) {
-      openSubagent(agentId ?? undefined, liveSubagentActivity.soleActive);
     }
   }, [
     liveSubagentActivity.awaitingCount,
     liveSubagentActivity.runningCount,
-    liveSubagentActivity.soleActive,
     runningBackgroundTasks.length,
-    agentId,
   ]);
 
   if (!hasLiveActivityWave) {
@@ -278,8 +258,8 @@ export const StreamStageActivityWave = memo(function StreamStageActivityWave({
       armedTimersCount={armedTimersCount}
       hasActiveGoal={hasActiveGoal}
       isForegroundRunning={isForegroundRunning}
-      onClick={handleClick}
-      overviewTrigger
+      onClick={isOverviewVisible ? undefined : handleClick}
+      overviewTrigger={!isOverviewVisible}
       className="mt-3 mb-1"
     />
   );

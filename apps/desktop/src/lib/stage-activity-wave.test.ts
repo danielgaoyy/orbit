@@ -327,9 +327,10 @@ describe("StageActivityWave SSR rendering and interactions", () => {
     assert.match(active.html, /orbit-activity-ripple-ring/);
     assert.match(active.html, /orbit-activity-ripple-ring-delayed/);
     assert.match(active.html, /data-overview-trigger="true"/);
+    assert.match(active.html, /inline-flex max-w-full/);
     assert.match(active.html, /shimmer/);
     assert.match(active.html, /1 subagent running/);
-    assert.match(active.html, /Overview/);
+    assert.doesNotMatch(active.html, /Overview|hover:bg-accent|orbit-press|w-\[calc\(100%\+14px\)\]/);
     assert.equal(active.html.match(/<button\b/g)?.length, 1);
     assert.equal(active.clicks.length, 1);
     active.clicks[0]();
@@ -350,7 +351,7 @@ describe("StageActivityWave SSR rendering and interactions", () => {
     assert.doesNotMatch(awaiting.html, /<button\b|Overview/);
   });
 
-  it("routes StreamStageActivityWave clicks to open Overview, expand collapsed section, or open sole active subagent", async () => {
+  it("makes StreamStageActivityWave clickable only while the Overview preview card is hidden", async () => {
     const { StreamStageActivityWave } = await server.ssrLoadModule(
       "/src/components/stage/stage-activity-wave.tsx",
     );
@@ -373,10 +374,11 @@ describe("StageActivityWave SSR rendering and interactions", () => {
       isManaged: true,
     };
 
-    // 1. Overview closed + subagents collapsed -> opens Overview AND expands subagents
+    // 1. Overview closed + subagents collapsed -> clickable inline text opens Overview AND expands subagents
     actionsLog.length = 0;
     state.stageCanDockOverview = true;
     state.overviewDesktopOpenPref = false;
+    state.overviewPopoverOpen = false;
     state.overviewCollapsedSections.subagents = true;
     const closedWave = renderWave(StreamStageActivityWave, {
       hostId: "local",
@@ -386,27 +388,51 @@ describe("StageActivityWave SSR rendering and interactions", () => {
       isForegroundRunning: false,
     });
     assert.equal(closedWave.clicks.length, 1);
+    assert.equal(closedWave.html.match(/<button\b/g)?.length, 1);
+    assert.match(closedWave.html, /data-overview-trigger="true"/);
     closedWave.clicks[0]();
     assert.deepEqual([...actionsLog], [
       { type: "toggleOverviewPanel", open: true },
       { type: "toggleOverviewSection", section: "subagents" },
     ]);
 
-    // 2. Overview open + section expanded + sole active subagent -> opens child subagent tab directly
+    // 2. Overview docked & visible -> plain non-clickable status text (no button)
     actionsLog.length = 0;
-    const openWave = renderWave(StreamStageActivityWave, {
+    const dockedOpenWave = renderWave(StreamStageActivityWave, {
       hostId: "local",
       agentId: "parent",
       sessionSubagents: [soleChild],
       runningBackgroundTasks: [],
       isForegroundRunning: false,
     });
-    openWave.clicks[0]();
-    assert.equal(actionsLog.length, 1);
-    assert.equal(actionsLog[0]?.type, "openSubagentTab");
-    assert.equal(actionsLog[0]?.record?.childAgentId, "ag_child");
+    assert.equal(dockedOpenWave.clicks.length, 0);
+    assert.doesNotMatch(dockedOpenWave.html, /<button\b|data-overview-trigger/);
 
-    // 3. Idle + foreground running renders bottom cushion spacer only
+    // 3. Narrow popover mode: non-clickable when popover open, clickable again when popover closed
+    state.stageCanDockOverview = false;
+    state.overviewPopoverOpen = true;
+    const popoverOpenWave = renderWave(StreamStageActivityWave, {
+      hostId: "local",
+      agentId: "parent",
+      sessionSubagents: [soleChild],
+      runningBackgroundTasks: [],
+      isForegroundRunning: false,
+    });
+    assert.equal(popoverOpenWave.clicks.length, 0);
+    assert.doesNotMatch(popoverOpenWave.html, /<button\b|data-overview-trigger/);
+
+    state.overviewPopoverOpen = false;
+    const popoverClosedWave = renderWave(StreamStageActivityWave, {
+      hostId: "local",
+      agentId: "parent",
+      sessionSubagents: [soleChild],
+      runningBackgroundTasks: [],
+      isForegroundRunning: false,
+    });
+    assert.equal(popoverClosedWave.clicks.length, 1);
+    assert.equal(popoverClosedWave.html.match(/<button\b/g)?.length, 1);
+
+    // 4. Idle + foreground running renders bottom cushion spacer only
     const spacer = renderWave(StreamStageActivityWave, {
       hostId: "local",
       agentId: "parent",

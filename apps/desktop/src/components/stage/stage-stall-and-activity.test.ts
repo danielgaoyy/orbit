@@ -265,4 +265,94 @@ describe("Stage stall detection and streaming-tail trailing activity", () => {
     assert.match(silentQueuedHtml, /2 queued/);
     assert.match(silentQueuedHtml, /Interrupt &amp; continue/);
   });
+
+  it("treats Waiting for 1 timer and Waiting for N background tasks as calm background waits after settled reply", async () => {
+    const { TurnStageSection } = await server.ssrLoadModule(
+      "/src/components/stage/stage-turn-card.tsx",
+    );
+
+    const now = Date.now();
+    const baseTurn = makeStreamingAssistantTurn(now - 120_000, now - 150_000);
+    const span = {
+      text: "Timer set, waiting cleanly.",
+      bold: false,
+      italic: false,
+      strikethrough: false,
+      inline_code: false,
+      link_url: null,
+    };
+    const settledTimerTurn: StageTurnView = {
+      ...baseTurn,
+      has_active_item: false,
+      live_segments: [
+        {
+          kind: "assistant_message",
+          key: "msg-1",
+          item: {
+            item_type: "assistant_message",
+            seq: 2,
+            item_id: "agy_msg_1",
+            text: "Timer set, waiting cleanly.",
+            streaming: false,
+            blocks: [{ kind: "paragraph", spans: [span] }],
+            timestamp_ms: now - 120_000,
+          },
+        },
+      ],
+    };
+
+    for (const statusLabel of ["Waiting for 1 timer", "Waiting for 2 background tasks"]) {
+      const html = renderToStaticMarkup(
+        createElement(TurnStageSection, {
+          turn: settledTimerTurn,
+          isTurnActive: true,
+          isLastTurn: true,
+          hasLiveBackgroundTasks: true,
+          agentStatusLabel: statusLabel,
+          isNetworkOffline: false,
+          autoFoldCompleted: true,
+          hostId: "local",
+          cwd: "/tmp/repo",
+          agentId: "ag_1",
+          thinkingSignature: "",
+          getThinkingDurationMs: () => null,
+          holdViewport: () => {},
+          onRequestRewind: () => {},
+          onPreviewImage: () => {},
+          queuedNotificationCount: 0,
+          onInterruptAndContinue: () => {},
+        }),
+      );
+      assert.match(html, /Timer set, waiting cleanly\./);
+      assert.doesNotMatch(html, /Thinking…|Thinking\.\.\./);
+      assert.doesNotMatch(html, /Working…|Working\.\.\./);
+      assert.doesNotMatch(html, /waiting for response/i);
+      assert.doesNotMatch(html, /Interrupt &amp; continue/);
+    }
+
+    // Contrast: when the agent is genuinely actively thinking (`Working`) with no waiting label,
+    // TurnStageSection DOES render the trailing thinking disclosure (`Thinking…`).
+    const workingHtml = renderToStaticMarkup(
+      createElement(TurnStageSection, {
+        turn: settledTimerTurn,
+        isTurnActive: true,
+        isLastTurn: true,
+        hasLiveBackgroundTasks: true,
+        agentStatusLabel: "Working",
+        isNetworkOffline: false,
+        autoFoldCompleted: true,
+        hostId: "local",
+        cwd: "/tmp/repo",
+        agentId: "ag_1",
+        thinkingSignature: "",
+        getThinkingDurationMs: () => null,
+        holdViewport: () => {},
+        onRequestRewind: () => {},
+        onPreviewImage: () => {},
+        queuedNotificationCount: 0,
+        onInterruptAndContinue: () => {},
+      }),
+    );
+    assert.match(workingHtml, /Thinking/);
+  });
 });

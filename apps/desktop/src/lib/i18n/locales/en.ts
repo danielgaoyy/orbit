@@ -2358,6 +2358,7 @@ export const en = {
   "voice.microphoneTitle": "Input microphone",
   "voice.microphoneDesc": "Choose which microphone to use for dictation on this device.",
   "voice.micSystemDefault": "System default",
+  "voice.micSystemDefaultNamed": "System default ({name})",
   "voice.micDeviceFallback": "Microphone {index}",
   "voice.micUnavailable": "Unavailable (using system default)",
   "voice.micAllowAccess": "Detect names",

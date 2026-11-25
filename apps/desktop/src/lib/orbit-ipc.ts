@@ -69,6 +69,12 @@ export function formatProviderShortLabel(provider: ProviderKind | string): strin
 
 export type AcpAgentSource = "builtin_catalog" | "remote_registry" | "custom";
 
+export interface SystemAudioInputDevice {
+  name: string;
+  is_default: boolean;
+  transport?: string | null;
+}
+
 export interface AcpAgentSpec {
   id: string;
   name: string;
@@ -8009,6 +8015,16 @@ export const orbitIpc = {
       language: options?.language ?? null,
       voiceId: options?.voiceId ?? null,
     });
+  },
+
+  listSystemAudioInputs: async (): Promise<SystemAudioInputDevice[]> => {
+    if (!isTauriRuntime()) return [];
+    try {
+      const res = await invoke<SystemAudioInputDevice[]>("list_system_audio_inputs");
+      return Array.isArray(res) ? res : [];
+    } catch {
+      return [];
+    }
   },
 
   // --- M8.1 Host-Scoped Inline FIM & M8.2 Two-Stage PR Patrol ---

@@ -17,6 +17,7 @@ export interface SelectProps<T extends string | number> {
   value: T | null;
   options: readonly SelectOption<T>[];
   onChange: (value: T) => void;
+  onOpenChange?: (open: boolean) => void;
   placeholder?: string;
   disabled?: boolean;
   size?: "default" | "sm" | "compact";
@@ -82,6 +83,7 @@ export function Select<T extends string | number>({
   value,
   options,
   onChange,
+  onOpenChange,
   placeholder = "Select…",
   disabled = false,
   size = "default",
@@ -123,6 +125,7 @@ export function Select<T extends string | number>({
       value={value}
       disabled={disabled}
       modal={false}
+      onOpenChange={(open) => onOpenChange?.(open)}
       onValueChange={(next) => {
         if (next !== null && next !== value) {
           onChange(next);

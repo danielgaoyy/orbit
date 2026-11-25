@@ -4,8 +4,28 @@ import {
   encodePcm16LeBase64,
   resampleMonoFloat32,
 } from "@/lib/voice-audio-pcm";
+import {
+  type AudioInputDeviceInfo,
+  VOICE_DEVICE_LABEL_PREFIX,
+  audioDeviceLabelsMatch,
+  findMatchingWebDeviceId,
+  mergeAudioInputDevices,
+  normalizeAudioDeviceName,
+  parseLabelPrefixedDeviceId,
+} from "@/lib/voice-devices";
 
-export { TARGET_VOICE_SAMPLE_RATE, encodePcm16LeBase64, resampleMonoFloat32 };
+export {
+  TARGET_VOICE_SAMPLE_RATE,
+  VOICE_DEVICE_LABEL_PREFIX,
+  audioDeviceLabelsMatch,
+  encodePcm16LeBase64,
+  findMatchingWebDeviceId,
+  mergeAudioInputDevices,
+  normalizeAudioDeviceName,
+  parseLabelPrefixedDeviceId,
+  resampleMonoFloat32,
+  type AudioInputDeviceInfo,
+};
 
 export interface VoiceRecordingPayload {
   pcm16LeBase64: string;
@@ -85,11 +105,6 @@ function decodeBase64ToBytes(b64: string): Uint8Array {
   return bytes;
 }
 
-export interface AudioInputDeviceInfo {
-  deviceId: string;
-  label: string;
-}
-
 export async function listAudioInputDevices(): Promise<{
   devices: AudioInputDeviceInfo[];
   needsPermission: boolean;
@@ -114,9 +129,25 @@ export async function listAudioInputDevices(): Promise<{
 
   return {
     devices,
-    needsPermission: hasUnlabeledInput && devices.every((d) => !d.label),
+    needsPermission: devices.length === 0 || hasUnlabeledInput,
     supported: true,
   };
+}
+
+let inFlightMicProbe: Promise<{
+  devices: AudioInputDeviceInfo[];
+  granted: boolean;
+}> | null = null;
+
+function stopStreamTracks(stream: MediaStream | null): void {
+  if (!stream) return;
+  for (const track of stream.getTracks()) {
+    try {
+      track.stop();
+    } catch {
+      // Ignore track stop errors
+    }
+  }
 }
 
 export async function requestMicrophoneLabels(): Promise<{
@@ -126,24 +157,42 @@ export async function requestMicrophoneLabels(): Promise<{
   if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
     return { devices: [], granted: false };
   }
-  let stream: MediaStream | null = null;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  } catch {
-    return { devices: [], granted: false };
-  } finally {
-    if (stream) {
-      for (const track of stream.getTracks()) {
-        try {
-          track.stop();
-        } catch {
-          // Ignore track stop errors
+  if (inFlightMicProbe) return inFlightMicProbe;
+
+  inFlightMicProbe = (async () => {
+    let stream: MediaStream | null = null;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Enumerate WHILE the capture stream is active so macOS WKWebView's
+      // CoreAudio HAL flushes newly attached Bluetooth HFP devices too.
+      let listed = await listAudioInputDevices();
+      if (listed.devices.length === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        listed = await listAudioInputDevices();
+      }
+      const devices = [...listed.devices];
+      for (const track of stream.getAudioTracks()) {
+        const trackDeviceId = track.getSettings?.().deviceId?.trim() ?? "";
+        const trackLabel = track.label?.trim() ?? "";
+        if (
+          trackDeviceId &&
+          trackDeviceId !== "default" &&
+          trackDeviceId !== "communications" &&
+          !devices.some((d) => d.deviceId === trackDeviceId)
+        ) {
+          devices.push({ deviceId: trackDeviceId, label: trackLabel });
         }
       }
+      return { devices, granted: true };
+    } catch {
+      return { devices: [], granted: false };
+    } finally {
+      stopStreamTracks(stream);
+      inFlightMicProbe = null;
     }
-  }
-  const listed = await listAudioInputDevices();
-  return { devices: listed.devices, granted: true };
+  })();
+
+  return inFlightMicProbe;
 }
 
 export class VoiceRecorderSession {
@@ -170,17 +219,50 @@ export class VoiceRecorderSession {
     if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
       throw new Error("Microphone capture is unavailable in this environment");
     }
-    const preferredDeviceId =
-      options.deviceId && options.deviceId !== "default" ? options.deviceId : null;
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        ...(preferredDeviceId ? { deviceId: { ideal: preferredDeviceId } } : {}),
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
+    const rawPreferred =
+      options.deviceId && options.deviceId !== "default" ? options.deviceId.trim() : null;
+    const preferredLabel = parseLabelPrefixedDeviceId(rawPreferred);
+    let preferredDeviceId: string | null = preferredLabel ? null : rawPreferred;
+    if (preferredLabel) {
+      const listed = await listAudioInputDevices().catch(() => ({
+        devices: [],
+        needsPermission: false,
+        supported: false,
+      }));
+      preferredDeviceId = findMatchingWebDeviceId(listed.devices, rawPreferred);
+    }
+
+    const buildAudioConstraints = (deviceId: string | null): MediaTrackConstraints => ({
+      ...(deviceId ? { deviceId: { ideal: deviceId } } : {}),
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
     });
+
+    let stream = await navigator.mediaDevices.getUserMedia({
+      audio: buildAudioConstraints(preferredDeviceId),
+    });
+
+    // If the user selected a device by OS label before WebKit unlocked deviceIds,
+    // check whether the active track already matches; otherwise resolve and re-acquire once.
+    if (preferredLabel && !preferredDeviceId) {
+      const activeTrackLabel = stream.getAudioTracks()[0]?.label ?? "";
+      if (!audioDeviceLabelsMatch(activeTrackLabel, preferredLabel)) {
+        const listed = await listAudioInputDevices().catch(() => ({
+          devices: [],
+          needsPermission: false,
+          supported: false,
+        }));
+        const resolvedId = findMatchingWebDeviceId(listed.devices, rawPreferred);
+        if (resolvedId) {
+          stopStreamTracks(stream);
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: buildAudioConstraints(resolvedId),
+          });
+        }
+      }
+    }
     const AudioCtx =
       window.AudioContext ||
       (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;

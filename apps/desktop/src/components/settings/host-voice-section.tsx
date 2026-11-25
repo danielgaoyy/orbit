@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Mic, RefreshCw } from "lucide-react";
 import {
   SettingCard,
@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { useI18n } from "@/lib/i18n";
 import {
+  type SystemAudioInputDevice,
   type VoiceConfig,
   type VoiceConfigState,
   orbitIpc,
@@ -20,12 +21,17 @@ import {
 } from "@/lib/orbit-ipc";
 import {
   type AudioInputDeviceInfo,
+  findMatchingWebDeviceId,
   listAudioInputDevices,
+  mergeAudioInputDevices,
+  normalizeAudioDeviceName,
+  parseLabelPrefixedDeviceId,
   requestMicrophoneLabels,
 } from "@/lib/voice-recorder";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
 const SYSTEM_DEFAULT_MIC = "default";
+const MIC_POLL_INTERVAL_MS = 2500;
 
 export function HostVoiceSection({ hostId }: { hostId: string }) {
   const { locale, t } = useI18n();
@@ -39,45 +45,111 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const [audioInputs, setAudioInputs] = useState<AudioInputDeviceInfo[]>([]);
+  const [webAudioInputs, setWebAudioInputs] = useState<AudioInputDeviceInfo[]>([]);
+  const [systemAudioInputs, setSystemAudioInputs] = useState<SystemAudioInputDevice[]>([]);
   const [needsMicPermission, setNeedsMicPermission] = useState(false);
   const [micSupported, setMicSupported] = useState(true);
   const [requestingMic, setRequestingMic] = useState(false);
+  const lastAutoProbedSignatureRef = useRef<string | null>(null);
 
-  const refreshMicrophones = useCallback(async () => {
-    try {
-      const res = await listAudioInputDevices();
-      setAudioInputs(res.devices);
-      setNeedsMicPermission(res.needsPermission);
-      setMicSupported(res.supported);
-    } catch {
-      setAudioInputs([]);
-      setNeedsMicPermission(false);
+  const reconcileWebSelection = useCallback((devices: readonly AudioInputDeviceInfo[]) => {
+    const current = orbitActions.getSnapshot().voiceInputDeviceId;
+    if (!parseLabelPrefixedDeviceId(current)) return;
+    const matchedWebId = findMatchingWebDeviceId(devices, current);
+    if (matchedWebId && matchedWebId !== current) {
+      orbitActions.setVoiceInputDeviceId(matchedWebId);
     }
   }, []);
 
+  const refreshMicrophones = useCallback(
+    async (options?: { probe?: boolean; autoProbeOnMissing?: boolean; notifyDenied?: boolean }) => {
+      try {
+        const [webRes, sysDevices] = await Promise.all([
+          listAudioInputDevices(),
+          orbitIpc.listSystemAudioInputs(),
+        ]);
+
+        let webDevices = webRes.devices;
+        let needsPerm = webRes.needsPermission;
+        setMicSupported(webRes.supported);
+        setSystemAudioInputs(sysDevices);
+
+        const initialMerged = mergeAudioInputDevices(webDevices, sysDevices);
+        const osSignature =
+          sysDevices.length > 0
+            ? sysDevices
+                .map((d) => normalizeAudioDeviceName(d.name))
+                .sort()
+                .join("|")
+            : null;
+        const shouldAutoProbe =
+          Boolean(options?.autoProbeOnMissing) &&
+          webRes.supported &&
+          Boolean(osSignature) &&
+          initialMerged.hasMissingSystemDevice &&
+          lastAutoProbedSignatureRef.current !== osSignature;
+
+        if ((options?.probe || shouldAutoProbe) && webRes.supported) {
+          if (osSignature) lastAutoProbedSignatureRef.current = osSignature;
+          const probed = await requestMicrophoneLabels();
+          if (probed.granted) {
+            webDevices = probed.devices;
+            needsPerm = false;
+          } else if (options?.notifyDenied) {
+            orbitActions.showToast(t("voice.micAccessDenied"));
+          }
+        }
+
+        setWebAudioInputs(webDevices);
+        setNeedsMicPermission(needsPerm);
+        reconcileWebSelection(webDevices);
+      } catch {
+        setWebAudioInputs([]);
+        setNeedsMicPermission(false);
+      }
+    },
+    [reconcileWebSelection, t],
+  );
+
   useEffect(() => {
-    void refreshMicrophones();
-    if (typeof navigator === "undefined" || !navigator.mediaDevices?.addEventListener) return;
-    const onChange = () => void refreshMicrophones();
-    navigator.mediaDevices.addEventListener("devicechange", onChange);
-    return () => navigator.mediaDevices.removeEventListener("devicechange", onChange);
+    void refreshMicrophones({ autoProbeOnMissing: true });
+
+    const onDeviceChange = () => void refreshMicrophones({ autoProbeOnMissing: true });
+    const onWindowFocus = () => void refreshMicrophones({ autoProbeOnMissing: true });
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void refreshMicrophones({ autoProbeOnMissing: true });
+      }
+    };
+
+    const mediaDevices = typeof navigator !== "undefined" ? navigator.mediaDevices : undefined;
+    mediaDevices?.addEventListener?.("devicechange", onDeviceChange);
+    window.addEventListener("focus", onWindowFocus);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
+    // macOS WKWebView often skips `devicechange` for Bluetooth headsets; poll while Voice is open.
+    const pollId = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        void refreshMicrophones({ autoProbeOnMissing: true });
+      }
+    }, MIC_POLL_INTERVAL_MS);
+
+    return () => {
+      mediaDevices?.removeEventListener?.("devicechange", onDeviceChange);
+      window.removeEventListener("focus", onWindowFocus);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.clearInterval(pollId);
+    };
   }, [refreshMicrophones]);
 
   const handleRequestMicLabels = useCallback(async () => {
     setRequestingMic(true);
     try {
-      const res = await requestMicrophoneLabels();
-      if (!res.granted) {
-        orbitActions.showToast(t("voice.micAccessDenied"));
-        return;
-      }
-      setAudioInputs(res.devices);
-      setNeedsMicPermission(false);
+      await refreshMicrophones({ probe: true, notifyDenied: true });
     } finally {
       setRequestingMic(false);
     }
-  }, [t]);
+  }, [refreshMicrophones]);
 
   const loadConfig = useCallback(async () => {
     setLoading(true);
@@ -117,10 +189,19 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
     [hostId, state],
   );
 
+  const mergedMicrophones = useMemo(
+    () => mergeAudioInputDevices(webAudioInputs, systemAudioInputs),
+    [webAudioInputs, systemAudioInputs],
+  );
+
   const micOptions = useMemo<SettingSelectOption<string>[]>(() => {
+    const defaultLabel = mergedMicrophones.defaultSystemDeviceName
+      ? t("voice.micSystemDefaultNamed", { name: mergedMicrophones.defaultSystemDeviceName })
+      : t("voice.micSystemDefault");
+
     const opts: SettingSelectOption<string>[] = [
-      { value: SYSTEM_DEFAULT_MIC, label: t("voice.micSystemDefault") },
-      ...audioInputs.map((dev, idx) => ({
+      { value: SYSTEM_DEFAULT_MIC, label: defaultLabel },
+      ...mergedMicrophones.devices.map((dev, idx) => ({
         value: dev.deviceId,
         label: dev.label || t("voice.micDeviceFallback", { index: idx + 1 }),
       })),
@@ -133,12 +214,55 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
     }
     return opts;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [audioInputs, voiceInputDeviceId, locale]);
+  }, [mergedMicrophones, voiceInputDeviceId, locale]);
 
   const busy = saving || loading;
   const cfg = state?.config;
   const languageValue = cfg?.language ?? "auto";
   const selectedMicValue = voiceInputDeviceId ?? SYSTEM_DEFAULT_MIC;
+  const showManualDetectButton =
+    needsMicPermission && micSupported && systemAudioInputs.length === 0;
+
+  const microphoneRow = (
+    <SettingRow
+      settingId="voice.microphoneTitle"
+      title={t("voice.microphoneTitle")}
+      description={t("voice.microphoneDesc")}
+    >
+      <div className="flex items-center gap-2">
+        {showManualDetectButton && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={requestingMic}
+            onClick={() => void handleRequestMicLabels()}
+          >
+            {requestingMic ? <OrbitSpinner size={12} /> : <Mic data-icon="inline-start" />}
+            {t("voice.micAllowAccess")}
+          </Button>
+        )}
+        <SettingSelect<string>
+          ariaLabel={t("voice.microphoneTitle")}
+          value={selectedMicValue}
+          disabled={!micSupported && systemAudioInputs.length === 0}
+          options={micOptions}
+          menuClassName="w-[280px]"
+          onOpenChange={(open) => {
+            if (open) {
+              void refreshMicrophones({
+                probe: needsMicPermission && systemAudioInputs.length === 0,
+                autoProbeOnMissing: true,
+              });
+            }
+          }}
+          onChange={(val) =>
+            orbitActions.setVoiceInputDeviceId(val === SYSTEM_DEFAULT_MIC ? null : val)
+          }
+        />
+      </div>
+    </SettingRow>
+  );
 
   return (
     <div className="flex flex-col gap-6">
@@ -151,7 +275,8 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
             size="sm"
             disabled={busy || !isOnline}
             onClick={() => {
-              void refreshMicrophones();
+              lastAutoProbedSignatureRef.current = null;
+              void refreshMicrophones({ probe: true });
               void loadConfig();
             }}
           >
@@ -191,36 +316,7 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
                 />
               </SettingRow>
 
-              <SettingRow
-                settingId="voice.microphoneTitle"
-                title={t("voice.microphoneTitle")}
-                description={t("voice.microphoneDesc")}
-              >
-                <div className="flex items-center gap-2">
-                  {needsMicPermission && micSupported && (
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={requestingMic}
-                      onClick={() => void handleRequestMicLabels()}
-                    >
-                      {requestingMic ? <OrbitSpinner size={12} /> : <Mic data-icon="inline-start" />}
-                      {t("voice.micAllowAccess")}
-                    </Button>
-                  )}
-                  <SettingSelect<string>
-                    ariaLabel={t("voice.microphoneTitle")}
-                    value={selectedMicValue}
-                    disabled={!micSupported}
-                    options={micOptions}
-                    menuClassName="w-[260px]"
-                    onChange={(val) =>
-                      orbitActions.setVoiceInputDeviceId(val === SYSTEM_DEFAULT_MIC ? null : val)
-                    }
-                  />
-                </div>
-              </SettingRow>
+              {microphoneRow}
 
               <SettingRow
                 settingId="voice.languageTitle"
@@ -259,36 +355,7 @@ export function HostVoiceSection({ hostId }: { hostId: string }) {
               </SettingRow>
             </>
           ) : (
-            <SettingRow
-              settingId="voice.microphoneTitle"
-              title={t("voice.microphoneTitle")}
-              description={t("voice.microphoneDesc")}
-            >
-              <div className="flex items-center gap-2">
-                {needsMicPermission && micSupported && (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    disabled={requestingMic}
-                    onClick={() => void handleRequestMicLabels()}
-                  >
-                    {requestingMic ? <OrbitSpinner size={12} /> : <Mic data-icon="inline-start" />}
-                    {t("voice.micAllowAccess")}
-                  </Button>
-                )}
-                <SettingSelect<string>
-                  ariaLabel={t("voice.microphoneTitle")}
-                  value={selectedMicValue}
-                  disabled={!micSupported}
-                  options={micOptions}
-                  menuClassName="w-[260px]"
-                  onChange={(val) =>
-                    orbitActions.setVoiceInputDeviceId(val === SYSTEM_DEFAULT_MIC ? null : val)
-                  }
-                />
-              </div>
-            </SettingRow>
+            microphoneRow
           )}
         </SettingCard>
       </div>

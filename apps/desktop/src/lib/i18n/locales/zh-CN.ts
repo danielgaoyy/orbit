@@ -2330,6 +2330,7 @@ export const zhCN: MessageDictionary = {
   "voice.microphoneTitle": "输入麦克风",
   "voice.microphoneDesc": "选择本机语音听写使用的麦克风设备。",
   "voice.micSystemDefault": "跟随系统默认",
+  "voice.micSystemDefaultNamed": "跟随系统默认（{name}）",
   "voice.micDeviceFallback": "麦克风 {index}",
   "voice.micUnavailable": "当前不可用（已回退系统默认）",
   "voice.micAllowAccess": "获取设备名",

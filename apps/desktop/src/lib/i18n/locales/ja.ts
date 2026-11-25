@@ -2356,6 +2356,7 @@ export const ja: MessageDictionary = {
   "voice.microphoneTitle": "入力マイク",
   "voice.microphoneDesc": "この端末の音声入力で使用するマイクを選択します。",
   "voice.micSystemDefault": "システム標準",
+  "voice.micSystemDefaultNamed": "システム標準（{name}）",
   "voice.micDeviceFallback": "マイク {index}",
   "voice.micUnavailable": "利用不可（システム標準を使用）",
   "voice.micAllowAccess": "名前を取得",

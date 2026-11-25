@@ -54,6 +54,7 @@ function createMinimalTestState(): OrbitUiState {
     locale: "en",
     enterToSend: true,
     activeTurnSendBehavior: "queue",
+    voiceEnabledByHost: {},
     terminalFontSize: 13,
     activeView: "workspace",
     workspacePanel: "conversation",
@@ -556,5 +557,62 @@ describe("GitHub Device Flow polling & countdown", () => {
     h.advance(2_000, true);
     assert.equal(await pending, "expired");
     assert.deepEqual(h.listenerCounts(), { focus: 0, visibility: 0 });
+  });
+});
+
+describe("evaluateSelectorWithTopicTracking WeakMap Proxy cache & re-entrancy", () => {
+  it("tracks isolated topic masks across sequential and nested re-entrant selector evaluations", () => {
+    const state = createMinimalTestState();
+    let innerMask = 0;
+
+    const outer = evaluateSelectorWithTopicTracking(state, (s) => {
+      const hostId = s.selectedHostId; // fleet topic
+      const nested = evaluateSelectorWithTopicTracking(state, (inner) => {
+        return inner.sidebarOpen ? inner.theme : inner.locale; // sidebar + preferences
+      });
+      innerMask = nested.mask;
+      return `${hostId}:${nested.value}:${s.activeView}`; // + ui topic
+    });
+
+    assert.equal(innerMask, TOPIC_BIT.sidebar | TOPIC_BIT.preferences);
+    assert.equal(outer.mask, TOPIC_BIT.fleet | TOPIC_BIT.ui);
+    assert.equal(outer.value, "host_1:system:workspace");
+
+    // Subsequent evaluation on the same immutable state object still tracks independently
+    const followUp = evaluateSelectorWithTopicTracking(state, (s) => s.terminalFocused);
+    assert.equal(followUp.mask, TOPIC_BIT.terminal);
+    assert.equal(followUp.value, false);
+  });
+
+  it("unwinds the active-mask stack safely when a nested selector throws", () => {
+    const state = createMinimalTestState();
+
+    const outer = evaluateSelectorWithTopicTracking(state, (s) => {
+      const panel = s.workspacePanel; // ui
+      try {
+        evaluateSelectorWithTopicTracking(state, (inner) => {
+          void inner.terminalTabs; // terminal (must NOT bleed into outer)
+          throw new Error("boom");
+        });
+      } catch {
+        // expected
+      }
+      return `${panel}:${s.locale}`; // + preferences
+    });
+
+    assert.equal(outer.mask, TOPIC_BIT.ui | TOPIC_BIT.preferences);
+    assert.equal(outer.value, "conversation:en");
+
+    // Stack must be completely empty after recovery
+    const after = evaluateSelectorWithTopicTracking(state, (s) => s.sidebarWidth);
+    assert.equal(after.mask, TOPIC_BIT.sidebar);
+    assert.equal(after.value, 256);
+  });
+
+  it("unwraps identity selector and marks ALL_TOPICS_MASK even with cached proxy", () => {
+    const state = createMinimalTestState();
+    const res = evaluateSelectorWithTopicTracking(state, (s) => s);
+    assert.strictEqual(res.value, state);
+    assert.equal(res.mask, ALL_TOPICS_MASK);
   });
 });

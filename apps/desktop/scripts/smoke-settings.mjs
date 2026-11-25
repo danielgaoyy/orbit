@@ -68,7 +68,7 @@ async function settingsDriver(cdp) {
 
   async function open() {
     await key(",", "Comma", 4); // The settings passes emulate macOS.
-    await waitFor("Settings rail", () => document.querySelectorAll("[data-settings-section]").length === 17);
+    await waitFor("Settings rail", () => document.querySelectorAll("[data-settings-section]").length === 16);
   }
 
   async function go(section) {
@@ -82,6 +82,30 @@ async function settingsDriver(cdp) {
 
 export async function exerciseLocalSettings(cdp) {
   const { click, evaluate, key, open, waitFor, go } = await settingsDriver(cdp);
+  // Verify empty Composer shows disabled Send button when Voice is disabled, and model+effort omits dot separator.
+  const initialComposerState = await waitFor("Composer bottom bar controls", () => {
+    const actionBtn = document.querySelector("[data-composer-action]");
+    const modelBtn = document.querySelector('[data-composer-model-trigger="true"]');
+    if (!actionBtn || !modelBtn) return null;
+    return {
+      actionMode: actionBtn.getAttribute("data-composer-action"),
+      actionDisabled: Boolean(actionBtn.disabled),
+      actionLabel: actionBtn.getAttribute("aria-label"),
+      modelText: modelBtn.innerText.trim(),
+    };
+  });
+  assert.equal(
+    initialComposerState.actionMode,
+    "send_disabled",
+    `Expected disabled Send action when Voice is off, got ${JSON.stringify(initialComposerState)}`,
+  );
+  assert.equal(initialComposerState.actionDisabled, true, "Empty Composer Send button must be disabled when Voice is off");
+  assert.equal(initialComposerState.actionLabel, "Send", "Empty Composer button label must be Send when Voice is off");
+  assert.ok(
+    !initialComposerState.modelText.includes("·"),
+    `Composer model/effort trigger must not render a dot separator, got ${JSON.stringify(initialComposerState.modelText)}`,
+  );
+
   const draft = "A draft to keep while configuring Orbit";
   await click("textarea");
   await cdp.send("Input.insertText", { text: draft });
@@ -131,7 +155,7 @@ export async function exerciseLocalSettings(cdp) {
       return box.top >= shellRect.top && box.bottom <= shellRect.bottom;
     });
   });
-  assert.ok(railFits, "All 17 destinations should fit inside the Settings modal rail at a 14-inch viewport");
+  assert.ok(railFits, "All 16 destinations should fit inside the Settings modal rail at a 14-inch viewport");
   assert.equal(await evaluate(() => document.documentElement.classList.contains("dark")), false);
   const destinations = await evaluate(() =>
     [...document.querySelectorAll("[data-settings-section]")].map((button) => button.dataset.settingsSection));
@@ -248,12 +272,13 @@ export async function exerciseLocalSettings(cdp) {
       document.querySelector('[data-setting-id="settings.sendWithEnter"]') &&
       document.querySelector('[data-setting-id="settings.activeTurnSendBehavior"]') &&
       document.querySelector('[data-setting-id="settings.appVersion"]') &&
+      document.querySelector('[data-setting-id="securityOps.migrationGroup"]') &&
       !document.querySelector('[data-setting-id="settings.isolateWorktrees"]') &&
       !document.querySelector('[data-setting-id="settings.collapseExploration"]') &&
       !document.querySelector('[data-setting-id="settings.externalEditor"]'),
     )),
     true,
-    "General should contain only Language, Setup guide, Send shortcut, While agent is running, and App version",
+    "General should contain Language, Setup guide, Send shortcut, While agent is running, App version, and IDE migration",
   );
   const sendTrigger = '[data-setting-id="settings.sendWithEnter"] [data-slot="select-trigger"]';
   await click(sendTrigger);
@@ -272,15 +297,16 @@ export async function exerciseLocalSettings(cdp) {
   await waitFor("restored active-turn send behavior to Queue", (selector) =>
     document.querySelector(selector)?.innerText.includes("Queue"), activeTurnTrigger);
 
-  await go("git_worktrees");
+  await go("workspace");
   assert.equal(
     await evaluate(() => Boolean(
       document.querySelector('[data-setting-id="settings.isolateWorktrees"]') &&
       document.querySelector('[data-setting-id="settings.branchPrefix"]') &&
-      document.querySelector('[data-setting-id="settings.externalEditor"]'),
+      document.querySelector('[data-setting-id="settings.externalEditor"]') &&
+      document.querySelector('[data-setting-id="settings.subTabLsp"]'),
     )),
     true,
-    "Git & Worktrees should contain Isolate worktrees, Branch prefix, and External editor",
+    "Workspace should contain Isolate worktrees, Branch prefix, External editor, and LSP",
   );
 
   await go("shortcuts");
@@ -299,19 +325,33 @@ export async function exerciseLocalSettings(cdp) {
   await waitFor("custom shortcut cleared", () =>
     !document.querySelector('[data-setting-id="settings.scCommandPalette"]')?.innerText.includes("Custom"));
 
-  await go("data_diagnostics");
+  await go("hosts");
   assert.equal(
-    await evaluate(() => Boolean(document.querySelector('[data-setting-id="dataOps.resetPreferences"]'))),
-    false,
-    "Data & Diagnostics should not render Reset UI preferences",
+    await evaluate(() => Boolean(
+      document.querySelector('[data-setting-id="securityOps.diagTitle"]') &&
+      document.querySelector('[data-setting-id="dataOps.archive"]') &&
+      !document.querySelector('[data-setting-id="dataOps.resetPreferences"]'),
+    )),
+    true,
+    "Hosts should contain Diagnostics export and Archived threads without Reset UI preferences",
   );
-  await assertNoResetButtons("Data & Diagnostics");
+  await assertNoResetButtons("Hosts");
+
+  await go("permissions");
+  assert.equal(
+    await evaluate(() => Boolean(document.querySelector('[data-setting-id="settings.defaultPermissions"]'))),
+    false,
+    "Permissions should not render the removed Default access permissions card group",
+  );
 
   await go("appearance");
   assert.equal(
-    await evaluate(() => Boolean(document.querySelector('[data-setting-id="settings.collapseExploration"]'))),
+    await evaluate(() => Boolean(
+      document.querySelector('[data-setting-id="settings.groupTheme"] [role="radiogroup"]') &&
+      document.querySelector('[data-setting-id="settings.collapseExploration"]'),
+    )),
     true,
-    "Appearance should contain Collapse thinking and tool calls",
+    "Appearance should render Theme as a Segmented radiogroup and contain Collapse thinking and tool calls",
   );
   await key("f", "KeyF", 4);
   const search = 'input[aria-label="Search settings"]';
@@ -347,7 +387,7 @@ export async function exerciseLocalSettings(cdp) {
     "Terminal settings should not be exposed in Appearance",
   );
 
-  await go("im_channels");
+  await go("channels");
   await click('[data-slot="settings-view"] button', "Add Channel");
   await waitFor("480px channel drawer contained inside Settings dialog", () => {
     const shell = document.querySelector('[data-slot="settings-view"]')?.getBoundingClientRect();
@@ -359,12 +399,55 @@ export async function exerciseLocalSettings(cdp) {
   });
   await key("Escape", "Escape");
   await waitFor("drawer closes, Settings stays open", () =>
-    !document.querySelector('[data-slot="setting-drawer"]') && document.querySelector('[data-settings-section="im_channels"][aria-current="page"]'));
+    !document.querySelector('[data-slot="setting-drawer"]') && document.querySelector('[data-settings-section="channels"][aria-current="page"]'));
   await key("Escape", "Escape");
   await waitFor("workspace focus and draft restored", (draft) =>
     !document.querySelector('[data-slot="settings-view"]') && window.smokeComposer === document.activeElement &&
     window.smokeComposer?.value === draft, draft);
   assert.equal(await evaluate(() => window.smokeStage.scrollTop), stageOffset, "Stage should retain its reading position");
+
+  // Clear draft and verify live Voice toggle updates Composer right action between Send and Voice Mic.
+  await evaluate(() => {
+    const el = document.querySelector("textarea");
+    if (el) {
+      el.focus();
+      el.setSelectionRange(0, el.value.length);
+    }
+  });
+  await cdp.send("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "Backspace",
+    code: "Backspace",
+    windowsVirtualKeyCode: 8,
+    nativeVirtualKeyCode: 8,
+  });
+  await cdp.send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "Backspace",
+    code: "Backspace",
+    windowsVirtualKeyCode: 8,
+    nativeVirtualKeyCode: 8,
+  });
+  await waitFor("empty Composer returns to disabled Send while Voice is off", () =>
+    document.querySelector("[data-composer-action]")?.getAttribute("data-composer-action") === "send_disabled");
+  await open();
+  await go("voice");
+  await click('[data-setting-id="voice.enableTitle"] [role="switch"]');
+  await waitFor("Voice enabled switch checked", () =>
+    document.querySelector('[data-setting-id="voice.enableTitle"] [role="switch"]')?.getAttribute("aria-checked") === "true");
+  await key("Escape", "Escape");
+  await waitFor("Composer switches to Voice Mic when Voice is enabled", () =>
+    !document.querySelector('[data-slot="settings-view"]') &&
+    document.querySelector("[data-composer-action]")?.getAttribute("data-composer-action") === "voice_idle");
+  await open();
+  await go("voice");
+  await click('[data-setting-id="voice.enableTitle"] [role="switch"]');
+  await waitFor("Voice enabled switch unchecked", () =>
+    document.querySelector('[data-setting-id="voice.enableTitle"] [role="switch"]')?.getAttribute("aria-checked") === "false");
+  await key("Escape", "Escape");
+  await waitFor("Composer returns to disabled Send when Voice is turned off", () =>
+    !document.querySelector('[data-slot="settings-view"]') &&
+    document.querySelector("[data-composer-action]")?.getAttribute("data-composer-action") === "send_disabled");
 }
 
 export async function exerciseMultiHostSettings(cdp) {
@@ -385,7 +468,7 @@ export async function exerciseMultiHostSettings(cdp) {
     document.querySelector('[data-settings-section="voice"][aria-current="page"]') &&
     document.querySelector('[data-slot="settings-scope-bar"]')?.innerText.includes("Remote Build Host") &&
     window.smokeVoiceHost === "host:ipv6:2001:db8::2");
-  await go("mcp_tools");
+  await go("mcp");
   await click('[data-setting-id="devTools.addServer"]');
   await click("#mcp-server-name");
   await cdp.send("Input.insertText", { text: "smoke-server" });
@@ -401,6 +484,9 @@ export async function exerciseMultiHostSettings(cdp) {
     document.querySelector('[data-slot="settings-scope-bar"]')?.innerText.includes("Smoke Host") &&
     document.querySelector('[data-setting-id="settings.subTabMcp"]') &&
     !document.querySelector('[data-setting-id="settings.subTabMcp"]').innerText.includes("smoke-server"));
+  await go("hooks");
+  await waitFor("standalone Hooks section rendered", () =>
+    Boolean(document.querySelector('[data-setting-id="hooks.title"]')));
   await go("general");
   assert.equal(await evaluate(() => Boolean(document.querySelector('[data-slot="settings-scope-bar"]'))), false);
   await go("hosts");
@@ -410,6 +496,6 @@ export async function exerciseMultiHostSettings(cdp) {
   assert.equal(await evaluate((selector) => document.querySelector(selector)?.getAttribute("aria-expanded"), relay), "false");
   await click(relay);
   await waitFor("advanced relay expanded", (selector) => document.querySelector(selector)?.getAttribute("aria-expanded") === "true", relay);
-  await click("[data-settings-canvas] header button", "Hosts & Fleet");
-  await waitFor("fleet overview", () => document.querySelector("[data-settings-canvas] h1")?.innerText === "Hosts & Fleet");
+  await click("[data-settings-canvas] header button", "Hosts");
+  await waitFor("fleet overview", () => document.querySelector("[data-settings-canvas] h1")?.innerText === "Hosts");
 }

@@ -1504,6 +1504,7 @@ And a SEP-1865 widget:
                 headers: BTreeMap::new(),
                 keep_existing_secrets: false,
                 enabled: true,
+                create_only: false,
             },
             &HashMap::new(),
         )

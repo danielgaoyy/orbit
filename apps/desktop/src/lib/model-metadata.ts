@@ -1,5 +1,136 @@
 import type { MessageKey } from "./i18n/index.ts";
-import type { ProviderKind, ReasoningEffort, ThinkingOptionSpec } from "./orbit-ipc.ts";
+import type {
+  ProviderKind,
+  ProviderModelCatalog,
+  ProviderModelSpec,
+  ReasoningEffort,
+  ThinkingOptionSpec,
+} from "./orbit-ipc.ts";
+
+export const PROVIDER_DISPLAY_LABELS: Readonly<Record<ProviderKind, string>> = {
+  claude_code: "Claude Code",
+  codex: "Codex",
+  antigravity: "Antigravity",
+  opencode: "OpenCode",
+  gemini_cli: "Gemini CLI",
+  cursor_agent: "Cursor Agent",
+  copilot: "GitHub Copilot",
+  goose: "Goose",
+  pi: "Pi",
+  kimi: "Kimi CLI",
+  cline: "Cline",
+  mistral_vibe: "Mistral Vibe",
+  augment: "Augment",
+  acp: "ACP Agent",
+};
+
+export function formatProviderDisplayName(provider: ProviderKind | string): string {
+  if (Object.hasOwn(PROVIDER_DISPLAY_LABELS, provider)) {
+    return PROVIDER_DISPLAY_LABELS[provider as ProviderKind];
+  }
+  return provider.replace(/_/g, " ");
+}
+
+export function stripAgyEffortSuffix(modelId: string): {
+  baseId: string;
+  inferredEffort: ReasoningEffort | null;
+} {
+  const m = /^(.*)-(xhigh|ultra|medium|high|low|max)$/i.exec(modelId.trim());
+  if (!m || modelId.toLowerCase() === "gpt-oss-120b-medium") {
+    return { baseId: modelId.trim(), inferredEffort: null };
+  }
+  return {
+    baseId: m[1],
+    inferredEffort: m[2].toLowerCase() as ReasoningEffort,
+  };
+}
+
+export function prettifyModelSlug(rawId: string, provider?: ProviderKind): string {
+  let cleaned = rawId
+    .trim()
+    .replace(/-\d{8}$/, "")
+    .replace(/-\d{4}-\d{2}-\d{2}$/, "")
+    .replace(/-(?:latest|preview(?:-[a-z0-9-]+)?|exp(?:-[a-z0-9-]+)?)$/i, "");
+
+  if (provider === "antigravity") {
+    cleaned = stripAgyEffortSuffix(cleaned).baseId;
+  } else if (provider === "claude_code") {
+    cleaned = cleaned.replace(/^claude-/i, "");
+  }
+
+  const gptMatch = /^gpt-(\d+(?:[.-]\d+)?)(?:-(.+))?$/i.exec(cleaned);
+  if (gptMatch) {
+    const ver = gptMatch[1].replace("-", ".");
+    if (!gptMatch[2]) return `GPT ${ver}`;
+    const rest = gptMatch[2]
+      .split("-")
+      .filter(Boolean)
+      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+      .join(" ");
+    return `GPT ${ver} ${rest}`;
+  }
+
+  const oMatch = /^(o\d+)(?:-(.+))?$/i.exec(cleaned);
+  if (oMatch) {
+    const base = oMatch[1].toLowerCase();
+    if (!oMatch[2]) return base;
+    const rest = oMatch[2]
+      .split("-")
+      .filter(Boolean)
+      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+      .join(" ");
+    return `${base} ${rest}`;
+  }
+
+  cleaned = cleaned.replace(/(\d+)-(\d+)(?=-|$)/g, "$1.$2");
+
+  return cleaned
+    .split("-")
+    .filter(Boolean)
+    .map((w) => (/^\d/.test(w) ? w : w.charAt(0).toUpperCase() + w.slice(1)))
+    .join(" ");
+}
+
+export function resolveActiveModelSpec(
+  catalog: ProviderModelCatalog,
+  rawModelId: string | null,
+): ProviderModelSpec | null {
+  if (catalog.models.length === 0) return null;
+  if (!rawModelId) {
+    return catalog.models.find((m) => m.is_default) ?? catalog.models[0];
+  }
+  const lowered = rawModelId.toLowerCase();
+  const exact = catalog.models.find((m) => m.id.toLowerCase() === lowered);
+  if (exact) return exact;
+
+  if (catalog.provider === "antigravity") {
+    const stripped = stripAgyEffortSuffix(rawModelId).baseId.toLowerCase();
+    const byBase = catalog.models.find((m) => m.id.toLowerCase() === stripped);
+    if (byBase) return byBase;
+  }
+
+  // Claude short alias compatibility (`opus` -> `claude-opus-...`, `sonnet` -> `claude-sonnet-...`)
+  if (catalog.provider === "claude_code") {
+    const byFamily = catalog.models.find((m) => m.id.toLowerCase().includes(`-${lowered}-`));
+    if (byFamily) return byFamily;
+  }
+
+  return null;
+}
+
+export function formatCatalogModelLabel(
+  catalog: ProviderModelCatalog,
+  rawModelId: string | null,
+): string {
+  const matched = resolveActiveModelSpec(catalog, rawModelId);
+  if (matched) {
+    return matched.label;
+  }
+  if (!rawModelId) {
+    return "Default";
+  }
+  return prettifyModelSlug(rawModelId, catalog.provider);
+}
 
 export interface BrowsedModelLeaf {
   key: string;

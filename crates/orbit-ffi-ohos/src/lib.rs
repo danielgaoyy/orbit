@@ -1280,6 +1280,17 @@ impl OhosCoreFacade {
         serde_json::to_string(&res).map_err(|e| e.to_string())
     }
 
+    pub fn cloud_sync_enable_manual_passphrase_json(
+        &self,
+        passphrase: &str,
+    ) -> Result<String, String> {
+        let status = self
+            .inner
+            .cloud_sync_enable_manual_passphrase(passphrase)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&status).map_err(|e| e.to_string())
+    }
+
     pub fn cloud_sync_set_manual_passphrase_mode_json(
         &self,
         require_manual: bool,
@@ -3094,6 +3105,26 @@ mod ohos_napi {
         }
     }
 
+    pub struct CloudSyncEnableManualPassphraseTask {
+        facade: OhosCoreFacade,
+        passphrase: String,
+    }
+
+    impl Task for CloudSyncEnableManualPassphraseTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .cloud_sync_enable_manual_passphrase_json(&self.passphrase)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
     pub struct CloudSyncSetManualPassphraseModeTask {
         facade: OhosCoreFacade,
         require_manual: bool,
@@ -4213,6 +4244,17 @@ mod ohos_napi {
             AsyncTask::new(CloudSyncImportDeviceLinkUriTask {
                 facade: self.facade.clone(),
                 uri,
+            })
+        }
+
+        #[napi]
+        pub fn cloud_sync_enable_manual_passphrase_json(
+            &self,
+            passphrase: String,
+        ) -> AsyncTask<CloudSyncEnableManualPassphraseTask> {
+            AsyncTask::new(CloudSyncEnableManualPassphraseTask {
+                facade: self.facade.clone(),
+                passphrase,
             })
         }
 

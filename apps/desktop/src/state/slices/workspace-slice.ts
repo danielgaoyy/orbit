@@ -281,7 +281,8 @@ export function createWorkspaceSlice(ctx: OrbitStoreContext) {
 
 
     setSidePanelWidth(w: number, persist = true): void {
-      setState((s) => ({ ...s, sidePanelWidth: clampSidePanelPrefWidth(w) }), persist);
+      const clamped = clampSidePanelPrefWidth(w);
+      setState((s) => (s.sidePanelWidth === clamped ? s : { ...s, sidePanelWidth: clamped }), persist);
     },
 
 

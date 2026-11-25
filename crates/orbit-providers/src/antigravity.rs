@@ -1484,7 +1484,7 @@ async fn run_agy_actor(
                 cancel_agy_subagent_monitors(ids.as_deref(), &mut subagent_monitors, &evt_tx).await;
             }
             BgTaskDelta::WakeupActivity => {}
-            BgTaskDelta::Compacted => {}
+            BgTaskDelta::Compacted { .. } => {}
         }
     }
     let now_utc = Utc::now();
@@ -4380,11 +4380,15 @@ async fn apply_foreground_bg_deltas_with_mode(
                 cancel_agy_subagent_monitors(ids.as_deref(), subagent_monitors, evt_tx).await;
             }
             BgTaskDelta::WakeupActivity => {}
-            BgTaskDelta::Compacted => {
+            BgTaskDelta::Compacted { manual } => {
                 let _ = evt_tx
                     .send(DriverEvent::Notice {
-                        level: "info".into(),
-                        message: "Context compacted automatically".into(),
+                        level: "compaction".into(),
+                        message: if manual {
+                            "Context compacted".into()
+                        } else {
+                            "Context compacted automatically".into()
+                        },
                     })
                     .await;
             }
@@ -6610,11 +6614,19 @@ async fn poll_agy_subagent_monitor(
         return;
     }
     let prev_status = entry.desc.status;
+    let prev_model = entry.desc.model.clone();
     let (payloads, status_transition) = apply_subagent_wakeup_steps(entry, steps, false);
-    // If the subagent transitioned back to Running (resume/follow-up turn), upsert Running BEFORE
-    // streaming the new turn's timeline items so clients reflect Running immediately.
-    if status_transition == Some(ProviderSubagentStatus::Running)
-        && prev_status != ProviderSubagentStatus::Running
+    if let Some(ref observed) = entry.monitor.observed_model
+        && entry.desc.model.as_deref() != Some(observed.as_str())
+    {
+        entry.desc.model = Some(observed.clone());
+    }
+    let model_changed = entry.desc.model != prev_model;
+    // If the subagent transitioned back to Running (resume/follow-up turn) or discovered its model,
+    // upsert BEFORE streaming the new turn's timeline items so clients reflect it immediately.
+    if (status_transition == Some(ProviderSubagentStatus::Running)
+        && prev_status != ProviderSubagentStatus::Running)
+        || (model_changed && status_transition.is_none())
     {
         let _ = evt_tx
             .send(DriverEvent::ProviderSubagentUpsert(entry.desc.clone()))
@@ -6678,6 +6690,7 @@ async fn register_agy_subagent_monitor_in_dir(
         parent_subagent_id: None,
         title,
         subtitle,
+        model: None,
         status: if force_canceled {
             ProviderSubagentStatus::Canceled
         } else {
@@ -6713,6 +6726,9 @@ async fn register_agy_subagent_monitor_in_dir(
         let initial_steps = entry.monitor.poll_post_turn_wakeup();
         let (initial_timeline, _) =
             apply_subagent_wakeup_steps(&mut entry, initial_steps, force_canceled);
+        if let Some(ref observed) = entry.monitor.observed_model {
+            entry.desc.model = Some(observed.clone());
+        }
         let _ = evt_tx
             .send(DriverEvent::ProviderSubagentUpsert(entry.desc.clone()))
             .await;
@@ -7587,7 +7603,9 @@ enum BgTaskDelta {
         ids: Option<Vec<String>>,
     },
     WakeupActivity,
-    Compacted,
+    Compacted {
+        manual: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -9019,6 +9037,19 @@ fn parse_bg_task_started(
     Some((task_id.to_string(), description, log_path))
 }
 
+fn is_transcript_compact_user_input(content: &str) -> bool {
+    let candidate = if let Some(start) = content.find("<USER_REQUEST>") {
+        let after = &content[start + "<USER_REQUEST>".len()..];
+        match after.find("</USER_REQUEST>") {
+            Some(end) => &after[..end],
+            None => after,
+        }
+    } else {
+        content
+    };
+    orbit_protocol::is_compaction_command(candidate, &[])
+}
+
 fn is_system_message_step(step_type: &str, content: &str) -> bool {
     if step_type == "SYSTEM_MESSAGE" {
         return true;
@@ -9766,6 +9797,8 @@ struct AgyTranscriptMonitor {
     foreground_settled_at: Option<Instant>,
     foreground_bg_tool_only_at: Option<Instant>,
     has_unfinished_foreground_step: bool,
+    last_user_input_was_compact: bool,
+    observed_model: Option<String>,
 }
 
 impl AgyTranscriptMonitor {
@@ -9806,6 +9839,8 @@ impl AgyTranscriptMonitor {
             foreground_settled_at: None,
             foreground_bg_tool_only_at: None,
             has_unfinished_foreground_step: false,
+            last_user_input_was_compact: false,
+            observed_model: None,
         }
     }
 
@@ -10298,6 +10333,14 @@ impl AgyTranscriptMonitor {
 
             let content = step.get("content").and_then(|v| v.as_str()).unwrap_or("");
             if step_type == "PLANNER_RESPONSE" {
+                if let Some(m) = step
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    self.observed_model = Some(m.to_string());
+                }
                 if status == "DONE" {
                     if !content.trim().is_empty() && self.committed_planner_texts.len() < 128 {
                         self.committed_planner_texts.push(content.to_string());
@@ -10697,9 +10740,20 @@ impl AgyTranscriptMonitor {
                 self.foreground_settled_at = None;
                 self.foreground_bg_tool_only_at = None;
             }
+            if step_type == "USER_INPUT" {
+                self.last_user_input_was_compact = is_transcript_compact_user_input(content);
+            } else if matches!(step_type, "PLANNER_RESPONSE" | "ERROR_MESSAGE") {
+                self.last_user_input_was_compact = false;
+            }
 
             if step_type == "CHECKPOINT" {
-                bg_deltas.push(BgTaskDelta::Compacted);
+                let manual = std::mem::take(&mut self.last_user_input_was_compact);
+                let message = if manual {
+                    "Context compacted"
+                } else {
+                    "Context compacted automatically"
+                };
+                bg_deltas.push(BgTaskDelta::Compacted { manual });
                 if !silent {
                     self.consecutive_errors = 0;
                     self.last_error_at = None;
@@ -10709,8 +10763,8 @@ impl AgyTranscriptMonitor {
                         self.last_wakeup_activity_at = Some(Instant::now());
                     }
                     out.push(WakeupStep::Notice {
-                        level: "info".into(),
-                        message: "Context compacted automatically".into(),
+                        level: "compaction".into(),
+                        message: message.into(),
                     });
                 }
                 continue;
@@ -12615,7 +12669,7 @@ mod tests {
         // Must surface compaction divider notice AND incremental thinking while PLANNER_RESPONSE is still RUNNING!
         assert!(steps1.iter().any(|s| matches!(
             s,
-            WakeupStep::Notice { level, message } if level == "info" && message.contains("compacted")
+            WakeupStep::Notice { level, message } if level == "compaction" && message.contains("compacted")
         )));
         assert!(steps1.iter().any(|s| matches!(
             s,
@@ -14778,6 +14832,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
                     "step_index": 1,
                     "type": "PLANNER_RESPONSE",
                     "status": "DONE",
+                    "model": "gemini-4-neon-high",
                     "content": "Initial audit complete."
                 })
             )
@@ -14792,6 +14847,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             parent_subagent_id: None,
             title: "Code Reviewer".into(),
             subtitle: None,
+            model: None,
             status: ProviderSubagentStatus::Running,
             created_at: now,
             updated_at: now,
@@ -14800,9 +14856,10 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         let mut entry = AgySubagentMonitorEntry::new(desc, sub_mon);
         let (tx, mut rx) = mpsc::channel(64);
 
-        // Poll Turn 1 -> settles to Completed.
+        // Poll Turn 1 -> settles to Completed and observes the real subagent model.
         poll_agy_subagent_monitor(sub_id, &mut entry, &tx).await;
         assert_eq!(entry.desc.status, ProviderSubagentStatus::Completed);
+        assert_eq!(entry.desc.model.as_deref(), Some("gemini-4-neon-high"));
         assert!(!entry.monitor.has_unconsumed_growth());
         while rx.try_recv().is_ok() {}
 
@@ -15135,7 +15192,11 @@ Task logs are available at: file:///tmp/task-1295.log\n";
 
         let mut monitor = AgyTranscriptMonitor::from_brain_dir_with_session(tmp.clone(), "sess_cp");
         let deltas = monitor.poll_foreground_bg_deltas();
-        assert!(deltas.iter().any(|d| matches!(d, BgTaskDelta::Compacted)));
+        assert!(
+            deltas
+                .iter()
+                .any(|d| matches!(d, BgTaskDelta::Compacted { manual: false }))
+        );
 
         let mut wakeup_tools = WakeupToolRegistry::default();
         let mut bg_tracker = BackgroundTaskTracker::default();
@@ -15158,7 +15219,49 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         assert!(matches!(
             notice,
             DriverEvent::Notice { level, message }
-                if level == "info" && message == "Context compacted automatically"
+                if level == "compaction" && message == "Context compacted automatically"
+        ));
+
+        // Manual `/compact` followed by `CHECKPOINT` must emit manual "Context compacted"
+        let manual_append = format!(
+            "{}\n{}\n",
+            json!({
+                "step_index": 13,
+                "type": "USER_INPUT",
+                "status": "DONE",
+                "content": "<USER_REQUEST>\n/compact\n</USER_REQUEST>\n<ADDITIONAL_METADATA>now</ADDITIONAL_METADATA>"
+            }),
+            json!({
+                "step_index": 14,
+                "type": "CHECKPOINT",
+                "status": "DONE"
+            })
+        );
+        let mut existing = std::fs::read_to_string(&transcript).expect("read transcript");
+        existing.push_str(&manual_append);
+        std::fs::write(&transcript, existing).expect("append manual compact checkpoint");
+
+        let manual_deltas = monitor.poll_foreground_bg_deltas();
+        assert!(
+            manual_deltas
+                .iter()
+                .any(|d| matches!(d, BgTaskDelta::Compacted { manual: true }))
+        );
+        apply_foreground_bg_deltas(
+            "ag_parent",
+            manual_deltas,
+            &mut wakeup_tools,
+            &mut bg_tracker,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &evt_tx,
+        )
+        .await;
+        let manual_notice = evt_rx.try_recv().expect("manual compaction notice emitted");
+        assert!(matches!(
+            manual_notice,
+            DriverEvent::Notice { level, message }
+                if level == "compaction" && message == "Context compacted"
         ));
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -17794,6 +17897,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             parent_subagent_id: None,
             title: "Workspace Reader".into(),
             subtitle: None,
+            model: None,
             status: ProviderSubagentStatus::Running,
             created_at: now,
             updated_at: now,

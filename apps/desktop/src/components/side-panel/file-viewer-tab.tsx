@@ -1031,8 +1031,13 @@ export const FileViewerTab = memo(function FileViewerTab({
         <div className="border-border bg-elevated/85 flex shrink-0 items-center justify-between gap-2 border-b px-3 py-1.5 text-[12px]">
           <div className="flex min-w-0 items-center gap-1.5">
             <span className="size-[6px] shrink-0 rounded-full bg-amber-500" />
-            <span className="text-foreground font-medium">Unsaved changes</span>
-            <span className="text-muted-foreground truncate text-[11.5px]">
+            <span className="text-foreground shrink-0 whitespace-nowrap font-medium">
+              Unsaved changes
+            </span>
+            <span
+              title={pendingUnsaved.label}
+              className="text-muted-foreground min-w-0 truncate text-[11.5px]"
+            >
               · {pendingUnsaved.label}
             </span>
           </div>

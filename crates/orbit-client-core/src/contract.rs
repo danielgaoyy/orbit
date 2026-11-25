@@ -527,6 +527,10 @@ pub struct UpsertExternalMcpServerRequest {
     pub keep_existing_secrets: bool,
     #[serde(default = "default_include_committed_true")]
     pub enabled: bool,
+    /// Create-only intent: refuse to replace an existing server with the same name in the target
+    /// scope. Defaults to `false` so older payloads keep the previous upsert semantics.
+    #[serde(default)]
+    pub create_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

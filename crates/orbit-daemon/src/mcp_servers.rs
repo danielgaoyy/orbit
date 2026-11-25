@@ -112,6 +112,10 @@ pub struct UpsertExternalMcpInput {
     pub headers: BTreeMap<String, String>,
     pub keep_existing_secrets: bool,
     pub enabled: bool,
+    /// Create-only guard: reject the write when a server with the same name already exists in the
+    /// target scope instead of replacing its transport/url/env. `false` keeps the historical blind
+    /// upsert behavior for existing non-UI callers.
+    pub create_only: bool,
 }
 
 /// Build a canonical probe cache key, namespacing `project_dot_mcp:*` entries by canonical `cwd`
@@ -1588,6 +1592,21 @@ pub(crate) fn upsert_external_mcp_server_with_homes(
     let final_headers = validate_headers_map(&final_headers, false)?;
 
     let mut root = load_or_init_json_root(&target_path)?;
+
+    // Create-only guard: check the target file's own map, since that is the entry a blind
+    // `servers_map.insert` would replace. Rejected before any write so the existing transport,
+    // url, env, and enabled state survive untouched.
+    if input.create_only
+        && root
+            .get("mcpServers")
+            .and_then(Value::as_object)
+            .is_some_and(|servers| servers.contains_key(&name))
+    {
+        return Err(format!(
+            "An MCP server named `{name}` already exists in this scope"
+        ));
+    }
+
     let mut entry_obj = Map::new();
     match &input.transport {
         McpTransportKind::Stdio { command, args } => {
@@ -3417,6 +3436,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 keep_existing_secrets: false,
                 enabled: true,
+                create_only: false,
             },
             &cache,
         )
@@ -3465,6 +3485,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 keep_existing_secrets: true,
                 enabled: true,
+                create_only: false,
             },
             &cache,
         )
@@ -3572,6 +3593,7 @@ mod tests {
                 ]),
                 keep_existing_secrets: true,
                 enabled: true,
+                create_only: false,
             },
             &cache,
         )
@@ -3608,6 +3630,7 @@ mod tests {
                 ]),
                 keep_existing_secrets: true,
                 enabled: true,
+                create_only: false,
             },
             &cache,
         )
@@ -3669,6 +3692,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 keep_existing_secrets: false,
                 enabled: true,
+                create_only: false,
             },
             &cache,
         )
@@ -3690,6 +3714,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 keep_existing_secrets: false,
                 enabled: true,
+                create_only: false,
             },
             &cache,
         )
@@ -3806,6 +3831,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 keep_existing_secrets: false,
                 enabled: true,
+                create_only: false,
             },
             &HashMap::new(),
         )
@@ -4124,6 +4150,7 @@ done
                 headers: BTreeMap::new(),
                 keep_existing_secrets: false,
                 enabled: true,
+                create_only: false,
             },
             &HashMap::new(),
         )
@@ -4302,6 +4329,7 @@ done
                 )]),
                 keep_existing_secrets: false,
                 enabled: true,
+                create_only: false,
             },
             &HashMap::new(),
         )
@@ -4332,6 +4360,7 @@ done
                 headers: BTreeMap::new(),
                 keep_existing_secrets: false,
                 enabled: true,
+                create_only: false,
             },
             &HashMap::new(),
         )
@@ -4445,6 +4474,7 @@ done
                 headers: BTreeMap::new(),
                 keep_existing_secrets: false,
                 enabled: true,
+                create_only: false,
             },
             &HashMap::new(),
         )
@@ -4465,6 +4495,7 @@ done
                 headers: BTreeMap::new(),
                 keep_existing_secrets: false,
                 enabled: false,
+                create_only: false,
             },
             &HashMap::new(),
         )
@@ -4628,6 +4659,7 @@ done
                     headers: BTreeMap::new(),
                     keep_existing_secrets: false,
                     enabled: true,
+                    create_only: false,
                 },
                 &HashMap::new(),
             )
@@ -4650,5 +4682,127 @@ done
 
         let _ = fs::remove_dir_all(&orbit_home);
         let _ = fs::remove_dir_all(&project_dir);
+    }
+
+    /// Regression: the settings "add server" entry had no existence check, so saving a server
+    /// whose name matched an existing one replaced its transport/url/env wholesale via
+    /// `servers_map.insert`. Create-only must refuse and leave the stored entry intact.
+    #[test]
+    fn create_only_rejects_duplicate_name_and_preserves_existing_entry() {
+        let orbit_home = make_temp_dir("create-only");
+        let user_home = make_temp_dir("create-only-uhome");
+        let cache = HashMap::new();
+
+        let created = upsert_external_mcp_server_with_homes(
+            &orbit_home,
+            Some(&user_home),
+            UpsertExternalMcpInput {
+                scope: McpWriteScope::User,
+                cwd: None,
+                name: "github".into(),
+                transport: McpTransportKind::Stdio {
+                    command: "npx".into(),
+                    args: vec!["-y".into(), "@modelcontextprotocol/server-github".into()],
+                },
+                env: BTreeMap::from([
+                    ("GITHUB_TOKEN".into(), "ghp_original_4321".into()),
+                    ("LOG_LEVEL".into(), "info".into()),
+                ]),
+                headers: BTreeMap::new(),
+                keep_existing_secrets: false,
+                enabled: true,
+                create_only: true,
+            },
+            &cache,
+        )
+        .expect("create-only succeeds when the name is free");
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].id, "orbit_user:github");
+
+        let config_path = orbit_home.join("mcp-servers.json");
+        let bytes_before = fs::read(&config_path).expect("read config before");
+
+        // Same name, completely different transport: previously a silent full replacement.
+        let err = upsert_external_mcp_server_with_homes(
+            &orbit_home,
+            Some(&user_home),
+            UpsertExternalMcpInput {
+                scope: McpWriteScope::User,
+                cwd: None,
+                name: "github".into(),
+                transport: McpTransportKind::StreamableHttp {
+                    url: "https://clobber.example.com/mcp".into(),
+                    header_keys: Vec::new(),
+                },
+                env: BTreeMap::new(),
+                headers: BTreeMap::new(),
+                keep_existing_secrets: false,
+                enabled: false,
+                create_only: true,
+            },
+            &cache,
+        )
+        .expect_err("create-only must reject a duplicate name");
+        assert!(
+            err.contains("already exists"),
+            "error should explain the name collision, got: {err}"
+        );
+
+        assert_eq!(
+            bytes_before,
+            fs::read(&config_path).expect("read config after"),
+            "rejected create must not rewrite mcp-servers.json"
+        );
+
+        // The original stdio entry, its env, and its enabled state all survive.
+        let listed =
+            list_external_mcp_servers_with_homes(&orbit_home, Some(&user_home), None, &cache);
+        let rec = listed
+            .iter()
+            .find(|s| s.id == "orbit_user:github")
+            .expect("existing entry preserved");
+        assert!(rec.enabled, "rejected create must not disable the entry");
+        assert!(
+            matches!(&rec.transport, McpTransportKind::Stdio { command, .. } if command == "npx"),
+            "transport must stay stdio/npx, got {:?}",
+            rec.transport
+        );
+        assert_eq!(
+            rec.masked_env.get("LOG_LEVEL").map(String::as_str),
+            Some("info")
+        );
+
+        // Editing the same server WITHOUT create_only still works (backward compatibility).
+        let edited = upsert_external_mcp_server_with_homes(
+            &orbit_home,
+            Some(&user_home),
+            UpsertExternalMcpInput {
+                scope: McpWriteScope::User,
+                cwd: None,
+                name: "github".into(),
+                transport: McpTransportKind::Stdio {
+                    command: "npx".into(),
+                    args: vec!["-y".into(), "@modelcontextprotocol/server-github".into()],
+                },
+                env: BTreeMap::from([("LOG_LEVEL".into(), "debug".into())]),
+                headers: BTreeMap::new(),
+                keep_existing_secrets: true,
+                enabled: true,
+                create_only: false,
+            },
+            &cache,
+        )
+        .expect("upsert edit path still works");
+        assert_eq!(
+            edited
+                .iter()
+                .find(|s| s.id == "orbit_user:github")
+                .and_then(|s| s.masked_env.get("LOG_LEVEL"))
+                .map(String::as_str),
+            Some("debug")
+        );
+
+        let _ = fs::remove_dir_all(&orbit_home);
+        let _ = fs::remove_dir_all(&user_home);
     }
 }

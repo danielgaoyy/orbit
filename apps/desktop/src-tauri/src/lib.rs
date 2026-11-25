@@ -1777,6 +1777,7 @@ async fn upsert_managed_skill(
     content: String,
     enabled: bool,
     expected_etag: Option<String>,
+    create_only: Option<bool>,
 ) -> Result<Vec<ManagedSkillRecord>, String> {
     state
         .core
@@ -1790,6 +1791,7 @@ async fn upsert_managed_skill(
             content,
             enabled,
             expected_etag,
+            create_only: create_only.unwrap_or(false),
         })
         .await
 }
@@ -1821,6 +1823,7 @@ async fn delete_managed_skill(
         .await
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn import_managed_skill(
     state: State<'_, DesktopAppState>,
@@ -1829,6 +1832,8 @@ async fn import_managed_skill(
     cwd: Option<String>,
     source_markdown_or_path: String,
     slug_override: Option<String>,
+    expected_etag: Option<String>,
+    create_only: Option<bool>,
 ) -> Result<Vec<ManagedSkillRecord>, String> {
     state
         .core
@@ -1838,6 +1843,8 @@ async fn import_managed_skill(
             cwd,
             source_markdown_or_path,
             slug_override,
+            expected_etag,
+            create_only: create_only.unwrap_or(false),
         })
         .await
 }
@@ -4528,6 +4535,20 @@ async fn cloud_sync_import_device_link_uri(
 }
 
 #[tauri::command]
+async fn cloud_sync_enable_manual_passphrase(
+    state: State<'_, DesktopAppState>,
+    passphrase: String,
+) -> Result<CloudSyncStatusView, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        core.cloud_sync_enable_manual_passphrase(&passphrase)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("cloud sync enable manual passphrase task error: {e}"))?
+}
+
+#[tauri::command]
 async fn cloud_sync_set_manual_passphrase_mode(
     state: State<'_, DesktopAppState>,
     require_manual: bool,
@@ -5465,6 +5486,7 @@ pub fn run() {
             cloud_sync_now,
             cloud_sync_export_device_link_uri,
             cloud_sync_import_device_link_uri,
+            cloud_sync_enable_manual_passphrase,
             cloud_sync_set_manual_passphrase_mode,
             cloud_sync_trigger_background,
             cloud_sync_logout,

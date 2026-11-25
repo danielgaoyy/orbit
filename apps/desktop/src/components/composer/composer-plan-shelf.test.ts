@@ -291,6 +291,57 @@ it("reappears cleanly when a new todo list arrives after dismissal or completion
   assert.equal(update([step("a", "in_progress", 14)], true, dismissedAbandoned, 10, 10).dismissed, false);
 });
 
+it("never flickers or resurrects a settled plan across optimistic send (anchor_seq 0) and HostChanged/TimelineChanged ordering", () => {
+  // 1. Plan completes live in Turn 1 (anchor_seq = 10), then auto-dismisses.
+  const active = update([step("a", "in_progress", 20)], true, null, 10, 10);
+  const done = [step("a", "completed", 50)];
+  const settled = update(done, false, active, 10, 10);
+  assert.equal(settled.open, false);
+  assert.equal(settled.settledLive, true);
+  assert.equal(settled.dismissed, false);
+
+  // Brief foreground status blip (false -> true -> false) must NOT strand settledLive = false.
+  const blipRunning = update(done, true, settled, 10, 10);
+  assert.equal(blipRunning.open, false);
+  assert.equal(blipRunning.dismissed, false);
+  const blipIdle = update(done, false, blipRunning, 10, 10);
+  assert.equal(blipIdle.settledLive, true);
+  assert.equal(blipIdle.dismissed, false);
+
+  // Auto-dismissed after dwell.
+  const dismissed = { ...blipIdle, dismissed: true, settledLive: false };
+
+  // 2a. User sends next message: HostChanged flips running=true BEFORE TimelineChanged adds Turn 2.
+  const afterHostChanged = update(done, true, dismissed, 10, 10);
+  assert.equal(afterHostChanged.dismissed, true);
+
+  // 2b. TimelineChanged appends optimistic Turn 2 with anchor_seq = 0.
+  const turnsWithOptimistic = [
+    { anchor_seq: 10, live_segments: [] },
+    { anchor_seq: 0, live_segments: [] },
+  ];
+  assert.equal(planSourceTurn(turnsWithOptimistic, 50), 10);
+  assert.equal(describePlan(done, true, 0)?.isFromPreviousTurn, true);
+  const afterOptimisticTurn = update(done, true, afterHostChanged, 10, 0);
+  assert.equal(afterOptimisticTurn.dismissed, true);
+
+  // 2c. Daemon ACKs Turn 2 with real anchor_seq = 55: stays cleanly dismissed.
+  const afterAckTurn = update(done, true, afterOptimisticTurn, 10, 55);
+  assert.equal(afterAckTurn.dismissed, true);
+
+  // 3. Even if the user sends a follow-up BEFORE the 2.8s dwell finishes, optimistic Turn 2
+  //    retires the completed plan immediately on anchor_seq = 0 (no hide -> show -> hide flicker).
+  const retiredOnOptimistic = update(done, true, settled, 10, 0);
+  assert.equal(retiredOnOptimistic.dismissed, true);
+  assert.equal(update(done, true, retiredOnOptimistic, 10, 55).dismissed, true);
+
+  // 4. Incomplete plan from Turn 1 also classifies as previous-turn immediately on anchor_seq = 0.
+  const prevIncompleteOnOptimistic = describePlan([step("a", "in_progress", 20)], true, 0);
+  assert.equal(prevIncompleteOnOptimistic?.isFromPreviousTurn, true);
+  assert.equal(prevIncompleteOnOptimistic?.headline?.state, "pending");
+  assert.equal(prevIncompleteOnOptimistic?.canDismiss, true);
+});
+
 it("keeps host and thread preferences separate when revisiting and bounds the session cache", () => {
   const cache = createPlanShelfCache(2);
   const a = JSON.stringify(["host1", "agent"]);

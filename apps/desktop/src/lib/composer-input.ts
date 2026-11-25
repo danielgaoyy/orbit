@@ -24,6 +24,29 @@ export interface CappedTextarea {
   scopeKey: string;
 }
 
+export type ComposerActionMode =
+  | "stop"
+  | "voice_recording"
+  | "submitting"
+  | "send"
+  | "send_disabled"
+  | "voice_idle";
+
+export function resolveComposerActionMode(opts: {
+  voiceRecording: boolean;
+  showStopButton: boolean;
+  submitBusy: boolean;
+  voiceTranscribing: boolean;
+  hasPayload: boolean;
+  voiceEnabled: boolean;
+}): ComposerActionMode {
+  if (opts.voiceRecording) return "voice_recording";
+  if (opts.showStopButton) return "stop";
+  if (opts.submitBusy || opts.voiceTranscribing) return "submitting";
+  if (opts.hasPayload) return "send";
+  return opts.voiceEnabled ? "voice_idle" : "send_disabled";
+}
+
 export function canSkipCappedMeasurement(
   capped: CappedTextarea | null,
   text: string,

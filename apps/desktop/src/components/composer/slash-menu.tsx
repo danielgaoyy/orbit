@@ -208,6 +208,7 @@ export function SlashCommandMenu({
                 aria-selected={active}
                 type="button"
                 data-slash-idx={idx}
+                title={[cmd.command, cmd.argument_hint, localizedDesc].filter(Boolean).join(" — ")}
                 onMouseEnter={() => onHoverIndex(idx)}
                 onMouseDown={(e) => {
                   // Keep focus inside composer textarea
@@ -215,31 +216,38 @@ export function SlashCommandMenu({
                   onSelect(cmd);
                 }}
                 className={cn(
-                  "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
+                  "flex w-full cursor-pointer items-center justify-between gap-3 overflow-hidden rounded-[9px] px-2.5 py-1.5 text-left transition-colors duration-110",
                   active
                     ? "bg-accent text-ink-primary"
                     : "text-ink-secondary hover:bg-accent/60 hover:text-ink-primary",
                 )}
               >
-                <div className="flex min-w-0 items-center gap-2.5">
+                <div className="flex min-w-0 flex-1 items-center gap-2.5">
                   <Icon
                     className={cn(
                       "size-4 shrink-0 stroke-[1.75]",
                       active || modeActive ? "text-ink-primary" : "text-ink-muted",
                     )}
                   />
-                  <div className="flex min-w-0 items-baseline gap-2">
-                    <span className="text-ink-primary shrink-0 font-mono text-[13px] font-medium">
+                  <div className="flex min-w-0 flex-1 items-baseline gap-2">
+                    <span
+                      className={cn(
+                        "text-ink-primary min-w-0 truncate font-mono text-[13px] font-medium",
+                        cmd.argument_hint || localizedDesc ? "max-w-[55%] shrink-0" : "flex-1",
+                      )}
+                    >
                       {cmd.command}
                     </span>
                     {cmd.argument_hint && (
-                      <span className="text-ink-faint shrink-0 font-mono text-[11px]">
+                      <span className="text-ink-faint min-w-0 max-w-[30%] shrink-0 truncate font-mono text-[11px]">
                         {cmd.argument_hint}
                       </span>
                     )}
-                    <span className="text-ink-muted truncate text-[11px]">
-                      {localizedDesc}
-                    </span>
+                    {localizedDesc && (
+                      <span className="text-ink-muted min-w-0 flex-1 truncate text-[11px]">
+                        {localizedDesc}
+                      </span>
+                    )}
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-1.5">

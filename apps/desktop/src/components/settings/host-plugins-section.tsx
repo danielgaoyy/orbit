@@ -30,6 +30,7 @@ import { Input } from "@/components/ui/input";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { useI18n } from "@/lib/i18n";
 import { type InstalledPluginView, orbitIpc } from "@/lib/orbit-ipc";
+import { cn } from "@/lib/utils";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
 export const ORBIT_PLUGINS_CHANGED_EVENT = "orbit:plugins-changed";
@@ -147,7 +148,7 @@ export const HostPluginsSection = memo(function HostPluginsSection({
   const effectiveCwd = selectedCwd && selectedCwd !== "~" ? selectedCwd : null;
 
   const [plugins, setPlugins] = useState<InstalledPluginView[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => isOnline);
   const [error, setError] = useState<string | null>(null);
   const [installOpen, setInstallOpen] = useState(false);
   const [detailOpen, setDetailOpen] = useState(false);
@@ -244,7 +245,7 @@ export const HostPluginsSection = memo(function HostPluginsSection({
   const selected = plugins.find((plugin) => plugin.manifest.id === selectedId);
   const manifest = selected?.manifest;
   return (
-    <section data-setting-id="plugins.title" className="flex flex-col gap-2">
+    <section data-setting-id="plugins.title" className="flex flex-col gap-3">
       <SettingGroupLabel
         action={
           <div className="flex items-center gap-1">
@@ -255,7 +256,7 @@ export const HostPluginsSection = memo(function HostPluginsSection({
               disabled={!isOnline || loading}
               onClick={() => void loadPlugins()}
             >
-              <RefreshCw />
+              <RefreshCw className={cn(loading && "animate-spin")} />
             </Button>
             <Button
               data-setting-id="plugins.installSection"
@@ -343,7 +344,7 @@ export const HostPluginsSection = memo(function HostPluginsSection({
               {manifest.id} · v{manifest.version}
             </p>
             {/* Declared Capabilities Audit Badges */}
-            <div className="flex flex-wrap items-center gap-1.5">
+            <div className="flex flex-wrap items-center gap-2">
               <Badge variant="outline" className="gap-1 text-[11px]">
                 <Shield className="size-3" />
                 {t("managedSkills.wasmSandbox")}
@@ -384,11 +385,11 @@ export const HostPluginsSection = memo(function HostPluginsSection({
 
             {/* Declared MCP Operations */}
             {manifest.mcp_ops.length > 0 && (
-              <div className="flex flex-col gap-1.5 pt-1">
+              <div className="flex flex-col gap-2 pt-1">
                 <div className="text-ink-muted text-[11px] font-medium">
                   {t("plugins.opsHeading")}
                 </div>
-                <div className="flex flex-wrap gap-1.5">
+                <div className="flex flex-wrap gap-2">
                   {manifest.mcp_ops.map((op) => {
                     const opKey = `${manifest.id}:${op.name}`;
                     const running = runningOpKey === opKey;
@@ -413,7 +414,7 @@ export const HostPluginsSection = memo(function HostPluginsSection({
                   return (
                     <pre
                       key={`out:${op.name}`}
-                      className="border-border-subtle bg-surface-recessed text-ink-secondary max-h-36 overflow-auto rounded-[8px] border p-2.5 font-mono text-[11px]"
+                      className="border-border-subtle bg-surface-recessed text-ink-secondary max-h-36 overflow-auto rounded-[8px] border p-3 font-mono text-[11px]"
                     >
                       {out}
                     </pre>
@@ -424,13 +425,13 @@ export const HostPluginsSection = memo(function HostPluginsSection({
 
             {/* Inline Live UI Preview */}
             {manifest.ui_slots.length > 0 && selected.enabled && (
-              <div className="border-border-subtle/70 flex flex-col gap-2.5 border-t pt-2.5">
+              <div className="border-border-subtle/70 flex flex-col gap-3 border-t pt-3">
                 <button
                   type="button"
                   onClick={() =>
                     setPreviewPluginIds((prev) => ({ ...prev, [manifest.id]: !prev[manifest.id] }))
                   }
-                  className="text-ink-secondary hover:text-ink-primary flex w-fit cursor-pointer items-center gap-1.5 text-[13px] font-medium transition-colors"
+                  className="text-ink-secondary hover:text-ink-primary flex w-fit cursor-pointer items-center gap-2 text-[13px] font-medium transition-colors"
                 >
                   {previewPluginIds[manifest.id] ? (
                     <ChevronDown className="size-3.5" />
@@ -440,7 +441,7 @@ export const HostPluginsSection = memo(function HostPluginsSection({
                   <span>{t("plugins.livePreviewToggle")}</span>
                 </button>
                 {previewPluginIds[manifest.id] && (
-                  <div className="flex flex-col gap-2.5">
+                  <div className="flex flex-col gap-3">
                     {manifest.ui_slots.map((slotDecl) => (
                       <PluginSlotCard
                         key={slotDecl.slot}

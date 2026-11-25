@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useRef } from "react";
 import { ArrowRight, Compass } from "lucide-react";
+import { HostMigrationSection } from "@/components/settings/host-security-ops-panels";
 import {
   SettingCard,
   SettingGroupLabel,
@@ -7,6 +8,7 @@ import {
   SettingSectionHeader,
   SettingSelect,
   type SettingSelectOption,
+  useHostIsOnline,
 } from "@/components/settings/settings-primitives";
 import { Button } from "@/components/ui/button";
 import { LOCALES, useI18n } from "@/lib/i18n";
@@ -24,7 +26,11 @@ const languageOptions = LOCALES.map((item) => ({
   description: item.nativeName !== item.englishName ? item.englishName : undefined,
 }));
 
-export const GeneralSection = memo(function GeneralSection() {
+export const GeneralSection = memo(function GeneralSection({
+  hostId,
+}: {
+  hostId: string | null;
+}) {
   const { locale, t } = useI18n();
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const activeTurnSendBehavior = useOrbitSelector((s) => s.activeTurnSendBehavior);
@@ -33,6 +39,10 @@ export const GeneralSection = memo(function GeneralSection() {
   const checkingUpdate = useOrbitSelector((s) => s.checkingReleaseUpdate);
   const releaseCheckError = useOrbitSelector((s) => s.releaseCheckError);
   const isBrowserOffline = useOrbitSelector((s) => s.isBrowserOffline);
+  const online = useHostIsOnline(hostId);
+  const projectCwd = useOrbitSelector((s) =>
+    s.selectedHostId === hostId ? s.selectedWorkspaceCwd : null,
+  );
   const mod = modSymbol();
   const modEnterLabel = mod === "⌘" ? "⌘ + Enter" : "Ctrl + Enter";
 
@@ -86,7 +96,7 @@ export const GeneralSection = memo(function GeneralSection() {
       />
 
       {/* General */}
-      <div className="flex flex-col gap-2">
+      <div className="flex flex-col gap-3">
         <SettingGroupLabel>{t("settings.groupGeneral")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
@@ -122,7 +132,7 @@ export const GeneralSection = memo(function GeneralSection() {
       </div>
 
       {/* Send */}
-      <div className="flex flex-col gap-2">
+      <div className="flex flex-col gap-3">
         <SettingGroupLabel>{t("settings.groupSend")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
@@ -161,7 +171,7 @@ export const GeneralSection = memo(function GeneralSection() {
 
       {/* App Version */}
       {!isWebRuntime() && (
-        <div className="flex flex-col gap-2">
+        <div className="flex flex-col gap-3">
           <SettingGroupLabel>{t("settings.groupAppVersion")}</SettingGroupLabel>
           <SettingCard>
             <SettingRow
@@ -185,6 +195,15 @@ export const GeneralSection = memo(function GeneralSection() {
             </SettingRow>
           </SettingCard>
         </div>
+      )}
+
+      {/* Import from IDE / CLI */}
+      {hostId && (
+        <HostMigrationSection
+          key={JSON.stringify([hostId, projectCwd])}
+          hostId={hostId}
+          isOnline={online}
+        />
       )}
     </div>
   );

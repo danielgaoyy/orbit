@@ -448,11 +448,17 @@ const InlineCommentComposer = memo(function InlineCommentComposer({
     <div className="border-border bg-elevated/95 border-x border-b px-3 py-2 font-sans">
       <div className="text-muted-foreground mb-1 flex items-center justify-between gap-2 text-[11px]">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="text-foreground/90 truncate font-mono font-medium">
+          <span
+            title={locationLabel}
+            className={cn(
+              "text-foreground/90 min-w-0 truncate font-mono font-medium",
+              !isMultiLine && target.lineNumber != null && "max-w-[65%] shrink-0",
+            )}
+          >
             {locationLabel}
           </span>
           {!isMultiLine && target.lineNumber != null && (
-            <span className="text-muted-foreground/75 hidden truncate text-[10.5px] sm:inline">
+            <span className="text-muted-foreground/75 hidden min-w-0 truncate text-[10.5px] sm:inline">
               {t("review.multiLineHint")}
             </span>
           )}

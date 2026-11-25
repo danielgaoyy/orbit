@@ -15,6 +15,9 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   computeDisclosureRevealDelta,
   computeStageScrollState,
+  mayUserPromptOverflow,
+  observeSharedBubbleResize,
+  shouldFollowBottomOnDisclosureExpand,
   STAGE_STICKY_REENGAGE_THRESHOLD_PX,
   USER_PROMPT_PREVIEW_MAX_PX,
   type ViewportAnchorHoldFn,
@@ -85,17 +88,31 @@ export function useViewportAnchorHold(
       '[data-slot="trace-collapsible"], [data-slot="collapsible"], [data-orbit-disclosure-root]',
     ) ?? triggerEl.parentElement ?? triggerEl;
     const beforeContainerHeight = container.getBoundingClientRect().height;
-    const beforeAnchor = triggerEl.getBoundingClientRect()[edge];
+    let anchorTarget = triggerEl.getBoundingClientRect()[edge];
     const wasPinnedBottom = stickToBottomRef?.current;
+    const beforeGap = Math.max(0, scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight);
+    const followBottomExpand = shouldFollowBottomOnDisclosureExpand({
+      followBottom: options?.followBottom,
+      intent: options?.intent,
+      wasPinnedBottom,
+      beforeGap,
+    });
     let expanding = options?.intent === "expand";
     let frame = 0;
     let timer = 0;
     let revealTarget: number | undefined;
+    let trackedPanel: HTMLElement | null = null;
+    let targetPanelHeight = 0;
 
     const cleanup = () => {
       window.cancelAnimationFrame(frame);
       window.clearTimeout(timer);
       scroller.removeEventListener("scrollend", onScrollEnd);
+      if (trackedPanel) {
+        trackedPanel.removeEventListener("transitionend", onPanelTransitionEnd);
+        trackedPanel.removeEventListener("transitioncancel", onPanelTransitionEnd);
+        trackedPanel = null;
+      }
       pending.current = undefined;
       if (tracking) {
         tracking.cancelHold = undefined;
@@ -104,14 +121,87 @@ export function useViewportAnchorHold(
     };
     const settle = () => {
       if (scroller === viewportRef.current && scroller.isConnected) {
+        if (followBottomExpand) {
+          scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+        }
         const gap = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
         if (stickToBottomRef) {
-          stickToBottomRef.current = (wasPinnedBottom === true && !expanding) || gap <= STAGE_STICKY_REENGAGE_THRESHOLD_PX;
+          stickToBottomRef.current =
+            followBottomExpand ||
+            (wasPinnedBottom === true && !expanding) ||
+            gap <= STAGE_STICKY_REENGAGE_THRESHOLD_PX;
         }
         // Consume the hold's own movement before accepting user scroll deltas again.
         tracking?.syncScrollMetrics();
       }
       cleanup();
+    };
+    const syncAnimatedFrame = () => {
+      if (scroller !== viewportRef.current || !triggerEl.isConnected) {
+        cleanup();
+        return;
+      }
+      if (followBottomExpand) {
+        const bottomTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+        if (Math.abs(scroller.scrollTop - bottomTop) > 0.5) {
+          scroller.scrollTop = bottomTop;
+        }
+        return;
+      }
+      // Batch all geometry reads before mutating `scrollTop` once to avoid Read->Write->Read
+      // forced synchronous layout thrashing on every frame of the CSS height transition.
+      const triggerRect = triggerEl.getBoundingClientRect();
+      const rawDelta = triggerRect[edge] - anchorTarget;
+      const anchorDelta = Math.abs(rawDelta) > 0.5 ? rawDelta : 0;
+      let nudge = 0;
+      if (expanding) {
+        const rawRect = container.getBoundingClientRect();
+        const scrollerRect = scroller.getBoundingClientRect();
+        const projectedHeight = Math.max(rawRect.height, beforeContainerHeight + targetPanelHeight);
+        nudge = computeDisclosureRevealDelta({
+          intent: options?.intent ?? "expand",
+          beforeContainerHeight,
+          containerRect: { bottom: rawRect.bottom - anchorDelta, height: projectedHeight },
+          scrollerRect,
+          triggerRect: {
+            top: triggerRect.top - anchorDelta,
+            bottom: triggerRect.bottom - anchorDelta,
+          },
+          triggerIsContainer: triggerEl === container,
+        });
+        if (nudge <= 0.5) nudge = 0;
+      }
+      const totalDelta = anchorDelta + nudge;
+      if (Math.abs(totalDelta) > 0.5) {
+        scroller.scrollTop += totalDelta;
+      }
+      if (nudge > 0) {
+        anchorTarget -= nudge;
+      }
+    };
+    const finishAnimatedTransition = () => {
+      if (trackedPanel) {
+        trackedPanel.removeEventListener("transitionend", onPanelTransitionEnd);
+        trackedPanel.removeEventListener("transitioncancel", onPanelTransitionEnd);
+        trackedPanel = null;
+      }
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timer);
+      syncAnimatedFrame();
+      if (followBottomExpand) {
+        // Wait one post-ResizeObserver frame so `height: auto` + virtualizer measurement
+        // finish updating `scrollHeight` before the final bottom snap and hold release.
+        frame = window.requestAnimationFrame(() => {
+          settle();
+        });
+        return;
+      }
+      settle();
+    };
+    const onPanelTransitionEnd = (event: TransitionEvent) => {
+      if (event.target !== trackedPanel) return;
+      if (event.propertyName !== "height") return;
+      finishAnimatedTransition();
     };
     const onScrollEnd = (event: Event) => {
       if (event.target === scroller && revealTarget !== undefined &&
@@ -136,25 +226,100 @@ export function useViewportAnchorHold(
         cleanup();
         return;
       }
-      const delta = triggerEl.getBoundingClientRect()[edge] - beforeAnchor;
-      if (Math.abs(delta) > 1) scroller.scrollTop += delta;
-      const containerRect = container.getBoundingClientRect();
-      expanding = options?.intent ? options.intent === "expand" : containerRect.height > beforeContainerHeight + 2;
-      const nudge = computeDisclosureRevealDelta({
-        intent: options?.intent,
-        beforeContainerHeight,
-        containerRect,
-        scrollerRect: scroller.getBoundingClientRect(),
-        triggerRect: triggerEl.getBoundingClientRect(),
-      });
-      if (nudge <= 1) {
-        settle();
+      const directPanel = container.querySelector<HTMLElement>(
+        ':scope > [data-slot="trace-collapsible-content"], :scope > [data-slot="collapsible-content"]',
+      );
+      const panelDurationMs = directPanel
+        ? Math.max(
+            0,
+            ...window
+              .getComputedStyle(directPanel)
+              .transitionDuration.split(",")
+              .map((part) => {
+                const trimmed = part.trim();
+                const value = Number.parseFloat(trimmed);
+                if (!Number.isFinite(value) || value <= 0) return 0;
+                return trimmed.endsWith("ms") ? value : value * 1000;
+              }),
+          )
+        : 0;
+
+      if (directPanel && panelDurationMs > 0) {
+        // Animated Collapsible panel: keep trigger anchored and reveal overflow smoothly
+        // frame-by-frame in lockstep with the CSS height transition instead of jumping on frame 1.
+        trackedPanel = directPanel;
+        const cssTargetHeight = Number.parseFloat(
+          window.getComputedStyle(directPanel).getPropertyValue("--collapsible-panel-height"),
+        );
+        targetPanelHeight = Math.max(
+          Number.isFinite(cssTargetHeight) ? cssTargetHeight : 0,
+          directPanel.scrollHeight,
+        );
+        directPanel.addEventListener("transitionend", onPanelTransitionEnd);
+        directPanel.addEventListener("transitioncancel", onPanelTransitionEnd);
+        const tick = () => {
+          syncAnimatedFrame();
+          if (trackedPanel) {
+            frame = window.requestAnimationFrame(tick);
+          }
+        };
+        syncAnimatedFrame();
+        frame = window.requestAnimationFrame(tick);
+        timer = window.setTimeout(() => {
+          finishAnimatedTransition();
+        }, Math.round(panelDurationMs) + 80);
         return;
       }
-      revealTarget = Math.min(scroller.scrollTop + nudge, scroller.scrollHeight - scroller.clientHeight);
-      scroller.addEventListener("scrollend", onScrollEnd);
-      timer = window.setTimeout(settle, 380);
-      scroller.scrollBy({ top: nudge, behavior: "smooth" });
+
+      if (followBottomExpand) {
+        scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+        frame = window.requestAnimationFrame(() => {
+          if (scroller !== viewportRef.current || !triggerEl.isConnected) {
+            cleanup();
+            return;
+          }
+          settle();
+        });
+        return;
+      }
+
+      const delta = triggerEl.getBoundingClientRect()[edge] - anchorTarget;
+      if (Math.abs(delta) > 1) scroller.scrollTop += delta;
+
+      // Wait one post-ResizeObserver frame before computing reveal nudge or releasing the hold so
+      // virtualized lists (`VirtualizedTurnList` / `measureTurn`) finish updating `scrollHeight`
+      // and downstream row offsets; otherwise `scrollBy` at the bottom clamps against stale height.
+      frame = window.requestAnimationFrame(() => {
+        if (scroller !== viewportRef.current || !triggerEl.isConnected) {
+          cleanup();
+          return;
+        }
+        const postMeasureDelta = triggerEl.getBoundingClientRect()[edge] - anchorTarget;
+        if (Math.abs(postMeasureDelta) > 1) scroller.scrollTop += postMeasureDelta;
+        const containerRect = container.getBoundingClientRect();
+        expanding = options?.intent
+          ? options.intent === "expand"
+          : containerRect.height > beforeContainerHeight + 2;
+        const nudge = computeDisclosureRevealDelta({
+          intent: options?.intent,
+          beforeContainerHeight,
+          containerRect,
+          scrollerRect: scroller.getBoundingClientRect(),
+          triggerRect: triggerEl.getBoundingClientRect(),
+          triggerIsContainer: triggerEl === container,
+        });
+        if (nudge <= 1) {
+          settle();
+          return;
+        }
+        revealTarget = Math.min(
+          scroller.scrollTop + nudge,
+          scroller.scrollHeight - scroller.clientHeight,
+        );
+        scroller.addEventListener("scrollend", onScrollEnd);
+        timer = window.setTimeout(settle, 380);
+        scroller.scrollBy({ top: nudge, behavior: "smooth" });
+      });
     });
   }, [viewportRef, stickToBottomRef]);
 }
@@ -303,7 +468,7 @@ export const ConversationViewport = memo(function ConversationViewport({
         <ScrollArea
           className="min-h-0 flex-1"
           viewportRef={viewportRef}
-          viewportClassName={cn("px-4 py-4", viewportClassName)}
+          viewportClassName={cn("px-4 py-4 [overflow-anchor:none]", viewportClassName)}
           contentClassName={contentClassName}
           onViewportScroll={handleScroll}
           onWheel={(event) => {
@@ -372,25 +537,16 @@ export const ConversationUserBubble = memo(function ConversationUserBubble({
   useLayoutEffect(() => {
     const el = bodyRef.current;
     if (!el) return;
+    if (!mayUserPromptOverflow(text)) {
+      setOverflowing((prev) => (prev ? false : prev));
+      return;
+    }
     const measure = () => {
       const next = el.scrollHeight > USER_PROMPT_PREVIEW_MAX_PX + 10;
       setOverflowing((prev) => (prev === next ? prev : next));
     };
     measure();
-    if (typeof ResizeObserver === "undefined") return;
-    let rafId = 0;
-    const ro = new ResizeObserver(() => {
-      if (rafId) return;
-      rafId = window.requestAnimationFrame(() => {
-        rafId = 0;
-        measure();
-      });
-    });
-    ro.observe(el);
-    return () => {
-      if (rafId) window.cancelAnimationFrame(rafId);
-      ro.disconnect();
-    };
+    return observeSharedBubbleResize(el, measure);
   }, [text]);
 
   useEffect(() => {

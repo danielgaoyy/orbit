@@ -341,12 +341,12 @@ export const HostConnectionSection = memo(function HostConnectionSection({
           }
           contentClassName="divide-border-subtle divide-y"
         >
-          <div className="flex items-center justify-between gap-4 px-4 py-2.5 text-[13px]">
-            <span className="text-ink-muted shrink-0">Host ID</span>
+          <div className="flex items-center justify-between gap-4 px-4 py-2 text-[13px]">
+            <span className="text-ink-muted shrink-0">{t("settings.fleetHostId")}</span>
             <button
               type="button"
               onClick={() => void copyValue("id", host.host_id)}
-              className="selectable-text text-ink-primary hover:bg-surface-recessed inline-flex min-w-0 cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 font-mono text-[13px] transition-colors"
+              className="selectable-text text-ink-primary hover:bg-surface-recessed inline-flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1 font-mono text-[13px] transition-colors"
             >
               <span className="truncate">{host.host_id}</span>
               {copiedField === "id" ? (
@@ -357,12 +357,12 @@ export const HostConnectionSection = memo(function HostConnectionSection({
             </button>
           </div>
 
-          <div className="flex items-center justify-between gap-4 px-4 py-2.5 text-[13px]">
+          <div className="flex items-center justify-between gap-4 px-4 py-2 text-[13px]">
             <span className="text-ink-muted shrink-0">{t("settings.fleetPublicKey")}</span>
             <button
               type="button"
               onClick={() => void copyValue("pubkey", host.daemon_pubkey_b64)}
-              className="selectable-text text-ink-primary hover:bg-surface-recessed inline-flex min-w-0 cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 font-mono text-[13px] transition-colors"
+              className="selectable-text text-ink-primary hover:bg-surface-recessed inline-flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1 font-mono text-[13px] transition-colors"
             >
               <span className="truncate">{host.daemon_pubkey_b64.slice(0, 26)}…</span>
               {copiedField === "pubkey" ? (
@@ -373,7 +373,7 @@ export const HostConnectionSection = memo(function HostConnectionSection({
             </button>
           </div>
 
-          <div className="flex items-center justify-between gap-4 px-4 py-2.5 text-[13px]">
+          <div className="flex items-center justify-between gap-4 px-4 py-2 text-[13px]">
             <span className="text-ink-muted shrink-0">{t("settings.fleetEndpoints")}</span>
             <span className="selectable-text text-ink-secondary truncate px-2 py-1 font-mono text-[13px]">
               {host.direct_endpoints.join(", ") || "—"}
@@ -393,7 +393,7 @@ export const HostConnectionSection = memo(function HostConnectionSection({
                 : t("settings.advancedRelayAutoBadge")}
             </Badge>
           }
-          contentClassName="flex flex-col gap-3 px-4 py-3.5"
+          contentClassName="flex flex-col gap-3 px-4 py-3"
         >
           <p className="text-ink-secondary text-[13px] leading-[1.45]">
             {t("settings.advancedRelayDesc")}
@@ -410,7 +410,7 @@ export const HostConnectionSection = memo(function HostConnectionSection({
                 if (e.key === "Enter" && relayDirty) handleRequestSaveRelay();
               }}
               placeholder="wss://relay.example.com"
-              className="h-[30px] min-w-[200px] flex-1 px-2.5 font-mono text-[13px]"
+              className="h-[30px] min-w-[200px] flex-1 px-3 font-mono text-[13px]"
             />
             <Button
               type="button"
@@ -448,11 +448,11 @@ export const HostConnectionSection = memo(function HostConnectionSection({
           </div>
 
           {sshHosts.length > 0 && (
-            <div className="flex flex-col gap-2 pt-0.5">
+            <div className="flex flex-col gap-2 pt-1">
               <button
                 type="button"
                 onClick={() => setShowSshDeploy((v) => !v)}
-                className="text-ink-secondary hover:text-ink-primary inline-flex w-fit cursor-pointer items-center gap-1.5 text-[13px] font-medium transition-colors"
+                className="text-ink-secondary hover:text-ink-primary inline-flex w-fit cursor-pointer items-center gap-2 text-[13px] font-medium transition-colors"
               >
                 {showSshDeploy ? (
                   <ChevronDown className="size-[13px]" />
@@ -463,7 +463,7 @@ export const HostConnectionSection = memo(function HostConnectionSection({
               </button>
 
               {showSshDeploy && (
-                <div className="flex flex-col gap-2.5 pt-0.5">
+                <div className="flex flex-col gap-2 pt-1">
                   <div className="orbit-native-scroll border-border-subtle bg-surface-recessed/40 divide-border-subtle max-h-48 divide-y overflow-y-auto overscroll-contain rounded-[10px] border">
                     {sshHosts.map((s) => (
                       <div
@@ -476,7 +476,7 @@ export const HostConnectionSection = memo(function HostConnectionSection({
                             {s.display_target}
                           </span>
                         </div>
-                        <div className="flex shrink-0 items-center gap-1.5">
+                        <div className="flex shrink-0 items-center gap-2">
                           <Button
                             type="button"
                             variant="outline"
@@ -490,7 +490,7 @@ export const HostConnectionSection = memo(function HostConnectionSection({
                                 tunnelToken: cfTunnelToken.trim() || undefined,
                               })
                             }
-                            className="shrink-0 gap-1.5 text-[11px]"
+                            className="shrink-0 gap-2 text-[11px]"
                           >
                             {deployingSsh === s.alias ? (
                               <OrbitSpinner size={12} />
@@ -505,7 +505,7 @@ export const HostConnectionSection = memo(function HostConnectionSection({
                             size="xs"
                             disabled={deployingSsh !== null}
                             onClick={() => openRelayConfirm({ kind: "deploy_ssh", ssh: s })}
-                            className="shrink-0 gap-1.5 text-[11px]"
+                            className="shrink-0 gap-2 text-[11px]"
                           >
                             {deployingSsh === s.alias ? (
                               <OrbitSpinner size={12} />
@@ -541,7 +541,7 @@ export const HostConnectionSection = memo(function HostConnectionSection({
                           onChange={(e) => setCfHostname(e.target.value)}
                           {...ime.compositionProps}
                           placeholder={t("settings.deployCfHostnamePlaceholder")}
-                          className="h-[30px] px-2.5 font-mono text-[13px]"
+                          className="h-[30px] px-3 font-mono text-[13px]"
                         />
                         <Input
                           type="password"
@@ -549,7 +549,7 @@ export const HostConnectionSection = memo(function HostConnectionSection({
                           onChange={(e) => setCfTunnelToken(e.target.value)}
                           {...ime.compositionProps}
                           placeholder={t("settings.deployCfTokenPlaceholder")}
-                          className="h-[30px] px-2.5 font-mono text-[13px]"
+                          className="h-[30px] px-3 font-mono text-[13px]"
                         />
                       </div>
                     )}

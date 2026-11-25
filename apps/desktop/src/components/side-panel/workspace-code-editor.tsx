@@ -1616,11 +1616,17 @@ export const WorkspaceCodeEditor = memo(function WorkspaceCodeEditor(
                     <button
                       key={`${refLoc.path}:${refLoc.line}:${refLoc.character}:${idx}`}
                       type="button"
+                      title={`${refLoc.path}:${refLoc.line}:${refLoc.character}`}
                       onClick={() => handleReferenceClick(refLoc)}
-                      className="hover:bg-accent flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left transition-colors"
+                      className="hover:bg-accent flex w-full cursor-pointer items-center gap-2 overflow-hidden px-3 py-1.5 text-left transition-colors"
                     >
                       <FileCode2 className="text-ink-faint size-[12px] shrink-0" />
-                      <span className="text-ink-secondary shrink-0 font-mono text-[11px]">
+                      <span
+                        className={cn(
+                          "text-ink-secondary min-w-0 truncate font-mono text-[11px]",
+                          refLoc.preview_line ? "max-w-[55%] shrink-0" : "flex-1",
+                        )}
+                      >
                         {refLoc.path}
                       </span>
                       <span className="text-ink-faint tabular-nums shrink-0 font-mono text-[10.5px]">

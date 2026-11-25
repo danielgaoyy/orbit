@@ -288,13 +288,16 @@ export function PermissionRulesPanel({
     }
   };
 
-  const isLoading = rulesSnap.status === "loading" && rulesSnap.rules.length === 0;
+  const isLoading =
+    isOnline &&
+    (rulesSnap.status === "idle" || rulesSnap.status === "loading") &&
+    rulesSnap.rules.length === 0;
   const canSaveRule =
     Boolean(draft.pattern.trim()) &&
     (draft.scopeKind !== "project" || Boolean(draft.projectCwd.trim()));
 
   const actionButtons = isOnline ? (
-    <div className="flex shrink-0 items-center gap-1.5">
+    <div className="flex shrink-0 items-center gap-2">
       {alwaysAllowCount >= 2 && (
         <Button
           type="button"
@@ -323,7 +326,7 @@ export function PermissionRulesPanel({
 
   const body = (
     <>
-      <div className="flex flex-col gap-2.5 px-4 py-3.5">
+      <div className="flex flex-col gap-3 px-4 py-3">
         <div className="text-ink-secondary text-[13px] leading-[1.45]">
           {t("permissionRules.sectionSubtitle")}
         </div>
@@ -363,9 +366,9 @@ export function PermissionRulesPanel({
       </div>
 
         {showAddForm && (
-          <div className="bg-surface-recessed/55 px-4 py-3.5">
+          <div className="bg-surface-recessed/55 px-4 py-3">
             <FieldGroup className="gap-3">
-              <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3">
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
                 <Field>
                   <FieldLabel>{t("permissionRules.decisionLabel")}</FieldLabel>
                   <SettingSelect
@@ -450,14 +453,14 @@ export function PermissionRulesPanel({
                     className="h-[30px] font-mono text-[13px]"
                   />
                   {uniqueWorkspacePaths.length > 0 && (
-                    <div className="flex flex-wrap items-center gap-1 pt-0.5">
+                    <div className="flex flex-wrap items-center gap-1 pt-1">
                       {uniqueWorkspacePaths.slice(0, 5).map((wsPath) => (
                         <button
                           key={wsPath}
                           type="button"
                           onClick={() => setDraft((prev) => ({ ...prev, projectCwd: wsPath }))}
                           className={cn(
-                            "border-border-subtle hover:bg-surface-recessed cursor-pointer rounded-[6px] border px-2 py-0.5 font-mono text-[11px] transition-colors",
+                            "border-border-subtle hover:bg-surface-recessed cursor-pointer rounded-[6px] border px-2 py-1 font-mono text-[11px] transition-colors",
                             draft.projectCwd.trim() === wsPath
                               ? "bg-surface-recessed text-ink-primary font-medium"
                               : "bg-surface-raised text-ink-muted",
@@ -471,7 +474,7 @@ export function PermissionRulesPanel({
                 </Field>
               )}
 
-              <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <Field data-invalid={Boolean(formError && !draft.pattern.trim()) || undefined}>
                   <FieldLabel htmlFor="orbit-perm-rule-pattern">
                     {t("permissionRules.patternLabel")}
@@ -576,8 +579,8 @@ export function PermissionRulesPanel({
                 key={rule.id}
                 className="flex items-start justify-between gap-3 px-4 py-3 transition-colors hover:bg-surface-recessed/35"
               >
-                <div className="flex min-w-0 flex-1 flex-col gap-1.5">
-                  <div className="flex flex-wrap items-center gap-1.5">
+                <div className="flex min-w-0 flex-1 flex-col gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <Badge variant={isDeny ? "destructive" : "success"}>
                       {isDeny ? (
                         <ShieldBan className="size-3" />
@@ -595,7 +598,7 @@ export function PermissionRulesPanel({
                     </code>
                   </div>
 
-                  <div className="text-ink-muted flex flex-wrap items-center gap-1.5 text-[11px]">
+                  <div className="text-ink-muted flex flex-wrap items-center gap-2 text-[11px]">
                     {rule.scope_kind === "project" ? (
                       <SimpleTooltip label={rule.project_cwd ?? ""} side="top">
                         <Badge variant="outline" className="font-mono text-[11px]">
@@ -715,9 +718,9 @@ export function PermissionRulesPanel({
   }
 
   return (
-    <div className="flex flex-col gap-2">
+    <div className="flex flex-col gap-3">
       <SettingGroupLabel action={actionButtons ?? undefined}>
-        <span className="inline-flex items-center gap-1.5">
+        <span className="inline-flex items-center gap-2">
           <span>{t("permissionRules.sectionTitle")}</span>
           {rulesSnap.rules.length > 0 && (
             <span className="text-ink-faint font-mono tabular-nums">

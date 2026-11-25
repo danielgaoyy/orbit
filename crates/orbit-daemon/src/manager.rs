@@ -301,6 +301,12 @@ fn strip_internal_thinking_tags(raw: &str) -> String {
     out.trim().to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingGateCleanup {
+    ClearMemoryOnly,
+    ResolveInTimeline,
+}
+
 pub struct AgentOrchestrator {
     pub(crate) memory: crate::memory::MemoryEngine,
     home_dir: PathBuf,
@@ -755,6 +761,15 @@ impl AgentOrchestrator {
     /// Increment generation to fence off stale startup/ingestion tasks, shut down any live driver,
     /// wait (bounded) for the old driver ingestion loop to drain, and guarantee zero surviving shims.
     async fn stop_and_wait_driver(&self, agent_id: &str) -> u64 {
+        self.stop_and_wait_driver_with_cleanup(agent_id, PendingGateCleanup::ClearMemoryOnly)
+            .await
+    }
+
+    async fn stop_and_wait_driver_with_cleanup(
+        &self,
+        agent_id: &str,
+        gate_cleanup: PendingGateCleanup,
+    ) -> u64 {
         let start_lock = self.agent_start_lock(agent_id).await;
         let _start_guard = start_lock.lock().await;
         let next_gen = self.bump_generation(agent_id).await;
@@ -773,13 +788,36 @@ impl AgentOrchestrator {
             kill_existing_shim(&sock).await;
         }
         kill_existing_shim(&self.legacy_shim_socket_path("agent", agent_id)).await;
-        self.clear_pending_requests(agent_id).await;
+        match gate_cleanup {
+            PendingGateCleanup::ClearMemoryOnly => {
+                self.clear_pending_requests(agent_id).await;
+            }
+            PendingGateCleanup::ResolveInTimeline => {
+                self.cancel_pending_permissions_and_questions(agent_id)
+                    .await;
+                self.clear_pending_requests(agent_id).await;
+            }
+        }
         self.pending_initial_prompt_agents
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(agent_id);
         self.keep_awake.mark_agent_idle(agent_id);
         next_gen
+    }
+
+    fn clear_permission_attention_in_store(
+        store: &OrbitStore,
+        agent_id: &str,
+    ) -> Option<AgentSummary> {
+        let ag = store.get_agent(agent_id).ok().flatten()?;
+        if ag.attention != AttentionState::Permission {
+            return None;
+        }
+        store
+            .set_agent_attention(agent_id, AttentionState::None)
+            .ok()?;
+        store.get_agent(agent_id).ok().flatten()
     }
 
     fn claude_runtime_dir(&self) -> PathBuf {
@@ -1033,7 +1071,8 @@ impl AgentOrchestrator {
                 self.keep_awake.mark_agent_idle(&ag.agent_id);
             }
 
-            // No surviving live shim -> normalize stale transient statuses to `Closed` and settle
+            // No surviving live shim -> normalize stale transient statuses to `Closed`, clear any
+            // orphaned `Permission` attention (no live gate can survive without a shim), and settle
             // any orphaned `Running` background-task tool calls in place so they never resurrect.
             let should_close_status = matches!(
                 ag.status,
@@ -1042,6 +1081,7 @@ impl AgentOrchestrator {
                     | AgentStatus::AwaitingPermission { .. }
                     | AgentStatus::AutonomousWakeup { .. }
             );
+            let clear_stale_permission = ag.attention == AttentionState::Permission;
             let aid_cleanup = ag.agent_id.clone();
             let _ = self
                 .with_store(move |s| {
@@ -1056,6 +1096,9 @@ impl AgentOrchestrator {
                     }
                     if should_close_status {
                         let _ = s.update_agent_status(&aid_cleanup, &AgentStatus::Closed);
+                    }
+                    if clear_stale_permission {
+                        let _ = s.set_agent_attention(&aid_cleanup, AttentionState::None);
                     }
                 })
                 .await;
@@ -3722,6 +3765,10 @@ impl AgentOrchestrator {
                 .set_session_mode(&batch.recipient_id, new_mode.clone())
                 .await;
         }
+        if batch.active_turn_behavior == ActiveTurnBehavior::Interrupt {
+            self.cancel_pending_permissions_and_questions(&batch.recipient_id)
+                .await;
+        }
 
         let recipient_touch = batch.recipient_id.clone();
         let _ = self
@@ -4128,11 +4175,12 @@ impl AgentOrchestrator {
             .await
             .remove(agent_id)
             .unwrap_or_default();
-        if cancelled_perms.is_empty() && cancelled_questions.is_empty() {
+        let clear_attn = !self.has_pending_human_gates(agent_id).await;
+        if cancelled_perms.is_empty() && cancelled_questions.is_empty() && !clear_attn {
             return;
         }
         let aid = agent_id.to_string();
-        if let Ok(evs) = self
+        if let Ok((evs, updated_opt)) = self
             .with_store(move |s| {
                 let mut out = Vec::new();
                 for request_id in cancelled_perms {
@@ -4161,12 +4209,22 @@ impl AgentOrchestrator {
                         out.push(ev);
                     }
                 }
-                out
+                let updated = if clear_attn {
+                    Self::clear_permission_attention_in_store(s, &aid)
+                } else {
+                    None
+                };
+                (out, updated)
             })
             .await
         {
             for ev in evs {
                 let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+            }
+            if let Some(updated) = updated_opt {
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::AgentUpdated(updated));
             }
         }
     }
@@ -4277,6 +4335,7 @@ impl AgentOrchestrator {
                         status: AgentStatus::Idle,
                     },
                 )?;
+                let _ = Self::clear_permission_attention_in_store(s, &aid_settle);
                 let updated = s.get_agent(&aid_settle)?;
                 Ok(Some((ev, updated)))
             })
@@ -4909,9 +4968,9 @@ impl AgentOrchestrator {
                 decision: dispatch_dec,
             });
 
-            let clear_attn = !self.has_pending_permissions(agent_id).await;
+            let clear_attn = !self.has_pending_human_gates(agent_id).await;
             let aid = agent_id.to_string();
-            if let Ok(Some(ev)) = self
+            if let Ok((ev_opt, updated_opt)) = self
                 .with_store(move |s| {
                     let ev = s
                         .append_timeline_event(
@@ -4924,14 +4983,23 @@ impl AgentOrchestrator {
                             },
                         )
                         .ok();
-                    if clear_attn {
-                        let _ = s.set_agent_attention(&aid, AttentionState::None);
-                    }
-                    ev
+                    let updated = if clear_attn {
+                        Self::clear_permission_attention_in_store(s, &aid)
+                    } else {
+                        None
+                    };
+                    (ev, updated)
                 })
                 .await
             {
-                let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+                if let Some(ev) = ev_opt {
+                    let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+                }
+                if let Some(updated) = updated_opt {
+                    let _ = self
+                        .broadcast_tx
+                        .send(DaemonBroadcast::AgentUpdated(updated));
+                }
             }
             return Ok(());
         } else {
@@ -5030,9 +5098,9 @@ impl AgentOrchestrator {
                 decision: wire_decision,
             });
 
-            let clear_attn = !self.has_pending_permissions(agent_id).await;
+            let clear_attn = !self.has_pending_human_gates(agent_id).await;
             let aid = agent_id.to_string();
-            if let Ok(Some(ev)) = self
+            if let Ok((ev_opt, updated_opt)) = self
                 .with_store(move |s| {
                     let ev = s
                         .append_timeline_event(
@@ -5045,17 +5113,37 @@ impl AgentOrchestrator {
                             },
                         )
                         .ok();
-                    if clear_attn {
-                        let _ = s.set_agent_attention(&aid, AttentionState::None);
-                    }
-                    ev
+                    let updated = if clear_attn {
+                        Self::clear_permission_attention_in_store(s, &aid)
+                    } else {
+                        None
+                    };
+                    (ev, updated)
                 })
                 .await
             {
-                let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+                if let Some(ev) = ev_opt {
+                    let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+                }
+                if let Some(updated) = updated_opt {
+                    let _ = self
+                        .broadcast_tx
+                        .send(DaemonBroadcast::AgentUpdated(updated));
+                }
             }
         } else {
             self.pending_permissions.write().await.remove(&key);
+            if !self.has_pending_human_gates(agent_id).await {
+                let aid = agent_id.to_string();
+                if let Ok(Some(updated)) = self
+                    .with_store(move |s| Self::clear_permission_attention_in_store(s, &aid))
+                    .await
+                {
+                    let _ = self
+                        .broadcast_tx
+                        .send(DaemonBroadcast::AgentUpdated(updated));
+                }
+            }
         }
         Ok(())
     }
@@ -5418,10 +5506,13 @@ impl AgentOrchestrator {
             ) {
                 let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
             }
-            if !self.has_pending_permissions(&agent_id).await {
+            if !self.has_pending_human_gates(&agent_id).await
+                && let Some(updated) =
+                    Self::clear_permission_attention_in_store(&self.store, &agent_id)
+            {
                 let _ = self
-                    .store
-                    .set_agent_attention(&agent_id, AttentionState::None);
+                    .broadcast_tx
+                    .send(DaemonBroadcast::AgentUpdated(updated));
             }
             resolved_count += 1;
         }
@@ -5751,7 +5842,7 @@ impl AgentOrchestrator {
             });
         }
 
-        let no_pending = !self.has_pending_permissions(agent_id).await;
+        let no_pending = !self.has_pending_human_gates(agent_id).await;
         let is_approve_build =
             matches!(action, orbit_protocol::PlanApprovalAction::ApproveAndBuild);
         let aid_after = agent_id.to_string();
@@ -5846,22 +5937,51 @@ impl AgentOrchestrator {
 
             Self::remove_pending_request(&self.pending_questions, agent_id, &request_id).await;
 
+            let clear_attn = !self.has_pending_human_gates(agent_id).await;
             let aid_q = agent_id.to_string();
-            if let Ok(ev) = self
-                .try_store(move |s| {
-                    s.append_timeline_event(
-                        &aid_q,
-                        1,
-                        None,
-                        TimelinePayload::QuestionResolved {
-                            request_id,
-                            answers,
-                        },
-                    )
+            if let Ok((ev_opt, updated_opt)) = self
+                .with_store(move |s| {
+                    let ev = s
+                        .append_timeline_event(
+                            &aid_q,
+                            1,
+                            None,
+                            TimelinePayload::QuestionResolved {
+                                request_id,
+                                answers,
+                            },
+                        )
+                        .ok();
+                    let updated = if clear_attn {
+                        Self::clear_permission_attention_in_store(s, &aid_q)
+                    } else {
+                        None
+                    };
+                    (ev, updated)
                 })
                 .await
             {
-                let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+                if let Some(ev) = ev_opt {
+                    let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+                }
+                if let Some(updated) = updated_opt {
+                    let _ = self
+                        .broadcast_tx
+                        .send(DaemonBroadcast::AgentUpdated(updated));
+                }
+            }
+        } else {
+            Self::remove_pending_request(&self.pending_questions, agent_id, &request_id).await;
+            if !self.has_pending_human_gates(agent_id).await {
+                let aid_q = agent_id.to_string();
+                if let Ok(Some(updated)) = self
+                    .with_store(move |s| Self::clear_permission_attention_in_store(s, &aid_q))
+                    .await
+                {
+                    let _ = self
+                        .broadcast_tx
+                        .send(DaemonBroadcast::AgentUpdated(updated));
+                }
             }
         }
         Ok(())
@@ -5877,8 +5997,10 @@ impl AgentOrchestrator {
             let existing = self.try_store(move |s| s.get_agent(&aid_get)).await?;
             let parent_ws_id = existing.as_ref().map(|a| a.workspace_id.clone());
 
-            // 1. Stop live runtime & clear pending permissions
-            let _ = self.stop_and_wait_driver(agent_id).await;
+            // 1. Stop live runtime & resolve any open pending permissions/questions
+            let _ = self
+                .stop_and_wait_driver_with_cleanup(agent_id, PendingGateCleanup::ResolveInTimeline)
+                .await;
 
             // 2. Retire any heartbeats & armed conditional timers bound to this agent
             if let Some(timers) = self.conditional_timers().await {
@@ -6036,11 +6158,14 @@ impl AgentOrchestrator {
     }
 
     pub async fn kill_agent(&self, agent_id: &str) -> anyhow::Result<()> {
-        let _ = self.stop_and_wait_driver(agent_id).await;
+        let _ = self
+            .stop_and_wait_driver_with_cleanup(agent_id, PendingGateCleanup::ResolveInTimeline)
+            .await;
         let aid = agent_id.to_string();
         let updated_opt = self
             .try_store(move |s| -> anyhow::Result<Option<AgentSummary>> {
                 s.update_agent_status(&aid, &AgentStatus::Closed)?;
+                s.set_agent_attention(&aid, AttentionState::None)?;
                 Ok(s.get_agent(&aid).ok().flatten())
             })
             .await?;
@@ -6609,9 +6734,13 @@ impl AgentOrchestrator {
                     epoch,
                     None,
                     TimelinePayload::Notice {
-                        level: "compaction".into(),
+                        level: if native {
+                            "compaction_live".into()
+                        } else {
+                            "compaction".into()
+                        },
                         message: if native {
-                            "Compaction requested".into()
+                            "Compacting context…".into()
                         } else {
                             "Context compacted for summary handoff on the next turn".into()
                         },
@@ -7252,6 +7381,7 @@ impl AgentOrchestrator {
         if let Ok(Some(updated)) = self
             .with_store(move |s| {
                 let _ = s.update_agent_status(&aid, &AgentStatus::Closed);
+                let _ = Self::clear_permission_attention_in_store(s, &aid);
                 s.get_agent(&aid).ok().flatten()
             })
             .await
@@ -8396,6 +8526,9 @@ impl AgentOrchestrator {
                 let was_background_waiting = prev
                     .as_ref()
                     .is_some_and(|a| a.status.is_background_waiting());
+                let prev_was_permission = prev
+                    .as_ref()
+                    .is_some_and(|a| a.attention == AttentionState::Permission);
                 let mut should_touch_activity = false;
                 let mut next_attention: Option<AttentionState> = None;
                 match &status {
@@ -8403,6 +8536,9 @@ impl AgentOrchestrator {
                         compact_after_idle =
                             was_running_turn && !self.has_pending_human_gates(agent_id).await;
                         self.clear_pending_requests(agent_id).await;
+                        if prev_was_permission {
+                            next_attention = Some(AttentionState::None);
+                        }
                         let suppressed = self.suppress_auto_drain.write().await.remove(agent_id);
                         if (was_foreground_busy || was_awaiting_permission) && !suppressed {
                             should_drain_queued_prompt = true;
@@ -8422,6 +8558,9 @@ impl AgentOrchestrator {
                     }
                     AgentStatus::AutonomousWakeup { .. } if status.is_background_waiting() => {
                         self.clear_pending_requests(agent_id).await;
+                        if prev_was_permission {
+                            next_attention = Some(AttentionState::None);
+                        }
                         let suppressed = self.suppress_auto_drain.write().await.remove(agent_id);
                         if (was_foreground_busy || was_awaiting_permission) && !suppressed {
                             should_drain_queued_prompt = true;
@@ -8438,6 +8577,9 @@ impl AgentOrchestrator {
                     }
                     AgentStatus::AutonomousWakeup { .. } => {
                         self.suppress_auto_drain.write().await.remove(agent_id);
+                        if prev_was_permission && !self.has_pending_human_gates(agent_id).await {
+                            next_attention = Some(AttentionState::None);
+                        }
                         should_touch_activity = true;
                     }
                     AgentStatus::Error {
@@ -8457,6 +8599,8 @@ impl AgentOrchestrator {
                         if let Some(ref ag) = prev {
                             if !ag.background {
                                 next_attention = Some(AttentionState::Error);
+                            } else if prev_was_permission {
+                                next_attention = Some(AttentionState::None);
                             }
                             let same_error = matches!(
                                 &ag.status,
@@ -8544,6 +8688,9 @@ impl AgentOrchestrator {
                     }
                     AgentStatus::Running { turn_id } => {
                         self.suppress_auto_drain.write().await.remove(agent_id);
+                        if prev_was_permission && !self.has_pending_human_gates(agent_id).await {
+                            next_attention = Some(AttentionState::None);
+                        }
                         let was_preempted = matches!(
                             &prev,
                             Some(p) if matches!(&p.status, AgentStatus::Running { turn_id: old_tid } if old_tid != turn_id)
@@ -8555,7 +8702,13 @@ impl AgentOrchestrator {
                         }
                         should_touch_activity = true;
                     }
-                    _ => {}
+                    AgentStatus::Closed => {
+                        self.clear_pending_requests(agent_id).await;
+                        if prev_was_permission {
+                            next_attention = Some(AttentionState::None);
+                        }
+                    }
+                    AgentStatus::Initializing => {}
                 }
                 if should_touch_activity || next_attention.is_some() {
                     let aid_st = agent_id.to_string();
@@ -8904,10 +9057,13 @@ impl AgentOrchestrator {
                                 .await
                                 .is_ok()
                         {
-                            if !self.has_pending_permissions(agent_id).await {
+                            if !self.has_pending_human_gates(agent_id).await
+                                && let Some(updated) =
+                                    Self::clear_permission_attention_in_store(&self.store, agent_id)
+                            {
                                 let _ = self
-                                    .store
-                                    .set_agent_attention(agent_id, AttentionState::None);
+                                    .broadcast_tx
+                                    .send(DaemonBroadcast::AgentUpdated(updated));
                             }
                             let notice = TimelinePayload::Notice {
                                 level: "warning".into(),
@@ -9029,10 +9185,16 @@ impl AgentOrchestrator {
                                     let _ = self
                                         .store
                                         .record_permission_rule_match(&matched.rule.id, matched_at);
-                                    if !self.has_pending_permissions(agent_id).await {
+                                    if !self.has_pending_human_gates(agent_id).await
+                                        && let Some(updated) =
+                                            Self::clear_permission_attention_in_store(
+                                                &self.store,
+                                                agent_id,
+                                            )
+                                    {
                                         let _ = self
-                                            .store
-                                            .set_agent_attention(agent_id, AttentionState::None);
+                                            .broadcast_tx
+                                            .send(DaemonBroadcast::AgentUpdated(updated));
                                     }
                                     let (tool_name, target_summary) =
                                         crate::guardian::summarize_tool_request(&detail, &title);
@@ -9186,7 +9348,7 @@ impl AgentOrchestrator {
                                         .await
                                         .is_ok()
                                 {
-                                    let clear_attn = !self.has_pending_permissions(agent_id).await;
+                                    let clear_attn = !self.has_pending_human_gates(agent_id).await;
                                     let notice = TimelinePayload::Notice {
                                         level: "info".into(),
                                         message: format!(
@@ -9195,26 +9357,33 @@ impl AgentOrchestrator {
                                         ),
                                     };
                                     let aid_g = agent_id.to_string();
-                                    if let Ok(Some(saved_ev)) = self
+                                    if let Ok((saved_ev_opt, updated_opt)) = self
                                         .with_store(move |s| {
-                                            if clear_attn {
-                                                let _ = s.set_agent_attention(
-                                                    &aid_g,
-                                                    AttentionState::None,
-                                                );
-                                            }
-                                            match s.append_timeline_event_deduped(
+                                            let updated = if clear_attn {
+                                                Self::clear_permission_attention_in_store(s, &aid_g)
+                                            } else {
+                                                None
+                                            };
+                                            let ev = match s.append_timeline_event_deduped(
                                                 &aid_g, 1, None, notice,
                                             ) {
                                                 Ok((ev, true)) => Some(ev),
                                                 _ => None,
-                                            }
+                                            };
+                                            (ev, updated)
                                         })
                                         .await
                                     {
-                                        let _ = self
-                                            .broadcast_tx
-                                            .send(DaemonBroadcast::TimelineLive(saved_ev));
+                                        if let Some(saved_ev) = saved_ev_opt {
+                                            let _ = self
+                                                .broadcast_tx
+                                                .send(DaemonBroadcast::TimelineLive(saved_ev));
+                                        }
+                                        if let Some(updated) = updated_opt {
+                                            let _ = self
+                                                .broadcast_tx
+                                                .send(DaemonBroadcast::AgentUpdated(updated));
+                                        }
                                     }
                                     return;
                                 }
@@ -9252,7 +9421,7 @@ impl AgentOrchestrator {
                                         .await
                                         .is_ok()
                                 {
-                                    let clear_attn = !self.has_pending_permissions(agent_id).await;
+                                    let clear_attn = !self.has_pending_human_gates(agent_id).await;
                                     let notice = TimelinePayload::Notice {
                                         level: "warning".into(),
                                         message: format!(
@@ -9262,26 +9431,33 @@ impl AgentOrchestrator {
                                         ),
                                     };
                                     let aid_g = agent_id.to_string();
-                                    if let Ok(Some(saved_ev)) = self
+                                    if let Ok((saved_ev_opt, updated_opt)) = self
                                         .with_store(move |s| {
-                                            if clear_attn {
-                                                let _ = s.set_agent_attention(
-                                                    &aid_g,
-                                                    AttentionState::None,
-                                                );
-                                            }
-                                            match s.append_timeline_event_deduped(
+                                            let updated = if clear_attn {
+                                                Self::clear_permission_attention_in_store(s, &aid_g)
+                                            } else {
+                                                None
+                                            };
+                                            let ev = match s.append_timeline_event_deduped(
                                                 &aid_g, 1, None, notice,
                                             ) {
                                                 Ok((ev, true)) => Some(ev),
                                                 _ => None,
-                                            }
+                                            };
+                                            (ev, updated)
                                         })
                                         .await
                                     {
-                                        let _ = self
-                                            .broadcast_tx
-                                            .send(DaemonBroadcast::TimelineLive(saved_ev));
+                                        if let Some(saved_ev) = saved_ev_opt {
+                                            let _ = self
+                                                .broadcast_tx
+                                                .send(DaemonBroadcast::TimelineLive(saved_ev));
+                                        }
+                                        if let Some(updated) = updated_opt {
+                                            let _ = self
+                                                .broadcast_tx
+                                                .send(DaemonBroadcast::AgentUpdated(updated));
+                                        }
                                     }
                                     return;
                                 }
@@ -9480,7 +9656,13 @@ impl AgentOrchestrator {
                 self.keep_awake
                     .notify_agent_status(agent_id, &AgentStatus::Closed);
                 let aid_ex = agent_id.to_string();
-                if let Ok(Some(ag)) = self.try_store(move |s| s.get_agent(&aid_ex)).await {
+                if let Ok(Some(ag)) = self
+                    .try_store(move |s| -> anyhow::Result<Option<AgentSummary>> {
+                        let _ = Self::clear_permission_attention_in_store(s, &aid_ex);
+                        Ok(s.get_agent(&aid_ex)?)
+                    })
+                    .await
+                {
                     let prov_slug = ag.provider.slug().to_string();
                     let payload = serde_json::json!({
                         "event": "session_end",
@@ -16553,6 +16735,389 @@ diff --git a/config/prod.env b/config/prod.env\n\
                     if level == "warning" && message.contains("Queued prompt paused:")
             )),
             "blocked auto-drain must record a warning Notice: {tl:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[tokio::test]
+    async fn kill_question_interrupt_and_status_transitions_clear_permission_attention() {
+        let (home_dir, store, orch) = test_orchestrator("perm_attn_cleanup").await;
+        let now = Utc::now();
+        let work_dir = home_dir.join("work");
+        std::fs::create_dir_all(&work_dir).expect("mkdir work");
+        let cwd = work_dir.to_string_lossy().to_string();
+
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_perm".into(),
+                title: "perm".into(),
+                cwd: cwd.clone(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+
+        let make_agent = |id: &str| AgentSummary {
+            agent_id: id.into(),
+            workspace_id: "ws_perm".into(),
+            cwd: cwd.clone(),
+            title: format!("Agent {id}"),
+            provider: ProviderKind::ClaudeCode,
+            acp_agent_id: None,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::FullAccess,
+            status: AgentStatus::Idle,
+            parent_agent_id: Some("ag_parent".into()),
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 1,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            task_summary: None,
+            cluster_suggestion: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            queued_prompts: Vec::new(),
+        };
+
+        let mut bcast_rx = orch.broadcast_tx.subscribe();
+
+        // 1. kill_agent must cancel open pending gates in timeline, set Closed, clear attention,
+        //    and broadcast AgentUpdated(Closed, None).
+        store
+            .upsert_agent(&make_agent("ag_kill"), None)
+            .expect("upsert ag_kill");
+        let (kill_tx, _kill_rx) = mpsc::channel(16);
+        let kill_gen = orch.bump_generation("ag_kill").await;
+        let kill_task = tokio::spawn(async {});
+        orch.live_agents.write().await.insert(
+            "ag_kill".into(),
+            LiveAgentEntry {
+                generation: kill_gen,
+                cmd_tx: kill_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: kill_task.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+        orch.ingest_driver_event(
+            "ag_kill",
+            kill_gen,
+            DriverEvent::StatusChanged(AgentStatus::AwaitingPermission {
+                turn_id: "t1".into(),
+                request_id: "clq_1".into(),
+            }),
+        )
+        .await;
+        orch.ingest_driver_event(
+            "ag_kill",
+            kill_gen,
+            DriverEvent::QuestionRequest {
+                request_id: "clq_1".into(),
+                questions: vec![orbit_protocol::QuestionItem {
+                    id: "q1".into(),
+                    header: None,
+                    question: "Pick one".into(),
+                    options: vec!["A".into()],
+                    is_multi_select: false,
+                }],
+            },
+        )
+        .await;
+        assert_eq!(
+            store
+                .get_agent("ag_kill")
+                .expect("get")
+                .expect("ag")
+                .attention,
+            AttentionState::Permission
+        );
+        assert!(orch.has_pending_human_gates("ag_kill").await);
+        while bcast_rx.try_recv().is_ok() {}
+
+        orch.kill_agent("ag_kill").await.expect("kill_agent");
+
+        let killed = store.get_agent("ag_kill").expect("get").expect("ag");
+        assert_eq!(killed.status, AgentStatus::Closed);
+        assert_eq!(killed.attention, AttentionState::None);
+        assert!(!orch.has_pending_human_gates("ag_kill").await);
+        let tl_kill = store.fetch_recent_timeline("ag_kill", 20).expect("tl");
+        assert!(
+            tl_kill.iter().any(|ev| matches!(
+                &ev.payload,
+                TimelinePayload::QuestionResolved { request_id, answers }
+                    if request_id == "clq_1" && answers.is_empty()
+            )),
+            "kill_agent must resolve open pending questions in timeline"
+        );
+        let mut saw_closed_clean = false;
+        while let Ok(ev) = bcast_rx.try_recv() {
+            if let DaemonBroadcast::AgentUpdated(ag) = ev
+                && ag.agent_id == "ag_kill"
+                && ag.status == AgentStatus::Closed
+                && ag.attention == AttentionState::None
+            {
+                saw_closed_clean = true;
+            }
+        }
+        assert!(
+            saw_closed_clean,
+            "kill_agent must broadcast AgentUpdated with Closed status and None attention"
+        );
+
+        // 2. answer_question clears AttentionState::Permission and broadcasts AgentUpdated once
+        //    no human gates remain.
+        store
+            .upsert_agent(&make_agent("ag_ans"), None)
+            .expect("upsert ag_ans");
+        let (ans_tx, mut ans_rx) = mpsc::channel(16);
+        let ans_gen = orch.bump_generation("ag_ans").await;
+        let ans_task = tokio::spawn(async {});
+        orch.live_agents.write().await.insert(
+            "ag_ans".into(),
+            LiveAgentEntry {
+                generation: ans_gen,
+                cmd_tx: ans_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: ans_task.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+        orch.ingest_driver_event(
+            "ag_ans",
+            ans_gen,
+            DriverEvent::StatusChanged(AgentStatus::AwaitingPermission {
+                turn_id: "t2".into(),
+                request_id: "clq_2".into(),
+            }),
+        )
+        .await;
+        orch.ingest_driver_event(
+            "ag_ans",
+            ans_gen,
+            DriverEvent::QuestionRequest {
+                request_id: "clq_2".into(),
+                questions: vec![orbit_protocol::QuestionItem {
+                    id: "q1".into(),
+                    header: None,
+                    question: "Confirm?".into(),
+                    options: vec!["Yes".into()],
+                    is_multi_select: false,
+                }],
+            },
+        )
+        .await;
+        while bcast_rx.try_recv().is_ok() {}
+        orch.answer_question("ag_ans", "clq_2".into(), vec![vec!["Yes".into()]])
+            .await
+            .expect("answer_question");
+        assert!(matches!(
+            ans_rx.try_recv().expect("driver cmd"),
+            DriverCommand::AnswerQuestion { request_id, .. } if request_id == "clq_2"
+        ));
+        assert_eq!(
+            store
+                .get_agent("ag_ans")
+                .expect("get")
+                .expect("ag")
+                .attention,
+            AttentionState::None
+        );
+        let mut saw_ans_clear = false;
+        while let Ok(ev) = bcast_rx.try_recv() {
+            if let DaemonBroadcast::AgentUpdated(ag) = ev
+                && ag.agent_id == "ag_ans"
+                && ag.attention == AttentionState::None
+            {
+                saw_ans_clear = true;
+            }
+        }
+        assert!(
+            saw_ans_clear,
+            "answer_question must broadcast AgentUpdated when Permission attention clears"
+        );
+
+        // 3. dispatch_coalesced_batch(Interrupt), StatusChanged(Running/Idle), and DriverEvent::Exited
+        //    must all clear stale AttentionState::Permission; close_idle_runtime preserves Finished
+        //    while still clearing Permission.
+        store
+            .upsert_agent(&make_agent("ag_int"), None)
+            .expect("upsert ag_int");
+        let (int_tx, mut int_rx) = mpsc::channel(16);
+        let int_gen = orch.bump_generation("ag_int").await;
+        let int_task = tokio::spawn(async {});
+        orch.live_agents.write().await.insert(
+            "ag_int".into(),
+            LiveAgentEntry {
+                generation: int_gen,
+                cmd_tx: int_tx,
+                done_notify: Arc::new(tokio::sync::Notify::new()),
+                ingest_abort: int_task.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+        orch.ingest_driver_event(
+            "ag_int",
+            int_gen,
+            DriverEvent::StatusChanged(AgentStatus::AwaitingPermission {
+                turn_id: "t3".into(),
+                request_id: "clq_3".into(),
+            }),
+        )
+        .await;
+        orch.ingest_driver_event(
+            "ag_int",
+            int_gen,
+            DriverEvent::QuestionRequest {
+                request_id: "clq_3".into(),
+                questions: vec![],
+            },
+        )
+        .await;
+        orch.dispatch_coalesced_batch(crate::messaging::CoalescedDispatchBatch {
+            recipient_id: "ag_int".into(),
+            wire_prompt: "Resume now".into(),
+            entries: vec![crate::messaging::QueuedAgentMessage {
+                recipient_id: "ag_int".into(),
+                message_id: "am_int_1".into(),
+                source: crate::messaging::AgentPromptSource {
+                    kind: AgentMessageKind::DirectMessage,
+                    source_agent_id: Some("ag_parent".into()),
+                    source_host_id: Some("host_local".into()),
+                    source_title: Some("Parent".into()),
+                    event: None,
+                    permission_context: None,
+                },
+                body: "Resume now".into(),
+                active_turn_behavior: ActiveTurnBehavior::Interrupt,
+                session_mode: None,
+                unarchive: false,
+            }],
+            active_turn_behavior: ActiveTurnBehavior::Interrupt,
+            session_mode: None,
+            unarchive: false,
+        })
+        .await
+        .expect("dispatch interrupt batch");
+        assert!(matches!(
+            int_rx.try_recv().expect("driver cmd"),
+            DriverCommand::SendPrompt {
+                behavior: ActiveTurnBehavior::Interrupt,
+                ..
+            }
+        ));
+        assert!(!orch.has_pending_human_gates("ag_int").await);
+        assert_eq!(
+            store
+                .get_agent("ag_int")
+                .expect("get")
+                .expect("ag")
+                .attention,
+            AttentionState::None
+        );
+
+        // Simulate stale Permission attention remaining before Running / Idle / Exited transitions.
+        store
+            .set_agent_attention("ag_int", AttentionState::Permission)
+            .expect("seed stale perm");
+        orch.ingest_driver_event(
+            "ag_int",
+            int_gen,
+            DriverEvent::StatusChanged(AgentStatus::Running {
+                turn_id: "t4".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            store
+                .get_agent("ag_int")
+                .expect("get")
+                .expect("ag")
+                .attention,
+            AttentionState::None,
+            "StatusChanged(Running) must clear stale Permission attention when no human gates exist"
+        );
+
+        store
+            .update_agent_status(
+                "ag_int",
+                &AgentStatus::AwaitingPermission {
+                    turn_id: "t4".into(),
+                    request_id: "stale_req".into(),
+                },
+            )
+            .expect("seed awaiting");
+        store
+            .set_agent_attention("ag_int", AttentionState::Permission)
+            .expect("seed perm");
+        orch.ingest_driver_event(
+            "ag_int",
+            int_gen,
+            DriverEvent::StatusChanged(AgentStatus::Idle),
+        )
+        .await;
+        assert_eq!(
+            store
+                .get_agent("ag_int")
+                .expect("get")
+                .expect("ag")
+                .attention,
+            AttentionState::None,
+            "AwaitingPermission -> Idle must clear stale Permission attention"
+        );
+
+        store
+            .set_agent_attention("ag_int", AttentionState::Permission)
+            .expect("seed perm");
+        orch.ingest_driver_event("ag_int", int_gen, DriverEvent::Exited { code: Some(0) })
+            .await;
+        let exited = store.get_agent("ag_int").expect("get").expect("ag");
+        assert_eq!(exited.status, AgentStatus::Closed);
+        assert_eq!(
+            exited.attention,
+            AttentionState::None,
+            "DriverEvent::Exited must clear stale Permission attention"
+        );
+
+        // 4. reattach_or_recover_agents self-heals orphaned Permission attention on dead/closed agents.
+        let mut orphaned = make_agent("ag_orphan_perm");
+        orphaned.status = AgentStatus::Closed;
+        orphaned.attention = AttentionState::Permission;
+        store.upsert_agent(&orphaned, None).expect("upsert orphan");
+        let _ = orch.reattach_or_recover_agents().await;
+        let healed = store.get_agent("ag_orphan_perm").expect("get").expect("ag");
+        assert_eq!(healed.status, AgentStatus::Closed);
+        assert_eq!(
+            healed.attention,
+            AttentionState::None,
+            "reattach_or_recover_agents must clear orphaned Permission attention when no shim survives"
         );
 
         let _ = std::fs::remove_dir_all(&home_dir);

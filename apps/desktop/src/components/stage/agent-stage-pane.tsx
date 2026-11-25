@@ -22,12 +22,12 @@ import {
 import {
   PromptImageLightbox,
   type PromptImagePreviewTarget,
-  TurnStageSection,
 } from "@/components/stage/stream-stage";
+import { SidePanelTurnList } from "@/components/stage/side-turn-list";
 import {
+  createHostAgentSelector,
+  createStableHostArtifactsSelector,
   createStageSessionSelector,
-  getTurnFooter,
-  getTurnTopGapPx,
 } from "@/components/stage/stage-helpers";
 import { openSubagent } from "@/components/stage/subagent-crew-dock";
 import { useDelegationDispatches } from "@/components/stage/use-delegation-dispatches";
@@ -55,8 +55,6 @@ import {
   useOrbitSelector,
 } from "@/state/orbit-store";
 
-const NOOP_REWIND = () => {};
-const NOOP_THINKING_DURATION = () => null;
 const EMPTY_TURNS: StageTurnView[] = [];
 
 export function recoverReplyDraftAfterSendError(
@@ -95,7 +93,19 @@ export const AgentStagePane = memo(function AgentStagePane({
   const tKey = threadScopeKey(hostId, agentId);
 
   const stage = useOrbitSelector((s) => s.stages[tKey] ?? null);
-  const hostDetail = useOrbitSelector((s) => (hostId ? (s.hostDetails[hostId] ?? null) : null));
+  const selectHostAgent = useMemo(
+    () => createHostAgentSelector(hostId || null, agentId || null),
+    [hostId, agentId],
+  );
+  const hostAgent = useOrbitSelector(selectHostAgent);
+  const selectStableArtifacts = useMemo(
+    () => createStableHostArtifactsSelector(hostId || null),
+    [hostId],
+  );
+  const stableHostArtifacts = useOrbitSelector(selectStableArtifacts);
+  const hostPendingPermissions = useOrbitSelector((s) =>
+    hostId ? s.hostDetails[hostId]?.pending_permissions : undefined,
+  );
   const customTitle = useOrbitSelector((s) => s.threadCustomTitles[tKey] ?? null);
   const coalesceExploration = useOrbitSelector((s) => s.coalesceExploration);
   const activeTurnSendBehavior = useOrbitSelector((s) => s.activeTurnSendBehavior);
@@ -106,11 +116,13 @@ export const AgentStagePane = memo(function AgentStagePane({
       : null,
   );
   const isNetworkOffline = connectionState === "disconnected";
-  const agent =
-    hostDetail?.agents.find((a) => a.agent_id === agentId) ?? stage?.agent ?? null;
-  const workspace = agent
-    ? (hostDetail?.workspaces.find((w) => w.workspace_id === agent.workspace_id) ?? null)
-    : null;
+  const agent = hostAgent ?? stage?.agent ?? null;
+  const workspaceTitle = useOrbitSelector((s) =>
+    hostId && agent?.workspace_id
+      ? (s.hostDetails[hostId]?.workspaces.find((w) => w.workspace_id === agent.workspace_id)
+          ?.title ?? undefined)
+      : undefined,
+  );
   const cwd = agent?.cwd ?? fallbackCwd ?? "";
   const foregroundRunning = isAgentForegroundRunning(agent);
   const awaitingPermission = Boolean(agent?.is_awaiting_permission);
@@ -128,14 +140,14 @@ export const AgentStagePane = memo(function AgentStagePane({
         agentId,
         decisions.parentPermissions,
         stage?.pending_permissions,
-        hostDetail?.pending_permissions,
+        hostPendingPermissions,
         pendingPlanApproval?.request_id ?? null,
       ),
     [
       agentId,
       decisions.parentPermissions,
       stage?.pending_permissions,
-      hostDetail?.pending_permissions,
+      hostPendingPermissions,
       pendingPlanApproval?.request_id,
     ],
   );
@@ -199,14 +211,13 @@ export const AgentStagePane = memo(function AgentStagePane({
     () => (stage?.insights.background_tasks ?? []).filter((task) => task.status === "running"),
     [stage?.insights.background_tasks],
   );
-  const armedTimersCount = useMemo(
-    () => selectArmedTimerCountForAgent(hostDetail, agentId),
-    [hostDetail, agentId],
+  const armedTimersCount = useOrbitSelector((s) =>
+    selectArmedTimerCountForAgent(hostId ? (s.hostDetails[hostId] ?? null) : null, agentId),
   );
-  const hasActiveGoal = useMemo(() => {
-    const goal = selectActiveGoalForAgent(hostDetail, agentId);
+  const hasActiveGoal = useOrbitSelector((s) => {
+    const goal = selectActiveGoalForAgent(hostId ? (s.hostDetails[hostId] ?? null) : null, agentId);
     return Boolean(goal && goal.status !== "paused");
-  }, [hostDetail, agentId]);
+  });
   const handleWaveClick = useMemo(() => {
     const soleActive = liveSubagentActivity.soleActive;
     if (!soleActive) return undefined;
@@ -253,12 +264,18 @@ export const AgentStagePane = memo(function AgentStagePane({
             />
           ) : null}
           <div className="min-w-0">
-            <div className="flex items-center gap-1.5">
-              <span className="text-ink-primary truncate text-[13px] font-semibold">
+            <div className="flex min-w-0 items-center gap-1.5">
+              <span
+                title={handleLabel}
+                className="text-ink-primary min-w-0 truncate text-[13px] font-semibold"
+              >
                 {handleLabel}
               </span>
               {hostBadge && (
-                <span className="bg-surface-recessed text-ink-tertiary shrink-0 rounded px-1.5 py-0.5 text-[11px]">
+                <span
+                  title={hostBadge}
+                  className="bg-surface-recessed text-ink-tertiary max-w-[110px] shrink-0 truncate rounded px-1.5 py-0.5 text-[11px]"
+                >
                   {hostBadge}
                 </span>
               )}
@@ -284,7 +301,7 @@ export const AgentStagePane = memo(function AgentStagePane({
                 orbitActions.openWorkspaceBoardTab(
                   hostId,
                   agent.workspace_id,
-                  workspace?.title,
+                  workspaceTitle,
                 )
               }
               className="text-ink-tertiary hover:text-ink-primary hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-[6px] px-1.5 text-[13px] leading-none transition-colors"
@@ -325,49 +342,29 @@ export const AgentStagePane = memo(function AgentStagePane({
       >
         <div className="orbit-stage-enter mx-auto w-full min-w-0 max-w-[740px]">
           {turns.length > 0 ? (
-            <div>
-              {(() => {
-                let previousHasFooter: boolean | undefined;
-                return turns.map((turn, idx) => {
-                  const isLastTurn = idx === turns.length - 1;
-                  const isTurnActive = isLastTurn && isRunning;
-                  const topGapPx = getTurnTopGapPx(turn, previousHasFooter);
-                  previousHasFooter =
-                    getTurnFooter(turn, {
-                      isActive: isTurnActive,
-                      isLastTurn,
-                      canFork: false,
-                    }) !== null;
-                  return (
-                    <div
-                      key={turn.key}
-                      style={topGapPx > 0 ? { paddingTop: topGapPx } : undefined}
-                    >
-                      <TurnStageSection
-                        turn={turn}
-                        dispatches={dispatches}
-                        isTurnActive={isTurnActive}
-                        isLastTurn={isLastTurn}
-                        agentStatusLabel={isTurnActive ? (agent?.status_label ?? null) : null}
-                        hasLiveBackgroundTasks={isTurnActive && runningBackgroundTasks.length > 0}
-                        isNetworkOffline={isNetworkOffline}
-                        autoFoldCompleted={coalesceExploration}
-                        hostId={hostId}
-                        cwd={cwd}
-                        agentId={agentId}
-                        thinkingSignature=""
-                        getThinkingDurationMs={NOOP_THINKING_DURATION}
-                        holdViewport={holdViewport}
-                        onRequestRewind={NOOP_REWIND}
-                        onPreviewImage={setImagePreviewTarget}
-                        sessionSubagents={sessionSubagents}
-                        sessionSubagentMatcher={nameMatcher}
-                        onOpenSubagent={handleOpenNestedSubagent}
-                      />
-                    </div>
-                  );
-                });
-              })()}
+            <>
+              <SidePanelTurnList
+                key={tKey}
+                scopeKey={tKey}
+                hostId={hostId}
+                agentId={agentId}
+                cwd={cwd}
+                turns={turns}
+                isRunning={isRunning}
+                liveStatusLabel={agent?.status_label ?? null}
+                hasLiveBackgroundTasks={runningBackgroundTasks.length > 0}
+                isNetworkOffline={isNetworkOffline}
+                autoFoldCompleted={coalesceExploration}
+                hostArtifacts={stableHostArtifacts}
+                scrollRef={viewportRef}
+                stickToBottomRef={stickToBottomRef}
+                holdViewport={holdViewport}
+                onPreviewImage={setImagePreviewTarget}
+                dispatches={dispatches}
+                sessionSubagents={sessionSubagents}
+                sessionSubagentMatcher={nameMatcher}
+                onOpenSubagent={handleOpenNestedSubagent}
+              />
               <StageActivityWave
                 runningSubagentsCount={liveSubagentActivity.runningCount}
                 awaitingSubagentsCount={liveSubagentActivity.awaitingCount}
@@ -378,7 +375,7 @@ export const AgentStagePane = memo(function AgentStagePane({
                 onClick={handleWaveClick}
                 className="mt-3 mb-1"
               />
-            </div>
+            </>
           ) : hydrating ? (
             <div role="status" className="text-ink-muted flex items-center justify-center gap-2 py-8 text-[13px]">
               <OrbitSpinner size={14} />

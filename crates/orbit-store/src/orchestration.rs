@@ -179,6 +179,7 @@ pub(crate) fn migrate_orchestration_schema(conn: &rusqlite::Connection) -> Resul
             parent_subagent_id TEXT,
             title              TEXT NOT NULL,
             subtitle           TEXT,
+            model              TEXT,
             status_json        TEXT NOT NULL,
             created_at         TEXT NOT NULL,
             updated_at         TEXT NOT NULL,
@@ -199,6 +200,7 @@ pub(crate) fn migrate_orchestration_schema(conn: &rusqlite::Connection) -> Resul
             ON provider_subagent_events(parent_agent_id, subagent_id, seq);
         ",
     )?;
+    crate::ensure_table_column(conn, "provider_subagents", "model", "TEXT")?;
     crate::ensure_table_column(conn, "provider_subagent_events", "dedupe_key", "TEXT")?;
     crate::ensure_table_column(conn, "provider_subagent_events", "updated_seq", "INTEGER")?;
     crate::ensure_table_column(
@@ -1310,9 +1312,9 @@ impl OrbitStore {
         let status_json = serde_json::to_string(&desc.status)?;
         conn.execute(
             "INSERT INTO provider_subagents (
-                parent_agent_id, subagent_id, parent_subagent_id, title, subtitle,
+                parent_agent_id, subagent_id, parent_subagent_id, title, subtitle, model,
                 status_json, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(parent_agent_id, subagent_id) DO UPDATE SET
                 parent_subagent_id = COALESCE(excluded.parent_subagent_id, provider_subagents.parent_subagent_id),
                 title = CASE
@@ -1322,6 +1324,7 @@ impl OrbitStore {
                     ELSE excluded.title
                 END,
                 subtitle = COALESCE(excluded.subtitle, provider_subagents.subtitle),
+                model = COALESCE(excluded.model, provider_subagents.model),
                 status_json = excluded.status_json,
                 updated_at = excluded.updated_at",
             params![
@@ -1330,6 +1333,7 @@ impl OrbitStore {
                 desc.parent_subagent_id,
                 desc.title,
                 desc.subtitle,
+                desc.model,
                 status_json,
                 desc.created_at.to_rfc3339(),
                 desc.updated_at.to_rfc3339(),
@@ -1344,22 +1348,23 @@ impl OrbitStore {
     ) -> Result<Vec<ProviderSubagentDescriptor>, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let mut stmt = conn.prepare(
-            "SELECT parent_agent_id, subagent_id, parent_subagent_id, title, subtitle,
+            "SELECT parent_agent_id, subagent_id, parent_subagent_id, title, subtitle, model,
                     status_json, created_at, updated_at
              FROM provider_subagents
              WHERE parent_agent_id = ?1
              ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map(params![parent_agent_id], |row| {
-            let status_str: String = row.get(5)?;
-            let created_s: String = row.get(6)?;
-            let updated_s: String = row.get(7)?;
+            let status_str: String = row.get(6)?;
+            let created_s: String = row.get(7)?;
+            let updated_s: String = row.get(8)?;
             Ok(ProviderSubagentDescriptor {
                 parent_agent_id: row.get(0)?,
                 subagent_id: row.get(1)?,
                 parent_subagent_id: row.get(2)?,
                 title: row.get(3)?,
                 subtitle: row.get(4)?,
+                model: row.get(5)?,
                 status: serde_json::from_str(&status_str)
                     .unwrap_or(ProviderSubagentStatus::Running),
                 created_at: parse_ts(&created_s),

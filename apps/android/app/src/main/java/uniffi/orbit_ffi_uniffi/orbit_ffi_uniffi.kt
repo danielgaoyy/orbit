@@ -769,6 +769,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cancel_workflow_run(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_enable_manual_passphrase(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_export_device_link_uri(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_generate_passphrase(
@@ -1248,6 +1250,8 @@ internal object UniffiLib {
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cancel_conditional_timer(`ptr`: Long,`hostId`: RustBuffer.ByValue,`timerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cancel_workflow_run(`ptr`: Long,`hostId`: RustBuffer.ByValue,`runId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_enable_manual_passphrase(`ptr`: Long,`passphrase`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_export_device_link_uri(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1861,6 +1865,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cancel_workflow_run() and 0xFFFF) != 30638) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_enable_manual_passphrase() and 0xFFFF) != 11631) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_export_device_link_uri() and 0xFFFF) != 50707) {
@@ -3392,6 +3399,8 @@ public interface OrbitMobileCoreInterface {
     
     fun `cancelWorkflowRun`(`hostId`: kotlin.String, `runId`: kotlin.String): FfiWorkflowRunRecord
     
+    fun `cloudSyncEnableManualPassphrase`(`passphrase`: kotlin.String): FfiCloudSyncStatus
+    
     fun `cloudSyncExportDeviceLinkUri`(): kotlin.String
     
     fun `cloudSyncGeneratePassphrase`(): kotlin.String
@@ -4131,6 +4140,21 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
         
         FfiConverterString.lower(`hostId`),
         FfiConverterString.lower(`runId`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncEnableManualPassphrase`(`passphrase`: kotlin.String): FfiCloudSyncStatus {
+            return FfiConverterTypeFfiCloudSyncStatus.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_enable_manual_passphrase(
+        it,
+        
+        FfiConverterString.lower(`passphrase`),_status)
 }
     }
     )

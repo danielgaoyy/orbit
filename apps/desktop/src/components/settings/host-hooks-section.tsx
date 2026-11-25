@@ -155,12 +155,23 @@ function formatTimeoutLabel(ms: number): string {
   return `${ms}ms`;
 }
 
+const relativeTimeFormatters = new Map<string, Intl.RelativeTimeFormat>();
+
+function getRelativeTimeFormatter(locale: string): Intl.RelativeTimeFormat {
+  let formatter = relativeTimeFormatters.get(locale);
+  if (!formatter) {
+    formatter = new Intl.RelativeTimeFormat(locale, {
+      numeric: "auto",
+      style: "short",
+    });
+    relativeTimeFormatters.set(locale, formatter);
+  }
+  return formatter;
+}
+
 function formatRelativeTime(tsMs: number): string {
   const diffSec = Math.max(0, Math.floor((Date.now() - tsMs) / 1000));
-  const relative = new Intl.RelativeTimeFormat(getLocale(), {
-    numeric: "auto",
-    style: "short",
-  });
+  const relative = getRelativeTimeFormatter(getLocale());
   if (diffSec < 60) return relative.format(-diffSec, "second");
   const minutes = Math.floor(diffSec / 60);
   if (minutes < 60) return relative.format(-minutes, "minute");
@@ -415,7 +426,7 @@ function HookEditorDrawer({
     >
       <form
         onSubmit={(e) => void handleSubmit(e)}
-        className="flex flex-col gap-[16px]"
+        className="flex flex-col gap-4"
       >
         <Field>
           <FieldLabel htmlFor="hook-name">{t("devTools.name")}</FieldLabel>
@@ -491,7 +502,7 @@ function HookEditorDrawer({
         </div>
 
         {/* Action Kind Switcher */}
-        <FieldGroup className="gap-2.5">
+        <FieldGroup className="gap-3">
           <div className="flex items-center justify-between gap-2">
             <FieldLabel>{t("devTools.action")}</FieldLabel>
             <SettingSelect
@@ -507,7 +518,7 @@ function HookEditorDrawer({
           </div>
 
           {actionKind === "command" ? (
-            <FieldGroup className="gap-2.5">
+            <FieldGroup className="gap-3">
               <Field>
                 <FieldLabel htmlFor="hook-command" className="text-[11px]">
                   {t("devTools.executable")}
@@ -522,7 +533,7 @@ function HookEditorDrawer({
                   className="font-mono text-[13px]"
                 />
               </Field>
-              <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <Field>
                   <FieldLabel htmlFor="hook-args" className="text-[11px]">
                     {t("devTools.argsLines")}
@@ -534,7 +545,7 @@ function HookEditorDrawer({
                     disabled={busy}
                     onChange={(e) => setArgsText(e.target.value)}
                     placeholder={"--edition\n2024"}
-                    className="min-h-[72px] resize-none px-2.5 py-1.5 font-mono text-[11px]"
+                    className="min-h-[72px] resize-none px-3 py-2 font-mono text-[11px]"
                   />
                 </Field>
                 <Field>
@@ -548,7 +559,7 @@ function HookEditorDrawer({
                     disabled={busy}
                     onChange={(e) => setEnvText(e.target.value)}
                     placeholder={"RUST_LOG=warn"}
-                    className="min-h-[72px] resize-none px-2.5 py-1.5 font-mono text-[11px]"
+                    className="min-h-[72px] resize-none px-3 py-2 font-mono text-[11px]"
                   />
                 </Field>
               </div>
@@ -560,7 +571,7 @@ function HookEditorDrawer({
               </FieldDescription>
             </FieldGroup>
           ) : (
-            <FieldGroup className="gap-2.5">
+            <FieldGroup className="gap-3">
               <Field>
                 <FieldLabel htmlFor="hook-webhook-url" className="text-[11px]">
                   {t("devTools.endpoint")}
@@ -586,7 +597,7 @@ function HookEditorDrawer({
                   disabled={busy}
                   onChange={(e) => setHeadersText(e.target.value)}
                   placeholder={"Authorization: Bearer …"}
-                  className="min-h-[72px] resize-none px-2.5 py-1.5 font-mono text-[11px]"
+                  className="min-h-[72px] resize-none px-3 py-2 font-mono text-[11px]"
                 />
                 {editing && hasMaskedValues(headersText) && (
                   <FieldDescription className="text-[11px]">
@@ -598,7 +609,7 @@ function HookEditorDrawer({
           )}
         </FieldGroup>
 
-        <Field orientation="horizontal" className="pt-0.5">
+        <Field orientation="horizontal" className="pt-1">
           <FieldLabel className="text-ink-primary text-[13px]">
             {t("devTools.enabled")}
           </FieldLabel>
@@ -632,7 +643,7 @@ function HookEditorDrawer({
               </Button>
             )}
             {editing && confirmDelete && (
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-2">
                 <Button
                   type="button"
                   variant="destructive"
@@ -681,13 +692,17 @@ function HookEditorDrawer({
 
 export const HostHooksSection = memo(function HostHooksSection({
   hostId,
-  workspaceCwd: effectiveCwd = null,
+  workspaceCwd = null,
 }: {
   hostId: string;
   workspaceCwd?: string | null;
 }) {
   const { t } = useI18n();
   const isOnline = useHostIsOnline(hostId);
+  const effectiveCwd =
+    workspaceCwd && workspaceCwd.trim() && workspaceCwd.trim() !== "~"
+      ? workspaceCwd.trim()
+      : null;
   const scopeKey = `${hostId}::${effectiveCwd ?? "__global__"}`;
   const entry = useOrbitSelector(
     (s) => s.lifecycleHooksByScope[scopeKey] ?? null,
@@ -695,8 +710,10 @@ export const HostHooksSection = memo(function HostHooksSection({
   const hooks = entry?.hooks ?? EMPTY_HOOKS;
   const recentExecutions = entry?.recentExecutions ?? EMPTY_EXECUTIONS;
   const projectTrusted = entry?.projectHooksTrusted ?? false;
-  const isLoading = entry?.status === "loading";
+  const isInitialLoading =
+    isOnline && (!entry || entry.status === "idle" || entry.status === "loading");
 
+  const [refreshing, setRefreshing] = useState(false);
   const [editor, setEditor] = useState<{
     open: boolean;
     rule: LifecycleHookRule | null;
@@ -707,15 +724,25 @@ export const HostHooksSection = memo(function HostHooksSection({
   const [runsExpanded, setRunsExpanded] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
-  const refresh = useCallback(() => {
+  const isLoading = isInitialLoading;
+  const isRefreshing = refreshing || isInitialLoading;
+
+  useEffect(() => {
     if (!isOnline) return;
     setActionError(null);
     void orbitActions.loadLifecycleHooks(hostId, effectiveCwd);
   }, [isOnline, hostId, effectiveCwd]);
 
-  useEffect(() => {
-    refresh();
-  }, [refresh]);
+  const refresh = useCallback(async () => {
+    if (!isOnline) return;
+    setActionError(null);
+    setRefreshing(true);
+    try {
+      await orbitActions.loadLifecycleHooks(hostId, effectiveCwd);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [isOnline, hostId, effectiveCwd]);
 
   const projectHooks = useMemo(
     () => hooks.filter((h) => h.scope === "project_orbit"),
@@ -789,16 +816,16 @@ export const HostHooksSection = memo(function HostHooksSection({
   };
 
   return (
-    <section data-setting-id="hooks.title" className="space-y-2">
+    <section data-setting-id="hooks.title" className="space-y-3">
       <SettingGroupLabel
         action={
           <div className="flex items-center gap-2">
             <IconButton
-              disabled={isLoading || !isOnline}
+              disabled={isRefreshing || !isOnline}
               tooltip={t("hooks.refreshAria")}
-              onClick={refresh}
+              onClick={() => void refresh()}
             >
-              <RefreshCw className={cn(isLoading && "animate-spin")} />
+              <RefreshCw className={cn(isRefreshing && "animate-spin")} />
             </IconButton>
             <Button
               data-setting-id="hooks.addHook"
@@ -828,9 +855,9 @@ export const HostHooksSection = memo(function HostHooksSection({
         <>
           {/* Project Trust Banner */}
           {hasUntrustedProjectHooks && (
-            <div className="flex items-center justify-between gap-3 rounded-[12px] border border-signal-warning-border bg-signal-warning-bg px-3.5 py-2.5">
-              <div className="flex min-w-0 items-start gap-2.5">
-                <ShieldAlert className="mt-0.5 h-[15px] w-[15px] shrink-0 text-signal-warning" />
+            <div className="flex items-center justify-between gap-3 rounded-[12px] border border-signal-warning-border bg-signal-warning-bg px-4 py-3">
+              <div className="flex min-w-0 items-start gap-2">
+                <ShieldAlert className="mt-1 h-[15px] w-[15px] shrink-0 text-signal-warning" />
                 <div className="min-w-0">
                   <div className="text-ink-primary text-[13px] font-medium">
                     {t("devTools.untrusted")} · .orbit/hooks.json
@@ -844,7 +871,7 @@ export const HostHooksSection = memo(function HostHooksSection({
                 type="button"
                 disabled={trustBusy}
                 onClick={() => void handleTrustChange(true)}
-                className="inline-flex h-[28px] shrink-0 cursor-pointer items-center gap-1.5 rounded-lg bg-action-primary-bg px-2.5 text-[11px] font-medium text-action-primary-fg hover:bg-action-primary-hover disabled:opacity-50"
+                className="inline-flex h-[28px] shrink-0 cursor-pointer items-center gap-2 rounded-lg bg-action-primary-bg px-3 text-[11px] font-medium text-action-primary-fg hover:bg-action-primary-hover disabled:opacity-50"
               >
                 {trustBusy && (
                   <Loader2 className="h-[12px] w-[12px] animate-spin" />
@@ -857,7 +884,7 @@ export const HostHooksSection = memo(function HostHooksSection({
           {Boolean(effectiveCwd) &&
             projectHooks.length > 0 &&
             projectTrusted && (
-              <div className="border-border-subtle/80 bg-surface-raised/50 flex items-center justify-between gap-3 rounded-[11px] border px-3.5 py-2">
+              <div className="border-border-subtle/80 bg-surface-raised/50 flex items-center justify-between gap-3 rounded-[11px] border px-4 py-2">
                 <div className="text-ink-muted flex min-w-0 items-center gap-2 text-[13px]">
                   <ShieldCheck className="h-[14px] w-[14px] shrink-0 text-signal-success" />
                   <span className="truncate">{t("devTools.trusted")}</span>
@@ -894,9 +921,9 @@ export const HostHooksSection = memo(function HostHooksSection({
               </div>
             </SettingCard>
           ) : (
-            <div className="space-y-4">
+            <div className="space-y-6">
               {groupedByEvent.map(({ event, rules }) => (
-                <div key={event.id} className="space-y-1.5">
+                <div key={event.id} className="space-y-3">
                   <SettingGroupLabel>
                     {t(event.labelKey)}{" "}
                     <span className="font-normal opacity-70">
@@ -980,11 +1007,11 @@ export const HostHooksSection = memo(function HostHooksSection({
           {/* Collapsible Recent Runs Audit Log */}
           <details
             data-setting-id="devTools.recentRuns"
-            className="space-y-1.5 pt-1"
+            className="space-y-3 pt-1"
             open={runsExpanded}
             onToggle={(event) => setRunsExpanded(event.currentTarget.open)}
           >
-            <summary className="text-ink-muted hover:text-ink-primary flex cursor-pointer items-center gap-1.5 px-0.5 text-[13px] font-medium transition-colors">
+            <summary className="text-ink-muted hover:text-ink-primary flex cursor-pointer items-center gap-2 px-1 text-[13px] font-medium transition-colors">
               {runsExpanded ? (
                 <ChevronDown className="h-[14px] w-[14px]" />
               ) : (
@@ -1007,12 +1034,12 @@ export const HostHooksSection = memo(function HostHooksSection({
                     const preview =
                       run.reason || run.stderr_preview || run.stdout_preview;
                     return (
-                      <div key={run.id} className="space-y-1 px-4 py-2.5">
+                      <div key={run.id} className="space-y-1 px-4 py-2">
                         <div className="flex items-center justify-between gap-2">
-                          <div className="flex min-w-0 items-center gap-1.5">
+                          <div className="flex min-w-0 items-center gap-2">
                             <span
                               className={cn(
-                                "shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium",
+                                "shrink-0 rounded px-2 py-1 text-[11px] font-medium",
                                 decisionPillClass(run.decision),
                               )}
                             >

@@ -6683,6 +6683,18 @@ impl OrbitMobileCore {
             })
     }
 
+    pub fn cloud_sync_enable_manual_passphrase(
+        &self,
+        passphrase: String,
+    ) -> Result<FfiCloudSyncStatus, FfiOrbitError> {
+        self.inner
+            .cloud_sync_enable_manual_passphrase(&passphrase)
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
     pub fn cloud_sync_set_manual_passphrase_mode(
         &self,
         require_manual: bool,

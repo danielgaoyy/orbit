@@ -1,18 +1,17 @@
-import { memo, useRef, useState, type PointerEvent, type ReactNode } from "react";
+import { memo, useMemo, useRef, useState, type PointerEvent, type ReactNode } from "react";
 import {
   AlertTriangle,
   ArrowUpRight,
   Check,
-  FileCode2,
+  FilePenLine,
   FilePlus2,
   FileSearch,
   FileSymlink,
   FileText,
+  GitBranch,
   Globe,
-  Layers,
   MessageSquareText,
   Search,
-  Sparkles,
   Terminal as TerminalIcon,
   Wrench,
   type LucideIcon,
@@ -38,13 +37,13 @@ import {
 import type { DiffLineView, TimelineItemView } from "@/lib/orbit-ipc";
 import {
   type ResolvedSubagentItem,
+  classifyGenericSubagentTool,
   extractSubagentMessageCall,
   resolveToolCallSubagent,
 } from "@/lib/subagents";
 import {
   classifySearchTool,
   describeToolStep,
-  extractThinkingHeadline,
   formatDurationCompact,
   formatThoughtSummaryLabel,
 } from "@/lib/timeline-coalesce";
@@ -104,58 +103,61 @@ function thinkingInline(text: string): ReactNode {
 }
 
 /** Thinking items have text only. Keep code literal and format prose without interpreting HTML. */
-function ThinkingMarkdown({ text }: { text: string }) {
-  const lines = text.split(/\r?\n/);
-  const blocks: ReactNode[] = [];
-  const listMarker = /^\s*(?:([-*+])|(\d+)\.)\s+(.+)$/;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (!line.trim()) continue;
-    if (/^\s*```/.test(line)) {
-      const start = i + 1;
-      i = start;
-      while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) i++;
-      blocks.push(
-        <pre key={start - 1} className="bg-surface-recessed rounded p-2 font-mono whitespace-pre-wrap">
-          {lines.slice(start, i).join("\n")}
-        </pre>,
-      );
-      continue;
-    }
-    const first = line.match(listMarker);
-    if (first) {
-      const start = i;
-      const items = [<li key={i}>{thinkingInline(first[3])}</li>];
-      let next = lines[i + 1]?.match(listMarker);
-      while (next && Boolean(next[2]) === Boolean(first[2])) {
-        i++;
-        items.push(
-          <li key={i} value={next[2] ? Number(next[2]) : undefined}>
-            {thinkingInline(next[3])}
-          </li>,
+const ThinkingMarkdown = memo(function ThinkingMarkdown({ text }: { text: string }) {
+  const blocks = useMemo(() => {
+    const lines = text.split(/\r?\n/);
+    const out: ReactNode[] = [];
+    const listMarker = /^\s*(?:([-*+])|(\d+)\.)\s+(.+)$/;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.trim()) continue;
+      if (/^\s*```/.test(line)) {
+        const start = i + 1;
+        i = start;
+        while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) i++;
+        out.push(
+          <pre key={start - 1} className="bg-surface-recessed rounded p-2 font-mono whitespace-pre-wrap">
+            {lines.slice(start, i).join("\n")}
+          </pre>,
         );
-        next = lines[i + 1]?.match(listMarker);
+        continue;
       }
-      blocks.push(first[2] ? (
-        <ol key={start} start={Number(first[2])} className="list-decimal pl-5">{items}</ol>
-      ) : (
-        <ul key={start} className="list-disc pl-5">{items}</ul>
-      ));
-      continue;
+      const first = line.match(listMarker);
+      if (first) {
+        const start = i;
+        const items = [<li key={i}>{thinkingInline(first[3])}</li>];
+        let next = lines[i + 1]?.match(listMarker);
+        while (next && Boolean(next[2]) === Boolean(first[2])) {
+          i++;
+          items.push(
+            <li key={i} value={next[2] ? Number(next[2]) : undefined}>
+              {thinkingInline(next[3])}
+            </li>,
+          );
+          next = lines[i + 1]?.match(listMarker);
+        }
+        out.push(first[2] ? (
+          <ol key={start} start={Number(first[2])} className="list-decimal pl-5">{items}</ol>
+        ) : (
+          <ul key={start} className="list-disc pl-5">{items}</ul>
+        ));
+        continue;
+      }
+      const heading = line.match(/^\s*(#{1,6})\s+(.+)$/);
+      out.push(heading ? (
+        <div key={i} role="heading" aria-level={heading[1].length} className="text-ink-primary font-semibold">
+          {thinkingInline(heading[2])}
+        </div>
+      ) : <p key={i}>{thinkingInline(line)}</p>);
     }
-    const heading = line.match(/^\s*(#{1,6})\s+(.+)$/);
-    blocks.push(heading ? (
-      <div key={i} role="heading" aria-level={heading[1].length} className="text-ink-primary font-semibold">
-        {thinkingInline(heading[2])}
-      </div>
-    ) : <p key={i}>{thinkingInline(line)}</p>);
-  }
+    return out;
+  }, [text]);
   return (
     <div className="selectable-text text-ink-secondary flex flex-col gap-1 text-[13px] leading-[1.55] whitespace-pre-wrap">
       {blocks}
     </div>
   );
-}
+});
 
 /** Inline compact diff preview used when expanding an `Edited` / `Created` step inside a turn. */
 export const InlineStepDiffPreview = memo(function InlineStepDiffPreview({
@@ -227,7 +229,7 @@ export function resolveToolStepIcon(
     case "file_create":
       return FilePlus2;
     case "file_edit":
-      return FileCode2;
+      return FilePenLine;
     case "search": {
       if (item.detail.kind === "search") {
         const sub = classifySearchTool(item.detail.query, item.summary_title);
@@ -239,9 +241,42 @@ export function resolveToolStepIcon(
     case "shell":
       return TerminalIcon;
     case "subagent":
-      return Layers;
-    case "generic":
+      return GitBranch;
+    case "generic": {
+      if (item.detail.kind === "generic") {
+        const subagentKind = classifyGenericSubagentTool(item.detail.tool_name);
+        if (subagentKind === "dispatch") return GitBranch;
+        if (subagentKind === "message") return MessageSquareText;
+      }
       return Wrench;
+    }
+  }
+}
+
+export function resolveLiveToolCallIcon(
+  item: Extract<TimelineItemView, { item_type: "tool_call" }>,
+): LucideIcon {
+  switch (item.detail.kind) {
+    case "file_read":
+      return FileText;
+    case "file_edit": {
+      const isCreate =
+        /^(?:create|created|write|wrote)\b/i.test(item.summary_title.trim()) ||
+        Boolean(item.detail.unified_diff && /---\s+\/dev\/null/.test(item.detail.unified_diff));
+      return isCreate ? FilePlus2 : FilePenLine;
+    }
+    case "search":
+      return resolveToolStepIcon(item, "search");
+    case "shell":
+      return TerminalIcon;
+    case "subagent":
+      return GitBranch;
+    case "generic": {
+      const subagentKind = classifyGenericSubagentTool(item.detail.tool_name);
+      if (subagentKind === "dispatch") return GitBranch;
+      if (subagentKind === "message") return MessageSquareText;
+      return Wrench;
+    }
   }
 }
 
@@ -299,125 +334,45 @@ export function computeLiveStallState({
   };
 }
 
-/** Isolated 1-second live elapsed ticker with offline, thinking-stall, and queue hints. */
+/** Isolated 1-second live elapsed ticker (quiet duration only). */
 export const InlineLiveElapsed = memo(function InlineLiveElapsed({
   startedAtMs,
-  lastActivityMs,
-  lastVisibleProgressMs,
-  isNetworkOffline = false,
-  stallLabel,
-  queuedNotificationCount = 0,
 }: {
   startedAtMs: number;
-  lastActivityMs?: number | null;
-  lastVisibleProgressMs?: number | null;
-  isNetworkOffline?: boolean;
-  stallLabel?: string | null;
-  queuedNotificationCount?: number;
 }) {
-  const { t, locale } = useI18n();
+  const { locale } = useI18n();
   const nowMs = useLiveSecondClock(true);
-  const { elapsedMs, isSilentStall, isThinkingStall } = computeLiveStallState({
-    nowMs,
-    startedAtMs,
-    lastActivityMs,
-    lastVisibleProgressMs,
-    isNetworkOffline,
-    stallLabel,
-    queuedNotificationCount,
-  });
+  const elapsedMs = Math.max(0, nowMs - startedAtMs);
 
-  if (elapsedMs < 1000 && !isNetworkOffline && queuedNotificationCount === 0) return null;
+  if (elapsedMs < 1000) return null;
 
   return (
-    <>
-      {elapsedMs >= 1000 && (
-        <TraceDescription>
-          · {formatDurationCompact(elapsedMs, locale)}
-        </TraceDescription>
-      )}
-      {isNetworkOffline ? (
-        <TraceDescription className="font-sans text-signal-warning">
-          · {t("stage.offline")}
-        </TraceDescription>
-      ) : isSilentStall ? (
-        <TraceDescription className="min-w-0 shrink truncate font-sans">
-          · {stallLabel ?? t("stage.waitingForResponse")}
-        </TraceDescription>
-      ) : isThinkingStall ? (
-        <TraceDescription className="font-sans text-signal-warning">
-          · {t("stage.thinkingNoProgress")}
-        </TraceDescription>
-      ) : null}
-      {queuedNotificationCount > 0 && (
-        <TraceDescription className="text-signal-warning">
-          · {t("stage.queuedCount", { count: queuedNotificationCount })}
-        </TraceDescription>
-      )}
-    </>
+    <TraceDescription>
+      {formatDurationCompact(elapsedMs, locale)}
+    </TraceDescription>
   );
 });
 
-/** Explicit sibling button shown only when a turn is stalled or blocking queued notifications. */
-export const LiveStallInterruptButton = memo(function LiveStallInterruptButton({
-  startedAtMs,
-  lastActivityMs,
-  lastVisibleProgressMs,
-  isNetworkOffline = false,
-  stallLabel,
-  queuedNotificationCount = 0,
-  onInterruptAndContinue,
-}: {
-  startedAtMs: number;
-  lastActivityMs?: number | null;
-  lastVisibleProgressMs?: number | null;
-  isNetworkOffline?: boolean;
-  stallLabel?: string | null;
-  queuedNotificationCount?: number;
-  onInterruptAndContinue?: (() => void) | null;
-}) {
-  const { t } = useI18n();
-  const nowMs = useLiveSecondClock(Boolean(onInterruptAndContinue));
-
-  if (!onInterruptAndContinue) return null;
-
-  const { showInterruptContinue } = computeLiveStallState({
-    nowMs,
-    startedAtMs,
-    lastActivityMs,
-    lastVisibleProgressMs,
-    isNetworkOffline,
-    stallLabel,
-    queuedNotificationCount,
-  });
-
-  if (!showInterruptContinue) return null;
-
-  return (
-    <button
-      type="button"
-      onClick={(e) => {
-        e.stopPropagation();
-        onInterruptAndContinue();
-      }}
-      className="orbit-press border-signal-warning-border bg-signal-warning-bg text-signal-warning hover:bg-signal-warning-bg/80 inline-flex h-[22px] shrink-0 cursor-pointer items-center rounded-[6px] border px-2 text-[11px] font-medium"
-    >
-      {t("stage.interruptAndContinue")}
-    </button>
-  );
-});
-
-function ToolStepDetail({
+const ToolStepDetail = memo(function ToolStepDetail({
   item,
-  diffLines,
   onOpenDiffReview,
 }: {
   item: Extract<TimelineItemView, { item_type: "tool_call" }>;
-  diffLines: DiffLineView[];
   onOpenDiffReview?: () => void;
 }) {
   const { t } = useI18n();
   const { detail } = item;
+  const diffLines = useMemo<DiffLineView[]>(() => {
+    if (detail.kind !== "file_edit") return [];
+    if (item.diff_files[0]?.lines && item.diff_files[0].lines.length > 0) {
+      return item.diff_files[0].lines;
+    }
+    return detail.unified_diff ? parseUnifiedDiffFallback(detail.unified_diff) : [];
+  }, [detail, item.diff_files]);
+  const genericArgsPreview = useMemo(
+    () => (detail.kind === "generic" ? formatJsonPreview(detail.arguments_json) : ""),
+    [detail],
+  );
   switch (detail.kind) {
     case "shell":
       return (
@@ -431,11 +386,11 @@ function ToolStepDetail({
           )}
           viewportClassName="max-h-56 py-2 pl-3"
         >
-          <pre className="selectable-text text-ink-primary font-mono text-[13px] leading-[1.5] whitespace-pre-wrap">
+          <pre className="selectable-text font-mono text-[13px] leading-[1.5] whitespace-pre-wrap">
             <span className="text-ink-muted select-none">$ </span>
-            {detail.command}
+            <span className="text-ink-primary">{detail.command}</span>
             {detail.output_preview ? (
-              `\n\n${detail.output_preview}`
+              <span className="text-ink-secondary">{`\n\n${detail.output_preview}`}</span>
             ) : item.status !== "running" && (
               <span className="text-ink-muted select-none">{"\n\n"}{t("stage.noOutput")}</span>
             )}
@@ -448,7 +403,7 @@ function ToolStepDetail({
       return <StepOutput text={detail.prompt_preview} />;
     case "generic": {
       const message = extractSubagentMessageCall(item)?.message;
-      if (!message) return <StepOutput text={formatJsonPreview(detail.arguments_json)} />;
+      if (!message) return <StepOutput text={genericArgsPreview} />;
       return (
         <StepOutput text={message} viewportClassName="max-h-60 py-2 pl-3">
           <p className="selectable-text text-ink-secondary text-[13px] leading-[1.5] whitespace-pre-wrap">{message}</p>
@@ -458,13 +413,14 @@ function ToolStepDetail({
     default:
       return null;
   }
-}
+});
 export const StepItemRow = memo(function StepItemRow({
   item,
   hostId,
   agentId,
   cwd,
   holdViewport,
+  followBottomOnExpand = false,
   isActivelyThinking = false,
   thoughtDurationMs = null,
   autoExpandError = false,
@@ -476,6 +432,7 @@ export const StepItemRow = memo(function StepItemRow({
   agentId?: string;
   cwd: string;
   holdViewport: ViewportAnchorHoldFn;
+  followBottomOnExpand?: boolean;
   isActivelyThinking?: boolean;
   thoughtDurationMs?: number | null;
   autoExpandError?: boolean;
@@ -488,11 +445,26 @@ export const StepItemRow = memo(function StepItemRow({
     item.item_type === "tool_call" &&
     (item.status === "failed" || item.status === "denied");
   const [expanded, setExpanded] = useState(defaultOpen);
+  const [hasOpened, setHasOpened] = useState(defaultOpen);
+  if (expanded && !hasOpened) {
+    setHasOpened(true);
+  }
   const triggerRef = useRef<HTMLButtonElement | null>(null);
 
-  function renderStep(line: ReactNode, detail?: ReactNode, actions?: ReactNode, triggerLabel?: string) {
-    const summary = detail ? (
-      <TraceCollapsibleTrigger ref={triggerRef} aria-label={triggerLabel}>
+  function renderStep(
+    line: ReactNode,
+    detail?: (() => ReactNode) | false | null,
+    actions?: ReactNode,
+    triggerLabel?: string,
+    preserveSummaryWidth = false,
+  ) {
+    const hasDetail = Boolean(detail);
+    const summary = hasDetail ? (
+      <TraceCollapsibleTrigger
+        ref={triggerRef}
+        aria-label={triggerLabel}
+        className={preserveSummaryWidth ? "shrink-0" : undefined}
+      >
         {line}
       </TraceCollapsibleTrigger>
     ) : line;
@@ -503,39 +475,35 @@ export const StepItemRow = memo(function StepItemRow({
       </div>
     ) : summary;
 
-    if (!detail) return header;
+    if (!hasDetail || !detail) return header;
     return (
       <TraceCollapsible
         open={expanded}
         onOpenChange={(open) => holdViewport(triggerRef.current, () => setExpanded(open), "top", {
           intent: open ? "expand" : "collapse",
+          followBottom: followBottomOnExpand,
         })}
       >
         {header}
-        <TraceCollapsibleContent>{detail}</TraceCollapsibleContent>
+        <TraceCollapsibleContent>{hasOpened ? detail() : null}</TraceCollapsibleContent>
       </TraceCollapsible>
     );
   }
 
   if (item.item_type === "assistant_thinking") {
     const trimmed = item.text.trim();
-    const headline = extractThinkingHeadline(trimmed, isActivelyThinking);
     const label = isActivelyThinking
-      ? t("stage.thinking")
+      ? t("stage.thinkingPending")
       : formatThoughtSummaryLabel(thoughtDurationMs, 1, locale);
     return renderStep(
       <TraceLine status={isActivelyThinking ? "running" : undefined}>
-        <TraceIcon><Sparkles /></TraceIcon>
         <TraceTitle>{label}</TraceTitle>
-        {!expanded && headline && (
-          <TraceDescription className="min-w-0 shrink truncate font-sans">{headline}</TraceDescription>
-        )}
       </TraceLine>,
-      trimmed && (
+      trimmed.length > 0 && (() => (
         <StepOutput text={item.text} className="bg-transparent" viewportClassName="max-h-56">
           <ThinkingMarkdown text={trimmed} />
         </StepOutput>
-      ),
+      )),
     );
   }
 
@@ -559,7 +527,7 @@ export const StepItemRow = memo(function StepItemRow({
         <TraceIcon><MessageSquareText /></TraceIcon>
         <TraceTitle className={compact ? "selectable-text whitespace-normal" : undefined}>{preview}</TraceTitle>
       </TraceLine>,
-      !compact && (
+      !compact && (() => (
         <StepOutput text={item.text} className="bg-transparent" viewportClassName="pl-0">
           {item.blocks.length ? (
             <MarkdownBlocksView blocks={item.blocks} streaming={item.streaming} />
@@ -567,7 +535,7 @@ export const StepItemRow = memo(function StepItemRow({
             <p className="selectable-text whitespace-pre-wrap">{trimmed}</p>
           )}
         </StepOutput>
-      ),
+      )),
     );
   }
 
@@ -607,16 +575,13 @@ export const StepItemRow = memo(function StepItemRow({
   const isError = desc.isFailed || desc.isDenied;
   const IconComp = resolveToolStepIcon(item, desc.kind);
 
-  const diffLines =
-    item.diff_files[0]?.lines && item.diff_files[0].lines.length > 0
-      ? item.diff_files[0].lines
-      : item.detail.kind === "file_edit" && item.detail.unified_diff
-        ? parseUnifiedDiffFallback(item.detail.unified_diff)
-        : [];
+  const hasFileEditDiff =
+    (item.diff_files[0]?.lines?.length ?? 0) > 0 ||
+    (item.detail.kind === "file_edit" && Boolean(item.detail.unified_diff?.trim()));
 
   const hasExpandableDetail =
     desc.hasExpandableDetail &&
-    (item.detail.kind !== "file_edit" || diffLines.length > 0);
+    (item.detail.kind !== "file_edit" || hasFileEditDiff);
   const openFilePath = desc.openPath;
   const canOpenFileInDiff =
     Boolean(openFilePath) && (desc.kind === "file_edit" || desc.kind === "file_create");
@@ -672,12 +637,17 @@ export const StepItemRow = memo(function StepItemRow({
   const targetTitle = resolvedSubagentMatch
     ? t("stage.openSubagentDetails")
     : t(canOpenFileInDiff ? "stage.openTargetDiff" : "stage.openTargetInPanel", { target: displayTarget });
+  const hasExternalTarget = Boolean(displayTarget && openTarget);
+  const hasInlineTarget = Boolean(displayTarget && !openTarget);
   const line = (
-    <TraceLine status={isError ? "error" : desc.isRunning ? "running" : undefined}>
+    <TraceLine
+      status={isError ? "error" : desc.isRunning ? "running" : undefined}
+      className={hasExternalTarget ? "shrink-0" : undefined}
+    >
       <TraceIcon>{isError ? <AlertTriangle /> : <IconComp />}</TraceIcon>
-      <TraceTitle>
+      <TraceTitle className={!hasInlineTarget ? "shrink-0" : undefined}>
         {desc.verb}
-        {displayTarget && !openTarget && <> <span className="font-mono">{displayTarget}</span></>}
+        {hasInlineTarget && <> <span className="font-mono">{displayTarget}</span></>}
       </TraceTitle>
       {desc.secondaryMeta && !canOpenFileDirect && (
         <TraceDescription className="min-w-0 shrink truncate">{desc.secondaryMeta}</TraceDescription>
@@ -772,10 +742,11 @@ export const StepItemRow = memo(function StepItemRow({
 
   return renderStep(
     line,
-    hasExpandableDetail && (
-      <ToolStepDetail item={item} diffLines={diffLines} onOpenDiffReview={canOpenFileInDiff ? handleOpenTargetFile : undefined} />
-    ),
+    hasExpandableDetail && (() => (
+      <ToolStepDetail item={item} onOpenDiffReview={canOpenFileInDiff ? handleOpenTargetFile : undefined} />
+    )),
     actions,
-    openTarget && displayTarget ? `${desc.verb} ${displayTarget}` : undefined,
+    hasExternalTarget ? `${desc.verb} ${displayTarget}` : undefined,
+    hasExternalTarget,
   );
 });

@@ -171,6 +171,7 @@ export function selectPendingDecisions(
   state: Pick<OrbitUiState, "stages" | "hostDetails" | "fleet" | "archivedSubagents">,
   hostId: string | null,
   agentId: string | null,
+  subagentsOverride?: SessionSubagentsSummary,
 ): UnifiedPendingDecisions {
   if (!hostId || !agentId) return EMPTY_DECISIONS;
 
@@ -192,7 +193,7 @@ export function selectPendingDecisions(
       item.item_type === "question_request" && item.resolved_answers === null,
   );
 
-  const subagents = selectSessionSubagents(state, hostId, agentId);
+  const subagents = subagentsOverride ?? selectSessionSubagents(state, hostId, agentId);
   const subagentPermissions: UnifiedPendingSubagentPermission[] = [];
   const seenReqIds = new Set<string>();
 

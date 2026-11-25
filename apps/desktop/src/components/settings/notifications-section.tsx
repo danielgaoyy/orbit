@@ -12,6 +12,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { useI18n } from "@/lib/i18n";
 import { playSoftNotificationChime } from "@/lib/notification-sound";
+import { cn } from "@/lib/utils";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
 const HOURS = Array.from({ length: 24 }, (_, h) => h);
@@ -82,7 +83,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
       />
 
       {/* Desktop System Permission */}
-      <div className="space-y-2">
+      <div className="space-y-3">
         <SettingGroupLabel>{t("settings.notifyPermissionGroup")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
@@ -97,18 +98,18 @@ export const NotificationsSection = memo(function NotificationsSection() {
             }
           >
             {permission === "granted" ? (
-              <div className="flex items-center gap-2.5">
+              <div className="flex items-center gap-2">
                 <Button
                   type="button"
                   variant="outline"
                   size="xs"
                   onClick={() => orbitActions.sendTestDesktopNotification()}
-                  className="h-[28px] gap-1.5 text-[13px]"
+                  className="h-[28px] gap-2 text-[13px]"
                 >
                   <Send className="h-[12px] w-[12px]" />
                   <span>{t("settings.notifyTest")}</span>
                 </Button>
-                <span className="text-signal-success inline-flex items-center gap-1.5 text-[13px] font-medium">
+                <span className="text-signal-success inline-flex items-center gap-2 text-[13px] font-medium">
                   <Check className="h-[14px] w-[14px]" />
                   {t("settings.notifyEnabled")}
                 </span>
@@ -133,7 +134,7 @@ export const NotificationsSection = memo(function NotificationsSection() {
       </div>
 
       {/* Desktop Alert Categories & Sound */}
-      <div className="space-y-2">
+      <div className="space-y-3">
         <SettingGroupLabel>{t("settings.notifyDesktopEvents")}</SettingGroupLabel>
         <SettingCard>
           <SettingRow
@@ -210,12 +211,12 @@ export const NotificationsSection = memo(function NotificationsSection() {
             description={t("settings.notificationSoundDesc")}
             disabled={isBlocked}
           >
-            <div className="flex items-center gap-2.5">
+            <div className="flex items-center gap-2">
               <button
                 type="button"
                 disabled={isBlocked}
                 onClick={() => void playSoftNotificationChime("default")}
-                className="border-border-default text-ink-primary hover:bg-surface-recessed inline-flex h-[28px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[13px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-45"
+                className="border-border-default text-ink-primary hover:bg-surface-recessed inline-flex h-[28px] cursor-pointer items-center gap-2 rounded-lg border px-3 text-[13px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-45"
               >
                 <Volume2 className="text-ink-muted h-[13px] w-[13px]" />
                 <span>{t("settings.testSound")}</span>
@@ -235,44 +236,65 @@ export const NotificationsSection = memo(function NotificationsSection() {
             description={t("settings.notifyQuietHoursDesc")}
             disabled={isBlocked}
           >
-            <div className="flex items-center gap-2">
-              {notifyQuietHoursEnabled && (
-                <div className="flex items-center gap-1.5 text-[13px]">
-                  <SettingSelect<number>
-                    size="sm"
-                    ariaLabel={t("settings.notifyQuietStart")}
-                    value={notifyQuietStartHour}
-                    options={HOUR_OPTIONS}
-                    disabled={isBlocked}
-                    triggerClassName="min-w-[82px]"
-                    menuClassName="min-w-[104px]"
-                    onChange={(hour) =>
-                      orbitActions.setNotificationPrefs({ notifyQuietStartHour: hour })
-                    }
-                  />
-                  <span className="text-ink-muted" aria-hidden>–</span>
-                  <SettingSelect<number>
-                    size="sm"
-                    ariaLabel={t("settings.notifyQuietEnd")}
-                    value={notifyQuietEndHour}
-                    options={HOUR_OPTIONS}
-                    disabled={isBlocked}
-                    triggerClassName="min-w-[82px]"
-                    menuClassName="min-w-[104px]"
-                    onChange={(hour) =>
-                      orbitActions.setNotificationPrefs({ notifyQuietEndHour: hour })
-                    }
-                  />
-                </div>
-              )}
-              <ToggleSwitch
-                ariaLabel={t("settings.notifyQuietHours")}
-                checked={notifyQuietHoursEnabled}
-                disabled={isBlocked}
-                onChange={(v) => orbitActions.setNotificationPrefs({ notifyQuietHoursEnabled: v })}
-              />
-            </div>
+            <ToggleSwitch
+              ariaLabel={t("settings.notifyQuietHours")}
+              checked={notifyQuietHoursEnabled}
+              disabled={isBlocked}
+              onChange={(v) => orbitActions.setNotificationPrefs({ notifyQuietHoursEnabled: v })}
+            />
           </SettingRow>
+
+          {notifyQuietHoursEnabled && (
+            <div
+              data-disabled={isBlocked ? "" : undefined}
+              className="bg-surface-recessed/35 flex flex-wrap items-center justify-between gap-x-6 gap-y-2 px-4 py-3"
+            >
+              <div className="flex items-center gap-2">
+                <span
+                  className={cn(
+                    "text-ink-secondary text-[13px] transition-opacity",
+                    isBlocked && "opacity-55",
+                  )}
+                >
+                  {t("settings.notifyQuietStart")}
+                </span>
+                <SettingSelect<number>
+                  size="sm"
+                  ariaLabel={t("settings.notifyQuietStart")}
+                  value={notifyQuietStartHour}
+                  options={HOUR_OPTIONS}
+                  disabled={isBlocked}
+                  triggerClassName="min-w-[86px]"
+                  menuClassName="min-w-[104px]"
+                  onChange={(hour) =>
+                    orbitActions.setNotificationPrefs({ notifyQuietStartHour: hour })
+                  }
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <span
+                  className={cn(
+                    "text-ink-secondary text-[13px] transition-opacity",
+                    isBlocked && "opacity-55",
+                  )}
+                >
+                  {t("settings.notifyQuietEnd")}
+                </span>
+                <SettingSelect<number>
+                  size="sm"
+                  ariaLabel={t("settings.notifyQuietEnd")}
+                  value={notifyQuietEndHour}
+                  options={HOUR_OPTIONS}
+                  disabled={isBlocked}
+                  triggerClassName="min-w-[86px]"
+                  menuClassName="min-w-[104px]"
+                  onChange={(hour) =>
+                    orbitActions.setNotificationPrefs({ notifyQuietEndHour: hour })
+                  }
+                />
+              </div>
+            </div>
+          )}
         </SettingCard>
       </div>
     </div>

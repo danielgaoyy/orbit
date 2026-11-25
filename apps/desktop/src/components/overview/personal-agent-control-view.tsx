@@ -68,9 +68,6 @@ interface FleetSessionRowItem {
   isError: boolean;
   isPinnedLane: boolean;
   updatedAtMs: number;
-  additions: number;
-  deletions: number;
-  stepPreview: string;
 }
 
 function describeToolDetailPlainly(detail: ToolCallDetail | undefined, fallbackTitle: string): string {
@@ -115,6 +112,144 @@ function parseTsMs(rfc3339?: string | null): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+const LiveElapsedLabel = memo(function LiveElapsedLabel({
+  tsMs,
+  active,
+  className,
+}: {
+  tsMs: number;
+  active: boolean;
+  className: string;
+}) {
+  const nowMs = useLiveSecondClock(active);
+  return <span className={className}>{formatCompactElapsed(tsMs, nowMs)}</span>;
+});
+
+const FleetSessionRow = memo(function FleetSessionRow({
+  row,
+  showHostBadges,
+}: {
+  row: FleetSessionRowItem;
+  showHostBadges: boolean;
+}) {
+  const { t } = useI18n();
+  const stageMeta = useOrbitSelector((s) => {
+    const stage = s.stages[row.key];
+    let additions = 0;
+    let deletions = 0;
+    for (const df of stage?.session_turn_diffs ?? []) {
+      additions += df.additions;
+      deletions += df.deletions;
+    }
+    const lastTurn = stage?.turns?.[stage.turns.length - 1];
+    const stepPreview =
+      (row.isRunning ? lastTurn?.work_summary_live_label : lastTurn?.work_summary_label) ||
+      row.agent.task_summary ||
+      row.agent.status_label ||
+      "";
+    return `${additions}\0${deletions}\0${stepPreview}`;
+  });
+
+  const firstSep = stageMeta.indexOf("\0");
+  const secondSep = stageMeta.indexOf("\0", firstSep + 1);
+  const additions = Number(stageMeta.slice(0, firstSep)) || 0;
+  const deletions = Number(stageMeta.slice(firstSep + 1, secondSep)) || 0;
+  const stepPreview = stageMeta.slice(secondSep + 1);
+
+  return (
+    <div
+      onClick={(e) => {
+        if (e.metaKey || e.ctrlKey) {
+          if (row.isPinnedLane) {
+            orbitActions.unpinOverviewLane(row.hostId, row.agent.agent_id);
+          } else {
+            orbitActions.pinOverviewLane(row.hostId, row.agent.agent_id);
+          }
+        } else {
+          orbitActions.selectAgent(row.hostId, row.agent.agent_id);
+        }
+      }}
+      className="group/row hover:bg-accent/55 flex cursor-pointer items-center justify-between gap-3 px-3.5 py-2.5 transition-colors"
+    >
+      <div className="flex min-w-0 flex-1 items-center gap-2.5">
+        <span className="inline-flex size-[18px] shrink-0 items-center justify-center">
+          {row.isRunning ? (
+            <OrbitSpinner size={14} className="text-ink-secondary" />
+          ) : row.isAwaiting ? (
+            <span className="bg-signal-warning size-[8px] rounded-full" />
+          ) : row.isError ? (
+            <span className="bg-signal-danger size-[8px] rounded-full" />
+          ) : (
+            <ProviderIcon
+              provider={row.agent.provider}
+              className="size-[15px] opacity-75"
+            />
+          )}
+        </span>
+
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5">
+            <span className="text-ink-primary truncate text-[13px] font-medium">
+              {row.effectiveTitle}
+            </span>
+            {showHostBadges && (
+              <span className="bg-surface-recessed text-ink-tertiary shrink-0 rounded px-1.5 py-0.5 text-[11px]">
+                {row.hostName}
+              </span>
+            )}
+            {row.agent.worktree_branch && (
+              <span className="text-ink-faint hidden max-w-[140px] items-center gap-0.5 truncate font-mono text-[11px] sm:inline-flex">
+                <GitBranch className="size-[10px] shrink-0" />
+                <span className="truncate">{row.agent.worktree_branch}</span>
+              </span>
+            )}
+          </div>
+          {stepPreview && (
+            <div className="text-ink-tertiary mt-0.5 truncate text-[11.5px]">
+              {stepPreview}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="flex shrink-0 items-center gap-2">
+        {(additions > 0 || deletions > 0) && (
+          <DiffStat additions={additions} deletions={deletions} />
+        )}
+
+        <LiveElapsedLabel
+          tsMs={row.updatedAtMs}
+          active={row.isRunning}
+          className="text-ink-faint font-mono text-[11px] tabular-nums"
+        />
+
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            if (row.isPinnedLane) {
+              orbitActions.unpinOverviewLane(row.hostId, row.agent.agent_id);
+            } else {
+              orbitActions.pinOverviewLane(row.hostId, row.agent.agent_id);
+            }
+          }}
+          className={cn(
+            "inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-[6px] border px-2 text-[11.5px] transition-colors",
+            row.isPinnedLane
+              ? "border-border-strong bg-accent text-ink-primary font-medium"
+              : "border-border-subtle text-ink-tertiary hover:border-border-default hover:text-ink-primary opacity-80 group-hover/row:opacity-100",
+          )}
+        >
+          <Eye className="size-3" />
+          <span>
+            {row.isPinnedLane ? t("overview.watchingLive") : t("overview.watchLive")}
+          </span>
+        </button>
+      </div>
+    </div>
+  );
+});
+
 /**
  * Humanized Personal Agent Global Overview ("全局总控视角").
  *
@@ -129,7 +264,6 @@ export const PersonalAgentControlView = memo(function PersonalAgentControlView()
   const { t } = useI18n();
   const fleet = useOrbitSelector((s) => s.fleet);
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
-  const stages = useOrbitSelector((s) => s.stages);
   const archivedThreads = useOrbitSelector((s) => s.archivedThreads);
   const threadCustomTitles = useOrbitSelector((s) => s.threadCustomTitles);
   const overviewPinnedLanes = useOrbitSelector((s) => s.overviewPinnedLanes);
@@ -142,17 +276,6 @@ export const PersonalAgentControlView = memo(function PersonalAgentControlView()
   const [sendingRouter, setSendingRouter] = useState(false);
   const [primaryRouterHostId, setPrimaryRouterHostId] = useState<string | null>(null);
   const routerIme = useImeCompositionGuard();
-
-  const hasAnyActive = useMemo(() => {
-    for (const detail of Object.values(hostDetails)) {
-      if (detail.agents.some((a) => !a.archived_at_rfc3339 && isAgentForegroundRunning(a))) {
-        return true;
-      }
-    }
-    return false;
-  }, [hostDetails]);
-
-  const nowMs = useLiveSecondClock(hasAnyActive);
 
   useEffect(() => {
     let active = true;
@@ -322,20 +445,6 @@ export const PersonalAgentControlView = memo(function PersonalAgentControlView()
         // Skip same-host subagents from top-level fleet ledger (keep primary threads crisp)
         if (ag.parent_agent_id && !ag.parent_host_id) continue;
 
-        const stage = stages[tKey];
-        let additions = 0;
-        let deletions = 0;
-        for (const df of stage?.session_turn_diffs ?? []) {
-          additions += df.additions;
-          deletions += df.deletions;
-        }
-        const lastTurn = stage?.turns?.[stage.turns.length - 1];
-        const stepPreview =
-          (isRunning ? lastTurn?.work_summary_live_label : lastTurn?.work_summary_label) ||
-          ag.task_summary ||
-          ag.status_label ||
-          "";
-
         sessions.push({
           key: tKey,
           hostId,
@@ -347,9 +456,6 @@ export const PersonalAgentControlView = memo(function PersonalAgentControlView()
           isError,
           isPinnedLane: pinnedLaneKeySet.has(tKey),
           updatedAtMs,
-          additions,
-          deletions,
-          stepPreview,
         });
       }
     }
@@ -375,7 +481,6 @@ export const PersonalAgentControlView = memo(function PersonalAgentControlView()
     fleet.hosts,
     hostDetails,
     hostById,
-    stages,
     archivedThreads,
     threadCustomTitles,
     pinnedLaneKeySet,
@@ -689,9 +794,11 @@ export const PersonalAgentControlView = memo(function PersonalAgentControlView()
                           </div>
                         </div>
 
-                        <span className="text-ink-faint shrink-0 font-mono text-[11px] tabular-nums">
-                          {formatCompactElapsed(item.updatedAtMs, nowMs)}
-                        </span>
+                        <LiveElapsedLabel
+                          tsMs={item.updatedAtMs}
+                          active={activeCount > 0}
+                          className="text-ink-faint shrink-0 font-mono text-[11px] tabular-nums"
+                        />
                       </div>
 
                       <div className="flex flex-wrap items-center justify-end gap-1.5">
@@ -799,95 +906,11 @@ export const PersonalAgentControlView = memo(function PersonalAgentControlView()
             ) : (
               <div className="border-border-subtle bg-surface-raised divide-border-subtle divide-y overflow-hidden rounded-xl border">
                 {fleetSessions.map((row) => (
-                  <div
+                  <FleetSessionRow
                     key={row.key}
-                    onClick={(e) => {
-                      if (e.metaKey || e.ctrlKey) {
-                        if (row.isPinnedLane) {
-                          orbitActions.unpinOverviewLane(row.hostId, row.agent.agent_id);
-                        } else {
-                          orbitActions.pinOverviewLane(row.hostId, row.agent.agent_id);
-                        }
-                      } else {
-                        orbitActions.selectAgent(row.hostId, row.agent.agent_id);
-                      }
-                    }}
-                    className="group/row hover:bg-accent/55 flex cursor-pointer items-center justify-between gap-3 px-3.5 py-2.5 transition-colors"
-                  >
-                    <div className="flex min-w-0 flex-1 items-center gap-2.5">
-                      <span className="inline-flex size-[18px] shrink-0 items-center justify-center">
-                        {row.isRunning ? (
-                          <OrbitSpinner size={14} className="text-ink-secondary" />
-                        ) : row.isAwaiting ? (
-                          <span className="bg-signal-warning size-[8px] rounded-full" />
-                        ) : row.isError ? (
-                          <span className="bg-signal-danger size-[8px] rounded-full" />
-                        ) : (
-                          <ProviderIcon
-                            provider={row.agent.provider}
-                            className="size-[15px] opacity-75"
-                          />
-                        )}
-                      </span>
-
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-ink-primary truncate text-[13px] font-medium">
-                            {row.effectiveTitle}
-                          </span>
-                          {showHostBadges && (
-                            <span className="bg-surface-recessed text-ink-tertiary shrink-0 rounded px-1.5 py-0.5 text-[11px]">
-                              {row.hostName}
-                            </span>
-                          )}
-                          {row.agent.worktree_branch && (
-                            <span className="text-ink-faint hidden max-w-[140px] items-center gap-0.5 truncate font-mono text-[11px] sm:inline-flex">
-                              <GitBranch className="size-[10px] shrink-0" />
-                              <span className="truncate">{row.agent.worktree_branch}</span>
-                            </span>
-                          )}
-                        </div>
-                        {row.stepPreview && (
-                          <div className="text-ink-tertiary mt-0.5 truncate text-[11.5px]">
-                            {row.stepPreview}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-
-                    <div className="flex shrink-0 items-center gap-2">
-                      {(row.additions > 0 || row.deletions > 0) && (
-                        <DiffStat additions={row.additions} deletions={row.deletions} />
-                      )}
-
-                      <span className="text-ink-faint font-mono text-[11px] tabular-nums">
-                        {formatCompactElapsed(row.updatedAtMs, nowMs)}
-                      </span>
-
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          if (row.isPinnedLane) {
-                            orbitActions.unpinOverviewLane(row.hostId, row.agent.agent_id);
-                          } else {
-                            orbitActions.pinOverviewLane(row.hostId, row.agent.agent_id);
-                          }
-                        }}
-                        className={cn(
-                          "inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-[6px] border px-2 text-[11.5px] transition-colors",
-                          row.isPinnedLane
-                            ? "border-border-strong bg-accent text-ink-primary font-medium"
-                            : "border-border-subtle text-ink-tertiary hover:border-border-default hover:text-ink-primary opacity-80 group-hover/row:opacity-100",
-                        )}
-                      >
-                        <Eye className="size-3" />
-                        <span>
-                          {row.isPinnedLane ? t("overview.watchingLive") : t("overview.watchLive")}
-                        </span>
-                      </button>
-                    </div>
-                  </div>
+                    row={row}
+                    showHostBadges={showHostBadges}
+                  />
                 ))}
               </div>
             )}

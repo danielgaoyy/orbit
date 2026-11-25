@@ -514,11 +514,13 @@ it("mounts actionable DecisionDock in SubagentTab and PeerSplitTab and recovers 
       },
     }),
   );
+  assert.match(subagentHtml, /data-slot="subagent-context-header"/);
   assert.match(subagentHtml, /approval-dock-surface/);
   assert.match(subagentHtml, /cargo test/);
   assert.match(subagentHtml, />Allow</);
   assert.match(subagentHtml, />Deny</);
-  assert.doesNotMatch(subagentHtml, />Approval required</);
+  assert.doesNotMatch(subagentHtml, /data-slot="context-banner"/);
+  assert.doesNotMatch(subagentHtml, />Refresh</);
 
   // PeerSplitTab renders real actionable DecisionDock for pending clarification/approval
   const peerHtml = renderToStaticMarkup(

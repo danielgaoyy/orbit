@@ -21,15 +21,15 @@ const t = (key: MessageKey) => en[key];
 const hostId = "ipv6:2001:db8::42";
 
 describe("Settings navigation", () => {
-  it("contains the seventeen sections in sidebar order within their four domains", () => {
+  it("contains the sixteen sections in sidebar order within their four domains", () => {
     const grouped = SETTINGS_NAV_GROUPS.map((group) => [
       group.id, ...SETTINGS_CORE_SECTIONS.filter((s) => s.group === group.id).map((s) => s.id),
     ]);
     assert.deepEqual(grouped, [
-      ["preferences", "general", "appearance", "git_worktrees", "shortcuts", "notifications", "voice"],
-      ["fleet_sync", "cloud_sync", "hosts"],
-      ["agents_safety", "agents", "personal_router", "safety", "usage"],
-      ["context_extensions", "instructions_memory", "mcp_tools", "skills_plugins", "im_channels", "data_diagnostics"],
+      ["preferences", "general", "appearance", "workspace", "shortcuts", "notifications", "voice"],
+      ["fleet_sync", "hosts", "cloud_sync"],
+      ["agents_safety", "agents", "permissions", "usage"],
+      ["context_extensions", "context", "mcp", "hooks", "extensions", "channels"],
     ]);
     for (const { id } of SETTINGS_CORE_SECTIONS) {
       const resolved = resolveSettingsSectionTarget(id, hostId);
@@ -40,20 +40,24 @@ describe("Settings navigation", () => {
   it("opens every legacy target at its page and, where applicable, its original resource", () => {
     const cases: [SettingsSectionTarget, SettingsCoreSectionId, SettingsSubTabId | null][] = [
       ["general", "general", null], ["appearance", "appearance", null],
-      ["git_worktrees", "git_worktrees", null],
+      ["workspace", "workspace", null], ["git_worktrees", "workspace", null],
       ["shortcuts", "shortcuts", null], ["notifications", "notifications", null],
-      ["cloud_sync", "cloud_sync", null], ["archived", "data_diagnostics", "archived"],
-      ["personal_router", "personal_router", null], ["router", "personal_router", null],
+      ["cloud_sync", "cloud_sync", null],
       ["hosts", "hosts", null], ["connection", "hosts", "connection"], ["add_host", "hosts", "add_host"],
-      ["im_channels", "im_channels", "im_channels"], ["channels", "im_channels", "im_channels"],
+      ["archived", "hosts", "archived"], ["data_diagnostics", "hosts", "data_diagnostics"],
       ["agents", "agents", "agents"], ["providers", "agents", "agents"], ["models_agents", "agents", "agents"],
-      ["acp", "agents", "acp"], ["safety", "safety", "safety"], ["guardian", "safety", "guardian"], ["usage", "usage", "usage"],
-      ["instructions", "instructions_memory", "instructions"], ["instructions_rules", "instructions_memory", "instructions"],
-      ["extensions", "instructions_memory", "instructions"], ["context", "instructions_memory", "instructions"],
-      ["rules", "instructions_memory", "rules"], ["memory", "instructions_memory", "memory"],
-      ["capabilities", "skills_plugins", "skills"], ["skills", "skills_plugins", "skills"],
-      ["plugins", "skills_plugins", "plugins"], ["voice", "voice", "voice"],
-      ["mcp", "mcp_tools", "mcp"], ["hooks", "mcp_tools", "hooks"], ["lsp", "mcp_tools", "lsp"],
+      ["acp", "agents", "acp"], ["personal_router", "agents", "router"], ["router", "agents", "router"],
+      ["permissions", "permissions", "permissions"], ["safety", "permissions", "permissions"],
+      ["guardian", "permissions", "guardian"], ["usage", "usage", "usage"],
+      ["context", "context", "instructions"], ["instructions", "context", "instructions"],
+      ["instructions_rules", "context", "instructions"], ["instructions_memory", "context", "instructions"],
+      ["rules", "context", "rules"], ["memory", "context", "memory"],
+      ["mcp", "mcp", "mcp"], ["mcp_tools", "mcp", "mcp"], ["hooks", "hooks", "hooks"],
+      ["lsp", "workspace", "lsp"],
+      ["extensions", "extensions", "skills"], ["skills_plugins", "extensions", "skills"],
+      ["capabilities", "extensions", "skills"], ["skills", "extensions", "skills"],
+      ["plugins", "extensions", "plugins"], ["voice", "voice", "voice"],
+      ["channels", "channels", "channels"], ["im_channels", "channels", "im_channels"],
       ["notifications_sync", "notifications", null], ["sync_data", "cloud_sync", null],
     ];
     for (const [target, page, leaf] of cases) {
@@ -68,8 +72,9 @@ describe("Settings navigation", () => {
 
   it("keeps explicitly linked hosts, even when the default host differs", () => {
     for (const tab of [
-      "connection", "agents", "guardian", "im_channels", "skills", "plugins", "voice", "acp",
-      "mcp", "rules", "memory", "hooks", "lsp", "usage", "instructions", "data_diagnostics", "archived",
+      "connection", "agents", "router", "permissions", "safety", "guardian", "channels", "im_channels",
+      "skills", "plugins", "voice", "acp", "mcp", "rules", "memory", "hooks", "lsp", "usage",
+      "instructions", "data_diagnostics", "archived",
     ] as const) {
       const link = `host:${hostId}:${tab}` as const;
       assert.deepEqual(parseHostSettingsSection(link), { hostId, tab });
@@ -79,7 +84,6 @@ describe("Settings navigation", () => {
       assert.equal(loc.subTab, tab);
       assert.equal(loc.coreSection, resolveActiveSettingsLocation(resolveSettingsSectionTarget(tab, null)).coreSection);
     }
-    assert.equal(resolveSettingsSectionTarget(`host:${hostId}:router`, "local"), "personal_router");
   });
 
   it("preserves the supplied fallback for malformed, missing, or unknown deep links", () => {
@@ -125,7 +129,7 @@ describe("Settings search", () => {
       }
     }
     assert.equal(searchSettingsEntries("Appearance", { t })[0]?.id, "appearance");
-    assert.equal(searchSettingsEntries("分支前缀", { t })[0]?.target, "git_worktrees");
+    assert.equal(searchSettingsEntries("分支前缀", { t })[0]?.target, "workspace");
     assert.equal(searchSettingsEntries("collapse exploration", { t })[0]?.target, "appearance");
     assert.equal(searchSettingsEntries("项目记忆", { t }).some((hit) => hit.settingId === "memory.title"), true);
     assert.equal(searchSettingsEntries("mobile push", { t }).length, 0);
@@ -141,7 +145,9 @@ describe("Settings search", () => {
   it("keeps hostless searches relevant while retaining client defaults", () => {
     assert.deepEqual(searchSettingsEntries("lsp", { t, hasHost: false }), []);
     assert.equal(searchSettingsEntries("connect remote host", { t, hasHost: false })[0]?.target, "hosts");
-    assert.equal(searchSettingsEntries("hermes", { t, hasHost: false })[0]?.target, "personal_router");
-    assert.equal(searchSettingsEntries("default provider", { t, hasHost: false })[0]?.id, "im.defaultProvider");
+    assert.equal(searchSettingsEntries("hermes", { t, hasHost: false })[0]?.target, "router");
+    for (const hasHost of [true, false]) {
+      assert.ok(searchSettingsEntries("default provider", { t, hasHost }).every((hit) => hit.id !== "im.defaultProvider"));
+    }
   });
 });

@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import {
   AlarmClock,
   AlertTriangle,
@@ -189,6 +189,12 @@ const SidebarWorkspaceGroup = memo(function SidebarWorkspaceGroup({
   );
   const wsHasTimer = ws.visiblePeers.some((c) => isAgentTimerWaiting(c.agent));
   const isDropHover = dragOverDropId === `ws:${ws.workspace_id}`;
+  const setWorkspaceHeaderRef = useCallback(
+    (el: HTMLDivElement | null) => {
+      onRegisterWorkspaceHeader(ws.workspace_id, { hostId: proj.host_id, projectId: proj.id }, el);
+    },
+    [onRegisterWorkspaceHeader, ws.workspace_id, proj.host_id, proj.id],
+  );
 
   return (
     <div
@@ -198,9 +204,7 @@ const SidebarWorkspaceGroup = memo(function SidebarWorkspaceGroup({
       )}
     >
       <div
-        ref={(el) =>
-          onRegisterWorkspaceHeader(ws.workspace_id, { hostId: proj.host_id, projectId: proj.id }, el)
-        }
+        ref={setWorkspaceHeaderRef}
         onContextMenu={(e) => {
           if (isRenamingThisWs) return;
           e.preventDefault();
@@ -758,9 +762,23 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
     );
   };
 
+  const setProjectRowRef = useCallback(
+    (el: HTMLDivElement | null) => {
+      onRegisterProjectRow(proj.id, el);
+    },
+    [onRegisterProjectRow, proj.id],
+  );
+
+  const setInboxAreaRef = useCallback(
+    (el: HTMLDivElement | null) => {
+      onRegisterInboxArea(proj.id, { hostId: proj.host_id, scopeKey: projThreadScopeKey }, el);
+    },
+    [onRegisterInboxArea, proj.id, proj.host_id, projThreadScopeKey],
+  );
+
   return (
     <div
-      ref={(el) => onRegisterProjectRow(proj.id, el)}
+      ref={setProjectRowRef}
       className={cn(
         "relative space-y-0.5 transition-opacity duration-150",
         isDraggingThis && "opacity-45",
@@ -1065,13 +1083,7 @@ export const SidebarProjectSection = memo(function SidebarProjectSection({
               {/* 2. Flat Project Threads (or transient ungroup drop zone when dragging from a group) */}
               {(totalUnclassified > 0 || showEmptyInboxDropZone) && (
                 <div
-                  ref={(el) =>
-                    onRegisterInboxArea(
-                      proj.id,
-                      { hostId: proj.host_id, scopeKey: projThreadScopeKey },
-                      el,
-                    )
-                  }
+                  ref={setInboxAreaRef}
                   className={cn(
                     "space-y-0.5 rounded-[8px] transition-colors",
                     curatedWorkspaces.length > 0 && "pt-0.5",

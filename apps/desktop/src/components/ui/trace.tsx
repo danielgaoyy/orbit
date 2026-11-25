@@ -108,7 +108,7 @@ function TraceCollapsibleTrigger({
       {...props}
     >
       {children}
-      <TraceIcon className="motion-safe:transition-transform motion-safe:duration-[150ms] motion-safe:ease-[var(--ease-panel)] group-aria-expanded/trace-collapsible-trigger:rotate-90">
+      <TraceIcon className="motion-safe:transition-transform motion-safe:duration-[180ms] motion-safe:ease-[var(--ease-panel)] group-aria-expanded/trace-collapsible-trigger:rotate-90">
         <ChevronRightIcon />
       </TraceIcon>
     </CollapsibleTrigger>
@@ -121,20 +121,21 @@ function TraceCollapsibleContent({
   ...props
 }: React.ComponentProps<typeof CollapsibleContent>) {
   return (
-    // Stage measures its viewport anchor on the next frame, after the full layout change.
     <CollapsibleContent
       data-slot="trace-collapsible-content"
-      className="h-auto min-w-0 duration-0 data-[starting-style]:h-auto data-[starting-style]:opacity-100"
+      className="group/trace-panel min-w-0 duration-[200ms] ease-[var(--ease-panel)] data-[ending-style]:duration-[150ms] data-[ending-style]:ease-[var(--ease-exit)]"
       {...props}
     >
-      <div
-        data-slot="trace-collapsible-content-inner"
-        className={cn(
-          "mt-2 mb-1 ml-[calc(--spacing(2)-1px)] min-w-0 border-l pr-1 pl-4 text-[13px] leading-[1.5] wrap-break-word text-muted-foreground transition-[opacity,transform] duration-[130ms] ease-[var(--ease-out-quart)] starting:opacity-0 starting:-translate-y-[3px] motion-reduce:transition-none",
-          className,
-        )}
-      >
-        {children}
+      <div className="min-w-0 pt-2 pb-1">
+        <div
+          data-slot="trace-collapsible-content-inner"
+          className={cn(
+            "ml-[calc(--spacing(2)-1px)] min-w-0 border-l pr-1 pl-4 text-[13px] leading-[1.5] wrap-break-word text-muted-foreground transition-transform duration-[200ms] ease-[var(--ease-panel)] group-data-[starting-style]/trace-panel:-translate-y-[4px] group-data-[ending-style]/trace-panel:-translate-y-[3px] group-data-[ending-style]/trace-panel:duration-[150ms] group-data-[ending-style]/trace-panel:ease-[var(--ease-exit)] motion-reduce:transition-none",
+            className,
+          )}
+        >
+          {children}
+        </div>
       </div>
     </CollapsibleContent>
   );

@@ -114,7 +114,7 @@ export const SettingPageHeader = memo(function SettingPageHeader({
           {badge}
         </div>
         {description && (
-          <p className="text-ink-secondary mt-1.5 text-[13px] leading-relaxed">{description}</p>
+          <p className="text-ink-secondary mt-1 text-[13px] leading-relaxed">{description}</p>
         )}
       </div>
       {action && <div className="flex shrink-0 items-center gap-2">{action}</div>}
@@ -154,7 +154,7 @@ export const SettingGroup = memo(function SettingGroup({
   children: ReactNode;
 }) {
   return (
-    <section data-setting-id={settingId} className="space-y-2">
+    <section data-setting-id={settingId} className="space-y-3">
       <SettingGroupLabel action={action}>{title}</SettingGroupLabel>
       {children}
     </section>
@@ -198,12 +198,12 @@ export const SettingRow = memo(function SettingRow({
     <div
       data-setting-id={settingId}
       data-disabled={disabled ? "" : undefined}
-      className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-3.5"
+      className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-3"
     >
       <div className={cn("min-w-[140px] flex-1 transition-opacity", disabled && "opacity-55")}>
         <div className="text-ink-primary text-[13px] font-medium">{title}</div>
         {description && (
-          <div className="text-ink-secondary mt-0.5 text-[13px] leading-[1.45]">{description}</div>
+          <div className="text-ink-secondary mt-1 text-[13px] leading-[1.45]">{description}</div>
         )}
       </div>
       <div className="max-w-full shrink-0">{children}</div>
@@ -240,7 +240,7 @@ export const SettingDisclosureCard = memo(function SettingDisclosureCard({
       className="border-border-subtle bg-surface-raised overflow-hidden rounded-[12px] border"
     >
       <CollapsibleTrigger className="group/disclosure hover:bg-surface-recessed/55 focus-visible:bg-surface-recessed/55 focus-visible:ring-ring/40 flex w-full cursor-pointer items-center justify-between gap-3 px-4 py-3 text-left transition-colors outline-none focus-visible:ring-1 focus-visible:ring-inset">
-        <span className="flex min-w-0 flex-1 items-center gap-2.5">
+        <span className="flex min-w-0 flex-1 items-center gap-2">
           <ChevronRight
             aria-hidden
             className="text-ink-muted size-[14px] shrink-0 transition-transform duration-150 group-data-[panel-open]/disclosure:rotate-90 motion-reduce:transition-none"
@@ -248,7 +248,7 @@ export const SettingDisclosureCard = memo(function SettingDisclosureCard({
           <span className="min-w-0 flex-1">
             <span className="text-ink-primary block truncate text-[13px] font-medium">{title}</span>
             {description && (
-              <span className="text-ink-secondary mt-0.5 block truncate text-[11px]">{description}</span>
+              <span className="text-ink-secondary mt-1 block truncate text-[11px]">{description}</span>
             )}
           </span>
         </span>
@@ -290,7 +290,7 @@ export const SettingResourceRow = memo(function SettingResourceRow({
       <span className="min-w-0 flex-1">
         <span className="text-ink-primary block break-words text-[13px] font-medium">{title}</span>
         {description && (
-          <span className="text-ink-muted mt-0.5 block break-words text-[11px]">{description}</span>
+          <span className="text-ink-muted mt-1 block break-words text-[11px]">{description}</span>
         )}
       </span>
       {status && (
@@ -299,7 +299,7 @@ export const SettingResourceRow = memo(function SettingResourceRow({
       {onClick && <ChevronRight className="text-ink-faint size-[14px] shrink-0" />}
     </>
   );
-  const layout = "flex min-h-[44px] min-w-0 flex-1 items-center gap-3 px-4 py-2.5 text-left";
+  const layout = "flex min-h-[44px] min-w-0 flex-1 items-center gap-3 px-4 py-2 text-left";
   return (
     <div data-setting-id={settingId} className="flex min-w-0 items-center">
       {onClick ? (
@@ -375,7 +375,7 @@ export function SettingDrawer({
             <div className="min-w-0 flex-1">
               <Dialog.Title className="text-[17px] font-semibold">{title}</Dialog.Title>
               {description && (
-                <Dialog.Description className="text-ink-secondary mt-1.5 text-[13px]">
+                <Dialog.Description className="text-ink-secondary mt-1 text-[13px]">
                   {description}
                 </Dialog.Description>
               )}

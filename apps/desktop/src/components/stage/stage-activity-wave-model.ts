@@ -91,18 +91,22 @@ function formatConciseTaskHint(task: StageActivityBackgroundTaskSummary | undefi
  * Summarizes live background dependencies affecting a conversation viewport into a single
  * calm status line aligned with `StageOverviewPanel`.
  *
- * Returns `null` when idle (zero chrome) and suppresses armed timers / standalone active goals
- * while the foreground turn is actively streaming so we never duplicate its `Thinking…` line.
+ * Returns `null` when idle (zero chrome). While the foreground turn is actively streaming,
+ * suppresses non-blocking background items (running subagents, background tasks, timers,
+ * standalone goals) so the stream never stacks a second animated status row beneath the live
+ * step disclosure; blocking `awaiting_permission` subagents always surface immediately.
  */
 export function summarizeStageLiveActivity(
   input: StageLiveActivityInput,
   locale: OrbitLocale = "en",
 ): StageLiveActivitySummary | null {
-  const runningSubagents = Math.max(0, Math.floor(input.runningSubagentsCount));
-  const awaitingSubagents = Math.max(0, Math.floor(input.awaitingSubagentsCount));
-  const bgTasks = input.runningBackgroundTasks;
-  const bgCount = bgTasks.length;
   const isForegroundRunning = Boolean(input.isForegroundRunning);
+  const awaitingSubagents = Math.max(0, Math.floor(input.awaitingSubagentsCount));
+  const runningSubagents = isForegroundRunning
+    ? 0
+    : Math.max(0, Math.floor(input.runningSubagentsCount));
+  const bgTasks = isForegroundRunning ? [] : input.runningBackgroundTasks;
+  const bgCount = bgTasks.length;
   const armedTimers = isForegroundRunning ? 0 : Math.max(0, Math.floor(input.armedTimersCount));
   const showGoal =
     !isForegroundRunning &&

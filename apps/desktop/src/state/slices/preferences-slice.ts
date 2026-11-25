@@ -45,6 +45,7 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
 
   let cloudDeviceFlowPollToken = 0;
   let cloudDeviceFlowAbort: AbortController | null = null;
+  const voiceConfigReqSeqByHost = new Map<string, number>();
 
   function abortActiveDeviceFlow(): void {
     cloudDeviceFlowPollToken += 1;
@@ -331,6 +332,48 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
           ? deviceId.trim()
           : null;
       setState((s) => ({ ...s, voiceInputDeviceId: normalized }), true);
+    },
+
+
+    setHostVoiceEnabled(hostId: string, enabled: boolean): void {
+      if (!hostId) return;
+      voiceConfigReqSeqByHost.set(hostId, (voiceConfigReqSeqByHost.get(hostId) ?? 0) + 1);
+      const normalized = Boolean(enabled);
+      setState((s) => {
+        if (s.voiceEnabledByHost[hostId] === normalized) return s;
+        return {
+          ...s,
+          voiceEnabledByHost: {
+            ...s.voiceEnabledByHost,
+            [hostId]: normalized,
+          },
+        };
+      });
+    },
+
+
+    async refreshHostVoiceEnabled(hostId: string): Promise<boolean | null> {
+      if (!hostId) return null;
+      const seq = (voiceConfigReqSeqByHost.get(hostId) ?? 0) + 1;
+      voiceConfigReqSeqByHost.set(hostId, seq);
+      try {
+        const next = await orbitIpc.getVoiceConfig(hostId);
+        if (voiceConfigReqSeqByHost.get(hostId) !== seq) return null;
+        const enabled = Boolean(next.config.enabled);
+        setState((s) => {
+          if (s.voiceEnabledByHost[hostId] === enabled) return s;
+          return {
+            ...s,
+            voiceEnabledByHost: {
+              ...s.voiceEnabledByHost,
+              [hostId]: enabled,
+            },
+          };
+        });
+        return enabled;
+      } catch {
+        return null;
+      }
     },
 
 
@@ -652,6 +695,33 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
           cloudSyncError: String(err),
         }));
         return false;
+      }
+    },
+
+    async enableCloudSyncManualPassphrase(
+      passphrase: string,
+    ): Promise<{ ok: boolean; error?: string }> {
+      setState((s) => ({ ...s, cloudSyncBusy: true, cloudSyncError: null }));
+      try {
+        const status = await orbitIpc.cloudSyncEnableManualPassphrase(passphrase);
+        setState((s) => ({
+          ...s,
+          cloudSyncBusy: false,
+          cloudSyncStatus: status,
+          cloudSyncError: null,
+        }));
+        notifyToast("Manual passphrase mode enabled for new devices");
+        return { ok: true };
+      } catch (err) {
+        const error = String(err);
+        const status = await orbitIpc.getCloudSyncStatus().catch(() => getState().cloudSyncStatus);
+        setState((s) => ({
+          ...s,
+          cloudSyncBusy: false,
+          cloudSyncStatus: status,
+          cloudSyncError: error,
+        }));
+        return { ok: false, error };
       }
     },
 

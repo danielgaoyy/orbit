@@ -353,21 +353,23 @@ export const BrowserTab = memo(function BrowserTab({
 
   useEffect(() => {
     const el = stageRef.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    let rafId = 0;
+    if (!el) return;
+    let lastW = 0;
+    let rafId: number | null = null;
     const ro = new ResizeObserver((entries) => {
-      const w = entries[0]?.contentRect.width ?? 0;
-      if (w <= 0 || rafId) return;
+      const nextW = Math.round(entries[0]?.contentRect.width ?? 0);
+      if (nextW <= 0 || nextW === lastW) return;
+      lastW = nextW;
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
       rafId = window.requestAnimationFrame(() => {
-        rafId = 0;
-        const measured = el.getBoundingClientRect().width || w;
-        if (measured > 0) setStageWidth(measured);
+        rafId = null;
+        setStageWidth(nextW);
       });
     });
     ro.observe(el);
     return () => {
-      if (rafId) window.cancelAnimationFrame(rafId);
       ro.disconnect();
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
     };
   }, []);
 

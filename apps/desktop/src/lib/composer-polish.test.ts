@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, it } from "node:test";
-import { canSkipCappedMeasurement, detectActiveTriggerKind } from "./composer-input.ts";
+import {
+  canSkipCappedMeasurement,
+  detectActiveTriggerKind,
+  resolveComposerActionMode,
+} from "./composer-input.ts";
 import { MESSAGES, translate } from "./i18n/index.ts";
 import {
   defaultEffortDescription,
@@ -334,5 +338,39 @@ describe("capped textarea measurement", () => {
     assert.equal(canSkipCappedMeasurement(capped, "long draft", 641, 42, "agent-a"), false);
     assert.equal(canSkipCappedMeasurement(capped, "long draft", 640, 0, "agent-a"), false);
     assert.equal(canSkipCappedMeasurement(capped, "long draft", 640, 42, "agent-b"), false);
+  });
+});
+
+describe("composer right-bottom action mode", () => {
+  it("shows disabled send icon instead of voice mic when voice is disabled and input is empty", () => {
+    const base = {
+      voiceRecording: false,
+      showStopButton: false,
+      submitBusy: false,
+      voiceTranscribing: false,
+      hasPayload: false,
+    };
+    assert.equal(resolveComposerActionMode({ ...base, voiceEnabled: false }), "send_disabled");
+    assert.equal(resolveComposerActionMode({ ...base, voiceEnabled: true }), "voice_idle");
+  });
+
+  it("prioritizes voice recording, stop, submitting, and send states over idle modes", () => {
+    const base = {
+      voiceRecording: false,
+      showStopButton: false,
+      submitBusy: false,
+      voiceTranscribing: false,
+      hasPayload: false,
+      voiceEnabled: false,
+    };
+    assert.equal(resolveComposerActionMode({ ...base, hasPayload: true }), "send");
+    assert.equal(resolveComposerActionMode({ ...base, hasPayload: true, voiceEnabled: true }), "send");
+    assert.equal(resolveComposerActionMode({ ...base, submitBusy: true, hasPayload: true }), "submitting");
+    assert.equal(resolveComposerActionMode({ ...base, voiceTranscribing: true, voiceEnabled: true }), "submitting");
+    assert.equal(resolveComposerActionMode({ ...base, showStopButton: true, voiceEnabled: true }), "stop");
+    assert.equal(
+      resolveComposerActionMode({ ...base, voiceRecording: true, showStopButton: true, voiceEnabled: true }),
+      "voice_recording",
+    );
   });
 });

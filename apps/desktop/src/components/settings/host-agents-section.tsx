@@ -1,6 +1,7 @@
 import { memo, useMemo, useRef, useState } from "react";
 import { Plus, RefreshCw, Trash2 } from "lucide-react";
 import { HostAcpSection } from "./host-acp-section";
+import { HostPersonalRouterSection } from "./host-personal-router-section";
 import {
   SettingCard,
   SettingDrawer,
@@ -19,7 +20,6 @@ import { Textarea } from "@/components/ui/textarea";
 import { ProviderIcon } from "@/components/ui/provider-icons";
 import { useI18n } from "@/lib/i18n";
 import {
-  ACP_PROVIDER_META,
   PROVIDER_LIST,
   orbitIpc,
   type AgentProfile,
@@ -218,30 +218,6 @@ function ProfileEditor({
   );
 }
 
-function DefaultProviderRow({ available }: { available?: readonly ProviderKind[] }) {
-  const { t } = useI18n();
-  const provider = useOrbitSelector((s) => s.draftProvider);
-  const acpAgentId = useOrbitSelector((s) => s.draftAcpAgentId);
-  const options = PROVIDER_LIST.map((item) => ({
-    value: item.id,
-    label: item.label,
-    disabled: available !== undefined && !available.includes(item.id),
-  }));
-  if (provider === "acp") {
-    options.push({value: provider, label: acpAgentId ?? ACP_PROVIDER_META.label, disabled: true});
-  }
-  return (
-    <SettingRow settingId="im.defaultProvider" title={t("im.defaultProvider")}>
-      <SettingSelect
-        value={provider}
-        options={options}
-        ariaLabel={t("im.defaultProvider")}
-        onChange={(provider) => orbitActions.setDraftConfig({ provider })}
-      />
-    </SettingRow>
-  );
-}
-
 export function HostAgentsSection({ hostId }: { hostId: string | null }) {
   const { t } = useI18n();
   return (
@@ -253,20 +229,16 @@ export function HostAgentsSection({ hostId }: { hostId: string | null }) {
       {hostId ? (
         <HostAgentControls key={hostId} hostId={hostId} />
       ) : (
-        <>
-          <SettingCard>
-            <DefaultProviderRow />
-          </SettingCard>
-          <Button
-            className="self-start"
-            size="sm"
-            variant="outline"
-            onClick={() => orbitActions.openSettings("add_host")}
-          >
-            {t("settings.connectHost")}
-          </Button>
-        </>
+        <Button
+          className="self-start"
+          size="sm"
+          variant="outline"
+          onClick={() => orbitActions.openSettings("add_host")}
+        >
+          {t("settings.connectHost")}
+        </Button>
       )}
+      <HostPersonalRouterSection />
     </div>
   );
 }
@@ -370,7 +342,6 @@ const HostAgentControls = memo(function HostAgentControls({ hostId }: { hostId: 
               {t(showAll ? "common.hide" : "settings.agentShowAll")}
             </Button>
           )}
-          <DefaultProviderRow available={available} />
         </SettingCard>
       </SettingGroup>
       <SettingGroup title={t("settings.subTabProvidersRuntime")}>

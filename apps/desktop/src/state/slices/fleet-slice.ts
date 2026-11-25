@@ -64,6 +64,226 @@ import {
   threadScopeKey,
   withBootstrapTimeout,
 } from "../store-helpers";
+
+function deepEqualJson(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") {
+    return false;
+  }
+  const aIsArray = Array.isArray(a);
+  if (aIsArray !== Array.isArray(b)) return false;
+  if (aIsArray) {
+    const arrA = a as unknown[];
+    const arrB = b as unknown[];
+    if (arrA.length !== arrB.length) return false;
+    for (let i = 0; i < arrA.length; i += 1) {
+      if (!deepEqualJson(arrA[i], arrB[i])) return false;
+    }
+    return true;
+  }
+  const recA = a as Record<string, unknown>;
+  const recB = b as Record<string, unknown>;
+  const keysA = Object.keys(recA);
+  const keysB = Object.keys(recB);
+  if (keysA.length !== keysB.length) return false;
+  for (let i = 0; i < keysA.length; i += 1) {
+    const k = keysA[i];
+    if (!Object.prototype.hasOwnProperty.call(recB, k)) return false;
+    if (!deepEqualJson(recA[k], recB[k])) return false;
+  }
+  return true;
+}
+
+function stabilizeRecord<T>(
+  prev: Record<string, T> | undefined,
+  next: Record<string, T> | undefined,
+): Record<string, T> | undefined {
+  if (prev === next) return prev;
+  if (!prev || !next) return next;
+  const nextKeys = Object.keys(next);
+  const prevKeys = Object.keys(prev);
+  let allSame = nextKeys.length === prevKeys.length;
+  let reusedAny = false;
+  const merged: Record<string, T> = {};
+  for (let i = 0; i < nextKeys.length; i += 1) {
+    const k = nextKeys[i];
+    if (Object.prototype.hasOwnProperty.call(prev, k) && deepEqualJson(prev[k], next[k])) {
+      merged[k] = prev[k];
+      reusedAny = true;
+    } else {
+      merged[k] = next[k];
+      allSame = false;
+    }
+  }
+  if (allSame) return prev;
+  return reusedAny ? merged : next;
+}
+
+/**
+ * Structural-sharing stabilizer for JSON-deserialized `HostDetailView` snapshots.
+ * Reuses `prev.<field>` references whenever a sub-field is structurally identical across
+ * `host_changed` heartbeats so targeted selectors (`provider_catalogs`, `managed_skills`,
+ * `profiles`, `acp_agents`, `artifacts`, `workspace_scripts`, `terminals`, `host.available_providers`,
+ * etc.) preserve referential equality and avoid unnecessary React re-renders.
+ */
+export function stabilizeHostDetail(
+  prev: HostDetailView | undefined,
+  next: HostDetailView,
+): HostDetailView {
+  if (!prev || prev === next) return next;
+
+  const host = deepEqualJson(prev.host, next.host)
+    ? prev.host
+    : deepEqualJson(prev.host.available_providers, next.host.available_providers)
+      ? { ...next.host, available_providers: prev.host.available_providers }
+      : next.host;
+
+  const discovered_projects = deepEqualJson(prev.discovered_projects, next.discovered_projects)
+    ? prev.discovered_projects
+    : next.discovered_projects;
+  const directory_listing = deepEqualJson(prev.directory_listing, next.directory_listing)
+    ? prev.directory_listing
+    : next.directory_listing;
+  const models_by_provider = deepEqualJson(prev.models_by_provider, next.models_by_provider)
+    ? prev.models_by_provider
+    : next.models_by_provider;
+  const workspaces = deepEqualJson(prev.workspaces, next.workspaces)
+    ? prev.workspaces
+    : next.workspaces;
+  const agents = deepEqualJson(prev.agents, next.agents) ? prev.agents : next.agents;
+  const replaced_optimistic_agents = deepEqualJson(
+    prev.replaced_optimistic_agents,
+    next.replaced_optimistic_agents,
+  )
+    ? prev.replaced_optimistic_agents
+    : next.replaced_optimistic_agents;
+  const quotas = deepEqualJson(prev.quotas, next.quotas) ? prev.quotas : next.quotas;
+  const provider_catalogs = deepEqualJson(prev.provider_catalogs, next.provider_catalogs)
+    ? prev.provider_catalogs
+    : next.provider_catalogs;
+  const terminals = deepEqualJson(prev.terminals, next.terminals) ? prev.terminals : next.terminals;
+  const profiles = deepEqualJson(prev.profiles, next.profiles) ? prev.profiles : next.profiles;
+  const schedules = deepEqualJson(prev.schedules, next.schedules) ? prev.schedules : next.schedules;
+  const conditional_timers = deepEqualJson(prev.conditional_timers, next.conditional_timers)
+    ? prev.conditional_timers
+    : next.conditional_timers;
+  const connected_hosts = deepEqualJson(prev.connected_hosts, next.connected_hosts)
+    ? prev.connected_hosts
+    : next.connected_hosts;
+  const orchestration_config = deepEqualJson(prev.orchestration_config, next.orchestration_config)
+    ? prev.orchestration_config
+    : next.orchestration_config;
+  const orchestration_skills = deepEqualJson(prev.orchestration_skills, next.orchestration_skills)
+    ? prev.orchestration_skills
+    : next.orchestration_skills;
+  const managed_skills = deepEqualJson(prev.managed_skills, next.managed_skills)
+    ? prev.managed_skills
+    : next.managed_skills;
+  const keep_awake_status = deepEqualJson(prev.keep_awake_status, next.keep_awake_status)
+    ? prev.keep_awake_status
+    : next.keep_awake_status;
+  const workspace_scripts = stabilizeRecord(prev.workspace_scripts, next.workspace_scripts);
+  const pending_permissions = deepEqualJson(prev.pending_permissions, next.pending_permissions)
+    ? prev.pending_permissions
+    : next.pending_permissions;
+  const provider_subagents = stabilizeRecord(prev.provider_subagents, next.provider_subagents);
+  const git_repos_by_cwd = stabilizeRecord(prev.git_repos_by_cwd, next.git_repos_by_cwd);
+  const workspace_boards = stabilizeRecord(prev.workspace_boards, next.workspace_boards);
+  const workspace_events = stabilizeRecord(prev.workspace_events, next.workspace_events);
+  const workspace_organize_status = stabilizeRecord(
+    prev.workspace_organize_status,
+    next.workspace_organize_status,
+  );
+  const host_sync_state = deepEqualJson(prev.host_sync_state, next.host_sync_state)
+    ? prev.host_sync_state
+    : next.host_sync_state;
+  const acp_agents = deepEqualJson(prev.acp_agents, next.acp_agents)
+    ? prev.acp_agents
+    : next.acp_agents;
+  const artifacts = deepEqualJson(prev.artifacts, next.artifacts) ? prev.artifacts : next.artifacts;
+  const goal_runs = deepEqualJson(prev.goal_runs, next.goal_runs) ? prev.goal_runs : next.goal_runs;
+  const monitor_watches = deepEqualJson(prev.monitor_watches, next.monitor_watches)
+    ? prev.monitor_watches
+    : next.monitor_watches;
+  const workflow_runs = deepEqualJson(prev.workflow_runs, next.workflow_runs)
+    ? prev.workflow_runs
+    : next.workflow_runs;
+
+  if (
+    prev.revision === next.revision &&
+    prev.last_created_agent_id === next.last_created_agent_id &&
+    prev.active_terminal_id === next.active_terminal_id &&
+    prev.active_terminal_slot === next.active_terminal_slot &&
+    host === prev.host &&
+    discovered_projects === prev.discovered_projects &&
+    directory_listing === prev.directory_listing &&
+    models_by_provider === prev.models_by_provider &&
+    workspaces === prev.workspaces &&
+    agents === prev.agents &&
+    replaced_optimistic_agents === prev.replaced_optimistic_agents &&
+    quotas === prev.quotas &&
+    provider_catalogs === prev.provider_catalogs &&
+    terminals === prev.terminals &&
+    profiles === prev.profiles &&
+    schedules === prev.schedules &&
+    conditional_timers === prev.conditional_timers &&
+    connected_hosts === prev.connected_hosts &&
+    orchestration_config === prev.orchestration_config &&
+    orchestration_skills === prev.orchestration_skills &&
+    managed_skills === prev.managed_skills &&
+    keep_awake_status === prev.keep_awake_status &&
+    workspace_scripts === prev.workspace_scripts &&
+    pending_permissions === prev.pending_permissions &&
+    provider_subagents === prev.provider_subagents &&
+    git_repos_by_cwd === prev.git_repos_by_cwd &&
+    workspace_boards === prev.workspace_boards &&
+    workspace_events === prev.workspace_events &&
+    workspace_organize_status === prev.workspace_organize_status &&
+    host_sync_state === prev.host_sync_state &&
+    acp_agents === prev.acp_agents &&
+    artifacts === prev.artifacts &&
+    goal_runs === prev.goal_runs &&
+    monitor_watches === prev.monitor_watches &&
+    workflow_runs === prev.workflow_runs
+  ) {
+    return prev;
+  }
+
+  return {
+    ...next,
+    host,
+    discovered_projects,
+    directory_listing,
+    models_by_provider,
+    workspaces,
+    agents,
+    replaced_optimistic_agents,
+    quotas,
+    provider_catalogs,
+    terminals,
+    profiles,
+    schedules,
+    conditional_timers,
+    connected_hosts,
+    orchestration_config,
+    orchestration_skills,
+    managed_skills,
+    keep_awake_status,
+    workspace_scripts,
+    pending_permissions,
+    provider_subagents,
+    git_repos_by_cwd,
+    workspace_boards,
+    workspace_events,
+    workspace_organize_status,
+    host_sync_state,
+    acp_agents,
+    artifacts,
+    goal_runs,
+    monitor_watches,
+    workflow_runs,
+  };
+}
 import type { OrbitStoreContext } from "../store-runtime";
 import type {
   ComposerFocusOptions,
@@ -365,10 +585,10 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
         }),
       );
 
-      const nextDetails: Record<string, HostDetailView> = {};
+      const rawDetails: Record<string, HostDetailView> = {};
       for (const [hid, d] of detailEntries) {
         if (d) {
-          nextDetails[hid] = d;
+          rawDetails[hid] = d;
           // Fleet reload already fetched fresh host detail for `hid`; cancel redundant
           // same-frame per-host sync scheduled by a paired `HostChanged` notification.
           const hGate = hostSyncGates.get(hid);
@@ -382,13 +602,39 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
         }
       }
 
+      const prevSnap = getState();
+      const previewTargetHostId = prevSnap.selectedHostId ?? snap.hosts[0]?.host_id ?? null;
+      const previewActiveHostId =
+        previewTargetHostId && snap.hosts.some((h) => h.host_id === previewTargetHostId)
+          ? previewTargetHostId
+          : (snap.hosts[0]?.host_id ?? null);
+      const previewNextDraftProvider = resolveAvailableDraftProvider(
+        previewActiveHostId ? rawDetails[previewActiveHostId] : undefined,
+        prevSnap.draftProvider,
+      );
+      const shouldPersistPrefs = previewNextDraftProvider !== prevSnap.draftProvider;
+
       setState((s) => {
+        const nextDetails: Record<string, HostDetailView> = {};
+        const prevDetailKeys = Object.keys(s.hostDetails);
+        const rawDetailKeys = Object.keys(rawDetails);
+        let allDetailsSame = prevDetailKeys.length === rawDetailKeys.length;
+        for (const hid of rawDetailKeys) {
+          const prevDetail = s.hostDetails[hid];
+          const stabilized = stabilizeHostDetail(prevDetail, rawDetails[hid]);
+          nextDetails[hid] = stabilized;
+          if (stabilized !== prevDetail) {
+            allDetailsSame = false;
+          }
+        }
+        const resolvedDetails = allDetailsSame ? s.hostDetails : nextDetails;
+
         const targetHostId = s.selectedHostId ?? snap.hosts[0]?.host_id ?? null;
         const activeHostId =
           targetHostId && snap.hosts.some((h) => h.host_id === targetHostId)
             ? targetHostId
             : (snap.hosts[0]?.host_id ?? null);
-        const activeDetail = activeHostId ? nextDetails[activeHostId] : undefined;
+        const activeDetail = activeHostId ? resolvedDetails[activeHostId] : undefined;
 
         let nextAgentId = s.isDraftNewSession ? null : s.selectedAgentId;
         let nextDraft = s.isDraftNewSession;
@@ -429,7 +675,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
             : null;
         const remotelyArchivedDraftKeys = collectRemotelyArchivedDraftScopes(
           s,
-          Object.entries(nextDetails),
+          Object.entries(resolvedDetails),
           activeScopeKey,
         );
 
@@ -438,7 +684,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
           fleet: snap,
           fleetHydrated: true,
           bootstrapError: null,
-          hostDetails: nextDetails,
+          hostDetails: resolvedDetails,
           selectedHostId: activeHostId,
           selectedAgentId: nextAgentId,
           selectedWorkspaceCwd: nextCwd,
@@ -455,7 +701,7 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
               }
             : {}),
         };
-      }, true);
+      }, shouldPersistPrefs);
 
       syncAttentionIndicators(getState().fleet, getState().hostDetails);
       ctx.actions.refreshSidebarView();
@@ -665,12 +911,24 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
           : null;
 
       setState((s) => {
-        const nextDetails = { ...s.hostDetails, [hostId]: detail };
+        const prevDetail = s.hostDetails[hostId];
+        const stabilizedDetail = stabilizeHostDetail(prevDetail, detail);
+        const nextDetails =
+          stabilizedDetail === prevDetail
+            ? s.hostDetails
+            : { ...s.hostDetails, [hostId]: stabilizedDetail };
         let nextGitReposCache = s.gitReposCache;
-        if (detail.git_repos_by_cwd && Object.keys(detail.git_repos_by_cwd).length > 0) {
-          nextGitReposCache = { ...s.gitReposCache };
-          for (const [cwdKey, insp] of Object.entries(detail.git_repos_by_cwd)) {
-            nextGitReposCache[`${hostId}::${cwdKey}`] = insp;
+        if (stabilizedDetail.git_repos_by_cwd) {
+          let clonedGitRepos = false;
+          for (const [cwdKey, insp] of Object.entries(stabilizedDetail.git_repos_by_cwd)) {
+            const fullKey = `${hostId}::${cwdKey}`;
+            if (!deepEqualJson(s.gitReposCache[fullKey], insp)) {
+              if (!clonedGitRepos) {
+                nextGitReposCache = { ...s.gitReposCache };
+                clonedGitRepos = true;
+              }
+              nextGitReposCache[fullKey] = insp;
+            }
           }
         }
         const replacedMap = detail.replaced_optimistic_agents ?? {};
@@ -774,8 +1032,16 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
               title: termMeta.title || "shell",
             };
             if (existingIdx >= 0) {
-              nextTabs = [...nextTabs];
-              nextTabs[existingIdx] = entry;
+              const existing = nextTabs[existingIdx];
+              if (
+                existing.terminalId !== entry.terminalId ||
+                existing.slot !== entry.slot ||
+                existing.cwd !== entry.cwd ||
+                existing.title !== entry.title
+              ) {
+                nextTabs = [...nextTabs];
+                nextTabs[existingIdx] = entry;
+              }
             } else {
               nextTabs = [...nextTabs, entry];
               nextActiveTab = tabKey;
@@ -2317,12 +2583,19 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
 
 
     setSidebarWidth(w: number, persist = true): void {
-      setState((s) => ({ ...s, sidebarWidth: clampSidebarPrefWidth(w) }), persist);
+      const clamped = clampSidebarPrefWidth(w);
+      setState((s) => (s.sidebarWidth === clamped ? s : { ...s, sidebarWidth: clamped }), persist);
     },
 
 
     resetSidebarWidth(): void {
-      setState((s) => ({ ...s, sidebarWidth: SIDEBAR_DEFAULT_WIDTH_PX }), true);
+      setState(
+        (s) =>
+          s.sidebarWidth === SIDEBAR_DEFAULT_WIDTH_PX
+            ? s
+            : { ...s, sidebarWidth: SIDEBAR_DEFAULT_WIDTH_PX },
+        true,
+      );
     },
 
 
@@ -2723,9 +2996,9 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
       );
       if (!target.childAgentId) {
         notifyToast(
-          t("store.archivedSubagent", {
-            role: target.role ? ` "${target.role}"` : "",
-          }),
+          target.role
+            ? t("store.archivedNamedSubagent", { role: target.role })
+            : t("store.archivedSubagent"),
         );
       }
     },

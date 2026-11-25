@@ -20,6 +20,7 @@ import {
   type ResolvedSubagentItem,
   type SubagentNameMatcher,
 } from "../../lib/subagents.ts";
+import { isTimelineAgentMessageHidden } from "../../lib/turn-delegation-split.ts";
 import {
   selectPendingDecisions,
   selectSessionSubagents,
@@ -30,6 +31,55 @@ import type { OrbitUiState } from "../../state/store-types.ts";
 
 export const USER_PROMPT_PREVIEW_MAX_PX = 124;
 
+/**
+ * Fast-path heuristic: a short single-line user prompt with no attachment badges
+ * cannot exceed `USER_PROMPT_PREVIEW_MAX_PX + 10` (~5+ lines), so bubbles can skip
+ * synchronous `scrollHeight` layout reads and ResizeObserver registration entirely.
+ */
+export function mayUserPromptOverflow(text: string, badgeCount = 0): boolean {
+  if (badgeCount > 0) return true;
+  if (text.length > 72) return true;
+  return text.includes("\n");
+}
+
+// Shared singleton ResizeObserver with rAF coalescing for user prompt bubbles
+// so N mounted bubbles never allocate N independent ResizeObserver instances.
+let sharedBubbleResizeObserver: ResizeObserver | null = null;
+const bubbleResizeCallbacks = new Map<Element, () => void>();
+const pendingBubbleResizeElements = new Set<Element>();
+let bubbleResizeRafId = 0;
+
+function flushBubbleResizes() {
+  bubbleResizeRafId = 0;
+  if (pendingBubbleResizeElements.size === 0) return;
+  const targets = Array.from(pendingBubbleResizeElements);
+  pendingBubbleResizeElements.clear();
+  for (let i = 0; i < targets.length; i += 1) {
+    bubbleResizeCallbacks.get(targets[i])?.();
+  }
+}
+
+export function observeSharedBubbleResize(el: Element, onResize: () => void): () => void {
+  if (typeof ResizeObserver === "undefined") return () => {};
+  if (!sharedBubbleResizeObserver) {
+    sharedBubbleResizeObserver = new ResizeObserver((entries) => {
+      for (let i = 0; i < entries.length; i += 1) {
+        pendingBubbleResizeElements.add(entries[i].target);
+      }
+      if (!bubbleResizeRafId && typeof window !== "undefined") {
+        bubbleResizeRafId = window.requestAnimationFrame(flushBubbleResizes);
+      }
+    });
+  }
+  bubbleResizeCallbacks.set(el, onResize);
+  sharedBubbleResizeObserver.observe(el);
+  return () => {
+    bubbleResizeCallbacks.delete(el);
+    pendingBubbleResizeElements.delete(el);
+    sharedBubbleResizeObserver?.unobserve(el);
+  };
+}
+
 export interface TurnTimingRecord {
   startedAtMs: number;
   completedAtMs: number | null;
@@ -39,6 +89,12 @@ export interface TurnTimingRecord {
 
 export interface ViewportAnchorHoldOptions {
   intent?: "expand" | "collapse";
+  /**
+   * When true (for the trailing latest disclosure at the bottom of the conversation),
+   * expanding tracks the bottom of the viewport across the height transition and keeps
+   * `stickToBottom` active so subsequent streaming tool calls continue auto-scrolling.
+   */
+  followBottom?: boolean;
 }
 
 export type ViewportAnchorHoldFn = (
@@ -81,14 +137,30 @@ export function computeStageScrollState({
   };
 }
 
+export function shouldFollowBottomOnDisclosureExpand({
+  followBottom = false,
+  intent,
+  wasPinnedBottom,
+  beforeGap,
+}: {
+  followBottom?: boolean;
+  intent?: ViewportAnchorHoldOptions["intent"];
+  wasPinnedBottom?: boolean;
+  beforeGap: number;
+}): boolean {
+  if (!followBottom || intent !== "expand") return false;
+  return wasPinnedBottom === true || beforeGap <= STAGE_STICKY_REENGAGE_THRESHOLD_PX;
+}
+
 export function computeDisclosureRevealDelta({
-  intent, beforeContainerHeight, containerRect, scrollerRect, triggerRect,
+  intent, beforeContainerHeight, containerRect, scrollerRect, triggerRect, triggerIsContainer = false,
 }: {
   intent?: ViewportAnchorHoldOptions["intent"];
   beforeContainerHeight: number;
   containerRect: Pick<DOMRect, "bottom" | "height">;
   scrollerRect: Pick<DOMRect, "top" | "bottom" | "height">;
   triggerRect: Pick<DOMRect, "top" | "bottom">;
+  triggerIsContainer?: boolean;
 }): number {
   if (intent === "collapse" || (!intent && containerRect.height < beforeContainerHeight - 2)) return 0;
   const maxNudge = Math.max(0, triggerRect.top - scrollerRect.top - 24);
@@ -96,7 +168,10 @@ export function computeDisclosureRevealDelta({
   if (overflowBelow <= 8 || maxNudge <= 4) return 0;
   const fullReveal = Math.min(overflowBelow + 16, maxNudge);
   if (containerRect.height <= scrollerRect.height * 0.55) return fullReveal;
-  const visibleBelowTrigger = Math.max(0, scrollerRect.bottom - triggerRect.bottom);
+  const anchorBottom = triggerIsContainer
+    ? Math.min(triggerRect.bottom, triggerRect.top + beforeContainerHeight)
+    : triggerRect.bottom;
+  const visibleBelowTrigger = Math.max(0, scrollerRect.bottom - anchorBottom);
   const targetReveal = Math.min(240, Math.round(scrollerRect.height * 0.35));
   return Math.min(fullReveal, Math.max(0, targetReveal - visibleBelowTrigger));
 }
@@ -203,6 +278,14 @@ export interface PromptImagePreviewTarget {
   path: string | null;
   hostId: string;
   cwd: string;
+  gallery?: ReadonlyArray<{
+    url: string;
+    label: string;
+    path?: string | null;
+    hostId?: string;
+    cwd?: string;
+  }>;
+  galleryIndex?: number;
 }
 
 export interface RewindFileEntry {
@@ -259,6 +342,7 @@ export const EMPTY_TIMELINE_ITEMS: TimelineItemView[] = [];
 export const EMPTY_TURNS: StageTurnView[] = [];
 export const EMPTY_DIFF_FILES: DiffFileView[] = [];
 export const EMPTY_ARTIFACTS: readonly ArtifactSummary[] = [];
+export const EMPTY_INLINE_ARTIFACT_REFS: readonly InlineArtifactRef[] = [];
 export const EMPTY_INSIGHTS: SessionInsightsView = {
   touched_files: [],
   background_tasks: [],
@@ -296,6 +380,81 @@ function sameStageSubagents(a: readonly SessionSubagentWithAvatar[], b: readonly
   );
 }
 
+function areModeValuesEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
+  const recA = a as Record<string, unknown>;
+  const recB = b as Record<string, unknown>;
+  const keysA = Object.keys(recA);
+  const keysB = Object.keys(recB);
+  if (keysA.length !== keysB.length) return false;
+  for (let i = 0; i < keysA.length; i += 1) {
+    const k = keysA[i];
+    if (recA[k] !== recB[k]) return false;
+  }
+  return true;
+}
+
+/**
+ * Narrow selector for a single host's `AgentCardView` that preserves referential identity
+ * across unrelated `host_changed` bursts (e.g. sibling agent activity or heartbeats).
+ */
+export function createHostAgentSelector(hostId: string | null, agentId: string | null) {
+  let prev: OrbitUiState["hostDetails"][string]["agents"][number] | null = null;
+  return (state: Pick<OrbitUiState, "hostDetails">) => {
+    if (!hostId || !agentId) {
+      prev = null;
+      return null;
+    }
+    const next = state.hostDetails[hostId]?.agents.find((a) => a.agent_id === agentId) ?? null;
+    if (next === prev) return prev;
+    if (
+      prev &&
+      next &&
+      prev.agent_id === next.agent_id &&
+      prev.workspace_id === next.workspace_id &&
+      prev.provider === next.provider &&
+      prev.title === next.title &&
+      prev.task_summary === next.task_summary &&
+      prev.cwd === next.cwd &&
+      prev.status_label === next.status_label &&
+      prev.latest_seq === next.latest_seq &&
+      prev.is_running === next.is_running &&
+      prev.is_awaiting_permission === next.is_awaiting_permission &&
+      Boolean(prev.has_background_tasks) === Boolean(next.has_background_tasks) &&
+      Boolean(prev.has_armed_timers) === Boolean(next.has_armed_timers) &&
+      Boolean(prev.has_running_subagents) === Boolean(next.has_running_subagents) &&
+      prev.model === next.model &&
+      prev.effort === next.effort &&
+      prev.worktree_branch === next.worktree_branch &&
+      prev.forked_from_agent_id === next.forked_from_agent_id &&
+      prev.archived_at_rfc3339 === next.archived_at_rfc3339 &&
+      prev.updated_at_rfc3339 === next.updated_at_rfc3339 &&
+      areModeValuesEqual(prev.mode, next.mode) &&
+      (prev.queued_prompts?.length ?? 0) === (next.queued_prompts?.length ?? 0) &&
+      (prev.queued_prompts ?? []).every((q, i) => q.queue_id === next.queued_prompts?.[i]?.queue_id)
+    ) {
+      return prev;
+    }
+    prev = next;
+    return next;
+  };
+}
+
+/**
+ * Narrow selector for a host's `artifacts` list that preserves referential identity across
+ * unrelated `host_changed` bursts via structural equivalence.
+ */
+export function createStableHostArtifactsSelector(hostId: string | null) {
+  let prev: readonly ArtifactSummary[] = EMPTY_ARTIFACTS;
+  return (state: Pick<OrbitUiState, "hostDetails">): readonly ArtifactSummary[] => {
+    const next = hostId ? (state.hostDetails[hostId]?.artifacts ?? EMPTY_ARTIFACTS) : EMPTY_ARTIFACTS;
+    if (areArtifactListsEquivalent(prev, next)) return prev;
+    prev = next;
+    return next;
+  };
+}
+
 /** Keep React's session snapshot stable across token deltas and unrelated host updates. */
 export function createStageSessionSelector(hostId: string | null, agentId: string | null) {
   let inputs: readonly unknown[] = [];
@@ -312,9 +471,10 @@ export function createStageSessionSelector(hostId: string | null, agentId: strin
     ];
     if (snapshot && sameItems(inputs, nextInputs)) return snapshot;
 
-    const all = selectSessionSubagents(state, hostId, agentId).all;
+    const subagentsSummary = selectSessionSubagents(state, hostId, agentId);
+    const all = subagentsSummary.all;
     const subagents = snapshot && sameStageSubagents(snapshot.subagents, all) ? snapshot.subagents : all;
-    const decisions = selectPendingDecisions(state, hostId, agentId);
+    const decisions = selectPendingDecisions(state, hostId, agentId, subagentsSummary);
     inputs = nextInputs;
     if (snapshot && subagents === snapshot.subagents) {
       const prev = snapshot.decisions;
@@ -563,18 +723,20 @@ const LEGACY_REVIEW_PROMPT =
 
 const promptPresentationCache = new WeakMap<
   Extract<TimelineItemView, { item_type: "user_prompt" }>,
-  UserPromptPresentation
+  Partial<Record<OrbitLocale, UserPromptPresentation>>
 >();
 
 /**
  * Extracts clean user-visible text and semantic chips from `user_prompt`,
  * including backwards-compatible cleanup for older turns stored before structured `badges`.
- * Memoized by `WeakMap` so `UserPromptBubble` and `outlinePrompts` run regexes at most once per item.
+ * Memoized by `WeakMap` + locale so `UserPromptBubble` and `outlinePrompts` run regexes at most once per item.
  */
 export function extractUserPromptPresentation(
   item: Extract<TimelineItemView, { item_type: "user_prompt" }>,
+  locale: OrbitLocale = DEFAULT_LOCALE,
 ): UserPromptPresentation {
-  const cached = promptPresentationCache.get(item);
+  const byLocale = promptPresentationCache.get(item);
+  const cached = byLocale?.[locale];
   if (cached) return cached;
 
   if (item.badges && item.badges.length > 0) {
@@ -583,7 +745,9 @@ export function extractUserPromptPresentation(
       badges: item.badges,
       sanitizedLegacy: false,
     };
-    promptPresentationCache.set(item, res);
+    const nextByLocale = byLocale ?? {};
+    nextByLocale[locale] = res;
+    if (!byLocale) promptPresentationCache.set(item, nextByLocale);
     return res;
   }
 
@@ -641,7 +805,13 @@ export function extractUserPromptPresentation(
     /^>\s*(Working Tree Diff|Staged Diff):\n```diff\n[\s\S]*?\n```\s*$/gm,
     (_, label: string) => {
       sanitized = true;
-      inferredBadges.push({ kind: "git_diff", label });
+      inferredBadges.push({
+        kind: "git_diff",
+        label:
+          label === "Staged Diff"
+            ? translate(locale, "stage.stagedDiff")
+            : translate(locale, "stage.workingTreeDiff"),
+      });
       return "";
     },
   );
@@ -651,7 +821,10 @@ export function extractUserPromptPresentation(
       sanitized = true;
       inferredBadges.push({
         kind: "git_diff",
-        label: kind.toLowerCase() === "staged" ? "Staged Diff" : "Working Tree Diff",
+        label:
+          kind.toLowerCase() === "staged"
+            ? translate(locale, "stage.stagedDiff")
+            : translate(locale, "stage.workingTreeDiff"),
       });
       return "";
     },
@@ -691,7 +864,9 @@ export function extractUserPromptPresentation(
     badges: inferredBadges,
     sanitizedLegacy: sanitized,
   };
-  promptPresentationCache.set(item, res);
+  const nextByLocale = byLocale ?? {};
+  nextByLocale[locale] = res;
+  if (!byLocale) promptPresentationCache.set(item, nextByLocale);
   return res;
 }
 
@@ -872,19 +1047,26 @@ export function parseArtifactRefsFromMessage(
   return refs;
 }
 
+const turnHasArtifactToolCache = new WeakMap<StageTurnView, boolean>();
+
 export function parseArtifactRefsFromTurnTools(
   turn: StageTurnView,
   knownArtifacts: readonly ArtifactSummary[],
   locale: OrbitLocale = DEFAULT_LOCALE,
-): InlineArtifactRef[] {
+): readonly InlineArtifactRef[] {
+  if (turnHasArtifactToolCache.get(turn) === false) {
+    return EMPTY_INLINE_ARTIFACT_REFS;
+  }
   const refs: InlineArtifactRef[] = [];
   const seen = new Set<string>();
+  let sawArtifactTool = false;
   const inspectItems = (items: readonly TimelineItemView[]) => {
     for (const item of items) {
       if (item.item_type !== "tool_call") continue;
       if (item.detail.kind !== "generic") continue;
       const toolName = item.detail.tool_name.toLowerCase();
       if (!toolName.endsWith("publish_artifact")) continue;
+      sawArtifactTool = true;
       try {
         const parsed = JSON.parse(item.detail.arguments_json) as Record<string, unknown>;
         const explicitId =
@@ -920,6 +1102,10 @@ export function parseArtifactRefsFromTurnTools(
     if (seg.kind === "step_group") {
       inspectItems(seg.items);
     }
+  }
+  if (!sawArtifactTool) {
+    turnHasArtifactToolCache.set(turn, false);
+    return EMPTY_INLINE_ARTIFACT_REFS;
   }
   return refs;
 }
@@ -981,12 +1167,18 @@ export function setCachedTurnHeight(key: string, height: number): void {
   sessionTurnHeightCache.set(key, height);
 }
 
-export const TURN_LIST_GAP_PX = 28;
+export const TURN_LIST_GAP_PX = 32;
 export const CONTINUATION_TURN_GAP_PX = 12;
 
 export function isCompactionMarkerTurn(turn: StageTurnView): boolean {
   return turn.is_compaction_command && turn.folded_steps.length === 0 &&
     turn.terminal_reply === null && turn.notices.length === 0;
+}
+
+export function isLiveCompactionSegment(seg: { key?: string; label?: string }): boolean {
+  if (seg.key?.startsWith("compact-live-")) return true;
+  const label = seg.label ?? "";
+  return /compacting|compaction requested/i.test(label);
 }
 
 type FooterContent = { replyText: string | null; forkUpToSeq: number | null };
@@ -1004,11 +1196,15 @@ export function getTurnFooter(
   if (isActive) return null;
   let content = footerContentCache.get(turn);
   if (content === undefined) {
-    // Coalescing a finish into its peer report still leaves a body. A turn made
-    // up entirely of suppressed wakeups or an opening prompt has no footer slot.
-    const hasBody = !isCompactionMarkerTurn(turn) && turn.live_segments.some(
-      (seg) => seg.kind !== "wakeup" || !isHiddenWakeupLabel(seg.label),
-    );
+    // A turn made up entirely of suppressed wakeups, hidden inter-agent messages,
+    // or an opening prompt has no footer slot.
+    const hasBody = !isCompactionMarkerTurn(turn) && turn.live_segments.some((seg) => {
+      if (seg.kind === "wakeup") return !isHiddenWakeupLabel(seg.label);
+      if (seg.kind === "agent_message") {
+        return seg.item.item_type === "agent_message" && !isTimelineAgentMessageHidden(seg.item);
+      }
+      return true;
+    });
     content = hasBody ? {
       replyText: turn.last_assistant_reply?.item_type === "assistant_message"
         ? turn.last_assistant_reply.text.trim() || null : null,
@@ -1023,11 +1219,11 @@ export function getTurnFooter(
   return { ...content, completedAtMs, showFork };
 }
 
-/** The preceding historical footer already supplies 24px of separation. */
+/** The preceding historical footer already supplies 26px (or 30px after changes bar) of separation. */
 export function getTurnTopGapPx(turn: StageTurnView, previousHasFooter: boolean | undefined): number {
   if (previousHasFooter === undefined) return 0;
-  if (turn.user_prompt !== null) return previousHasFooter ? 16 : TURN_LIST_GAP_PX;
-  return previousHasFooter ? 0 : CONTINUATION_TURN_GAP_PX;
+  if (turn.user_prompt !== null) return previousHasFooter ? 14 : TURN_LIST_GAP_PX;
+  return previousHasFooter ? 8 : CONTINUATION_TURN_GAP_PX;
 }
 
 export interface TurnListRow {
@@ -1063,7 +1259,12 @@ export function getTurnListRows(
       timing: timings.get(`${scope}::${turn.key}`)?.timing,
     }) !== null;
     const topGapPx = getTurnTopGapPx(turn, previousHasFooter);
-    const footerPx = hasFooter ? (isLastTurn ? 28 : 24) : 0;
+    const hasChangesBar = turn.turn_diffs.length > 0;
+    const footerPx = hasFooter
+      ? isLastTurn
+        ? hasChangesBar ? 32 : 30
+        : hasChangesBar ? 30 : 26
+      : 0;
     const spacingPx = topGapPx + footerPx;
     const row = previousRows[index];
     if (row?.key === turn.key && row.topGapPx === topGapPx && row.spacingPx === spacingPx) {

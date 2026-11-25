@@ -316,13 +316,18 @@ fn orbit_mermaid_theme(theme: DiagramTheme) -> MmdTheme {
 
 fn orbit_mermaid_layout_config(theme: DiagramTheme) -> LayoutConfig {
     let mut cfg = LayoutConfig {
-        node_spacing: 46.0,
-        rank_spacing: 50.0,
+        node_spacing: 48.0,
+        rank_spacing: 64.0,
         node_padding_x: 32.0,
         node_padding_y: 16.0,
         label_line_height: 1.48,
         ..LayoutConfig::default()
     };
+    // Disable the coarse 16px orthogonal A* grid router on flowcharts: on diamonds
+    // and multi-branch hubs it produces U-turns and crossing sibling edges, whereas
+    // direct smooth routing keeps branches monotonic and legible.
+    cfg.flowchart.routing.enable_grid_router = false;
+    cfg.flowchart.routing.snap_ports_to_grid = false;
     cfg.mindmap.default_corner_radius = 8.0;
 
     match theme {
@@ -484,6 +489,18 @@ fn polish_mermaid_svg(svg: &str, root_id: &str) -> String {
                 "stroke-width=\"1\" stroke-linejoin=\"round\" stroke-linecap=\"round\"/>",
                 "stroke-width=\"1.15\" stroke-linejoin=\"round\" stroke-linecap=\"round\"/>",
             )
+        } else if starts_with_ascii_ci(tag, "<text") || starts_with_ascii_ci(tag, "<tspan") {
+            // In WebKit/WKWebView, `dominant-baseline="middle"` and
+            // `alignment-baseline="mathematical"` sit visibly above the optical center of
+            // node boxes; `central` centers both Latin and CJK labels cleanly.
+            tag.replace(
+                "dominant-baseline=\"middle\"",
+                "dominant-baseline=\"central\"",
+            )
+            .replace(
+                "alignment-baseline=\"mathematical\"",
+                "alignment-baseline=\"central\"",
+            )
         } else {
             tag.to_string()
         }
@@ -633,11 +650,17 @@ fn polish_graphviz_svg(svg: &str, theme_mode: DiagramTheme) -> String {
                     next = next.replace("rx=\"0\"", "rx=\"7\" ry=\"7\"");
                 }
             }
+        } else if starts_with_ascii_ci(&next, "<text") {
+            // `central` aligns Latin and CJK labels on the true optical centerline in WebKit.
+            next = next.replace(
+                "dominant-baseline=\"middle\"",
+                "dominant-baseline=\"central\"",
+            );
         }
         next
     });
 
-    pad_graphviz_viewbox(&work, 8.0)
+    tighten_graphviz_viewbox(&work, 12.0)
 }
 
 /// Apply `rewrite` strictly to opening XML tags (`<tag ...>` / `<tag .../>`), leaving closing tags,
@@ -841,30 +864,66 @@ fn scope_css_rules(css: &str, root_id: &str) -> String {
     out
 }
 
-fn pad_graphviz_viewbox(svg: &str, pad: f32) -> String {
+/// Compute a tight geometric bounding box for `layout-rs` Graphviz SVG output and rewrite
+/// `<svg width="..." height="..." viewBox="...">`.
+///
+/// `layout-rs` 0.1.3 has a swapped-axis bug in `SVGWriter::draw_text` (`Point::new(10., len * 10.)`),
+/// which inflates `view_size.y` by `10 * label_len` and leaves massive blank space under horizontal
+/// (`rankdir=LR`) graphs. Measuring the rendered geometry directly restores exact centering.
+fn tighten_graphviz_viewbox(svg: &str, pad: f32) -> String {
     let Some(open_end) = svg.find('>') else {
         return svg.to_string();
     };
+    let bounds = compute_graphviz_geometry_bounds(svg);
     let header = &svg[..open_end];
-    let Some(vb_raw) = extract_attr_value_ci(header, "viewbox") else {
+
+    let (vx, vy, vw, vh) = if let Some((min_x, min_y, max_x, max_y)) = bounds {
+        let content_w = (max_x - min_x).max(1.0);
+        let content_h = (max_y - min_y).max(1.0);
+        (
+            min_x - pad,
+            min_y - pad,
+            content_w + pad * 2.0,
+            content_h + pad * 2.0,
+        )
+    } else if let Some(vb_raw) = extract_attr_value_ci(header, "viewbox") {
+        let nums: Vec<f32> = vb_raw
+            .split(|c: char| c.is_ascii_whitespace() || c == ',')
+            .filter(|p| !p.is_empty())
+            .filter_map(|p| p.parse::<f32>().ok())
+            .collect();
+        if nums.len() == 4 && nums[2] > 0.0 && nums[3] > 0.0 {
+            (
+                nums[0] - pad,
+                nums[1] - pad,
+                nums[2] + pad * 2.0,
+                nums[3] + pad * 2.0,
+            )
+        } else {
+            return svg.to_string();
+        }
+    } else {
         return svg.to_string();
     };
-    let nums: Vec<f32> = vb_raw
-        .split(|c: char| c.is_ascii_whitespace() || c == ',')
-        .filter(|p| !p.is_empty())
-        .filter_map(|p| p.parse::<f32>().ok())
-        .collect();
-    if nums.len() != 4 || nums[2] <= 0.0 || nums[3] <= 0.0 {
-        return svg.to_string();
+
+    let mut new_header = header.to_string();
+    let padded_vb = format!("{vx:.2} {vy:.2} {vw:.2} {vh:.2}");
+    if let Some(vb_raw) = extract_attr_value_ci(&new_header, "viewbox").map(str::to_string) {
+        new_header = new_header.replacen(&vb_raw, &padded_vb, 1);
+    } else {
+        new_header.push_str(&format!(" viewBox=\"{padded_vb}\""));
     }
-    let padded_vb = format!(
-        "{:.2} {:.2} {:.2} {:.2}",
-        nums[0] - pad,
-        nums[1] - pad,
-        nums[2] + pad * 2.0,
-        nums[3] + pad * 2.0
-    );
-    let new_header = header.replacen(vb_raw, &padded_vb, 1);
+    if let Some(w_raw) = extract_attr_value_ci(&new_header, "width").map(str::to_string) {
+        let target = format!("width=\"{w_raw}\"");
+        let repl = format!("width=\"{vw:.2}\"");
+        new_header = new_header.replacen(&target, &repl, 1);
+    }
+    if let Some(h_raw) = extract_attr_value_ci(&new_header, "height").map(str::to_string) {
+        let target = format!("height=\"{h_raw}\"");
+        let repl = format!("height=\"{vh:.2}\"");
+        new_header = new_header.replacen(&target, &repl, 1);
+    }
+
     let mut out = String::with_capacity(svg.len() + 32);
     out.push_str(&new_header);
     out.push_str(&svg[open_end..]);
@@ -902,6 +961,432 @@ fn polish_raw_svg_contrast(svg: &str, theme_mode: DiagramTheme) -> String {
         }
         next
     })
+}
+
+fn compute_graphviz_geometry_bounds(svg: &str) -> Option<(f32, f32, f32, f32)> {
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+
+    let mut include_point = |x: f32, y: f32| {
+        if x.is_finite() && y.is_finite() {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    };
+
+    let style_font_sizes = parse_svg_class_font_sizes(svg);
+
+    // Skip `<defs>...</defs>` so marker arrowheads (e.g. `0 0 10 10`) don't pull bounds to origin.
+    let body = if let Some(defs_end) = find_ascii_ci(svg, "</defs>") {
+        &svg[defs_end + "</defs>".len()..]
+    } else {
+        svg
+    };
+
+    let _ = rewrite_svg_open_tags(body, |tag| {
+        if starts_with_ascii_ci(tag, "<rect")
+            && tag
+                .as_bytes()
+                .get(5)
+                .copied()
+                .is_some_and(|b| b.is_ascii_whitespace())
+        {
+            if let (Some(x), Some(y), Some(w), Some(h)) = (
+                extract_attr_value_ci(tag, "x").and_then(parse_svg_length),
+                extract_attr_value_ci(tag, "y").and_then(parse_svg_length),
+                extract_attr_value_ci(tag, "width").and_then(parse_svg_length),
+                extract_attr_value_ci(tag, "height").and_then(parse_svg_length),
+            ) {
+                include_point(x, y);
+                include_point(x + w, y + h);
+            }
+        } else if starts_with_ascii_ci(tag, "<ellipse") {
+            if let (Some(cx), Some(cy), Some(rx), Some(ry)) = (
+                extract_attr_value_ci(tag, "cx").and_then(parse_svg_length),
+                extract_attr_value_ci(tag, "cy").and_then(parse_svg_length),
+                extract_attr_value_ci(tag, "rx").and_then(parse_svg_length),
+                extract_attr_value_ci(tag, "ry").and_then(parse_svg_length),
+            ) {
+                include_point(cx - rx, cy - ry);
+                include_point(cx + rx, cy + ry);
+            }
+        } else if starts_with_ascii_ci(tag, "<circle") {
+            if let (Some(cx), Some(cy), Some(r)) = (
+                extract_attr_value_ci(tag, "cx").and_then(parse_svg_length),
+                extract_attr_value_ci(tag, "cy").and_then(parse_svg_length),
+                extract_attr_value_ci(tag, "r").and_then(parse_svg_length),
+            ) {
+                include_point(cx - r, cy - r);
+                include_point(cx + r, cy + r);
+            }
+        } else if starts_with_ascii_ci(tag, "<line") {
+            if let (Some(x1), Some(y1), Some(x2), Some(y2)) = (
+                extract_attr_value_ci(tag, "x1").and_then(parse_svg_length),
+                extract_attr_value_ci(tag, "y1").and_then(parse_svg_length),
+                extract_attr_value_ci(tag, "x2").and_then(parse_svg_length),
+                extract_attr_value_ci(tag, "y2").and_then(parse_svg_length),
+            ) {
+                include_point(x1, y1);
+                include_point(x2, y2);
+            }
+        } else if starts_with_ascii_ci(tag, "<polygon") || starts_with_ascii_ci(tag, "<polyline") {
+            if let Some(pts) = extract_attr_value_ci(tag, "points") {
+                let nums = extract_float_sequence(pts);
+                for pair in nums.as_chunks::<2>().0 {
+                    include_point(pair[0], pair[1]);
+                }
+            }
+        } else if starts_with_ascii_ci(tag, "<path")
+            && let Some(d) = extract_attr_value_ci(tag, "d")
+        {
+            // `layout-rs` emits absolute `M x y`, `L x y`, `C x1 y1 x2 y2 x y` path commands.
+            let nums = extract_float_sequence(d);
+            for pair in nums.as_chunks::<2>().0 {
+                include_point(pair[0], pair[1]);
+            }
+        }
+        String::new()
+    });
+
+    include_graphviz_text_bounds(body, &style_font_sizes, &mut include_point);
+
+    if min_x.is_finite() && min_y.is_finite() && max_x > min_x && max_y > min_y {
+        Some((min_x, min_y, max_x, max_y))
+    } else {
+        None
+    }
+}
+
+fn parse_svg_class_font_sizes(svg: &str) -> HashMap<String, f32> {
+    let mut map = HashMap::new();
+    let mut cursor = 0usize;
+    while let Some(rel_open) = find_ascii_ci(&svg[cursor..], "<style") {
+        let open_pos = cursor + rel_open;
+        let Some(rel_gt) = svg[open_pos..].find('>') else {
+            break;
+        };
+        let body_start = open_pos + rel_gt + 1;
+        let Some(rel_close) = find_ascii_ci(&svg[body_start..], "</style>") else {
+            break;
+        };
+        let body_end = body_start + rel_close;
+        let mut rest = &svg[body_start..body_end];
+        while let Some(open_brace) = rest.find('{') {
+            let selector_part = &rest[..open_brace];
+            let after_open = &rest[open_brace + 1..];
+            let Some(close_brace) = after_open.find('}') else {
+                break;
+            };
+            let decls = &after_open[..close_brace];
+            if let Some(size) = extract_css_font_size(decls) {
+                for sel in selector_part.split(',') {
+                    if let Some(dot_pos) = sel.rfind('.') {
+                        let cls: String = sel[dot_pos + 1..]
+                            .chars()
+                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                            .collect();
+                        if !cls.is_empty() {
+                            map.insert(cls, size);
+                        }
+                    }
+                }
+            }
+            rest = &after_open[close_brace + 1..];
+        }
+        cursor = body_end + "</style>".len();
+    }
+    map
+}
+
+fn extract_css_font_size(css_decls: &str) -> Option<f32> {
+    for decl in css_decls.split(';') {
+        let Some((name, val)) = decl.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("font-size")
+            && let Some(size) = parse_svg_length(val)
+            && size.is_finite()
+            && size > 0.0
+        {
+            return Some(size.clamp(4.0, 256.0));
+        }
+    }
+    None
+}
+
+fn find_svg_tag_end(s: &str, lt: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut j = lt + 1;
+    let mut quote: Option<u8> = None;
+    while j < bytes.len() {
+        let b = bytes[j];
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+        } else if b == b'"' || b == b'\'' {
+            quote = Some(b);
+        } else if b == b'>' {
+            return Some(j + 1);
+        }
+        j += 1;
+    }
+    None
+}
+
+fn parse_svg_relative_length(raw: &str, font_size: f32) -> Option<f32> {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2 && trimmed[trimmed.len() - 2..].eq_ignore_ascii_case("em") {
+        let mult = trimmed[..trimmed.len() - 2].trim().parse::<f32>().ok()?;
+        Some(mult * font_size)
+    } else {
+        parse_svg_length(trimmed)
+    }
+}
+
+fn decode_basic_xml_entities(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp..];
+        if let Some(rem) = after.strip_prefix("&amp;") {
+            out.push('&');
+            rest = rem;
+        } else if let Some(rem) = after.strip_prefix("&lt;") {
+            out.push('<');
+            rest = rem;
+        } else if let Some(rem) = after.strip_prefix("&gt;") {
+            out.push('>');
+            rest = rem;
+        } else if let Some(rem) = after.strip_prefix("&quot;") {
+            out.push('"');
+            rest = rem;
+        } else if let Some(rem) = after.strip_prefix("&apos;") {
+            out.push('\'');
+            rest = rem;
+        } else {
+            out.push('&');
+            rest = &after[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn strip_inline_xml_tags(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        let Some(gt) = rest[lt..].find('>') else {
+            return out;
+        };
+        rest = &rest[lt + gt + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn estimate_svg_text_width(text: &str, font_size: f32) -> f32 {
+    let decoded = decode_basic_xml_entities(text);
+    let mut width = 0.0f32;
+    for ch in decoded.chars() {
+        let advance = if !ch.is_ascii() {
+            1.05
+        } else if ch.is_ascii_uppercase() {
+            0.68
+        } else if matches!(
+            ch,
+            'i' | 'l' | 'I' | '1' | '.' | ',' | ':' | ';' | '!' | '|' | ' '
+        ) {
+            0.36
+        } else {
+            0.58
+        };
+        width += advance * font_size;
+    }
+    width.max(font_size * 0.5)
+}
+
+fn include_graphviz_text_bounds(
+    body: &str,
+    style_font_sizes: &HashMap<String, f32>,
+    include_point: &mut impl FnMut(f32, f32),
+) {
+    let mut cursor = 0usize;
+    while let Some(rel_open) = find_ascii_ci(&body[cursor..], "<text") {
+        let open_pos = cursor + rel_open;
+        let next_byte = body.as_bytes().get(open_pos + 5).copied();
+        if !next_byte.is_some_and(|b| b.is_ascii_whitespace() || b == b'>' || b == b'/') {
+            cursor = open_pos + 5;
+            continue;
+        }
+        let Some(open_end) = find_svg_tag_end(body, open_pos) else {
+            break;
+        };
+        let open_tag = &body[open_pos..open_end];
+        if open_tag.trim_end().ends_with("/>") {
+            cursor = open_end;
+            continue;
+        }
+        let Some(rel_close) = find_ascii_ci(&body[open_end..], "</text>") else {
+            break;
+        };
+        let close_start = open_end + rel_close;
+        let inner = &body[open_end..close_start];
+        cursor = close_start + "</text>".len();
+
+        let base_x = extract_attr_value_ci(open_tag, "x").and_then(parse_svg_length);
+        let base_y = extract_attr_value_ci(open_tag, "y").and_then(parse_svg_length);
+        let font_size = extract_attr_value_ci(open_tag, "font-size")
+            .and_then(parse_svg_length)
+            .or_else(|| extract_attr_value_ci(open_tag, "style").and_then(extract_css_font_size))
+            .or_else(|| {
+                extract_attr_value_ci(open_tag, "class").and_then(|cls| {
+                    cls.split_whitespace()
+                        .find_map(|c| style_font_sizes.get(c).copied())
+                })
+            })
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(14.0)
+            .clamp(4.0, 256.0);
+
+        let anchor =
+            extract_attr_value_ci(open_tag, "text-anchor").map(|v| v.trim().to_ascii_lowercase());
+        let centered_baseline =
+            extract_attr_value_ci(open_tag, "dominant-baseline").is_some_and(|v| {
+                matches!(v.trim().to_ascii_lowercase().as_str(), "central" | "middle")
+            });
+
+        let mut include_line = |lx: f32, ly: f32, text: &str| {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            let est_w = estimate_svg_text_width(trimmed, font_size);
+            let (x0, x1) = match anchor.as_deref() {
+                Some("middle") => (lx - est_w * 0.5, lx + est_w * 0.5),
+                Some("end") => (lx - est_w, lx),
+                _ => (lx, lx + est_w),
+            };
+            let (y0, y1) = if centered_baseline {
+                (ly - font_size * 0.6, ly + font_size * 0.6)
+            } else {
+                (ly - font_size * 0.9, ly + font_size * 0.35)
+            };
+            include_point(x0, y0);
+            include_point(x1, y1);
+        };
+
+        if find_ascii_ci(inner, "<tspan").is_some() {
+            let mut cur_x = base_x;
+            let mut cur_y = base_y;
+            let mut tcursor = 0usize;
+            while let Some(rel_ts) = find_ascii_ci(&inner[tcursor..], "<tspan") {
+                let ts_pos = tcursor + rel_ts;
+                let ts_next = inner.as_bytes().get(ts_pos + 6).copied();
+                if !ts_next.is_some_and(|b| b.is_ascii_whitespace() || b == b'>' || b == b'/') {
+                    tcursor = ts_pos + 6;
+                    continue;
+                }
+                let Some(ts_end) = find_svg_tag_end(inner, ts_pos) else {
+                    break;
+                };
+                let ts_tag = &inner[ts_pos..ts_end];
+                if ts_tag.trim_end().ends_with("/>") {
+                    tcursor = ts_end;
+                    continue;
+                }
+                let Some(rel_ts_close) = find_ascii_ci(&inner[ts_end..], "</tspan>") else {
+                    break;
+                };
+                let ts_body = &inner[ts_end..ts_end + rel_ts_close];
+                tcursor = ts_end + rel_ts_close + "</tspan>".len();
+
+                if let Some(tx) = extract_attr_value_ci(ts_tag, "x").and_then(parse_svg_length) {
+                    cur_x = Some(tx);
+                }
+                if let Some(ty) = extract_attr_value_ci(ts_tag, "y").and_then(parse_svg_length) {
+                    cur_y = Some(ty);
+                }
+                if let Some(dx) = extract_attr_value_ci(ts_tag, "dx")
+                    .and_then(|v| parse_svg_relative_length(v, font_size))
+                    && let Some(x) = cur_x
+                {
+                    cur_x = Some(x + dx);
+                }
+                if let Some(dy) = extract_attr_value_ci(ts_tag, "dy")
+                    .and_then(|v| parse_svg_relative_length(v, font_size))
+                    && let Some(y) = cur_y
+                {
+                    cur_y = Some(y + dy);
+                }
+
+                if let (Some(lx), Some(ly)) = (cur_x, cur_y) {
+                    let text = strip_inline_xml_tags(ts_body);
+                    include_line(lx, ly, &text);
+                }
+            }
+        } else if find_ascii_ci(inner, "<textpath").is_none()
+            && let (Some(lx), Some(ly)) = (base_x, base_y)
+        {
+            let plain = strip_inline_xml_tags(inner);
+            let lines: Vec<&str> = plain
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            for (idx, line) in lines.iter().enumerate() {
+                let line_y = ly + (idx as f32) * font_size * 1.2;
+                include_line(lx, line_y, line);
+            }
+        }
+    }
+}
+
+fn extract_float_sequence(raw: &str) -> Vec<f32> {
+    let mut nums = Vec::new();
+    let bytes = raw.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let starts_num = b.is_ascii_digit()
+            || ((b == b'-' || b == b'+' || b == b'.')
+                && bytes
+                    .get(i + 1)
+                    .copied()
+                    .is_some_and(|n| n.is_ascii_digit() || n == b'.'));
+        if starts_num {
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                let c = bytes[i];
+                if c.is_ascii_digit() || c == b'.' {
+                    i += 1;
+                } else if (c == b'e' || c == b'E')
+                    && bytes
+                        .get(i + 1)
+                        .copied()
+                        .is_some_and(|n| n.is_ascii_digit() || n == b'+' || n == b'-')
+                {
+                    i += 2;
+                } else {
+                    break;
+                }
+            }
+            if let Ok(v) = raw[start..i].parse::<f32>() {
+                nums.push(v);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    nums
 }
 
 fn render_raw_svg(source: &str, theme_mode: DiagramTheme) -> RenderDiagramView {
@@ -2395,5 +2880,154 @@ mod tests {
         let svg = out.svg.expect("graphviz svg");
         assert!(!svg.contains("ry=\"7\" ry=\""));
         assert!(!svg.contains("rx=&quot;7&quot;"));
+    }
+
+    #[test]
+    fn graphviz_lr_tightens_viewbox_and_centers_text_baseline() {
+        let dot = r#"digraph CompactionFlow {
+  rankdir=LR;
+  node [shape=box, style=rounded, fontsize=11];
+  Trigger [label="Auto / /compact"];
+  Compacting [label="Compacting..."];
+  Divider [label="Compacted Divider"];
+  Trigger -> Compacting -> Divider;
+}"#;
+        let out = render_diagram(&RenderDiagramRequest {
+            kind: DiagramKind::Graphviz,
+            source: dot.into(),
+            theme: DiagramTheme::Dark,
+        });
+        assert!(out.error.is_none(), "dot error: {:?}", out.error);
+        let svg = out.svg.expect("graphviz svg");
+        assert!(
+            out.height < 90.0,
+            "expected tight LR Graphviz height (<90px) without layout-rs vertical void, got {}x{}\n{}",
+            out.width,
+            out.height,
+            &svg[..svg.len().min(320)]
+        );
+        assert!(svg.contains("dominant-baseline=\"central\""));
+        assert!(!svg.contains("dominant-baseline=\"middle\""));
+    }
+
+    #[test]
+    fn graphviz_geometry_bounds_include_text_labels_outside_shapes() {
+        // 1. Plain `<text>` positioned outside `<rect>` expands bounds instead of getting clipped.
+        let svg_with_outside_text = r##"<svg width="400" height="200" viewBox="0 0 400 200">
+  <defs><marker id="endarrow"><polygon points="0 0, 10 3.5, 0 7"/></marker></defs>
+  <rect x="20" y="20" width="60" height="30"/>
+  <text x="200" y="110" text-anchor="middle" font-size="14">Plaintext Edge Label</text>
+  <text><textPath href="#arrow0" startOffset="50%" text-anchor="middle">OnEdge</textPath></text>
+</svg>"##;
+        let (min_x, min_y, max_x, max_y) =
+            compute_graphviz_geometry_bounds(svg_with_outside_text).expect("bounds");
+        assert!(
+            (19.0..=20.0).contains(&min_x),
+            "unexpected min_x={min_x} (textPath must not pull bounds to origin)"
+        );
+        assert!((19.0..=20.0).contains(&min_y), "unexpected min_y={min_y}");
+        assert!(
+            max_x > 250.0,
+            "expected middle-anchored text at x=200 to expand max_x past 250, got {max_x}"
+        );
+        assert!(
+            max_y > 110.0,
+            "expected text at y=110 to expand max_y past 110, got {max_y}"
+        );
+
+        let tightened = tighten_graphviz_viewbox(svg_with_outside_text, 12.0);
+        let (tw, th) = extract_svg_dimensions(&tightened).expect("tightened dims");
+        assert!(
+            tw >= (max_x - min_x) + 23.0,
+            "tightened width {tw} must cover text bounds + padding"
+        );
+        assert!(
+            th >= (max_y - min_y) + 23.0,
+            "tightened height {th} must cover text bounds + padding"
+        );
+
+        // 2. Pure plaintext diagram using `layout-rs` `<style>` class font-size & `<tspan dy="1.0em">`.
+        let plaintext_only = r#"<svg width="200" height="400" viewBox="0 0 200 400">
+  <style>.a14 { font-size: 14px; font-family: sans-serif; }</style>
+  <text dominant-baseline="central" text-anchor="middle" x="40" y="6" class="a14"><tspan x = "40" dy="1.0em">Very Long Plaintext Node</tspan></text>
+</svg>"#;
+        let (pmin_x, pmin_y, pmax_x, pmax_y) =
+            compute_graphviz_geometry_bounds(plaintext_only).expect("plaintext bounds");
+        assert!(
+            pmin_x < 0.0 && pmax_x > 80.0,
+            "expected wide centered tspan bounds around x=40, got [{pmin_x}, {pmax_x}]"
+        );
+        // `y=6` + `dy="1.0em"` (14px) => optical center at y=20, spanning roughly [11.6, 28.4]
+        assert!(
+            pmin_y < 14.0 && pmax_y > 26.0,
+            "expected vertical tspan bounds centered at y=20, got [{pmin_y}, {pmax_y}]"
+        );
+
+        // 3. `text-anchor="start"` / `"end"` and CJK width estimation.
+        let anchored_cjk = r#"<svg width="300" height="100" viewBox="0 0 300 100">
+  <text x="100" y="40" text-anchor="start" font-size="14">系统架构标签</text>
+  <text x="100" y="70" text-anchor="end" font-size="14">LeftSide</text>
+</svg>"#;
+        let (cmin_x, _, cmax_x, _) =
+            compute_graphviz_geometry_bounds(anchored_cjk).expect("cjk bounds");
+        assert!(
+            cmin_x < 55.0,
+            "expected end-anchored label to extend left of x=100, got min_x={cmin_x}"
+        );
+        assert!(
+            cmax_x > 180.0,
+            "expected 6 CJK chars at 14px to extend past x=180, got max_x={cmax_x}"
+        );
+    }
+
+    #[test]
+    fn mermaid_diamond_branching_uses_central_baseline_and_monotonic_edges() {
+        let mmd = r#"flowchart LR
+    U["User Prompt"] --> D["Orbit Daemon"]
+    D --> S["orbit shim (setsid)"]
+    S --> P{"Provider Driver"}
+    P -->|Codex| C["App Server"]
+    P -->|Claude| L["Stream JSON"]
+    P -->|Antigravity| A["Session RPC"]"#;
+        let out = render_diagram(&RenderDiagramRequest {
+            kind: DiagramKind::Mermaid,
+            source: mmd.into(),
+            theme: DiagramTheme::Dark,
+        });
+        assert!(out.error.is_none(), "mermaid error: {:?}", out.error);
+        let svg = out.svg.expect("mermaid svg");
+        assert!(!svg.contains("alignment-baseline=\"mathematical\""));
+        assert!(!svg.contains("dominant-baseline=\"middle\""));
+        // Verify every edge path progresses monotonically rightward (no U-turn detours beneath diamond)
+        let mut edge_count = 0usize;
+        for segment in svg.split("<path ").skip(1) {
+            let Some(tag_end) = segment.find('>') else {
+                continue;
+            };
+            let tag = &segment[..tag_end];
+            if !tag.contains("class=\"edgePath\"") {
+                continue;
+            }
+            edge_count += 1;
+            if let Some(d) = extract_attr_value_ci(tag, "d") {
+                let coords = extract_float_sequence(d);
+                let xs: Vec<f32> = coords.as_chunks::<2>().0.iter().map(|p| p[0]).collect();
+                assert!(
+                    xs.len() >= 2 && xs[xs.len() - 1] > xs[0],
+                    "edge path must progress rightward in d=\"{d}\""
+                );
+                // Allow minor orthogonal corner-radius pullback across platform font metrics
+                // (e.g. Linux DejaVu vs macOS SF) while rejecting grid-router U-turn detours.
+                for win in xs.windows(2) {
+                    assert!(
+                        win[1] + 20.0 >= win[0],
+                        "edge path looped backwards (x {} -> {}) in d=\"{d}\"",
+                        win[0],
+                        win[1]
+                    );
+                }
+            }
+        }
+        assert_eq!(edge_count, 6, "expected 6 directed edges");
     }
 }

@@ -50,7 +50,10 @@ import {
   DropdownMenuTrigger,
   SimpleTooltip,
 } from "@/components/ui/overlays";
-import { detectActiveTriggerKind } from "@/lib/composer-input";
+import {
+  detectActiveTriggerKind,
+  resolveComposerActionMode,
+} from "@/lib/composer-input";
 import { translate, useI18n, useLocale } from "@/lib/i18n";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
@@ -339,6 +342,14 @@ export const OmniComposer = memo(function OmniComposer({
   const t = useMemo(() => translate.bind(null, locale), [locale]);
   const mod = modSymbol();
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
+  const isSelectedHostOnline = useOrbitSelector((s) => {
+    if (!s.selectedHostId) return false;
+    const conn = s.fleet.hosts.find((h) => h.host_id === s.selectedHostId)?.connection_state;
+    return conn === "online_direct" || conn === "online_relay";
+  });
+  const isHostVoiceEnabled = useOrbitSelector((s) =>
+    Boolean(s.selectedHostId && s.voiceEnabledByHost[s.selectedHostId]),
+  );
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const activePathRulesCount = useOrbitSelector((s) =>
@@ -608,20 +619,23 @@ export const OmniComposer = memo(function OmniComposer({
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
+    let lastW = 0;
     let rafId: number | null = null;
     const ro = new ResizeObserver(([entry]) => {
-      const width = entry.borderBoxSize[0]?.inlineSize ?? entry.contentRect.width;
+      const nextW = Math.round(entry.borderBoxSize[0]?.inlineSize ?? entry.contentRect.width);
+      if (nextW === lastW) return;
+      lastW = nextW;
       if (rafId !== null) window.cancelAnimationFrame(rafId);
       rafId = window.requestAnimationFrame(() => {
         rafId = null;
-        setComposerWidthPx(width);
-        setIsCompactBar(width < 440);
+        setComposerWidthPx(nextW);
+        setIsCompactBar(nextW < 440);
       });
     });
     ro.observe(el, { box: "border-box" });
     return () => {
-      if (rafId !== null) window.cancelAnimationFrame(rafId);
       ro.disconnect();
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
     };
   }, [selectedHostId]);
 
@@ -1693,6 +1707,19 @@ export const OmniComposer = memo(function OmniComposer({
     };
   }, [selectedHostId, stopVoiceTimer]);
 
+  // Hydrate host-scoped voice setting so the bottom-right action reflects Settings immediately
+  useEffect(() => {
+    if (!selectedHostId || !isSelectedHostOnline) return;
+    void orbitActions.refreshHostVoiceEnabled(selectedHostId);
+  }, [selectedHostId, isSelectedHostOnline]);
+
+  // Cancel any active voice recording if Voice is turned off in Settings
+  useEffect(() => {
+    if (!isHostVoiceEnabled && voiceRecording) {
+      handleCancelVoice();
+    }
+  }, [isHostVoiceEnabled, voiceRecording, handleCancelVoice]);
+
   // Escape cancels an active recording without disturbing surrounding panels
   useEffect(() => {
     if (!voiceRecording) return;
@@ -1909,6 +1936,7 @@ export const OmniComposer = memo(function OmniComposer({
     let voiceLang: string | null = null;
     try {
       const voiceState = await orbitIpc.getVoiceConfig(selectedHostId);
+      orbitActions.setHostVoiceEnabled(selectedHostId, voiceState.config.enabled);
       voiceLang = voiceState.config.language;
       if (!voiceState.config.enabled) {
         orbitActions.showToast(t("composer.voiceDisabledOnHost"), {
@@ -1965,6 +1993,7 @@ export const OmniComposer = memo(function OmniComposer({
       let voiceLang: string | null = null;
       try {
         const cfgState = await orbitIpc.getVoiceConfig(selectedHostId);
+        orbitActions.setHostVoiceEnabled(selectedHostId, cfgState.config.enabled);
         voiceLang = cfgState.config.language;
       } catch {
         // Optional language hint
@@ -2335,6 +2364,7 @@ export const OmniComposer = memo(function OmniComposer({
               submitBusy={submitBusy}
               isTurnBusy={isTurnBusy}
               showStopButton={showStopButton}
+              voiceEnabled={isHostVoiceEnabled}
               voiceRecording={voiceRecording}
               voiceTranscribing={voiceTranscribing}
               submitTooltipLabel={submitTooltipLabel}
@@ -2364,6 +2394,7 @@ interface ComposerBottomBarProps {
   submitBusy: boolean;
   isTurnBusy: boolean;
   showStopButton: boolean;
+  voiceEnabled: boolean;
   voiceRecording: boolean;
   voiceTranscribing: boolean;
   submitTooltipLabel: string;
@@ -2383,22 +2414,20 @@ interface ComposerBottomBarProps {
 }
 
 const ComposerBottomBar = memo(function ComposerBottomBar({
-  hasPayload, submitBusy, isTurnBusy, showStopButton, voiceRecording, voiceTranscribing,
+  hasPayload, submitBusy, isTurnBusy, showStopButton, voiceEnabled, voiceRecording, voiceTranscribing,
   submitTooltipLabel, submitShortcut,
   activeMode, effectiveProvider, isCompactBar, selectedHostId, selectedAgentId,
   onAttach, onMention, onSlash, onSelectMode, onSubmit, onStartVoice, onStopVoice,
 }: ComposerBottomBarProps) {
   const { t } = useI18n();
-  const actionMode: "stop" | "voice_recording" | "submitting" | "send" | "voice_idle" =
-    voiceRecording
-      ? "voice_recording"
-      : showStopButton
-        ? "stop"
-        : submitBusy || voiceTranscribing
-          ? "submitting"
-          : hasPayload
-            ? "send"
-            : "voice_idle";
+  const actionMode = resolveComposerActionMode({
+    voiceRecording,
+    showStopButton,
+    submitBusy,
+    voiceTranscribing,
+    hasPayload,
+    voiceEnabled,
+  });
   const actionLabel =
     actionMode === "voice_recording"
       ? t("composer.voiceStopAndTranscribe")
@@ -2412,10 +2441,10 @@ const ComposerBottomBar = memo(function ComposerBottomBar({
   const actionShortcut =
     actionMode === "stop"
       ? "Esc Esc"
-      : actionMode === "send"
+      : actionMode === "send" || actionMode === "send_disabled"
         ? submitShortcut
         : undefined;
-  const actionDisabled = actionMode === "submitting";
+  const actionDisabled = actionMode === "submitting" || actionMode === "send_disabled";
 
   return (
     <div className="flex items-center justify-between gap-2 px-2.5 pt-2 pb-2">
@@ -2501,6 +2530,7 @@ const ComposerBottomBar = memo(function ComposerBottomBar({
           <button
             type="button"
             disabled={actionDisabled}
+            data-composer-action={actionMode}
             aria-busy={actionMode === "submitting"}
             aria-pressed={actionMode === "voice_recording" ? true : undefined}
             aria-label={actionLabel}
@@ -2533,7 +2563,9 @@ const ComposerBottomBar = memo(function ComposerBottomBar({
                     ? "bg-action-primary-bg text-action-primary-fg hover:bg-action-primary-hover"
                     : actionMode === "submitting"
                       ? "bg-action-primary-bg text-action-primary-fg pointer-events-none opacity-80"
-                      : "text-ink-secondary bg-surface-recessed hover:bg-accent hover:text-ink-primary",
+                      : actionMode === "send_disabled"
+                        ? "text-ink-muted bg-surface-recessed pointer-events-none opacity-65"
+                        : "text-ink-secondary bg-surface-recessed hover:bg-accent hover:text-ink-primary",
             )}
           >
             <span className="relative flex size-4 items-center justify-center">
@@ -2550,7 +2582,7 @@ const ComposerBottomBar = memo(function ComposerBottomBar({
                 aria-hidden="true"
                 className={cn(
                   "absolute size-[17px] stroke-[2.15] transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)]",
-                  actionMode === "send"
+                  actionMode === "send" || actionMode === "send_disabled"
                     ? "scale-100 opacity-100"
                     : "pointer-events-none scale-75 opacity-0",
                 )}

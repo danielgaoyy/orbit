@@ -30,7 +30,17 @@ import { WorkspaceScriptsPopover } from "@/components/side-panel/scripts-panel";
 import { SimpleTooltip } from "@/components/ui/overlays";
 import { PanelErrorBoundary } from "@/components/ui/panel-error-boundary";
 import { SubagentAvatar } from "@/components/ui/subagent-avatar";
-import { selectSessionSubagents } from "@/state/selectors/session-selectors";
+import type {
+  HostCardView,
+  HostDetailView,
+  SessionSubagentEntryView,
+} from "@/lib/orbit-ipc";
+import { getSubagentCharacterById } from "@/lib/subagent-avatar";
+import type { ResolvedSubagentStatus } from "@/lib/subagents";
+import {
+  hasCrossHostChildAgents,
+  selectSessionSubagents,
+} from "@/state/selectors/session-selectors";
 import { type MessageKey, useI18n } from "@/lib/i18n";
 import { useActionShortcutDisplay } from "@/lib/keybindings";
 import {
@@ -47,6 +57,32 @@ interface TabDropIndicator {
   position: "before" | "after";
 }
 
+const EMPTY_INSIGHT_SUBAGENTS: readonly SessionSubagentEntryView[] = [];
+const EMPTY_HOST_DETAILS: Record<string, HostDetailView> = {};
+const EMPTY_FLEET_HOSTS: readonly HostCardView[] = [];
+
+const FileTabDirtyIndicator = memo(function FileTabDirtyIndicator({
+  hostId,
+  cwd,
+  filePath,
+  title,
+}: {
+  hostId: string;
+  cwd: string;
+  filePath: string;
+  title: string;
+}) {
+  const key = fileCacheKey(hostId, cwd, filePath);
+  const isDirty = useOrbitSelector((s) => Boolean(s.fileEditorDrafts[key]?.dirty));
+  if (!isDirty) return null;
+  return (
+    <span
+      title={title}
+      className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500/90"
+    />
+  );
+});
+
 const SubagentSidePanelTabAvatar = memo(function SubagentSidePanelTabAvatar({
   tab,
 }: {
@@ -54,39 +90,63 @@ const SubagentSidePanelTabAvatar = memo(function SubagentSidePanelTabAvatar({
 }) {
   const hostId = useOrbitSelector((s) => s.selectedHostId);
   const parentAgentId = useOrbitSelector((s) => tab.parentAgentId ?? s.selectedAgentId);
-  const hostDetails = useOrbitSelector((s) => s.hostDetails);
-  const fleet = useOrbitSelector((s) => s.fleet);
-  const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
-  const parentStage = useOrbitSelector((s) =>
-    hostId && parentAgentId ? (s.stages[`${hostId}::${parentAgentId}`] ?? null) : null,
+  const insightSubagents = useOrbitSelector((s) =>
+    hostId && parentAgentId
+      ? (s.stages[`${hostId}::${parentAgentId}`]?.insights?.subagents ?? EMPTY_INSIGHT_SUBAGENTS)
+      : EMPTY_INSIGHT_SUBAGENTS,
   );
+  const avatarKey = useOrbitSelector((s) => {
+    if (!hostId || !parentAgentId) return "";
+    const hasCrossHost = hasCrossHostChildAgents(
+      s.hostDetails,
+      hostId,
+      parentAgentId,
+      insightSubagents,
+    );
+    const localDetail = s.hostDetails[hostId];
+    const scopedHostDetails = hasCrossHost
+      ? s.hostDetails
+      : localDetail
+        ? { [hostId]: localDetail }
+        : EMPTY_HOST_DETAILS;
+    const summary = selectSessionSubagents(
+      {
+        hostDetails: scopedHostDetails,
+        fleet: {
+          revision: 0,
+          total_pending_approvals: 0,
+          hosts: (hasCrossHost ? s.fleet.hosts : EMPTY_FLEET_HOSTS) as HostCardView[],
+          projects: [],
+        },
+        archivedSubagents: s.archivedSubagents,
+      },
+      hostId,
+      parentAgentId,
+      insightSubagents,
+    );
+    const matched = summary.all.find(
+      (sa) =>
+        (tab.childAgentId && sa.childAgentId === tab.childAgentId) ||
+        (tab.providerSubagentId && sa.providerSubagentId === tab.providerSubagentId) ||
+        (tab.subagentCallId && sa.callId === tab.subagentCallId),
+    );
+    if (!matched) return "";
+    return `${matched.character.id}\0${matched.status}`;
+  });
 
-  const summary = selectSessionSubagents(
-    {
-      hostDetails,
-      fleet,
-      archivedSubagents,
-      stages: hostId && parentAgentId && parentStage ? { [`${hostId}::${parentAgentId}`]: parentStage } : {},
-    },
-    hostId,
-    parentAgentId,
-  );
-
-  const matched = summary.all.find(
-    (sa) =>
-      (tab.childAgentId && sa.childAgentId === tab.childAgentId) ||
-      (tab.providerSubagentId && sa.providerSubagentId === tab.providerSubagentId) ||
-      (tab.subagentCallId && sa.callId === tab.subagentCallId),
-  );
+  const sepIdx = avatarKey.indexOf("\0");
+  const character =
+    sepIdx > 0 ? (getSubagentCharacterById(avatarKey.slice(0, sepIdx)) ?? undefined) : undefined;
+  const status = (sepIdx >= 0 ? avatarKey.slice(sepIdx + 1) : "completed") as ResolvedSubagentStatus;
 
   const fallbackSeed =
     tab.childAgentId || tab.providerSubagentId || tab.subagentCallId || tab.title;
 
   return (
     <SubagentAvatar
-      character={matched?.character}
+      character={character}
       seedKey={fallbackSeed}
-      status={matched?.status ?? "completed"}
+      status={status}
       size="xs"
     />
   );
@@ -260,7 +320,6 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
   const sidebarOpen = useOrbitSelector((s) => s.sidebarOpen);
   const selectedWorkspaceCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const tabs = useOrbitSelector((s) => s.sidePanelTabs);
-  const fileEditorDrafts = useOrbitSelector((s) => s.fileEditorDrafts);
   const sidePanelSplit = useOrbitSelector((s) => s.sidePanelSplit);
   const activeTabId = useOrbitSelector((s) => s.activeSidePanelTabId);
   const newTabShortcut = useActionShortcutDisplay("new_side_tab");
@@ -619,18 +678,6 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                       const isPrimary = tab.id === activeTab?.id;
                       const isSecondary = tab.id === secondaryTab?.id;
                       const isActive = isPrimary || isSecondary;
-                      const isDirtyFile =
-                        tab.kind === "file" &&
-                        Boolean(tab.filePath) &&
-                        Boolean(
-                          fileEditorDrafts[
-                            fileCacheKey(
-                              tab.hostId ?? selectedHostId,
-                              tab.cwd ?? selectedWorkspaceCwd ?? "~",
-                              tab.filePath ?? "",
-                            )
-                          ]?.dirty,
-                        );
                       const showPulseDot =
                         (tab.kind === "side_question" && hasStreamingSideQuestion) ||
                         (tab.kind === "terminal" && activeTerminalCount > 0 && !isActive);
@@ -682,10 +729,12 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                           )}
                           <SidePanelTabIcon tab={tab} />
                           <span className="min-w-0 truncate">{displayTitle}</span>
-                          {isDirtyFile && (
-                            <span
+                          {tab.kind === "file" && tab.filePath && (
+                            <FileTabDirtyIndicator
+                              hostId={tab.hostId ?? selectedHostId}
+                              cwd={tab.cwd ?? selectedWorkspaceCwd ?? "~"}
+                              filePath={tab.filePath}
                               title={t("sidePanel.unsavedChanges")}
-                              className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500/90"
                             />
                           )}
                           {tab.kind === "artifacts" && artifactCount > 0 && (

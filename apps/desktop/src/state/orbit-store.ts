@@ -23,7 +23,6 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
-import { createCachedStateSnapshot } from "@/lib/selector-snapshot";
 import {
   MAX_CACHED_STAGE_VIEWS,
   collectPinnedStageKeys,
@@ -212,6 +211,42 @@ const composerFocusListeners = new Set<(opts?: ComposerFocusOptions) => void>();
 
 const autoUpgradeAttempted = new Map<string, string>();
 const stagePullGates = new Map<string, StagePullGate>();
+const TIMELINE_STREAM_COALESCE_MS = 32;
+const timelineStreamCoalescers = new Map<
+  string,
+  { lastDispatchedAt: number; timerId: ReturnType<typeof setTimeout> | null }
+>();
+
+function scheduleCoalescedTimelinePull(hostId: string, agentId: string): void {
+  if (typeof window === "undefined" || typeof window.setTimeout !== "function") {
+    void orbitActions.pullStageDelta(hostId, agentId);
+    return;
+  }
+  const key = `${hostId}::${agentId}`;
+  const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+  let state = timelineStreamCoalescers.get(key);
+  if (!state) {
+    state = { lastDispatchedAt: 0, timerId: null };
+    timelineStreamCoalescers.set(key, state);
+  }
+  const elapsed = now - state.lastDispatchedAt;
+  if (state.timerId === null && elapsed >= TIMELINE_STREAM_COALESCE_MS) {
+    state.lastDispatchedAt = now;
+    void orbitActions.pullStageDelta(hostId, agentId);
+    return;
+  }
+  if (state.timerId !== null) return;
+  const delay = Math.max(1, Math.ceil(TIMELINE_STREAM_COALESCE_MS - elapsed));
+  state.timerId = setTimeout(() => {
+    const cur = timelineStreamCoalescers.get(key);
+    if (cur) {
+      cur.timerId = null;
+      cur.lastDispatchedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+    }
+    if (disposed) return;
+    void orbitActions.pullStageDelta(hostId, agentId);
+  }, delay);
+}
 const hostSyncGates = new Map<string, SimpleSyncGate>();
 const fleetSyncGate: SimpleSyncGate = { inFlight: false, queued: false, rafId: null };
 const sidebarSyncGate: SimpleSyncGate = { inFlight: false, queued: false, rafId: null };
@@ -818,7 +853,7 @@ function subscribeCoreEvents(): Promise<void> {
                 (t.kind === "subagent" && t.childAgentId === ev.agent_id)),
           );
         if (isMainStage || isOpenTimelineTab) {
-          void orbitActions.pullStageDelta(ev.host_id, ev.agent_id);
+          scheduleCoalescedTimelinePull(ev.host_id, ev.agent_id);
         }
         if (isMainStage && snap.selectedWorkspaceCwd) {
           scheduleStreamAutoRefreshGit(ev.host_id, snap.selectedWorkspaceCwd);
@@ -1173,12 +1208,31 @@ export function useOrbitSelector<T>(
   topics?: StoreTopic | readonly StoreTopic[],
 ): T {
   const explicitMask = topics !== undefined ? topicsToMask(topics) : null;
+  const selectorRef = useRef(selector);
+  selectorRef.current = selector;
+  const explicitMaskRef = useRef<number | null>(explicitMask);
+  explicitMaskRef.current = explicitMask;
+
   const subRef = useRef<{
     handle: TopicSubscriptionHandle | null;
     desiredMask: number;
   }>({
     handle: null,
     desiredMask: explicitMask ?? ALL_TOPICS_MASK,
+  });
+
+  const cacheRef = useRef<{
+    hasCache: boolean;
+    state: OrbitUiState | undefined;
+    selector: ((s: OrbitUiState) => T) | undefined;
+    explicitMask: number | null;
+    value: T;
+  }>({
+    hasCache: false,
+    state: undefined,
+    selector: undefined,
+    explicitMask: null,
+    value: undefined as T,
   });
 
   const subscribe = useCallback((onStoreChange: () => void) => {
@@ -1192,25 +1246,50 @@ export function useOrbitSelector<T>(
     };
   }, []);
 
-  const getSnapshot = createCachedStateSnapshot(
-    () => kernel.getState(),
-    (currentState) => {
-      if (explicitMask !== null) {
-        if (subRef.current.desiredMask !== explicitMask) {
-          subRef.current.desiredMask = explicitMask;
-          subRef.current.handle?.updateMask(explicitMask);
-        }
-        return selector(currentState);
+  const getSnapshot = useCallback((): T => {
+    const currentState = kernel.getState();
+    const currentSelector = selectorRef.current;
+    const currentExplicitMask = explicitMaskRef.current;
+    const cache = cacheRef.current;
+    if (
+      cache.hasCache &&
+      Object.is(cache.state, currentState) &&
+      cache.selector === currentSelector &&
+      cache.explicitMask === currentExplicitMask
+    ) {
+      return cache.value;
+    }
+
+    let nextValue: T;
+    if (currentExplicitMask !== null) {
+      if (subRef.current.desiredMask !== currentExplicitMask) {
+        subRef.current.desiredMask = currentExplicitMask;
+        subRef.current.handle?.updateMask(currentExplicitMask);
       }
-      const { value, mask } = evaluateSelectorWithTopicTracking(currentState, selector);
+      nextValue = currentSelector(currentState);
+    } else {
+      const { value, mask } = evaluateSelectorWithTopicTracking(currentState, currentSelector);
       if (subRef.current.desiredMask !== mask) {
         subRef.current.desiredMask = mask;
         subRef.current.handle?.updateMask(mask);
       }
-      return value;
-    },
-    isDevSelectorGuard && !didWarnUnstableSelector ? warnUnstableSelectorOnce : undefined,
-  );
+      nextValue = value;
+    }
+
+    if (isDevSelectorGuard && !didWarnUnstableSelector) {
+      const checkValue = currentSelector(currentState);
+      if (!Object.is(nextValue, checkValue)) {
+        warnUnstableSelectorOnce();
+      }
+    }
+
+    cache.state = currentState;
+    cache.selector = currentSelector;
+    cache.explicitMask = currentExplicitMask;
+    cache.value = nextValue;
+    cache.hasCache = true;
+    return nextValue;
+  }, []);
 
   return useSyncExternalStore(subscribe, getSnapshot);
 }

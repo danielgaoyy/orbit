@@ -1054,7 +1054,6 @@ html.orbit-linux .animate-spin {
   .settings-rail-group + .settings-rail-group { margin-top: 6px; }
 }
 .settings-view [data-setting-id] { scroll-margin-block: 24px; }
-.settings-view [data-modified="true"] { box-shadow: inset 2px 0 var(--ink-muted); }
 
 [data-settings-highlight="true"] {
   position: relative;

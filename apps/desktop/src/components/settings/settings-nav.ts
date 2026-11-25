@@ -13,7 +13,7 @@ export type SettingsNavGroupId = (typeof SETTINGS_NAV_GROUPS)[number]["id"];
 
 export const SETTINGS_CORE_SECTIONS = [
   { group: "preferences", id: "general", labelKey: "settings.navGeneral" },
-  { group: "preferences", id: "appearance", labelKey: "settings.nav4Appearance" },
+  { group: "preferences", id: "appearance", labelKey: "settings.navAppearance" },
   { group: "preferences", id: "shortcuts", labelKey: "settings.subTabShortcuts" },
   { group: "preferences", id: "notifications", labelKey: "settings.subTabNotifications" },
   { group: "preferences", id: "voice", labelKey: "settings.subTabVoice" },

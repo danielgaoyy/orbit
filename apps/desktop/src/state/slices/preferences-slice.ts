@@ -64,18 +64,10 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
       const nextTheme: ThemeMode = fresh.theme ?? getState().theme;
       const nextResolved = resolveTheme(nextTheme);
       applyDocumentTheme(nextResolved);
-      const nextFontSize = fresh.terminalFontSize ?? getState().terminalFontSize;
-      const nextCursor = fresh.terminalCursorStyle ?? getState().terminalCursorStyle;
-      const nextScrollback = fresh.terminalScrollback ?? getState().terminalScrollback;
-      const nextTerminalThemeMode = fresh.terminalThemeMode ?? getState().terminalThemeMode;
       if (
         nextLocale === getState().locale &&
         nextTheme === getState().theme &&
-        nextResolved === getState().resolvedTheme &&
-        nextFontSize === getState().terminalFontSize &&
-        nextCursor === getState().terminalCursorStyle &&
-        nextScrollback === getState().terminalScrollback &&
-        nextTerminalThemeMode === getState().terminalThemeMode
+        nextResolved === getState().resolvedTheme
       ) {
         return;
       }
@@ -84,10 +76,6 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
         locale: nextLocale,
         theme: nextTheme,
         resolvedTheme: nextResolved,
-        terminalFontSize: nextFontSize,
-        terminalCursorStyle: nextCursor,
-        terminalScrollback: nextScrollback,
-        terminalThemeMode: nextTerminalThemeMode,
       }));
     },
 
@@ -321,28 +309,13 @@ export function createPreferencesSlice(ctx: OrbitStoreContext) {
     },
 
 
-    setTerminalPrefs(patch: {
+    setTerminalPrefs(_patch: {
       fontSize?: number;
       cursorStyle?: TerminalCursorStyle;
       scrollback?: number;
       themeMode?: TerminalThemeMode;
     }): void {
-      setState(
-        (s) => ({
-          ...s,
-          terminalFontSize:
-            patch.fontSize !== undefined
-              ? Math.min(18, Math.max(10, patch.fontSize))
-              : s.terminalFontSize,
-          terminalCursorStyle: patch.cursorStyle ?? s.terminalCursorStyle,
-          terminalScrollback:
-            patch.scrollback !== undefined
-              ? Math.min(50000, Math.max(500, patch.scrollback))
-              : s.terminalScrollback,
-          terminalThemeMode: patch.themeMode ?? s.terminalThemeMode,
-        }),
-        true,
-      );
+      // Terminal always uses Orbit's curated factory defaults and is not user-configurable.
     },
 
 

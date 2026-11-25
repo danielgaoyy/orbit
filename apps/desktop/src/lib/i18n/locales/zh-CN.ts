@@ -732,7 +732,6 @@ export const zhCN: MessageDictionary = {
   "settings.nav4FleetSync": "主机与同步",
   "settings.nav4AgentsSafety": "智能体与安全",
   "settings.nav4ContextExtensions": "上下文与扩展",
-  "settings.nav4Appearance": "外观与终端",
   "settings.nav4Hosts": "主机集群",
   "settings.nav4Safety": "安全与沙箱",
   "settings.nav4Instructions": "指令与记忆",
@@ -776,9 +775,6 @@ export const zhCN: MessageDictionary = {
   // Settings -> General
   "settings.appVersion": "应用版本",
   "settings.manageFleet": "主机与集群",
-  "settings.terminalPreview": "终端预览",
-  "settings.fontDecrease": "缩小终端字体",
-  "settings.fontIncrease": "放大终端字体",
   "settings.notifyPermissionGroup": "桌面权限",
   "settings.desktopNotificationPermission": "桌面通知",
   "settings.notifyPermissionGranted": "点击通知可打开对应会话。",
@@ -889,8 +885,8 @@ export const zhCN: MessageDictionary = {
   "settings.openSetupGuide": "打开向导",
 
   // Settings -> Appearance
-  "settings.appearanceTitle": "外观与终端",
-  "settings.appearanceDesc": "主题、代码审查布局与终端外观。",
+  "settings.appearanceTitle": "外观",
+  "settings.appearanceDesc": "主题与代码审查布局。",
   "settings.groupInterface": "界面",
   "settings.language": "语言",
   "settings.languageDesc": "Orbit 桌面端的界面显示语言。",

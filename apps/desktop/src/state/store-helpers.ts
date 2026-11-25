@@ -736,13 +736,10 @@ export function createDefaultInitialState(
     coalesceExploration: initialPrefs.coalesceExploration ?? preferenceDefaults.coalesceExploration,
     worktreeBranchPrefix: initialPrefs.worktreeBranchPrefix ?? preferenceDefaults.worktreeBranchPrefix,
     preferredEditor: initialPrefs.preferredEditor ?? preferenceDefaults.preferredEditor,
-    terminalFontSize:
-      initialPrefs.terminalFontSize !== undefined
-        ? Math.min(18, Math.max(10, Math.round(initialPrefs.terminalFontSize)))
-        : preferenceDefaults.terminalFontSize,
-    terminalCursorStyle: initialPrefs.terminalCursorStyle ?? preferenceDefaults.terminalCursorStyle,
-    terminalScrollback: initialPrefs.terminalScrollback ?? preferenceDefaults.terminalScrollback,
-    terminalThemeMode: initialPrefs.terminalThemeMode ?? preferenceDefaults.terminalThemeMode,
+    terminalFontSize: preferenceDefaults.terminalFontSize,
+    terminalCursorStyle: preferenceDefaults.terminalCursorStyle,
+    terminalScrollback: preferenceDefaults.terminalScrollback,
+    terminalThemeMode: preferenceDefaults.terminalThemeMode,
     customKeybindings: sanitizeCustomKeybindings(initialPrefs.customKeybindings),
   };
 }

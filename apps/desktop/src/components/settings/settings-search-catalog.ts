@@ -18,11 +18,6 @@ export const SETTING_ENTRIES = [
 
   ["appearance", "settings.groupTheme", "system light dark color scheme 主题 暗色 ダーク ライト テーマ"],
   ["appearance", "settings.diffLayout", "git code review diff layout unified split 统一 分栏 差分 並列"],
-  ["appearance", "settings.terminalTheme", "terminal colors ansi palette 终端配色 ターミナルテーマ"],
-  ["appearance", "settings.fontSize", "terminal font size 终端字号 ターミナル文字サイズ"],
-  ["appearance", "settings.cursorStyle", "terminal cursor block underline bar 光标形状 カーソル"],
-  ["appearance", "settings.scrollback", "terminal scrollback history buffer 滚动缓冲 スクロールバック 履歴"],
-  ["appearance", "settings.terminalPreview", "ansi terminal preview 终端预览 端末プレビュー"],
 
   ["shortcuts", "settings.searchShortcutsPlaceholder", "keybindings hotkeys filter 查找快捷键 ショートカット検索"],
   ...SHORTCUT_ACTIONS.map(({ labelKey, defaultChord }): SettingEntry => ["shortcuts", labelKey, defaultChord]),

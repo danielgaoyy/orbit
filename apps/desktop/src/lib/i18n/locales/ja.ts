@@ -740,7 +740,6 @@ export const ja: MessageDictionary = {
   "settings.nav4FleetSync": "フリートと同期",
   "settings.nav4AgentsSafety": "エージェントと安全性",
   "settings.nav4ContextExtensions": "コンテキストと拡張機能",
-  "settings.nav4Appearance": "外観とターミナル",
   "settings.nav4Hosts": "ホストとフリート",
   "settings.nav4Safety": "安全性とサンドボックス",
   "settings.nav4Instructions": "指示とメモリ",
@@ -784,9 +783,6 @@ export const ja: MessageDictionary = {
   // Settings -> General
   "settings.appVersion": "アプリのバージョン",
   "settings.manageFleet": "ホストとフリート",
-  "settings.terminalPreview": "ターミナルのプレビュー",
-  "settings.fontDecrease": "ターミナルの文字を小さくする",
-  "settings.fontIncrease": "ターミナルの文字を大きくする",
   "settings.notifyPermissionGroup": "デスクトップ通知の権限",
   "settings.desktopNotificationPermission": "デスクトップ通知",
   "settings.notifyPermissionGranted": "通知をクリックすると該当の会話が開きます。",
@@ -899,8 +895,8 @@ export const ja: MessageDictionary = {
   "settings.openSetupGuide": "ガイドを開く",
 
   // Settings -> Appearance
-  "settings.appearanceTitle": "外観とターミナル",
-  "settings.appearanceDesc": "テーマ、コードレビューのレイアウト、ターミナルの外観。",
+  "settings.appearanceTitle": "外観",
+  "settings.appearanceDesc": "テーマとコードレビューのレイアウト。",
   "settings.groupInterface": "インターフェース",
   "settings.language": "言語",
   "settings.languageDesc": "Orbit デスクトップの表示言語。",

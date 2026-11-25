@@ -740,7 +740,6 @@ export const en = {
   "settings.nav4FleetSync": "Fleet & Sync",
   "settings.nav4AgentsSafety": "Agents & Safety",
   "settings.nav4ContextExtensions": "Context & Extensions",
-  "settings.nav4Appearance": "Appearance & Terminal",
   "settings.nav4Hosts": "Hosts & Fleet",
   "settings.nav4Safety": "Safety & Sandbox",
   "settings.nav4Instructions": "Instructions & Memory",
@@ -784,9 +783,6 @@ export const en = {
   // Settings -> General
   "settings.appVersion": "App version",
   "settings.manageFleet": "Hosts & Fleet",
-  "settings.terminalPreview": "Terminal preview",
-  "settings.fontDecrease": "Decrease terminal font size",
-  "settings.fontIncrease": "Increase terminal font size",
   "settings.notifyPermissionGroup": "Desktop permission",
   "settings.desktopNotificationPermission": "Desktop notifications",
   "settings.notifyPermissionGranted": "Click an alert to open its conversation.",
@@ -900,8 +896,8 @@ export const en = {
   "settings.openSetupGuide": "Open Setup Guide",
 
   // Settings -> Appearance
-  "settings.appearanceTitle": "Appearance & Terminal",
-  "settings.appearanceDesc": "Theme, code review layout, and terminal appearance.",
+  "settings.appearanceTitle": "Appearance",
+  "settings.appearanceDesc": "Theme and code review layout.",
   "settings.groupInterface": "Interface",
   "settings.language": "Language",
   "settings.languageDesc": "Display language for Orbit Desktop.",

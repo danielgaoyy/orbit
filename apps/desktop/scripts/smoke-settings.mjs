@@ -165,23 +165,23 @@ export async function exerciseLocalSettings(cdp) {
   await waitFor("restored default", (selector) => document.querySelector(selector)?.getAttribute("aria-checked") === "true", toggle);
 
   await key("f", "KeyF", 4);
-  await cdp.send("Input.insertText", { text: "scrollback" });
+  await cdp.send("Input.insertText", { text: "diff layout" });
   await key("Escape", "Escape");
   await waitFor("Escape clears the query", (selector) => document.querySelector(selector)?.value === "", search);
   await key("f", "KeyF", 4);
-  await cdp.send("Input.insertText", { text: "scrollback" });
+  await cdp.send("Input.insertText", { text: "diff layout" });
   await key("Enter", "Enter");
-  await waitFor("scrollback row highlighted in view", () => {
-    const row = document.querySelector('[data-setting-id="settings.scrollback"][data-settings-highlight="true"]');
+  await waitFor("diff layout row highlighted in view", () => {
+    const row = document.querySelector('[data-setting-id="settings.diffLayout"][data-settings-highlight="true"]');
     if (!row) return false;
     const rect = row.getBoundingClientRect();
     return rect.top >= 0 && rect.bottom <= innerHeight;
   });
-  await click('[data-setting-id="settings.fontSize"] button', "Increase terminal font size");
-  await waitFor("terminal preview updates to 14px across four lines", () => {
-    const screen = document.querySelector('[data-setting-id="settings.terminalPreview"] > div');
-    return screen?.children.length === 4 && getComputedStyle(screen).fontSize === "14px";
-  });
+  assert.equal(
+    await evaluate(() => Boolean(document.querySelector('[data-setting-id="settings.terminalTheme"], [data-setting-id="settings.fontSize"], [data-setting-id="settings.cursorStyle"], [data-setting-id="settings.scrollback"], [data-setting-id="settings.terminalPreview"]'))),
+    false,
+    "Terminal settings should not be exposed in Appearance",
+  );
 
   await go("im_channels");
   await click('[data-slot="settings-view"] button', "Add Channel");

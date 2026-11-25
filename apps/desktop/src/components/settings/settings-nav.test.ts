@@ -110,7 +110,7 @@ describe("Settings search", () => {
 
   it("matches individual settings, localized labels and keywords across all language choices", () => {
     const cases: [string, string | undefined][] = [
-      ["scrollback", "settings.scrollback"], ["分支前缀", "settings.branchPrefix"],
+      ["diff layout", "settings.diffLayout"], ["分支前缀", "settings.branchPrefix"],
       ["音声認識", "voice.sttBackendTitle"], ["whisper", "voice.sttBackendTitle"],
       ["keep awake", "settings.agentKeepAwake"], ["cloudflare", "settings.advancedRelayTitle"],
       ["CLAUDE.md", "settings.subTabInstructions"], ["飞书", "im.configuredChannels"],
@@ -122,18 +122,18 @@ describe("Settings search", () => {
         assert.equal(result?.settingId, id, query);
       }
     }
-    assert.equal(searchSettingsEntries("Appearance & Terminal", { t })[0]?.id, "appearance");
+    assert.equal(searchSettingsEntries("Appearance", { t })[0]?.id, "appearance");
     assert.equal(searchSettingsEntries("项目记忆", { t }).some((hit) => hit.settingId === "memory.title"), true);
   });
 
   it("filters modified rows using current values and combines the filter with text", () => {
-    const modifiedIds = new Set(["settings.branchPrefix", "settings.scrollback", "settings.defaultPermissions"]);
+    const modifiedIds = new Set(["settings.branchPrefix", "settings.diffLayout", "settings.defaultPermissions"]);
     assert.deepEqual(new Set(searchSettingsEntries("@modified", { t, modifiedIds }).map((hit) => hit.id)), modifiedIds);
-    const [result] = searchSettingsEntries("terminal @MODIFIED", { t, modifiedIds });
-    assert.equal(result.settingId, "settings.scrollback");
+    const [result] = searchSettingsEntries("diff @MODIFIED", { t, modifiedIds });
+    assert.equal(result.settingId, "settings.diffLayout");
     assert.equal(result.target, "appearance");
-    modifiedIds.delete("settings.scrollback");
-    assert.deepEqual(searchSettingsEntries("@modified terminal", { t, modifiedIds }), []);
+    modifiedIds.delete("settings.diffLayout");
+    assert.deepEqual(searchSettingsEntries("@modified diff", { t, modifiedIds }), []);
     assert.deepEqual(searchSettingsEntries("@modified", { t }), []);
   });
 

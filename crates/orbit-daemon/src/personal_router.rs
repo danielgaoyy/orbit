@@ -20,9 +20,10 @@ use std::time::Duration;
 
 use orbit_protocol::{
     AGENT_ROLE_PERSONAL_ROUTER, AgentRole, AgentStatus, AgentSummary, ConnectedHostSummary,
-    FleetProjectEntry, GuardianAssessment, GuardianRiskLevel, HermesBridgeBundle, HostInfo,
-    LABEL_AGENT_ROLE, PendingPermissionSummary, PersonalRouterConfig, ProjectContextPacket,
-    ProviderKind, RouterHostCapabilities, RouterPreReviewMode, RouterScope, RouterStatusSnapshot,
+    FleetProjectEntry, FleetWorkspaceEntry, GuardianAssessment, GuardianRiskLevel,
+    HermesBridgeBundle, HostInfo, LABEL_AGENT_ROLE, LABEL_SESSION_TIER, PendingPermissionSummary,
+    PersonalRouterConfig, ProjectContextPacket, ProviderKind, RouterHostCapabilities,
+    RouterPreReviewMode, RouterScope, RouterStatusSnapshot, SESSION_TIER_PERSONAL_ROUTER,
     SessionMode, WireMessage, WorktreeCreateMode,
 };
 use orbit_providers::{find_provider_executable, resolve_acp_agent_command};
@@ -44,8 +45,11 @@ const REMOTE_FLEET_CACHE_TTL: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone, Default)]
 struct CachedRemoteFleetSnapshot {
     fetched_at: Option<std::time::Instant>,
+    host_descriptors: BTreeMap<String, String>,
     projects: Vec<FleetProjectEntry>,
+    workspaces: Vec<FleetWorkspaceEntry>,
     workers: BTreeMap<String, WorkerContextDigest>,
+    pending_perms: Vec<String>,
 }
 
 /// Persisted on-disk wrapper in `$ORBIT_HOME/personal_router.json` (`0o600`),
@@ -125,6 +129,12 @@ impl PersonalRouterManager {
 
     pub async fn config(&self) -> PersonalRouterConfig {
         self.state.read().await.config.clone()
+    }
+
+    /// Build the authoritative persistent system prompt for launching or resuming a Personal Router session.
+    pub async fn router_system_prompt_for_launch(&self) -> String {
+        let cfg = self.state.read().await.config.clone();
+        build_router_system_instructions(&cfg)
     }
 
     pub async fn active_router_agent_id(&self) -> Option<String> {
@@ -246,8 +256,8 @@ impl PersonalRouterManager {
             save_router_file(&self.home_dir, &guard)?;
         }
 
-        // Reset incremental fleet delta state whenever config changes so next turn sends full snapshot.
-        *self.fleet_ctx_state.write().await = None;
+        // Reset incremental fleet delta & remote cache whenever config changes so next turn sends a fresh full snapshot.
+        self.reset_fleet_context_state().await;
 
         if activate && new_config.enabled {
             let _ = self.ensure_router_agent().await?;
@@ -293,9 +303,26 @@ impl PersonalRouterManager {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| resolve_user_home().to_string_lossy().to_string());
 
+        let mut init_labels = HashMap::new();
+        init_labels.insert(
+            LABEL_AGENT_ROLE.to_string(),
+            AGENT_ROLE_PERSONAL_ROUTER.to_string(),
+        );
+        init_labels.insert(
+            LABEL_SESSION_TIER.to_string(),
+            SESSION_TIER_PERSONAL_ROUTER.to_string(),
+        );
+        init_labels.insert(
+            crate::workspace_organizer::LABEL_TITLE_LOCKED.to_string(),
+            "1".to_string(),
+        );
+
         let created = self
             .orchestrator
-            .create_and_start_agent(build_router_create_spec(&cfg, provider, acp_agent_id, cwd))
+            .create_and_start_agent_with_labels(
+                build_router_create_spec(&cfg, provider, acp_agent_id, cwd),
+                init_labels,
+            )
             .await?;
 
         // Mark canonical role, pin at top, and lock title
@@ -344,7 +371,10 @@ impl PersonalRouterManager {
             .store
             .list_agents_filtered(None, false, false, None)
             .unwrap_or_default();
-        let managed_workers_count = workers.iter().filter(|a| !a.is_personal_router()).count();
+        let managed_workers_count = workers
+            .iter()
+            .filter(|a| a.is_primary_conversation())
+            .count();
         let pending_approvals_count = self.orchestrator.list_pending_permissions(None).await.len();
 
         RouterStatusSnapshot {
@@ -650,7 +680,7 @@ impl PersonalRouterManager {
                 .list_agents_filtered(None, false, false, None)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|a| !a.is_personal_router() && a.cwd == canon_str)
+                .filter(|a| a.is_primary_conversation() && a.cwd == canon_str)
                 .take(12)
                 .map(|a| {
                     let h = a
@@ -692,49 +722,41 @@ impl PersonalRouterManager {
     async fn get_cached_remote_fleet_snapshot(
         &self,
         connected: &[ConnectedHostSummary],
-    ) -> (
-        Vec<FleetProjectEntry>,
-        BTreeMap<String, WorkerContextDigest>,
-    ) {
+    ) -> CachedRemoteFleetSnapshot {
         {
             let guard = self.remote_fleet_cache.read().await;
             if let Some(ts) = guard.fetched_at
                 && ts.elapsed() < REMOTE_FLEET_CACHE_TTL
             {
-                return (guard.projects.clone(), guard.workers.clone());
+                return guard.clone();
             }
         }
-        let mut proj_tasks = Vec::new();
-        let mut agent_tasks = Vec::new();
+        let mut host_tasks = Vec::new();
         for host in connected.iter().filter(|h| h.enabled) {
-            let c1 = Arc::clone(&self.connected_hosts);
-            let h1 = host.clone();
-            proj_tasks.push(tokio::spawn(async move {
-                fetch_remote_host_projects(c1, h1).await
-            }));
-            let c2 = Arc::clone(&self.connected_hosts);
-            let h2 = host.clone();
-            agent_tasks.push(tokio::spawn(async move {
-                fetch_remote_host_workers(c2, h2).await
+            let c = Arc::clone(&self.connected_hosts);
+            let h = host.clone();
+            host_tasks.push(tokio::spawn(async move {
+                fetch_remote_host_atlas_bundle(c, h).await
             }));
         }
-        let mut projects = Vec::new();
-        for t in proj_tasks {
-            if let Ok(mut list) = t.await {
-                projects.append(&mut list);
-            }
-        }
-        let mut workers = BTreeMap::new();
-        for t in agent_tasks {
-            if let Ok(map) = t.await {
-                workers.extend(map);
+        let mut snap = CachedRemoteFleetSnapshot {
+            fetched_at: Some(std::time::Instant::now()),
+            ..CachedRemoteFleetSnapshot::default()
+        };
+        for t in host_tasks {
+            if let Ok((hid, host_desc, mut projs, mut wss, map, mut perms)) = t.await {
+                if let Some(desc) = host_desc {
+                    snap.host_descriptors.insert(hid, desc);
+                }
+                snap.projects.append(&mut projs);
+                snap.workspaces.append(&mut wss);
+                snap.workers.extend(map);
+                snap.pending_perms.append(&mut perms);
             }
         }
         let mut guard = self.remote_fleet_cache.write().await;
-        guard.fetched_at = Some(std::time::Instant::now());
-        guard.projects = projects.clone();
-        guard.workers = workers.clone();
-        (projects, workers)
+        *guard = snap.clone();
+        snap
     }
 
     pub async fn invalidate_remote_fleet_cache(&self) {
@@ -749,8 +771,9 @@ impl PersonalRouterManager {
     /// Build either a full `<orbit-fleet-state rev="N">` (first turn / after reset) or a compact
     /// `<orbit-fleet-delta rev="N">` (subsequent turns) to prepend to Personal Router prompts.
     ///
-    /// This guarantees the Personal Router never loses track of live Workers, Workspaces, or
-    /// connected hosts even across long sessions and Hermes context compaction.
+    /// Aggregates all local + connected remote hosts, their OS/provider capabilities, active Git
+    /// projects, curated Mission Workspaces (with current `Goal`), and primary user-visible
+    /// `Conversation`s (strictly excluding internal `Subagent`s).
     pub async fn build_fleet_context_incremental(&self, router_agent_id: &str) -> Option<String> {
         let cfg = self.state.read().await.config.clone();
         let connected = if cfg.scope == RouterScope::GlobalFleet {
@@ -777,7 +800,10 @@ impl PersonalRouterManager {
         let mut cur_hosts = BTreeMap::new();
         cur_hosts.insert(
             self.host_info.host_id.clone(),
-            format!("{} (local, online)", self.host_info.hostname),
+            format!(
+                "{} (local, online, {}/{})",
+                self.host_info.hostname, self.host_info.os, self.host_info.arch
+            ),
         );
         for h in &connected {
             let hid = h
@@ -818,14 +844,26 @@ impl PersonalRouterManager {
         }
 
         let mut cur_workspaces = BTreeMap::new();
-        for ws in workspaces.iter().take(MAX_FLEET_WORKSPACES_IN_CONTEXT) {
+        for ws in workspaces
+            .iter()
+            .filter(|w| w.is_curated)
+            .take(MAX_FLEET_WORKSPACES_IN_CONTEXT)
+        {
+            let goal_part = ws
+                .mission_goal
+                .as_deref()
+                .map(str::trim)
+                .filter(|g| !g.is_empty())
+                .map(|g| format!(" | goal={}", compact_inline(g, 64)))
+                .unwrap_or_default();
             cur_workspaces.insert(
-                ws.workspace_id.clone(),
+                format!("[local] {}", ws.workspace_id),
                 format!(
-                    "{} | cwd={} | board_rev={}",
+                    "{} | cwd={} | board_rev={}{}",
                     compact_inline(&ws.title, 48),
                     compact_inline(&ws.cwd, 64),
-                    ws.board_revision
+                    ws.board_revision,
+                    goal_part
                 ),
             );
         }
@@ -833,7 +871,7 @@ impl PersonalRouterManager {
         let mut cur_workers = BTreeMap::new();
         for ag in agents
             .iter()
-            .filter(|a| a.agent_id != router_agent_id && !a.is_personal_router())
+            .filter(|a| a.agent_id != router_agent_id && a.is_primary_conversation())
             .take(MAX_FLEET_WORKERS_IN_CONTEXT)
         {
             let handle = ag
@@ -864,10 +902,17 @@ impl PersonalRouterManager {
             );
         }
 
+        let mut remote_perm_lines: Vec<String> = Vec::new();
         if cfg.scope == RouterScope::GlobalFleet && !connected.is_empty() {
-            let (remote_projs, remote_workers) =
-                self.get_cached_remote_fleet_snapshot(&connected).await;
-            for rp in remote_projs.into_iter().take(MAX_FLEET_PROJECTS_IN_CONTEXT) {
+            let remote_snap = self.get_cached_remote_fleet_snapshot(&connected).await;
+            for (hid, desc) in remote_snap.host_descriptors {
+                cur_hosts.insert(hid, desc);
+            }
+            for rp in remote_snap
+                .projects
+                .into_iter()
+                .take(MAX_FLEET_PROJECTS_IN_CONTEXT)
+            {
                 let key = format!("{}:{}", rp.host_id, rp.cwd);
                 let br = rp.git_branch.unwrap_or_else(|| "-".into());
                 cur_projects.insert(
@@ -881,12 +926,35 @@ impl PersonalRouterManager {
                     ),
                 );
             }
-            for (k, rw) in remote_workers {
+            for rws in remote_snap.workspaces {
+                if cur_workspaces.len() >= MAX_FLEET_WORKSPACES_IN_CONTEXT * 2 {
+                    break;
+                }
+                let goal_part = rws
+                    .mission_goal
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|g| !g.is_empty())
+                    .map(|g| format!(" | goal={}", compact_inline(g, 64)))
+                    .unwrap_or_default();
+                cur_workspaces.insert(
+                    format!("[host={}] {}", rws.host_id, rws.workspace_id),
+                    format!(
+                        "{} | cwd={} | board_rev={}{}",
+                        compact_inline(&rws.title, 48),
+                        compact_inline(&rws.cwd, 64),
+                        rws.board_revision,
+                        goal_part
+                    ),
+                );
+            }
+            for (k, rw) in remote_snap.workers {
                 if cur_workers.len() >= MAX_FLEET_WORKERS_IN_CONTEXT {
                     break;
                 }
                 cur_workers.insert(k, rw);
             }
+            remote_perm_lines = remote_snap.pending_perms;
         }
 
         let mut guard = self.fleet_ctx_state.write().await;
@@ -935,10 +1003,13 @@ impl PersonalRouterManager {
                         ));
                     }
                 }
-                if !pending_perms.is_empty() {
+                if !pending_perms.is_empty() || !remote_perm_lines.is_empty() {
                     out.push_str("PendingPermissions:\n");
                     for p in pending_perms.iter().take(10) {
                         out.push_str(&format_pending_perm_line(p));
+                    }
+                    for rp in remote_perm_lines.iter().take(10) {
+                        out.push_str(rp);
                     }
                 }
                 out.push_str("</orbit-fleet-state>");
@@ -983,6 +1054,12 @@ impl PersonalRouterManager {
                                 .trim_end()
                         ));
                     }
+                }
+                for rp in remote_perm_lines.iter().take(6) {
+                    lines.push(format!(
+                        "! pending_perm {}",
+                        rp.trim_start_matches("- ").trim_end()
+                    ));
                 }
                 if lines.is_empty() {
                     None
@@ -1105,36 +1182,41 @@ platform_toolsets:\n\
     }
 }
 
-/// Core routing constitution injected into the Personal Router session & exported as `SOUL.md`.
+/// Core routing constitution injected persistently into the Personal Router's `system_prompt_append` & exported as `SOUL.md`.
 pub fn build_router_system_instructions(cfg: &PersonalRouterConfig) -> String {
     let mut base = String::from(
-        "# Orbit Personal Router (Chief-of-Staff / 分工师)\n\n\
-         You are the user's persistent Personal Router inside Orbit. Your job is to absorb all of the \
-         user's goals in a single calm conversation, maintain long-term context, and delegate all \
-         heavy coding/research/execution work to specialized Worker Conversations via Orbit MCP tools.\n\n\
-         ## Non-Negotiable Operating Principles\n\
-         1. **Never Block the Human (Fast-Ack & Async-Delegate)**: Reply concisely within seconds. \
-            Dispatch work asynchronously via `create_agent`, `spawn_workspace_peer`, or `send_agent_prompt` \
-            with `notify_on_finish: true`. Never wait synchronously for builds, tests, or long edits.\n\
-         2. **Stay Lightweight & Keep Context Clean**: Do NOT write repository code, run heavy terminal \
-            commands, or paste huge diffs/logs into this conversation. Use `workspace_peers` / `orbit_agent(status)` \
-            for concise checks and let the human click through to Worker conversations for deep diffs.\n\
-         3. **Smart Cross-Host Project & Workspace Orchestration**: Check `<orbit-fleet-state>` / `<orbit-fleet-delta>` \
-            before spawning. You can manage projects across ALL connected remote hosts: call \
-            `orbit_control(action=\"list_projects\", host_id=\"all\")` to discover remote repos and \
-            `orbit_control(action=\"inspect_project_context\", host_id=..., cwd=...)` to read a remote repo's \
-            `AGENTS.md`, `README.md`, git branch, and active workers BEFORE dispatching `create_agent(host_id=..., cwd=..., worktree=true, notify_on_finish=true)`. \
-            Reuse existing Workers when appropriate; group collaborating tasks into the same Mission Workspace \
-            (`orbit_workspace` + `orbit_agent(move_workspace)` + `workspace_board`).\n\
-         4. **3-Tier Safety & Pre-Review Discipline**: You may pre-review Tier-2 (`Medium`) permission \
-            checkpoints when they clearly align with the user's stated intent using \
-            `orbit_control(action=\"respond_permission\", ...)` (when mode is `medium_risk_only`). \
-            In `assist_only` mode OR for any Tier-3 (`High`/`Critical`, `human_only`, or plan approval) \
-            checkpoint, do NOT resolve directly — call \
-            `orbit_control(action=\"recommend_permission\", agent_id=..., request_id=..., decision=\"allow\"|\"deny\", reason=...)` \
-            with a concise 1-sentence rationale so the user can decide effortlessly in the Briefing Rail.\n\
-         5. **Calm Reporting**: When background Workers finish, synthesize concise milestone updates \
-            or silently trigger the next workflow step when no human decision is needed.\n",
+        "# Orbit Personal Router (Chief-of-Staff / 个人总控分诊师)\n\n\
+         You are the user's persistent **Personal Router** inside Orbit — NOT a hands-on coding worker and NOT a chatty Q&A bot. \
+         Your mission is to combine the user's multi-device environment (`<orbit-fleet-state>` / `<orbit-fleet-delta>`), \
+         smartly decompose intent, launch or steer **user-visible Sidebar Conversations** on the right device & Workspace via Orbit MCP, \
+         and synthesize ultra-concise, high-signal-to-noise (High-SNR) topic summaries.\n\n\
+         ## Non-Negotiable Operating Contract\n\
+         1. **Smart Scouting YES, Doing the Work Yourself NO**:\n\
+            - You **MAY** use your read/search/CLI/memory/skill tools for **1–2 fast scouting steps** (e.g., `orbit_control(action=\"inspect_project_context\")`, \
+              checking `git status`/`git log -n 5`, reading `AGENTS.md`/`README.md`, querying calendar/Feishu/docs skills, or recalling memory) \
+              so you route to the exact right host, repository, branch, and Workspace with a crisp brief.\n\
+            - You **MUST NOT** implement code changes, edit repository files, debug build/test loops, or write long solutions directly in this chat.\n\
+         2. **Dispatch User-Visible Orbit `Conversation`s — NEVER Black-Box Internal Subagents**:\n\
+            - **NEVER** call harness-internal subagent tools (`delegate_task`, `Task`, `invoke_subagent`, `swarm`, etc.): those hide sessions inside a black box.\n\
+            - **ALWAYS** dispatch execution/research via Orbit MCP `dispatch_conversation` (or `create_agent` / `send_agent_prompt` with `notify_on_finish: true`) \
+              so the session appears immediately as a first-class **Conversation** in the user's Orbit Left Sidebar where the human can observe, steer, or take over.\n\
+         3. **Multi-Device Fleet & Long-Lived Workspace Routing**:\n\
+            - Inspect `<orbit-fleet-state>` first: check every connected Host (`Hosts`), its repositories (`Projects`), active `Workspaces` (and their `goal`), and running `ActiveWorkers`.\n\
+            - Before routing to an unfamiliar or remote repository, call `orbit_control(action=\"inspect_project_context\", host_id=..., cwd=...)`.\n\
+            - Reuse an existing `Conversation` (`send_agent_prompt`) when continuing the same topic. Reuse an existing `Workspace` (`workspace_id=...`) when the work belongs to that project arena; \
+              if that Workspace's previous `Goal` / `BOARD.md` is from a finished old phase, call `orbit_workspace(action=\"reset_board\", workspace_id=..., goal=..., keep_notes=...)` \
+              to archive old notes to `BOARD.history.md` and keep the whiteboard clean without disturbing sidebar threads.\n\
+         4. **Ultra-High SNR Replies (Zero Conversational Fluff)**:\n\
+            - Keep every reply to **2–5 crisp lines**. No small talk, no repeating the user's prompt, no raw log/diff dumps.\n\
+            - When dispatching: state `[Dispatched] Host · Workspace · Conversation title/ID` + 1-line objective.\n\
+            - When a Conversation finishes and wakes you: give a **1–3 bullet executive digest** of the outcome or decision needed.\n\
+         5. **Strict Manual Reclaim Only (`发指令或点按钮才收回`)**:\n\
+            - **NEVER** auto-archive or call `reclaim_conversation` / `orbit_agent(action=\"archive\" | \"kill\")` on your own when a Conversation finishes! \
+              Leave completed Conversations visible in the user's Left Sidebar until the human **explicitly instructs you** to reclaim/archive them (e.g. \"收掉吧\" / \"归档刚才那个会话\").\n\
+         6. **3-Tier Safety & Pre-Review Discipline**:\n\
+            - You may pre-review Tier-2 (`Medium`) permission checkpoints for Conversations you routed when clearly aligned with user intent (`orbit_control(action=\"respond_permission\", ...)` in `medium_risk_only` mode).\n\
+            - In `assist_only` mode OR for any Tier-3 (`High`/`Critical`, `human_only`, or plan approval) checkpoint, do NOT resolve directly — call \
+              `orbit_control(action=\"recommend_permission\", agent_id=..., request_id=..., decision=\"allow\"|\"deny\", reason=...)` with a 1-sentence rationale.\n",
     );
     if let Some(ref custom) = cfg.soul_prompt_override {
         let trimmed = custom.trim();
@@ -1150,17 +1232,155 @@ pub fn build_router_system_instructions(cfg: &PersonalRouterConfig) -> String {
 const ORBIT_ROUTER_SKILL_TEMPLATE: &str = "\
 ---
 name: orbit-router
-description: Orchestrate multi-host Orbit coding Workers (Claude Code, Codex, Antigravity) and Mission Workspaces via Orbit MCP.
+description: Route tasks across multi-host Orbit devices into user-visible Sidebar Conversations and clean Mission Workspaces via Orbit MCP.
 ---
 
-# Orbit Router Workflow
+# Orbit Personal Router Workflow
 
-1. Inspect `<orbit-fleet-state>` or call `orbit_agent(action=\"list\")` and `orbit_workspace(action=\"list\")`.
-2. Pick the best target host (`orbit_control(action=\"list_hosts\")`) and provider/profile (`orbit_control(action=\"list_profiles\")`).
-3. Delegate heavy work asynchronously (`create_agent` or `spawn_workspace_peer` with `worktree: true` for parallel edits).
-4. Group related conversations into a shared Mission Workspace (`orbit_agent(action=\"move_workspace\")`) and coordinate via `workspace_board` (`BOARD.md`).
-5. Never block the user waiting for completion; rely on reactive finish notifications.
+1. Check `<orbit-fleet-state>` (Hosts, Projects, Workspaces + current Goal, ActiveWorkers).
+2. Scout lightly if needed (`orbit_control(action=\"inspect_project_context\", host_id=..., cwd=...)` or 1 quick read/skill check) — never write repo code or spawn harness-internal black-box subagents.
+3. Reuse or refresh a Mission Workspace (`orbit_workspace(action=\"create\" | \"update_goal\" | \"reset_board\")`) and launch/steer a user-visible Sidebar Conversation via `dispatch_conversation` or `send_agent_prompt` (`notify_on_finish: true`).
+4. Reply in 2–5 high-SNR lines. When notified of completion, summarize concisely and keep the Conversation in the sidebar until the user explicitly asks to `reclaim_conversation`.
 ";
+
+type RemoteHostAtlasBundle = (
+    String,
+    Option<String>,
+    Vec<FleetProjectEntry>,
+    Vec<FleetWorkspaceEntry>,
+    BTreeMap<String, WorkerContextDigest>,
+    Vec<String>,
+);
+
+async fn fetch_remote_host_atlas_bundle(
+    connected: Arc<ConnectedHostsManager>,
+    host: ConnectedHostSummary,
+) -> RemoteHostAtlasBundle {
+    let hid = host
+        .host_id
+        .clone()
+        .unwrap_or_else(|| host.registration_id.clone());
+    let c_proj = Arc::clone(&connected);
+    let h_proj = host.clone();
+    let c_ws = Arc::clone(&connected);
+    let h_ws = host.clone();
+    let c_ag = Arc::clone(&connected);
+    let h_ag = host.clone();
+    let c_perm = Arc::clone(&connected);
+    let hid_perm = hid.clone();
+    let c_cap = Arc::clone(&connected);
+    let h_cap = host.clone();
+
+    let (projs, wss, mut workers, perms_raw, cap) = tokio::join!(
+        fetch_remote_host_projects(c_proj, h_proj),
+        fetch_remote_host_workspaces(c_ws, h_ws),
+        fetch_remote_host_workers(c_ag, h_ag),
+        async move {
+            let req_id = Uuid::new_v4();
+            match c_perm
+                .send_rpc(
+                    &hid_perm,
+                    req_id,
+                    WireMessage::ListPendingPermissions {
+                        request_id: req_id,
+                        agent_id: None,
+                    },
+                    Duration::from_secs(4),
+                )
+                .await
+            {
+                Ok(WireMessage::PendingPermissionsSnapshot { permissions, .. }) => permissions,
+                _ => Vec::new(),
+            }
+        },
+        probe_remote_host_capabilities(c_cap, h_cap),
+    );
+
+    let mut perm_counts: HashMap<String, usize> = HashMap::new();
+    let mut perm_lines = Vec::new();
+    for p in &perms_raw {
+        *perm_counts.entry(p.agent_id.clone()).or_insert(0) += 1;
+        let risk = p
+            .guardian_assessment
+            .as_ref()
+            .map(|a| a.risk_level.as_str())
+            .unwrap_or("unknown");
+        perm_lines.push(format!(
+            "- [host={hid}] agent={} req={} risk={} title={}\n",
+            p.agent_id,
+            p.request_id,
+            risk,
+            compact_inline(&p.title, 64)
+        ));
+    }
+    for (key, w) in &mut workers {
+        if let Some((_, raw_aid)) = key.split_once(':')
+            && let Some(&cnt) = perm_counts.get(raw_aid)
+        {
+            w.pending_perms = cnt;
+        }
+    }
+
+    let host_desc = if cap.online {
+        let provs = if cap.available_providers.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<&str> = cap
+                .available_providers
+                .iter()
+                .map(|p| p.short_label())
+                .collect();
+            format!(", providers=[{}]", names.join(","))
+        };
+        Some(format!("{} (remote, online{provs})", cap.host_name))
+    } else {
+        None
+    };
+
+    (hid, host_desc, projs, wss, workers, perm_lines)
+}
+
+async fn fetch_remote_host_workspaces(
+    connected: Arc<ConnectedHostsManager>,
+    host: ConnectedHostSummary,
+) -> Vec<FleetWorkspaceEntry> {
+    let hid = host
+        .host_id
+        .clone()
+        .unwrap_or_else(|| host.registration_id.clone());
+    let req_id = Uuid::new_v4();
+    match connected
+        .send_rpc(
+            &hid,
+            req_id,
+            WireMessage::ListWorkspaces {
+                request_id: req_id,
+                include_archived: false,
+                include_background: false,
+            },
+            Duration::from_secs(4),
+        )
+        .await
+    {
+        Ok(WireMessage::WorkspacesSnapshot { workspaces, .. }) => workspaces
+            .into_iter()
+            .filter(|w| w.is_curated)
+            .take(MAX_FLEET_WORKSPACES_IN_CONTEXT)
+            .map(|w| FleetWorkspaceEntry {
+                host_id: hid.clone(),
+                host_name: host.label.clone(),
+                is_local: false,
+                workspace_id: w.workspace_id,
+                title: w.title,
+                cwd: w.cwd,
+                git_branch: w.git_branch,
+                mission_goal: w.mission_goal,
+                board_revision: w.board_revision,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
 
 async fn fetch_remote_host_projects(
     connected: Arc<ConnectedHostsManager>,
@@ -1223,7 +1443,7 @@ async fn fetch_remote_host_workers(
     {
         for ag in agents
             .into_iter()
-            .filter(|a| !a.is_personal_router())
+            .filter(|a| a.is_primary_conversation())
             .take(16)
         {
             let handle = ag
@@ -1523,11 +1743,10 @@ fn build_router_create_spec(
     acp_agent_id: Option<String>,
     cwd: String,
 ) -> CreateAgentSpec {
-    let router_soul = build_router_system_instructions(cfg);
-    let init_prompt = format!(
-        "[Orbit Personal Router Initialization]\n{router_soul}\n\n\
-         You are now online as the user's Orbit Personal Router. \
-         Acknowledge briefly in 1-2 sentences that you are ready to route and coordinate tasks."
+    // Full Router constitution is persistently injected via `SessionLaunchConfig.system_prompt_append`
+    // on every launch and resume; keep Turn 1 initialization crisp so context stays ultra-clean.
+    let init_prompt = String::from(
+        "[Orbit Personal Router Online] Acknowledge briefly in 1 concise sentence that you are ready to route tasks across the user's Fleet.",
     );
     CreateAgentSpec {
         cwd,

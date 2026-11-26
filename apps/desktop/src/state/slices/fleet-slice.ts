@@ -2515,6 +2515,89 @@ export function createFleetSlice(ctx: OrbitStoreContext) {
     },
 
 
+    async harvestConversation(
+      hostId: string,
+      agentId: string,
+      options?: { summaryNote?: string | null; appendToWorkspaceBoard?: boolean },
+    ): Promise<void> {
+      const tKey = threadScopeKey(hostId, agentId);
+      const wasSelected =
+        !getState().isDraftNewSession &&
+        getState().selectedHostId === hostId &&
+        getState().selectedAgentId === agentId;
+
+      const detail = getState().hostDetails[hostId];
+      const targetAgent = detail?.agents.find((a) => a.agent_id === agentId);
+      let fallbackAgentId: string | null = null;
+      if (wasSelected) {
+        const nextCandidate = detail?.agents.find(
+          (a) =>
+            a.agent_id !== agentId &&
+            !a.archived_at_rfc3339 &&
+            !getState().archivedThreads[threadScopeKey(hostId, a.agent_id)],
+        );
+        fallbackAgentId = nextCandidate?.agent_id ?? null;
+      }
+
+      const preArchive = getState();
+      const undoEntry: UndoArchiveEntry = {
+        hostId,
+        agentId,
+        title: targetAgent?.title ?? agentId,
+        draft: preArchive.composerDrafts[tKey] ?? "",
+        slashDirective: preArchive.slashDirectives[tKey] ?? null,
+        inlineMentions: [...(preArchive.inlineMentions[tKey] ?? [])],
+        contexts: [...(preArchive.contextItems[tKey] ?? [])],
+        pastes: [...(preArchive.pastedAttachments[tKey] ?? [])],
+        quotes: [...(preArchive.diffQuotes[tKey] ?? [])],
+        sideQuestionDraft: preArchive.sideQuestionDrafts[tKey] ?? "",
+      };
+
+      const archivedKeySet = new Set([tKey]);
+      setState(
+        (s) => ({
+          ...s,
+          archivedThreads: {
+            ...s.archivedThreads,
+            [tKey]: {
+              key: tKey,
+              hostId,
+              agentId,
+              archivedAtMs: Date.now(),
+            },
+          },
+          composerDrafts: omitRecordKeys(s.composerDrafts, archivedKeySet),
+          slashDirectives: omitRecordKeys(s.slashDirectives, archivedKeySet),
+          inlineMentions: omitRecordKeys(s.inlineMentions, archivedKeySet),
+          contextItems: omitRecordKeys(s.contextItems, archivedKeySet),
+          pastedAttachments: omitRecordKeys(s.pastedAttachments, archivedKeySet),
+          diffQuotes: omitRecordKeys(s.diffQuotes, archivedKeySet),
+          sideQuestionDrafts: omitRecordKeys(s.sideQuestionDrafts, archivedKeySet),
+          ...(wasSelected && !fallbackAgentId
+            ? {
+                selectedAgentId: null,
+                isDraftNewSession: true,
+              }
+            : {}),
+        }),
+        true,
+      );
+      draftPersistence.removeScopes(archivedKeySet, true);
+
+      await orbitIpc.harvestConversation({
+        hostId,
+        agentId,
+        summaryNote: options?.summaryNote ?? null,
+        appendToWorkspaceBoard: options?.appendToWorkspaceBoard ?? true,
+      });
+      ctx.actions.refreshSidebarView();
+      if (wasSelected && fallbackAgentId) {
+        ctx.actions.selectAgent(hostId, fallbackAgentId);
+      }
+      notifyToast(t("overview.reclaimedToast"), undoEntry);
+    },
+
+
     async deleteThreadPermanently(hostId: string, agentId: string): Promise<void> {
       const tKey = threadScopeKey(hostId, agentId);
       const wasSelected =

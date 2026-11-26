@@ -117,7 +117,7 @@ pub fn discover_host_projects(store: &OrbitStore) -> Vec<DiscoveredProject> {
         }
     }
     if let Ok(agents) = store.list_agents(None) {
-        for ag in agents {
+        for ag in agents.into_iter().filter(|a| a.is_primary_conversation()) {
             let p = PathBuf::from(&ag.cwd);
             if p.is_dir() {
                 insert_candidate(&mut by_path, &p, Some(ag.updated_at.timestamp()), None);

@@ -36,6 +36,8 @@ import {
   type SidebarWorkspaceGroupView,
   isAgentBackgroundWaiting,
   isAgentForegroundRunning,
+  isRoutedConversationCard,
+  isSubagentCard,
   orbitIpc,
   semanticAgentTabLabel,
 } from "@/lib/orbit-ipc";
@@ -523,7 +525,7 @@ export function SharedConversationMenu({
         <DropdownMenuSeparator />
 
         <DropdownMenuGroup>
-          {agent.parent_agent_id && (
+          {isSubagentCard(agent) && (
             <DropdownMenuItem
               onSelect={() => {
                 void orbitActions.detachAgent(host.host_id, agent.agent_id);
@@ -532,6 +534,21 @@ export function SharedConversationMenu({
               <span className="flex items-center gap-2 whitespace-nowrap">
                 <Unlink className="text-ink-muted size-[13.5px] stroke-[1.75]" />
                 <span>{t("sidebar.detach")}</span>
+              </span>
+            </DropdownMenuItem>
+          )}
+
+          {isRoutedConversationCard(agent) && !isForegroundRunning && (
+            <DropdownMenuItem
+              onSelect={() => {
+                void orbitActions.harvestConversation(host.host_id, agent.agent_id, {
+                  appendToWorkspaceBoard: isCuratedWs,
+                });
+              }}
+            >
+              <span className="flex items-center gap-2 whitespace-nowrap">
+                <Inbox className="text-ink-muted size-[13.5px] stroke-[1.75]" />
+                <span>{t("sidebar.reclaimConversation")}</span>
               </span>
             </DropdownMenuItem>
           )}
@@ -956,7 +973,7 @@ export function SharedWorkspaceMenu({
             a.workspace_id === ws.workspace_id &&
             !a.archived_at_rfc3339 &&
             !a.background &&
-            !a.parent_agent_id,
+            !isSubagentCard(a),
         )
       : ws.conversations.map((c) => c.agent)
     : [];

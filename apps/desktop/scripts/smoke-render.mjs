@@ -337,6 +337,8 @@ const MOCK_TAURI_INIT_SCRIPT = `(() => {
           };
         case "get_agent_stage_turns_slice":
           return [];
+        case "harvest_conversation":
+        case "reset_workspace_board":
         case "resolve_plan_approval":
           return null;
         case "list_permission_rules":

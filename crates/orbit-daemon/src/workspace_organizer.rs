@@ -1223,7 +1223,12 @@ async fn organize_project_workspaces_inner(
         .iter()
         .map(|w| (w.workspace_id.clone(), w.clone()))
         .collect();
-    let all_agents = mgr.store().list_agents_filtered(None, false, false, None)?;
+    let all_agents: Vec<AgentSummary> = mgr
+        .store()
+        .list_agents_filtered(None, false, false, None)?
+        .into_iter()
+        .filter(|a| a.is_primary_conversation())
+        .collect();
 
     let mut curated_workspaces: Vec<(WorkspaceSummary, Vec<AgentSummary>)> = Vec::new();
     for ws in &all_workspaces {

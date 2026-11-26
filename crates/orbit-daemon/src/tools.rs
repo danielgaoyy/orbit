@@ -237,9 +237,75 @@ pub fn list_tool_definitions_for_caller(
         return Vec::new();
     }
     let packs = resolve_effective_packs(runtime, caller_agent_id, policy);
+    let is_router_or_external = match caller_agent_id {
+        None => true,
+        Some(cid) => runtime
+            .store
+            .get_agent(cid)
+            .ok()
+            .flatten()
+            .is_some_and(|a| a.is_personal_router()),
+    };
+    let router_tools: Vec<PackToolDefinition> = if is_router_or_external {
+        vec![
+            PackToolDefinition {
+                pack: McpToolPack::Core,
+                def: ToolDefinition {
+                    name: "dispatch_conversation",
+                    description: "Launch a user-visible Sidebar Conversation on the local or remote host inside a Project or Mission Workspace (notifies you asynchronously on completion).",
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "host_id": { "type": "string", "description": "Target host ID (omit for local host)." },
+                            "workspace_id": { "type": "string", "description": "Existing Mission Workspace ID to reuse, if applicable." },
+                            "cwd": { "type": "string", "description": "Target project directory path." },
+                            "provider": { "type": "string" },
+                            "acp_agent_id": { "type": "string" },
+                            "model": { "type": "string" },
+                            "effort": { "type": "string", "enum": ["off", "low", "medium", "high", "xhigh", "max", "ultra"] },
+                            "fast_mode": { "type": "boolean" },
+                            "mode": { "type": "string", "enum": ["default", "auto", "plan", "accept_edits", "full_access"] },
+                            "profile_id": { "type": "string" },
+                            "worktree": { "type": "boolean" },
+                            "branch": { "type": "string" },
+                            "base_ref": { "type": "string" },
+                            "title": { "type": "string" },
+                            "handle": { "type": "string" },
+                            "initial_prompt": { "type": "string" },
+                            "notify_on_finish": { "type": "boolean", "default": true },
+                            "idempotency_key": { "type": "string" }
+                        },
+                        "required": ["initial_prompt"],
+                        "additionalProperties": false
+                    }),
+                },
+            },
+            PackToolDefinition {
+                pack: McpToolPack::Core,
+                def: ToolDefinition {
+                    name: "reclaim_conversation",
+                    description: "Harvest and archive a completed Sidebar Conversation ONLY when the user explicitly instructs you to reclaim/archive it (never call automatically on completion).",
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "agent_id": { "type": "string" },
+                            "host_id": { "type": "string" },
+                            "summary_note": { "type": "string", "description": "Optional concise 1-2 line outcome note to record." },
+                            "append_to_workspace_board": { "type": "boolean", "default": false }
+                        },
+                        "required": ["agent_id"],
+                        "additionalProperties": false
+                    }),
+                },
+            },
+        ]
+    } else {
+        Vec::new()
+    };
     let plugin = runtime.plugins.has_ops().then(plugin_tool_definition);
     pack_tool_definitions()
         .into_iter()
+        .chain(router_tools)
         .chain(plugin)
         .filter(|entry| {
             packs.contains(&entry.pack)
@@ -334,6 +400,7 @@ fn resolve_composite_dispatch(name: &str, args: &Value) -> anyhow::Result<&'stat
             "set_mode" | "mode" => Ok("set_agent_mode"),
             "cancel" | "interrupt" => Ok("cancel_agent"),
             "archive" => Ok("archive_agent"),
+            "harvest" | "reclaim" => Ok("reclaim_conversation"),
             "kill" | "delete" => Ok("kill_agent"),
             "move_workspace" | "move" => Ok("move_agent_to_workspace"),
             other => anyhow::bail!("unsupported `orbit_agent` action `{other}`"),
@@ -342,6 +409,8 @@ fn resolve_composite_dispatch(name: &str, args: &Value) -> anyhow::Result<&'stat
             "create" => Ok("create_workspace"),
             "list" => Ok("list_workspaces"),
             "rename" => Ok("rename_workspace"),
+            "update_goal" | "set_goal" => Ok("update_workspace_goal"),
+            "reset_board" | "refresh_board" => Ok("reset_workspace_board"),
             "archive" => Ok("archive_workspace"),
             "list_scripts" => Ok("list_workspace_scripts"),
             "start_script" => Ok("start_workspace_script"),
@@ -478,6 +547,23 @@ pub async fn execute_tool(
 /// running hook suppress recursive `PostToolUse` loops and self-rule re-entry without bypassing
 /// unrelated `PreToolUse` security rules.
 pub async fn execute_tool_with_context(
+    runtime: &Arc<DaemonRuntime>,
+    caller_agent_id: Option<&str>,
+    name: &str,
+    args: Value,
+    hook_origin: &crate::hooks::HookOriginContext,
+) -> ToolExecResult {
+    Box::pin(execute_tool_with_context_inner(
+        runtime,
+        caller_agent_id,
+        name,
+        args,
+        hook_origin,
+    ))
+    .await
+}
+
+async fn execute_tool_with_context_inner(
     runtime: &Arc<DaemonRuntime>,
     caller_agent_id: Option<&str>,
     name: &str,
@@ -839,7 +925,9 @@ async fn execute_tool_inner(
             }
         }
         // ==================== AGENTS ====================
-        "create_agent" => {
+        "create_agent" | "dispatch_conversation" => {
+            let caller_is_router = caller.as_ref().is_some_and(|c| c.is_personal_router());
+            let creates_primary_conversation = caller_agent_id.is_none() || caller_is_router;
             let profile_id = opt_str(args, "profile_id").or_else(|| opt_str(args, "profile"));
             let local_profile = if target_host.is_none() {
                 profile_id.as_deref().and_then(|pid| {
@@ -927,6 +1015,21 @@ async fn execute_tool_inner(
                         .unwrap_or_else(|| c.title.clone())
                 }
             });
+            let effective_parent_id = if creates_primary_conversation {
+                None
+            } else {
+                caller_agent_id.map(ToOwned::to_owned)
+            };
+            let effective_parent_host = if creates_primary_conversation || target_host.is_none() {
+                None
+            } else {
+                caller_agent_id.map(|_| rt.host_info.host_id.clone())
+            };
+            let effective_auto_cluster = if creates_primary_conversation {
+                args.get("auto_cluster").and_then(|v| v.as_bool())
+            } else {
+                Some(false)
+            };
 
             let created_agent = if let Some(ref remote_host_id) = target_host {
                 let cwd = opt_str(args, "cwd").unwrap_or_default();
@@ -959,8 +1062,8 @@ async fn execute_tool_inner(
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false),
                             workspace_id,
-                            parent_agent_id: caller_agent_id.map(ToOwned::to_owned),
-                            parent_host_id: caller_agent_id.map(|_| rt.host_info.host_id.clone()),
+                            parent_agent_id: effective_parent_id,
+                            parent_host_id: effective_parent_host,
                             parent_title: caller_source_title.clone(),
                             profile_id,
                             background,
@@ -973,13 +1076,13 @@ async fn execute_tool_inner(
                             ),
                             branch: opt_str(args, "branch"),
                             handle: opt_str(args, "handle"),
-                            auto_cluster: args.get("auto_cluster").and_then(|v| v.as_bool()),
+                            auto_cluster: effective_auto_cluster,
                             acp_agent_id: opt_str(args, "acp_agent_id"),
                         },
                         Duration::from_secs(30),
                     )
                     .await;
-                match resp {
+                let mut remote_agent = match resp {
                     Ok(WireMessage::AgentCreated { agent, .. }) => agent,
                     Ok(WireMessage::RpcError { message, .. }) => {
                         if let Some(ref idem) = idempotency_key {
@@ -994,7 +1097,47 @@ async fn execute_tool_inner(
                         return Err(e);
                     }
                     _ => anyhow::bail!("unexpected remote reply to create_agent"),
+                };
+                // Stamp `orbit.routed_by_agent` + `orbit.routed_by_host` BEFORE registering finish watch
+                // so remote FinishSubscriptions authenticate Router ownership without hiding the Conversation.
+                if caller_is_router && let Some(cid) = caller_agent_id {
+                    let mut routed_labels = remote_agent.labels.clone();
+                    routed_labels.insert(
+                        orbit_protocol::LABEL_ROUTED_BY_AGENT.to_string(),
+                        cid.to_string(),
+                    );
+                    routed_labels.insert(
+                        orbit_protocol::LABEL_ROUTED_BY_HOST.to_string(),
+                        rt.host_info.host_id.clone(),
+                    );
+                    routed_labels.insert(
+                        orbit_protocol::LABEL_SESSION_TIER.to_string(),
+                        orbit_protocol::SESSION_TIER_CONVERSATION.to_string(),
+                    );
+                    let upd_req_id = Uuid::new_v4();
+                    let _ = rt
+                        .connected_hosts
+                        .send_rpc(
+                            remote_host_id,
+                            upd_req_id,
+                            WireMessage::UpdateAgent {
+                                request_id: upd_req_id,
+                                agent_id: remote_agent.agent_id.clone(),
+                                title: None,
+                                model: None,
+                                effort: None,
+                                fast_mode: None,
+                                mode: None,
+                                labels: Some(routed_labels.clone()),
+                                handle: None,
+                                task_summary: None,
+                            },
+                            Duration::from_secs(10),
+                        )
+                        .await;
+                    remote_agent.labels = routed_labels;
                 }
+                remote_agent
             } else {
                 let cwd = opt_str(args, "cwd")
                     .or_else(|| caller.as_ref().map(|c| c.cwd.clone()))
@@ -1007,43 +1150,62 @@ async fn execute_tool_inner(
                     event: Some("initial_prompt".into()),
                     permission_context: None,
                 });
+                let mut init_labels = HashMap::new();
+                if caller_is_router && let Some(cid) = caller_agent_id {
+                    init_labels.insert(
+                        orbit_protocol::LABEL_ROUTED_BY_AGENT.to_string(),
+                        cid.to_string(),
+                    );
+                    init_labels.insert(
+                        orbit_protocol::LABEL_SESSION_TIER.to_string(),
+                        orbit_protocol::SESSION_TIER_CONVERSATION.to_string(),
+                    );
+                } else if !creates_primary_conversation {
+                    init_labels.insert(
+                        orbit_protocol::LABEL_SESSION_TIER.to_string(),
+                        orbit_protocol::SESSION_TIER_SUBAGENT.to_string(),
+                    );
+                }
                 let res = Box::pin(
-                    rt.orchestrator.create_and_start_agent(CreateAgentSpec {
-                        cwd,
-                        extra_dirs: Vec::new(),
-                        title,
-                        provider,
-                        model,
-                        effort,
-                        fast_mode,
-                        mode,
-                        initial_prompt,
-                        initial_display_prompt: None,
-                        initial_badges: Vec::new(),
-                        worktree: args
-                            .get("worktree")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false),
-                        workspace_id,
-                        parent_agent_id: caller_agent_id.map(ToOwned::to_owned),
-                        parent_host_id: None,
-                        initial_prompt_source,
-                        profile_id,
-                        background,
-                        auto_archive,
-                        base_ref: opt_str(args, "base_ref"),
-                        worktree_mode: parse_worktree_mode(
-                            opt_str(args, "worktree_mode").as_deref(),
-                        ),
-                        branch: opt_str(args, "branch"),
-                        pr_number: args
-                            .get("pr_number")
-                            .and_then(|v| v.as_u64())
-                            .map(|n| n as u32),
-                        handle: opt_str(args, "handle"),
-                        auto_cluster: args.get("auto_cluster").and_then(|v| v.as_bool()),
-                        acp_agent_id: opt_str(args, "acp_agent_id"),
-                    }),
+                    rt.orchestrator.create_and_start_agent_with_labels(
+                        CreateAgentSpec {
+                            cwd,
+                            extra_dirs: Vec::new(),
+                            title,
+                            provider,
+                            model,
+                            effort,
+                            fast_mode,
+                            mode,
+                            initial_prompt,
+                            initial_display_prompt: None,
+                            initial_badges: Vec::new(),
+                            worktree: args
+                                .get("worktree")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false),
+                            workspace_id,
+                            parent_agent_id: effective_parent_id,
+                            parent_host_id: None,
+                            initial_prompt_source,
+                            profile_id,
+                            background,
+                            auto_archive,
+                            base_ref: opt_str(args, "base_ref"),
+                            worktree_mode: parse_worktree_mode(
+                                opt_str(args, "worktree_mode").as_deref(),
+                            ),
+                            branch: opt_str(args, "branch"),
+                            pr_number: args
+                                .get("pr_number")
+                                .and_then(|v| v.as_u64())
+                                .map(|n| n as u32),
+                            handle: opt_str(args, "handle"),
+                            auto_cluster: effective_auto_cluster,
+                            acp_agent_id: opt_str(args, "acp_agent_id"),
+                        },
+                        init_labels,
+                    ),
                 )
                 .await;
                 match res {
@@ -1384,6 +1546,66 @@ async fn execute_tool_inner(
             Ok(json!({ "ok": true, "agent_id": agent_id, "archived": true }))
         }
 
+        "reclaim_conversation" | "harvest_conversation" => {
+            let agent_id = str_arg(args, "agent_id")?;
+            let summary_note = opt_str(args, "summary_note");
+            let append_to_board = args
+                .get("append_to_workspace_board")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                let resp = rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::HarvestConversation {
+                            request_id: req_id,
+                            agent_id: agent_id.clone(),
+                            summary_note,
+                            append_to_workspace_board: append_to_board,
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?;
+                return match resp {
+                    WireMessage::ConversationHarvested {
+                        agent_id,
+                        workspace_id,
+                        summary,
+                        ..
+                    } => Ok(json!({
+                        "ok": true,
+                        "host_id": remote_host_id,
+                        "agent_id": agent_id,
+                        "workspace_id": workspace_id,
+                        "summary": summary,
+                        "archived": true,
+                    })),
+                    WireMessage::RpcError { message, .. } => anyhow::bail!("{message}"),
+                    _ => anyhow::bail!("unexpected remote reply to reclaim_conversation"),
+                };
+            }
+            rt.finish_subs.cancel_for_caller(&agent_id).await;
+            let actor = caller
+                .as_ref()
+                .and_then(|c| c.handle.as_deref())
+                .or(Some("router"));
+            let (summary, workspace_id) = rt
+                .orchestrator
+                .harvest_conversation(&agent_id, summary_note, append_to_board, actor)
+                .await?;
+            Ok(json!({
+                "ok": true,
+                "host_id": rt.host_info.host_id,
+                "agent_id": agent_id,
+                "workspace_id": workspace_id,
+                "summary": summary,
+                "archived": true,
+            }))
+        }
+
         "kill_agent" => {
             let agent_id = str_arg(args, "agent_id")?;
             if let Some(ref remote_host_id) = target_host {
@@ -1541,7 +1763,8 @@ async fn execute_tool_inner(
                             background,
                             idempotency_key: opt_str(args, "idempotency_key"),
                             is_curated: Some(true),
-                            mission_goal: opt_str(args, "mission_goal"),
+                            mission_goal: opt_str(args, "mission_goal")
+                                .or_else(|| opt_str(args, "goal")),
                             project_root: opt_str(args, "project_root"),
                         },
                         Duration::from_secs(30),
@@ -1565,7 +1788,8 @@ async fn execute_tool_inner(
                         parent_workspace_id,
                         background,
                         project_root: opt_str(args, "project_root"),
-                        mission_goal: opt_str(args, "mission_goal"),
+                        mission_goal: opt_str(args, "mission_goal")
+                            .or_else(|| opt_str(args, "goal")),
                         allow_reuse_existing: false,
                         is_curated: true,
                     })
@@ -1626,6 +1850,119 @@ async fn execute_tool_inner(
                 .rename_workspace(&workspace_id, &title)
                 .await?;
             Ok(json!({ "workspace": ws }))
+        }
+
+        "update_workspace_goal" => {
+            let workspace_id = opt_str(args, "workspace_id")
+                .or_else(|| {
+                    if target_host.is_none() {
+                        caller.as_ref().map(|c| c.workspace_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("`workspace_id` is required"))?;
+            let title = opt_str(args, "title");
+            let goal = opt_str(args, "mission_goal")
+                .or_else(|| opt_str(args, "new_goal"))
+                .or_else(|| opt_str(args, "goal"));
+            if title.is_none() && goal.is_none() {
+                anyhow::bail!("supply `mission_goal` (or `title`) for `update_goal`");
+            }
+            if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                let resp = rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::UpdateWorkspaceGoal {
+                            request_id: req_id,
+                            workspace_id: workspace_id.clone(),
+                            title,
+                            mission_goal: goal.clone(),
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await?;
+                if let WireMessage::RpcError { message, .. } = resp {
+                    anyhow::bail!("{message}");
+                }
+                return Ok(json!({
+                    "ok": true,
+                    "host_id": remote_host_id,
+                    "workspace_id": workspace_id,
+                    "mission_goal": goal,
+                }));
+            }
+            let ws = rt
+                .orchestrator
+                .update_workspace_goal(&workspace_id, title, goal)?;
+            Ok(json!({
+                "ok": true,
+                "host_id": rt.host_info.host_id,
+                "workspace": ws,
+            }))
+        }
+
+        "reset_workspace_board" => {
+            let workspace_id = opt_str(args, "workspace_id")
+                .or_else(|| {
+                    if target_host.is_none() {
+                        caller.as_ref().map(|c| c.workspace_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("`workspace_id` is required"))?;
+            let new_goal = opt_str(args, "new_goal")
+                .or_else(|| opt_str(args, "mission_goal"))
+                .or_else(|| opt_str(args, "goal"));
+            let keep_notes = opt_str(args, "keep_notes");
+            let updated_by = caller
+                .as_ref()
+                .and_then(|c| c.handle.clone())
+                .or_else(|| opt_str(args, "updated_by"))
+                .unwrap_or_else(|| "router".into());
+            if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                let resp = rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::ResetWorkspaceBoard {
+                            request_id: req_id,
+                            workspace_id: workspace_id.clone(),
+                            new_goal,
+                            keep_notes,
+                            updated_by: Some(updated_by),
+                        },
+                        Duration::from_secs(20),
+                    )
+                    .await?;
+                return match resp {
+                    WireMessage::WorkspaceBoardSnapshot { board, .. } => Ok(json!({
+                        "ok": true,
+                        "host_id": remote_host_id,
+                        "board": board,
+                    })),
+                    WireMessage::RpcError { message, .. } => anyhow::bail!("{message}"),
+                    _ => anyhow::bail!("unexpected remote reply to reset_workspace_board"),
+                };
+            }
+            let board = rt.orchestrator.reset_workspace_board(
+                &workspace_id,
+                new_goal,
+                keep_notes,
+                Some(&updated_by),
+                caller_agent_id,
+            )?;
+            Ok(json!({
+                "ok": true,
+                "host_id": rt.host_info.host_id,
+                "board": board,
+            }))
         }
 
         "archive_workspace" => {
@@ -2309,6 +2646,29 @@ async fn execute_tool_inner(
             }))
         }
 
+        other => {
+            Box::pin(execute_tool_inner_collab(
+                rt,
+                caller_agent_id,
+                caller,
+                target_host,
+                other,
+                args,
+            ))
+            .await
+        }
+    }
+}
+
+async fn execute_tool_inner_collab(
+    rt: &Arc<DaemonRuntime>,
+    caller_agent_id: Option<&str>,
+    caller: Option<orbit_protocol::AgentSummary>,
+    target_host: Option<String>,
+    name: &str,
+    args: &Value,
+) -> anyhow::Result<Value> {
+    match name {
         "list_pending_permissions" => {
             let agent_filter = opt_str(args, "agent_id");
             if let Some(ref remote_host_id) = target_host {
@@ -2364,7 +2724,7 @@ async fn execute_tool_inner(
                 if target_host.is_none() {
                     if !is_worker_spawned_by_caller(&rt.store, &agent_id, cid)? {
                         anyhow::bail!(
-                            "Personal Router can only resolve permissions for workers it spawned (`parent_agent_id == router_id`); escalate unrelated session `{agent_id}` to the human"
+                            "Personal Router can only resolve permissions for workers it routed or spawned; escalate unrelated session `{agent_id}` to the human"
                         );
                     }
                     resolved_pending_info = rt
@@ -2685,11 +3045,22 @@ async fn execute_tool_inner(
                 .store
                 .get_workspace(&ws_id)?
                 .ok_or_else(|| anyhow::anyhow!("workspace `{ws_id}` not found"))?;
-            let peers = rt
+            let peers: Vec<orbit_protocol::AgentSummary> = rt
                 .store
-                .list_agents_filtered(Some(&ws_id), false, false, None)?;
+                .list_agents_filtered(Some(&ws_id), false, false, None)?
+                .into_iter()
+                .filter(|p| {
+                    p.is_primary_conversation()
+                        || p.labels.contains_key("orbit.workspace_helper")
+                        || caller_agent_id == Some(p.agent_id.as_str())
+                })
+                .collect();
             let board = rt.orchestrator.get_workspace_board(&ws_id).ok();
-            let events = rt.orchestrator.list_workspace_events(&ws_id, 20)?;
+            let events = rt.orchestrator.list_active_workspace_events(&ws_id, 20)?;
+            let workspace_edited_files = rt
+                .store
+                .list_workspace_edited_files(&ws_id, 20)
+                .unwrap_or_default();
             let caller_cwd = caller.as_ref().map(|c| c.cwd.as_str());
             let mut shared_checkout_peers: Vec<String> = Vec::new();
             let peer_cards: Vec<Value> = peers
@@ -2729,6 +3100,7 @@ async fn execute_tool_inner(
                 "shared_checkout_peers": shared_checkout_peers,
                 "board_revision": board.as_ref().map(|b| b.revision).unwrap_or(0),
                 "board_path": board.as_ref().and_then(|b| b.board_path.clone()),
+                "workspace_edited_files": workspace_edited_files,
                 "recent_events": events,
             }))
         }
@@ -2754,7 +3126,11 @@ async fn execute_tool_inner(
                 rt.store
                     .list_agents_filtered(Some(&ws_id), false, false, None)?
                     .into_iter()
-                    .filter(|a| caller_agent_id != Some(a.agent_id.as_str()))
+                    .filter(|a| {
+                        caller_agent_id != Some(a.agent_id.as_str())
+                            && (a.is_primary_conversation()
+                                || a.labels.contains_key("orbit.workspace_helper"))
+                    })
                     .collect()
             } else {
                 match rt
@@ -3012,37 +3388,67 @@ async fn execute_tool_inner(
                 event: Some("initial_prompt".into()),
                 permission_context: None,
             });
+            let caller_is_router = caller.as_ref().is_some_and(|c| c.is_personal_router());
+            let creates_primary = caller_agent_id.is_none() || caller_is_router;
+            let mut peer_labels = HashMap::new();
+            if caller_is_router && let Some(cid) = caller_agent_id {
+                peer_labels.insert(
+                    orbit_protocol::LABEL_ROUTED_BY_AGENT.to_string(),
+                    cid.to_string(),
+                );
+                peer_labels.insert(
+                    orbit_protocol::LABEL_SESSION_TIER.to_string(),
+                    orbit_protocol::SESSION_TIER_CONVERSATION.to_string(),
+                );
+            } else if !creates_primary {
+                peer_labels.insert(
+                    orbit_protocol::LABEL_SESSION_TIER.to_string(),
+                    orbit_protocol::SESSION_TIER_SUBAGENT.to_string(),
+                );
+                peer_labels.insert("orbit.workspace_helper".to_string(), "1".to_string());
+            }
+
             let peer = rt
                 .orchestrator
-                .create_and_start_agent(CreateAgentSpec {
-                    cwd,
-                    extra_dirs: Vec::new(),
-                    title,
-                    provider,
-                    model,
-                    effort,
-                    fast_mode,
-                    mode,
-                    initial_prompt,
-                    initial_display_prompt: None,
-                    initial_badges: Vec::new(),
-                    worktree,
-                    workspace_id: Some(ws_id.clone()),
-                    // Sibling peers stay top-level inside the Mission Workspace (not collapsed as hidden subagents)
-                    parent_agent_id: None,
-                    parent_host_id: None,
-                    initial_prompt_source,
-                    profile_id,
-                    background: false,
-                    auto_archive: false,
-                    base_ref: opt_str(args, "base_ref"),
-                    worktree_mode: parse_worktree_mode(opt_str(args, "worktree_mode").as_deref()),
-                    branch: opt_str(args, "branch"),
-                    pr_number: None,
-                    handle,
-                    auto_cluster: Some(false),
-                    acp_agent_id: opt_str(args, "acp_agent_id"),
-                })
+                .create_and_start_agent_with_labels(
+                    CreateAgentSpec {
+                        cwd,
+                        extra_dirs: Vec::new(),
+                        title,
+                        provider,
+                        model,
+                        effort,
+                        fast_mode,
+                        mode,
+                        initial_prompt,
+                        initial_display_prompt: None,
+                        initial_badges: Vec::new(),
+                        worktree,
+                        workspace_id: Some(ws_id.clone()),
+                        // Only Human / PersonalRouter create top-level Sidebar Conversations;
+                        // worker-spawned peers stay hidden as Subagents in the Sidebar while retaining `@handle` coordination.
+                        parent_agent_id: if creates_primary {
+                            None
+                        } else {
+                            caller_agent_id.map(ToOwned::to_owned)
+                        },
+                        parent_host_id: None,
+                        initial_prompt_source,
+                        profile_id,
+                        background: false,
+                        auto_archive: false,
+                        base_ref: opt_str(args, "base_ref"),
+                        worktree_mode: parse_worktree_mode(
+                            opt_str(args, "worktree_mode").as_deref(),
+                        ),
+                        branch: opt_str(args, "branch"),
+                        pr_number: None,
+                        handle,
+                        auto_cluster: Some(false),
+                        acp_agent_id: opt_str(args, "acp_agent_id"),
+                    },
+                    peer_labels,
+                )
                 .await?;
             if notify_on_finish && let Some(cid) = caller_agent_id {
                 let _ = rt
@@ -3087,9 +3493,12 @@ async fn execute_tool_inner(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
+            let caller_is_router = caller.as_ref().is_some_and(|c| c.is_personal_router());
+            let fork_as_subagent = caller_agent_id.is_some() && !caller_is_router;
+
             let (agent, workspace) = if let Some(ref remote_host_id) = target_host {
                 let req_id = Uuid::new_v4();
-                match rt
+                let (mut ag, ws) = match rt
                     .connected_hosts
                     .send_rpc(
                         remote_host_id,
@@ -3101,6 +3510,16 @@ async fn execute_tool_inner(
                             target,
                             title,
                             initial_prompt,
+                            parent_agent_id: if fork_as_subagent {
+                                caller_agent_id.map(ToOwned::to_owned)
+                            } else {
+                                None
+                            },
+                            parent_host_id: if fork_as_subagent {
+                                Some(rt.host_info.host_id.clone())
+                            } else {
+                                None
+                            },
                         },
                         Duration::from_secs(30),
                     )
@@ -3113,17 +3532,56 @@ async fn execute_tool_inner(
                         anyhow::bail!("remote host `{remote_host_id}` error: {message}");
                     }
                     _ => anyhow::bail!("unexpected remote reply to fork_agent"),
+                };
+                if fork_as_subagent {
+                    let mut sub_labels = ag.labels.clone();
+                    sub_labels.insert(
+                        orbit_protocol::LABEL_SESSION_TIER.to_string(),
+                        orbit_protocol::SESSION_TIER_SUBAGENT.to_string(),
+                    );
+                    sub_labels.insert("orbit.workspace_helper".to_string(), "1".to_string());
+                    let upd_req_id = Uuid::new_v4();
+                    let _ = rt
+                        .connected_hosts
+                        .send_rpc(
+                            remote_host_id,
+                            upd_req_id,
+                            WireMessage::UpdateAgent {
+                                request_id: upd_req_id,
+                                agent_id: ag.agent_id.clone(),
+                                title: None,
+                                model: None,
+                                effort: None,
+                                fast_mode: None,
+                                mode: None,
+                                labels: Some(sub_labels.clone()),
+                                handle: None,
+                                task_summary: None,
+                            },
+                            Duration::from_secs(10),
+                        )
+                        .await;
+                    ag.labels = sub_labels;
                 }
+                (ag, ws)
             } else {
                 let outcome = rt
                     .orchestrator
-                    .fork_agent(ForkAgentSpec {
-                        source_agent_id,
-                        up_to_seq,
-                        target,
-                        title,
-                        initial_prompt,
-                    })
+                    .fork_agent_with_parent(
+                        ForkAgentSpec {
+                            source_agent_id,
+                            up_to_seq,
+                            target,
+                            title,
+                            initial_prompt,
+                        },
+                        if fork_as_subagent {
+                            caller_agent_id.map(ToOwned::to_owned)
+                        } else {
+                            None
+                        },
+                        None,
+                    )
                     .await?;
                 (outcome.agent, outcome.workspace)
             };
@@ -3592,6 +4050,27 @@ async fn execute_tool_inner(
             }))
         }
 
+        other => {
+            Box::pin(execute_tool_inner_ops(
+                rt,
+                caller_agent_id,
+                target_host,
+                other,
+                args,
+            ))
+            .await
+        }
+    }
+}
+
+async fn execute_tool_inner_ops(
+    rt: &Arc<DaemonRuntime>,
+    caller_agent_id: Option<&str>,
+    target_host: Option<String>,
+    name: &str,
+    args: &Value,
+) -> anyhow::Result<Value> {
+    match name {
         // ==================== AUTONOMOUS GOAL MODE & MONITORS ====================
         "start_goal" => {
             let objective = str_arg(args, "objective")?;
@@ -5645,11 +6124,11 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
             pack: McpToolPack::Core,
             def: ToolDefinition {
                 name: "orbit_agent",
-                description: "Manage Orbit agents: list, inspect status/activity, fork (same dir or worktree — inside a Mission Workspace `worktree=true` keeps the forked peer in the same workspace for parallel non-blocking development), update config/mode, move workspace, cancel, archive, or kill.",
+                description: "Manage Orbit agents: list, status, activity, fork, update, set_mode, move_workspace, cancel, harvest (user-requested reclaim), archive, or kill.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["list", "status", "activity", "fork", "update", "set_mode", "move_workspace", "cancel", "archive", "kill"] },
+                        "action": { "type": "string", "enum": ["list", "status", "activity", "fork", "update", "set_mode", "move_workspace", "cancel", "harvest", "archive", "kill"] },
                         "agent_id": { "type": "string" },
                         "workspace_id": { "type": "string" },
                         "target_workspace_id": { "type": "string" },
@@ -5663,6 +6142,8 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
                         "title": { "type": "string" },
                         "initial_prompt": { "type": "string" },
                         "notify_on_finish": { "type": "boolean" },
+                        "summary_note": { "type": "string" },
+                        "append_to_workspace_board": { "type": "boolean" },
                         "model": { "type": "string" },
                         "effort": { "type": "string" },
                         "fast_mode": { "type": "boolean" },
@@ -5679,11 +6160,11 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
             pack: McpToolPack::Core,
             def: ToolDefinition {
                 name: "orbit_workspace",
-                description: "Manage workspaces and `orbit.json`/`paseo.json` dev scripts: create, list, rename, archive, list_scripts, start_script, stop_script.",
+                description: "Manage workspaces, whiteboard goals (`update_goal`, `reset_board`), and dev scripts.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["create", "list", "rename", "archive", "list_scripts", "start_script", "stop_script"] },
+                        "action": { "type": "string", "enum": ["create", "list", "rename", "update_goal", "reset_board", "archive", "list_scripts", "start_script", "stop_script"] },
                         "workspace_id": { "type": "string" },
                         "source_cwd": { "type": "string" },
                         "isolation": { "type": "string", "enum": ["local", "worktree"] },
@@ -5692,6 +6173,8 @@ fn pack_tool_definitions() -> Vec<PackToolDefinition> {
                         "base_ref": { "type": "string" },
                         "pr_number": { "type": "integer" },
                         "title": { "type": "string" },
+                        "goal": { "type": "string" },
+                        "keep_notes": { "type": "string" },
                         "script_name": { "type": "string" },
                         "include_archived": { "type": "boolean" },
                         "host_id": { "type": "string" }
@@ -6023,6 +6506,11 @@ fn is_worker_spawned_by_caller(
         let Some(agent) = store.get_agent(&current)? else {
             return Ok(false);
         };
+        if agent.routed_by_agent_id() == Some(caller_agent_id)
+            && agent.routed_by_host_id().is_none()
+        {
+            return Ok(true);
+        }
         let Some(parent_id) = agent.parent_agent_id else {
             return Ok(false);
         };
@@ -6056,6 +6544,13 @@ fn is_remote_worker_spawned_by_caller(
         let Some(agent) = by_id.get(current) else {
             return false;
         };
+        if agent.routed_by_agent_id() == Some(caller_agent_id)
+            && agent
+                .routed_by_host_id()
+                .is_none_or(|rh| rh == caller_host_id)
+        {
+            return true;
+        }
         let Some(parent_id) = agent.parent_agent_id.as_deref() else {
             return false;
         };

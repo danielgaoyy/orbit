@@ -7,6 +7,7 @@ import type {
   SidebarConversationView,
   SidebarProjectGroupView,
 } from "../../lib/orbit-ipc.ts";
+import { isSubagentCard } from "../../lib/session-tier.ts";
 import type {
   ArchivedThreadEntry,
   SidebarProjectSort,
@@ -128,7 +129,13 @@ export function buildRunningParentThreadKeys(
   for (const [hid, detail] of Object.entries(hostDetails)) {
     for (const ag of detail.agents) {
       managedAgentsById.set(ag.agent_id, ag);
-      if (!ag.parent_agent_id || isSidebarAgentArchived(hid, ag, archivedThreads)) continue;
+      if (
+        !isSubagentCard(ag) ||
+        !ag.parent_agent_id ||
+        isSidebarAgentArchived(hid, ag, archivedThreads)
+      ) {
+        continue;
+      }
       if (isForegroundRunning(ag) || ag.is_awaiting_permission) {
         const parentHostId = ag.parent_host_id || hid;
         keys.add(threadKey(parentHostId, ag.parent_agent_id));
@@ -388,7 +395,6 @@ export function buildSidebarDisplayModel(input: BuildSidebarModelInput): Sidebar
   const {
     hosts,
     sidebarView,
-    hostDetails,
     archivedThreads,
     hiddenProjectKeys,
     threadCustomTitles,
@@ -426,7 +432,7 @@ export function buildSidebarDisplayModel(input: BuildSidebarModelInput): Sidebar
   const filteredAttentionItems: SidebarAttentionItem[] = [];
   const attentionThreadKeySet = new Set<string>();
   for (const conv of sidebarView?.needs_attention ?? []) {
-    if (isSidebarAgentArchived(conv.host_id, conv.agent, archivedThreads)) continue;
+    if (isSubagentCard(conv.agent) || isSidebarAgentArchived(conv.host_id, conv.agent, archivedThreads)) continue;
     const host = hostById.get(conv.host_id);
     if (!host) continue;
     const tKey = threadKey(conv.host_id, conv.agent.agent_id);
@@ -465,7 +471,7 @@ export function buildSidebarDisplayModel(input: BuildSidebarModelInput): Sidebar
   const filteredPinnedEntries: SidebarPinnedEntry[] = [];
   const pinnedThreadKeySet = new Set<string>();
   for (const conv of sidebarView?.pinned_conversations ?? []) {
-    if (isSidebarAgentArchived(conv.host_id, conv.agent, archivedThreads)) continue;
+    if (isSubagentCard(conv.agent) || isSidebarAgentArchived(conv.host_id, conv.agent, archivedThreads)) continue;
     const host = hostById.get(conv.host_id);
     if (!host) continue;
     const tKey = threadKey(conv.host_id, conv.agent.agent_id);
@@ -532,18 +538,10 @@ export function buildSidebarDisplayModel(input: BuildSidebarModelInput): Sidebar
       matchesProjectDir(proj.directories, selectedWorkspaceCwd);
 
     const hasCuratedWorkspaces = (proj.workspaces ?? []).some((w) => w.is_curated !== false);
-    const detail = hostDetails[proj.host_id];
-    const agentsById = new Map((detail?.agents ?? []).map((a) => [a.agent_id, a]));
 
     const visibleConversations = proj.conversations.filter((c) => {
-      if (c.agent.background) return false;
+      if (c.agent.background || isSubagentCard(c.agent)) return false;
       if (isSidebarAgentArchived(proj.host_id, c.agent, archivedThreads)) return false;
-      if (c.agent.parent_agent_id && !c.agent.parent_host_id) {
-        const parent = agentsById.get(c.agent.parent_agent_id);
-        if (parent && !isSidebarAgentArchived(proj.host_id, parent, archivedThreads)) {
-          return false;
-        }
-      }
       return true;
     });
 

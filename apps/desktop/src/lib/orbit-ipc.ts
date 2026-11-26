@@ -1036,6 +1036,13 @@ export interface WorkspaceOrganizeEvent {
   summarized_agents: number;
 }
 
+export {
+  type SessionTier,
+  resolveAgentSessionTier,
+  isSubagentCard,
+  isRoutedConversationCard,
+} from "./session-tier.ts";
+
 const GENERIC_HARNESS_HANDLES = new Set([
   "peer",
   "lead",
@@ -4801,6 +4808,36 @@ export const orbitIpc = {
   ): Promise<void> => {
     if (!transport()) return;
     await invoke<void>("update_workspace_goal", { hostId, workspaceId, goal });
+  },
+
+  resetWorkspaceBoard: async (params: {
+    hostId: string;
+    workspaceId: string;
+    newGoal?: string | null;
+    keepNotes?: string | null;
+  }): Promise<void> => {
+    if (!transport()) return;
+    await invoke<void>("reset_workspace_board", {
+      hostId: params.hostId,
+      workspaceId: params.workspaceId,
+      newGoal: params.newGoal ?? null,
+      keepNotes: params.keepNotes ?? null,
+    });
+  },
+
+  harvestConversation: async (params: {
+    hostId: string;
+    agentId: string;
+    summaryNote?: string | null;
+    appendToWorkspaceBoard?: boolean;
+  }): Promise<void> => {
+    if (!transport()) return;
+    await invoke<void>("harvest_conversation", {
+      hostId: params.hostId,
+      agentId: params.agentId,
+      summaryNote: params.summaryNote ?? null,
+      appendToWorkspaceBoard: params.appendToWorkspaceBoard ?? false,
+    });
   },
 
   moveAgentToWorkspace: async (

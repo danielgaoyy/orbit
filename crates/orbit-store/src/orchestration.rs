@@ -507,6 +507,10 @@ impl OrbitStore {
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default();
         labels.retain(|k, _| !k.starts_with("orbit.open_tab."));
+        labels.insert(
+            orbit_protocol::LABEL_SESSION_TIER.to_string(),
+            orbit_protocol::SESSION_TIER_CONVERSATION.to_string(),
+        );
         let labels_json = serde_json::to_string(&labels)?;
         conn.execute(
             "UPDATE agents
@@ -515,6 +519,37 @@ impl OrbitStore {
             params![labels_json, Utc::now().to_rfc3339(), agent_id],
         )?;
         Ok(())
+    }
+
+    /// Collect all non-archived local descendant `Subagent`s of `root_agent_id` (cycle-safe, max depth 8).
+    pub fn list_local_descendant_subagents(
+        &self,
+        root_agent_id: &str,
+    ) -> Result<Vec<AgentSummary>, StoreError> {
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(root_agent_id.to_string());
+        let mut frontier = vec![root_agent_id.to_string()];
+        let mut out = Vec::new();
+        for _ in 0..8 {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next_frontier = Vec::new();
+            for pid in frontier {
+                let children = self.list_agents_filtered(None, false, true, Some(&pid))?;
+                for child in children {
+                    if !visited.insert(child.agent_id.clone()) {
+                        continue;
+                    }
+                    if child.parent_host_id.is_none() && child.is_subagent() {
+                        next_frontier.push(child.agent_id.clone());
+                        out.push(child);
+                    }
+                }
+            }
+            frontier = next_frontier;
+        }
+        Ok(out)
     }
 
     pub fn set_agent_attention(

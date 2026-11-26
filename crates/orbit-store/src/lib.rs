@@ -37,7 +37,11 @@ pub use triggers::{
 pub use usage::{
     AgentContextTelemetry, QUOTA_SAMPLES_RETENTION_MS, QuotaSampleRecord, USAGE_LEDGER_RETENTION_MS,
 };
-pub use workspace_sync::{AgentContextSnippet, LABEL_HANDLE_ALIASES, SemanticIdentityOptions};
+pub use workspace_sync::{
+    AgentContextSnippet, DEFAULT_BOARD_GOAL_PLACEHOLDER, LABEL_HANDLE_ALIASES,
+    ResetWorkspaceBoardOutcome, SemanticIdentityOptions, board_has_substantive_content,
+    build_clean_board_markdown, extract_goal_section_from_board, upsert_board_markdown_section,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

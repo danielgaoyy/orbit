@@ -1636,7 +1636,7 @@ impl HostMemoryState {
         let active_agent_count = self
             .agents
             .values()
-            .filter(|a| a.archived_at.is_none() && !a.background)
+            .filter(|a| a.archived_at.is_none() && !a.background && !a.is_subagent())
             .count() as u32;
         HostCardView {
             host_id: self.profile.host_id.clone(),
@@ -3398,8 +3398,18 @@ impl OrbitAppCore {
                     .workspace_events
                     .iter()
                     .filter_map(|(ws_id, evs)| {
+                        let reset_seq = evs
+                            .iter()
+                            .filter(|ev| {
+                                ev.kind == WorkspaceEventKind::BoardUpdated
+                                    && ev.summary.starts_with("Reset Shared Board")
+                            })
+                            .map(|ev| ev.seq)
+                            .max()
+                            .unwrap_or(0);
                         let recent_conflict = evs.iter().any(|ev| {
                             ev.kind == WorkspaceEventKind::ConflictWarning
+                                && ev.seq > reset_seq
                                 && ev.created_at.timestamp_millis() >= conflict_cutoff_ms
                         });
                         recent_conflict.then(|| ws_id.clone())
@@ -7140,6 +7150,21 @@ impl OrbitAppCore {
                     notify_fleet = true;
                     notify_host = true;
                 }
+                WireMessage::ConversationHarvested {
+                    agent_id, summary, ..
+                } => {
+                    state.pending_permissions.retain(|p| p.agent_id != agent_id);
+                    if let Some(ag) = state.agents.get_mut(&agent_id) {
+                        if ag.archived_at.is_none() {
+                            ag.archived_at = Some(chrono::Utc::now());
+                        }
+                        if !summary.trim().is_empty() {
+                            ag.task_summary = Some(summary);
+                        }
+                    }
+                    notify_fleet = true;
+                    notify_host = true;
+                }
                 WireMessage::WorkspaceEventsSnapshot {
                     workspace_id,
                     events,
@@ -7151,7 +7176,12 @@ impl OrbitAppCore {
                 }
                 WireMessage::WorkspaceEventRecorded { event } => {
                     let ws_id = event.workspace_id.clone();
+                    let is_board_reset = event.kind == WorkspaceEventKind::BoardUpdated
+                        && event.summary.starts_with("Reset Shared Board");
                     let list = state.workspace_events.entry(ws_id).or_default();
+                    if is_board_reset {
+                        list.retain(|existing| existing.seq >= event.seq);
+                    }
                     if !list.iter().any(|existing| existing.seq == event.seq) {
                         list.insert(0, event);
                         if list.len() > 200 {
@@ -10324,6 +10354,7 @@ impl OrbitAppCore {
         {
             ag.parent_agent_id = None;
             ag.parent_host_id = None;
+            ag.set_session_tier(orbit_protocol::SessionTier::Conversation);
         }
         self.dispatch_wire_queued(
             host_id,
@@ -10332,6 +10363,37 @@ impl OrbitAppCore {
                 agent_id: agent_id.to_string(),
             },
         );
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+    }
+
+    pub fn harvest_conversation(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        summary_note: Option<String>,
+        append_to_workspace_board: bool,
+    ) {
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ag) = h.agents.get_mut(agent_id)
+        {
+            ag.archived_at = Some(chrono::Utc::now());
+            h.pending_permissions.retain(|p| p.agent_id != agent_id);
+        }
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::HarvestConversation {
+                request_id: Uuid::new_v4(),
+                agent_id: agent_id.to_string(),
+                summary_note,
+                append_to_workspace_board,
+            },
+        );
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
         self.emit(|revision| CoreNotification::HostChanged {
             revision,
             host_id: host_id.to_string(),
@@ -10735,6 +10797,43 @@ impl OrbitAppCore {
                 workspace_id: workspace_id.to_string(),
                 title: None,
                 mission_goal: Some(goal),
+            },
+        );
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+    }
+
+    pub fn reset_workspace_board(
+        self: &Arc<Self>,
+        host_id: &str,
+        workspace_id: &str,
+        new_goal: Option<String>,
+        keep_notes: Option<String>,
+    ) {
+        if let Some(ref raw_goal) = new_goal {
+            let trimmed = raw_goal.trim();
+            let next_goal = (!trimmed.is_empty()).then(|| trimmed.to_string());
+            if let Ok(mut guard) = self.hosts.write()
+                && let Some(h) = guard.get_mut(host_id)
+                && let Some(ws) = h
+                    .workspaces
+                    .iter_mut()
+                    .find(|w| w.workspace_id == workspace_id)
+            {
+                ws.mission_goal = next_goal;
+            }
+        }
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::ResetWorkspaceBoard {
+                request_id: Uuid::new_v4(),
+                workspace_id: workspace_id.to_string(),
+                new_goal,
+                keep_notes,
+                updated_by: Some("human".to_string()),
             },
         );
         self.emit(|revision| CoreNotification::FleetChanged { revision });
@@ -15416,6 +15515,8 @@ impl OrbitAppCore {
                     target: req.target,
                     title: req.title,
                     initial_prompt: req.initial_prompt,
+                    parent_agent_id: None,
+                    parent_host_id: None,
                 })
                 .await
             {
@@ -19010,6 +19111,9 @@ impl OrbitAppCore {
                 None
             }
         };
+        if let Some(ref sel) = result {
+            self.sync_fleet_connected_hosts(&sel.host_id);
+        }
         if self.cloud_sync_status().state == crate::cloud_sync::CloudSyncState::Ready {
             self.schedule_cloud_auto_sync(false);
         }

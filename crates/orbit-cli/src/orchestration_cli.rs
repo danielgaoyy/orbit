@@ -480,7 +480,8 @@ fn matches_rpc_response(w: &WireMessage, req_id: Uuid) -> bool {
         | WireMessage::KeepAwakeStatusSnapshot { request_id, .. }
         | WireMessage::ProviderSubagentsSnapshot { request_id, .. }
         | WireMessage::WorktreeHandoffPreviewResult { request_id, .. }
-        | WireMessage::WorktreeHandoffExecuted { request_id, .. } => *request_id == req_id,
+        | WireMessage::WorktreeHandoffExecuted { request_id, .. }
+        | WireMessage::ConversationHarvested { request_id, .. } => *request_id == req_id,
         WireMessage::RpcError {
             request_id: Some(r),
             ..
@@ -2195,6 +2196,12 @@ pub async fn cmd_fork_agent(
     } else {
         ForkTarget::SameDirectory
     };
+    let env_caller = std::env::var("ORBIT_AGENT_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let env_host = std::env::var("ORBIT_HOST_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     let resp = send_rpc(
         &client,
         req_id,
@@ -2205,6 +2212,8 @@ pub async fn cmd_fork_agent(
             target,
             title,
             initial_prompt,
+            parent_agent_id: env_caller,
+            parent_host_id: env_host,
         },
         60,
     )

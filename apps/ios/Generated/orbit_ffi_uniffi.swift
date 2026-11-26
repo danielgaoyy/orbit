@@ -1169,6 +1169,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func sendTerminalKeysSlot(hostId: String, slot: UInt8, keys: String) 
     
+    func setAccountDefaultMode(mode: FfiSessionMode, updatedAtMs: Int64) 
+    
     func setAgentConfig(hostId: String, agentId: String, model: String?, effort: FfiReasoningEffort?) 
     
     func setAgentFastMode(hostId: String, agentId: String, fastMode: Bool) 
@@ -2912,6 +2914,16 @@ open func sendTerminalKeysSlot(hostId: String, slot: UInt8, keys: String)  {try!
         FfiConverterString.lower(hostId),
         FfiConverterUInt8.lower(slot),
         FfiConverterString.lower(keys),uniffiCallStatus
+    )
+}
+}
+    
+open func setAccountDefaultMode(mode: FfiSessionMode, updatedAtMs: Int64)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_set_account_default_mode(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeFfiSessionMode_lower(mode),
+        FfiConverterInt64.lower(updatedAtMs),uniffiCallStatus
     )
 }
 }
@@ -4867,10 +4879,12 @@ public struct FfiAgentCard: Equatable, Hashable {
     public var seenSeq: UInt64
     public var isUnread: Bool
     public var queuedPrompts: [FfiQueuedPrompt]
+    public var labels: [String: String]
+    public var isPersonalRouter: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(agentId: String, workspaceId: String, cwd: String, title: String, provider: FfiProviderKind, providerLabel: String, model: String?, effort: FfiReasoningEffort?, fastMode: Bool, mode: FfiSessionMode, statusLabel: String, isRunning: Bool, hasBackgroundTasks: Bool, hasArmedTimers: Bool, isAwaitingPermission: Bool, parentAgentId: String?, parentHostId: String?, archivedAtRfc3339: String?, handle: String?, clusterSuggestion: FfiWorkspaceClusterSuggestion?, worktreeBranch: String?, taskSummary: String?, forkedFromAgentId: String?, forkedAtSeq: UInt64?, acpAgentId: String?, attentionLabel: String?, latestSeq: UInt64, createdAtRfc3339: String?, updatedAtRfc3339: String, isPinned: Bool, seenSeq: UInt64, isUnread: Bool, queuedPrompts: [FfiQueuedPrompt]) {
+    public init(agentId: String, workspaceId: String, cwd: String, title: String, provider: FfiProviderKind, providerLabel: String, model: String?, effort: FfiReasoningEffort?, fastMode: Bool, mode: FfiSessionMode, statusLabel: String, isRunning: Bool, hasBackgroundTasks: Bool, hasArmedTimers: Bool, isAwaitingPermission: Bool, parentAgentId: String?, parentHostId: String?, archivedAtRfc3339: String?, handle: String?, clusterSuggestion: FfiWorkspaceClusterSuggestion?, worktreeBranch: String?, taskSummary: String?, forkedFromAgentId: String?, forkedAtSeq: UInt64?, acpAgentId: String?, attentionLabel: String?, latestSeq: UInt64, createdAtRfc3339: String?, updatedAtRfc3339: String, isPinned: Bool, seenSeq: UInt64, isUnread: Bool, queuedPrompts: [FfiQueuedPrompt], labels: [String: String], isPersonalRouter: Bool) {
         self.agentId = agentId
         self.workspaceId = workspaceId
         self.cwd = cwd
@@ -4904,6 +4918,8 @@ public struct FfiAgentCard: Equatable, Hashable {
         self.seenSeq = seenSeq
         self.isUnread = isUnread
         self.queuedPrompts = queuedPrompts
+        self.labels = labels
+        self.isPersonalRouter = isPersonalRouter
     }
 
     
@@ -4954,7 +4970,9 @@ public struct FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer {
                 isPinned: FfiConverterBool.read(from: &buf), 
                 seenSeq: FfiConverterUInt64.read(from: &buf), 
                 isUnread: FfiConverterBool.read(from: &buf), 
-                queuedPrompts: FfiConverterSequenceTypeFfiQueuedPrompt.read(from: &buf)
+                queuedPrompts: FfiConverterSequenceTypeFfiQueuedPrompt.read(from: &buf), 
+                labels: FfiConverterDictionaryStringString.read(from: &buf), 
+                isPersonalRouter: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -4992,6 +5010,8 @@ public struct FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.seenSeq, into: &buf)
         FfiConverterBool.write(value.isUnread, into: &buf)
         FfiConverterSequenceTypeFfiQueuedPrompt.write(value.queuedPrompts, into: &buf)
+        FfiConverterDictionaryStringString.write(value.labels, into: &buf)
+        FfiConverterBool.write(value.isPersonalRouter, into: &buf)
     }
 }
 
@@ -27770,6 +27790,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_send_terminal_keys_slot() != 21579) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_set_account_default_mode() != 41375) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_set_agent_config() != 45534) {

@@ -164,6 +164,12 @@ impl OrbitHarmonyCore {
     }
 
     #[napi]
+    pub fn set_account_default_mode(&self, mode: String, updated_at_ms: Option<i64>) {
+        self.facade
+            .set_account_default_mode(&mode, updated_at_ms.unwrap_or(0));
+    }
+
+    #[napi]
     pub fn send_prompt_with_meta(
         &self,
         host_id: String,

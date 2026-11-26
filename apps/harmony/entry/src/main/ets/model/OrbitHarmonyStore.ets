@@ -2653,8 +2653,12 @@ export class OrbitHarmonyStore {
   public setSessionMode(mode: string): void {
     const normalized = mode === 'plan' || mode.length === 0 ? 'default' : mode;
     this.composerMode = normalized;
-    if (this.bridge !== null && this.selectedHostId.length > 0 && this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
-      this.bridge.setSessionMode(this.selectedHostId, this.selectedAgentId, normalized);
+    if (this.bridge !== null) {
+      if (this.selectedHostId.length > 0 && this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
+        this.bridge.setSessionMode(this.selectedHostId, this.selectedAgentId, normalized);
+      } else {
+        this.bridge.setAccountDefaultMode(normalized, Date.now());
+      }
     }
     this.triggerHaptic(8);
   }
@@ -2943,6 +2947,13 @@ export class OrbitHarmonyStore {
     return [];
   }
 
+  public isActiveAgentPersonalAgent(): boolean {
+    if (this.isNewSessionDraft || this.selectedAgentId.length === 0 || this.currentAgent === null) {
+      return false;
+    }
+    return this.currentAgent.labels !== undefined && this.currentAgent.labels['orbit.role'] === 'personal_router';
+  }
+
   public isActiveAgentRunning(): boolean {
     if (this.isNewSessionDraft || this.selectedAgentId.length === 0) {
       return false;
@@ -2961,8 +2972,10 @@ export class OrbitHarmonyStore {
     }
     return (
       this.currentAgent.is_running ||
+      this.currentAgent.is_awaiting_permission ||
       this.currentAgent.status.state === 'running' ||
-      this.currentAgent.status.state === 'initializing'
+      this.currentAgent.status.state === 'initializing' ||
+      this.currentAgent.status.state === 'awaiting_permission'
     );
   }
 
@@ -3521,9 +3534,25 @@ export class OrbitHarmonyStore {
       return;
     }
 
-    if (overridePrompt === undefined && this.isActiveAgentRunning()) {
-      this.enqueueCurrentDraft();
-      return;
+    if (this.isActiveAgentRunning()) {
+      if (overridePrompt === undefined) {
+        this.enqueueCurrentDraft();
+        return;
+      }
+      if (this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
+        const badgesJsonOverride = composed.badges.length > 0 ? JSON.stringify(composed.badges) : null;
+        const queueId = `q_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+        this.bridge.enqueuePrompt(
+          this.selectedHostId,
+          this.selectedAgentId,
+          composed.wire_prompt,
+          composed.display_prompt,
+          badgesJsonOverride,
+          queueId
+        );
+        this.reloadStage();
+        return;
+      }
     }
 
     const badgesJson = composed.badges.length > 0 ? JSON.stringify(composed.badges) : null;

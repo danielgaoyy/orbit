@@ -49,6 +49,7 @@
   "monitor_watches": [],
   "orchestration_config": {
     "auto_cluster_enabled": false,
+    "default_session_mode_updated_at_ms": 0,
     "idle_cleanup_enabled": true,
     "idle_timeout_secs": 3600,
     "installed_skills": [],

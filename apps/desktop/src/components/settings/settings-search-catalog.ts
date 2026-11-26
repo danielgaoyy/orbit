@@ -11,6 +11,7 @@ export const SETTING_ENTRIES = [
   ["general", "settings.setupGuide", "onboarding walkthrough first run 入门向导 セットアップ 初期設定"],
   ["general", "settings.sendWithEnter", "send shortcut enter to send composer submit 发送快捷键 回车发送 送信ショートカット エンターキー"],
   ["general", "settings.activeTurnSendBehavior", "while agent is running queue steer follow up interrupt 排队发送 引导发送 代理运行时 ステア キュー 実行中"],
+  ["general", "settings.defaultPermissionMode", "default permission mode full access accept edits auto personal agent 默认权限 完全访问 自动批准 デフォルト権限"],
   ["general", "settings.appVersion", "check for updates app desktop version 版本升级 バージョン更新"],
   ["general", "securityOps.migrationGroup", "external ide migration import settings IDE 迁移 移行"],
   ["general", "securityOps.migrationSourceTitle", "migration source external ide 迁移来源 移行元"],

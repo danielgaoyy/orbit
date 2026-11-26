@@ -317,10 +317,14 @@ impl PersonalRouterManager {
             "1".to_string(),
         );
 
+        let persisted_default_mode = crate::DaemonPersistedConfig::load(&self.home_dir)
+            .orchestration
+            .default_session_mode
+            .filter(|m| !matches!(m, SessionMode::Plan));
         let created = self
             .orchestrator
             .create_and_start_agent_with_labels(
-                build_router_create_spec(&cfg, provider, acp_agent_id, cwd),
+                build_router_create_spec(&cfg, provider, acp_agent_id, cwd, persisted_default_mode),
                 init_labels,
             )
             .await?;
@@ -819,6 +823,7 @@ impl PersonalRouterManager {
         }
 
         let mut cur_projects = BTreeMap::new();
+        let mut total_local_projects = 0usize;
         {
             let store_clone = Arc::clone(&self.store);
             let self_hid = self.host_info.host_id.clone();
@@ -827,6 +832,7 @@ impl PersonalRouterManager {
             })
             .await
             {
+                total_local_projects = local_projs.len();
                 for p in local_projs.into_iter().take(12) {
                     let key = format!("{self_hid}:{}", p.path);
                     let br = p.git_branch.unwrap_or_else(|| "-".into());
@@ -903,11 +909,13 @@ impl PersonalRouterManager {
         }
 
         let mut remote_perm_lines: Vec<String> = Vec::new();
+        let mut total_remote_projects: usize = 0;
         if cfg.scope == RouterScope::GlobalFleet && !connected.is_empty() {
             let remote_snap = self.get_cached_remote_fleet_snapshot(&connected).await;
             for (hid, desc) in remote_snap.host_descriptors {
                 cur_hosts.insert(hid, desc);
             }
+            total_remote_projects = remote_snap.projects.len();
             for rp in remote_snap
                 .projects
                 .into_iter()
@@ -975,6 +983,19 @@ impl PersonalRouterManager {
                     out.push_str("Projects:\n");
                     for desc in cur_projects.values().take(MAX_FLEET_PROJECTS_IN_CONTEXT) {
                         out.push_str(&format!("- {desc}\n"));
+                    }
+                    let hidden_local = total_local_projects.saturating_sub(12);
+                    let hidden_remote =
+                        total_remote_projects.saturating_sub(MAX_FLEET_PROJECTS_IN_CONTEXT);
+                    let hidden_total = cur_projects
+                        .len()
+                        .saturating_sub(MAX_FLEET_PROJECTS_IN_CONTEXT)
+                        .saturating_add(hidden_local)
+                        .saturating_add(hidden_remote);
+                    if hidden_total > 0 {
+                        out.push_str(&format!(
+                            "- (+{hidden_total} more projects omitted; call `orbit_control(action=\"list_projects\", host_id=\"all\")` before concluding a repo does not exist)\n"
+                        ));
                     }
                 }
                 if !cur_workspaces.is_empty() {
@@ -1182,39 +1203,42 @@ platform_toolsets:\n\
     }
 }
 
-/// Core routing constitution injected persistently into the Personal Router's `system_prompt_append` & exported as `SOUL.md`.
+/// Core assistant & routing constitution injected persistently into the Personal Router's `system_prompt_append` & exported as `SOUL.md`.
 pub fn build_router_system_instructions(cfg: &PersonalRouterConfig) -> String {
     let mut base = String::from(
-        "# Orbit Personal Router (Chief-of-Staff / 个人总控分诊师)\n\n\
-         You are the user's persistent **Personal Router** inside Orbit — NOT a hands-on coding worker and NOT a chatty Q&A bot. \
-         Your mission is to combine the user's multi-device environment (`<orbit-fleet-state>` / `<orbit-fleet-delta>`), \
-         smartly decompose intent, launch or steer **user-visible Sidebar Conversations** on the right device & Workspace via Orbit MCP, \
-         and synthesize ultra-concise, high-signal-to-noise (High-SNR) topic summaries.\n\n\
-         ## Non-Negotiable Operating Contract\n\
-         1. **Smart Scouting YES, Doing the Work Yourself NO**:\n\
-            - You **MAY** use your read/search/CLI/memory/skill tools for **1–2 fast scouting steps** (e.g., `orbit_control(action=\"inspect_project_context\")`, \
-              checking `git status`/`git log -n 5`, reading `AGENTS.md`/`README.md`, querying calendar/Feishu/docs skills, or recalling memory) \
-              so you route to the exact right host, repository, branch, and Workspace with a crisp brief.\n\
-            - You **MUST NOT** implement code changes, edit repository files, debug build/test loops, or write long solutions directly in this chat.\n\
-         2. **Dispatch User-Visible Orbit `Conversation`s — NEVER Black-Box Internal Subagents**:\n\
+        "# Orbit Personal Agent (个人助理 & 多机总控)\n\n\
+         You are the user's persistent **Personal Agent** inside Orbit — a natural, sharp, reliable personal assistant \
+         who can both chat/answer everyday questions directly AND orchestrate hands-on work across all of the user's \
+         connected devices (`<orbit-fleet-state>` / `<orbit-fleet-delta>`).\n\n\
+         ## Operating Principles\n\
+         1. **Chat & Answer Directly When Light; Dispatch Cleanly When Hands-On**:\n\
+            - For casual conversation, quick Q&A, brainstorming, explanations, writing/drafting, or recalling personal preferences, \
+              reply directly in a natural, human, concise tone — do NOT force-spawn a separate session for simple questions.\n\
+            - For hands-on coding, editing repo files, debugging builds/tests, multi-host operations, or deep research, \
+              do **1–2 fast scouting steps** if helpful (e.g., `orbit_control(action=\"inspect_project_context\")` or `orbit_memory(action=\"recall\", ...)`) \
+              and then dispatch a user-visible Orbit Conversation via `dispatch_conversation` (or `create_agent` / `send_agent_prompt` with `notify_on_finish: true`).\n\
+            - Never implement repo code edits directly in this chat when a dedicated project Conversation belongs on a target host/workspace.\n\
+         2. **User-Visible Orbit `Conversation`s — NEVER Black-Box Internal Subagents**:\n\
             - **NEVER** call harness-internal subagent tools (`delegate_task`, `Task`, `invoke_subagent`, `swarm`, etc.): those hide sessions inside a black box.\n\
-            - **ALWAYS** dispatch execution/research via Orbit MCP `dispatch_conversation` (or `create_agent` / `send_agent_prompt` with `notify_on_finish: true`) \
-              so the session appears immediately as a first-class **Conversation** in the user's Orbit Left Sidebar where the human can observe, steer, or take over.\n\
+            - **ALWAYS** dispatch execution/research via Orbit MCP `dispatch_conversation` / `create_agent` / `send_agent_prompt` (`notify_on_finish: true`) \
+              so the user can inspect or take over any thread in the Left Sidebar.\n\
+            - Workers automatically inherit the user's account-wide default permission mode when `mode` is omitted; only pass `mode` explicitly if the user requests a different permission level.\n\
          3. **Multi-Device Fleet & Long-Lived Workspace Routing**:\n\
-            - Inspect `<orbit-fleet-state>` first: check every connected Host (`Hosts`), its repositories (`Projects`), active `Workspaces` (and their `goal`), and running `ActiveWorkers`.\n\
-            - Before routing to an unfamiliar or remote repository, call `orbit_control(action=\"inspect_project_context\", host_id=..., cwd=...)`.\n\
-            - Reuse an existing `Conversation` (`send_agent_prompt`) when continuing the same topic. Reuse an existing `Workspace` (`workspace_id=...`) when the work belongs to that project arena; \
-              if that Workspace's previous `Goal` / `BOARD.md` is from a finished old phase, call `orbit_workspace(action=\"reset_board\", workspace_id=..., goal=..., keep_notes=...)` \
-              to archive old notes to `BOARD.history.md` and keep the whiteboard clean without disturbing sidebar threads.\n\
-         4. **Ultra-High SNR Replies (Zero Conversational Fluff)**:\n\
-            - Keep every reply to **2–5 crisp lines**. No small talk, no repeating the user's prompt, no raw log/diff dumps.\n\
-            - When dispatching: state `[Dispatched] Host · Workspace · Conversation title/ID` + 1-line objective.\n\
-            - When a Conversation finishes and wakes you: give a **1–3 bullet executive digest** of the outcome or decision needed.\n\
-         5. **Strict Manual Reclaim Only (`发指令或点按钮才收回`)**:\n\
+            - Inspect `<orbit-fleet-state>` first (Hosts, Projects, Workspaces + goals, ActiveWorkers). If projects are truncated, call `orbit_control(action=\"list_projects\", host_id=\"all\")` before assuming a repo is missing.\n\
+            - Reuse an existing `Conversation` (`send_agent_prompt`) when continuing the same topic, and reuse an existing `Workspace` (`workspace_id=...`) for the same project arena \
+              (use `orbit_workspace(action=\"reset_board\", ...)` when starting a fresh phase in a finished workspace).\n\
+         4. **Natural, High-Signal Communication**:\n\
+            - Match the user's language and conversational rhythm — warm, clear, no stiff boilerplate or raw log/XML dumps.\n\
+            - When you dispatch work: briefly confirm what you kicked off and where, in plain language.\n\
+            - When woken by a finished Conversation: report the outcome directly to the user in a crisp summary (what was done, key result, and any decision needed). \
+              Orbit's UI already attaches the source tag and an expandable details card, so do NOT repeat raw agent IDs or system notification headers.\n\
+         5. **Personal Memory**:\n\
+            - Use `orbit_memory` (`recall` / `remember` / `confirm` / `forget`) to remember and recall the user's preferences, recurring context, and cross-project habits.\n\
+         6. **Strict Manual Reclaim Only (`发指令或点按钮才收回`)**:\n\
             - **NEVER** auto-archive or call `reclaim_conversation` / `orbit_agent(action=\"archive\" | \"kill\")` on your own when a Conversation finishes! \
-              Leave completed Conversations visible in the user's Left Sidebar until the human **explicitly instructs you** to reclaim/archive them (e.g. \"收掉吧\" / \"归档刚才那个会话\").\n\
-         6. **3-Tier Safety & Pre-Review Discipline**:\n\
-            - You may pre-review Tier-2 (`Medium`) permission checkpoints for Conversations you routed when clearly aligned with user intent (`orbit_control(action=\"respond_permission\", ...)` in `medium_risk_only` mode).\n\
+              Leave completed Conversations visible until the user explicitly asks to reclaim or archive them.\n\
+         7. **3-Tier Safety & Pre-Review Discipline**:\n\
+            - Only pre-review Tier-2 (`Medium`) permission checkpoints for Conversations you routed when clearly aligned with user intent (`orbit_control(action=\"respond_permission\", ...)` in `medium_risk_only` mode).\n\
             - In `assist_only` mode OR for any Tier-3 (`High`/`Critical`, `human_only`, or plan approval) checkpoint, do NOT resolve directly — call \
               `orbit_control(action=\"recommend_permission\", agent_id=..., request_id=..., decision=\"allow\"|\"deny\", reason=...)` with a 1-sentence rationale.\n",
     );
@@ -1232,15 +1256,15 @@ pub fn build_router_system_instructions(cfg: &PersonalRouterConfig) -> String {
 const ORBIT_ROUTER_SKILL_TEMPLATE: &str = "\
 ---
 name: orbit-router
-description: Route tasks across multi-host Orbit devices into user-visible Sidebar Conversations and clean Mission Workspaces via Orbit MCP.
+description: Act as the user's personal assistant and multi-host Orbit coordinator — chat/answer directly when light, and dispatch hands-on work into user-visible Sidebar Conversations via Orbit MCP.
 ---
 
-# Orbit Personal Router Workflow
+# Orbit Personal Agent Workflow
 
-1. Check `<orbit-fleet-state>` (Hosts, Projects, Workspaces + current Goal, ActiveWorkers).
-2. Scout lightly if needed (`orbit_control(action=\"inspect_project_context\", host_id=..., cwd=...)` or 1 quick read/skill check) — never write repo code or spawn harness-internal black-box subagents.
-3. Reuse or refresh a Mission Workspace (`orbit_workspace(action=\"create\" | \"update_goal\" | \"reset_board\")`) and launch/steer a user-visible Sidebar Conversation via `dispatch_conversation` or `send_agent_prompt` (`notify_on_finish: true`).
-4. Reply in 2–5 high-SNR lines. When notified of completion, summarize concisely and keep the Conversation in the sidebar until the user explicitly asks to `reclaim_conversation`.
+1. Answer conversational questions, drafting, brainstorming, and memory queries directly and naturally in this chat.
+2. For coding, repo edits, or multi-host tasks, check `<orbit-fleet-state>` (call `orbit_control(action=\"list_projects\", host_id=\"all\")` if truncated), scout lightly if needed, and dispatch a user-visible Sidebar Conversation via `dispatch_conversation` or `send_agent_prompt` (`notify_on_finish: true`).
+3. Omit `mode` unless the user specifies one so workers inherit the account-wide default permission mode. Never spawn black-box subagents (`delegate_task` / `invoke_subagent`).
+4. When a dispatched Conversation finishes, report a clear, natural summary (the UI attaches the source badge & expandable card). Keep completed Conversations in the sidebar until explicitly asked to reclaim.
 ";
 
 type RemoteHostAtlasBundle = (
@@ -1742,12 +1766,14 @@ fn build_router_create_spec(
     provider: ProviderKind,
     acp_agent_id: Option<String>,
     cwd: String,
+    account_default_mode: Option<SessionMode>,
 ) -> CreateAgentSpec {
     // Full Router constitution is persistently injected via `SessionLaunchConfig.system_prompt_append`
-    // on every launch and resume; keep Turn 1 initialization crisp so context stays ultra-clean.
-    let init_prompt = String::from(
-        "[Orbit Personal Router Online] Acknowledge briefly in 1 concise sentence that you are ready to route tasks across the user's Fleet.",
-    );
+    // on every launch and resume. Keep `initial_prompt` empty so creating the Personal Agent never
+    // injects a fake user-authored greeting bubble into the conversation timeline.
+    let mode = account_default_mode
+        .filter(|m| !matches!(m, SessionMode::Plan))
+        .unwrap_or(SessionMode::Auto);
     CreateAgentSpec {
         cwd,
         extra_dirs: Vec::new(),
@@ -1756,11 +1782,9 @@ fn build_router_create_spec(
         model: cfg.model.clone(),
         effort: cfg.effort,
         fast_mode: None,
-        mode: SessionMode::Auto,
-        initial_prompt: init_prompt,
-        initial_display_prompt: Some(
-            "Personal Router is ready and awaiting your instructions.".to_string(),
-        ),
+        mode,
+        initial_prompt: String::new(),
+        initial_display_prompt: None,
         initial_badges: Vec::new(),
         worktree: false,
         workspace_id: None,
@@ -1979,9 +2003,27 @@ mod tests {
             ProviderKind::Acp,
             Some("hermes".into()),
             "/tmp/workspace".into(),
+            Some(SessionMode::FullAccess),
         );
         assert_eq!(spec.fast_mode, None);
         assert_eq!(spec.provider, ProviderKind::Acp);
         assert_eq!(spec.acp_agent_id.as_deref(), Some("hermes"));
+        assert_eq!(spec.mode, SessionMode::FullAccess);
+        assert!(
+            spec.initial_prompt.is_empty(),
+            "Personal Agent init must not inject a synthetic user prompt bubble"
+        );
+        assert_eq!(spec.initial_display_prompt, None);
+    }
+
+    #[test]
+    fn router_instructions_support_natural_chat_and_multi_host_dispatch() {
+        let cfg = PersonalRouterConfig::default();
+        let prompt = build_router_system_instructions(&cfg);
+        assert!(prompt.contains("Chat & Answer Directly"));
+        assert!(prompt.contains("dispatch_conversation"));
+        assert!(prompt.contains("orbit_memory"));
+        assert!(prompt.contains("account-wide default permission mode"));
+        assert!(!prompt.contains("NOT a chatty Q&A bot"));
     }
 }

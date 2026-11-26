@@ -1723,6 +1723,7 @@ pub struct OrbitAppCore {
     fleet_relay_fabric_in_flight: Arc<AtomicBool>,
     fleet_relay_auto_attempted: Arc<AtomicBool>,
     last_vault_fingerprint: Arc<RwLock<Option<String>>>,
+    account_default_mode: Arc<RwLock<Option<(SessionMode, i64)>>>,
 }
 
 impl OrbitAppCore {
@@ -2019,6 +2020,7 @@ impl OrbitAppCore {
             fleet_relay_fabric_in_flight: Arc::new(AtomicBool::new(false)),
             fleet_relay_auto_attempted: Arc::new(AtomicBool::new(false)),
             last_vault_fingerprint: Arc::new(RwLock::new(None)),
+            account_default_mode: Arc::new(RwLock::new(None)),
         });
         if !core.store.is_replica_fts_backfill_done() {
             let store_bg = Arc::clone(&core.store);
@@ -2437,7 +2439,17 @@ impl OrbitAppCore {
                     rendered_by_event.push(rendered);
                 }
 
-                let sliced = stage::process_timeline_turns_slice(&items, 0, 0, cwd);
+                let split_finish_reports = host_state
+                    .agents
+                    .get(agent_id)
+                    .is_some_and(|a| a.is_personal_router());
+                let sliced = stage::process_timeline_turns_slice_with_options(
+                    &items,
+                    0,
+                    0,
+                    cwd,
+                    split_finish_reports,
+                );
                 let provider_subagents = host_state
                     .provider_subagents
                     .get(agent_id)
@@ -2524,6 +2536,14 @@ impl OrbitAppCore {
                             .partition_point(|&start| start <= base_item_idx)
                             .saturating_sub(1)
                     };
+                    // Interleaved deferred finish reports share their predecessor's `turn_item_starts`
+                    // anchor; walk back so incremental tail rebuilds never slice mid-interleave.
+                    while replace_from_turn_idx > 0
+                        && cached.turn_item_starts[replace_from_turn_idx]
+                            == cached.turn_item_starts[replace_from_turn_idx - 1]
+                    {
+                        replace_from_turn_idx -= 1;
+                    }
                     let start_item_idx = if replace_from_turn_idx == 0 {
                         0
                     } else {
@@ -2532,11 +2552,16 @@ impl OrbitAppCore {
                     cached.turns.truncate(replace_from_turn_idx);
                     cached.turn_item_starts.truncate(replace_from_turn_idx);
 
-                    let sliced = stage::process_timeline_turns_slice(
+                    let split_finish_reports = host_state
+                        .agents
+                        .get(agent_id)
+                        .is_some_and(|a| a.is_personal_router());
+                    let sliced = stage::process_timeline_turns_slice_with_options(
                         &cached.items,
                         start_item_idx,
                         replace_from_turn_idx as u32,
                         cwd,
+                        split_finish_reports,
                     );
                     cached.turns.extend(sliced.turns);
                     cached.turn_item_starts.extend(sliced.turn_item_starts);
@@ -6303,7 +6328,13 @@ impl OrbitAppCore {
                         if local_max_seq > agent.latest_seq {
                             agent.latest_seq = local_max_seq;
                         }
-                        if !stage_fields_unchanged {
+                        let router_role_changed = prev_summary
+                            .map_or(agent.is_personal_router(), |prev| {
+                                prev.is_personal_router() != agent.is_personal_router()
+                            });
+                        if router_role_changed {
+                            state.mark_stage_dirty(&ag_id, 0, true);
+                        } else if !stage_fields_unchanged {
                             state.mark_stage_meta_dirty(&ag_id);
                         }
                     }
@@ -8459,6 +8490,19 @@ impl OrbitAppCore {
                 self.record_cloud_meta_mutation(|meta| meta.record_host_mutated(host_id, now_ms));
                 self.schedule_cloud_auto_sync(false);
             }
+            if let Ok(guard) = self.account_default_mode.read()
+                && let Some((mode, updated_at_ms)) = guard.clone()
+                && !matches!(mode, SessionMode::Plan)
+            {
+                self.dispatch_wire_queued(
+                    host_id,
+                    WireMessage::SetAccountDefaultMode {
+                        request_id: Uuid::new_v4(),
+                        mode,
+                        updated_at_ms,
+                    },
+                );
+            }
         }
         if let Some(ref relay) = promoted_fleet_relay {
             self.propagate_fleet_relay_to_online_hosts(relay);
@@ -9563,6 +9607,7 @@ impl OrbitAppCore {
                 handle: clean_handle,
                 auto_cluster: req.auto_cluster,
                 acp_agent_id: clean_acp_agent_id,
+                labels: std::collections::HashMap::new(),
             },
         );
 
@@ -9814,9 +9859,11 @@ impl OrbitAppCore {
         {
             h.cancelled_optimistic_agents.remove(agent_id);
             if let Some(ag) = h.agents.get_mut(agent_id) {
-                ag.status = AgentStatus::Running {
-                    turn_id: "pending".into(),
-                };
+                if !matches!(ag.status, AgentStatus::AwaitingPermission { .. }) {
+                    ag.status = AgentStatus::Running {
+                        turn_id: "pending".into(),
+                    };
+                }
                 ag.archived_at = None;
                 ag.updated_at = now;
             }
@@ -12939,6 +12986,51 @@ impl OrbitAppCore {
         if changed_any {
             self.emit(|revision| CoreNotification::FleetChanged { revision });
             self.schedule_cloud_auto_sync(false);
+        }
+    }
+
+    pub fn set_account_default_mode(self: &Arc<Self>, mode: SessionMode, updated_at_ms: i64) {
+        if matches!(mode, SessionMode::Plan) {
+            return;
+        }
+        if let Ok(mut guard) = self.account_default_mode.write() {
+            let should_store = match guard.as_ref() {
+                None => true,
+                Some((_, prev_ts)) => updated_at_ms > 0 && updated_at_ms >= *prev_ts,
+            };
+            if should_store {
+                *guard = Some((mode.clone(), updated_at_ms));
+            }
+        }
+        let host_ids: Vec<String> = self
+            .hosts
+            .read()
+            .map(|guard| guard.keys().cloned().collect())
+            .unwrap_or_default();
+        for host_id in host_ids {
+            if let Ok(mut guard) = self.hosts.write()
+                && let Some(h) = guard.get_mut(&host_id)
+            {
+                let should_update = if updated_at_ms > 0 {
+                    updated_at_ms >= h.orchestration_config.default_session_mode_updated_at_ms
+                } else {
+                    h.orchestration_config.default_session_mode.is_none()
+                };
+                if should_update {
+                    h.orchestration_config.default_session_mode = Some(mode.clone());
+                    if updated_at_ms > 0 {
+                        h.orchestration_config.default_session_mode_updated_at_ms = updated_at_ms;
+                    }
+                }
+            }
+            self.dispatch_wire_queued(
+                &host_id,
+                WireMessage::SetAccountDefaultMode {
+                    request_id: Uuid::new_v4(),
+                    mode: mode.clone(),
+                    updated_at_ms,
+                },
+            );
         }
     }
 

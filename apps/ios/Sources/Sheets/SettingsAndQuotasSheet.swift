@@ -196,8 +196,8 @@ struct SettingsAndQuotasSheet: View {
 
                     LazyVGrid(columns: [GridItem(.flexible(), spacing: 4), GridItem(.flexible(), spacing: 4)], spacing: 4) {
                         permissionPrefChip(.default, title: OrbitL10n.tr("Always Ask"), selected: defaultPerm == .default)
+                        permissionPrefChip(.auto, title: OrbitL10n.tr("Auto"), selected: defaultPerm == .auto)
                         permissionPrefChip(.acceptEdits, title: OrbitL10n.tr("Accept Edits"), selected: defaultPerm == .acceptEdits)
-                        permissionPrefChip(.plan, title: OrbitL10n.tr("Plan"), selected: defaultPerm == .plan)
                         permissionPrefChip(.fullAccess, title: OrbitL10n.tr("Full Access"), selected: defaultPerm == .fullAccess)
                     }
                     .padding(3)

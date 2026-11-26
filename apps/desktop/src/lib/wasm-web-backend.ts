@@ -497,6 +497,20 @@ export class WasmWebBackend implements OrbitTransportBackend {
       case "on_network_changed":
       case "on_app_foreground":
         return Promise.allSettled(hosts.map((h) => this.connect(h)));
+      case "set_account_default_mode": {
+        const mode = a.mode as string | undefined;
+        const updatedAtMs = typeof a.updatedAtMs === "number" ? a.updatedAtMs : 0;
+        if (!mode || mode === "plan") return;
+        await Promise.allSettled(
+          hosts.map((host) =>
+            this.rpc(host, "set_account_default_mode", {
+              mode,
+              updated_at_ms: updatedAtMs,
+            }).catch(() => {}),
+          ),
+        );
+        return;
+      }
       case "on_app_background":
         return;
       case "get_fallback_provider_catalogs":

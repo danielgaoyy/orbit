@@ -111,6 +111,7 @@ import {
   useComposerDraft,
   useOrbitSelector,
 } from "@/state/orbit-store";
+import { selectIsSelectedAgentPersonalAgent } from "@/state/selectors/personal-agent-selectors";
 import { resolveTypography } from "@/lib/typography";
 import { cn } from "@/lib/utils";
 
@@ -376,6 +377,10 @@ export const OmniComposer = memo(function OmniComposer({
   );
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const activeTurnSendBehavior = useOrbitSelector((s) => s.activeTurnSendBehavior);
+  const isPersonalAgentSession = useOrbitSelector(selectIsSelectedAgentPersonalAgent);
+  const effectiveActiveTurnSendBehavior: ActiveTurnSendBehavior = isPersonalAgentSession
+    ? "steer"
+    : activeTurnSendBehavior;
   const promptHistory = useOrbitSelector((s) => s.promptHistory);
   const slashCommands = useOrbitSelector((s) => s.slashCommands);
   const managedSkills = useOrbitSelector((s) =>
@@ -1661,7 +1666,7 @@ export const OmniComposer = memo(function OmniComposer({
       e,
       enterToSend,
       isTurnBusy,
-      activeTurnSendBehavior,
+      effectiveActiveTurnSendBehavior,
       isAwaitingPermission,
     );
     if (enterAction.submit) {
@@ -1682,14 +1687,14 @@ export const OmniComposer = memo(function OmniComposer({
       resolveComposerTurnPresentation({
         isForegroundRunning,
         isAwaitingPermission,
-        activeTurnSendBehavior,
+        activeTurnSendBehavior: effectiveActiveTurnSendBehavior,
         hasCurrentAgent,
         isDraft,
       }),
     [
       isForegroundRunning,
       isAwaitingPermission,
-      activeTurnSendBehavior,
+      effectiveActiveTurnSendBehavior,
       hasCurrentAgent,
       isDraft,
     ],
@@ -2130,7 +2135,7 @@ export const OmniComposer = memo(function OmniComposer({
     ? t("composer.uploadingAttachments")
     : isSubmitting && !localSubmission
       ? t("composer.sendingPrompt")
-      : localSubmission
+      : localSubmission || isPersonalAgentSession
         ? t("common.send")
         : turnPresentation.tooltipKey === "composer.steerFollowUpHint" ||
             turnPresentation.tooltipKey === "composer.queueFollowUpHint"
@@ -2161,6 +2166,9 @@ export const OmniComposer = memo(function OmniComposer({
       default:
         break;
     }
+    if (isPersonalAgentSession && !isAwaitingPermission) {
+      return t("personalAgent.placeholder");
+    }
     return turnPresentation.placeholderKey === "composer.placeholderRunningSteer" ||
       turnPresentation.placeholderKey === "composer.placeholderRunning"
       ? t(turnPresentation.placeholderKey, { shortcut: alternateSendShortcut })
@@ -2190,7 +2198,7 @@ export const OmniComposer = memo(function OmniComposer({
           }}
         />
 
-        {/* Isolated Queued Follow-Up Strip — zero keystroke re-renders */}
+        {/* Isolated Queued Follow-Up Strip — renders only when prompts are actively queued */}
         <ComposerQueueStrip />
 
         {/* Relative Anchor for Floating `/` & `@` Menus + Single-Rim Tactile Composer Card */}
@@ -2385,6 +2393,7 @@ export const OmniComposer = memo(function OmniComposer({
               submitBusy={submitBusy}
               isTurnBusy={isTurnBusy}
               showStopButton={showStopButton}
+              isPersonalAgentSession={isPersonalAgentSession}
               voiceEnabled={isHostVoiceEnabled}
               voiceRecording={voiceRecording}
               voiceTranscribing={voiceTranscribing}
@@ -2415,6 +2424,7 @@ interface ComposerBottomBarProps {
   submitBusy: boolean;
   isTurnBusy: boolean;
   showStopButton: boolean;
+  isPersonalAgentSession: boolean;
   voiceEnabled: boolean;
   voiceRecording: boolean;
   voiceTranscribing: boolean;
@@ -2435,7 +2445,7 @@ interface ComposerBottomBarProps {
 }
 
 const ComposerBottomBar = memo(function ComposerBottomBar({
-  hasPayload, submitBusy, isTurnBusy, showStopButton, voiceEnabled, voiceRecording, voiceTranscribing,
+  hasPayload, submitBusy, isTurnBusy, showStopButton, isPersonalAgentSession, voiceEnabled, voiceRecording, voiceTranscribing,
   submitTooltipLabel, submitShortcut,
   activeMode, effectiveProvider, isCompactBar, selectedHostId, selectedAgentId,
   onAttach, onMention, onSlash, onSelectMode, onSubmit, onStartVoice, onStopVoice,
@@ -2443,7 +2453,7 @@ const ComposerBottomBar = memo(function ComposerBottomBar({
   const { t } = useI18n();
   const actionMode = resolveComposerActionMode({
     voiceRecording,
-    showStopButton,
+    showStopButton: isPersonalAgentSession ? false : showStopButton,
     submitBusy,
     voiceTranscribing,
     hasPayload,
@@ -2516,31 +2526,53 @@ const ComposerBottomBar = memo(function ComposerBottomBar({
         <ComposerModelPicker />
       </div>
 
-      {/* Right Cluster: Ambient Context Ring + Access Permissions + Stationary Single `size-8.5` Action Circle */}
+      {/* Right Cluster: Minimalist PA status or Ambient Context Ring + Access Permissions + Stationary Action Circle */}
       <div className="flex shrink-0 items-center gap-1">
-        <ContextOccupancyPill />
-        <ComposerModePicker
-          mode={activeMode}
-          onSelectMode={onSelectMode}
-          provider={effectiveProvider}
-          iconOnly={isCompactBar}
-        />
+        {isPersonalAgentSession ? (
+          isTurnBusy && !voiceRecording && Boolean(selectedAgentId) && (
+            <SimpleTooltip label={t("composer.stopGeneration")} shortcut="Esc Esc" side="top">
+              <button
+                type="button"
+                aria-label={t("composer.stopGeneration")}
+                onClick={() => {
+                  if (selectedAgentId) {
+                    void orbitIpc.interruptAgent(selectedHostId, selectedAgentId);
+                  }
+                }}
+                className="text-ink-muted hover:text-ink-primary hover:bg-surface-recessed inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[11px] font-medium transition-colors"
+              >
+                <span aria-hidden="true" className="bg-ink-muted size-1.5 animate-pulse rounded-full" />
+                <span>{t("personalAgent.processing")}</span>
+              </button>
+            </SimpleTooltip>
+          )
+        ) : (
+          <>
+            <ContextOccupancyPill />
+            <ComposerModePicker
+              mode={activeMode}
+              onSelectMode={onSelectMode}
+              provider={effectiveProvider}
+              iconOnly={isCompactBar}
+            />
 
-        {isTurnBusy && !showStopButton && !voiceRecording && Boolean(selectedAgentId) && (
-          <SimpleTooltip label={t("composer.stopGeneration")} shortcut="Esc Esc" side="top">
-            <button
-              type="button"
-              aria-label={t("composer.stopGeneration")}
-              onClick={() => {
-                if (selectedAgentId) {
-                  void orbitIpc.interruptAgent(selectedHostId, selectedAgentId);
-                }
-              }}
-              className="orbit-press bg-surface-recessed hover:bg-accent inline-flex size-8.5 shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors duration-150 ease-[var(--ease-out-expo)]"
-            >
-              <span aria-hidden="true" className="bg-signal-danger size-[11px] rounded-[2.5px]" />
-            </button>
-          </SimpleTooltip>
+            {isTurnBusy && !showStopButton && !voiceRecording && Boolean(selectedAgentId) && (
+              <SimpleTooltip label={t("composer.stopGeneration")} shortcut="Esc Esc" side="top">
+                <button
+                  type="button"
+                  aria-label={t("composer.stopGeneration")}
+                  onClick={() => {
+                    if (selectedAgentId) {
+                      void orbitIpc.interruptAgent(selectedHostId, selectedAgentId);
+                    }
+                  }}
+                  className="orbit-press bg-surface-recessed hover:bg-accent inline-flex size-8.5 shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors duration-150 ease-[var(--ease-out-expo)]"
+                >
+                  <span aria-hidden="true" className="bg-signal-danger size-[11px] rounded-[2.5px]" />
+                </button>
+              </SimpleTooltip>
+            )}
+          </>
         )}
 
         <SimpleTooltip

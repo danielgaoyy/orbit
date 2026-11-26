@@ -313,6 +313,12 @@ pub struct OrchestrationConfig {
     /// Prevent OS idle sleep while agents, autonomous wakeups, or scheduled runs are active (default: `true`).
     #[serde(default = "default_true")]
     pub keep_awake_while_running: bool,
+    /// Account-wide default permission mode synced from clients and inherited by newly dispatched conversations/workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_session_mode: Option<SessionMode>,
+    /// Monotonic client timestamp (ms since Unix epoch) for last-write-wins sync of `default_session_mode`.
+    #[serde(default)]
+    pub default_session_mode_updated_at_ms: i64,
 }
 
 impl Default for OrchestrationConfig {
@@ -326,6 +332,8 @@ impl Default for OrchestrationConfig {
             installed_skills: Vec::new(),
             auto_cluster_enabled: false,
             keep_awake_while_running: true,
+            default_session_mode: None,
+            default_session_mode_updated_at_ms: 0,
         }
     }
 }

@@ -413,6 +413,9 @@ data class OrbitUiState(
             return localList
         }
 
+    val isActiveAgentPersonalAgent: Boolean
+        get() = !isNewSessionMode && (activeAgent?.isPersonalRouter == true)
+
     val isActiveAgentRunning: Boolean
         get() = !isNewSessionMode && (activeAgent?.isForegroundRunning() == true)
 
@@ -2111,9 +2114,14 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         val normalized = OrbitFormatters.normalizeSessionMode(mode)
         val prev = _state.value
         _state.update { it.copy(composer = it.composer.copy(mode = normalized)) }
+        if (prev.isNewSessionMode || prev.selectedAgentId == null) {
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { core?.setAccountDefaultMode(normalized, System.currentTimeMillis()) }
+            }
+            return
+        }
         val hostId = prev.selectedHostId ?: return
         val agentId = prev.selectedAgentId ?: return
-        if (prev.isNewSessionMode) return
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { core?.setSessionMode(hostId, agentId, normalized) }
             reloadStageInternal(hostId, agentId)
@@ -3060,6 +3068,18 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                         reloadHostDetailInternal(hostId)
                         reloadStageInternal(hostId, createdId)
                     }
+                } else if (cur.isActiveAgentRunning || cur.activeAgent?.isAwaitingPermission == true) {
+                    val queueId = "q_${System.currentTimeMillis()}_${java.util.UUID.randomUUID().toString().take(6)}"
+                    core?.enqueuePrompt(
+                        hostId = hostId,
+                        agentId = targetAgentId,
+                        prompt = composed.wirePrompt,
+                        displayPrompt = composed.displayPrompt,
+                        badges = composed.badges,
+                        queueId = queueId,
+                    )
+                    reloadHostDetailInternal(hostId)
+                    reloadStageInternal(hostId, targetAgentId)
                 } else {
                     runningAgentKeys.add(agentQueueKey(hostId, targetAgentId))
                     core?.sendPromptWithMeta(

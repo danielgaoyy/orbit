@@ -33,6 +33,7 @@ import {
 import {
   matchesProjectDirectory,
 } from "@/lib/projects";
+import { isPersonalAgentCard } from "../selectors/personal-agent-selectors";
 import {
   type ComposerContextInput,
   type PromptBadge,
@@ -626,6 +627,16 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         },
         true,
       );
+      if (patch.mode !== undefined && patch.mode !== "plan") {
+        const nowMs = Date.now();
+        void orbitIpc.setAccountDefaultMode(patch.mode, nowMs);
+        if (getState().cloudSyncStatus?.state === "ready") {
+          void orbitIpc.cloudSyncUpdatePreferences({
+            draftMode: patch.mode,
+            draftModeUpdatedAtMs: nowMs,
+          });
+        }
+      }
     },
 
 
@@ -882,7 +893,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       const dispatchMode = resolvePromptDispatchMode(
         activeAgent,
         supportsServerQueue,
-        wantsSteer,
+        isPersonalAgentCard(activeAgent) ? false : wantsSteer,
       );
       const displayPrompt = opts?.displayPrompt ?? prompt;
       const badges = opts?.badges;
@@ -960,7 +971,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       const dispatchMode = resolvePromptDispatchMode(
         activeAgent,
         supportsServerQueue,
-        state.activeTurnSendBehavior === "steer",
+        isPersonalAgentCard(activeAgent) ? false : state.activeTurnSendBehavior === "steer",
       );
 
       if (dispatchMode === "enqueue_server" || dispatchMode === "enqueue_local") {
@@ -1341,7 +1352,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
       const dispatchMode = resolvePromptDispatchMode(
         liveAgent,
         supportsServerQueue,
-        liveState.activeTurnSendBehavior === "steer",
+        isPersonalAgentCard(liveAgent) ? false : liveState.activeTurnSendBehavior === "steer",
       );
 
       if (dispatchMode === "enqueue_server") {
@@ -2039,7 +2050,7 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
           const dispatchMode = resolvePromptDispatchMode(
             activeAgent,
             supportsServerQueue,
-            steerImmediately,
+            isPersonalAgentCard(activeAgent) ? false : steerImmediately,
           );
           if (dispatchMode === "enqueue_server") {
             const queueId = `q_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -2488,10 +2499,13 @@ export function createStageStreamSlice(ctx: OrbitStoreContext) {
         const detail = getState().hostDetails[submitTarget.hostId];
         const activeAgent = detail?.agents.find((a) => a.agent_id === agentId);
         const supportsServerQueue = Boolean(detail?.host.supports_server_queue);
+        const isPersonalAgentTarget = isPersonalAgentCard(activeAgent);
+        // Personal Agent follow-ups while busy always queue non-destructively so running turns
+        // (especially on Claude Code / Hermes ACP) are never interrupted or misattributed.
         const dispatchMode = resolvePromptDispatchMode(
           activeAgent,
           supportsServerQueue,
-          steerImmediately,
+          isPersonalAgentTarget ? false : steerImmediately,
         );
 
         if (dispatchMode !== "send_idle") {

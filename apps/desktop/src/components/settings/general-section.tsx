@@ -13,7 +13,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { LOCALES, useI18n } from "@/lib/i18n";
 import { modSymbol } from "@/lib/keybindings";
-import { isWebRuntime, normalizeSemver } from "@/lib/orbit-ipc";
+import { isWebRuntime, normalizeSemver, type SessionMode } from "@/lib/orbit-ipc";
 import {
   type ActiveTurnSendBehavior,
   orbitActions,
@@ -34,6 +34,7 @@ export const GeneralSection = memo(function GeneralSection({
   const { locale, t } = useI18n();
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const activeTurnSendBehavior = useOrbitSelector((s) => s.activeTurnSendBehavior);
+  const draftMode = useOrbitSelector((s) => s.draftMode);
   const storeAppVersion = useOrbitSelector((s) => s.appVersion);
   const releaseUpdateInfo = useOrbitSelector((s) => s.releaseUpdateInfo);
   const checkingUpdate = useOrbitSelector((s) => s.checkingReleaseUpdate);
@@ -77,6 +78,24 @@ export const GeneralSection = memo(function GeneralSection({
     ],
     [t],
   );
+
+  const defaultPermissionOptions = useMemo<SettingSelectOption<string>[]>(
+    () => [
+      { value: "default", label: t("composer.modeAlwaysAsk"), description: t("composer.modeAlwaysAskDesc") },
+      { value: "accept_edits", label: t("composer.modeAcceptEdits"), description: t("composer.modeAcceptEditsDesc") },
+      { value: "auto", label: t("composer.modeAuto"), description: t("composer.modeAutoDesc") },
+      { value: "full_access", label: t("composer.modeFullAccess"), description: t("composer.modeFullAccessDesc") },
+    ],
+    [t],
+  );
+  const normalizedDefaultMode =
+    typeof draftMode === "string" &&
+    (draftMode === "default" ||
+      draftMode === "accept_edits" ||
+      draftMode === "auto" ||
+      draftMode === "full_access")
+      ? draftMode
+      : "accept_edits";
 
   const appVersion = normalizeSemver(storeAppVersion) ?? "0.11.10";
   const autoCheckedRef = useRef(false);
@@ -163,6 +182,22 @@ export const GeneralSection = memo(function GeneralSection({
               value={activeTurnSendBehavior}
               options={activeTurnSendOptions}
               onChange={(val) => orbitActions.setActiveTurnSendBehavior(val)}
+              menuClassName="w-[248px]"
+            />
+          </SettingRow>
+
+          <SettingRow
+            settingId="settings.defaultPermissionMode"
+            title={t("settings.defaultPermissionMode")}
+            description={t("settings.defaultPermissionModeDesc")}
+          >
+            <SettingSelect<string>
+              ariaLabel={t("settings.defaultPermissionMode")}
+              value={normalizedDefaultMode}
+              options={defaultPermissionOptions}
+              onChange={(val) => {
+                orbitActions.setDraftConfig({ mode: val as SessionMode });
+              }}
               menuClassName="w-[248px]"
             />
           </SettingRow>

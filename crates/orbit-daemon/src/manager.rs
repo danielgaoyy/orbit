@@ -533,7 +533,9 @@ impl AgentOrchestrator {
         *self.personal_router.write().await = Some(router);
     }
 
-    async fn personal_router(&self) -> Option<Arc<crate::personal_router::PersonalRouterManager>> {
+    pub(crate) async fn personal_router(
+        &self,
+    ) -> Option<Arc<crate::personal_router::PersonalRouterManager>> {
         self.personal_router.read().await.clone()
     }
 
@@ -3561,6 +3563,27 @@ impl AgentOrchestrator {
             .await
             .ok()
             .flatten();
+        // Server-authoritative non-destructive queueing guard:
+        // 1. Option A: Never interrupt or scramble timeline while a human permission/question gate is live.
+        // 2. Personal Router: Follow-ups sent while a turn is active queue non-destructively so
+        //    Claude Code / Hermes ACP turns are never killed or misattributed even across fast double-texts.
+        if matches!(behavior, ActiveTurnBehavior::Steer)
+            && let Some(ref ag) = existing_agent
+        {
+            let awaiting_gate = matches!(ag.status, AgentStatus::AwaitingPermission { .. })
+                || self.has_pending_human_gates(agent_id).await;
+            let pa_busy = ag.is_personal_router() && ag.status.is_foreground_busy();
+            if awaiting_gate || pa_busy {
+                return Box::pin(self.enqueue_user_prompt(
+                    agent_id,
+                    prompt,
+                    display_prompt,
+                    badges,
+                    None,
+                ))
+                .await;
+            }
+        }
         let checked_prompt = self
             .run_pre_prompt_submit_hook(agent_id, existing_agent.as_ref(), prompt)
             .await?;
@@ -3597,10 +3620,13 @@ impl AgentOrchestrator {
             let _ = self.unarchive_agent(agent_id).await;
         }
         let is_live = self.live_agents.read().await.contains_key(agent_id);
+        let has_pending_gates = self.has_pending_human_gates(agent_id).await;
         let aid_db = agent_id.to_string();
         let handoff_context = self
             .try_store(move |s| -> anyhow::Result<Option<String>> {
-                let _ = s.set_agent_attention(&aid_db, AttentionState::None);
+                if !has_pending_gates {
+                    let _ = s.set_agent_attention(&aid_db, AttentionState::None);
+                }
                 let _ = s.touch_agent_activity(&aid_db, Utc::now());
                 let needs_handoff = !is_live && s.get_persistence_ref(&aid_db)?.is_none();
                 Ok(if needs_handoff {
@@ -3898,7 +3924,7 @@ impl AgentOrchestrator {
                 .entries
                 .first()
                 .map_or("", |entry| entry.body.as_str());
-            self.with_first_turn_memory(&ag.cwd, query, batch.wire_prompt)
+            self.with_first_turn_memory_for_agent(&ag, query, batch.wire_prompt)
                 .await
         } else {
             batch.wire_prompt
@@ -4080,13 +4106,13 @@ impl AgentOrchestrator {
         let prompt_state = self
             .try_store(move |s| -> anyhow::Result<_> {
                 let first_turn = !s.has_prompt_history(&aid_cwd)?;
-                Ok(s.get_agent(&aid_cwd)?.map(|ag| (ag.cwd, first_turn)))
+                Ok(s.get_agent(&aid_cwd)?.map(|ag| (ag, first_turn)))
             })
             .await
             .ok()
             .flatten();
-        let tree_oid = if let Some((cwd_str, _)) = &prompt_state {
-            capture_git_tree_snapshot(Path::new(cwd_str)).await
+        let tree_oid = if let Some((ag, _)) = &prompt_state {
+            capture_git_tree_snapshot(Path::new(&ag.cwd)).await
         } else {
             None
         };
@@ -4095,8 +4121,8 @@ impl AgentOrchestrator {
             None => sanitized.clone(),
         };
         let with_handoff = match prompt_state {
-            Some((cwd, true)) => {
-                self.with_first_turn_memory(&cwd, &prompt, with_handoff)
+            Some((ag, true)) => {
+                self.with_first_turn_memory_for_agent(&ag, &prompt, with_handoff)
                     .await
             }
             _ => with_handoff,
@@ -7044,6 +7070,11 @@ impl AgentOrchestrator {
             .lock()
             .await
             .insert(aid.clone(), (std::time::Instant::now(), last_prompt));
+        if agent.is_personal_router()
+            && let Some(router) = self.personal_router().await
+        {
+            router.reset_fleet_context_state().await;
+        }
         let ev = self
             .try_store(move |s| -> anyhow::Result<_> {
                 s.append_audit_event(
@@ -7378,6 +7409,50 @@ impl AgentOrchestrator {
         }
     }
 
+    async fn with_first_turn_memory_for_agent(
+        &self,
+        agent: &AgentSummary,
+        query: &str,
+        prompt: String,
+    ) -> String {
+        if !agent.is_personal_router() {
+            return self.with_first_turn_memory(&agent.cwd, query, prompt).await;
+        }
+        let router_mem_dir = self.home_dir.join("router_memory");
+        let mut sections: Vec<String> = Vec::new();
+        if router_mem_dir.is_dir() {
+            let root = router_mem_dir.to_string_lossy().to_string();
+            if let Ok(ctx) = self
+                .memory
+                .build_confirmed_memory_context(
+                    &root,
+                    query,
+                    self.memory.config.auto_inject_budget_tokens,
+                )
+                .await
+                && !ctx.is_empty()
+            {
+                sections.push(ctx);
+            }
+        }
+        let share_hermes = if let Some(router) = self.personal_router().await {
+            router.config().await.share_host_hermes_memory
+        } else {
+            true
+        };
+        if share_hermes && let Some(home) = crate::platform::resolve_user_home_dir() {
+            let hermes_memories_dir = home.join(".hermes/memories");
+            if let Some(hermes_ctx) = read_hermes_personal_memories(&hermes_memories_dir).await {
+                sections.push(hermes_ctx);
+            }
+        }
+        if sections.is_empty() {
+            prompt
+        } else {
+            format!("{}\n\n{prompt}", sections.join("\n\n"))
+        }
+    }
+
     async fn with_first_turn_memory(&self, cwd: &str, query: &str, prompt: String) -> String {
         match self
             .memory
@@ -7396,7 +7471,85 @@ impl AgentOrchestrator {
             _ => prompt,
         }
     }
+}
 
+/// Read bounded markdown personal memories from Hermes (`~/.hermes/memories/*.md`) when
+/// `share_host_hermes_memory` is enabled on the Personal Router.
+async fn read_hermes_personal_memories(memories_dir: &Path) -> Option<String> {
+    if !memories_dir.is_dir() {
+        return None;
+    }
+    const MAX_TOTAL_BYTES: usize = 4096;
+    let mut ordered_paths: Vec<PathBuf> = Vec::new();
+    for priority in ["USER.md", "MEMORY.md"] {
+        let p = memories_dir.join(priority);
+        if p.is_file() {
+            ordered_paths.push(p);
+        }
+    }
+    if let Ok(mut entries) = tokio::fs::read_dir(memories_dir).await {
+        let mut extras: Vec<PathBuf> = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let p = entry.path();
+            if p.is_file()
+                && p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+                && !ordered_paths.iter().any(|existing| existing == &p)
+            {
+                extras.push(p);
+            }
+        }
+        extras.sort();
+        ordered_paths.extend(extras);
+    }
+    if ordered_paths.is_empty() {
+        return None;
+    }
+    let mut out = String::from("<hermes-personal-memory>\n");
+    let mut used = 0usize;
+    for path in ordered_paths {
+        let Ok(raw) = tokio::fs::read_to_string(&path).await else {
+            continue;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let fname = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("memory.md");
+        let header = format!("## {fname}\n");
+        let remaining = MAX_TOTAL_BYTES.saturating_sub(used);
+        if remaining <= header.len() + 32 {
+            break;
+        }
+        out.push_str(&header);
+        used += header.len();
+        let body_budget = MAX_TOTAL_BYTES.saturating_sub(used);
+        if trimmed.len() <= body_budget {
+            out.push_str(trimmed);
+            out.push('\n');
+            used += trimmed.len() + 1;
+        } else {
+            let mut cut = body_budget;
+            while cut > 0 && !trimmed.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            out.push_str(&trimmed[..cut]);
+            out.push_str("\n…[truncated]\n");
+            break;
+        }
+    }
+    if used == 0 {
+        return None;
+    }
+    out.push_str("</hermes-personal-memory>");
+    Some(out)
+}
+
+impl AgentOrchestrator {
     /// Prepend either the full `<orbit-workspace>` block (Turn 1) or a compact `<orbit-workspace-delta>`
     /// block (Turn 2+) whenever structural peers, shared board, or high-signal events change.
     async fn augment_prompt_with_workspace_context(
@@ -9687,8 +9840,12 @@ impl AgentOrchestrator {
                 } else if !pre_hook_blocked
                     && plan_approval.is_none()
                     && let Some(ref ag) = agent_opt
-                    && matches!(ag.mode, SessionMode::Auto)
+                    && (matches!(ag.mode, SessionMode::Auto)
+                        || (!ag.is_personal_router()
+                            && (ag.routed_by_agent_id().is_some() || ag.parent_agent_id.is_some())
+                            && !matches!(ag.mode, SessionMode::FullAccess)))
                 {
+                    let started_in_auto = matches!(ag.mode, SessionMode::Auto);
                     let eval_req = crate::guardian::GuardianEvalRequest {
                         agent_id,
                         request_id: &request_id,
@@ -9706,22 +9863,25 @@ impl AgentOrchestrator {
                         return;
                     }
                     let aid_auto = agent_id.to_string();
-                    let still_auto = self
-                        .try_store(move |s| s.get_agent(&aid_auto))
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some_and(|fresh| matches!(fresh.mode, SessionMode::Auto));
+                    let still_auto = started_in_auto
+                        && self
+                            .try_store(move |s| s.get_agent(&aid_auto))
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some_and(|fresh| matches!(fresh.mode, SessionMode::Auto));
                     let (_, target_summary) =
                         crate::guardian::summarize_tool_request(&detail, &title);
 
                     if !still_auto {
                         let mut escalated = assessment;
                         escalated.decision = orbit_protocol::GuardianDecision::RequireHuman;
-                        escalated.classifier_tier = "fail_closed".into();
-                        escalated.reason =
-                            "Session mode changed during Guardian evaluation; requires approval"
-                                .into();
+                        if started_in_auto {
+                            escalated.classifier_tier = "fail_closed".into();
+                            escalated.reason =
+                                "Session mode changed during Guardian evaluation; requires approval"
+                                    .into();
+                        }
                         guardian_assessment = Some(escalated);
                     } else {
                         match assessment.decision {
@@ -10086,6 +10246,12 @@ impl AgentOrchestrator {
                         notice = %message,
                         "Agent emitted runtime notice"
                     );
+                }
+                if (level == "compaction" || level == "compaction_live")
+                    && let Some(router) = self.personal_router().await
+                    && router.active_router_agent_id().await.as_deref() == Some(agent_id)
+                {
+                    router.reset_fleet_context_state().await;
                 }
                 TimelinePayload::Notice { level, message }
             }
@@ -17654,6 +17820,34 @@ diff --git a/config/prod.env b/config/prod.env\n\
             .expect("outline");
         assert_eq!(outline.len(), 1);
         assert_eq!(outline[0].preview, "Audit folding logic");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_hermes_personal_memories_reads_user_and_memory_markdown_with_bounds() {
+        let dir = std::env::temp_dir().join(format!("orbit-hermes-mem-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(
+            dir.join("USER.md"),
+            "Name: Zicheng\nPrefers concise Chinese replies.",
+        )
+        .expect("write USER.md");
+        std::fs::write(
+            dir.join("MEMORY.md"),
+            "Default mode: Full Access on Mac Studio.",
+        )
+        .expect("write MEMORY.md");
+
+        let rendered = read_hermes_personal_memories(&dir)
+            .await
+            .expect("must read ~/.hermes/memories/*.md");
+        assert!(rendered.starts_with("<hermes-personal-memory>"));
+        assert!(rendered.contains("## USER.md"));
+        assert!(rendered.contains("Zicheng"));
+        assert!(rendered.contains("## MEMORY.md"));
+        assert!(rendered.contains("Full Access"));
+        assert!(rendered.ends_with("</hermes-personal-memory>"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

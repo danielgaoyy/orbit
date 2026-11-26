@@ -123,6 +123,18 @@ extension OrbitIosStore {
 
     // MARK: - Navigation & Global Overview
 
+    public func openPersonalAgentOrOverview() {
+        if let candidate = routerHostCandidates.first(where: { $0.routerEnabled && $0.activeRouterAgentId != nil }),
+           let routerAgentId = candidate.activeRouterAgentId {
+            isShowingGlobalOverview = false
+            isDrawerOpen = false
+            selectAgent(hostId: candidate.hostId, agentId: routerAgentId)
+            hapticLight()
+            return
+        }
+        openGlobalOverview()
+    }
+
     public func openGlobalOverview() {
         isShowingGlobalOverview = true
         isDrawerOpen = false
@@ -787,8 +799,10 @@ extension OrbitIosStore {
 
         if let candidate = routerHostCandidates.first(where: { $0.routerEnabled && $0.activeRouterAgentId != nil }),
            let routerAgentId = candidate.activeRouterAgentId {
+            isShowingGlobalOverview = false
             selectAgent(hostId: candidate.hostId, agentId: routerAgentId)
-            core?.sendPrompt(hostId: candidate.hostId, agentId: routerAgentId, prompt: prompt)
+            composerText = prompt
+            submitComposer()
             hapticSuccess()
             return
         }

@@ -1002,11 +1002,16 @@ public final class OrbitIosStore: ObservableObject {
             self.reloadFleet()
             self.refreshSidebar()
             self.startNetworkMonitor()
+            let initialPermRaw = self.defaultPermissionModeRaw
             coreReadQueue.async { [weak self] in
                 let catalogs = instance.fallbackProviderCatalogs()
                 let cmds = instance.slashCommands(platform: .ios, query: nil)
                 let localUri = instance.discoverLocalDaemonUri()
                 let syncStatus = instance.cloudSyncStatus()
+                instance.setAccountDefaultMode(
+                    mode: Self.sessionModeFromRaw(initialPermRaw),
+                    updatedAtMs: 0
+                )
                 instance.connectAllHosts()
                 Task { @MainActor [weak self] in
                     guard let self else { return }
@@ -1085,6 +1090,12 @@ public final class OrbitIosStore: ObservableObject {
         }
         guard let agent = activeAgent else { return false }
         return agent.isForegroundRunning || agent.isAwaitingPermission
+    }
+
+    /// True when the currently active session is the host's canonical Personal Agent.
+    public var isActiveAgentPersonalAgent: Bool {
+        guard !isDraftNewSession, let agent = activeAgent else { return false }
+        return agent.isPersonalRouter
     }
 
     /// True when no foreground turn is active, yet the agent still has running background tasks.
@@ -2022,7 +2033,9 @@ public final class OrbitIosStore: ObservableObject {
             isUnread: false,
             queuedPrompts: [
                 FfiQueuedPrompt(queueId: "demo-q1", displayText: "Run XCTest suite & capture iOS screenshots", badges: [], createdAtRfc3339: "2026-11-22T06:01:00Z")
-            ]
+            ],
+            labels: [:],
+            isPersonalRouter: false
         )
         let demoDetail = FfiHostDetail(
             revision: 1,
@@ -3458,6 +3471,12 @@ public final class OrbitIosStore: ObservableObject {
 
     public func applySessionMode(_ mode: FfiSessionMode) {
         selectedMode = mode
+        if isDraftNewSession || selectedAgentId == nil {
+            if mode != .plan {
+                setDefaultPermissionMode(mode)
+            }
+            return
+        }
         if let hid = selectedHostId, let aid = selectedAgentId {
             core?.setSessionMode(hostId: hid, agentId: aid, mode: mode)
             reloadAgentStage(hostId: hid, agentId: aid)
@@ -3863,7 +3882,7 @@ public final class OrbitIosStore: ObservableObject {
             return
         }
 
-        if isActiveAgentTurnBusy, selectedAgentId != nil {
+        if (isActiveAgentTurnBusy || (activeAgent?.isAwaitingPermission == true)), selectedAgentId != nil {
             enqueueComposerPrompt()
             return
         }
@@ -5311,13 +5330,17 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public func setDefaultPermissionMode(_ mode: FfiSessionMode) {
-        let raw = Self.rawFromSessionMode(mode)
+        let normalized = OrbitFormatters.normalizePermissionMode(mode)
+        guard normalized != .plan else { return }
+        let raw = Self.rawFromSessionMode(normalized)
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         defaultPermissionModeRaw = raw
         UserDefaults.standard.set(raw, forKey: Self.defaultPermissionModeDefaultsKey)
         if isDraftNewSession {
-            selectedMode = OrbitFormatters.normalizePermissionMode(mode)
+            selectedMode = normalized
         }
-        pushCloudSyncPreferencesPatch(["draftMode": raw])
+        core?.setAccountDefaultMode(mode: normalized, updatedAtMs: nowMs)
+        pushCloudSyncPreferencesPatch(["draftMode": raw, "draftModeUpdatedAtMs": nowMs])
         hapticLight()
     }
 
@@ -6604,14 +6627,17 @@ public final class OrbitIosStore: ObservableObject {
             draftUseWorktree = val
             UserDefaults.standard.set(val, forKey: Self.draftUseWorktreeDefaultsKey)
         }
-        if let val = dict["draftMode"] as? String, !val.isEmpty {
+        if let val = dict["draftMode"] as? String, !val.isEmpty, val != "plan" {
             let mode = Self.sessionModeFromRaw(val)
-            let norm = Self.rawFromSessionMode(mode)
+            let normalizedMode = OrbitFormatters.normalizePermissionMode(mode)
+            let norm = Self.rawFromSessionMode(normalizedMode)
             defaultPermissionModeRaw = norm
             UserDefaults.standard.set(norm, forKey: Self.defaultPermissionModeDefaultsKey)
             if isDraftNewSession {
-                selectedMode = OrbitFormatters.normalizePermissionMode(mode)
+                selectedMode = normalizedMode
             }
+            let updatedAtMs = (dict["draftModeUpdatedAtMs"] as? NSNumber)?.int64Value ?? 0
+            core?.setAccountDefaultMode(mode: normalizedMode, updatedAtMs: updatedAtMs)
         }
         if let sortRaw = dict["sidebarProjectSort"] as? String,
            let sortVal = OrbitSidebarProjectSort(rawValue: sortRaw) {

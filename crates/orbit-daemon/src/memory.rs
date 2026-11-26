@@ -1049,6 +1049,15 @@ pub(crate) async fn execute_tool(
     caller: &orbit_protocol::AgentSummary,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value> {
+    execute_tool_for_root(engine, &caller.cwd, caller, args).await
+}
+
+pub(crate) async fn execute_tool_for_root(
+    engine: &MemoryEngine,
+    root: &str,
+    caller: &orbit_protocol::AgentSummary,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value> {
     #[derive(Deserialize)]
     #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
     enum Action {
@@ -1075,7 +1084,6 @@ pub(crate) async fn execute_tool(
         },
     }
     use serde_json::json;
-    let root = &caller.cwd;
     Ok(match serde_json::from_value(args.clone())? {
         Action::Recall {
             query,

@@ -191,6 +191,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   sessionSubagents,
   sessionSubagentMatcher,
   onOpenSubagent,
+  isPersonalAgentSession,
 }: {
   selectedHostId: string;
   selectedAgentId: string;
@@ -223,6 +224,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   sessionSubagents: readonly ResolvedSubagentItem[];
   sessionSubagentMatcher: SubagentNameMatcher | null;
   onOpenSubagent: (subagent: ResolvedSubagentItem) => void;
+  isPersonalAgentSession: boolean;
 }) {
   const widthBucket = stageMaxContentWidthPx ? Math.round(stageMaxContentWidthPx / 32) : 24;
   const selectionTurnsRef = useRef<number[]>([]);
@@ -820,6 +822,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
               sessionSubagents={needsSubagents ? sessionSubagents : undefined}
               sessionSubagentMatcher={needsSubagents ? sessionSubagentMatcher : proseMatcherForTurn(turn)}
               onOpenSubagent={onOpenSubagent}
+              isPersonalAgentSession={isPersonalAgentSession}
             />
           </div>
         );
@@ -2308,6 +2311,7 @@ export function StreamStage() {
                   canForkWorktree={canForkWorktree}
                   onPreviewImage={setImagePreviewTarget}
                   sessionSubagents={sessionSubagents}
+                  isPersonalAgentSession={isPersonalAgentSession}
                   sessionSubagentMatcher={sessionSubagentMatcher}
                   onOpenSubagent={handleOpenSubagent}
                 />

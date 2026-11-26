@@ -1608,10 +1608,11 @@ pub struct SlicedStageTurns {
     pub turn_item_starts: Vec<usize>,
 }
 
-fn starts_stage_turn(
+fn starts_stage_turn_with_options(
     item: &TimelineItemView,
     has_open_turn: bool,
     current_turn_has_settled_assistant: bool,
+    split_finish_reports: bool,
 ) -> bool {
     match item {
         TimelineItemView::UserPrompt { .. } => true,
@@ -1619,8 +1620,22 @@ fn starts_stage_turn(
             kind,
             delivery_status,
             blocking_turn_id,
+            permission_context,
             ..
         } => {
+            if split_finish_reports
+                && matches!(kind, AgentMessageKind::FinishNotification)
+                && permission_context.is_none()
+                && (!has_open_turn
+                    || (current_turn_has_settled_assistant
+                        && (blocking_turn_id.is_none()
+                            || !matches!(
+                                delivery_status,
+                                Some(orbit_protocol::AgentMessageDeliveryStatus::Queued)
+                            ))))
+            {
+                return true;
+            }
             let stay_inline = has_open_turn
                 && (matches!(
                     kind,
@@ -1637,6 +1652,19 @@ fn starts_stage_turn(
     }
 }
 
+fn starts_stage_turn(
+    item: &TimelineItemView,
+    has_open_turn: bool,
+    current_turn_has_settled_assistant: bool,
+) -> bool {
+    starts_stage_turn_with_options(
+        item,
+        has_open_turn,
+        current_turn_has_settled_assistant,
+        false,
+    )
+}
+
 /// Builds semantic turns starting at `start_item_idx` (and `start_turn_index`),
 /// allowing `OrbitAppCore` to recompute only the active tail when streaming deltas arrive.
 pub fn process_timeline_turns_slice(
@@ -1645,6 +1673,19 @@ pub fn process_timeline_turns_slice(
     start_turn_index: u32,
     cwd: Option<&str>,
 ) -> SlicedStageTurns {
+    process_timeline_turns_slice_with_options(items, start_item_idx, start_turn_index, cwd, false)
+}
+
+/// Builds semantic turns with optional `split_finish_reports` (enabled for Personal Agent threads
+/// so background worker completion reports open their own clean assistant report turn instead of
+/// gluing onto an unrelated earlier user turn).
+pub fn process_timeline_turns_slice_with_options(
+    items: &[TimelineItemView],
+    start_item_idx: usize,
+    start_turn_index: u32,
+    cwd: Option<&str>,
+    split_finish_reports: bool,
+) -> SlicedStageTurns {
     let mut turns: Vec<StageTurnView> = Vec::new();
     let mut turn_item_starts: Vec<usize> = Vec::new();
 
@@ -1652,6 +1693,10 @@ pub fn process_timeline_turns_slice(
     let mut current_body: Vec<TimelineItemView> = Vec::new();
     let mut current_turn_start: Option<usize> = None;
     let mut has_open_turn = false;
+    // Finish notifications that arrived mid-turn while the open turn had not yet produced its
+    // settled assistant reply are deferred until the open turn's reply settles, preventing
+    // them from splitting the active turn prematurely and stealing its assistant message.
+    let mut deferred_finish_reports: Vec<(usize, TimelineItemView)> = Vec::new();
 
     let flush_turn = |turns: &mut Vec<StageTurnView>,
                       turn_item_starts: &mut Vec<usize>,
@@ -1699,7 +1744,77 @@ pub fn process_timeline_turns_slice(
                 }
             )
         });
-        if starts_stage_turn(&item, has_open_turn, current_turn_has_settled_assistant) {
+
+        // Once the open turn has settled its assistant reply, promote any deferred mid-turn
+        // finish notifications into their own independent report turn BEFORE the next turn's
+        // content (or user prompt) begins. Share `group_start` across the interleaved pair so
+        // incremental tail rebuilds never slice between Turn 0 and Turn 1 and duplicate Turn 0's reply.
+        if split_finish_reports
+            && !deferred_finish_reports.is_empty()
+            && current_turn_has_settled_assistant
+        {
+            let group_start = current_turn_start.unwrap_or(start_item_idx);
+            flush_turn(
+                &mut turns,
+                &mut turn_item_starts,
+                &mut current_prompt,
+                &mut current_body,
+                &mut current_turn_start,
+                &mut has_open_turn,
+            );
+            let mut drained = deferred_finish_reports.drain(..);
+            if let Some((_, first_item)) = drained.next() {
+                current_prompt = Some(first_item);
+                current_body.extend(drained.map(|(_, it)| it));
+                current_turn_start = Some(group_start);
+                has_open_turn = true;
+            }
+        }
+
+        let current_turn_has_settled_assistant = current_body.iter().any(|it| {
+            matches!(
+                it,
+                TimelineItemView::AssistantMessage {
+                    streaming: false,
+                    ..
+                }
+            )
+        });
+
+        // Defer mid-turn dispatched/settled FinishNotifications on Personal Agent threads until
+        // the open non-report turn settles its own assistant reply so Turn 1 never loses its reply.
+        let current_prompt_is_finish = matches!(
+            current_prompt,
+            Some(TimelineItemView::AgentMessage {
+                kind: AgentMessageKind::FinishNotification,
+                ..
+            })
+        );
+        if split_finish_reports
+            && has_open_turn
+            && !current_turn_has_settled_assistant
+            && !current_prompt_is_finish
+            && let TimelineItemView::AgentMessage {
+                kind: AgentMessageKind::FinishNotification,
+                permission_context: None,
+                delivery_status,
+                ..
+            } = &item
+            && !matches!(
+                delivery_status,
+                Some(orbit_protocol::AgentMessageDeliveryStatus::Queued)
+            )
+        {
+            deferred_finish_reports.push((abs_idx, item));
+            continue;
+        }
+
+        if starts_stage_turn_with_options(
+            &item,
+            has_open_turn,
+            current_turn_has_settled_assistant,
+            split_finish_reports,
+        ) {
             flush_turn(
                 &mut turns,
                 &mut turn_item_starts,
@@ -1721,6 +1836,38 @@ pub fn process_timeline_turns_slice(
             current_turn_start = Some(abs_idx);
         }
         current_body.push(item);
+    }
+
+    let final_turn_has_settled_assistant = current_body.iter().any(|it| {
+        matches!(
+            it,
+            TimelineItemView::AssistantMessage {
+                streaming: false,
+                ..
+            }
+        )
+    });
+    if split_finish_reports && !deferred_finish_reports.is_empty() {
+        if final_turn_has_settled_assistant {
+            let group_start = current_turn_start.unwrap_or(start_item_idx);
+            flush_turn(
+                &mut turns,
+                &mut turn_item_starts,
+                &mut current_prompt,
+                &mut current_body,
+                &mut current_turn_start,
+                &mut has_open_turn,
+            );
+            let mut drained = deferred_finish_reports.drain(..);
+            if let Some((_, first_item)) = drained.next() {
+                current_prompt = Some(first_item);
+                current_body.extend(drained.map(|(_, it)| it));
+                current_turn_start = Some(group_start);
+                has_open_turn = true;
+            }
+        } else {
+            current_body.extend(deferred_finish_reports.drain(..).map(|(_, it)| it));
+        }
     }
 
     flush_turn(
@@ -6509,6 +6656,23 @@ Log: file:///tmp/spoofed.log\n";
             "FinishNotification & Heartbeat must stay inline while DirectMessage opens a new turn"
         );
 
+        let pa_sliced =
+            process_timeline_turns_slice_with_options(&items, 0, 0, Some("/repo"), true);
+        assert_eq!(
+            pa_sliced.turns.len(),
+            3,
+            "Personal Agent must split FinishNotification after a settled turn into its own independent report turn"
+        );
+        assert!(pa_sliced.turns[1].user_prompt.is_none());
+        assert!(matches!(
+            &pa_sliced.turns[1].agent_message,
+            Some(TimelineItemView::AgentMessage {
+                kind: AgentMessageKind::FinishNotification,
+                message_id,
+                ..
+            }) if message_id == "am_fin_1"
+        ));
+
         let t0 = &turns[0];
         assert!(t0.user_prompt.is_some());
         assert!(t0.agent_message.is_none());
@@ -7256,6 +7420,268 @@ Log: file:///tmp/spoofed.log\n";
         assert_eq!(
             insights.outline_prompts[1].preview,
             "Run phase 2 verification"
+        );
+    }
+
+    #[test]
+    fn personal_agent_finish_reports_split_after_busy_dispatch_idle_queue_and_coalesce_batches() {
+        use chrono::Utc;
+        use orbit_protocol::{AgentMessageDeliveryStatus, TimelineEvent, TimelinePayload};
+
+        // 1. REAL daemon mid-turn order: User asks PA -> PA runs a tool call -> Worker finishes
+        //    WHILE Turn 1 is still running (`seq 3`, `blocking_turn_id = Some("turn_1")`) ->
+        //    Turn 1 finishes with its assistant reply (`seq 4`) -> `Dispatched` (`seq 5`) ->
+        //    PA summarizes worker (`seq 6`). Turn 0 MUST keep `seq 4` (never stolen!) and Turn 1
+        //    MUST open cleanly for `fin_busy` + `seq 6`!
+        let now = Utc::now();
+        let events = vec![
+            TimelineEvent {
+                seq: 1,
+                epoch: 1,
+                agent_id: "ag_pa".into(),
+                turn_id: Some("turn_1".into()),
+                timestamp: now,
+                payload: TimelinePayload::UserPrompt {
+                    message_id: "u_1".into(),
+                    text: "Check git status".into(),
+                    badges: Vec::new(),
+                },
+            },
+            TimelineEvent {
+                seq: 2,
+                epoch: 1,
+                agent_id: "ag_pa".into(),
+                turn_id: Some("turn_1".into()),
+                timestamp: now,
+                payload: TimelinePayload::AssistantThinking {
+                    item_id: "th_1".into(),
+                    text: "Checking git status...".into(),
+                },
+            },
+            TimelineEvent {
+                seq: 3,
+                epoch: 1,
+                agent_id: "ag_pa".into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::AgentMessage {
+                    message_id: "fin_busy".into(),
+                    kind: AgentMessageKind::FinishNotification,
+                    source_agent_id: Some("ag_w1".into()),
+                    source_host_id: Some("host_mac".into()),
+                    source_title: Some("Fix Login".into()),
+                    event: Some("finished".into()),
+                    text: "Fixed login bug.".into(),
+                    permission_context: None,
+                    delivery_status: Some(AgentMessageDeliveryStatus::Queued),
+                    delivery_turn_id: None,
+                    blocking_turn_id: Some("turn_1".into()),
+                    queued_at_ms: Some(1_000),
+                    dispatched_at_ms: None,
+                    settled_at_ms: None,
+                },
+            },
+            TimelineEvent {
+                seq: 4,
+                epoch: 1,
+                agent_id: "ag_pa".into(),
+                turn_id: Some("turn_1".into()),
+                timestamp: now,
+                payload: TimelinePayload::AssistantMessage {
+                    item_id: "a_1".into(),
+                    text: "Your git status is clean.".into(),
+                    streaming: false,
+                },
+            },
+            TimelineEvent {
+                seq: 5,
+                epoch: 1,
+                agent_id: "ag_pa".into(),
+                turn_id: Some("turn_2".into()),
+                timestamp: now,
+                payload: TimelinePayload::AgentMessageDeliveryUpdated {
+                    message_id: "fin_busy".into(),
+                    status: AgentMessageDeliveryStatus::Dispatched,
+                    delivery_turn_id: Some("turn_2".into()),
+                    blocking_turn_id: None,
+                    timestamp_ms: 1_500,
+                },
+            },
+            TimelineEvent {
+                seq: 6,
+                epoch: 1,
+                agent_id: "ag_pa".into(),
+                turn_id: Some("turn_2".into()),
+                timestamp: now,
+                payload: TimelinePayload::AssistantMessage {
+                    item_id: "a_2".into(),
+                    text: "Fix Login finished successfully.".into(),
+                    streaming: false,
+                },
+            },
+            // 2. Idle PA receives coalesced 2-worker batch (`Queued` with `blocking_turn_id: None`)
+            //    -> W2 must split IMMEDIATELY (no idle flicker), and W3 must stay in the SAME report turn!
+            TimelineEvent {
+                seq: 7,
+                epoch: 1,
+                agent_id: "ag_pa".into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::AgentMessage {
+                    message_id: "fin_batch_a".into(),
+                    kind: AgentMessageKind::FinishNotification,
+                    source_agent_id: Some("ag_w2".into()),
+                    source_host_id: Some("host_mac".into()),
+                    source_title: Some("Build iOS".into()),
+                    event: Some("finished".into()),
+                    text: "iOS build succeeded.".into(),
+                    permission_context: None,
+                    delivery_status: Some(AgentMessageDeliveryStatus::Queued),
+                    delivery_turn_id: None,
+                    blocking_turn_id: None,
+                    queued_at_ms: Some(2_000),
+                    dispatched_at_ms: None,
+                    settled_at_ms: None,
+                },
+            },
+            TimelineEvent {
+                seq: 8,
+                epoch: 1,
+                agent_id: "ag_pa".into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::AgentMessage {
+                    message_id: "fin_batch_b".into(),
+                    kind: AgentMessageKind::FinishNotification,
+                    source_agent_id: Some("ag_w3".into()),
+                    source_host_id: Some("host_linux".into()),
+                    source_title: Some("Run E2E".into()),
+                    event: Some("finished".into()),
+                    text: "E2E green.".into(),
+                    permission_context: None,
+                    delivery_status: Some(AgentMessageDeliveryStatus::Queued),
+                    delivery_turn_id: None,
+                    blocking_turn_id: None,
+                    queued_at_ms: Some(2_050),
+                    dispatched_at_ms: None,
+                    settled_at_ms: None,
+                },
+            },
+            TimelineEvent {
+                seq: 9,
+                epoch: 1,
+                agent_id: "ag_pa".into(),
+                turn_id: Some("turn_3".into()),
+                timestamp: now,
+                payload: TimelinePayload::AssistantMessage {
+                    item_id: "a_3".into(),
+                    text: "Both iOS build and E2E passed.".into(),
+                    streaming: false,
+                },
+            },
+        ];
+
+        let delivery_updates = crate::viewmodel::collect_delivery_updates(&events);
+        assert!(
+            delivery_updates["fin_busy"].blocking_turn_cleared,
+            "Dispatched update must clear blocking_turn_id"
+        );
+        let empty_perms = std::collections::HashMap::new();
+        let empty_qs = std::collections::HashMap::new();
+        let mut md_cache = std::collections::HashMap::new();
+        let mut stream_md_cache = std::collections::HashMap::new();
+        let items: Vec<TimelineItemView> = events
+            .iter()
+            .filter_map(|ev| {
+                crate::viewmodel::render_timeline_event_view(
+                    "ag_pa",
+                    Some("/repo"),
+                    ev,
+                    &empty_perms,
+                    &empty_qs,
+                    &delivery_updates,
+                    false,
+                    &mut md_cache,
+                    &mut stream_md_cache,
+                )
+            })
+            .collect();
+
+        let pa = process_timeline_turns_slice_with_options(&items, 0, 0, Some("/repo"), true);
+        assert_eq!(
+            pa.turns.len(),
+            3,
+            "Expected Turn 0 (chat), Turn 1 (dispatched busy finish), Turn 2 (coalesced 2-worker finish)"
+        );
+        // Critical regression check: Turn 0 MUST retain its own assistant reply ("Your git status is clean.")
+        assert!(
+            matches!(
+                &pa.turns[0].terminal_reply,
+                Some(TimelineItemView::AssistantMessage { text, .. }) if text.contains("git status is clean")
+            ),
+            "Mid-turn finish notification must NEVER steal Turn 0's assistant reply"
+        );
+        assert!(pa.turns[1].user_prompt.is_none());
+        assert!(matches!(
+            &pa.turns[1].agent_message,
+            Some(TimelineItemView::AgentMessage { message_id, blocking_turn_id, .. })
+                if message_id == "fin_busy" && blocking_turn_id.is_none()
+        ));
+        assert!(
+            matches!(
+                &pa.turns[1].terminal_reply,
+                Some(TimelineItemView::AssistantMessage { text, .. }) if text.contains("Fix Login finished")
+            ),
+            "Turn 1 must contain only the finish report's assistant summary"
+        );
+        assert!(pa.turns[2].user_prompt.is_none());
+        assert!(matches!(
+            &pa.turns[2].agent_message,
+            Some(TimelineItemView::AgentMessage { message_id, .. }) if message_id == "fin_batch_a"
+        ));
+        assert!(
+            pa.turns[2].live_segments.iter().any(|seg| matches!(
+                seg,
+                TurnLiveSegmentView::AgentMessage {
+                    item: TimelineItemView::AgentMessage { message_id, .. },
+                    ..
+                } if message_id == "fin_batch_b"
+            )),
+            "Second coalesced finish must remain inside Turn 2 rather than spawning an empty turn"
+        );
+
+        // 3. Incremental live streaming delta on Turn 1 (idx 4) must walk back shared interleaved
+        //    starts (`turn_item_starts[1] == turn_item_starts[0]`) and NEVER duplicate Turn 0's reply!
+        assert_eq!(pa.turn_item_starts[0], pa.turn_item_starts[1]);
+        let base_item_idx = 4usize; // Turn 1's AssistantMessage item
+        let mut replace_from_turn_idx = pa
+            .turn_item_starts
+            .partition_point(|&start| start <= base_item_idx)
+            .saturating_sub(1);
+        while replace_from_turn_idx > 0
+            && pa.turn_item_starts[replace_from_turn_idx]
+                == pa.turn_item_starts[replace_from_turn_idx - 1]
+        {
+            replace_from_turn_idx -= 1;
+        }
+        assert_eq!(replace_from_turn_idx, 0);
+        let inc = process_timeline_turns_slice_with_options(
+            &items[..5],
+            pa.turn_item_starts[replace_from_turn_idx],
+            replace_from_turn_idx as u32,
+            Some("/repo"),
+            true,
+        );
+        assert_eq!(inc.turns.len(), 2);
+        assert!(
+            !inc.turns[1].live_segments.iter().any(|seg| matches!(
+                seg,
+                TurnLiveSegmentView::AssistantMessage {
+                    item: TimelineItemView::AssistantMessage { text, .. },
+                    ..
+                } if text.contains("git status is clean")
+            )),
+            "Incremental streaming rebuild on Turn 1 must NEVER duplicate Turn 0's assistant reply"
         );
     }
 }

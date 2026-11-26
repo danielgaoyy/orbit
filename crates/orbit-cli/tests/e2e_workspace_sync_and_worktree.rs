@@ -412,6 +412,7 @@ async fn test_01_non_git_worktree_guard_and_nested_git_repo_folding() {
                 handle: None,
                 auto_cluster: Some(false),
                 acp_agent_id: None,
+                labels: std::collections::HashMap::new(),
             },
             Duration::from_secs(10),
             |w| matches!(w, WireMessage::RpcError { request_id, .. } if *request_id == Some(req_id)),

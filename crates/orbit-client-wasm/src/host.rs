@@ -336,11 +336,29 @@ impl WasmHost {
         if let Some(t) = self.timelines.get(agent_id) {
             insights.merge_outline(&t.outline);
         }
+        let split_finish_reports = agent.is_some_and(|a| {
+            a.labels
+                .get(orbit_protocol::LABEL_AGENT_ROLE)
+                .map(|r| r.trim().to_ascii_lowercase())
+                .is_some_and(|r| {
+                    matches!(r.as_str(), "personal_router" | "router" | "chief_of_staff")
+                })
+                || a.handle
+                    .as_deref()
+                    .is_some_and(|h| h.trim().eq_ignore_ascii_case("router"))
+        });
         stage::AgentStageView {
             host_id: self.detail.host.host_id.clone(),
             revision: self.detail.revision,
             agent: agent.cloned(),
-            turns: stage::process_timeline_turns_slice(&items, 0, 0, cwd).turns,
+            turns: stage::process_timeline_turns_slice_with_options(
+                &items,
+                0,
+                0,
+                cwd,
+                split_finish_reports,
+            )
+            .turns,
             latest_seq: self.cursor(agent_id) as u64,
             pending_permissions,
             pending_questions,

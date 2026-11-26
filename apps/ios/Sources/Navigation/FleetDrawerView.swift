@@ -482,7 +482,10 @@ struct FleetDrawerView: View {
 
     @ViewBuilder
     private var missionControlContent: some View {
-        // 0a. Personal Agent Global Overview Entry
+        // 0a. Dedicated Personal Agent Chat Entry (when enabled) + Global Overview Entry
+        if store.routerHostCandidates.contains(where: { $0.routerEnabled && $0.activeRouterAgentId != nil }) {
+            personalAgentNavRow
+        }
         homeOverviewNavRow
 
         // 0b. Quick Automations Entry
@@ -661,6 +664,37 @@ struct FleetDrawerView: View {
         if hiddenCount > 0 {
             showMoreLessRow(projectId: project.id, hiddenCount: hiddenCount, isExpandedAll: isExpandedAll)
         }
+    }
+
+    private var personalAgentNavRow: some View {
+        let isSelected = !store.isShowingGlobalOverview && store.isActiveAgentPersonalAgent
+        return Button {
+            store.openPersonalAgentOrOverview()
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 13.5, weight: .medium))
+                    .foregroundStyle(isSelected ? palette.fgPrimary : palette.fgSecondary)
+                    .frame(width: 16, height: 16)
+
+                Text(OrbitL10n.tr("Personal Agent"))
+                    .font(OrbitTypography.subhead(isSelected ? .semibold : .medium))
+                    .foregroundStyle(isSelected ? palette.fgPrimary : palette.fgPrimary.opacity(0.9))
+
+                Spacer(minLength: 4)
+            }
+            .padding(.horizontal, 8)
+            .frame(minHeight: 34)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(isSelected ? selectedRowFill : Color.clear)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
     }
 
     private var homeOverviewNavRow: some View {

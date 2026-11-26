@@ -546,6 +546,12 @@ export class OrbitCoreBridge
     });
   }
 
+  public setAccountDefaultMode(mode: string, updatedAtMs: number = 0): void {
+    this.traceVoidSync('setAccountDefaultMode', 0, (): void => {
+      this.core.setAccountDefaultMode(mode, updatedAtMs);
+    });
+  }
+
   public setAgentConfig(
     hostId: string,
     agentId: string,

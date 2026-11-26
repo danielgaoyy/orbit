@@ -2257,6 +2257,10 @@ pub enum WireMessage {
         /// Optional ACP registry agent ID when `provider == ProviderKind::Acp`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         acp_agent_id: Option<String>,
+        /// Optional initial labels persisted atomically before the worker driver launches
+        /// (e.g. `orbit.routed_by_agent` and `orbit.routed_by_host` for remote router dispatch).
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        labels: HashMap<String, String>,
     },
     AgentCreated {
         request_id: Uuid,
@@ -2791,6 +2795,16 @@ pub enum WireMessage {
     UpdateOrchestrationConfig {
         request_id: Uuid,
         config: OrchestrationConfig,
+    },
+    /// Synchronize the user's account-wide default session permission mode to this host without
+    /// overwriting host-local orchestration fields (e.g. idle timeout or startup resume).
+    SetAccountDefaultMode {
+        request_id: Uuid,
+        mode: SessionMode,
+        /// Monotonic client timestamp (ms since Unix epoch) for last-write-wins conflict resolution.
+        /// `0` applies only if this host has no persisted default yet.
+        #[serde(default)]
+        updated_at_ms: i64,
     },
 
     // Personal Router ("Chief-of-Staff / 分工师") & Multi-Host Fleet Router Discovery
@@ -4755,6 +4769,7 @@ mod tests {
             auto_cluster: None,
             fast_mode: Some(true),
             acp_agent_id: None,
+            labels: HashMap::new(),
         };
         let raw_json = serde_json::to_vec(&msg).expect("serialize");
         let compressed = msg.encode_zstd(3).expect("compress");

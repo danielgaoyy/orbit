@@ -64,15 +64,17 @@ struct OmniComposerView: View {
     }
 
     private var isRunningWithDraft: Bool {
-        store.isActiveAgentTurnBusy && store.canSubmitComposer && store.selectedAgentId != nil
+        !store.isActiveAgentPersonalAgent && store.isActiveAgentTurnBusy && store.canSubmitComposer && store.selectedAgentId != nil
     }
 
     private var showPrimaryStopButton: Bool {
-        store.isActiveAgentTurnBusy && !store.canSubmitComposer
+        !store.isActiveAgentPersonalAgent && store.isActiveAgentTurnBusy && !store.canSubmitComposer
     }
 
     private var placeholderText: String {
-        "Ask anything, @ to mention, / for actions"
+        store.isActiveAgentPersonalAgent
+            ? OrbitL10n.tr("Message Personal Agent…")
+            : "Ask anything, @ to mention, / for actions"
     }
 
     private var normalizedPermissionMode: FfiSessionMode {
@@ -777,73 +779,101 @@ struct OmniComposerView: View {
 
                 Spacer(minLength: OrbitSpacing.xs)
 
-                // [Access Permissions] Compact Popover (aligned 1:1 with ModelPickerPopoverView)
-                Button {
-                    isComposerFocused = false
-                    store.hapticLight()
-                    isPermissionPickerPresented.toggle()
-                } label: {
-                    Image(systemName: OrbitFormatters.sessionModeIcon(normalizedPermissionMode))
-                        .font(OrbitTypography.iconSmall)
-                        .foregroundStyle(palette.fgSecondary)
-                        .frame(width: 36, height: Self.controlBarHeight)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Access Permissions: \(OrbitFormatters.sessionModeLabel(normalizedPermissionMode))")
-                .orbitCompactPopover(
-                    isPresented: $isPermissionPickerPresented,
-                    arrowEdge: .bottom,
-                    palette: palette
-                ) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        OrbitPopoverSectionHeader(title: "Access Permissions")
+                // [Access Permissions] Compact Popover (hidden on minimalist Personal Agent chat)
+                if !store.isActiveAgentPersonalAgent {
+                    Button {
+                        isComposerFocused = false
+                        store.hapticLight()
+                        isPermissionPickerPresented.toggle()
+                    } label: {
+                        Image(systemName: OrbitFormatters.sessionModeIcon(normalizedPermissionMode))
+                            .font(OrbitTypography.iconSmall)
+                            .foregroundStyle(palette.fgSecondary)
+                            .frame(width: 36, height: Self.controlBarHeight)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Access Permissions: \(OrbitFormatters.sessionModeLabel(normalizedPermissionMode))")
+                    .orbitCompactPopover(
+                        isPresented: $isPermissionPickerPresented,
+                        arrowEdge: .bottom,
+                        palette: palette
+                    ) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            OrbitPopoverSectionHeader(title: "Access Permissions")
 
-                        VStack(alignment: .leading, spacing: 2) {
-                            OrbitPopoverOptionRow(
-                                title: "Always Ask",
-                                subtitle: "Require approval before file edits and commands",
-                                systemImage: "shield",
-                                isSelected: normalizedPermissionMode == .default
-                            ) {
-                                store.applySessionMode(.default)
-                                isPermissionPickerPresented = false
-                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                OrbitPopoverOptionRow(
+                                    title: "Always Ask",
+                                    subtitle: "Require approval before file edits and commands",
+                                    systemImage: "shield",
+                                    isSelected: normalizedPermissionMode == .default
+                                ) {
+                                    store.applySessionMode(.default)
+                                    isPermissionPickerPresented = false
+                                }
 
-                            OrbitPopoverOptionRow(
-                                title: "Accept Edits",
-                                subtitle: "Auto-approve file edits, ask before commands",
-                                systemImage: "checkmark.shield",
-                                isSelected: normalizedPermissionMode == .acceptEdits
-                            ) {
-                                store.applySessionMode(.acceptEdits)
-                                isPermissionPickerPresented = false
-                            }
+                                OrbitPopoverOptionRow(
+                                    title: "Accept Edits",
+                                    subtitle: "Auto-approve file edits, ask before commands",
+                                    systemImage: "checkmark.shield",
+                                    isSelected: normalizedPermissionMode == .acceptEdits
+                                ) {
+                                    store.applySessionMode(.acceptEdits)
+                                    isPermissionPickerPresented = false
+                                }
 
-                            OrbitPopoverOptionRow(
-                                title: "Plan Mode",
-                                subtitle: "Draft and review a plan before making edits",
-                                systemImage: "list.bullet.clipboard",
-                                isSelected: normalizedPermissionMode == .plan
-                            ) {
-                                store.applySessionMode(.plan)
-                                isPermissionPickerPresented = false
-                            }
+                                OrbitPopoverOptionRow(
+                                    title: "Plan Mode",
+                                    subtitle: "Draft and review a plan before making edits",
+                                    systemImage: "list.bullet.clipboard",
+                                    isSelected: normalizedPermissionMode == .plan
+                                ) {
+                                    store.applySessionMode(.plan)
+                                    isPermissionPickerPresented = false
+                                }
 
-                            OrbitPopoverOptionRow(
-                                title: "Full Access",
-                                subtitle: "Edit files and run commands without prompts",
-                                systemImage: "shield.slash",
-                                isSelected: normalizedPermissionMode == .fullAccess
-                            ) {
-                                store.applySessionMode(.fullAccess)
-                                isPermissionPickerPresented = false
+                                OrbitPopoverOptionRow(
+                                    title: "Full Access",
+                                    subtitle: "Edit files and run commands without prompts",
+                                    systemImage: "shield.slash",
+                                    isSelected: normalizedPermissionMode == .fullAccess
+                                ) {
+                                    store.applySessionMode(.fullAccess)
+                                    isPermissionPickerPresented = false
+                                }
                             }
                         }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 10)
+                        .frame(width: 296)
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 10)
-                    .frame(width: 296)
+                } else if store.isActiveAgentTurnBusy {
+                    HStack(spacing: 4) {
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(palette.fgMuted)
+                                .frame(width: 5, height: 5)
+                            Text(OrbitL10n.tr("Working…"))
+                                .font(OrbitTypography.meta(.medium))
+                        }
+                        .foregroundStyle(palette.fgMuted)
+                        .padding(.leading, 8)
+                        .padding(.trailing, 4)
+
+                        Button {
+                            store.interruptActiveAgent()
+                        } label: {
+                            Image(systemName: "stop.fill")
+                                .font(.system(size: 8.5, weight: .semibold))
+                                .foregroundStyle(palette.fgMuted)
+                                .frame(width: 22, height: 22)
+                                .background(palette.subtleFill, in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Stop Generation")
+                    }
+                    .frame(minHeight: Self.controlBarHeight)
                 }
 
                 // Borderless Steer/Queue toggle + Stop action when typing during active run
